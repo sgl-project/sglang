@@ -9,7 +9,7 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
-use crate::proxy::chat::{self as dispatch, SelectedWorkers};
+use crate::proxy::chat_dispatch::{self as dispatch, SelectedWorkers};
 use crate::server::app_context::AppContext;
 use crate::server::chat_request::{parse_probe, ChatRequest};
 use crate::server::error::ApiError;

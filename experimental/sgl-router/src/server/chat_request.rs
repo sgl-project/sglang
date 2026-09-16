@@ -12,6 +12,7 @@ use crate::server::metrics::MetricsRegistry;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde_json::{json, Number, Value};
 
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
@@ -22,8 +23,8 @@ pub(crate) struct ChatRequest {
     pub(crate) body: Bytes,
     pub(crate) tokens: Option<RequestTokens>,
     pub(crate) prefill_load: usize,
-    value: Option<serde_json::Value>,
-    sampling: Vec<(SamplingField, serde_json::Number)>,
+    value: Option<Value>,
+    sampling: Vec<(SamplingField, Number)>,
 }
 
 impl ChatRequest {
@@ -44,9 +45,7 @@ impl ChatRequest {
         let value = want_tokens
             .then(|| serde_json::from_slice(&body))
             .transpose()
-            .map_err(|_| {
-                ApiError::BadRequest("invalid request: body must be a JSON object".into())
-            })?;
+            .map_err(|_| invalid_request())?;
         let tokens = value
             .as_ref()
             .and_then(|value| request_tokens_for(&ctx.tokenizers, &model, value));
@@ -361,10 +360,7 @@ pub(crate) struct BootstrapFields {
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
-fn splice_top_level(
-    body: &Bytes,
-    members: &[(SamplingField, serde_json::Number)],
-) -> Option<Bytes> {
+fn splice_top_level(body: &Bytes, members: &[(SamplingField, Number)]) -> Option<Bytes> {
     use std::io::Write as _;
 
     let open = body.iter().position(|&b| b == b'{')?;
@@ -390,10 +386,10 @@ fn splice_top_level(
 /// Reuse the parsed body when injecting tokens or bootstrap fields; splice sampling alone.
 fn build_outgoing_body(
     body: &Bytes,
-    value: Option<serde_json::Value>,
+    value: Option<Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
-    sampling: &[(SamplingField, serde_json::Number)],
+    sampling: &[(SamplingField, Number)],
 ) -> Result<Bytes, ApiError> {
     let only_sampling = input_ids.is_none() && bootstrap.is_none();
     if only_sampling && sampling.is_empty() {
@@ -406,50 +402,24 @@ fn build_outgoing_body(
     }
     let parsed = match value {
         Some(v) => v,
-        None => serde_json::from_slice(body).map_err(|_| {
-            ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-        })?,
+        None => serde_json::from_slice(body).map_err(|_| invalid_request())?,
     };
     let mut obj = match parsed {
-        serde_json::Value::Object(map) => map,
+        Value::Object(map) => map,
         _ => {
-            return Err(ApiError::BadRequest(
-                "invalid request: body must be a JSON object".to_string(),
-            ));
+            return Err(invalid_request());
         }
     };
     for (field, value) in sampling {
-        obj.insert(
-            field.wire_name().to_string(),
-            serde_json::Value::Number(value.clone()),
-        );
+        obj.insert(field.wire_name().into(), value.clone().into());
     }
     if let Some(ids) = input_ids {
-        obj.insert(
-            "input_ids".to_string(),
-            serde_json::Value::Array(
-                ids.iter()
-                    .map(|&i| serde_json::Value::Number(i.into()))
-                    .collect(),
-            ),
-        );
+        obj.insert("input_ids".into(), json!(ids));
     }
     if let Some(b) = bootstrap {
-        obj.insert(
-            "bootstrap_host".to_string(),
-            serde_json::Value::String(b.host.clone()),
-        );
-        obj.insert(
-            "bootstrap_port".to_string(),
-            match b.port {
-                Some(p) => serde_json::Value::Number(p.into()),
-                None => serde_json::Value::Null,
-            },
-        );
-        obj.insert(
-            "bootstrap_room".to_string(),
-            serde_json::Value::Number(b.room.into()),
-        );
+        obj.insert("bootstrap_host".into(), json!(b.host));
+        obj.insert("bootstrap_port".into(), json!(b.port));
+        obj.insert("bootstrap_room".into(), json!(b.room));
     }
     let bytes = serde_json::to_vec(&obj).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
@@ -458,7 +428,7 @@ fn build_outgoing_body(
 }
 
 /// Only forward tokens when the router replicated all template inputs.
-fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
+fn input_ids_safe_to_forward(value: &Value) -> bool {
     if request_has_tools(value) || request_has_non_text_content(value) {
         return false;
     }
@@ -473,11 +443,7 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
             return false;
         }
     }
-    if value
-        .get("continue_final_message")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
+    if value.get("continue_final_message").and_then(Value::as_bool) == Some(true) {
         return false;
     }
     !last_message_is_assistant(value)
@@ -485,49 +451,44 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
 
 fn ingress_tokenize_offload_failed(
     has_chat_formatter: bool,
-    request_value: Option<&serde_json::Value>,
+    request_value: Option<&Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> bool {
-    if !has_chat_formatter {
-        return false;
-    }
-    let chat_request = request_value.is_some_and(|v| {
-        v.get("messages").is_some_and(|m| m.is_array()) && input_ids_safe_to_forward(v)
-    });
-    if !chat_request {
-        return false;
-    }
-    !request_tokens.is_some_and(|t| t.rendered_from_chat)
+    has_chat_formatter
+        && request_value.is_some_and(|v| {
+            v.get("messages").is_some_and(Value::is_array) && input_ids_safe_to_forward(v)
+        })
+        && !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
-fn last_message_is_assistant(value: &serde_json::Value) -> bool {
+fn last_message_is_assistant(value: &Value) -> bool {
     value
         .get("messages")
-        .and_then(|m| m.as_array())
+        .and_then(Value::as_array)
         .and_then(|msgs| msgs.last())
         .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
+        .and_then(Value::as_str)
         == Some("assistant")
 }
 
-fn request_has_tools(value: &serde_json::Value) -> bool {
+fn request_has_tools(value: &Value) -> bool {
     let nonempty = |key: &str| {
         value.get(key).is_some_and(|v| match v {
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
+            Value::Array(a) => !a.is_empty(),
+            Value::Null => false,
             _ => true,
         })
     };
     nonempty("tools") || nonempty("functions")
 }
 
-fn request_has_non_text_content(value: &serde_json::Value) -> bool {
+fn request_has_non_text_content(value: &Value) -> bool {
     value
         .get("messages")
-        .and_then(|m| m.as_array())
+        .and_then(Value::as_array)
         .is_some_and(|msgs| {
             msgs.iter()
-                .any(|m| !matches!(m.get("content"), Some(serde_json::Value::String(_))))
+                .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
         })
 }
 
@@ -535,7 +496,7 @@ fn apply_sampling_overrides(
     overrides: &SamplingOverrides,
     probe: &RequestProbe,
     metrics: &MetricsRegistry,
-) -> Result<Vec<(SamplingField, serde_json::Number)>, ApiError> {
+) -> Result<Vec<(SamplingField, Number)>, ApiError> {
     let mut inject = Vec::with_capacity(overrides.params.len());
     // Count every violated parameter, but report only the first to the client.
     let mut first_violation: Option<ApiError> = None;
@@ -590,9 +551,11 @@ pub(crate) fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     }
     // Keep deserialization details out of the client-visible error.
     tracing::debug!(error = %err, "chat-completions request-probe deserialize failed");
-    Err(ApiError::BadRequest(
-        "invalid request: body must be a JSON object".to_string(),
-    ))
+    Err(invalid_request())
+}
+
+fn invalid_request() -> ApiError {
+    ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
 
 #[cfg(test)]
@@ -618,116 +581,90 @@ mod tests {
     }
 
     #[test]
-    fn build_outgoing_body_emits_null_for_missing_port() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let bootstrap = BootstrapFields {
-            host: "host".into(),
-            port: None,
+    fn outgoing_body_injects_tokens_and_bootstrap_without_losing_messages() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let original: Value = serde_json::from_slice(&body).unwrap();
+        let bootstrap = |port| BootstrapFields {
+            host: "h".into(),
+            port,
             room: 42,
         };
-        let injected =
-            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), &[]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
-        assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
-        assert_eq!(
-            parsed.get("bootstrap_host"),
-            Some(&serde_json::Value::String("host".into()))
-        );
-        assert_eq!(
-            parsed.get("bootstrap_room"),
-            Some(&serde_json::Value::Number(42.into()))
-        );
+        for (ids, bootstrap, fields) in [
+            (Some(&[1, 2, 3][..]), None, json!({"input_ids": [1, 2, 3]})),
+            (
+                None,
+                Some(bootstrap(None)),
+                json!({"bootstrap_host": "h", "bootstrap_port": null, "bootstrap_room": 42}),
+            ),
+            (
+                None,
+                Some(bootstrap(Some(9))),
+                json!({"bootstrap_host": "h", "bootstrap_port": 9, "bootstrap_room": 42}),
+            ),
+            (
+                Some(&[7, 8][..]),
+                Some(bootstrap(Some(9))),
+                json!({"input_ids": [7, 8], "bootstrap_host": "h", "bootstrap_port": 9, "bootstrap_room": 42}),
+            ),
+        ] {
+            let mut expected = original.clone();
+            expected
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            for value in [None, Some(original.clone())] {
+                let out = build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[]).unwrap();
+                assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
-    fn build_outgoing_body_injects_input_ids_and_keeps_messages() {
-        let body =
-            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &[]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
-        assert!(
-            parsed.get("messages").is_some(),
-            "messages must be retained alongside input_ids"
-        );
-    }
-
-    #[test]
-    fn build_outgoing_body_no_injection_returns_original_bytes() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, &[]).unwrap();
-        assert_eq!(
-            out, body,
-            "no injection must forward the original bytes unchanged"
-        );
-    }
-
-    #[test]
-    fn build_outgoing_body_injects_both_input_ids_and_bootstrap() {
-        let body =
-            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ids = [7u32, 8];
-        let bootstrap = BootstrapFields {
-            host: "h".into(),
-            port: Some(9),
-            room: 5,
-        };
-        let out =
-            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), &[]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
-        assert_eq!(
-            parsed.get("bootstrap_room"),
-            Some(&serde_json::Value::Number(5.into()))
-        );
-        assert_eq!(
-            parsed.get("bootstrap_port"),
-            Some(&serde_json::Value::Number(9.into()))
-        );
+    fn outgoing_body_without_injection_reuses_original_bytes() {
+        for raw in [r#"{"model":"x"}"#, r#"{"model":"x","messages":[]}"#] {
+            let body = Bytes::copy_from_slice(raw.as_bytes());
+            for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
+                let out = build_outgoing_body(&body, value, None, None, &[]).unwrap();
+                assert_eq!(out, body);
+                assert_eq!(out.as_ptr(), body.as_ptr());
+            }
+        }
     }
 
     #[test]
     fn request_has_tools_detects_tools_and_functions() {
-        assert!(request_has_tools(
-            &serde_json::json!({"tools":[{"type":"function"}]})
-        ));
-        assert!(request_has_tools(
-            &serde_json::json!({"functions":[{"name":"f"}]})
-        ));
-        assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
-        assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+        assert!(request_has_tools(&json!({"tools":[{"type":"function"}]})));
+        assert!(request_has_tools(&json!({"functions":[{"name":"f"}]})));
+        assert!(!request_has_tools(&json!({"tools":[]})));
+        assert!(!request_has_tools(&json!({"messages":[]})));
     }
 
     #[test]
     fn request_has_non_text_content_detects_non_string_content() {
         for content in [
-            serde_json::json!([{"type":"image_url","image_url":"x"}]),
-            serde_json::json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
-            serde_json::Value::Null,
+            json!([{"type":"image_url","image_url":"x"}]),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            Value::Null,
         ] {
             assert!(
-                request_has_non_text_content(&serde_json::json!({
+                request_has_non_text_content(&json!({
                     "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":content}]
                 })),
                 "content {content} must block"
             );
         }
-        assert!(request_has_non_text_content(&serde_json::json!({
+        assert!(request_has_non_text_content(&json!({
             "messages":[{"role":"assistant","tool_calls":[]}]
         })));
-        assert!(!request_has_non_text_content(&serde_json::json!({
+        assert!(!request_has_non_text_content(&json!({
             "messages":[{"role":"user","content":"hello"}]
         })));
     }
 
     #[test]
     fn input_ids_safe_to_forward_allows_plain_text_chat() {
-        assert!(input_ids_safe_to_forward(&serde_json::json!({
+        assert!(input_ids_safe_to_forward(&json!({
             "messages": [{"role": "user", "content": "hello"}]
         })));
     }
@@ -735,15 +672,15 @@ mod tests {
     #[test]
     fn input_ids_safe_to_forward_blocks_unreplicated_signals() {
         let blockers = [
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+            json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
+            json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
         ];
         for b in blockers {
             assert!(
@@ -755,7 +692,7 @@ mod tests {
 
     #[test]
     fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
-        assert!(input_ids_safe_to_forward(&serde_json::json!({
+        assert!(input_ids_safe_to_forward(&json!({
             "messages": [{"role": "user", "content": "hi"}],
             "chat_template": null,
             "reasoning_effort": null,
@@ -765,176 +702,78 @@ mod tests {
     }
 
     #[test]
-    fn build_outgoing_body_reparses_when_value_absent() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let bootstrap = BootstrapFields {
-            host: "h".into(),
-            port: Some(1),
-            room: 2,
-        };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), &[]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(
-            parsed.get("bootstrap_room"),
-            Some(&serde_json::Value::Number(2.into()))
-        );
-        assert!(parsed.get("input_ids").is_none());
+    fn offload_failures_only_count_forwardable_chats_missing_rendered_tokens() {
+        let chat = json!({"messages":[{"role":"user","content":"hi"}]});
+        let tools = json!({"messages":[{"role":"user","content":"hi"}], "tools":[{"type":"function","function":{"name":"f"}}]});
+        let prompt = json!({"prompt":"hi"});
+        for (formatter, value, rendered, failed) in [
+            (true, Some(&chat), Some(true), false),
+            (true, Some(&chat), Some(false), true),
+            (true, Some(&chat), None, true),
+            (false, Some(&chat), None, false),
+            (true, Some(&tools), None, false),
+            (true, Some(&prompt), None, false),
+            (true, None, None, false),
+        ] {
+            let tokens = rendered.map(|rendered_from_chat| RequestTokens {
+                ids: vec![1, 2, 3],
+                rendered_from_chat,
+            });
+            assert_eq!(
+                ingress_tokenize_offload_failed(formatter, value, tokens.as_ref()),
+                failed,
+                "formatter={formatter}, request={value:?}, rendered={rendered:?}"
+            );
+        }
     }
 
     #[test]
-    fn offload_failed_false_when_tokens_rendered_from_chat() {
-        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        let tokens = RequestTokens {
-            ids: vec![1, 2, 3],
-            rendered_from_chat: true,
-        };
-        assert!(!ingress_tokenize_offload_failed(
-            true,
-            Some(&value),
-            Some(&tokens)
-        ));
-    }
-
-    #[test]
-    fn offload_failed_false_for_unforwardable_request() {
-        let value = serde_json::json!({
-            "messages":[{"role":"user","content":"hi"}],
-            "tools":[{"type":"function","function":{"name":"f"}}]
-        });
-        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
-    }
-
-    #[test]
-    fn offload_failed_true_when_chat_formatter_request_has_no_tokens() {
-        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
-    }
-
-    #[test]
-    fn offload_failed_true_when_tokens_not_rendered_from_chat() {
-        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        let tokens = RequestTokens {
-            ids: vec![1, 2, 3],
-            rendered_from_chat: false,
-        };
-        assert!(ingress_tokenize_offload_failed(
-            true,
-            Some(&value),
-            Some(&tokens)
-        ));
-    }
-
-    #[test]
-    fn offload_failed_false_without_chat_formatter() {
-        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
-    }
-
-    #[test]
-    fn offload_failed_false_for_non_messages_request() {
-        let value = serde_json::json!({"prompt":"hi"});
-        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
-    }
-
-    #[test]
-    fn parse_probe_reads_stream_bool_from_object() {
-        let b = Bytes::from_static(br#"{"stream": true, "model": "tiny"}"#);
-        assert_eq!(parse_probe(&b).unwrap().stream, Some(true));
-        let b = Bytes::from_static(br#"{"stream": false, "model": "tiny"}"#);
-        assert_eq!(parse_probe(&b).unwrap().stream, Some(false));
-    }
-
-    #[test]
-    fn parse_probe_defaults_when_stream_absent() {
-        let b = Bytes::from_static(br#"{"model": "tiny", "messages": []}"#);
-        let p = parse_probe(&b).unwrap();
-        assert_eq!(p.stream, None);
-        assert_eq!(p.model.as_deref(), Some("tiny"));
-    }
-
-    #[test]
-    fn parse_probe_accepts_modern_openai_completion_budget() {
-        let body =
-            Bytes::from_static(br#"{"model":"tiny","messages":[],"max_completion_tokens":256}"#);
-        assert_eq!(
-            parse_probe(&body).unwrap().requested_max_output_tokens(),
-            Some(256)
-        );
-    }
-
-    #[test]
-    fn modern_completion_budget_takes_precedence_when_both_fields_are_present() {
-        let body =
-            Bytes::from_static(br#"{"model":"tiny","max_tokens":128,"max_completion_tokens":256}"#);
-        assert_eq!(
-            parse_probe(&body).unwrap().requested_max_output_tokens(),
-            Some(256)
-        );
-    }
-
-    #[test]
-    fn parse_probe_rejects_non_object_shapes() {
-        for bad in [&b"null"[..], &b"[]"[..], &b"\"hi\""[..], &b"42"[..]] {
-            let b = Bytes::copy_from_slice(bad);
-            let err = parse_probe(&b).unwrap_err();
-            match err {
-                ApiError::BadRequest(_) => {}
-                other => panic!("expected BadRequest for {bad:?}, got {other:?}"),
+    fn probe_reads_routing_fields_and_nested_messages() {
+        for stream in [true, false] {
+            for messages in [
+                json!([]),
+                json!([{"role":"user","content":[{"type":"text","text":"hi"}]}]),
+            ] {
+                let body =
+                    json!({"model":"tiny", "stream":stream, "messages":messages}).to_string();
+                let probe = probe_of(&body);
+                assert_eq!(probe.stream, Some(stream));
+                assert_eq!(probe.model.as_deref(), Some("tiny"));
+                assert_eq!(probe.requested_max_output_tokens(), None);
             }
         }
+        let probe = probe_of(r#"{"model":"tiny","messages":[]}"#);
+        assert_eq!(probe.stream, None);
+        assert_eq!(probe.model.as_deref(), Some("tiny"));
     }
 
     #[test]
-    fn parse_probe_rejects_malformed_json() {
-        let b = Bytes::from_static(b"{not json}");
-        let err = parse_probe(&b).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[test]
-    fn parse_probe_handles_nested_messages_with_stream_true() {
-        let b = Bytes::from_static(
-            br#"{
-              "model": "x",
-              "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-              "stream": true
-            }"#,
-        );
-        assert_eq!(parse_probe(&b).unwrap().stream, Some(true));
-    }
-
-    #[test]
-    fn parse_probe_handles_nested_messages_with_stream_false() {
-        let b = Bytes::from_static(
-            br#"{
-              "model": "x",
-              "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-              "stream": false
-            }"#,
-        );
-        assert_eq!(parse_probe(&b).unwrap().stream, Some(false));
-    }
-
-    #[test]
-    fn parse_probe_handles_duplicate_stream_keys() {
-        let b = Bytes::from_static(br#"{"stream": true, "stream": false}"#);
-        let err = parse_probe(&b).unwrap_err();
-        match err {
-            ApiError::BadRequest(_) => {}
-            other => panic!("expected BadRequest on duplicate `stream` key, got {other:?}"),
+    fn probe_prefers_modern_output_budget() {
+        for body in [
+            r#"{"model":"tiny","messages":[],"max_completion_tokens":256}"#,
+            r#"{"model":"tiny","max_tokens":128,"max_completion_tokens":256}"#,
+        ] {
+            assert_eq!(probe_of(body).requested_max_output_tokens(), Some(256));
         }
     }
 
     #[test]
-    fn parse_probe_bad_request_message_does_not_leak_serde_detail() {
-        let b = Bytes::from_static(br#"{"stream": "not-a-bool"}"#);
-        let err = parse_probe(&b).unwrap_err();
-        match err {
-            ApiError::BadRequest(msg) => assert_eq!(
-                msg, "invalid request: body must be a JSON object",
-                "client-visible message must be fixed; got: {msg}"
-            ),
-            other => panic!("expected BadRequest, got {other:?}"),
+    fn probe_rejects_invalid_requests_without_exposing_parser_details() {
+        for body in [
+            "null",
+            "[]",
+            r#""hi""#,
+            "42",
+            "{not json}",
+            r#"{"stream":"not-a-bool"}"#,
+            r#"{"stream":true,"stream":false}"#,
+        ] {
+            let error = parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap_err();
+            assert!(
+                matches!(error, ApiError::BadRequest(ref message)
+                if message == "invalid request: body must be a JSON object"),
+                "{body}: {error:?}"
+            );
         }
     }
 
@@ -948,6 +787,16 @@ mod tests {
 
     fn metrics() -> Arc<MetricsRegistry> {
         MetricsRegistry::new()
+    }
+
+    fn assert_rejections(metrics: &MetricsRegistry, param: &str, count: usize) {
+        let rendered = metrics.render();
+        let expected =
+            format!(r#"sgl_router_sampling_contract_rejections_total{{param="{param}"}} {count}"#);
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected}:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1037,94 +886,59 @@ mod tests {
         assert!(apply_sampling_overrides(&exact, &p, &metrics()).is_err());
         assert_eq!(
             apply_sampling_overrides(&exact, &probe_of(r#"{"model":"x"}"#), &metrics()).unwrap(),
-            vec![(
-                SamplingField::Temperature,
-                serde_json::Number::from_f64(1.0).unwrap()
-            )]
+            vec![(SamplingField::Temperature, Number::from_f64(1.0).unwrap())]
         );
     }
 
     #[test]
-    fn allow_mode_never_rejects_and_never_masks_a_client_value() {
+    fn allow_mode_only_injects_missing_or_null_parameters() {
         let overrides = overrides_of(
             ConflictPolicy::Allow,
-            r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
+            r#"{"temperature":1,"top_p":0.95,"n":1}"#,
         );
-
-        let p = probe_of(r#"{"model":"x"}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, &metrics())
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["temperature", "top_p", "n"]
-        );
-
-        let p = probe_of(r#"{"model":"x","temperature":0.6,"top_p":0.8,"n":4}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
-            vec![]
-        );
-
-        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, &metrics())
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["top_p", "n"]
-        );
+        for (body, fields) in [
+            (r#"{"model":"x"}"#, vec!["temperature", "top_p", "n"]),
+            (r#"{"temperature":0.6,"top_p":0.8,"n":4}"#, vec![]),
+            (r#"{"temperature":0.6}"#, vec!["top_p", "n"]),
+            (
+                r#"{"temperature":null,"top_p":0.95,"n":1}"#,
+                vec!["temperature"],
+            ),
+            (r#"{"temperature":"abc","top_p":[1],"n":1}"#, vec![]),
+        ] {
+            let inject = apply_sampling_overrides(&overrides, &probe_of(body), &metrics()).unwrap();
+            assert_eq!(
+                inject
+                    .iter()
+                    .map(|(f, _)| f.wire_name())
+                    .collect::<Vec<_>>(),
+                fields,
+                "{body}"
+            );
+        }
     }
 
     #[test]
-    fn explicit_null_sampling_value_counts_as_omitted() {
-        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-        let p = probe_of(r#"{"model":"x","temperature":null}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, &metrics())
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["temperature"]
-        );
-    }
-
-    #[test]
-    fn build_outgoing_body_injects_sampling_overrides_alongside_input_ids() {
+    fn outgoing_body_combines_sampling_defaults_and_input_ids() {
         let body =
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ids = [1u32, 2, 3];
         let overrides = overrides_of(
             ConflictPolicy::Reject,
-            r#"{"top_p": 0.95, "top_k": 1000, "frequency_penalty": 0.0,
-                "presence_penalty": 0.0, "n": 1}"#,
+            r#"{"top_p":0.95,"top_k":1000,"frequency_penalty":0.0,"presence_penalty":0.0,"n":1}"#,
         );
-        let inject = apply_sampling_overrides(
-            &overrides,
-            &probe_of(r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#),
-            &metrics(),
-        )
-        .unwrap();
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &inject).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
-        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
-        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        let inject =
+            apply_sampling_overrides(&overrides, &parse_probe(&body).unwrap(), &metrics()).unwrap();
+        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject).unwrap();
         assert_eq!(
-            parsed.get("frequency_penalty"),
-            Some(&serde_json::json!(0.0))
+            serde_json::from_slice::<Value>(&out).unwrap(),
+            json!({
+                "model":"x", "messages":[{"role":"user","content":"hi"}],
+                "input_ids":[1,2,3], "top_p":0.95, "top_k":1000,
+                "frequency_penalty":0.0, "presence_penalty":0.0, "n":1
+            })
         );
-        assert_eq!(
-            parsed.get("presence_penalty"),
-            Some(&serde_json::json!(0.0))
-        );
-        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
-        assert!(parsed.get("messages").is_some());
     }
+
     #[test]
     fn duplicate_sampling_key_takes_the_last_value_like_the_engine() {
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
@@ -1214,68 +1028,45 @@ mod tests {
         assert!(msg.contains("top_p") && msg.contains("0.5"), "got {msg}");
 
         apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
-        assert!(
-            metrics
-                .render()
-                .contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 2"#),
-            "rejections must be counted per parameter:\n{}",
-            metrics.render()
-        );
+        assert_rejections(&metrics, "top_p", 2);
     }
 
     #[test]
-    fn build_outgoing_body_splices_sampling_without_reparsing() {
-        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
-        let inject = apply_sampling_overrides(
-            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0, "n": 1}"#),
-            &probe_of(r#"{"model":"x"}"#),
-            &metrics(),
-        )
-        .unwrap();
-
-        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
-        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
-        assert_eq!(parsed.get("model"), Some(&serde_json::json!("x")));
-    }
-
-    #[test]
-    fn splice_top_level_handles_empty_objects_and_leading_whitespace() {
-        let inject = apply_sampling_overrides(
-            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
-            &probe_of(r#"{"model":"x"}"#),
-            &metrics(),
-        )
-        .unwrap();
-
-        for (raw, want) in [
-            (r#"{}"#, r#"{"temperature":1.0}"#),
-            (r#"{ }"#, r#"{ "temperature":1.0}"#),
-            ("\n\t {\"a\":1}", "\n\t {\"a\":1,\"temperature\":1.0}"),
-            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0}"#),
-            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
+    fn sampling_splice_preserves_bytes_and_overrides_null_with_or_without_cached_json() {
+        let config = overrides_of(ConflictPolicy::Reject, r#"{"temperature":1.0,"n":1}"#);
+        for (raw, expected) in [
+            (r#"{}"#, r#"{"temperature":1.0,"n":1}"#),
+            (r#"{ }"#, r#"{ "temperature":1.0,"n":1}"#),
+            (
+                "\n\t {\"a\":1}",
+                "\n\t {\"a\":1,\"temperature\":1.0,\"n\":1}",
+            ),
+            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0,"n":1}"#),
+            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0,\"n\":1} \n"),
+            (
+                r#"{ "model" : "x" ,  "messages" : [ ] }"#,
+                r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#,
+            ),
+            (
+                r#"{ "model" : "x" }"#,
+                r#"{ "model" : "x" ,"temperature":1.0,"n":1}"#,
+            ),
+            (
+                r#"{"model":"x","temperature":null}"#,
+                r#"{"model":"x","temperature":null,"temperature":1.0,"n":1}"#,
+            ),
         ] {
-            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
-            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
-            serde_json::from_slice::<serde_json::Value>(&out)
-                .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
+            let body = Bytes::copy_from_slice(raw.as_bytes());
+            let inject = apply_sampling_overrides(&config, &probe_of(raw), &metrics()).unwrap();
+            assert_eq!(inject.len(), 2);
+            for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
+                let out = build_outgoing_body(&body, value, None, None, &inject).unwrap();
+                assert_eq!(std::str::from_utf8(&out).unwrap(), expected, "{raw}");
+                let parsed: Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(parsed["temperature"], json!(1.0));
+                assert_eq!(parsed["n"], json!(1));
+            }
         }
-    }
-
-    #[test]
-    fn build_outgoing_body_without_injection_forwards_the_same_allocation() {
-        let body = Bytes::from_static(br#"{"model":"x"}"#);
-        let out = build_outgoing_body(&body, None, None, None, &[]).unwrap();
-        assert_eq!(
-            out.as_ptr(),
-            body.as_ptr(),
-            "must be an Arc clone, not a copy"
-        );
     }
 
     #[test]
@@ -1395,14 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn allow_never_rejects_an_unreadable_value() {
-        let probe = probe_of(r#"{"model":"x","temperature":"abc","top_p":[1]}"#);
-        let overrides = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1, "top_p": 0.9}"#);
-        let inject = apply_sampling_overrides(&overrides, &probe, &metrics()).unwrap();
-        assert!(inject.is_empty(), "a client value is never overwritten");
-    }
-
-    #[test]
     fn unreadable_value_rejection_is_counted_and_named() {
         for (config, body, expected_detail) in [
             (
@@ -1428,13 +1211,7 @@ mod tests {
                 }
                 other => panic!("expected SamplingContract, got {other:?}"),
             }
-            assert!(
-                metrics.render().contains(
-                    r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 1"#
-                ),
-                "a refusal must be visible to an operator rolling the flag out:\n{}",
-                metrics.render()
-            );
+            assert_rejections(&metrics, "temperature", 1);
         }
     }
 
@@ -1492,14 +1269,8 @@ mod tests {
         };
         assert_eq!(*param, "temperature");
 
-        let rendered = metrics.render();
         for name in ["temperature", "top_p", "n"] {
-            assert!(
-                rendered.contains(&format!(
-                    r#"sgl_router_sampling_contract_rejections_total{{param="{name}"}} 1"#
-                )),
-                "{name} must be counted:\n{rendered}"
-            );
+            assert_rejections(&metrics, name, 1);
         }
     }
 
@@ -1511,42 +1282,6 @@ mod tests {
             parse_as_engine_number(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
             "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
             "a value at the cap is still read"
-        );
-    }
-
-    #[test]
-    fn spliced_value_outranks_an_explicit_null_the_client_sent() {
-        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
-        let raw = r#"{"model":"x","temperature":null}"#;
-        let body = Bytes::copy_from_slice(raw.as_bytes());
-        let inject = apply_sampling_overrides(&overrides, &probe_of(raw), &metrics()).unwrap();
-        assert_eq!(inject.len(), 1, "null must be treated as omitted");
-
-        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(
-            parsed.get("temperature"),
-            Some(&serde_json::json!(1.0)),
-            "the engine must read the configured value, not the client's null: {}",
-            std::str::from_utf8(&out).unwrap()
-        );
-    }
-
-    #[test]
-    fn splice_fires_even_when_a_parse_is_already_on_hand() {
-        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let inject = apply_sampling_overrides(
-            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
-            &probe_of(r#"{"model":"x"}"#),
-            &metrics(),
-        )
-        .unwrap();
-
-        let out = build_outgoing_body(&body, Some(value), None, None, &inject).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"{ "model" : "x" ,"temperature":1.0}"#
         );
     }
 }
