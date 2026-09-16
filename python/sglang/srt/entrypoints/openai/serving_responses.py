@@ -80,7 +80,6 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -105,14 +104,10 @@ class _MediaInputValidationError(ValueError):
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
     """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
     covering every generated token."""
-    decoded = to_openai_style_logprobs(
-        output_token_logprobs=meta_info.get("output_token_logprobs"),
-        output_top_logprobs=meta_info.get("output_top_logprobs"),
-    )
-    top_lists = decoded.top_logprobs or []
+    top_lists = meta_info.get("output_top_logprobs") or []
     logprobs: list[Logprob] = []
-    for index, (token, logprob) in enumerate(
-        zip(decoded.tokens, decoded.token_logprobs)
+    for index, (logprob, _, token) in enumerate(
+        meta_info.get("output_token_logprobs") or []
     ):
         top_entry = top_lists[index] if index < len(top_lists) else None
         top_logprobs = [
@@ -121,7 +116,7 @@ def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
                 logprob=top_logprob,
                 bytes=list(top_token.encode("utf-8")),
             )
-            for top_token, top_logprob in (top_entry or {}).items()
+            for top_logprob, _, top_token in (top_entry or [])
         ]
         logprobs.append(
             Logprob(

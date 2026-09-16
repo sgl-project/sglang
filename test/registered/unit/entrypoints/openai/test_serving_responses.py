@@ -1095,7 +1095,7 @@ class BuildOutputTextLogprobsTestCase(CustomTestCase):
         meta_info = {
             "output_token_logprobs": [(-0.1, 10, "Hello"), (-0.2, 11, " world")],
             "output_top_logprobs": [
-                [(-0.1, 10, "Hello"), (-2.0, 12, "Hi")],
+                [(-0.1, 10, "Hello"), (-2.0, 12, "Hello")],
                 [(-0.2, 11, " world"), (-3.0, 13, " earth")],
             ],
         }
@@ -1104,18 +1104,39 @@ class BuildOutputTextLogprobsTestCase(CustomTestCase):
         self.assertEqual(out[0].token, "Hello")
         self.assertEqual(out[0].logprob, -0.1)
         self.assertEqual(out[0].bytes, list("Hello".encode("utf-8")))
-        self.assertEqual(len(out[0].top_logprobs), 2)
-        self.assertEqual(out[0].top_logprobs[0].token, "Hello")
         self.assertEqual(out[1].token, " world")
+        self.assertEqual(
+            [
+                [(entry.token, entry.logprob) for entry in item.top_logprobs]
+                for item in out
+            ],
+            [[("Hello", -0.1), ("Hello", -2.0)], [(" world", -0.2), (" earth", -3.0)]],
+        )
 
     def test_no_top_logprobs_yields_empty_lists(self):
-        meta_info = {
-            "output_token_logprobs": [(-0.5, 7, "hi")],
-            "output_top_logprobs": None,
-        }
-        out = _build_output_text_logprobs(meta_info)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0].top_logprobs, [])
+        for fields in (
+            {},
+            {"output_top_logprobs": None},
+            {"output_top_logprobs": []},
+            {"output_top_logprobs": [None]},
+        ):
+            with self.subTest(fields=fields):
+                out = _build_output_text_logprobs(
+                    {
+                        "output_token_logprobs": [(-0.5, 7, "hi"), (-0.6, 8, "!")],
+                        **fields,
+                    }
+                )
+                self.assertEqual([item.top_logprobs for item in out], [[], []])
+
+    def test_no_tokens_yields_empty_list(self):
+        for fields in (
+            {},
+            {"output_token_logprobs": None},
+            {"output_token_logprobs": []},
+        ):
+            with self.subTest(fields=fields):
+                self.assertEqual(_build_output_text_logprobs(fields), [])
 
 
 class ChatToolChoiceConversionTestCase(CustomTestCase):
@@ -1389,6 +1410,44 @@ async def create_response_result(serving, request):
         assert payloads[-1]["type"] == "response.completed"
         return ResponsesResponse.model_validate(payloads[-1]["response"])
     return result
+
+
+@pytest.mark.parametrize("include_logprobs", [False, True])
+def test_response_logprobs_preserve_candidates_when_requested(
+    response_serving, include_logprobs
+):
+    serving = response_serving()
+
+    async def generate(*args, **kwargs):
+        chunk = engine_chunk("Hello", finish=True)
+        chunk["meta_info"].update(
+            output_token_logprobs=[(-0.1, 10, "Hello")],
+            output_top_logprobs=[[(-0.1, 10, "Hello"), (-2.0, 12, "Hello")]],
+        )
+        yield chunk
+
+    serving.tokenizer_manager.generate_request = Mock(side_effect=generate)
+    request = ResponsesRequest(
+        model="x",
+        input="hello",
+        store=False,
+        include=["message.output_text.logprobs"] if include_logprobs else [],
+        top_logprobs=2,
+    )
+    response = asyncio.run(create_response_result(serving, request))
+    output = response.output[0].content[0]
+    assert output.text == "Hello"
+    if include_logprobs:
+        assert len(output.logprobs) == 1
+        assert output.logprobs[0].logprob == -0.1
+        assert [
+            (item.token, item.logprob) for item in output.logprobs[0].top_logprobs
+        ] == [
+            ("Hello", -0.1),
+            ("Hello", -2.0),
+        ]
+    else:
+        assert output.logprobs is None
 
 
 def assert_response_error(response, param, message=STORE_DISABLED_MESSAGE, status=400):

@@ -56,7 +56,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     DeltaMessage,
     ErrorResponse,
     FunctionResponse,
-    LogProbs,
     MessageProcessingResult,
     PromptTokensDetails,
     ResponseParserProtocol,
@@ -79,7 +78,6 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
-    to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
@@ -909,14 +907,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Flush logprobs still unattached this step — only when a parser is
-        # active, since _process_tool_call_stream may consume the delta and emit
-        # no content chunk. On the plain path an empty-delta step has no chunk
-        # to attach to either way, and a standalone empty-delta logprobs chunk
-        # is not a shape clients expect.
-        if remaining_logprobs is not None and (
-            self.reasoning_parser or self.tool_call_parser
-        ):
+        # A generated token may add no visible text (e.g. a UTF-8 fragment).
+        # Flush its logprobs even when no reasoning or content chunk was emitted.
+        if remaining_logprobs is not None:
             usage = None
             if continuous_usage_stats:
                 usage = UsageProcessor.calculate_token_usage(
@@ -2308,42 +2301,28 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _process_logprobs_tokens(
-        self, logprobs: LogProbs, use_token_index: bool = False
+        self,
+        output_token_logprobs: list[tuple[float, int, str]] | None,
+        output_top_logprobs: list[list[tuple[float, int, str]] | None] | None,
     ) -> List[ChatCompletionTokenLogprob]:
-        """Common helper to process logprobs tokens for both streaming and non-streaming
-
-        Args:
-            logprobs: LogProbs data from model
-            use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
-        """
+        """Preserve each token's candidates, including identical decoded texts."""
         token_logprobs = []
-
-        for token_idx, (token, logprob) in enumerate(
-            zip(logprobs.tokens, logprobs.token_logprobs)
-        ):
-            token_bytes = list(token.encode("utf-8"))
-            top_logprobs = []
-            if logprobs.top_logprobs:
-                # - Non-streaming (use_token_index=True): uses token_idx for full data
-                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
-                top_logprobs_idx = token_idx if use_token_index else 0
-                for top_token, top_logprob in logprobs.top_logprobs[
-                    top_logprobs_idx
-                ].items():
-                    top_token_bytes = list(top_token.encode("utf-8"))
-                    top_logprobs.append(
-                        TopLogprob(
-                            token=top_token,
-                            bytes=top_token_bytes,
-                            logprob=top_logprob,
-                        )
-                    )
+        top_lists = output_top_logprobs or []
+        for index, (logprob, _, token) in enumerate(output_token_logprobs or []):
+            candidates = top_lists[index] if index < len(top_lists) else None
             token_logprobs.append(
                 ChatCompletionTokenLogprob(
                     token=token,
-                    bytes=token_bytes,
+                    bytes=list(token.encode("utf-8")),
                     logprob=logprob,
-                    top_logprobs=top_logprobs,
+                    top_logprobs=[
+                        TopLogprob(
+                            token=top_token,
+                            bytes=list(top_token.encode("utf-8")),
+                            logprob=top_logprob,
+                        )
+                        for top_logprob, _, top_token in candidates or []
+                    ],
                 )
             )
 
@@ -2351,12 +2330,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
-        logprobs = to_openai_style_logprobs(
+        token_logprobs = self._process_logprobs_tokens(
             output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
     def _process_tool_call_id(
@@ -2514,8 +2492,8 @@ class OpenAIServingChat(OpenAIServingBase):
         total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
-        output_token_logprobs = content["meta_info"]["output_token_logprobs"]
-        output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
+        output_token_logprobs = content["meta_info"]["output_token_logprobs"] or []
+        output_top_logprobs = content["meta_info"].get("output_top_logprobs") or []
         if not get_serving().incremental_streaming_output:
             output_token_logprobs = output_token_logprobs[
                 n_prev_token:total_output_logprobs
@@ -2523,12 +2501,11 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs = output_top_logprobs[
                 n_prev_token:total_output_logprobs
             ]
-        logprobs = to_openai_style_logprobs(
+        token_logprobs = self._process_logprobs_tokens(
             output_token_logprobs=output_token_logprobs,
             output_top_logprobs=output_top_logprobs,
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
         return ChoiceLogprobs(content=token_logprobs)
 
     def _process_reasoning_stream(
