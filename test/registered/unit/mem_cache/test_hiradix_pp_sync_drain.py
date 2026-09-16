@@ -1,6 +1,7 @@
 """Unit tests for HiCache PP synchronization."""
 
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -59,6 +60,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         )
         cache.pp_rank = pp_rank
         cache.pp_size = 2
+        cache.host_memory_mode = "cache"
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
@@ -108,6 +110,42 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         follower._all_reduce.assert_called_once()
         follower.writing_check.assert_called_once_with(finish_count=1)
         follower.loading_check.assert_called_once_with(finish_count=1)
+
+    def test_buffer_mode_follower_drains_rank_local_completions(self):
+        cache = self._make_cache(1, [True, False], [True, True])
+        cache.host_memory_mode = "buffer_only"
+        cache.tree_core.enable_storage = True
+        cache._all_reduce_attn_groups = MagicMock()
+        cache._drain_storage_control_queues_impl = MagicMock()
+        cc = cache.cache_controller
+        for size, name in enumerate(
+            (
+                "prefetch_hit_queue",
+                "ack_prefetch_queue",
+                "ack_backup_queue",
+                "host_mem_release_queue",
+            ),
+            start=1,
+        ):
+            queue = Queue()
+            for _ in range(size):
+                queue.put(object())
+            setattr(cc, name, queue)
+
+        cache.check_hicache_events()
+
+        cache._all_reduce.assert_not_called()
+        cache._all_reduce_attn_groups.assert_called_once()
+        cache.writing_check.assert_called_once_with(finish_count=1)
+        cache.loading_check.assert_called_once_with(finish_count=2)
+        cache._drain_storage_control_queues_impl.assert_called_once_with(
+            n_storage_hit=1,
+            n_ack_prefetch=2,
+            n_backup=3,
+            n_release=4,
+            extra_release_counts={},
+            log_metrics=True,
+        )
 
 
 if __name__ == "__main__":
