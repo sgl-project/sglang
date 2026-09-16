@@ -285,7 +285,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for npu implementation"
         )
-        if positions.ndim == 2 and self.mrope_section:
+        if positions.ndim == 2 or query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
         rotary_mode = "half" if self.is_neox_style else "interleave"
