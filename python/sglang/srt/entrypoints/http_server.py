@@ -293,7 +293,7 @@ async def lifespan(fast_api_app: FastAPI):
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         if get_disagg().disaggregation_mode == "prefill":
@@ -657,6 +657,13 @@ async def validate_json_request(raw_request: Request):
 
 
 ##### Native API endpoints #####
+
+
+@app.get("/ready")
+async def ready() -> Response:
+    """Report whether the server is ready to receive new requests."""
+    status_code = 200 if _global_state.tokenizer_manager.is_ready() else 503
+    return Response(status_code=status_code)
 
 
 @app.get("/health")
