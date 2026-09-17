@@ -329,7 +329,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.output_ids = array("q")
 
         # Transfer fails -> cache_finished_req with is_insert=False
-        # This frees delta tokens and dec_lock_ref on last_node
         cache.token_to_kv_pool_allocator.reset_mock()
         cache.cache_finished_req(
             req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len

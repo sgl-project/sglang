@@ -495,8 +495,8 @@ class RadixCache(BasePrefixCache):
             return
 
         if not is_insert:
-            # The protected prefix is owned by the cache. Release every KV slot
-            # owned by the request, including slots without a committed token id.
+            # Frees committed slots that no token id names, which the insert
+            # path below cannot reach; the protected prefix stays with the cache.
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
             ]
