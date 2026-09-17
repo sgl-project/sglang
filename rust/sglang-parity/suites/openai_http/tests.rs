@@ -2,8 +2,10 @@ use super::*;
 use sglang_parity::sse::SseEvent;
 
 fn config() -> RunConfig {
-    let mut config: RunConfig =
-        serde_json::from_str(include_str!("../../configs/cuda.json")).unwrap();
+    let mut config = sglang_parity::config::RunSpec::parse(include_str!("../../configs/cuda.json"))
+        .unwrap()
+        .resolve_environment()
+        .unwrap();
     config.server.model = "test".into();
     config
 }
@@ -425,7 +427,10 @@ fn both_platform_configs_and_model_aliases_resolve_without_side_effects() {
         include_str!("../../configs/mlx.json"),
         include_str!("../../configs/cuda.json"),
     ] {
-        let mut config: RunConfig = serde_json::from_str(text).unwrap();
+        let mut config = sglang_parity::config::RunSpec::parse(text)
+            .unwrap()
+            .resolve_environment()
+            .unwrap();
         config
             .server
             .args
@@ -445,7 +450,16 @@ fn both_platform_configs_and_model_aliases_resolve_without_side_effects() {
             .find(|p| p.profile.id == "incremental")
             .unwrap();
         assert_eq!(incremental.suite.output_mode, "incremental");
-        assert_eq!(plan.profiles[0].suite.cases.len(), 44);
+        assert_eq!(
+            plan.profiles
+                .iter()
+                .find(|p| p.profile.id == "default")
+                .unwrap()
+                .suite
+                .cases
+                .len(),
+            44
+        );
         assert_eq!(incremental.suite.cases.len(), 42);
     }
 }

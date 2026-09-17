@@ -58,7 +58,6 @@ struct HttpSpec {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseSpec {
-    #[serde(default = "default_profiles")]
     profiles: Vec<String>,
     #[serde(default)]
     requires: Requirements,
@@ -73,10 +72,6 @@ struct CaseSpec {
     expect_status: u16,
     #[serde(default)]
     equivalence_group: Option<String>,
-}
-
-fn default_profiles() -> Vec<String> {
-    vec!["default".into()]
 }
 
 #[derive(Clone, Deserialize)]
@@ -205,6 +200,7 @@ const INPUT_LOGPROBS: [&str; 3] = [
 ];
 
 /// Compile one API policy per explicitly selected startup profile.
+#[cfg(test)]
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<GeneratePolicy>, String> {
     load_plan_for_check(text, config, CheckTarget::FullResponse)
 }
@@ -216,21 +212,9 @@ pub fn load_plan_for_check(
     check: CheckTarget,
 ) -> Result<ExecutionPlan<GeneratePolicy>, String> {
     let spec: SuiteSpec = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    let resolved = config.resolve_profiles()?;
-    for case in &spec.cases {
-        let mut seen = BTreeSet::new();
-        if case.profiles.is_empty() {
-            return Err(format!("{}: profiles cannot be empty", case.name));
-        }
-        for id in &case.profiles {
-            if !seen.insert(id) || !resolved.iter().any(|p| &p.id == id) {
-                return Err(format!(
-                    "{}: unknown or duplicate profile {id:?}",
-                    case.name
-                ));
-            }
-        }
-    }
+    config.validate()?;
+    let resolved =
+        crate::profiles::resolve(&config.server, spec.cases.iter().map(|case| &case.profiles))?;
     // Validate declarations even if filtering would otherwise conceal an error.
     compile(spec.clone(), config, check)?;
     let mut profiles = Vec::new();

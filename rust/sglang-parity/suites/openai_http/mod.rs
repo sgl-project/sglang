@@ -88,6 +88,7 @@ const SEMANTICS: [&str; 8] = [
     "usage",
 ];
 
+#[cfg(test)]
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiPolicy>, String> {
     load_plan_for_check(text, config, CheckTarget::FullResponse)
 }
@@ -127,7 +128,9 @@ pub fn load_plan_for_check(
         );
     }
     spec.comparison.validate()?;
-    let profiles = config.resolve_profiles()?;
+    config.validate()?;
+    let profiles =
+        crate::profiles::resolve(&config.server, spec.cases.iter().map(|case| &case.profiles))?;
     let mut names = BTreeSet::new();
     let mut groups: BTreeMap<(&str, &str), Vec<&Case>> = BTreeMap::new();
     for case in &spec.cases {
@@ -142,18 +145,6 @@ pub fn load_plan_for_check(
             "/v1/completions" | "/v1/chat/completions"
         ) {
             return Err(format!("{}: unsupported endpoint", case.name));
-        }
-        let selected: BTreeSet<_> = case.profiles.iter().collect();
-        if selected.is_empty()
-            || selected.len() != case.profiles.len()
-            || selected
-                .iter()
-                .any(|id| !profiles.iter().any(|p| &p.id == *id))
-        {
-            return Err(format!(
-                "{}: unknown, duplicate or empty profiles",
-                case.name
-            ));
         }
         if case.expect_status != 200 && !(400..500).contains(&case.expect_status) {
             return Err(format!("{}: expected status must be 200 or 4xx", case.name));

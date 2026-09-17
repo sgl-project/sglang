@@ -17,6 +17,7 @@
 
 pub mod artifacts;
 pub mod compare;
+pub mod config;
 pub mod environment;
 pub mod http;
 pub mod plan;
@@ -34,5 +35,5 @@ pub use plan::{
 pub use process::{Implementation, ServerConfig};
 pub use runner::{
     EquivalenceValue, HttpSuite, PreparedResponse, Report, ResponsePolicy, RunConfig, RunError,
-    describe, describe_plan, run, run_plan,
+    RunSummary, SuiteSummary, describe, describe_plan, describe_suites, run, run_plan, run_suites,
 };

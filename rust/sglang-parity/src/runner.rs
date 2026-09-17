@@ -85,11 +85,6 @@ pub struct EffectiveSuite {
 /// Returns a configuration error for invalid run settings or suite declarations.
 pub fn describe(config: &RunConfig, suite: &HttpSuite) -> Result<EffectiveSuite, RunError> {
     config.validate().map_err(RunError::Config)?;
-    if !config.profiles.is_empty() {
-        return Err(RunError::Config(
-            "named profiles require describe_plan/run_plan".into(),
-        ));
-    }
     suite.validate().map_err(RunError::Config)?;
     Ok(EffectiveSuite {
         environment: environment::describe(config).map_err(RunError::Config)?,
@@ -119,17 +114,16 @@ pub fn describe_plan<P>(
     config: &RunConfig,
     plan: &ExecutionPlan<P>,
 ) -> Result<EffectivePlan, RunError> {
-    let declared = config.resolve_profiles().map_err(RunError::Config)?;
-    plan.validate().map_err(RunError::Config)?;
-    for entry in &plan.profiles {
-        if !declared.contains(&entry.profile) {
-            return Err(RunError::Config(format!(
-                "profile {} no longer matches RunConfig; recompile the plan",
-                entry.profile.id
-            )));
-        }
-    }
+    config.validate().map_err(RunError::Config)?;
     let source = environment::describe(config).map_err(RunError::Config)?;
+    describe_with_source(plan, &source)
+}
+
+fn describe_with_source<P>(
+    plan: &ExecutionPlan<P>,
+    source: &EnvironmentPlan,
+) -> Result<EffectivePlan, RunError> {
+    plan.validate().map_err(RunError::Config)?;
     let profiles = plan
         .profiles
         .iter()
@@ -137,7 +131,7 @@ pub fn describe_plan<P>(
             Ok(EffectiveProfile {
                 profile: entry.profile.clone(),
                 suite: entry.suite.clone(),
-                environment: environment::for_server(&source, &entry.profile.server)
+                environment: environment::for_server(source, &entry.profile.server)
                     .map_err(RunError::Config)?,
             })
         })
@@ -147,6 +141,50 @@ pub fn describe_plan<P>(
         repeats_per_implementation: 2,
         implementation_order: Implementation::ALL,
     })
+}
+
+/// Resolve every suite against the same observed commit, without preparing it.
+pub fn describe_suites<P>(
+    config: &RunConfig,
+    plans: &[ExecutionPlan<P>],
+) -> Result<Vec<EffectivePlan>, RunError> {
+    config.validate().map_err(RunError::Config)?;
+    if plans.is_empty() {
+        return Err(RunError::Config("no suites selected".into()));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for plan in plans {
+        plan.validate().map_err(RunError::Config)?;
+        let name = &plan.profiles[0].suite.name;
+        if !crate::plan::valid_name(name)
+            || !names.insert(name)
+            || plan.profiles.iter().any(|p| &p.suite.name != name)
+        {
+            return Err(RunError::Config(
+                "each plan must have one distinct, valid suite name".into(),
+            ));
+        }
+        if plan.profiles[0].suite.check != plans[0].profiles[0].suite.check {
+            return Err(RunError::Config(
+                "all suites must use the same check target".into(),
+            ));
+        }
+    }
+    let source = environment::describe(config).map_err(RunError::Config)?;
+    plans
+        .iter()
+        .map(|plan| describe_with_source(plan, &source))
+        .collect()
+}
+
+impl<T: ResponsePolicy + ?Sized> ResponsePolicy for Box<T> {
+    fn prepare(
+        &self,
+        case: &HttpCase,
+        observation: &HttpObservation,
+    ) -> Result<PreparedResponse, Vec<Violation>> {
+        (**self).prepare(case, observation)
+    }
 }
 
 impl<T: ResponsePolicy + ?Sized> ResponsePolicy for &T {
@@ -321,6 +359,177 @@ struct RunArtifacts {
     report: Option<Report>,
 }
 
+/// One suite's progress and a path relative to the batch directory.
+#[derive(Clone, Debug, Serialize)]
+pub struct SuiteSummary {
+    pub name: String,
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub report: Option<PathBuf>,
+}
+
+/// A small index of independent suite reports; it contains no response data.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunSummary {
+    pub directory: PathBuf,
+    pub commit: String,
+    pub check: crate::CheckTarget,
+    pub state: String,
+    pub suites: Vec<SuiteSummary>,
+    pub errors: Vec<String>,
+}
+
+impl RunSummary {
+    pub fn exit_code(&self) -> i32 {
+        if self.state != "complete" || !self.errors.is_empty() {
+            return 2;
+        }
+        self.suites
+            .iter()
+            .map(|s| s.exit_code.unwrap_or(2))
+            .max()
+            .unwrap_or(2)
+    }
+}
+
+struct BatchArtifacts {
+    artifacts: Artifacts,
+    summary: RunSummary,
+}
+
+impl BatchArtifacts {
+    fn save(&self) -> Result<(), RunError> {
+        self.artifacts
+            .write_json(&self.artifacts.root().join("summary.json"), &self.summary)?;
+        crate::report::write_summary_html(&self.summary)?;
+        Ok(())
+    }
+}
+
+impl Drop for BatchArtifacts {
+    fn drop(&mut self) {
+        if self.summary.state == "running" {
+            self.summary.state = "interrupted".into();
+            for suite in &mut self.summary.suites {
+                if suite.state == "RUNNING" {
+                    suite.state = "INTERRUPTED".into();
+                    suite.exit_code = Some(2);
+                }
+            }
+            let _ = self.save();
+        }
+    }
+}
+
+struct ExecutionContext {
+    source: Option<std::sync::Arc<environment::PreparedSource>>,
+    can_continue: bool,
+    source_log: Option<PathBuf>,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            source: None,
+            can_continue: true,
+            source_log: None,
+        }
+    }
+}
+
+/// Run suites sequentially with separate services and one leased source snapshot.
+///
+/// All plans are checked before preparation. Ordinary test failures do not stop
+/// later suites; cancellation, source invalidation and unsafe cleanup do.
+pub async fn run_suites<P: ResponsePolicy>(
+    config: &RunConfig,
+    plans: &[ExecutionPlan<P>],
+) -> Result<RunSummary, RunError> {
+    let effective = describe_suites(config, plans)?;
+    let artifacts = Artifacts::create(&config.output_dir)?;
+    let mut batch = BatchArtifacts {
+        summary: RunSummary {
+            directory: artifacts.root().to_owned(),
+            commit: effective[0].profiles[0].environment.commit.clone(),
+            check: plans[0].profiles[0].suite.check,
+            state: "running".into(),
+            suites: plans
+                .iter()
+                .map(|plan| SuiteSummary {
+                    name: plan.profiles[0].suite.name.clone(),
+                    state: "NOT_RUN".into(),
+                    exit_code: None,
+                    report: None,
+                })
+                .collect(),
+            errors: Vec::new(),
+        },
+        artifacts,
+    };
+    batch.save()?;
+    let mut context = ExecutionContext::default();
+    for (index, (plan, effective)) in plans.iter().zip(effective).enumerate() {
+        let mut config = config.clone();
+        let entry = &mut batch.summary.suites[index];
+        config.output_dir = batch.artifacts.root().join(&entry.name);
+        let artifacts = Artifacts::create(&config.output_dir)?;
+        entry.report = Some(
+            artifacts
+                .root()
+                .join("report.json")
+                .strip_prefix(batch.artifacts.root())
+                .unwrap()
+                .to_owned(),
+        );
+        entry.state = "RUNNING".into();
+        batch.save()?;
+        tracing::info!(suite = %plan.profiles[0].suite.name, "Running suite");
+        match execute(
+            &config,
+            plan,
+            effective,
+            None,
+            &mut context,
+            Some(artifacts),
+        )
+        .await
+        {
+            Ok(report) => {
+                let entry = &mut batch.summary.suites[index];
+                entry.exit_code = Some(report.exit_code());
+                entry.state = if context.can_continue {
+                    "COMPLETE"
+                } else {
+                    "INTERRUPTED"
+                }
+                .into();
+            }
+            Err(error) => {
+                batch.summary.errors.push(error.to_string());
+                batch.summary.suites[index].state = "FAILED".into();
+                batch.summary.suites[index].exit_code = Some(2);
+                context.can_continue = false;
+            }
+        }
+        batch.save()?;
+        if !context.can_continue {
+            batch.summary.errors.push(
+                "Stopped because execution could not safely continue; later suites were not run."
+                    .into(),
+            );
+            break;
+        }
+    }
+    batch.summary.state = if context.can_continue {
+        "complete"
+    } else {
+        "interrupted"
+    }
+    .into();
+    batch.save()?;
+    Ok(batch.summary.clone())
+}
+
 impl RunArtifacts {
     fn verify_source(&mut self, prepared: &PreparedEnvironment) -> bool {
         match prepared.verify_source() {
@@ -397,7 +606,15 @@ pub async fn run(
         repeats_per_implementation: 2,
         implementation_order: Implementation::ALL,
     };
-    execute(config, &plan, resolved, Some(effective)).await
+    execute(
+        config,
+        &plan,
+        resolved,
+        Some(effective),
+        &mut ExecutionContext::default(),
+        None,
+    )
+    .await
 }
 
 /// Execute explicit profile/case bindings with one source snapshot and one report.
@@ -406,7 +623,15 @@ pub async fn run_plan<P: ResponsePolicy>(
     plan: &ExecutionPlan<P>,
 ) -> Result<Report, RunError> {
     let effective = describe_plan(config, plan)?;
-    execute(config, plan, effective, None).await
+    execute(
+        config,
+        plan,
+        effective,
+        None,
+        &mut ExecutionContext::default(),
+        None,
+    )
+    .await
 }
 
 async fn execute<P: ResponsePolicy>(
@@ -414,9 +639,14 @@ async fn execute<P: ResponsePolicy>(
     plan: &ExecutionPlan<P>,
     effective: EffectivePlan,
     legacy: Option<EffectiveSuite>,
+    context: &mut ExecutionContext,
+    artifacts: Option<Artifacts>,
 ) -> Result<Report, RunError> {
     let client = http::client()?;
-    let artifacts = Artifacts::create(&config.output_dir)?;
+    let artifacts = match artifacts {
+        Some(artifacts) => artifacts,
+        None => Artifacts::create(&config.output_dir)?,
+    };
     let legacy_paths = legacy.is_some();
     let effective_path = artifacts.root().join(if legacy_paths {
         "effective_suite.json"
@@ -480,7 +710,10 @@ async fn execute<P: ResponsePolicy>(
     };
     state.report.as_mut().unwrap().directory = state.artifacts.root().to_owned();
     state.save()?;
-    let mut source = None;
+    if let Some(log) = &context.source_log {
+        std::fs::copy(log, state.artifacts.root().join("source.log"))?;
+    }
+    let source = &mut context.source;
     let mut environments = BTreeMap::new();
     let mut offset = 0;
     let mut source_valid = true;
@@ -522,8 +755,12 @@ async fn execute<P: ResponsePolicy>(
             )
             .await
             {
-                Ok(prepared) => source = Some(prepared),
+                Ok(prepared) => {
+                    context.source_log = Some(state.artifacts.root().join("source.log"));
+                    *source = Some(prepared);
+                }
                 Err(error) => {
+                    context.can_continue = false;
                     state
                         .report
                         .as_mut()
@@ -617,9 +854,11 @@ async fn execute<P: ResponsePolicy>(
         .into();
         state.save()?;
         if !safe || !source_valid {
+            context.can_continue = false;
             break;
         }
     }
+    context.can_continue &= source_valid;
     let report = state.report.as_mut().unwrap();
     let mut start = 0;
     for entry in &plan.profiles {

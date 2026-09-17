@@ -5,9 +5,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use sglang_parity::config::RunSpec;
 use sglang_parity::environment::{self, Backend};
 use sglang_parity::report::ReportView;
-use sglang_parity::{CheckTarget, Report, RunConfig, describe, describe_plan, run, run_plan};
+use sglang_parity::{
+    ExecutionPlan, ProfilePlan, Report, ResponsePolicy, RunConfig, describe_plan, describe_suites,
+    run_plan, run_suites,
+};
+
+#[path = "../suites/profiles.rs"]
+mod profiles;
 
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
@@ -15,23 +22,13 @@ mod native_generate;
 #[path = "../suites/openai_http/mod.rs"]
 mod openai_http;
 
-const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate|openai_http] [--suite-file <suite.json>] [--check full-response|generated-content] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--check defaults to full-response.\n--describe validates and prints the effective specification without installing environments or starting services.";
-
-#[derive(Default)]
-enum Suite {
-    #[default]
-    Native,
-    OpenAi,
-}
+const USAGE: &str = "Usage: sglang-parity --config <run.json> [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n       sglang-parity --help|-h\n\n--config selects environment, suites, check and output_dir; all four are required.\n--describe prints the resolved plan without installing environments or starting services.\n--report reads recorded results; --case expands one recorded case.\n--update-env-lock regenerates the selected platform's dependency lock.";
 
 #[derive(Default)]
 struct Arguments {
-    suite: Suite,
-    check: CheckTarget,
     config: Option<PathBuf>,
     report: Option<PathBuf>,
     case: Option<String>,
-    suite_file: Option<PathBuf>,
     describe: bool,
     update_env_lock: bool,
     backend: Option<Backend>,
@@ -51,8 +48,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
         match argument.as_str() {
             "--describe" => result.describe = true,
             "--update-env-lock" => result.update_env_lock = true,
-            "--config" | "--suite" | "--suite-file" | "--backend" | "--report" | "--case"
-            | "--check" => {
+            "--config" | "--backend" | "--report" | "--case" => {
                 let value = arguments
                     .next()
                     .filter(|value| !value.starts_with("--"))
@@ -61,14 +57,6 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
                     "--config" => result.config = Some(value.into()),
                     "--report" => result.report = Some(value.into()),
                     "--case" => result.case = Some(value),
-                    "--suite-file" => result.suite_file = Some(value.into()),
-                    "--check" => {
-                        result.check = match value.as_str() {
-                            "full-response" => CheckTarget::FullResponse,
-                            "generated-content" => CheckTarget::GeneratedContent,
-                            _ => return Err(format!("unsupported check target {value:?}")),
-                        }
-                    }
                     "--backend" => {
                         result.backend = Some(match value.as_str() {
                             "mlx" => Backend::Mlx,
@@ -76,13 +64,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
                             _ => return Err(format!("unsupported environment backend {value:?}")),
                         })
                     }
-                    _ => {
-                        result.suite = match value.as_str() {
-                            "native_generate" => Suite::Native,
-                            "openai_http" => Suite::OpenAi,
-                            _ => return Err(format!("unsupported suite {value:?}")),
-                        }
-                    }
+                    _ => unreachable!(),
                 }
             }
             _ => return Err(format!("unknown option {argument}")),
@@ -99,15 +81,9 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
             return Err("--report cannot be combined with run or environment options".into());
         }
     } else if result.update_env_lock {
-        if [
-            "--config",
-            "--describe",
-            "--suite",
-            "--suite-file",
-            "--check",
-        ]
-        .iter()
-        .any(|option| seen.contains(*option))
+        if ["--config", "--describe"]
+            .iter()
+            .any(|option| seen.contains(*option))
         {
             return Err("--update-env-lock cannot be combined with run or suite options".into());
         }
@@ -171,74 +147,99 @@ async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::
         println!("Lock: {}", path.display());
         return Ok(0);
     }
-    let config: RunConfig = serde_json::from_slice(&std::fs::read(arguments.config.unwrap())?)?;
-    let external = arguments
-        .suite_file
-        .map(std::fs::read_to_string)
-        .transpose()?;
-    match arguments.suite {
-        Suite::Native => {
-            let spec = external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC);
-            let plan = match arguments.check {
-                CheckTarget::FullResponse => native_generate::load_plan(spec, &config),
-                check => native_generate::load_plan_for_check(spec, &config, check),
-            };
-            execute_plan(
-                &config,
-                plan.map_err(std::io::Error::other)?,
-                arguments.describe,
-                color,
-            )
-            .await
+    let selection = RunSpec::parse(&std::fs::read_to_string(arguments.config.unwrap())?)
+        .map_err(std::io::Error::other)?;
+    let config = selection
+        .resolve_environment()
+        .map_err(std::io::Error::other)?;
+    let plans = compile(&selection, &config).map_err(std::io::Error::other)?;
+    if arguments.describe {
+        let effective = if plans.len() == 1 {
+            serde_json::to_value(describe_plan(&config, &plans[0])?)?
+        } else {
+            serde_json::to_value(describe_suites(&config, &plans)?)?
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "selection": selection, "config": config, "plan": effective
+            }))?
+        );
+        return Ok(0);
+    }
+    if plans.len() == 1 {
+        let report = run_plan(&config, &plans[0]).await?;
+        print!(
+            "{}",
+            ReportView::new(&report, &report.directory)
+                .terminal(None, color)
+                .map_err(std::io::Error::other)?
+        );
+        Ok(report.exit_code())
+    } else {
+        let summary = run_suites(&config, &plans).await?;
+        for suite in &summary.suites {
+            println!(
+                "{}: {} · exit code {}",
+                suite.name,
+                suite.state,
+                suite
+                    .exit_code
+                    .map_or_else(|| "not run".into(), |code| code.to_string())
+            );
         }
-        Suite::OpenAi => {
-            let spec = external.as_deref().unwrap_or(openai_http::DEFAULT_SPEC);
-            let plan = match arguments.check {
-                CheckTarget::FullResponse => openai_http::load_plan(spec, &config),
-                check => openai_http::load_plan_for_check(spec, &config, check),
-            };
-            execute_plan(
-                &config,
-                plan.map_err(std::io::Error::other)?,
-                arguments.describe,
-                color,
-            )
-            .await
-        }
+        println!(
+            "Details: {}",
+            summary.directory.join("index.html").display()
+        );
+        println!(
+            "Data:    {}",
+            summary.directory.join("summary.json").display()
+        );
+        Ok(summary.exit_code())
     }
 }
 
-async fn execute_plan<P: sglang_parity::ResponsePolicy>(
+fn compile(
+    selection: &RunSpec,
     config: &RunConfig,
-    plan: sglang_parity::ExecutionPlan<P>,
-    describe_only: bool,
-    color: bool,
-) -> Result<i32, Box<dyn std::error::Error>> {
-    // Preserve the original single-profile review format and artifact layout.
-    let single = config.profiles.is_empty()
-        && plan.profiles.len() == 1
-        && plan.profiles[0].profile.id == "default";
-    if describe_only {
-        let value = if single {
-            serde_json::to_value(describe(config, &plan.profiles[0].suite)?)?
-        } else {
-            serde_json::to_value(describe_plan(config, &plan)?)?
-        };
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(0);
+) -> Result<Vec<ExecutionPlan<Box<dyn ResponsePolicy>>>, String> {
+    // API identities are dispatched here, outside the core planner.
+    selection
+        .suites
+        .iter()
+        .map(|name| match name.as_str() {
+            "native_generate" => native_generate::load_plan_for_check(
+                native_generate::DEFAULT_SPEC,
+                config,
+                selection.check,
+            )
+            .map(box_policy),
+            "openai_http" => {
+                openai_http::load_plan_for_check(openai_http::DEFAULT_SPEC, config, selection.check)
+                    .map(box_policy)
+            }
+            _ => Err(format!(
+                "unknown suite {name:?}; expected native_generate or openai_http"
+            )),
+        })
+        .collect()
+}
+
+fn box_policy<P: ResponsePolicy + 'static>(
+    plan: ExecutionPlan<P>,
+) -> ExecutionPlan<Box<dyn ResponsePolicy>> {
+    ExecutionPlan {
+        profiles: plan
+            .profiles
+            .into_iter()
+            .map(|entry| ProfilePlan {
+                profile: entry.profile,
+                suite: entry.suite,
+                policy: Box::new(entry.policy) as Box<dyn ResponsePolicy>,
+            })
+            .collect(),
     }
-    let report = if single {
-        run(config, &plan.profiles[0].suite, &plan.profiles[0].policy).await?
-    } else {
-        run_plan(config, &plan).await?
-    };
-    print!(
-        "{}",
-        ReportView::new(&report, &report.directory)
-            .terminal(None, color)
-            .map_err(std::io::Error::other)?
-    );
-    Ok(report.exit_code())
 }
 
 #[tokio::main]
@@ -336,22 +337,28 @@ mod tests {
             assert_eq!(arguments.backend, Some(backend));
             assert!(arguments.config.is_none());
         }
-        for (name, expected) in [
-            (None, CheckTarget::FullResponse),
-            (Some("full-response"), CheckTarget::FullResponse),
-            (Some("generated-content"), CheckTarget::GeneratedContent),
-        ] {
-            let mut args = vec!["--config", "run.json"];
-            if let Some(name) = name {
-                args.extend(["--check", name]);
-            }
-            assert_eq!(
-                parse(args.into_iter().map(String::from))
-                    .unwrap()
-                    .unwrap()
-                    .check,
-                expected
+        assert!(
+            parse(
+                ["--config", "run.json", "--describe"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .unwrap()
+            .unwrap()
+            .describe
+        );
+        for option in ["--suite", "--suite-file", "--check"] {
+            assert!(
+                parse(
+                    ["--config", "run.json", option, "value"]
+                        .into_iter()
+                        .map(String::from)
+                )
+                .is_err()
             );
         }
+        let mut selection = RunSpec::parse(include_str!("../configs/mlx.json")).unwrap();
+        selection.suites = vec!["unknown".into()];
+        assert!(compile(&selection, &selection.resolve_environment().unwrap()).is_err());
     }
 }

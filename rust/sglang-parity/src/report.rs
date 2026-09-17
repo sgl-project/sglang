@@ -16,6 +16,47 @@ use crate::compare::{ComparisonScope, DifferenceKind};
 use crate::http::CaptureMode;
 use crate::runner::{Attempt, CaseResult, Check, HttpSuite, Report, Status};
 
+/// Save a portable index without duplicating per-case evidence or verdicts.
+pub(crate) fn write_summary_html(summary: &crate::runner::RunSummary) -> std::io::Result<()> {
+    let mut html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SGLang Parity — Suites</title><style>{STYLE}</style></head><body><main><header><h1>SGLang Parity</h1><p>State: {} · Exit code: {}</p><p>Commit: <code>{}</code> · Check: {}</p></header><section><h2>Suites</h2><table><thead><tr><th>Suite</th><th>State</th><th>Exit code</th><th>Report</th></tr></thead><tbody>",
+        escape(&summary.state),
+        summary.exit_code(),
+        escape(&summary.commit),
+        match summary.check {
+            CheckTarget::FullResponse => "Full response parity",
+            CheckTarget::GeneratedContent => "Generated content parity",
+        },
+    );
+    for suite in &summary.suites {
+        let link = suite.report.as_ref().map_or_else(
+            || "Not started".into(),
+            |path| {
+                format!(
+                    "<a href=\"{}\">HTML</a> · <a href=\"{}\">JSON</a>",
+                    escape(&url_path(&path.with_extension("html"))),
+                    escape(&url_path(path))
+                )
+            },
+        );
+        let _ = write!(
+            html,
+            "<tr><th>{}</th><td>{}</td><td>{}</td><td>{link}</td></tr>",
+            escape(&suite.name),
+            escape(&suite.state),
+            suite
+                .exit_code
+                .map_or_else(|| "—".into(), |code| code.to_string())
+        );
+    }
+    html.push_str("</tbody></table></section>");
+    for error in &summary.errors {
+        let _ = write!(html, "<p>{}</p>", escape(error));
+    }
+    html.push_str("</main></body></html>");
+    write_atomic(&summary.directory.join("index.html"), html.as_bytes())
+}
+
 const PREVIEW_LIMIT: usize = 64 * 1024;
 const STATUSES: [Status; 5] = [
     Status::Pass,

@@ -385,21 +385,17 @@ fn has_generated_content(entry: &Value, chat: bool) -> Result<bool, Violation> {
     for (key, value) in delta {
         let path = format!("/choices/delta/{key}");
         match key.as_str() {
-            "content" | "reasoning_content" | "refusal" => {
-                if !value.is_null() {
-                    content |= !value
-                        .as_str()
-                        .ok_or_else(|| invalid(&path, "expected string or null delta"))?
-                        .is_empty();
-                }
+            "content" | "reasoning_content" | "refusal" if !value.is_null() => {
+                content |= !value
+                    .as_str()
+                    .ok_or_else(|| invalid(&path, "expected string or null delta"))?
+                    .is_empty();
             }
-            "tool_calls" => {
-                if !value.is_null() {
-                    content |= !value
-                        .as_array()
-                        .ok_or_else(|| invalid(&path, "expected tool call array"))?
-                        .is_empty();
-                }
+            "tool_calls" if !value.is_null() => {
+                content |= !value
+                    .as_array()
+                    .ok_or_else(|| invalid(&path, "expected tool call array"))?
+                    .is_empty();
             }
             "function_call" if !value.is_null() => {
                 return Err(invalid(

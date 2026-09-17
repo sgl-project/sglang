@@ -6,8 +6,8 @@ native HTTP `POST /generate`, including JSON and SSE responses.
 
 ## Run
 
-Use the committed configuration for your platform directly. Both select a public
-Qwen3 model at a fixed revision and define every startup profile used by the suite;
+Use the committed configuration for your platform directly. Each selects an embedded
+environment with a public Qwen3 model at a fixed revision;
 no model path edits or local configuration copy are needed. The runner prepares one
 Python 3.12.8 environment and the Rust HTTP extension for both implementations.
 It tests a detached snapshot of the calling checkout's exact `HEAD`; commit source
@@ -43,34 +43,59 @@ deterministic inference and radix caching; automatic backend selection can disab
 the cache needed by the cache-hit cases.
 Real NVIDIA acceptance of the CUDA configuration is still pending.
 
-The defaults contain no personal paths or forced offline settings. Model caching
-uses the standard Hugging Face cache and honors `HF_HOME` / `HF_HUB_CACHE`.
-For custom settings, copy the relevant config and pass its path with `--config`.
-When changing models, update the `--revision` in every overridden argument list
-and review model-specific cases such as the Qwen3 reasoning checks.
+### Four explicit run choices
 
-The command runs the complete [`native_generate` suite](suites/native_generate/suite.json),
-including metadata checks and both streaming modes. The default check is
-`full-response`; choose `generated-content` to compare the generated payload.
-No `--suite-file` is needed.
-Existing configurations must define every profile referenced by the suite;
-missing profiles are configuration errors, not a request to run fewer tests.
+The entire run configuration is:
 
-Relative `server.python`, `server.working_dir`, and `output_dir` paths resolve from
-the invocation directory; a bare executable name such as `python3` uses `PATH`.
-`server.working_dir` optionally selects the servers' working directory, where the
-server resolves relative model paths and file paths in `server.args`. On a Mac,
-use a model supported by SGLang's MLX backend and include `--mlx-enable-sampling` in
-`server.args` for the default sampling and output-logprob cases. Backend support
-for deterministic inference is required; the runner never retries with it disabled.
+```json
+{
+  "environment": "mlx",
+  "suites": ["native_generate", "openai_http"],
+  "check": "generated-content",
+  "output_dir": "target/parity"
+}
+```
 
-For the current MLX path, also set `--prefill-attention-backend torch_native` and
-`--decode-attention-backend torch_native` in the shared arguments. These select the
-non-Triton cache-allocation path while generation uses MLX and the deterministic
-flag remains enabled. Leaving those phases unspecified can select a CUDA backend
-during deterministic configuration and fail readiness on a Mac.
+All four fields are required. `environment` is `mlx` or `cuda`; `suites` is a
+nonempty list of distinct built-in names, in execution order. `check` applies to
+all selected suites. A relative `output_dir` resolves from the invocation directory.
+Unknown fields or names, omitted choices, and empty paths are errors.
+The committed configs explicitly select `native_generate` and `full-response`.
+Copy one to a local run file to change these four choices, then pass `--config`.
 
-The runner sets `--enable-deterministic-inference`, `--random-seed` (default 42),
+Platform settings live in [`configs/environments/`](configs/environments): model,
+revision, device and attention settings, resources, port, seed, and timeouts.
+Scenario settings live in [`suites/profiles.json`](suites/profiles.json).
+These definitions and the suite specifications are compiled into the binary;
+changing the invocation directory cannot select different resources. There are no
+external definition references, config inheritance, or field overrides. Add new
+platforms/scenarios in their owning definition and rebuild. The environment loader
+continues to locate source from the calling checkout and use verified caches.
+Model downloads use the standard Hugging Face cache (`HF_HOME` / `HF_HUB_CACHE`).
+
+Old run files with inline `server`/`profiles` are rejected with a migration message.
+Local model paths, custom startup arguments, Python paths and timeouts in those
+files cannot be copied into the four-field format; update the appropriate built-in
+definition or use the Rust library's resolved configuration. No old settings are
+silently discarded. Historical report JSON remains readable.
+
+### CLI reference
+
+| Options | Purpose |
+| --- | --- |
+| `--config <path>` | Required run file, including for `--describe`. |
+| `--describe` | Print the selection, environment, resolved profiles, requests, rules and service arguments without installation or service startup. |
+| `--report <report.json>` | Read recorded verdicts, regenerate HTML and print a summary; no test execution. |
+| `--case <name>` | Expand one case, only with `--report`. |
+| `--update-env-lock` | Regenerate one dependency lock; cannot be combined with run/report options. |
+| `--backend <mlx\|cuda>` | Required only with `--update-env-lock`; does not override a run. |
+| `--help`, `-h` | Print usage. |
+
+`--suite`, `--suite-file`, and `--check` are removed. There is no version flag or
+environment-variable override for the four run choices. `RUST_LOG` controls logging
+and `NO_COLOR` controls presentation, without changing the selected tests.
+
+The runner sets `--enable-deterministic-inference`, `--random-seed` (42 in both environments),
 host `127.0.0.1`, and the configured port. It sets `--disable-radix-cache` unless
 the profile declares `radix_cache: true`. These controls cannot be overridden
 through extra arguments or environment settings. Metrics and speculative
@@ -98,21 +123,8 @@ unit tests; matching responses alone do not prove every requested option was hon
 
 ## Choose the check
 
-Both built-in suites support two explicit checks. From `rust/`:
-
-```sh
-# Generated payload only, using the Native API.
-cargo run --locked -p sglang-parity -- --config sglang-parity/configs/mlx.json \
-  --suite native_generate --check generated-content
-
-# Generated payload only, using the OpenAI APIs.
-cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json \
-  --suite openai_http --check generated-content
-
-# Complete response contract, including metadata (the default).
-cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json \
-  --suite openai_http --check full-response
-```
+Both built-in suites support two explicit checks. Set `"check": "full-response"`
+or `"check": "generated-content"` in the run file. Neither is implicitly selected.
 
 Append `--describe` to review the selected check without starting services.
 The check is recorded in the effective suite and report and applies to
@@ -120,7 +132,7 @@ repeatability, Python/Rust parity, and declared JSON/SSE equivalence.
 
 | Check | Compared values | Validation and scenario checks |
 | --- | --- | --- |
-| `full-response` (default) | Complete JSON or reconstructed SSE response, with the suite's declared value exceptions and precision rules | Full response validation and all configured scenario assertions |
+| `full-response` | Complete JSON or reconstructed SSE response, with the suite's declared value exceptions and precision rules | Full response validation and all configured scenario assertions |
 | `generated-content` | Native text; OpenAI Completion choice index and text; Chat choice index, text, reasoning, refusal, and tool-call type, name and raw arguments | Output integrity and content, reasoning, tool-call and refusal assertions |
 
 Generated-content checks omit token IDs, all logprobs, usage, cache statistics,
@@ -138,39 +150,44 @@ generated payload. Use `full-response` to check the complete response contract.
 ## Multiple startup profiles in one run
 
 A **profile** names a SGLang startup configuration. A case explicitly lists its
-profiles; there is no implicit Cartesian product. One invocation runs all bound
-profile/case instances and produces one JSON/HTML report. Python and Rust receive
+profiles; there is no implicit Cartesian product. Each selected suite runs all bound
+profile/case instances and produces its own JSON/HTML report. Python and Rust receive
 the same settings and request bytes within each profile. Comparisons and JSON/SSE
 equivalence groups never cross profiles.
 
-`server` remains the base configuration and the implicit `default` profile.
-Named profiles override only `model`, `seed`, `args`, `env`, and `radix_cache`:
+Every profile is defined once in [`suites/profiles.json`](suites/profiles.json):
 
 ```json
 {
-  "server": {"model": "/path/to/fixed-model-snapshot", "args": []},
-  "profiles": {
-    "cached": {"server": {"radix_cache": true}},
-    "incremental": {"server": {"args": ["--incremental-streaming-output"]}},
-    "dp": {"server": {"args": ["--dp-size", "2"]},
-           "requires": {"backends": ["cuda"], "min_cuda_devices": 2}}
+  "default": {"args": []},
+  "incremental": {"args": ["--incremental-streaming-output"]},
+  "cached_incremental": {
+    "args": ["--enable-cache-report", "--incremental-streaming-output"],
+    "radix_cache": true
   }
 }
 ```
 
-`args` replaces the entire base argument list; `env` overlays keys. Other settings
-inherit from the base. There is no profile-to-profile inheritance. `default` is
-reserved. Unknown/duplicate bindings and incomplete equivalence groups are
-configuration errors. Unreferenced profiles are not started. Execution follows
-`default`, then named profiles in key order, with cases in specification order.
-The response policy is compiled against each profile's actual streaming mode.
+Cases must explicitly name their profiles. `default` is an ordinary empty scenario,
+not an automatically inserted or reserved profile. There are no suite-local
+profile maps or fallback definitions. Only referenced profiles run, sorted by
+name; their cases retain specification order.
+
+Profile `args` **append** to the environment's base arguments. An exact duplicate
+option or an option-name prefix ambiguity is rejected, including `--key=value`
+versus `--key value`. Profile `env` adds variables and rejects base-key collisions.
+An explicit `radix_cache` selects that switch; model and seed remain owned by the
+environment. Profiles may require a backend or minimum device count. There are
+no generic overrides, argument replacement, or profile inheritance. Controlled
+server options still pass through the existing launch validation.
+The response policy uses each resolved profile's actual streaming mode.
 
 A native case can declare prerequisites and scenario expectations:
 
 ```json
 {
   "name": "cached_json",
-  "profiles": ["cached"],
+  "profiles": ["cached_cumulative"],
   "isolation": "fresh_process",
   "before_each": [{
     "body": {"text": "A sufficiently long fixed prefix...",
@@ -184,7 +201,7 @@ A native case can declare prerequisites and scenario expectations:
 }
 ```
 
-Omitted `profiles` means `["default"]`. `shared` isolation (the default) reuses a
+Omitted `profiles` is an error. `shared` isolation (the default) reuses a
 service across consecutive cases. `fresh_process` restarts it for **each attempt**,
 then runs `before_each` in order and sends the measured request. Prerequisites
 undergo the same protocol validation, without measured-case assertions or
@@ -201,8 +218,8 @@ the report as uncovered, with their reason and exit code 2.
 All scenarios and their metadata assertions live in
 [`suites/native_generate/suite.json`](suites/native_generate/suite.json).
 Use [`configs/mlx.json`](configs/mlx.json) on Mac or
-[`configs/cuda.json`](configs/cuda.json) on CUDA. Both include every required
-profile, including cumulative and incremental settings.
+[`configs/cuda.json`](configs/cuda.json) on CUDA. The suite resolves every bound profile from the shared catalog, including
+cumulative and incremental settings.
 
 | Scenario | Required evidence | Availability |
 | --- | --- | --- |
@@ -234,8 +251,9 @@ positive-value assertion and also show the corresponding missing-field parity
 failure. Existing server differences are results, not expected passing answers.
 
 Library callers use `run_plan(&config, &plan)` for profile bindings;
-`run(config, suite, policy)` is the default-only convenience entry into the same
-executor.
+`run(config, suite, policy)` is the single-server convenience entry into the same
+executor. Library callers provide explicit resolved conditions; the CLI run file
+is a separate, smaller input type.
 
 ### Profile artifacts and review
 
@@ -265,6 +283,31 @@ response validation (or output integrity) and parity. `--case profile/case` sele
 an unqualified name works only when unique. Old reports and the original
 single-profile artifact layout remain readable.
 
+## Multiple suites
+
+List both built-in names in `suites` to run Native and OpenAI sequentially.
+All plans are validated before preparation; one observed commit and one leased
+source snapshot are shared throughout. Each suite starts and stops its own
+Python/Rust processes. Compatible environment/build/model caches are reused,
+but service state and comparisons never cross suites.
+
+A parity or validation failure does not prevent the next suite from running.
+Source invalidation, unsafe cleanup, cancellation, or critical artifact I/O errors
+stop the batch; remaining suites are `NOT_RUN`. Exit precedence is `2 > 1 > 0`.
+
+A single suite keeps its existing artifact layout. Multiple suites add an index:
+
+```text
+<output_dir>/<batch-id>/
+  summary.json / index.html
+  native_generate/<run-id>/report.json / report.html / ...
+  openai_http/<run-id>/report.json / report.html / ...
+```
+
+The index links to self-contained suite directories using relative paths.
+Each report records the expanded settings and rules, not only their names.
+Use `--report` with an individual `report.json` to inspect saved cases.
+
 ## Reproducible environments
 
 Review [`environments/profiles.json`](environments/profiles.json) and the generated
@@ -276,7 +319,7 @@ installation contract. These are separate from the API suite specification.
 | `mlx` | Apple Silicon, macOS 14+, Xcode command-line tools | `python/pyproject_other.toml` base + expanded `srt_mps`; tokenizer compatibility constraint from the default manifest. |
 | `cuda` | Linux x86_64, glibc 2.31+, NVIDIA driver supporting CUDA 13.0, C compiler | Default `python/pyproject.toml`; PyTorch `cu130` wheels. |
 
-Both profiles include the local package's declared build dependencies. Install
+Both dependency profiles include the local package's declared build dependencies. Install
 **uv 0.11.14**, Git, and the Rust toolchain specified by `rust/rust-toolchain.toml`
 first. The runner downloads Python **3.12.8** through uv when needed; it does not
 install system drivers or compilers. Third-party packages must have suitable
@@ -288,25 +331,12 @@ The selected Python environment's executable directory is prepended to the
 server `PATH`, so its locked tools are available to subprocesses. CUDA setup
 checks that `ninja` runs before compiling the Rust extension or starting services.
 
-Optional `environment` settings in `run.json`:
-
-```json
-{
-  "environment": {
-    "source_root": "/path/to/sglang",
-    "backend": "auto",
-    "cache_dir": "/path/to/parity-cache",
-    "setup_timeout_secs": 1800
-  }
-}
-```
-
-Omit `source_root` to discover the repository from the invocation directory.
-`auto` selects MLX on Apple Silicon and CUDA on Linux x86_64. The default cache is
-`<source_root>/rust/target/parity-environments`. Relative paths resolve from the
-invocation directory. `--describe` prints the commit, profile, lock digest, cache
-paths, and effective suite without downloading, installing, building, or starting
-services.
+The built-in environments fix the backend and preparation timeout. Source is
+located from the invocation directory; the cache uses
+`<source_root>/rust/target/parity-environments`. `--describe` prints the actual
+commit, dependency lock digest, cache paths and resolved plans without creating
+an environment or starting services. These preparation settings belong to the
+embedded environment definition, not to the four-field run file.
 
 The CLI prints progress to stderr by default: source revision, artifact directory,
 environment setup or reuse, server readiness, and each case/repeat. Stages that
@@ -343,7 +373,7 @@ versions, source import locations, a device operation, and the Rust loader's
 source fingerprint and extension path. Rust builds use the existing loader and
 `Cargo.lock`.
 
-To use an existing interpreter, set `server.python`. The runner validates its
+Rust library callers can use an existing interpreter through `RunConfig.server.python`. The runner validates its
 Python version and installed third-party packages against the selected lock and
 does not install into that environment. SGLang imports still come from the fixed
 source snapshot; Rust artifacts use the build cache. On MLX, installed SGLang
@@ -390,7 +420,7 @@ input digest and require a lock update. Ordinary source changes do not. Commit
 updated locks alongside dependency changes. Generated files contain no local
 paths, timestamps, or source commit, so regeneration is reviewable.
 
-Model files and GPU drivers are outside the Python lock. The committed run configs
+Model files and GPU drivers are outside the Python lock. The built-in environments
 pin model revisions through `--revision`, which is retained in the effective plan.
 Custom runs should likewise use a pinned revision or a local snapshot with recorded
 provenance. Resolving dependencies successfully is
@@ -401,13 +431,8 @@ not evidence of successful device execution or Python/Rust parity.
 Start with [`suites/native_generate/suite.json`](suites/native_generate/suite.json).
 It is the single source for request bodies, profile bindings, prerequisites,
 scenario assertions, expected statuses, equivalence groups, and comparison rules.
-`--suite-file` optionally replaces this specification for custom tests; it does
-not add to the built-in suite. Both use the same loader:
-
-```sh
-cargo run -p sglang-parity -- --config /path/to/run.json \
-  --suite native_generate --suite-file /path/to/suite.json --describe
-```
+The OpenAI API contract is in [`suites/openai_http/suite.json`](suites/openai_http/suite.json).
+Change the owning built-in specification and rebuild to add cases or rules.
 
 `--describe` validates and prints the resolved requests, capture modes, comparison
 scopes, complete rules and exception reasons, repeats, response implementation,
@@ -508,7 +533,7 @@ a protocol failure.
 
 ## Results
 
-Each run creates a unique directory under `output_dir` (default `target/parity`),
+Each run creates a unique directory under the required `output_dir` (`target/parity` in the committed configs),
 using the profile layout shown above. Custom single-profile runs retain this
 layout:
 
@@ -626,14 +651,17 @@ the test does not widen its exceptions to conceal them.
 ## Library and module boundaries
 
 Call `sglang_parity::run(&config, &suite, &policy).await` from Rust. A caller supplies
-`RunConfig`, a resolved `HttpSuite`, and a `ResponsePolicy` that returns complete
-final JSON or violations. The library owns process cleanup, HTTP capture, declared
+`RunConfig`, a resolved `HttpSuite`, and a `ResponsePolicy` that prepares values
+for the selected check or returns violations. Use `run_plan` for explicit profiles
+and `run_suites` for sequential, independent suites pinned to one source revision. The library owns process cleanup, HTTP capture, declared
 comparison rules, and all artifacts; these do not depend on the CLI.
 
 | Location | Responsibility |
 | --- | --- |
-| `src/plan.rs` | Named startup overrides, requirements, explicit compiled profile/case plans. |
-| `src/runner.rs` | Lifecycle order, repeated execution, final comparisons, reports. |
+| `src/config.rs`, `configs/` | Four-field run selection and embedded platform definitions. |
+| `suites/profiles.rs`, `suites/profiles.json` | One catalog of scenarios and explicit Case/Profile resolution. |
+| `src/plan.rs` | Append-only startup composition, requirements, resolved profile/case plans. |
+| `src/runner.rs` | One executor for single/multiple suites, source pinning, lifecycle order, comparisons and reports. |
 | `src/process.rs` | Shared SGLang configuration and process-group ownership for setup and services. |
 | `src/environment.rs` | Source snapshots, platform selection, environment preparation, cache leases and provenance. |
 | `src/environment/lock.rs` | Shared dependency expansion, semantic input digests, lock validation and generation. |
@@ -681,22 +709,15 @@ The CPU tests exercise separate contracts:
 
 Parser fixtures are inputs to unit tests, while integration tests use lightweight
 local services. These tests check whether the checker can accept valid results and
-detect deliberate faults. The default suite against a real model is a separate
+detect deliberate faults. The built-in suites against real models are separate
 acceptance run that compares the actual Python and Rust implementations. Follow
 the repository contribution guide and run `pre-commit run --all-files` before submitting.
 
 ### OpenAI HTTP generation
 
-Use the same platform configuration with the OpenAI suite (run from `rust/`):
-
-```sh
-cargo run --locked -p sglang-parity -- --config sglang-parity/configs/mlx.json --suite openai_http
-cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json --suite openai_http
-```
-
-Add `--describe` to review resolved requests without preparing an environment or
-starting services. The default suite remains `native_generate`; `--suite-file`
-overrides the specification of the explicitly selected suite.
+Set `"suites": ["openai_http"]` in the four-field run file, or include it alongside
+`native_generate`. Run with `--config`; append `--describe` for resolved requests
+without environment preparation or service startup.
 
 `suites/openai_http/suite.json` defines both `POST /v1/completions` and
 `POST /v1/chat/completions`: JSON/SSE, greedy and seeded sampling, multiple
@@ -760,7 +781,7 @@ keeps the first ID and its event origin, while raw events retain every ID.
 Choices are always reconstructed by `index`, never by ID. Creation timestamps
 and the other declared constant fields retain their existing checks.
 
-With `--check full-response`, there are two deliberately separate comparisons:
+With `"check": "full-response"`, there are two deliberately separate comparisons:
 
 - **Python/Rust parity and repeatability** use the complete JSON or reconstructed
   SSE result in `final.json`. Only declared ID/time values are replaced;
@@ -772,7 +793,7 @@ With `--check full-response`, there are two deliberately separate comparisons:
   message/delta are excluded only from this semantic view. The paired streaming
   request requires final usage. Other fields remain visible to full parity.
 
-With `--check generated-content`, parity and repeatability read `output.json`;
+With `"check": "generated-content"`, parity and repeatability read `output.json`;
 JSON/SSE equivalence uses the same generated-payload contract. It contains
 Completion text or Chat content, reasoning/refusal text and function calls,
 routed by choice index. Tool-call IDs, logprobs, usage and other metadata are

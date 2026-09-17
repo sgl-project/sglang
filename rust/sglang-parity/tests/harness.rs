@@ -4,7 +4,7 @@ mod support;
 
 use std::fs;
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde_json::{Value, json};
 use sglang_parity::report::ReportView;
@@ -114,6 +114,14 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     // Re-render a moved run with no tools on PATH; the lifecycle must stay unchanged.
     let moved = fixture.directory.path().join("moved report");
     fs::rename(&report.directory, &moved).unwrap();
+    // Historical profile overrides are evidence, never current run inputs.
+    let mut historical = read_json(moved.join("report.json"));
+    historical["config"]["profiles"] = json!({"old":{"server":{"args":["--old-flag"],"seed":99}}});
+    fs::write(
+        moved.join("report.json"),
+        serde_json::to_vec(&historical).unwrap(),
+    )
+    .unwrap();
     let lifecycle_before = fixture.lifecycle();
     let preparations_before = fixture.preparations();
     let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
@@ -727,76 +735,26 @@ fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
 }
 
 #[test]
-fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python() {
-    let mut fixture = Fixture::new();
-    fixture.config.server.python = Some(fixture.directory.path().join("missing-python"));
-    let defaults: RunConfig = serde_json::from_str(include_str!("../configs/mlx.json")).unwrap();
-    fixture.config.profiles = defaults.profiles;
-    let directory = &fixture.directory;
-    let config_path = directory.path().join("run.json");
-    fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
-    let execute = |external: Option<&std::path::Path>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sglang-parity"));
-        command
-            .env_remove("RUST_LOG")
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--describe");
-        if let Some(path) = external {
-            command.arg("--suite-file").arg(path);
-        }
-        command.output().unwrap()
-    };
-    let default = execute(None);
-    assert!(
-        default.status.success(),
-        "{}",
-        String::from_utf8_lossy(&default.stderr)
-    );
-    let default_json: Value = serde_json::from_slice(&default.stdout).unwrap();
-    assert!(
-        default.stderr.is_empty(),
-        "describe must not emit run progress"
-    );
-    let profiles = default_json["profiles"].as_array().unwrap();
-    assert_eq!(profiles.len(), 12);
-    assert_eq!(
-        profiles
-            .iter()
-            .map(|profile| profile["suite"]["cases"].as_array().unwrap().len())
-            .sum::<usize>(),
-        48
-    );
-    assert_eq!(default_json["repeats_per_implementation"], 2);
-    let rules = profiles[0]["suite"]["comparison"]["per_result_value_exceptions"]
-        .as_array()
-        .unwrap();
-    assert_eq!(
-        rules
-            .iter()
-            .map(|rule| rule["presence"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["required", "required", "optional"]
-    );
-    assert_eq!(rules[2]["path"], "/meta_info/response_sent_to_client_ts");
-    let external_path = directory.path().join("suite.json");
-    fs::write(
-        &external_path,
-        include_str!("../suites/native_generate/suite.json"),
-    )
-    .unwrap();
-    let external = execute(Some(&external_path));
-    assert!(external.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&external.stdout).unwrap(),
-        default_json
-    );
-    for api in ["native_generate", "openai_http"] {
+fn cli_describe_resolves_all_selections_without_preparation() {
+    let fixture = Fixture::new();
+    let config_path = fixture.directory.path().join("run.json");
+    let mut config = json!({
+        "environment": if cfg!(target_os="macos") { "mlx" } else { "cuda" },
+        "suites":["native_generate", "openai_http"],
+        "check":"full-response", "output_dir":fixture.config.output_dir
+    });
+    for (check, counts) in [
+        ("full-response", [48, 114]),
+        ("generated-content", [48, 112]),
+    ] {
+        config["check"] = json!(check);
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
-            .args(["--suite", api, "--check", "generated-content", "--describe"])
+            .current_dir(fixture.source())
+            .env_remove("RUST_LOG")
             .arg("--config")
             .arg(&config_path)
-            .env_remove("RUST_LOG")
+            .arg("--describe")
             .output()
             .unwrap();
         assert!(
@@ -804,42 +762,55 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let effective: Value = serde_json::from_slice(&output.stdout).unwrap();
-        for profile in effective["profiles"].as_array().unwrap() {
-            assert_eq!(profile["suite"]["check"], "generated-content");
-            assert_eq!(
-                profile["suite"]["comparison"]["per_result_value_exceptions"],
-                json!([])
-            );
-            assert!(
-                profile["suite"]["cases"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|case| case["expect_status"].as_u64().unwrap() < 400)
-            );
-        }
         assert!(output.stderr.is_empty());
+        let effective: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(effective["selection"], config);
+        let plans = effective["plan"].as_array().unwrap();
+        assert_eq!(plans.len(), 2);
+        for (plan, count) in plans.iter().zip(counts) {
+            let profiles = plan["profiles"].as_array().unwrap();
+            assert_eq!(
+                profiles
+                    .iter()
+                    .map(|p| p["suite"]["cases"].as_array().unwrap().len())
+                    .sum::<usize>(),
+                count
+            );
+            for profile in profiles {
+                assert_eq!(profile["suite"]["check"], check);
+                assert_eq!(
+                    profile["environment"]["commit"],
+                    plans[0]["profiles"][0]["environment"]["commit"]
+                );
+                if check == "generated-content" {
+                    assert_eq!(
+                        profile["suite"]["comparison"]["per_result_value_exceptions"],
+                        json!([])
+                    );
+                    assert!(
+                        profile["suite"]["cases"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|c| c["expect_status"].as_u64().unwrap() < 400)
+                    );
+                }
+            }
+        }
     }
     assert!(fixture.lifecycle().is_empty());
     assert!(fixture.preparations().is_empty());
     assert!(!fixture.config.output_dir.exists());
-    // Missing profile definitions must fail, never silently reduce coverage.
-    let mut incomplete = serde_json::to_value(&fixture.config).unwrap();
-    incomplete["profiles"] = json!({});
-    fs::write(&config_path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
-    let rejected = execute(None);
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown or duplicate profile"));
+    // Legacy input is rejected before any implicit migration or installation.
     fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
-    let mut invalid = read_json(&external_path);
-    invalid["comparison"]["numeric_tolerance"] = json!(0.1);
-    fs::write(&external_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
-    let rejected = execute(Some(&external_path));
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown field"));
-    assert!(!fixture.config.output_dir.exists());
-    assert!(fixture.preparations().is_empty());
+    let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--describe")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("obsolete run configuration"));
 }
 
 #[tokio::test]
@@ -865,7 +836,7 @@ async fn dirty_and_untracked_sources_are_rejected_before_preparation() {
 }
 
 #[tokio::test]
-async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
+async fn all_suites_keep_the_prepared_head_when_original_checkout_changes() {
     let mut fixture = Fixture::new();
     let original_commit = git(&fixture.source(), &["rev-parse", "HEAD"]);
     let release = fixture.directory.path().join("release");
@@ -873,14 +844,12 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
         "PARITY_FIXTURE_RELEASE".into(),
         release.to_string_lossy().into_owned(),
     );
-    fixture.config.profiles = serde_json::from_value(
-        json!({"second":{"server":{"env":{"ANOTHER_BUILD_SETTING":"yes"}}}}),
-    )
-    .unwrap();
     let config = fixture.config.clone();
-    let suite = suite(vec![case("held", "/json", "wait_for_release")]);
-    let plan = profile_plan(&config, vec![suite.clone(), suite]);
-    let task = tokio::spawn(async move { sglang_parity::run_plan(&config, &plan).await });
+    let plans = vec![
+        named_plan(&config, "first", "wait_for_release"),
+        named_plan(&config, "second", "normal"),
+    ];
+    let task = tokio::spawn(async move { sglang_parity::run_suites(&config, &plans).await });
     assert!(
         wait_until(|| fixture
             .lifecycle()
@@ -912,13 +881,34 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
     fs::write(fixture.source().join("python/later.py"), "untracked later").unwrap();
     fs::write(&release, "resume").unwrap();
 
-    let report = task.await.unwrap().unwrap();
-    assert_eq!(report.exit_code(), 0, "{report:#?}");
-    let environment = report.environment.as_ref().unwrap();
-    assert_eq!(environment["plan"]["commit"], original_commit);
+    let summary = task.await.unwrap().unwrap();
+    assert_eq!(summary.exit_code(), 0, "{summary:#?}");
+    assert_eq!(summary.commit, original_commit);
+    let reports: Vec<_> = summary
+        .suites
+        .iter()
+        .map(|entry| {
+            let path = summary.directory.join(entry.report.as_ref().unwrap());
+            serde_json::from_value::<sglang_parity::Report>(read_json(path)).unwrap()
+        })
+        .collect();
+    let environment = reports[0].environment.as_ref().unwrap();
     let snapshot = std::path::Path::new(environment["plan"]["source_snapshot"].as_str().unwrap());
     assert_eq!(git(snapshot, &["rev-parse", "HEAD"]), original_commit);
     assert!(git(snapshot, &["status", "--porcelain"]).is_empty());
+    for report in &reports {
+        let recorded = report.environment.as_ref().unwrap();
+        assert_eq!(recorded["plan"]["commit"], original_commit);
+        assert_eq!(
+            recorded["plan"]["environment_dir"],
+            environment["plan"]["environment_dir"]
+        );
+        for profile in report.profiles.values() {
+            let path = profile.environment.as_ref().unwrap();
+            assert!(path.starts_with(&report.directory));
+            assert_eq!(read_json(path)["plan"]["commit"], original_commit);
+        }
+    }
     let starts: Vec<_> = fixture
         .lifecycle()
         .into_iter()
@@ -926,12 +916,6 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
         .collect();
     assert_eq!(starts.len(), 4);
     assert_eq!(fixture.preparations().len(), 2);
-    for profile in report.profiles.values() {
-        assert_eq!(
-            read_json(profile.environment.as_ref().unwrap())["plan"]["commit"],
-            original_commit
-        );
-    }
     for start in starts {
         assert_eq!(start["python_path"], json!(snapshot.join("python")));
         assert_eq!(start["source_version"], "initial HEAD");
@@ -991,7 +975,7 @@ async fn failed_environment_probe_retains_evidence_without_starting_servers() {
 }
 
 #[tokio::test]
-async fn cli_sigterm_cleans_managed_descendants_and_retains_an_interrupted_report() {
+async fn cancelling_a_batch_preserves_current_report_and_unstarted_suites() {
     let mut fixture = Fixture::new();
     fixture.config.request_timeout_secs = 30;
     fixture
@@ -999,110 +983,174 @@ async fn cli_sigterm_cleans_managed_descendants_and_retains_an_interrupted_repor
         .server
         .env
         .insert("PARITY_FIXTURE_CHILD".into(), "1".into());
-    let config_path = fixture.directory.path().join("cli-run.json");
-    fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
-    let spec_path = fixture.directory.path().join("native-suite.json");
-    let mut spec: Value =
-        serde_json::from_str(include_str!("../suites/native_generate/suite.json")).unwrap();
-    spec["cases"] = json!([{
-        "name": "pending",
-        "body": {
-            "text": "fixture request",
-            "sampling_params": {"temperature": 0, "max_new_tokens": 8, "sampling_seed": 42},
-            "stream": true,
-            "behavior": "timeout",
-            "value": "pending"
-        },
-        "expect_status": 200
-    }]);
-    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
-    let log_path = fixture.directory.path().join("cli.log");
-    let log = fs::File::create(&log_path).unwrap();
-    let stdout_path = fixture.directory.path().join("cli.stdout");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
-        .env_remove("RUST_LOG")
-        .arg("--config")
-        .arg(config_path)
-        .arg("--suite-file")
-        .arg(spec_path)
-        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .unwrap();
-    let received = wait_until(|| {
-        fixture
-            .lifecycle()
-            .iter()
-            .any(|entry| entry["kind"] == "request")
-    })
-    .await;
-    // SAFETY: this PID belongs to the live CLI child spawned immediately above.
-    let signal_result = unsafe { libc::kill(cli.id() as i32, libc::SIGTERM) };
-    let finished = wait_until(|| cli.try_wait().unwrap().is_some()).await;
-    if !finished {
-        let _ = cli.kill();
-    }
-    let status = cli.wait().unwrap();
-    let progress = fs::read_to_string(&log_path).unwrap();
-    for expected in [
-        "Run artifacts and logs",
-        "Environment ready",
-        "Server ready",
-        "case 1/1 pending, repeat 1/2",
-        "server.log",
-    ] {
-        assert!(
-            progress.contains(expected),
-            "missing {expected}: {progress}"
-        );
-    }
-    assert!(
-        fs::read_to_string(stdout_path).unwrap().is_empty(),
-        "progress belongs on stderr"
-    );
-    assert!(
-        received,
-        "CLI did not reach its request: {:?}; lifecycle={:#?}",
-        fs::read_to_string(&log_path),
-        fixture.lifecycle()
-    );
-    assert_eq!(signal_result, 0);
-    assert!(finished, "CLI did not stop after SIGTERM");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "CLI log: {:?}",
-        fs::read_to_string(&log_path)
-    );
+    let first = named_plan(&fixture.config, "first", "timeout");
+    let second = named_plan(&fixture.config, "second", "normal");
+    let config = fixture.config.clone();
+    let task =
+        tokio::spawn(async move { sglang_parity::run_suites(&config, &[first, second]).await });
+    assert!(wait_until(|| fixture.lifecycle().iter().any(|e| e["kind"] == "request")).await);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let directory = fixture.only_run_directory();
+    let summary = read_json(directory.join("summary.json"));
+    assert_eq!(summary["state"], "interrupted");
+    assert_eq!(summary["suites"][0]["state"], "INTERRUPTED");
+    assert_eq!(summary["suites"][1]["state"], "NOT_RUN");
+    assert!(summary["suites"][1]["report"].is_null());
+    let report = read_json(directory.join(summary["suites"][0]["report"].as_str().unwrap()));
+    assert_eq!(report["state"], "interrupted");
+    assert!(directory.join("index.html").is_file());
     let starts: Vec<_> = fixture
         .lifecycle()
         .into_iter()
-        .filter(|entry| entry["kind"] == "start")
+        .filter(|e| e["kind"] == "start")
         .collect();
     assert_eq!(starts.len(), 1);
-    assert_process_stopped(starts[0]["pid"].as_i64().unwrap() as i32).await;
-    assert_process_stopped(starts[0]["worker"].as_i64().unwrap() as i32).await;
-    let report = read_json(fixture.only_run_directory().join("report.json"));
-    assert_eq!(report["state"], "interrupted");
+    for key in ["pid", "worker"] {
+        assert_process_stopped(starts[0][key].as_i64().unwrap() as i32).await;
+    }
+}
+
+#[tokio::test]
+async fn batches_continue_after_test_failures_and_keep_reports_portable() {
+    let fixture = Fixture::new();
+    let plans = [
+        named_plan(&fixture.config, "first", "different"),
+        named_plan(&fixture.config, "second", "normal"),
+    ];
+    let summary = sglang_parity::run_suites(&fixture.config, &plans)
+        .await
+        .unwrap();
+    assert_eq!(summary.exit_code(), 1);
+    assert_eq!(summary.state, "complete");
     assert_eq!(
-        report["cases"][0]["implementations"]["rust"]["attempts"],
-        json!([])
+        summary
+            .suites
+            .iter()
+            .map(|s| s.exit_code)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(0)]
     );
-    assert_ne!(report["cases"][0]["parity"]["status"], "PASS");
+    let events = fixture.lifecycle();
+    let starts: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["kind"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 4);
+    for ((_, previous), (next_index, _)) in starts.iter().zip(starts.iter().skip(1)) {
+        assert!(
+            events[..*next_index]
+                .iter()
+                .any(|e| e["kind"] == "stop" && e["pid"] == previous["pid"])
+        );
+    }
+    let moved = fixture.directory.path().join("moved-batch");
+    fs::rename(&summary.directory, &moved).unwrap();
+    let html = fs::read_to_string(moved.join("index.html")).unwrap();
+    for entry in &summary.suites {
+        let relative = entry.report.as_ref().unwrap();
+        assert!(relative.is_relative());
+        assert!(html.contains(relative.with_extension("html").to_str().unwrap()));
+        let path = moved.join(relative);
+        let saved: sglang_parity::Report = serde_json::from_value(read_json(&path)).unwrap();
+        ReportView::new(&saved, path.parent().unwrap())
+            .write_html()
+            .unwrap();
+    }
+    let mut invalid = named_plan(&fixture.config, "invalid", "normal");
+    invalid.profiles[0].suite.cases.clear();
+    let before = fixture.lifecycle();
+    assert!(
+        sglang_parity::run_suites(
+            &fixture.config,
+            &[named_plan(&fixture.config, "valid", "normal"), invalid]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        fixture.lifecycle(),
+        before,
+        "validate every suite before starting any"
+    );
+}
+
+#[tokio::test]
+async fn critical_source_and_artifact_failures_stop_later_suites() {
+    for corrupt_source in [true, false] {
+        let mut fixture = Fixture::new();
+        let release = fixture.directory.path().join("release");
+        fixture.config.server.env.insert(
+            "PARITY_FIXTURE_RELEASE".into(),
+            release.to_string_lossy().into(),
+        );
+        let config = fixture.config.clone();
+        let plans = vec![
+            named_plan(&config, "first", "wait_for_release"),
+            named_plan(&config, "second", "normal"),
+        ];
+        let task = tokio::spawn(async move { sglang_parity::run_suites(&config, &plans).await });
+        assert!(wait_until(|| fixture.lifecycle().iter().any(|e| e["kind"] == "request")).await);
+        let directory = fixture.only_run_directory();
+        let index = read_json(directory.join("summary.json"));
+        let report_path = directory.join(index["suites"][0]["report"].as_str().unwrap());
+        if corrupt_source {
+            let effective = read_json(report_path.parent().unwrap().join("effective_plan.json"));
+            let source = std::path::Path::new(
+                effective["profiles"][0]["environment"]["source_snapshot"]
+                    .as_str()
+                    .unwrap(),
+            );
+            fs::write(source.join("python/fixture-version.txt"), "tampered source").unwrap();
+        } else {
+            fs::create_dir(
+                report_path
+                    .parent()
+                    .unwrap()
+                    .join("profiles/default/python/request/1/final.json"),
+            )
+            .unwrap();
+        }
+        fs::write(release, "resume").unwrap();
+        let summary = task.await.unwrap().unwrap();
+        assert_eq!(summary.exit_code(), 2);
+        assert_eq!(summary.state, "interrupted");
+        assert_eq!(summary.suites[1].state, "NOT_RUN");
+        assert!(!summary.errors.is_empty());
+        assert!(summary.directory.join("index.html").is_file());
+        for start in fixture
+            .lifecycle()
+            .into_iter()
+            .filter(|e| e["kind"] == "start")
+        {
+            assert_process_stopped(start["pid"].as_i64().unwrap() as i32).await;
+        }
+    }
+}
+
+fn named_plan(
+    config: &RunConfig,
+    name: &str,
+    behavior: &str,
+) -> sglang_parity::ExecutionPlan<EchoPolicy> {
+    let mut suite = suite(vec![case("request", "/json", behavior)]);
+    suite.name = name.into();
+    profile_plan(config, vec![("default", json!({}), suite)])
 }
 
 fn profile_plan(
     config: &RunConfig,
-    suites: Vec<sglang_parity::HttpSuite>,
+    suites: Vec<(&str, Value, sglang_parity::HttpSuite)>,
 ) -> sglang_parity::ExecutionPlan<EchoPolicy> {
-    let profiles = config.resolve_profiles().unwrap();
-    assert_eq!(profiles.len(), suites.len());
     sglang_parity::ExecutionPlan {
-        profiles: profiles
+        profiles: suites
             .into_iter()
-            .zip(suites)
-            .map(|(profile, suite)| sglang_parity::ProfilePlan {
-                profile,
+            .map(|(id, spec, suite)| sglang_parity::ProfilePlan {
+                profile: serde_json::from_value::<sglang_parity::ProfileSpec>(spec)
+                    .unwrap()
+                    .resolve(id, &config.server)
+                    .unwrap(),
                 suite,
                 policy: EchoPolicy,
             })
@@ -1112,11 +1160,7 @@ fn profile_plan(
 
 #[tokio::test]
 async fn profiles_share_installations_without_sharing_serving_state_or_comparisons() {
-    let mut fixture = Fixture::new();
-    fixture.config.profiles = serde_json::from_value(json!({
-        "cached": {"server":{"args":["--incremental-streaming-output"],"radix_cache":true,"seed":7}},
-        "other_env": {"server":{"env":{"PROFILE_BUILD_FLAG":"different"}}}
-    })).unwrap();
+    let fixture = Fixture::new();
     let pair = || {
         let mut a = case("json", "/json", "normal");
         a["equivalence_group"] = json!("pair");
@@ -1133,10 +1177,22 @@ async fn profiles_share_installations_without_sharing_serving_state_or_compariso
         // An unisolated second attempt would return 4 instead of 2.
         case.request.body["behavior"] = json!("unstable");
     }
-    let plan = profile_plan(&fixture.config, vec![pair(), cached, pair()]);
-    let mut stale = fixture.config.clone();
-    stale.server.seed += 1;
-    assert!(sglang_parity::describe_plan(&stale, &plan).is_err());
+    let plan = profile_plan(
+        &fixture.config,
+        vec![
+            ("default", json!({}), pair()),
+            (
+                "cached",
+                json!({"args":["--incremental-streaming-output"],"radix_cache":true}),
+                cached,
+            ),
+            (
+                "other_env",
+                json!({"env":{"PROFILE_BUILD_FLAG":"different"}}),
+                pair(),
+            ),
+        ],
+    );
     let described = sglang_parity::describe_plan(&fixture.config, &plan).unwrap();
     assert!(fixture.preparations().is_empty());
     assert_eq!(
@@ -1172,13 +1228,14 @@ async fn profiles_share_installations_without_sharing_serving_state_or_compariso
         assert!(args.contains(&json!("--incremental-streaming-output")));
         assert!(!args.contains(&json!("--disable-radix-cache")));
         assert!(
-            !args.contains(&json!("fixture")),
-            "argv must replace, not append"
+            args.contains(&json!("fixture")),
+            "profile args must retain environment args"
         );
-        assert!(
-            args.windows(2)
-                .any(|p| p == [json!("--random-seed"), json!("7")])
-        );
+        assert!(args.windows(2).any(|p| p
+            == [
+                json!("--random-seed"),
+                json!(fixture.config.server.seed.to_string())
+            ]));
     }
     for case in &report.cases[2..4] {
         for attempt in case.implementations.values().flat_map(|s| &s.attempts) {
@@ -1212,11 +1269,15 @@ async fn prerequisites_and_requirements_never_produce_false_coverage() {
         json!({"backends": [if cfg!(target_os="macos") {"cuda"} else {"mlx"}]});
     let plan = profile_plan(
         &fixture.config,
-        vec![suite(vec![
-            blocked,
-            unsupported,
-            case("following", "/json", "normal"),
-        ])],
+        vec![(
+            "default",
+            json!({}),
+            suite(vec![
+                blocked,
+                unsupported,
+                case("following", "/json", "normal"),
+            ]),
+        )],
     );
     let report = sglang_parity::run_plan(&fixture.config, &plan)
         .await

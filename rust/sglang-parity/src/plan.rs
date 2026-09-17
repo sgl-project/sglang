@@ -14,8 +14,9 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub server: ServerConfig,
-    #[serde(default)]
-    pub profiles: BTreeMap<String, ProfileSpec>,
+    /// Historical declarations retained when reading reports, never executed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, Value>,
     #[serde(default)]
     pub environment: EnvironmentConfig,
     #[serde(default = "default_startup_timeout")]
@@ -68,6 +69,9 @@ pub struct HttpSuite {
 
 impl RunConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.profiles.is_empty() {
+            return Err("profiles belong to the suite; RunConfig.profiles is only retained for reading old reports".into());
+        }
         self.server.validate()?;
         if self.environment.setup_timeout_secs == 0
             || self.startup_timeout_secs == 0
@@ -147,18 +151,6 @@ impl HttpSuite {
     }
 }
 
-/// Startup overrides. Argument vectors replace rather than append to the base.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerOverrides {
-    pub model: Option<String>,
-    pub seed: Option<u64>,
-    pub args: Option<Vec<String>>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    pub radix_cache: Option<bool>,
-}
-
 /// Host requirements can be tightened by an individual case.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -228,12 +220,15 @@ impl Requirements {
     }
 }
 
-/// One named startup configuration; there is no profile-to-profile inheritance.
+/// A scenario's additions to the environment's base server configuration.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
     #[serde(default)]
-    pub server: ServerOverrides,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub radix_cache: Option<bool>,
     #[serde(default)]
     pub requires: Requirements,
 }
@@ -263,42 +258,46 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
-impl RunConfig {
-    /// Resolve the implicit default first, followed by named profiles in key order.
-    pub fn resolve_profiles(&self) -> Result<Vec<ResolvedProfile>, String> {
-        self.validate()?;
-        let mut result = vec![ResolvedProfile {
-            id: "default".into(),
-            server: self.server.clone(),
-            requires: Requirements::default(),
-        }];
-        for (id, spec) in &self.profiles {
-            if id == "default" || !valid_name(id) {
-                return Err(format!("invalid or reserved profile name {id:?}"));
-            }
-            spec.requires.validate()?;
-            let mut server = self.server.clone();
-            if let Some(model) = &spec.server.model {
-                server.model.clone_from(model);
-            }
-            if let Some(seed) = spec.server.seed {
-                server.seed = seed;
-            }
-            if let Some(args) = &spec.server.args {
-                server.args.clone_from(args);
-            }
-            server.env.extend(spec.server.env.clone());
-            if let Some(enabled) = spec.server.radix_cache {
-                server.radix_cache = enabled;
-            }
-            server.validate()?;
-            result.push(ResolvedProfile {
-                id: id.clone(),
-                server,
-                requires: spec.requires.clone(),
-            });
+impl ProfileSpec {
+    /// Resolve one explicit profile without changing the base server.
+    pub fn resolve(&self, id: &str, base: &ServerConfig) -> Result<ResolvedProfile, String> {
+        if !valid_name(id) {
+            return Err(format!("invalid profile name {id:?}"));
         }
-        Ok(result)
+        self.requires.validate()?;
+        let mut server = base.clone();
+        server.args.extend(self.args.clone());
+        let mut options: Vec<&str> = Vec::new();
+        for arg in &server.args {
+            if arg.starts_with("--") {
+                let option = arg.split('=').next().unwrap();
+                if let Some(previous) = options
+                    .iter()
+                    .find(|previous| option.starts_with(**previous) || previous.starts_with(option))
+                {
+                    return Err(format!(
+                        "profile {id}: duplicate or ambiguous options {previous} and {option}"
+                    ));
+                }
+                options.push(option);
+            }
+        }
+        for (key, value) in &self.env {
+            if server.env.insert(key.clone(), value.clone()).is_some() {
+                return Err(format!(
+                    "profile {id}: environment variable {key} is already set by the environment"
+                ));
+            }
+        }
+        if let Some(enabled) = self.radix_cache {
+            server.radix_cache = enabled;
+        }
+        server.validate()?;
+        Ok(ResolvedProfile {
+            id: id.into(),
+            server,
+            requires: self.requires.clone(),
+        })
     }
 }
 
@@ -332,29 +331,53 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn overrides_replace_argv_overlay_environment_and_reject_conflicts() {
-        let config: RunConfig = serde_json::from_value(json!({
-            "server": {"model":"base", "args":["--device","mps"], "env":{"COMMON":"yes","MODE":"base"}},
-            "profiles": {"variant": {"server": {"model":"other", "seed":7,
-                "args":["--incremental-streaming-output"], "env":{"MODE":"variant"}, "radix_cache":true}}}
+    fn profiles_append_settings_and_reject_conflicts() {
+        let base: ServerConfig = serde_json::from_value(json!({
+            "model":"base", "seed":7, "args":["--device","mps"], "env":{"COMMON":"yes"}
+        }))
+        .unwrap();
+        let profile: ProfileSpec = serde_json::from_value(json!({
+            "args":["--incremental-streaming-output"], "env":{"SCENARIO":"enabled"}, "radix_cache":true
         })).unwrap();
-        let profiles = config.resolve_profiles().unwrap();
+        let resolved = profile.resolve("variant", &base).unwrap();
+        assert_eq!(resolved.server.model, base.model);
+        assert_eq!(resolved.server.seed, base.seed);
         assert_eq!(
-            profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            ["default", "variant"]
+            resolved.server.args,
+            ["--device", "mps", "--incremental-streaming-output"]
         );
-        let server = &profiles[1].server;
-        assert_eq!(server.model, "other");
-        assert_eq!(server.args, ["--incremental-streaming-output"]);
-        assert_eq!(server.env["COMMON"], "yes");
-        assert_eq!(server.env["MODE"], "variant");
-        assert!(server.radix_cache);
-        assert!(!profiles[0].server.radix_cache);
-        assert_eq!(server.seed, 7);
-        for name in ["default", "bad/name", ""] {
-            let mut invalid = config.clone();
-            invalid.profiles.insert(name.into(), ProfileSpec::default());
-            assert!(invalid.resolve_profiles().is_err());
+        assert_eq!(resolved.server.env["COMMON"], "yes");
+        assert_eq!(resolved.server.env["SCENARIO"], "enabled");
+        assert!(resolved.server.radix_cache);
+        assert!(!base.radix_cache);
+        assert_eq!(
+            ProfileSpec::default()
+                .resolve("default", &base)
+                .unwrap()
+                .server,
+            base
+        );
+        for name in ["bad/name", ""] {
+            assert!(profile.resolve(name, &base).is_err());
+        }
+        for value in [
+            json!({"args":["--device=cuda"]}),
+            json!({"args":["--dev","mps"]}),
+            json!({"args":["--device-extra"]}),
+            json!({"env":{"COMMON":"override"}}),
+            json!({"args":["--port","9999"]}),
+            json!({"args":["--foo=1","--foo","2"]}),
+        ] {
+            let invalid: ProfileSpec = serde_json::from_value(value.clone()).unwrap();
+            assert!(invalid.resolve("invalid", &base).is_err(), "{value}");
+        }
+        for obsolete in [
+            json!({"server":{}}),
+            json!({"model":"other"}),
+            json!({"seed":99}),
+            json!({"extra_args":[]}),
+        ] {
+            assert!(serde_json::from_value::<ProfileSpec>(obsolete).is_err());
         }
         let mlx = Requirements {
             backends: vec![Backend::Mlx],

@@ -195,7 +195,7 @@ fn suite_configuration_rejects_unknown_fields_and_mixed_contracts() {
 fn request_payload_is_preserved_and_shape_comes_from_request() {
     let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
     spec["cases"] = json!([{
-        "name": "one_item_batch", "expect_status": 200,
+        "name": "one_item_batch", "expect_status": 200, "profiles":["default"],
         "body": {"input_ids": [[1, 2]], "stream": true, "future_request_field": {"keep": null}}
     }]);
     let (suite, _) = load(&spec.to_string(), &config(false)).unwrap();
@@ -735,7 +735,7 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
     let spec = json!({
         "name":"native_generate", "http":{"method":"POST","path":"/generate"},
         "comparison":{"base":"exact_json","per_result_value_exceptions":[]},
-        "cases":[{"name":"invalid","expect_status":400,"body":{"stream":true,"input_ids":[]}}]
+        "cases":[{"name":"invalid","expect_status":400,"profiles":["default"],"body":{"stream":true,"input_ids":[]}}]
     });
     let (suite, policy) = load(&spec.to_string(), &config(false)).unwrap();
     assert_eq!(suite.cases[0].capture, CaptureMode::Json);
@@ -929,12 +929,7 @@ fn streaming_rules_are_explicit_and_extension_values_remain_complete() {
 
 #[test]
 fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
-    let mut config = config(false);
-    config.profiles = serde_json::from_value(json!({
-        "incremental":{"server":{"args":["--incremental-streaming-output"]}},
-        "unused":{"server":{"model":"not-started"}}
-    }))
-    .unwrap();
+    let config = config(false);
     let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
     for case in spec["cases"].as_array_mut().unwrap() {
         case["profiles"] = json!(["default", "incremental"]);
@@ -958,6 +953,12 @@ fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
         invalid["cases"][0]["profiles"] = binding;
         assert!(load_plan(&invalid.to_string(), &config).is_err());
     }
+    let mut missing = spec.clone();
+    missing["cases"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("profiles");
+    assert!(load_plan(&missing.to_string(), &config).is_err());
     // A JSON/SSE equivalence pair must be complete within each profile.
     spec["cases"][0]["profiles"] = json!(["default"]);
     assert!(load_plan(&spec.to_string(), &config).is_err());
@@ -969,7 +970,10 @@ fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_servic
         include_str!("../../configs/mlx.json"),
         include_str!("../../configs/cuda.json"),
     ] {
-        let config: RunConfig = serde_json::from_str(config).unwrap();
+        let config = sglang_parity::config::RunSpec::parse(config)
+            .unwrap()
+            .resolve_environment()
+            .unwrap();
         let model_parts = config.server.model.split('/').collect::<Vec<_>>();
         assert_eq!(model_parts.len(), 2, "defaults must use a Hub repository");
         assert!(model_parts.iter().all(|part| !part.is_empty()));
@@ -995,7 +999,7 @@ fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_servic
             48
         );
         for entry in &plan.profiles {
-            // Profile argv replaces the base list; every override must keep the pin.
+            // Appended scenario arguments must retain the environment model pin.
             assert_eq!(entry.profile.server.model, config.server.model);
             assert!(
                 entry
@@ -1127,7 +1131,7 @@ fn content_case(name: &str, incremental: bool) -> (HttpCase, GeneratePolicy) {
 fn generated_content_selects_successes_and_removes_metadata_rules() {
     let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
     spec["cases"].as_array_mut().unwrap().push(json!({
-        "name":"invalid", "expect_status":400, "body":{"input_ids":[]}
+        "name":"invalid", "expect_status":400, "profiles":["default"], "body":{"input_ids":[]}
     }));
     let (suite, _) = compile(
         serde_json::from_value(spec.clone()).unwrap(),
