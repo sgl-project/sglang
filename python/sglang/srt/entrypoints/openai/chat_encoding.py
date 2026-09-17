@@ -157,9 +157,8 @@ def resolve_chat_encoding_spec(
 def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
     """Map an API ``reasoning_effort`` onto what the V4.1 encoder accepts.
 
-    Tiers pass through; an OpenAI float in [0, 0.99] becomes a 1-100 budget;
-    an int budget (only reachable via ``chat_template_kwargs``) passes through
-    when in range. None means unsupported and the caller applies its default.
+    An int budget only reaches here through ``chat_template_kwargs``; None
+    means unsupported, and the caller applies its default.
     """
     if isinstance(value, bool):
         return None

@@ -1,9 +1,7 @@
 # Adapted from the DeepSeek-V4.1 release reference implementation.
 """Encode DeepSeek-V4.1 chat messages.
 
-Supports tool calls, reasoning effort, quick instruction tasks and image content.
-Mid-conversation system messages trigger the assistant generation header;
-image records are returned alongside the encoded prompt.
+Mid-conversation system messages trigger the assistant generation header.
 """
 
 import copy
@@ -108,7 +106,6 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 
 
 def to_json(value: Any) -> str:
-    """Serialize a value to JSON string."""
     try:
         return json.dumps(value, ensure_ascii=False)
     except:
@@ -116,12 +113,10 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
     return [tool["function"] for tool in tools]
 
 
 def tool_calls_from_openai_format(tool_calls):
-    """Convert OpenAI-format tool calls to internal format."""
     return [
         {
             "name": tool_call["function"]["name"],
@@ -132,7 +127,6 @@ def tool_calls_from_openai_format(tool_calls):
 
 
 def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
-    """Encode tool call arguments into V4.1 DSML parameter format."""
     p_dsml_template = (
         '<{dsml_token}{tool_parameter_tag_name} name="{key}" string="{is_str}">'
         "{value}</{dsml_token}{tool_parameter_tag_name}>"
@@ -163,7 +157,6 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
 
 
 def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
-    """Render tool schemas into the V4.1 system prompt format."""
     tools_json = [to_json(t) for t in tools]
 
     return TOOLS_TEMPLATE.format(
@@ -235,7 +228,6 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
 ) -> str:
-    """Render the message at `index` into its DeepSeek-V4.1 encoded string form."""
     assert 0 <= index < len(messages)
     assert thinking_mode in [
         "chat",
@@ -261,8 +253,7 @@ def render_message(
     reasoning_effort_prompt = render_reasoning_effort(
         index, thinking_mode, reasoning_effort
     )
-    # The leading system token is emitted whenever there is something to host
-    # at index 0: a system message or the effort prompt (even before a user).
+    # Index 0 also emits the system token for the effort prompt, even before a user.
     prompt = (
         SYSTEM_SP_TOKEN
         if index == 0 and (reasoning_effort_prompt or role == "system")
@@ -487,10 +478,6 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def sort_tool_results_by_call_order(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Sort tool_result blocks within user messages by the order of tool_calls
-    in the preceding assistant message.
-    """
     last_tool_call_order: Dict[str, int] = {}
 
     for msg in messages:
@@ -534,7 +521,6 @@ def _is_image_block(block: Dict[str, Any]) -> bool:
 
 
 def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize an ``image_url`` part into an internal image record."""
     image_url = block.get("image_url")
     url = image_url if isinstance(image_url, str) else (image_url or {}).get("url", "")
     if not url:
@@ -545,7 +531,6 @@ def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
 def _process_image_blocks(
     blocks: List[Any], image_placeholder: str = IMAGE_PLACEHOLDER
 ) -> Tuple[List[Any], List[Dict[str, Any]]]:
-    """Replace image blocks with placeholders and collect their records in order."""
     new_blocks: List[Any] = []
     images: List[Dict[str, Any]] = []
     for block in blocks:
@@ -578,7 +563,6 @@ def _process_image_blocks(
 
 
 def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
-    """Reject user-supplied image placeholder tokens in textual fields."""
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
         raise ValueError(
@@ -595,7 +579,6 @@ def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
 def process_image_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Normalize image blocks and return their records in prompt order."""
     processed: List[Dict[str, Any]] = []
     images: List[Dict[str, Any]] = []
     for msg in messages:
@@ -701,12 +684,9 @@ def encode_messages(
     reasoning_effort: Union[str, int, None] = None,
     return_multi_modal_data: bool = False,
 ) -> Any:
-    """
-    Encode a list of messages into the DeepSeek-V4.1 prompt format.
+    """Encode a list of messages into the DeepSeek-V4.1 prompt format.
 
-    Handles BOS insertion, thinking mode with optional reasoning dropping, tool
-    message merging, multi-turn context, and image content blocks. Returns the
-    prompt string, or ``(prompt, {"images": [...]})`` when
+    Returns the prompt string, or ``(prompt, {"images": [...]})`` when
     ``return_multi_modal_data`` is set; the image records are in prompt order.
     """
     context = context or []

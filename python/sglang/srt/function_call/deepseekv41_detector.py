@@ -19,7 +19,7 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 class DeepSeekV41Detector(DeepSeekV32Detector):
     """DeepSeek V4.1 DSML detector.
 
-    Tag names have a leading space: " calls", " invoke", and " parameter".
+    The leading space in each tag name below is intentional, not a typo.
     """
 
     tool_calls_block_name = " calls"
@@ -46,7 +46,7 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         """The builtin "deepseek_v4" shape with the spaced tag names.
 
         Bodies are JSON: xgrammar's "deepseek_xml" body style also hardcodes
-        the unspaced " parameter" name, and the V3.2-lineage parser accepts a
+        the unspaced "parameter" name, and the V3.2-lineage parser accepts a
         JSON body inside an invoke.
         """
         tools = list(tools or [])
