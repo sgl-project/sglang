@@ -14,13 +14,6 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
-
-
-
-
-
-
-
 def _extend_batch(
     *,
     seq_lens,

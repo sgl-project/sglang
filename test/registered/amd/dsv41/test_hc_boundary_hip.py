@@ -326,7 +326,5 @@ class TestHcBoundaryPrefill(CustomTestCase):
         self.assertTrue(_all_equal(sub[2:], [t[idx] for t in full[2:]]))
 
 
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -185,8 +185,6 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
                     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-
-
 def _moe(group, dual, shared_tp1):
     from sglang.srt.layers.moe.topk import TopKOutputFormat
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
