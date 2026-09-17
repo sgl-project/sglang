@@ -711,7 +711,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+            shape_mismatch = dst_val.shape != src_val.shape
+            assert not shape_mismatch or field_name in self._CP_GLOBAL_FIELDS, (
+                f"Only CP-global replay metadata may use a shorter live prefix, "
+                f"got {field_name=} {src_val.shape=} {dst_val.shape=}"
+            )
+            _copy_tensor_allowing_storage_alias(
+                dst_val, src_val, pad_value=0 if shape_mismatch else None
+            )
 
         # These fields are safe to replace because captured kernels only need
         # the current per-replay objects, or the field is produced inside the
@@ -961,6 +968,27 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
+
+
+def _copy_tensor_allowing_storage_alias(
+    dst: torch.Tensor, src: torch.Tensor, *, pad_value: Optional[int] = None
+) -> None:
+    """Copy replay metadata while preserving capture-stable destination addresses."""
+    if dst is src:
+        return
+    if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        src = src.clone()
+    if dst.shape == src.shape:
+        dst.copy_(src)
+        return
+    assert (
+        pad_value is not None
+        and dst.ndim == src.ndim
+        and dst.shape[0] >= src.shape[0]
+        and dst.shape[1:] == src.shape[1:]
+    ), f"Cannot copy replay metadata from {src.shape=} to {dst.shape=}"
+    dst.fill_(pad_value)
+    dst[: src.shape[0]].copy_(src)
 
 
 @dataclass
