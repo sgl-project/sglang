@@ -62,7 +62,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             can_run_decode_cuda_graph=True,
         )
 
-        fb.init_mlp_sync_metadata(_mock_model_runner(), batch, torch.device("cpu"))
+        fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
 
         self.assertEqual(fb.original_global_num_tokens_cpu, [2, 0, 3])
         self.assertEqual(fb.global_num_tokens_cpu, [8, 0, 12])
