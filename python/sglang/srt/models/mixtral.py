@@ -427,7 +427,6 @@ class MixtralForCausalLM(nn.Module):
                 if name is None:
                     continue
 
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
