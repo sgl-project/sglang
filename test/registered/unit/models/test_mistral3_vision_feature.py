@@ -1,9 +1,9 @@
-"""Mistral3 should not ask the vision tower for every layer to read one.
+"""Pixtral adaptors should not ask the vision tower for every layer to read one.
 
 The tower materialises one hidden-state tensor per layer when hidden states are
-requested and holds them for the whole item loop, which is ~49x the tensor the
-model actually consumes. These tests pin that the final-layer case takes the
-cheap path and that both paths agree.
+requested, ~49x the tensor the model actually consumes. These tests pin that the
+final-layer case takes the cheap path and that both paths agree, for each
+adaptor that reads the Pixtral tower this way.
 """
 
 import unittest
@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.models.llava import LlavaForConditionalGeneration
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -20,7 +21,10 @@ NUM_LAYERS = 4
 TOKENS = 3
 HIDDEN = 8
 
-get_image_feature = Mistral3ForConditionalGeneration.get_image_feature
+ADAPTORS = {
+    "mistral3": Mistral3ForConditionalGeneration.get_image_feature,
+    "llava": LlavaForConditionalGeneration.get_image_feature,
+}
 
 
 class RecordingTower:
@@ -50,7 +54,7 @@ def _model(vision_feature_layer):
         vision_tower=RecordingTower(),
         vision_feature_layer=vision_feature_layer,
         vision_feature_select_strategy="full",
-        multi_modal_projector=lambda feature, image_sizes: feature,
+        multi_modal_projector=lambda feature, image_sizes=None: feature,
     )
 
 
@@ -61,32 +65,44 @@ def _items(n):
     ]
 
 
-class TestMistral3VisionFeature(unittest.TestCase):
+class TestPixtralAdaptorVisionFeature(unittest.TestCase):
     def test_final_layer_never_requests_hidden_states(self):
-        model = _model(-1)
-        get_image_feature(model, _items(3))
-        self.assertEqual(model.vision_tower.calls, [False, False, False])
+        for name, get_image_feature in ADAPTORS.items():
+            with self.subTest(adaptor=name):
+                model = _model(-1)
+                get_image_feature(model, _items(3))
+                self.assertEqual(model.vision_tower.calls, [False, False, False])
 
     def test_non_final_layer_still_requests_hidden_states(self):
-        model = _model(-2)
-        get_image_feature(model, _items(2))
-        self.assertEqual(model.vision_tower.calls, [True, True])
+        for name, get_image_feature in ADAPTORS.items():
+            with self.subTest(adaptor=name):
+                model = _model(-2)
+                get_image_feature(model, _items(2))
+                self.assertEqual(model.vision_tower.calls, [True, True])
 
     def test_both_paths_agree_on_the_final_layer(self):
         # -1 through the cheap path vs NUM_LAYERS (the same tensor, reached by
         # indexing the hidden-state list) must produce identical features.
-        cheap = get_image_feature(_model(-1), _items(2))
-        listed = get_image_feature(_model(NUM_LAYERS), _items(2))
-        self.assertTrue(torch.equal(cheap, listed))
+        for name, get_image_feature in ADAPTORS.items():
+            with self.subTest(adaptor=name):
+                cheap = get_image_feature(_model(-1), _items(2))
+                listed = get_image_feature(_model(NUM_LAYERS), _items(2))
+                self.assertTrue(torch.equal(cheap, listed))
 
     def test_non_final_layer_selects_that_layer(self):
-        model = _model(1)
-        out = get_image_feature(model, _items(1))
-        self.assertTrue(torch.equal(out, model.vision_tower.layers[1].squeeze(0)))
+        for name, get_image_feature in ADAPTORS.items():
+            with self.subTest(adaptor=name):
+                model = _model(1)
+                out = get_image_feature(model, _items(1))
+                self.assertTrue(
+                    torch.equal(out, model.vision_tower.layers[1].squeeze(0))
+                )
 
     def test_features_are_concatenated_per_item(self):
-        out = get_image_feature(_model(-1), _items(3))
-        self.assertEqual(out.shape, (3 * TOKENS, HIDDEN))
+        for name, get_image_feature in ADAPTORS.items():
+            with self.subTest(adaptor=name):
+                out = get_image_feature(_model(-1), _items(3))
+                self.assertEqual(out.shape, (3 * TOKENS, HIDDEN))
 
 
 if __name__ == "__main__":
