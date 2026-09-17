@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -396,8 +406,19 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
+# Grace period from ShutdownReq to SIGKILL for each scheduler.
+_SCHEDULER_EXIT_TIMEOUT_SECS = 15
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    # Set by whoever owns the event loop, and left None for Engine and grpc,
+    # which own no server. Class-level to leave the frozen __init__ alone.
+    _server_stop_hook: Optional[Callable[[], None]] = None
+
+    def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
+        self._server_stop_hook = hook
 
     @property
     def serving_chat_class(self):
@@ -604,6 +625,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+    def is_ready(self) -> bool:
+        """Return whether this server should receive new requests."""
+        return (
+            not self.is_pause
+            and not self.gracefully_exit
+            and self.server_status == ServerStatus.Up
+        )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -1345,24 +1374,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
-                )
-
-    def _validate_input_ids_in_vocab(
-        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
-    ) -> None:
-        # Handle both single sequence and batch of sequences
-        if isinstance(input_ids[0], list):
-            # Batch of sequences
-            for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
-                    raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
-                    )
-        else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
     def _create_tokenized_object(
@@ -3246,10 +3257,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
+        stragglers = [proc.pid for proc in collect_scheduler_processes()]
+        if stragglers:
+            # SIGKILL here lands mid-release,
+            # which is how GPU memory survives a shutdown. Name the pids.
+            logger.warning(
+                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+                f"ShutdownReq, killing them before they released: {stragglers}"
+            )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        if self._server_stop_hook is not None:
+            # sys.exit() here raises SystemExit into the loop and kills it,
+            # so the ASGI server never runs its lifespan shutdown.
+            # The loop outlives this coroutine now, so drop our own tasks first;
+            # a pending handle_loop would be reported as destroyed-while-pending.
+            current = asyncio.current_task()
+            for task in self.asyncio_tasks:
+                if task is not current:
+                    task.cancel()
+            self._server_stop_hook()
+            return
         sys.exit(0)
 
     def force_exit_handler(self):
