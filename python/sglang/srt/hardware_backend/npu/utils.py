@@ -24,6 +24,22 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
+class FusedMoEMode(IntEnum):
+    """Ascend FuseEP operator modes (maps to ``--fuseep-mode``).
+
+    DISPATCH_GMM_COMBINE_DECODE (1):
+        Low-latency decode path — dispatch + GMM + combine in one operator.
+    DISPATCH_FFN_COMBINE (2):
+        Fused FFN path — dispatch + W8A8 GEMM1/SwiGLU + GEMM2 + combine.
+        Supports hybrid prefill/decode deployment (prefill uses
+        DispatchFFNCombineM3 normal-mode, decode uses fused_deep_moe
+        low-latency).
+    """
+
+    DISPATCH_GMM_COMBINE_DECODE = 1
+    DISPATCH_FFN_COMBINE = 2
+
+
 @functools.lru_cache(maxsize=1)
 def is_npu_arch35() -> bool:
     """Whether the runtime is on NPU architecture 35."""
