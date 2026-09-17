@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.multimodal_gen.runtime.server_args as server_args_module
 from sglang.multimodal_gen.runtime.layers.attention import (
     autotune,
 )
@@ -56,7 +57,7 @@ def stub(monkeypatch):
 @pytest.fixture
 def enabled_autotune(monkeypatch):
     monkeypatch.setattr(
-        attention_layer,
+        server_args_module,
         "get_global_server_args",
         lambda: SimpleNamespace(
             enable_attention_backend_autotune=True,
@@ -130,7 +131,7 @@ def test_small_calls_stay_on_the_default_and_leave_the_tuner_armed(monkeypatch):
 
 def test_explicit_backend_is_not_autotuned(monkeypatch, enabled_autotune):
     monkeypatch.setattr(
-        attention_layer,
+        server_args_module,
         "get_global_server_args",
         lambda: SimpleNamespace(
             enable_attention_backend_autotune=True,

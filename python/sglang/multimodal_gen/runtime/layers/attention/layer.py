@@ -18,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -72,7 +73,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -100,6 +100,8 @@ def _resolve_sp_attention_mode(
     the degree was auto-assigned, layers the gather path cannot serve fall
     back to Ulysses; an explicit degree fails closed instead of degrading.
     """
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
     args = get_global_server_args()
     if args.kv_gather_degree <= 1:
         return "ulysses", False
@@ -2123,7 +2125,7 @@ def _maybe_install_backend_autotune(
 ) -> None:
     """Opt-in: let the layer pick its backend by measurement on its first big call."""
     try:
-        server_args = get_global_server_args()
+        server_args = server_args_module.get_global_server_args()
         if not server_args.enable_attention_backend_autotune:
             return
     except Exception:  # no ServerArgs yet (unit tests, tooling)
