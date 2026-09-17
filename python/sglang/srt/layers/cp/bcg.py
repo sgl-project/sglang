@@ -31,10 +31,12 @@ from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -101,6 +103,8 @@ class PrefillCPBCGInput:
 
     input_embeds: torch.Tensor
     positions: torch.Tensor
+    input_ids: Optional[torch.Tensor] = None
+    num_token_non_padded: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
 
@@ -119,6 +123,8 @@ class PrefillCPBCGInput:
                     (runner.max_num_tokens,),
                     dtype=torch.int64,
                 ),
+                input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                num_token_non_padded=torch.zeros((), dtype=torch.int32),
             )
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
@@ -231,6 +237,7 @@ class PrefillCPBCGInput:
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
+        local_input_ids = cp_shard_hidden_states(global_input_ids, forward_batch)
         global_input_embeds = runner.model_runner.model.get_input_embeddings()(
             global_input_ids
         )
@@ -261,12 +268,31 @@ class PrefillCPBCGInput:
 
         input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
+        assert self.input_ids is not None
+        input_ids = self.input_ids[:captured_local_tokens]
         input_embeds.zero_()
         positions.zero_()
+        input_ids.zero_()
         input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
+        input_ids[:live_local_tokens].copy_(local_input_ids)
         forward_batch.input_embeds = input_embeds
-        forward_batch.positions = positions
+        forward_batch._cp_positions = positions
+        # Keep the global input_ids field intact: the runner uses its length to
+        # select the global capture bucket. The DSV4 body consumes this fixed,
+        # rank-local view for hash routing and MegaMoE.
+        forward_batch._cp_input_ids = input_ids
+        forward_batch.input_ids_global = input_ids
+        if forward_batch.num_token_non_padded is not None:
+            assert self.num_token_non_padded is not None
+            metadata = forward_batch.attn_cp_metadata
+            logical_tokens = (
+                metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            )
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
+            forward_batch.num_token_non_padded = self.num_token_non_padded
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
@@ -352,11 +378,31 @@ def execute_prefill_cp_bcg(
             hidden_states, hidden_states_before_norm = hidden_states
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        tail = None
+        language_model = getattr(model, "model", None)
+        if (
+            capture_aux_hidden_states
+            and getattr(language_model, "late_layer_start", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail_metadata = runner.model_runner.attn_backend.tail_forward_metadata
+            tail = tail_metadata.late_layer_tail
+            input_ids = tail.rows(input_ids)
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+
+        output = model.logits_processor(
+            input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.token_indices
+        return output
