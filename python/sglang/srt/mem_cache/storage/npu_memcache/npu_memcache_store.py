@@ -10,7 +10,6 @@ It follows the same HiCacheStorage contract and key layout strategy, while using
 
 from __future__ import annotations
 
-import ctypes
 import json
 import logging
 import threading
@@ -202,12 +201,6 @@ class NpuMemcacheStore(HiCacheStorage):
                 init_bm=init_bm,
                 host_pool_names=getattr(storage_config, "host_pool_names", ()),
             )
-            # Runtime setup is deferred for both SDMA and RDMA. Only SDMA needs
-            # ordinary-DRAM staging for NPU-pinned host pointers; RDMA keeps its
-            # registerable HugeTLB-backed host buffers.
-            self._use_dram_staging = (
-                self._defer_runtime_init and self._protocol == "device_sdma"
-            )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
                 "memcache_metrics_url"
@@ -377,12 +370,6 @@ class NpuMemcacheStore(HiCacheStorage):
     def register_buffer(self, tensor: torch.Tensor):
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        if getattr(self, "_use_dram_staging", False):
-            # SGLang DSV4 L2 is NPU-pinned host memory. Its pointer falls in the
-            # NPU VA numeric range, so SmemBmRegisterUserMem misclassifies it as
-            # local HBM. Host H2G/G2H I/O does not require registration (matching
-            # MemCache's CPU tensor examples); registering it corrupts SDMA data.
-            return
         if not self._store_initialized:
             buffer_meta = (ptr, size)
             if buffer_meta not in self._pending_buffers:
@@ -1152,51 +1139,24 @@ class NpuMemcacheStore(HiCacheStorage):
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         self._ensure_initialized()
-        io_ptrs = buffer_ptrs
-        staging_buffers = None
-        if getattr(self, "_use_dram_staging", False):
-            # torch_npu pinned-host allocations use an Ascend UVA address.  The
-            # address is CPU-accessible, but MemCache device_sdma does not handle
-            # it as ordinary MEDIA_DRAM reliably: the copy can return success
-            # while persisting unrelated bytes.  Copy each object to a regular
-            # process-DRAM buffer before H2G.  This is deliberately limited to
-            # the DSV4 device_sdma path; device_rdma retains its registered
-            # HugeTLB zero-copy behavior even though runtime init is deferred.
-            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
-            for src, dst, size in zip(buffer_ptrs, io_ptrs, buffer_sizes):
-                ctypes.memmove(dst, src, size)
-        return self.store.batch_put_from(key_strs, io_ptrs, buffer_sizes)
+        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         if not self._store_initialized:
             return [-1] * len(key_strs)
-        io_ptrs = buffer_ptrs
-        staging_buffers = None
-        if getattr(self, "_use_dram_staging", False):
-            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
-        raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
+        raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
         out: List[int] = []
-        for i, (code, sz) in enumerate(zip(raw, buffer_sizes)):
+        for code, sz in zip(raw, buffer_sizes):
             code = int(code)
             if code == 0:
-                if staging_buffers is not None:
-                    ctypes.memmove(buffer_ptrs[i], io_ptrs[i], sz)
                 out.append(int(sz))
             else:
                 out.append(-abs(code))
         return out
-
-    @staticmethod
-    def _make_dram_staging_buffers(
-        buffer_sizes: List[int],
-    ) -> Tuple[List[Any], List[int]]:
-        """Allocate ordinary process DRAM and keep it alive for one MemCache call."""
-        buffers = [ctypes.create_string_buffer(int(size)) for size in buffer_sizes]
-        return buffers, [ctypes.addressof(buffer) for buffer in buffers]
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         if not self._store_initialized:

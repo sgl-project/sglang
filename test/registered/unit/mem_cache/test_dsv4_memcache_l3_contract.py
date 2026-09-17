@@ -131,7 +131,6 @@ def _make_lazy_memcache(protocol="device_sdma"):
     backend._init_bm = True
     backend._protocol = protocol
     backend._defer_runtime_init = True
-    backend._use_dram_staging = protocol == "device_sdma"
     return backend
 
 
@@ -228,7 +227,7 @@ def test_logical_anchor_uses_controller_pool_names_for_lazy_init():
     )
 
 
-def test_lazy_store_reports_miss_and_skips_misclassified_host_registration():
+def test_lazy_store_reports_miss_and_defers_host_registration():
     backend = _make_lazy_memcache()
     tensor = torch.empty(16, dtype=torch.uint8)
 
@@ -243,7 +242,7 @@ def test_lazy_store_reports_miss_and_skips_misclassified_host_registration():
     store = _LifecycleObjectStore.instances[0]
     assert store.setup_calls == 1
     assert store.init_calls == [(3, True)]
-    assert store.registered_buffers == []
+    assert store.registered_buffers == [(tensor.data_ptr(), 16)]
 
 
 def test_lazy_store_first_put_initializes_only_once():
@@ -260,11 +259,11 @@ def test_lazy_store_first_put_initializes_only_once():
     assert len(store.put_calls) == 1
     assert store.put_calls[0][0] == ["k0"]
     assert store.put_calls[0][2:] == ([16], None)
-    assert store.put_calls[0][1] != [ctypes.addressof(source)]
+    assert store.put_calls[0][1] == [ctypes.addressof(source)]
     assert store.objects["k0"] == b"0123456789abcdef"
 
 
-def test_lazy_store_stages_npu_pinned_host_addresses_through_process_dram():
+def test_lazy_store_keeps_original_addresses_for_io():
     backend = _make_lazy_memcache()
     source = ctypes.create_string_buffer(b"0123456789abcdef")
     destination = ctypes.create_string_buffer(16)
@@ -277,9 +276,9 @@ def test_lazy_store_stages_npu_pinned_host_addresses_through_process_dram():
     ) == [16]
 
     store = _LifecycleObjectStore.instances[0]
-    assert store.put_calls[0][1] != [ctypes.addressof(source)]
+    assert store.put_calls[0][1] == [ctypes.addressof(source)]
     assert store.put_calls[0][2:] == ([16], None)
-    assert store.get_call[1] != [ctypes.addressof(destination)]
+    assert store.get_call[1] == [ctypes.addressof(destination)]
     assert store.get_call[2:] == ([16], None)
     assert destination.raw == b"0123456789abcdef"
 
@@ -483,7 +482,6 @@ def test_refactored_indexer_pools_round_trip_independently():
     backend = _make_memcache()
     backend.store = _LifecycleObjectStore()
     backend._store_initialized = True
-    backend._use_dram_staging = True
     backend._batch_exist = lambda keys: [int(k in backend.store.objects) for k in keys]
     buffers = {
         PoolName.DEEPSEEK_V4_C4_INDEXER: ctypes.create_string_buffer(b"index-key"),
