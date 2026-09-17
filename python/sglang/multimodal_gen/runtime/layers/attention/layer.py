@@ -1715,9 +1715,7 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(q_shard, k_shard, v_shard)
 
         joint_mask = joint_mask_meta = None
         if attn_mask is not None:
@@ -2026,9 +2024,7 @@ class USPAttention(nn.Module):
         k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
         v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(q_shard, k_shard, v_shard)
 
         h_local = q_shard.shape[2]
         kv_h_local = k_shard.shape[2]

@@ -399,6 +399,18 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
+    """True when ``x.view(b * s_local, h, d)`` costs no copy.
+
+    The pack kernel reads q/k/v through explicit row/head strides, so only the
+    head_size dim has to be unit-stride; full contiguity is not required. The
+    batch and sequence dims still have to merge into one, which is free when
+    batch is 1 or when the two dims are already adjacent in memory.
+    """
+    batch, seq_local = x.shape[0], x.shape[1]
+    return x.stride(-1) == 1 and (batch == 1 or x.stride(0) == seq_local * x.stride(1))
+
+
 def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
@@ -408,9 +420,9 @@ def _can_use_packed_qkv_a2a_4d(
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
         and q.dtype in (torch.float16, torch.bfloat16)
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
+        and _packed_qkv_row_view_is_free(q)
+        and _packed_qkv_row_view_is_free(k)
+        and _packed_qkv_row_view_is_free(v)
         and q.shape[2] % world_size == 0
         and not torch.compiler.is_compiling()
     )
@@ -427,7 +439,8 @@ def _usp_input_all_to_all_qkv(
     destination-major by one relayout kernel and exchanged in a single
     collective instead of three; only data movement changes, so the result is
     bit-identical to the unpacked path, which stays as the fallback for
-    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
+    would copy).
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()
