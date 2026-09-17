@@ -1352,6 +1352,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         below reads the metadata it just planned.
         """
         request_number = last_correct_step_indices.shape[0]
+        source_indices_tensor = None
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and req_pool_indices is not None:
+            # PP target-verify writes scratch by stable request-pool row so it
+            # survives other in-flight micro-batches until acceptance relays
+            # back.  Commit must read those same rows, not positional 0..bs-1.
+            source_indices_tensor = req_pool_indices[:request_number]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
         if mamba_track_indices is not None:
@@ -1425,6 +1431,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                     intermediate_conv_window,
                     state_indices_tensor,
                     last_correct_step_indices,
+                    source_indices_tensor,
                 )
             accept_lens_pool[state_indices_tensor.to(torch.int64)] = (
                 last_correct_step_indices.to(torch.int32) + 1
@@ -1437,6 +1444,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            source_indices_tensor=source_indices_tensor,
         )
 
         self._update_ple_state_after_mtp_verify(

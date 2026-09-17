@@ -260,10 +260,17 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
 
         last_steps = torch.tensor([2, 0, 3], dtype=torch.int32)
         req_pool_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
-        with patch(
-            "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-            "scatter_mamba_states_after_mtp_verify"
-        ) as scatter:
+        with (
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "scatter_mamba_states_after_mtp_verify"
+            ) as scatter,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "envs.SGLANG_ENABLE_PP_SPEC.get",
+                return_value=True,
+            ),
+        ):
             backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_steps,
                 mamba_track_indices=None,
@@ -282,6 +289,9 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
             torch.tensor([141, 142, 143], dtype=torch.int32),
         )
         torch.testing.assert_close(scatter.call_args.args[2], last_steps)
+        torch.testing.assert_close(
+            scatter.call_args.kwargs["source_indices_tensor"], req_pool_indices
+        )
 
 
 class TestConvWindowDedupLayout(CustomTestCase):

@@ -3735,7 +3735,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
-            req_pool_indices=self.req_pool_indices,
+            # PP speculative results return after other in-flight micro-batches
+            # have run.  Keep an owning snapshot of the request rows used by the
+            # verify scratch so relay-time commit cannot observe a reused buffer.
+            req_pool_indices=self.req_pool_indices.clone(),
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
