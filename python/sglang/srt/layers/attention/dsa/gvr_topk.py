@@ -232,11 +232,16 @@ def flashinfer_sparse_topk(
         and offsets is None
         and page_offsets is None
         and row_starts is None
-        and logits.shape[1] <= 16384
-        and rows <= _device_sms(logits.device)
+        and (
+            logits.shape[1] <= 16384
+            and rows <= _device_sms(logits.device)
+            or top_k <= 1024
+            and logits.shape[1] <= 32768
+            and rows <= _device_sms(logits.device) // 2
+        )
     ):
-        # These envelopes route to GVR's register families. Other shapes keep
-        # the existing complete path until the fused backend supports them.
+        # These envelopes route to register or clustered-register kernels.
+        # Streaming shapes retain the existing raw-selection + finish path.
         return flashinfer.top_k_page_table_transform(
             logits,
             page_table,
