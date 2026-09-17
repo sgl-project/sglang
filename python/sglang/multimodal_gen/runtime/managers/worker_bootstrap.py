@@ -31,17 +31,20 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _DIFFUSION_PREFIX = "sglang.multimodal_gen."
-_RUNTIME_NAMESPACE = "sglang.multimodal_gen.runtime"
+_RUNTIME_NAMESPACES = (
+    "sglang.multimodal_gen.runtime",
+    "sglang.multimodal_gen.runtime.managers",
+)
 # What may legitimately be imported this early: bootstrap's own imports, and the
 # platform and plugin modules that every plugin loads and the contract keeps
 # import-safe. Listing these rather than their complement keeps the check
 # complete as subpackages are added.
 _PRE_ACTIVATION_MODULES = (
     "sglang.multimodal_gen.envs",
-    "sglang.multimodal_gen.plugins",
+    "sglang.multimodal_gen.runtime.plugins",
     "sglang.multimodal_gen.runtime.platforms",
     "sglang.multimodal_gen.runtime.utils",
-    "sglang.multimodal_gen.runtime.worker_bootstrap",
+    "sglang.multimodal_gen.runtime.managers.worker_bootstrap",
 )
 _MAX_REPORTED_MODULES = 5
 
@@ -52,7 +55,7 @@ def _warn_if_runtime_imported_early() -> None:
         name
         for name in list(sys.modules)
         if name.startswith(_DIFFUSION_PREFIX)
-        and name != _RUNTIME_NAMESPACE
+        and name not in _RUNTIME_NAMESPACES
         and not name.startswith(_PRE_ACTIVATION_MODULES)
     )
     if not early:
@@ -128,7 +131,7 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
 
     initialize_current_platform()
 
-    from sglang.multimodal_gen.plugins import apply_plugin_hooks, load_plugins
+    from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks, load_plugins
 
     load_plugins()
     apply_plugin_hooks()
@@ -158,7 +161,7 @@ def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
 
     # No initialize_current_platform() here: this child serves HTTP and never
     # touches the device, so it has no reason to bring up a vendor backend.
-    from sglang.multimodal_gen.plugins import apply_plugin_hooks, load_plugins
+    from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks, load_plugins
 
     load_plugins()
     apply_plugin_hooks()

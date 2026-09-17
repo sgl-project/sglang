@@ -10,7 +10,7 @@ import json
 import multiprocessing as mp
 import sys
 
-from sglang.multimodal_gen.runtime import worker_bootstrap
+from sglang.multimodal_gen.runtime.managers import worker_bootstrap
 
 _CHILD_REPLY_TIMEOUT_S = 120
 _CHILD_JOIN_TIMEOUT_S = 10

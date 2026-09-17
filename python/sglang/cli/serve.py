@@ -112,7 +112,7 @@ def _run_diffusion(request: ServeRequest) -> None:
         _print_diffusion_help(request)
         return
 
-    from sglang.multimodal_gen.plugins import apply_plugin_hooks
+    from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks
 
     apply_plugin_hooks()
 

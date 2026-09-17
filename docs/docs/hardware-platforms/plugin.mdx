@@ -177,7 +177,7 @@ load_plugins()
 
 Diffusion launchers call `apply_plugin_hooks()`, which first performs registration
 if necessary and then resolves and patches targets. Scheduler children use a
-stricter lifecycle in `runtime/worker_bootstrap.py`:
+stricter lifecycle in `runtime/managers/worker_bootstrap.py`:
 
 ```text
 spawn unpickles SchedulerProcessSpec (stdlib types + opaque ServerArgs bytes)
@@ -227,7 +227,7 @@ if __name__ == "__main__":
 `DiffGenerator` on the `sglang.multimodal_gen` facade is a lazy proxy, so
 binding it at module scope costs no diffusion import and the child still reaches
 `initialize_current_platform()` with a clean module table. Module scope also
-stays open to `envs`, `plugins` and `runtime.platforms`, which the contract
+stays open to `envs`, `runtime.plugins` and `runtime.platforms`, which the contract
 already keeps import-safe — a plugin must import the last of those to subclass
 `Platform`. Everything else, including `SamplingParams` and `PipelineConfig`
 from the same facade, belongs inside the `if __name__ == "__main__":` guard or
@@ -806,13 +806,16 @@ General function plugins inject behavior into SRT or diffusion **without requiri
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 # Diffusion plugin
-from sglang.multimodal_gen.plugins import HookType, plugin_hook
+from sglang.multimodal_gen.runtime.plugins import HookType, plugin_hook
 ```
 
 Register an SRT plugin under `sglang.srt.plugins` and a diffusion plugin under
 `sglang.multimodal_gen.plugins`, and import the hook API from the matching
 module above. Each runtime applies only its own registry, so a hook registered
 through the other runtime's API never runs. The examples below use SRT.
+
+The diffusion hook API lives in `sglang.multimodal_gen.runtime.plugins`;
+`sglang.multimodal_gen.plugins` is its entry-point group, not a Python module path.
 
 Use cases include:
 
@@ -1061,11 +1064,11 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
       <td>Diffusion <code>current_platform</code> lazy singleton and built-in fallback order</td>
     </tr>
     <tr>
-      <td><code>sglang/multimodal_gen/plugins.py</code></td>
+      <td><code>sglang/multimodal_gen/runtime/plugins.py</code></td>
       <td>Diffusion plugin registration, explicit hook-application phase, and hook registry</td>
     </tr>
     <tr>
-      <td><code>sglang/multimodal_gen/runtime/worker_bootstrap.py</code></td>
+      <td><code>sglang/multimodal_gen/runtime/managers/worker_bootstrap.py</code></td>
       <td>Import-neutral process specifications and spawn targets that initialize the backend before resolving runtime hooks</td>
     </tr>
     <tr>

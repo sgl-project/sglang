@@ -10,8 +10,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.multimodal_gen.runtime import worker_bootstrap
+from sglang.multimodal_gen.runtime.managers import worker_bootstrap
 
 WORKER_MODULE = "sglang.multimodal_gen.runtime.managers.gpu_worker"
 GENERATOR_MODULE = "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator"
@@ -35,7 +37,7 @@ FAKE_PLUGIN_FIXTURE = FIXTURES_DIR / "sgl_fake_plugin.py"
 FACADE_IMPORT_SCRIPT = FIXTURES_DIR / "offline_script_facade_import.py"
 RUNTIME_IMPORT_SCRIPT = FIXTURES_DIR / "offline_script_runtime_import.py"
 
-PYTHON_ROOT = pathlib.Path(worker_bootstrap.__file__).parents[3]
+PYTHON_ROOT = pathlib.Path(__file__).parents[4]
 EARLY_IMPORT_WARNING = "imported before this worker initialized its platform"
 SCRIPT_TIMEOUT_S = 300
 
@@ -75,7 +77,7 @@ def _check_cli_import_order(pipe_writer) -> None:
 
 
 def _check_http_server_import_order(pipe_writer) -> None:
-    from sglang.multimodal_gen import plugins
+    from sglang.multimodal_gen.runtime import plugins
 
     class StopAtPluginBoundary(Exception):
         pass
@@ -101,6 +103,31 @@ def _check_http_server_import_order(pipe_writer) -> None:
 
     pipe_writer.send(observed)
     pipe_writer.close()
+
+
+class TestBootstrapImportBoundary(unittest.TestCase):
+    def test_manager_namespace_does_not_hide_early_worker_imports(self):
+        for module, warned in (
+            ("sglang.multimodal_gen.runtime.managers", False),
+            (worker_bootstrap.__name__, False),
+            (WORKER_MODULE, True),
+        ):
+            modules = {
+                "__main__": SimpleNamespace(__file__="offline.py"),
+                module: None,
+            }
+            with (
+                self.subTest(module=module),
+                patch.object(worker_bootstrap, "sys", SimpleNamespace(modules=modules)),
+                patch.object(worker_bootstrap.logging, "getLogger") as get_logger,
+            ):
+                worker_bootstrap._warn_if_runtime_imported_early()
+                if warned:
+                    warning = get_logger.return_value.warning
+                    warning.assert_called_once()
+                    self.assertEqual(warning.call_args.args[1], module)
+                else:
+                    get_logger.assert_not_called()
 
 
 class TestSpawnedWorkerReceivesPluginOverride(unittest.TestCase):

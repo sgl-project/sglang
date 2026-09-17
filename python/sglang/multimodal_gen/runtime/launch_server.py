@@ -8,17 +8,23 @@ import time
 
 import uvicorn
 
-from sglang.multimodal_gen.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
+    SchedulerProcessSpec,
+    ServerArgsPayload,
+    bootstrap_http_server_process,
+    bootstrap_scheduler_process,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import (
     configure_metrics,
     start_role_metrics_server,
 )
+from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -31,12 +37,6 @@ from sglang.multimodal_gen.runtime.utils.process import (
     kill_process_tree,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
-from sglang.multimodal_gen.runtime.worker_bootstrap import (
-    SchedulerProcessSpec,
-    ServerArgsPayload,
-    bootstrap_http_server_process,
-    bootstrap_scheduler_process,
-)
 
 _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10
