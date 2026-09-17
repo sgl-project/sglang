@@ -41,6 +41,10 @@ _LEGACY_CUDA_PREFIXES = ("stress",)
 
 _TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
 
+# Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
+# carries the `-kernel-` infix `kernel` needs, and these launch device work.
+_VENDOR_DIRS = {"amd", "mlx", "musa", "npu", "xpu"}
+
 
 def _defines_testcase(tree: ast.AST) -> bool:
     """True if the file defines unittest classes, statically or via type()."""
@@ -126,6 +130,8 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
 
     parts = path.split("/")
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
+    if relative_parts and relative_parts[0] in _VENDOR_DIRS:
+        return []
     if len(relative_parts) < 3 or relative_parts[0] not in _TEST_KINDS:
         return [
             f"{path}: registered tests must live under "
@@ -136,9 +142,13 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
     kind = relative_parts[0]
     errors = []
     if kind == "unit":
-        non_cpu = [r for r in registries if r.backend.name != "CPU"]
-        if non_cpu:
-            errors.append(f"{path}: unit tests may register only CPU suites")
+        invalid = [
+            r
+            for r in registries
+            if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
+        ]
+        if invalid:
+            errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
         if any(r.est_time > 60 for r in registries):
             errors.append(f"{path}: unit test est_time must be <= 60 seconds")
         if _contains_call(tree, "popen_launch_server"):

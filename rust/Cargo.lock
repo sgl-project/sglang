@@ -1005,9 +1005,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.3.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fd951c32c033f4f220b6087db91d7f7d475f1bf1f886c8e60798ac1cf4cc9a"
+checksum = "b1cdacfc1398779cf173d5ff54438d9f14682f76875b6879853a84cc7d646228"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -1022,9 +1022,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.0.1"
+version = "5.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfe04753d666e3462e3eed4abcf2a4d05997cf2dea45858733f2bdea5b61f733"
+checksum = "3ae2eaa139651c535aeaad8856c5546709608931ccd4d24d3a529f6c5233c4b6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1040,9 +1040,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.8.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "821c767e896f1f225b6411a5ce41dba7f114c2c97db862a13fd962195665075e"
+checksum = "ed232a9d254149a4e2e14f0a7d77f59bd64161964c0ba55267beea3955650faa"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3715,6 +3715,7 @@ dependencies = [
  "hf-hub",
  "itertools",
  "libc",
+ "minijinja",
  "numpy",
  "pyo3",
  "regex-syntax",
