@@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -438,6 +439,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     def __init__(
         self,
@@ -976,11 +978,10 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        config_to_check = self.model_config.hf_config
-        if hasattr(self.model_config.hf_config, "text_config"):
-            config_to_check = self.model_config.hf_config.text_config
-        elif hasattr(self.model_config, "hf_text_config"):
-            config_to_check = self.model_config.hf_text_config
+        # Use the language config already normalized by ModelConfig. Multimodal
+        # wrappers expose it under different attributes (for example,
+        # ``text_config`` or ``llm_config``).
+        config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -1023,6 +1024,17 @@ class Scheduler(
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            # PP+spec: the draft model (MTP layer) needs final hidden states and
+            # the lm_head, both of which live on the last PP stage only.
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -1155,7 +1167,9 @@ class Scheduler(
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # PP+spec: non-last stages have no draft worker; they run the
+            # verify-shaped target forward through the plain tp_worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1522,6 +1536,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             # The decode requests polling kv cache
@@ -1569,6 +1584,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1680,11 +1696,6 @@ class Scheduler(
             self.tp_worker.model_runner.ngram_embedding_manager
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
-        if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
-            hf_config = self.tp_worker.model_config.hf_config
-            self.ngram_embedding_n = hf_config.ngram_embedding_n
-            self.ngram_embedding_k = hf_config.ngram_embedding_k
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2168,7 +2179,8 @@ class Scheduler(
                     tokenized_req.mm_inputs, MultimodalInputs
                 ):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
-                        tokenized_req.mm_inputs
+                        tokenized_req.mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
             except Exception as error:
                 local_error = f"{type(error).__name__}: {error}"
@@ -2603,7 +2615,10 @@ class Scheduler(
         if self.dp_tp_group.rank_in_group == 0:
             try:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
             except Exception as error:
                 result = _MultimodalInputBroadcast(
@@ -2634,7 +2649,10 @@ class Scheduler(
                 result = obj_list[0]
             else:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
 
         if result.error is not None:
@@ -2649,7 +2667,10 @@ class Scheduler(
 
         if get_mm().enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs)
-        return MultimodalInputs.from_processor_output(mm_inputs)
+        return MultimodalInputs.from_processor_output(
+            mm_inputs,
+            requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+        )
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
@@ -4415,31 +4436,99 @@ class Scheduler(
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
+                is_verify_round = self.ps.pp_size > 1 and not (
+                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
+                )
+                # The relayed tree is what the requests carry between rounds;
+                # the rebuild below swaps it for this round's verify input, so
+                # hold on to it and put it back once the forward is done.
+                relay_input = batch.spec_info if is_verify_round else None
+                if is_verify_round:
+                    # PP+spec decode: every stage rebuilds the same verify
+                    # input from relayed per-req state (draft lives on the
+                    # last stage only).
+                    self._pp_spec_rebuild_verify_input(batch)
+                if not self.pp_group.is_last_rank:
+                    # PP+spec: non-last stages run only their model chunk on
+                    # the verify-shaped batch; sampling, accept and draft all
+                    # live on the last stage. The plain tp_worker path already
+                    # returns pp_hidden_states_proxy_tensors for relay.
+                    resolve_forward_inputs(batch, self.future_map)
+                    if is_verify_round:
+                        from sglang.srt.speculative.eagle_utils import (
+                            eagle_prepare_for_verify,
+                        )
+
+                        # Isolation is load-bearing: eagle_prepare_for_verify
+                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
+                        # input_ids, out_cache_loc); without the restore the
+                        # next get_next_batch_to_run treats this decode batch
+                        # as extend and re-merges it (duplicate reqs).
+                        with self._forward_isolation(batch, overlap=False):
+                            verify_forward_batch, can_run_cuda_graph = (
+                                eagle_prepare_for_verify(
+                                    batch.spec_info,
+                                    self.req_to_token_pool,
+                                    batch,
+                                    self.tp_worker,
+                                )
+                            )
+                            batch_result = self.tp_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                                is_verify=True,
+                            )
+                        batch_result.can_run_cuda_graph = can_run_cuda_graph
+                        # The isolation above restores batch.out_cache_loc, but
+                        # this stage still has to compact its own accepted-path
+                        # KV once the last stage relays which nodes it kept, so
+                        # the verify slots have to outlive the forward.
+                        batch_result.spec_verify_out_cache_loc = (
+                            verify_forward_batch.out_cache_loc
+                        )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    batch.input_ids = None
+                    # The verify input is per-round; between iterations
+                    # spec_info carries the relayed tree, which is
+                    # merge/filter-safe.
+                    batch.spec_info = relay_input
+                else:
+                    # Non-overlap: drive the V2 worker synchronously (no
+                    # future_map relay / on_publish).
+                    resolve_forward_inputs(batch, self.future_map)
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter. Under PP the
+                    # tail draft already consumed the draft input in-round, and
+                    # the next round's tree comes from the relay, so the last
+                    # stage carries the same relayed tree as the others.
+                    batch.spec_info = (
+                        relay_input
+                        if is_verify_round
+                        else batch_result.next_draft_input
                     )
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Only the last PP rank owns real results requiring D2H; other ranks
-                # consume device tensors rebuilt from the output ring.
-                batch_result.copy_done = self.device_module.Event()
-                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    # Only the last PP rank owns real results requiring D2H; other ranks
+                    # consume device tensors rebuilt from the output ring.
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -4759,7 +4848,7 @@ class Scheduler(
         # (queues parked under KV pressure / disagg transfer) has no
         # process_batch_result to publish the growing gauge, and gating here
         # froze /get_loads, DP balancing, and the LoadStat for the stall. This
-        # path spins without sleeping, so a wall-clock floor bounds the
+        # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
         fully_idle = self.is_fully_idle()
@@ -4772,6 +4861,10 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+            if self.enable_hicache_storage:
+                # Storage workers need the GIL between I/O calls. Yield while
+                # there is no GPU batch so polling cannot starve their acks.
+                time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5857,7 +5950,7 @@ def run_scheduler_process(
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"

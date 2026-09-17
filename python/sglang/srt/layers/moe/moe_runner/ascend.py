@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSituMXFP8Quant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
+    NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
@@ -100,6 +101,12 @@ class AscendRunnerCore(MoeRunnerCore):
             # both dispatchers: ascend_tp gets its activation quant fused into
             # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
+        elif (
+            isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
@@ -210,7 +217,7 @@ class AscendRunnerCore(MoeRunnerCore):
             # Grouped-row activations require dispatch metadata.
             if isinstance(
                 self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu, NPUSituMXFP8Quant),
+                (NPUSwigluDeepEPKernel, NPUSitu, NPUSituMXFP8Quant, NPUSwigluMxfp8Quant),
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
