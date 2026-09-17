@@ -61,14 +61,60 @@ def _block_scale_shape(shape: Sequence[int]) -> tuple[int, ...]:
     )
 
 
+def _fp8_packing_only_parameters(
+    model: torch.nn.Module, manifest: Mapping[str, Any]
+) -> set[str]:
+    """Find DeepGEMM buffers that can receive without rebinding or requantizing."""
+    if manifest.get("quantization", {}).get("scale_format") != "ue8m0_unpacked":
+        return set()
+    names: set[str] = set()
+    for entry in manifest["entries"]:
+        if entry.get("tensor_role") != "weight":
+            continue
+        descriptor = entry["destination"]
+        name = descriptor["parameter"]
+        module = model.get_submodule(name.rsplit(".", 1)[0])
+        method = getattr(module, "quant_method", None)
+        uses_deepgemm = getattr(
+            method, "is_deepgemm_moe_runner_backend_enabled", lambda: False
+        )
+        if not uses_deepgemm():
+            continue
+        weight = model.get_parameter(name)
+        scale_name = f"{name}_scale_inv"
+        scale = model.get_parameter(scale_name)
+        shape = list(descriptor["local_shape"])
+        if descriptor["recipe"] in ("expert_gate", "expert_up"):
+            shape[1] *= 2
+        if (
+            tuple(weight.shape) == tuple(shape)
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.is_contiguous()
+            and getattr(scale, "format_ue8m0", False)
+            and scale.dtype == torch.int32
+            and tuple(scale.shape)
+            == (shape[0], shape[1], (shape[2] // _FP8_BLOCK_SIZE + 3) // 4)
+        ):
+            names.update((name, scale_name))
+    return names
+
+
+def _pack_fp8_scales(scales: torch.Tensor) -> torch.Tensor:
+    # Keep the optional DeepGEMM dependency out of non-DeepGEMM receive paths.
+    from sglang.srt.layers.quantization.fp8_utils import transform_scale_ue8m0
+
+    return transform_scale_ue8m0(scales, mn=scales.shape[-2] * _FP8_BLOCK_SIZE)
+
+
 class M2NFP8Storage:
-    """Keep graph-visible FP8 buffers alive until an update is finalized.
+    """Keep fallback-path FP8 buffers alive until an update is finalized.
 
     The receiver needs canonical tensors while loading, whereas inference may
     use packed UE8M0 scales. Quantization hooks can also replace Parameters.
     Hold views of the original inference storage (not copies), then copy the
     post-processed values back into those exact buffers before generation resumes.
-    This state belongs to the model runner, not a reconnectable communicator.
+    Packing-only DeepGEMM updates leave inference storage in place and need no
+    snapshot. This state belongs to the runner, not a reconnectable communicator.
     """
 
     def __init__(
@@ -80,6 +126,8 @@ class M2NFP8Storage:
             for entry in manifest["entries"]
             if entry.get("tensor_role") in ("weight", "scale")
         }
+        for manifest in manifests:
+            names.difference_update(_fp8_packing_only_parameters(model, manifest))
         params = dict(model.named_parameters()) if names else {}
         self._buffers = {name: params[name].detach() for name in sorted(names)}
 
@@ -251,6 +299,7 @@ class NcclM2NReceiver:
             if expected_hash != actual_hash:
                 raise ValueError("Miles NCCL M2N manifest hash mismatch")
         self.manifest = manifest
+        self._packing_only_fp8_parameters: set[str] = set()
         self._pg = pg
         self.model = model
         self.device = (
@@ -602,10 +651,14 @@ class NcclM2NReceiver:
             if pair_id is not None:
                 pairs[pair_id][tensor_role] = record
         if pairs:
-            if self.manifest.get("quantization") != _FP8_QUANTIZATION:
+            quantization = self.manifest.get("quantization")
+            if quantization not in (
+                _FP8_QUANTIZATION,
+                {**_FP8_QUANTIZATION, "scale_format": "ue8m0_unpacked"},
+            ):
                 raise ValueError(
-                    "Paired FP8 entries require canonical manifest quantization "
-                    f"metadata {_FP8_QUANTIZATION}"
+                    "Paired FP8 entries require canonical or ue8m0_unpacked "
+                    "128x128 FP8 manifest quantization metadata"
                 )
             self._validate_fp8_pairs(pairs)
         elif "quantization" in self.manifest:
@@ -763,6 +816,9 @@ class NcclM2NReceiver:
             if entry.get("tensor_role") in ("weight", "scale"):
                 self._validate_fp8_target(entry)
 
+        self._packing_only_fp8_parameters = _fp8_packing_only_parameters(
+            self.model, self.manifest
+        )
         was_packed = {
             entry["destination"]["parameter"]: bool(
                 getattr(
@@ -781,7 +837,7 @@ class NcclM2NReceiver:
                 continue
             descriptor = entry["destination"]
             parameter = descriptor["parameter"]
-            if parameter in prepared:
+            if parameter in prepared or parameter in self._packing_only_fp8_parameters:
                 continue
             prepared.add(parameter)
 
@@ -839,17 +895,46 @@ class NcclM2NReceiver:
             # before the model post-load hook packs it again.
             param.data = param.data.reshape(shape)
 
+    def _packed_scale_destination(
+        self, entry: Mapping[str, Any], shape: tuple[int, ...]
+    ) -> tuple[torch.Tensor, Callable[[], None]]:
+        descriptor = entry["destination"]
+        target = self._params[descriptor["parameter"]].data
+        rows = shape[1] * _FP8_BLOCK_SIZE
+        component = descriptor["recipe"].removesuffix("_scale")
+        if component in ("expert_gate", "expert_up"):
+            starts = self._expert_gate_up_starts(descriptor["parameter"], rows)
+            target = target.narrow(1, starts[component == "expert_up"], rows)
+        buffer = torch.empty(shape, dtype=torch.float32, device=self.device)
+
+        def pack_and_copy() -> None:
+            packed = _pack_fp8_scales(buffer)
+            if packed.shape != target.shape or packed.dtype != target.dtype:
+                raise ValueError(
+                    "NCCL M2N packed scales do not match inference storage"
+                )
+            target.copy_(packed)
+
+        return buffer, pack_and_copy
+
     def _destination(
         self, entry: Mapping[str, Any], shape: tuple[int, ...]
     ) -> tuple[torch.Tensor, Callable[[], None] | None]:
         descriptor = entry["destination"]
+        if (
+            entry.get("tensor_role") == "scale"
+            and descriptor["parameter"] in self._packing_only_fp8_parameters
+        ):
+            return self._packed_scale_destination(entry, shape)
         param = self._params[descriptor["parameter"]].data
         recipe = descriptor["recipe"]
         if self._unquantized_expert_is_transposed(entry):
             # Copy through a logical NxK view without changing the parameter's
             # inference shape, strides, or CUDA-graph-visible storage.
             param = param.transpose(1, 2)
-        if recipe == "dense_down":
+        if recipe == "dense_down" or (
+            tuple(param.shape) == shape and param.is_contiguous()
+        ):
             return param, None
 
         buffer = torch.empty(shape, dtype=param.dtype, device=self.device)
@@ -871,8 +956,6 @@ class NcclM2NReceiver:
                 buffer.transpose(1, 2)
             )
         if tuple(param.shape) == shape:
-            if param.is_contiguous():
-                return param, None
             return buffer, lambda: param.copy_(buffer)
         return buffer, lambda: param.copy_(buffer.transpose(1, 2))
 
