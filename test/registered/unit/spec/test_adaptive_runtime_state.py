@@ -57,7 +57,10 @@ class _FakePolicy:
         return 1 if batch_size >= 8 else 3
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> int | None:
         return self.feedback_step
 
@@ -65,6 +68,9 @@ class _FakePolicy:
         if self.cuda_graph_bs is None:
             return None
         return [batch_size for batch_size in self.cuda_graph_bs if batch_size <= step]
+
+    def on_state_activated(self, steps: int) -> None:
+        pass
 
 
 class TestAdaptiveController(unittest.TestCase):

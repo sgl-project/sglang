@@ -6,9 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+    SpecProfilePoint,
+)
 from sglang.srt.speculative.throughput_aware_controller import (
-    ThroughputAwareAdaptiveController,
+    ThroughputAwarePolicy,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -52,13 +56,17 @@ class TestThroughputAwareController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
-            controller = ThroughputAwareAdaptiveController(FakeWorker(), str(path))
+            policy = ThroughputAwarePolicy(
+                initial_steps=3,
+                config_path=str(path),
+            )
+            controller = AdaptiveController(FakeWorker(), policy)
         controller.init_states([1, 4, 8, 16])
         return controller
 
     def test_policy_interface_builds_pruned_runtime_states(self):
         controller = self.make_controller()
-        self.assertIs(controller.params, controller)
+        self.assertIsInstance(controller.params, ThroughputAwarePolicy)
         self.assertEqual(
             controller.worker.build_calls, [(1, [1, 4, 8, 16]), (3, [1, 4])]
         )
@@ -66,8 +74,8 @@ class TestThroughputAwareController(unittest.TestCase):
 
     def test_feedback_defers_switch_until_next_decode(self):
         controller = self.make_controller()
-        controller._cost_table.set(1, 1, 1.0)
-        controller._cost_table.set(1, 3, 10.0)
+        controller.params._cost_table.set(1, 1, 1.0)
+        controller.params._cost_table.set(1, 3, 10.0)
         controller.on_verify_complete([3, 3], 1)
         controller.activate_step_by_batch(1)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
@@ -76,14 +84,14 @@ class TestThroughputAwareController(unittest.TestCase):
         controller.activate_step_by_batch(1)
         self.assertEqual(controller.worker.speculative_num_steps, 1)
         self.assertEqual(
-            controller._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
+            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
         )
-        self.assertTrue(controller._tracker.is_position_extrapolated(1))
+        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
 
     def test_hysteresis_keeps_current_step(self):
         controller = self.make_controller()
-        controller._cost_table.set(1, 1, 2 / 1.05)
-        controller._cost_table.set(1, 3, 4.0)
+        controller.params._cost_table.set(1, 1, 2 / 1.05)
+        controller.params._cost_table.set(1, 3, 4.0)
         for _ in range(2):
             controller.on_verify_complete([3], 1)
         controller.activate_step_by_batch(1)
@@ -94,10 +102,10 @@ class TestThroughputAwareController(unittest.TestCase):
     ):
         controller = self.make_controller()
         controller.on_verify_complete([1], batch_size=1, num_steps=1)
-        self.assertFalse(controller._tracker.all_positions_warmed(3))
-        self.assertTrue(controller._tracker.is_position_extrapolated(1))
+        self.assertFalse(controller.params._tracker.all_positions_warmed(3))
+        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
         self.assertEqual(
-            controller._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
+            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
         )
 
     def test_delayed_feedback_after_shrink_uses_verify_time_steps(self):
@@ -105,7 +113,7 @@ class TestThroughputAwareController(unittest.TestCase):
         controller.activate_step_by_batch(8)
         controller.on_verify_complete([2], batch_size=1, num_steps=3)
         self.assertEqual(
-            controller._tracker.snapshot_position_rates(3), [1.0, 1.0, 0.0]
+            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 0.0]
         )
 
     def test_cpu_result_processor_delivers_original_steps_to_controller(self):
@@ -163,28 +171,40 @@ class TestThroughputAwareController(unittest.TestCase):
         batch = SimpleNamespace(reqs=[SimpleNamespace(is_retracted=True)])
         tokens = namespace["_resolve_spec_v2_tokens"](processor, result, batch)
         self.assertEqual(tokens, [[10, 11]])
-        self.assertEqual(controller._batch_count, 1)
-        self.assertTrue(controller._tracker.is_position_extrapolated(1))
+        self.assertEqual(controller.params._batch_count, 1)
+        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
 
     def test_batch_change_selects_captured_state_before_tracker_warmup(self):
         controller = self.make_controller()
         # BS=5 pads to the captured BS=8, whose only allowed step is 1.
         controller.activate_step_by_batch(5)
         self.assertEqual(controller.worker.speculative_num_steps, 1)
-        self.assertEqual(controller._batch_count, 0)
+        self.assertEqual(controller.params._batch_count, 0)
 
-    def test_profile_grid_uses_resolved_buckets_and_request_limit(self):
+    def test_profile_plan_uses_resolved_buckets_and_request_limit(self):
         controller = self.make_controller(profile_run_batch_sizes=[1, 2, 4, 8, 16])
-        self.assertEqual(controller._build_profile_grid(8), {1: [1, 4, 8], 3: [1, 4]})
-        controller.set_cuda_graph_bs(None)
-        self.assertEqual(controller._build_profile_grid(8), {})
+        self.assertEqual(
+            controller.params._build_profile_points(8),
+            (
+                SpecProfilePoint(1, 1),
+                SpecProfilePoint(1, 4),
+                SpecProfilePoint(1, 8),
+                SpecProfilePoint(3, 1),
+                SpecProfilePoint(3, 4),
+            ),
+        )
+        controller.params.set_cuda_graph_bs(None)
+        self.assertEqual(controller.params._build_profile_points(8), ())
 
     def test_profile_context_leaves_decode_headroom(self):
         controller = self.make_controller(profile_run_seq_len=4096)
-        self.assertEqual(controller._resolve_profile_seq_len(), 4096 - 15 * 4 - 16)
+        self.assertEqual(
+            controller.params._resolve_profile_seq_len(controller.worker),
+            4096 - 15 * 4 - 16,
+        )
         controller.worker.model_config.context_len = 32
         with self.assertRaisesRegex(ValueError, "headroom"):
-            controller._resolve_profile_seq_len()
+            controller.params._resolve_profile_seq_len(controller.worker)
 
     def test_invalid_config_fails_before_runtime_state_building(self):
         for setting in (
@@ -204,9 +224,9 @@ class TestThroughputAwareController(unittest.TestCase):
         ) as factory:
             controller.run_profiling(object(), max_running_requests=4)
         self.assertEqual(factory.call_count, 4)
-        self.assertEqual(controller._cost_table.lookup(4, 3), 2.5)
+        self.assertEqual(controller.params._cost_table.lookup(4, 3), 2.5)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
-        self.assertEqual(controller._batch_count, 0)
+        self.assertEqual(controller.params._batch_count, 0)
 
 
 if __name__ == "__main__":

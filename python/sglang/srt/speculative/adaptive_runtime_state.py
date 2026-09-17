@@ -1,5 +1,8 @@
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -60,10 +63,69 @@ class AdaptiveSpecPolicy(Protocol):
     def get_steps_for_batch(self, batch_size: int) -> int: ...
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> int | None: ...
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
+
+    def on_state_activated(self, steps: int) -> None: ...
+
+
+@dataclass(frozen=True)
+class SpecProfilePoint:
+    """One speculative-decode cost measurement."""
+
+    steps: int
+    batch_size: int
+
+
+@dataclass(frozen=True)
+class SpecProfilePlan:
+    """Measurements a profiling policy asks the controller to execute."""
+
+    points: tuple[SpecProfilePoint, ...]
+    seq_len: int
+    n_warmup: int
+    n_measure: int
+
+
+@runtime_checkable
+class AdaptiveProfilingPolicy(Protocol):
+    """Optional profiling extension for an adaptive policy."""
+
+    def profile_plan(
+        self, worker: AdaptiveSpecWorker, *, max_running_requests: int
+    ) -> SpecProfilePlan: ...
+
+    def record_profile(self, batch_size: int, steps: int, avg_ms: float) -> None: ...
+
+    def profile_summary(self) -> str: ...
+
+
+logger = logging.getLogger(__name__)
+
+
+def _broadcast_float_from_rank0(value: float) -> float:
+    """Broadcast a profile measurement so every TP rank shares a cost table."""
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return value
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+    )
+
+    if get_tensor_model_parallel_world_size() <= 1:
+        return value
+    tp_group = get_tp_group()
+    value_tensor = torch.tensor([value], dtype=torch.float64, device=tp_group.device)
+    dist.broadcast(value_tensor, src=0, group=tp_group.device_group)
+    return float(value_tensor.item())
 
 
 class AdaptiveController:
@@ -132,13 +194,55 @@ class AdaptiveController:
     ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req, batch_size, num_steps
         )
         if new_step is not None:
             self._activate(new_step)
 
     def run_profiling(self, tree_cache, *, max_running_requests: int) -> None:
-        """Startup profiling hook; policies without profiling leave it a no-op."""
+        """Run startup measurements requested by a profiling-capable policy."""
+        if not isinstance(self.params, AdaptiveProfilingPolicy):
+            return
+
+        profile = self.params.profile_plan(
+            self.worker, max_running_requests=max_running_requests
+        )
+        if not profile.points:
+            log_info_on_rank0(
+                logger,
+                "Adaptive speculative profiling skipped: no eligible batch sizes.",
+            )
+            return
+
+        from sglang.srt.speculative.spec_profiling_session import SpecProfilingSession
+
+        original_steps = self.worker.speculative_num_steps
+        log_info_on_rank0(
+            logger,
+            f"Adaptive speculative profiling: {len(profile.points)} points, "
+            f"seq_len={profile.seq_len}, n_warmup={profile.n_warmup}, "
+            f"n_measure={profile.n_measure}",
+        )
+        for point in profile.points:
+            self._activate(point.steps)
+            avg_ms = SpecProfilingSession(
+                worker=self.worker,
+                tree_cache=tree_cache,
+                batch_size=point.batch_size,
+                num_steps=point.steps,
+                seq_len=profile.seq_len,
+                n_warmup=profile.n_warmup,
+                n_measure=profile.n_measure,
+            ).measure()
+            self.params.record_profile(
+                point.batch_size, point.steps, _broadcast_float_from_rank0(avg_ms)
+            )
+
+        self._activate(original_steps)
+        log_info_on_rank0(
+            logger,
+            f"Adaptive speculative profiling complete: {self.params.profile_summary()}",
+        )
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
@@ -147,3 +251,4 @@ class AdaptiveController:
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
         self.worker.apply_runtime_state(state)
+        self.params.on_state_activated(speculative_num_steps)

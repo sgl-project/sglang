@@ -5,7 +5,6 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 
 from __future__ import annotations
 
-import bisect
 import json
 import logging
 import math
@@ -16,12 +15,34 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.speculative.adaptive_step_router import AdaptiveStepRouter
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_adaptive_strategy(cfg_path: str | None = None) -> str:
+    """Read the strategy selector from the adaptive config (defaults to EMA)."""
+    if cfg_path is None:
+        return "ema"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            "speculative adaptive config must be a JSON object, "
+            f"got {type(cfg).__name__}"
+        )
+    strategy = cfg.get("strategy", "ema")
+    if strategy not in ("ema", "throughput_aware"):
+        raise ValueError(
+            "speculative adaptive config 'strategy' must be 'ema' or "
+            f"'throughput_aware', got {strategy!r}"
+        )
+    return strategy
+
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
@@ -86,7 +107,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
         )
-    if cfg.speculative_adaptive_strategy == "throughput_aware" and cfg.pp_size != 1:
+    if (
+        resolve_adaptive_strategy(cfg.speculative_adaptive_config) == "throughput_aware"
+        and cfg.pp_size != 1
+    ):
         return (
             f"pp_size={cfg.pp_size} is not supported by throughput-aware adaptive "
             "profiling (synthetic startup batches do not traverse PP stages)"
@@ -137,6 +161,13 @@ def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
+    if resolve_adaptive_strategy(cfg_path) == "throughput_aware":
+        from sglang.srt.speculative.throughput_aware_controller import (
+            resolve_throughput_aware_candidate_steps,
+        )
+
+        return resolve_throughput_aware_candidate_steps(cfg_path)
+
     _, bs_entries = _load_adaptive_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
@@ -278,9 +309,7 @@ class AdaptiveSpeculativeParams:
         cfg_path: str | None = None,
     ):
         cfg, bs_entries = _load_adaptive_config(cfg_path)
-        self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
-        self._cuda_graph_bs: list[int] | None = None
 
         for bs, entry in sorted(bs_entries.items()):
             self._slots[bs] = AdaptiveStepSlot(
@@ -288,7 +317,13 @@ class AdaptiveSpeculativeParams:
                 cfg={**cfg, **entry},
             )
 
-        first_slot = self._slots[self._bs_list[0]]
+        self._router = AdaptiveStepRouter(
+            {
+                batch_size: slot.candidate_steps
+                for batch_size, slot in self._slots.items()
+            }
+        )
+        first_slot = self._slots[min(self._slots)]
         log_info_on_rank0(
             logger,
             f"AdaptiveSpeculativeParams initialized: "
@@ -299,16 +334,19 @@ class AdaptiveSpeculativeParams:
     @cached_property
     def candidate_steps(self) -> list[int]:
         """Union of all BS slots' candidate steps."""
-        return sorted({s for p in self._slots.values() for s in p.candidate_steps})
+        return self._router.candidate_steps
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
-        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+        self._router.set_cuda_graph_bs(cuda_graph_bs)
 
     def get_steps_for_batch(self, batch_size: int) -> int:
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
 
@@ -319,34 +357,17 @@ class AdaptiveSpeculativeParams:
             return params.current_steps
         return None
 
+    def on_state_activated(self, steps: int) -> None:
+        """EMA slots already own their selected steps; no extra synchronization."""
+
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
         """Return cuda_graph_bs values that can reach *step* at runtime.
 
         Returns ``None`` when CUDA graphs are disabled (``set_cuda_graph_bs``
         was never called or was called with ``None``).
         """
-        if self._cuda_graph_bs is None:
-            return None
-        return [
-            v
-            for v in self._cuda_graph_bs
-            if step in self._slots[self._find_closest_bs(v)].candidate_steps
-        ]
+        return self._router.cuda_graph_bs_for_step(step)
 
     def _route(self, batch_size: int) -> AdaptiveStepSlot:
         """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
-        return self._slots[
-            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        ]
-
-    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
-        if self._cuda_graph_bs is None:
-            return batch_size
-        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
-        return (
-            self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
-        )
-
-    def _find_closest_bs(self, target: int) -> int:
-        idx = bisect.bisect_right(self._bs_list, target) - 1
-        return self._bs_list[max(0, idx)]
+        return self._slots[self._router.batch_size_key_for_batch(batch_size)]
