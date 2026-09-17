@@ -100,16 +100,53 @@ class SortedHelpFormatter(argparse.HelpFormatter):
         super().add_arguments(actions)
 
 
-@lru_cache
-def _print_info_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.info(msg, stacklevel=2)
+# `logger.warning_once(msg, *args)` is bound as MethodType(_print_warning_once,
+# logger), so there is exactly ONE frame between the caller and logger.warning --
+# and stacklevel=2 is part of the observable contract, asserted literally by
+# test_diffusion_bcg_padding. Any helper in between pushes the record's filename
+# to this file and breaks that assertion, so the dedup cannot be an lru_cache on
+# a second function.
+#
+# It also cannot be an lru_cache on THIS function: keyed on the arguments it would
+# hold a strong reference to each one for the life of the process, and callers
+# here pass tensors. Hence a set of formatted text, which stores only strings.
+#
+# The args themselves are new: these helpers used to take the message alone, so a
+# caller that formatted lazily -- the way the standard contract implies -- raised
+# TypeError instead of logging, always on a branch too rare to have been seen.
+_logged_once: set[tuple[str, int, str]] = set()
 
 
-@lru_cache
-def _print_warning_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.warning(msg, stacklevel=2)
+def _log_once_guard(logger: Logger, level: int, msg: str, *args: Any) -> str | None:
+    """The text to log, or None when this message has already been logged."""
+    text = msg % args if args else msg
+    key = (logger.name, level, text)
+    if key in _logged_once:
+        return None
+    _logged_once.add(key)
+    return text
+
+
+def _print_info_once(logger: Logger, msg: str, *args: Any) -> None:
+    text = _log_once_guard(logger, logging.INFO, msg, *args)
+    # stacklevel=2 is asserted literally by test_diffusion_bcg_padding, so it is
+    # contract rather than a tuning knob. It does NOT reach the caller: init_logger
+    # also patches `warning` into a forwarder to `logger.log`, adding a frame, so
+    # the record names this module. That was true before these helpers too.
+    if text is not None:
+        logger.info(text, stacklevel=2)
+
+
+def _print_warning_once(logger: Logger, msg: str, *args: Any) -> None:
+    text = _log_once_guard(logger, logging.WARNING, msg, *args)
+    if text is not None:
+        logger.warning(text, stacklevel=2)
+
+
+# These were lru_cache objects, so `.cache_clear()` was part of their surface and
+# a test resets the dedup through it.
+_print_info_once.cache_clear = _logged_once.clear
+_print_warning_once.cache_clear = _logged_once.clear
 
 
 def get_is_main_process():
@@ -167,19 +204,19 @@ class _SGLDiffusionLogger(Logger):
         `intel_extension_for_pytorch.utils._logger`.
     """
 
-    def info_once(self, msg: str) -> None:
+    def info_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`info`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_info_once(self, msg)
+        _print_info_once(self, msg, *args)
 
-    def warning_once(self, msg: str) -> None:
+    def warning_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`warning`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_warning_once(self, msg)
+        _print_warning_once(self, msg, *args)
 
     def info(  # type: ignore[override]
         self,
@@ -454,13 +491,13 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     # Install access log path filter into LOGGING_CONFIG so it survives

@@ -68,7 +68,15 @@ def speculative_sampling_classic_kernel(
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
 
-        if coin * q < p:
+        # X was sampled from q, so q(X) has to be a positive probability.
+        # Anything else means this row is not the distribution X came from, and
+        # `coin * q < p` would then accept unconditionally -- -inf < p for an
+        # -inf q, 0 < p for a zero one, and the range guard the residual passes
+        # use lets zero through. Reject instead: the residual path resamples
+        # from the target, which is the safe direction to fail in.
+        q_is_prob = (q > 0.0) & (q <= 1.0)
+
+        if q_is_prob & (coin * q < p):
             num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
@@ -111,8 +119,10 @@ def speculative_sampling_classic_kernel(
         else:
             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
             q_val = tl.load(q_ptr, mask=mask, other=0.0)
-            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
-            q_val = tl.where(q_val == q_val, q_val, 0.0)
+            # Treat any non-probability q (NaN, +-inf, negative) as 0: the
+            # residual falls back to p. A comparison against NaN is false, so
+            # the range test rejects it along with the infinities.
+            q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
             diff = p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
 
@@ -139,8 +149,8 @@ def speculative_sampling_classic_kernel(
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
-                # Same NaN-q guard as pass 1.
-                q_val = tl.where(q_val == q_val, q_val, 0.0)
+                # Same guard as pass 1.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
                 diff = p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 

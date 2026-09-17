@@ -308,10 +308,19 @@ def create_or_update_configmap(cm_name: str, data: dict, namespace: str):
             raise
 
 
-def prepare_cm_data(namespace, pod_string):
-    """Prepare a configmap data: {pod_name: pod_ip} by the running pod's information."""
+def prepare_cm_data(namespace, pod_string, run_id=None):
+    """Prepare a configmap data: {pod_name: pod_ip} by the running pod's information.
+
+    When run_id is provided, the label selector is scoped to that run_id so that
+    concurrent runs in the same namespace do not pollute each other's ConfigMap.
+    The pod_string filter (final_kube_job_name) still acts as a safety net.
+    """
+    if run_id:
+        label_selector = f"app=sgl-ascend,run-id={run_id}"
+    else:
+        label_selector = "app=sgl-ascend"
     pods = core_api.list_namespaced_pod(
-        namespace=namespace, label_selector="app=sgl-ascend"
+        namespace=namespace, label_selector=label_selector
     )
     data = {}
     for pod in pods.items:
@@ -492,6 +501,13 @@ def monitor_pod_logs(
 
 
 def generate_metrics_json(metrics_data_file, test_case, status):
+    """Collect [METRIC] lines from the log and write metrics.json.
+
+    This writes ${metrics_data_file}/metrics.json only, which feeds the
+    persistence-directory output (e.g. /root/.cache/tests/output/...).
+    It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
+    'Upload metrics' path was removed).
+    """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
@@ -544,10 +560,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
 
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
-
 
 def run_npu_e2e_test_case(
     docker_image_url: str,
@@ -563,6 +575,7 @@ def run_npu_e2e_test_case(
     env="debug",
     trouble_shotting=False,
     transformers_version="",
+    run_id: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -578,6 +591,8 @@ def run_npu_e2e_test_case(
         sglang_is_in_ci (bool): whether running in CI environment.
         install_sglang_from_source (bool): whether installing sglang from source or use docker image directly.
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
+        run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
+            isolation when multiple runs share the same k8s namespace.
     """
     random_str = get_unique_random_string(16, True)
 
@@ -629,6 +644,7 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
+                "run_id": run_id,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -652,6 +668,7 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
+                "run_id": run_id,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -680,6 +697,7 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
+                "run_id": run_id,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -699,7 +717,9 @@ def run_npu_e2e_test_case(
         ):
             if kube_job_type != "single":
                 matching_pod_string = final_kube_job_name
-                cm_data = prepare_cm_data(kube_name_space, matching_pod_string)
+                cm_data = prepare_cm_data(
+                    kube_name_space, matching_pod_string, run_id=run_id
+                )
                 if not cm_data:
                     logger.info(
                         f"No sglang pod found while matching {matching_pod_string}"
@@ -870,6 +890,14 @@ if __name__ == "__main__":
         help="The transformers version number for running sglang. Use default version in image if keep empty.",
     )
 
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        required=False,
+        default="",
+        help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -886,6 +914,7 @@ if __name__ == "__main__":
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
+    run_id = args.run_id
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -915,4 +944,5 @@ if __name__ == "__main__":
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
+        run_id=run_id,
     )
