@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.mlx.fx_lowering import (
     MlxFxLoweringRegistry,
+    UnsupportedMlxFxGraphError,
     _lower_mlx_node,
     build_mlx_fx_plan,
     make_mlx_fx_executor,
@@ -58,6 +59,22 @@ def _check_lowering(inputs, **kwargs):
     actual = torch.from_numpy(np.array(actual.astype(mx.float32)))
     torch.testing.assert_close(actual, expected.float(), atol=5e-3, rtol=5e-3)
     return actual
+
+
+@pytest.mark.parametrize("heads", [(4, 2, 2), (4, 1, 2), (4, 2, 1), (4, 4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_sdpa_gqa_repeats_key_and_value_independently(heads, dtype):
+    inputs = _inputs(2, 5, heads=heads, dtype=dtype)
+    _check_lowering(inputs, enable_gqa=True, scale=0.25)
+
+
+@pytest.mark.parametrize("heads", [(3, 2, 2), (4, 2, 3)])
+def test_sdpa_rejects_nondivisible_gqa_heads(heads):
+    inputs = _inputs(2, 5, heads=heads)
+    with pytest.raises(RuntimeError):
+        F.scaled_dot_product_attention(*inputs, enable_gqa=True)
+    with pytest.raises(UnsupportedMlxFxGraphError, match="GQA"):
+        _lower_mlx_node("sdpa", tuple(map(_to_mlx, inputs)), {"enable_gqa": True})
 
 
 @pytest.mark.parametrize("mask_kind", ["boolean", "additive"])

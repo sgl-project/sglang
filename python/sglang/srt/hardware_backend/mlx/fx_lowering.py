@@ -300,10 +300,25 @@ def _lower_sdpa(mx, args, kwargs):
     enable_gqa = _arg(args, kwargs, 7, "enable_gqa", False)
     if dropout not in (None, 0, 0.0):
         raise UnsupportedMlxFxGraphError("SDPA dropout is unsupported")
-    if enable_gqa and query.shape[-3] != key.shape[-3]:
-        repeats = query.shape[-3] // key.shape[-3]
-        key = mx.repeat(key, repeats, axis=-3)
-        value = mx.repeat(value, repeats, axis=-3)
+    if enable_gqa:
+        if any(tensor.ndim < 3 for tensor in (query, key, value)):
+            raise UnsupportedMlxFxGraphError("SDPA GQA requires a head dimension")
+        query_heads, key_heads, value_heads = (
+            tensor.shape[-3] for tensor in (query, key, value)
+        )
+        if (
+            key_heads == 0
+            or value_heads == 0
+            or query_heads % key_heads
+            or query_heads % value_heads
+        ):
+            raise UnsupportedMlxFxGraphError(
+                "SDPA GQA key/value head counts must divide query heads"
+            )
+        if query_heads != key_heads:
+            key = mx.repeat(key, query_heads // key_heads, axis=-3)
+        if query_heads != value_heads:
+            value = mx.repeat(value, query_heads // value_heads, axis=-3)
     scale = float(scale) if scale is not None else 1.0 / sqrt(query.shape[-1])
     scores = (query @ mx.swapaxes(key, -1, -2)) * scale
     if causal:
