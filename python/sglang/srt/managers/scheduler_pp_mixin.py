@@ -846,6 +846,10 @@ class SchedulerPPMixin:
                 tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
                 if result.cap_lens is not None:
                     tensor_dict["dspark_cap_lens"] = result.cap_lens
+        elif result.pp_dspark_draft_idle:
+            tensor_dict["dspark_draft_idle"] = result.next_token_ids.new_ones(
+                (1,), dtype=torch.uint8
+            )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1057,6 +1061,8 @@ class SchedulerPPMixin:
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
+        self._pp_schedule_relayed_dspark_idle_draft(batch, pp_outputs)
+
         if "dspark_projected_context" in pp_outputs.tensors:
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 make_next_draft_input,
@@ -1251,6 +1257,23 @@ class SchedulerPPMixin:
         work = self._pp_dspark_draft_ready_queue.pop(identities)
         with torch.profiler.record_function("pp_dspark_draft_bubble"):
             return self.model_worker.prepare_pp_draft(work.batch, work.draft_input)
+
+    def _pp_schedule_dspark_idle_draft(self: Scheduler, batch: ScheduleBatch) -> None:
+        with torch.profiler.record_function("pp_dspark_draft_bubble"):
+            self.model_worker.prepare_pp_idle_draft(batch)
+
+    def _pp_schedule_relayed_dspark_idle_draft(
+        self: Scheduler, batch: ScheduleBatch, pp_outputs: PPProxyTensors
+    ) -> None:
+        if (
+            "dspark_draft_idle" not in pp_outputs.tensors
+            or not self.pp_group.is_first_rank
+        ):
+            return
+        self.forward_stream.wait_stream(self.copy_stream)
+        with self.forward_stream_ctx:
+            self._pp_schedule_dspark_idle_draft(batch)
+        self.copy_stream.wait_stream(self.forward_stream)
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -1711,7 +1734,9 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
-                if (
+                if result.pp_dspark_draft_idle:
+                    self._pp_schedule_dspark_idle_draft(cur_batch)
+                elif (
                     result.pp_dspark_projected_context is not None
                     and result.accept_lens is not None
                     and result.pp_dspark_next_proposal is None

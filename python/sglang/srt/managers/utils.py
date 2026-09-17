@@ -115,6 +115,7 @@ class GenerationBatchResult:
     pp_dspark_commit_state: Optional[Any] = None
     pp_dspark_projected_context: Optional[torch.Tensor] = None
     pp_dspark_next_proposal: Optional[dict] = None
+    pp_dspark_draft_idle: bool = False
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec

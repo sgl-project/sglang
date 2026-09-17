@@ -202,12 +202,16 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
         device = self.model_runner.device
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(None, armed=False)
+        num_dummy_slots = (
+            int(idle_layout.verify_lens.numel()) if idle_layout is not None else 0
+        )
         num_dummy_tokens = (
             idle_layout.graph_num_tokens if idle_layout is not None else 0
         )
@@ -226,8 +230,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
         )
+        # DP padding materializes this zero-token lane to the active verify
+        # geometry. Keep the same model path even when no ragged layout is used.
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
         if idle_layout is not None:
-            num_dummy_slots = int(idle_layout.verify_lens.numel())
             batch.seq_lens = torch.ones(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
@@ -236,7 +242,6 @@ class TargetVerifyExecutor:
             )
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -244,6 +249,7 @@ class TargetVerifyExecutor:
         return self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )

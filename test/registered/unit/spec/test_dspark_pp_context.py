@@ -1,5 +1,6 @@
 import os
 import unittest
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,7 +15,13 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
 )
@@ -27,6 +34,7 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     _BlockFp8LinearSlice,
 )
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
     use_empty_draft_model_for_pp_prefill,
@@ -38,6 +46,9 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa:
     DSparkWorkerV2,
     PPDSparkCommitState,
     _is_context_only_pp_prefill_rank,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import (  # noqa: E402
+    TargetVerifyExecutor,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -73,6 +84,39 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_idle_verify_without_ragged_layout_uses_target_verify_mode(self):
+        target_worker = Mock()
+        target_worker.forward_batch_generation.return_value = object()
+        executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
+        executor.model_runner = SimpleNamespace(device="cpu")
+        executor.verify_num_draft_tokens = 5
+        executor.verify_epilogue = None
+        executor.target_worker = target_worker
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            global_num_tokens=[0, 1, 1, 1],
+            global_num_tokens_for_logprob=[0, 1, 1, 1],
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "DFlashVerifyInput.prepare_for_verify",
+            return_value=(
+                SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                False,
+            ),
+        ):
+            executor.run_idle_participation(batch=batch, idle_layout=None)
+
+        self.assertEqual(batch.forward_mode, ForwardMode.TARGET_VERIFY)
+        forward_batch = target_worker.forward_batch_generation.call_args.kwargs[
+            "forward_batch"
+        ]
+        self.assertEqual(forward_batch.forward_mode, ForwardMode.TARGET_VERIFY)
+
     def test_replicated_commit_writes_only_locally_owned_rows(self):
         rids = []
         for owner in range(2):
@@ -160,15 +204,13 @@ class TestDSparkPPContext(CustomTestCase):
 
     @patch(
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
-        return_value=SimpleNamespace(
-            enable_dp_attention=True,
-        ),
+        return_value=SimpleNamespace(enable_dp_attention=True),
     )
-    def test_replicated_idle_lane_matches_verify_then_draft_order(self, _):
+    def test_replicated_final_idle_lane_defers_draft_to_scheduler(self, _):
         calls = []
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker.device = "cpu"
-        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2, attn_dp_rank=0)
+        worker.ps = SimpleNamespace(pp_rank=1, pp_size=2, attn_dp_rank=0)
         worker._pp_draft_dp_enabled = True
         worker._replicated_pp_decode = True
         worker._draft_is_moe = True
@@ -184,21 +226,135 @@ class TestDSparkPPContext(CustomTestCase):
             lambda batch: calls.append(("draft", batch))
         )
         worker._idle_verify_ragged_layout = Mock(return_value=None)
-        worker._decode_idle_result = Mock()
+        idle_result = object()
+        worker._decode_idle_result = Mock(return_value=idle_result)
+        pp_proxy_tensors = object()
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: True),
-            global_num_tokens=[3, 2, 5, 2],
-            global_num_tokens_for_logprob=[3, 2, 5, 2],
+            spec_info=DFlashDraftInputV2.create_idle_input(device="cpu"),
+            global_num_tokens=[0, 2, 1, 0],
+            global_num_tokens_for_logprob=[0, 2, 1, 0],
             global_pp_dspark_owned_num_tokens=[0, 2, 1, 0],
         )
 
-        result = worker._forward_decode(batch, on_publish=None)
+        result = worker._forward_decode(
+            batch, on_publish=None, pp_proxy_tensors=pp_proxy_tensors
+        )
+
+        self.assertIs(result, idle_result)
+        worker._decode_idle_result.assert_called_once_with(
+            on_publish=None, draft_idle=True
+        )
+        self.assertEqual([name for name, _ in calls], ["verify"])
+        worker._proposer.run_idle_participation.assert_not_called()
+        self.assertIs(calls[0][1], batch)
+        self.assertIs(
+            worker._verify_executor.run_idle_participation.call_args.kwargs[
+                "pp_proxy_tensors"
+            ],
+            pp_proxy_tensors,
+        )
+
+    @patch(
+        "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+        return_value=SimpleNamespace(enable_dp_attention=True),
+    )
+    def test_replicated_nonfinal_idle_lane_only_forwards_verify_proxy(self, _):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2, attn_dp_rank=0)
+        worker._replicated_pp_decode = True
+        worker._draft_is_moe = True
+        worker._observers = Mock()
+        worker._verify_executor = Mock()
+        verify_result = object()
+        worker._verify_executor.run_idle_participation.return_value = verify_result
+        worker._proposer = Mock()
+        worker._idle_verify_ragged_layout = Mock(return_value=None)
+        worker._decode_idle_result = Mock()
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            spec_info=DFlashDraftInputV2.create_idle_input(device="cpu"),
+            global_num_tokens=[0, 2, 1, 0],
+        )
+
+        result = worker._forward_decode(
+            batch, on_publish=None, pp_proxy_tensors=object()
+        )
 
         self.assertIs(result, verify_result)
         worker._decode_idle_result.assert_not_called()
-        self.assertEqual([name for name, _ in calls], ["verify", "draft"])
-        self.assertIs(calls[0][1], batch)
-        self.assertEqual(calls[1][1].global_num_tokens, [0, 2, 1, 0])
+        worker._proposer.run_idle_participation.assert_not_called()
+
+    def test_prepare_pp_idle_draft_uses_gathered_owner_counts(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.ps = SimpleNamespace(attn_dp_rank=0)
+        worker._pp_draft_dp_enabled = True
+        worker._draft_context = Mock(return_value=nullcontext())
+        worker._observers = Mock()
+        worker._observers.segment.return_value = nullcontext()
+        worker._proposer = Mock()
+        batch = SimpleNamespace(global_pp_dspark_owned_num_tokens=[0, 2, 1, 0])
+
+        worker.prepare_pp_idle_draft(batch)
+
+        idle_batch = worker._proposer.run_idle_participation.call_args.args[0]
+        self.assertEqual(idle_batch.global_num_tokens, [0, 2, 1, 0])
+        self.assertEqual(idle_batch.global_num_tokens_for_logprob, [0, 2, 1, 0])
+
+    def test_pp_launch_schedules_idle_draft_after_run_batch(self):
+        result = GenerationBatchResult(pp_dspark_draft_idle=True)
+        scheduler = SimpleNamespace(
+            forward_stream_ctx=nullcontext(),
+            forward_stream=Mock(),
+            schedule_stream=Mock(),
+            run_batch=Mock(return_value=result),
+            _pp_schedule_dspark_idle_draft=Mock(),
+            device_module=SimpleNamespace(
+                Event=Mock(return_value=Mock()), current_stream=Mock()
+            ),
+            pp_group=SimpleNamespace(is_last_rank=False),
+        )
+        batch = SimpleNamespace(
+            reqs=[],
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        )
+        metadata = [None]
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+            return_value=SimpleNamespace(
+                speculative_dspark_pp_replicated_draft=False
+            ),
+        ):
+            SchedulerPPMixin._pp_launch_batch(
+                scheduler, 0, batch, None, metadata, deque()
+            )
+
+        scheduler._pp_schedule_dspark_idle_draft.assert_called_once_with(batch)
+
+    def test_pp_relay_schedules_idle_draft_on_first_stage(self):
+        scheduler = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True),
+            forward_stream=Mock(),
+            copy_stream=Mock(),
+            forward_stream_ctx=nullcontext(),
+            _pp_schedule_dspark_idle_draft=Mock(),
+        )
+        batch = object()
+        outputs = PPProxyTensors({"dspark_draft_idle": torch.ones(1)})
+
+        SchedulerPPMixin._pp_schedule_relayed_dspark_idle_draft(
+            scheduler, batch, outputs
+        )
+
+        scheduler.forward_stream.wait_stream.assert_called_once_with(
+            scheduler.copy_stream
+        )
+        scheduler._pp_schedule_dspark_idle_draft.assert_called_once_with(batch)
+        scheduler.copy_stream.wait_stream.assert_called_once_with(
+            scheduler.forward_stream
+        )
 
     def test_full_projection_fast_path_requires_final_pp_owner(self):
         with patch.dict(

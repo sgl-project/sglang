@@ -1029,6 +1029,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         *,
         on_publish,
+        draft_idle: bool = False,
     ) -> GenerationBatchResult:
         next_draft_input = make_next_draft_input(
             bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
@@ -1045,6 +1046,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=False,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=next_draft_input.new_seq_lens,
+            pp_dspark_draft_idle=draft_idle,
         )
 
     def _forward_decode(
@@ -1068,21 +1070,28 @@ class DSparkWorkerV2(BaseSpecWorker):
                 idle_layout = self._idle_verify_ragged_layout(batch)
                 if self._replicated_pp_decode:
                     idle_verify_result = self._verify_executor.run_idle_participation(
-                        batch=batch, idle_layout=idle_layout
+                        batch=batch,
+                        idle_layout=idle_layout,
+                        pp_proxy_tensors=pp_proxy_tensors,
                     )
-                    if self._draft_is_moe:
-                        self._proposer.run_idle_participation(
-                            self._pp_draft_sync_batch(batch, local_bs=0)
-                        )
                     if self.ps.pp_rank < self.ps.pp_size - 1:
                         return idle_verify_result
                 else:
                     if self._draft_is_moe:
                         self._proposer.run_idle_participation(batch)
                     self._verify_executor.run_idle_participation(
-                        batch=batch, idle_layout=idle_layout
+                        batch=batch,
+                        idle_layout=idle_layout,
+                        pp_proxy_tensors=pp_proxy_tensors,
                     )
-            return self._decode_idle_result(on_publish=on_publish)
+            return self._decode_idle_result(
+                on_publish=on_publish,
+                draft_idle=(
+                    self._replicated_pp_decode
+                    and self._draft_is_moe
+                    and get_parallel().enable_dp_attention
+                ),
+            )
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -1434,6 +1443,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
                 self._proposer.run_idle_participation(draft_batch)
         return payload
+
+    def prepare_pp_idle_draft(self, batch: ScheduleBatch) -> None:
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            self._proposer.run_idle_participation(
+                self._pp_draft_sync_batch(batch, local_bs=0)
+            )
 
     def _pp_draft_sync_batch(
         self, batch: ScheduleBatch, *, local_bs: int
