@@ -1216,8 +1216,11 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
 
     def __init__(self, config):
         super().__init__(config)
+        quant_config = config.quant_config
         config = config.arch_config
-        self.model = Qwen3VLModel(config)
+        self.model = Qwen3VLModel(
+            config, quant_config=quant_config, use_tensor_parallel=True, prefix="model"
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )

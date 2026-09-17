@@ -200,7 +200,7 @@ def test_qwen3vl_ties_lm_head_to_input_embeddings():
         _fsdp_shard_conditions=[],
         stacked_params_mapping=[],
     )
-    config = SimpleNamespace(arch_config=arch_config)
+    config = SimpleNamespace(arch_config=arch_config, quant_config=None)
 
     with get_parallel().override(tp_size=1, tp_rank=0):
         model = Qwen3VLForConditionalGeneration(config)

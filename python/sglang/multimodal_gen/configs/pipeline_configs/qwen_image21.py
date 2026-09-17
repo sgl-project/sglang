@@ -63,6 +63,9 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
         return batch.extra["qwen21_negative"]
 
     def post_denoising_loop(self, latents, batch):
+        # decode consumes only target latents, not the condition prefix or its KV cache
+        batch.extra.pop("qwen21_positive", None)
+        batch.extra.pop("qwen21_negative", None)
         return latents.transpose(1, 2).reshape(
             latents.shape[0], -1, 1, batch.height // 16, batch.width // 16
         )

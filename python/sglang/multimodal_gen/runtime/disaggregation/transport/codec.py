@@ -26,6 +26,8 @@ _DTYPE_TO_STR = {
     torch.int64: "int64",
     torch.uint8: "uint8",
     torch.bool: "bool",
+    torch.complex64: "complex64",
+    torch.complex128: "complex128",
 }
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 

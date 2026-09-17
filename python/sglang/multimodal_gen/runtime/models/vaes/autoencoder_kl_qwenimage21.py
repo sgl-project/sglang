@@ -6,7 +6,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelConv2d,
+    chunk_height_by_sizes,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    gather_variable_height,
+    split_height_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 def get_activation(name):
@@ -251,11 +267,14 @@ class QwenImage21AttentionBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
+        self.spatial_parallel = False
         self.norm = QwenImage21RMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
+        if self.spatial_parallel:
+            x, heights = gather_variable_height(x)
         identity = x
         batch_size, channels, time, height, width = x.size()
         x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
@@ -273,7 +292,8 @@ class QwenImage21AttentionBlock(nn.Module):
         x = self.proj(x)
         x = x.view(batch_size, time, channels, height, width)
         x = x.permute(0, 2, 1, 3, 4)
-        return x + identity
+        x = x + identity
+        return chunk_height_by_sizes(x, heights) if self.spatial_parallel else x
 
 
 class QwenImage21MidBlock(nn.Module):
@@ -618,6 +638,39 @@ def _unpatchify(x, patch_size):
     return x
 
 
+class QwenImage21SpatialConv3d(SpatialParallelConv2d):
+    def forward(self, x, cache_x=None):
+        assert cache_x is None
+        return super().forward(x.squeeze(2)).unsqueeze(2)
+
+
+def enable_qwen21_spatial_decode(module):
+    for name, child in list(module.named_children()):
+        if isinstance(child, QwenImage21AttentionBlock):
+            # attention needs the full image; its pointwise projections stay local
+            child.spatial_parallel = True
+        elif isinstance(child, nn.Conv2d):
+            causal = isinstance(child, QwenImage21CausalConv3d)
+            conv_cls = QwenImage21SpatialConv3d if causal else SpatialParallelConv2d
+            padding = (
+                (child._padding[2], child._padding[0]) if causal else child.padding
+            )
+            conv = conv_cls(
+                child.in_channels,
+                child.out_channels,
+                child.kernel_size,
+                stride=child.stride,
+                padding=padding,
+                dilation=child.dilation,
+                groups=child.groups,
+                bias=child.bias is not None,
+            )
+            conv.weight, conv.bias = child.weight, child.bias
+            setattr(module, name, conv)
+        else:
+            enable_qwen21_spatial_decode(child)
+
+
 class AutoencoderKLQwenImage21(ParallelTiledVAE):
     def __init__(self, config: QwenImage21VAEConfig, **kwargs):
         super().__init__(config, **kwargs)
@@ -646,6 +699,11 @@ class AutoencoderKLQwenImage21(ParallelTiledVAE):
                 temperal_upsample=list(ac.temperal_downsample)[::-1],
                 out_channels=ac.out_channels,
             )
+        self.spatial_parallel = (
+            config.load_decoder and can_install_spatial_shard_parallel_decode(config)
+        )
+        if self.spatial_parallel:
+            enable_qwen21_spatial_decode(self.decoder)
 
     def _encode(self, x):
         if x.shape[2] != 1:
@@ -657,9 +715,25 @@ class AutoencoderKLQwenImage21(ParallelTiledVAE):
     def _decode(self, z):
         if z.shape[2] != 1:
             raise ValueError("Qwen-Image 2.1 VAE expects one latent frame")
-        x = self.decoder(self.post_quant_conv(z), first_chunk=True)
+        z = self.post_quant_conv(z)
+        parallel = self.spatial_parallel and should_run_spatial_shard_parallel_decode(
+            self.config, z
+        )
+        if parallel:
+            z, expected_height = split_height_for_parallel_decode(
+                z,
+                expected_height=z.shape[-2] * self.spatial_compression_ratio,
+                world_size=get_decode_parallel_world_size(),
+                rank=get_decode_parallel_rank(),
+            )
+            x = self.decoder(z, first_chunk=True)
+        else:
+            with disable_spatial_parallel_decode():
+                x = self.decoder(z, first_chunk=True)
         if self.config.patch_size is not None:
             x = _unpatchify(x, self.config.patch_size)
+        if parallel:
+            x = gather_and_trim_height(x, expected_height)
         return x.clamp(-1, 1)
 
 

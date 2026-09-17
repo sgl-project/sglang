@@ -86,12 +86,15 @@ def test_adjacent_image_slots_stay_distinct():
 
 def test_latent_pack_decode_contract():
     config = QwenImage21PipelineConfig()
-    batch = SimpleNamespace(height=64, width=96)
+    batch = SimpleNamespace(
+        height=64, width=96, extra={"qwen21_positive": {}, "qwen21_negative": {}}
+    )
     shape = config.prepare_latent_shape(batch, 2, 1)
     x = torch.arange(torch.tensor(shape).prod()).reshape(shape)
     packed = config.maybe_pack_latents(x, 2, batch)
     assert packed.shape == (2, 24, 64)
     decoded = config.post_denoising_loop(packed, batch)
+    assert not batch.extra
     torch.testing.assert_close(decoded[:, :, 0], x[:, 0])
     scale, shift = config.get_decode_scale_and_shift("cpu", torch.float32, None)
     torch.testing.assert_close(
