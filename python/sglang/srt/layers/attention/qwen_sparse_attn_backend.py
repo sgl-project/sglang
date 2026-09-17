@@ -225,6 +225,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
 
+    @property
+    def _pending_ring_groups(self) -> int:
+        """Groups the pending index-K ring holds; the pool fixes this at construction."""
+        return self.token_to_kv_pool.qsa_num_groups
+
     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
         if forward_mode is None or not forward_mode.is_target_verify():
             return
@@ -233,13 +238,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        window = self.compress_ratio * self._pending_ring_groups
+        if draft_tokens > window:
+            # The ring keys state by position % ratio within a group, so a window
+            # wider than every group it holds would collide within one forward.
             raise NotImplementedError(
                 "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                f"compress ratio ({self.compress_ratio}) times the pending "
+                f"index-key ring's group count ({self._pending_ring_groups}): "
+                f"got {draft_tokens}"
             )
 
     @staticmethod
@@ -674,6 +681,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
+                num_groups=self._pending_ring_groups,
             )
             if write_locs.numel():
                 if group_member_rows is not None:
@@ -691,6 +699,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        num_groups=self._pending_ring_groups,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -835,9 +844,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
     ) -> None:
-        self._require_chain_speculation(forward_mode, spec_info)
+        # The guard reads the ring's group count off the pool, so resolve it first.
         if self.token_to_kv_pool is None:
             self.token_to_kv_pool = getattr(self.runner, "token_to_kv_pool", None)
+        self._require_chain_speculation(forward_mode, spec_info)
         if self.req_to_token is None:
             req_pool = getattr(self.runner, "req_to_token_pool", None)
             self.req_to_token = getattr(req_pool, "req_to_token", None)
@@ -1090,6 +1100,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=current_positions,
                 compress_ratio=ratio,
                 is_extend=False,
+                num_groups=pool.qsa_num_groups,
             )
         )
         metadata.graph_ring_group_locs.copy_(
@@ -1098,6 +1109,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                num_groups=pool.qsa_num_groups,
             ).to(torch.int32)
         )
 
