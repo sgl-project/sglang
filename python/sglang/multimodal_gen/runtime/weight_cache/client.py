@@ -81,7 +81,13 @@ class WeightCacheClient:
     def request(self, kind, **fields):
         send_msg(
             self.sock,
-            {**PROTOCOL, "type": kind, "compatibility": self.plan.to_dict(), **fields},
+            {
+                **PROTOCOL,
+                "type": kind,
+                "compatibility": self.plan.to_dict(),
+                "consumer": msgspec.to_builtins(ProcessIdentity.read(os.getpid())),
+                **fields,
+            },
         )
         response = recv_msg(self.sock)
         validate_response(response)

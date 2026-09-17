@@ -45,6 +45,48 @@ class ProducerDiedError(RuntimeError):
     pass
 
 
+class ProcessHandle:
+    """Pin a process identity for race-free consumer signalling on Linux.
+
+    Owners require pidfd support rather than ever signalling a recycled PID.
+    An observation error raises: it must not be interpreted as safe to free IPC
+    allocations. Keep this handle until confirmed exit, then close it.
+    """
+
+    def __init__(self, identity: ProcessIdentity):
+        self.identity = identity
+        if not hasattr(signal, "pidfd_send_signal"):
+            raise RuntimeError("Weight-cache owner requires Linux pidfd signalling")
+        if ProcessIdentity.read(identity.pid) != identity:
+            raise ProcessLookupError("Consumer identity changed before registration")
+        try:
+            self.fd = os.pidfd_open(identity.pid)
+        except (AttributeError, OSError) as error:
+            raise RuntimeError(
+                "Weight-cache owner requires Linux pidfd support"
+            ) from error
+        try:
+            if ProcessIdentity.read(identity.pid) != identity:
+                raise ProcessLookupError("Consumer changed while opening pidfd")
+            self._poll = select.poll()
+            self._poll.register(self.fd, select.POLLIN)
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def is_alive(self) -> bool:
+        events = self._poll.poll(0)
+        if any(mask & (select.POLLERR | select.POLLNVAL) for _, mask in events):
+            raise RuntimeError("Consumer pidfd monitoring failed")
+        return not events
+
+    def send_signal(self, signum: int) -> None:
+        signal.pidfd_send_signal(self.fd, signum)
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
 class ProducerWatchdog:
     """Start BEFORE importing handles; close only after all mappings are unused.
 

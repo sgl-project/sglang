@@ -15,6 +15,7 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -47,9 +48,11 @@ from sglang.srt.weight_cache.protocol import (
     send_msg,
 )
 from sglang.weight_cache_common.identity import default_runtime_dir
+from sglang.weight_cache_common.liveness import ProcessHandle, ProcessIdentity
 from sglang.weight_cache_common.transport import CudaIpcExporter
 
 logger = init_logger(__name__)
+DRAIN_GRACE_SECONDS = 5.0
 
 
 def private_directory(path):
@@ -93,8 +96,12 @@ class DiffusionWeightCacheDaemon:
         self.plan = compatibility_plan(self.prepared, args, verify_checkpoint=True)
         self.path = locate(self.plan, args)
         self.ready_path = self.path.with_suffix(".ready")
+        self._initialize_control()
+
+    def _initialize_control(self):
         self.stopping = False
-        self.consumers = set()
+        self.consumers = {}
+        self._consumers_lock = threading.Lock()
         self.exporter = None
         self._connection = None
 
@@ -107,6 +114,14 @@ class DiffusionWeightCacheDaemon:
                 self._connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    def _live_consumers(self):
+        with self._consumers_lock:
+            for identity, handle in list(self.consumers.items()):
+                if not handle.is_alive():
+                    handle.close()
+                    del self.consumers[identity]
+            return list(self.consumers.values())
 
     def _request(self, request, peer):
         if self.stopping:
@@ -128,7 +143,7 @@ class DiffusionWeightCacheDaemon:
                 "generation": msgspec.to_builtins(generation),
                 "cache_status": {
                     **stats,
-                    "active_consumers": sum(p.is_alive() for p in self.consumers),
+                    "active_consumers": len(self._live_consumers()),
                     "accepting_fetches": not stats["admission_stopped"]
                     and not stats["budget_exhausted"],
                 },
@@ -147,12 +162,18 @@ class DiffusionWeightCacheDaemon:
             raise ValueError("Unsupported diffusion weight-cache request/component")
         if decode_generation(request["generation"]) != generation:
             raise ValueError("Weight-cache fetch generation mismatch")
-        if not peer.is_alive():
+        if (
+            msgspec.convert(request["consumer"], type=ProcessIdentity, strict=True)
+            != peer
+            or not peer.is_alive()
+        ):
             raise ProcessLookupError("Consumer exited before fetch")
         # Register actual socket credentials before creating the first handle,
         # including clients which abandon a response or partially import it.
-        self.consumers = {p for p in self.consumers if p.is_alive()}
-        self.consumers.add(peer)
+        self._live_consumers()
+        with self._consumers_lock:
+            if peer not in self.consumers:
+                self.consumers[peer] = ProcessHandle(peer)
         return msgspec.to_builtins(
             self.exporter.export(request["request_id"], generation=generation)
         )
@@ -161,24 +182,47 @@ class DiffusionWeightCacheDaemon:
         if self.exporter is None:
             return
         self.exporter.stop_admission()
+
         # The process identity alone is not a lease on its allocations. Retain
         # the exporter and its model until EVERY actual consumer has exited.
-        for peer in self.consumers:
-            if peer.is_alive():
+        def signal_consumers(signum):
+            for handle in self.consumers.values():
                 try:
-                    os.kill(peer.pid, signal.SIGTERM)
+                    handle.send_signal(signum)
                 except ProcessLookupError:
                     pass
-        deadline = time.monotonic() + 5
-        while any(peer.is_alive() for peer in self.consumers):
-            if time.monotonic() >= deadline:
-                for peer in self.consumers:
-                    if peer.is_alive():
-                        try:
-                            os.kill(peer.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-            time.sleep(0.05)
+                except OSError:
+                    logger.exception(
+                        "Cannot signal consumer %s; retaining allocations",
+                        handle.identity,
+                    )
+
+        signal_consumers(signal.SIGTERM)
+        deadline = time.monotonic() + DRAIN_GRACE_SECONDS
+        escalated = False
+        next_report = deadline
+        while True:
+            try:
+                if not self._live_consumers():
+                    return
+            except Exception:
+                # Unknown is NOT dead. A bad pidfd must never authorize freeing
+                # allocations potentially still referenced by a consumer.
+                logger.exception(
+                    "Cannot confirm consumer exit; retaining owner allocations"
+                )
+            now = time.monotonic()
+            if now >= deadline and not escalated:
+                signal_consumers(signal.SIGKILL)
+                escalated = True
+            if escalated and now >= next_report:
+                logger.critical(
+                    "Owner drain stalled; retaining allocations for %s. "
+                    "Forced owner death is NOT graceful recovery; investigate consumers/GPU health.",
+                    list(self.consumers),
+                )
+                next_report = now + 10
+            time.sleep(0.1)
 
     def _cleanup_stale_files(self):
         # Both device and path locks are held. Never signal a PID from .ready:

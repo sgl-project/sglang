@@ -92,10 +92,7 @@ def _owner(root, plan):
     owner.plan = plan
     owner.path = Path(owner.args.weight_cache_socket)
     owner.ready_path = owner.path.with_suffix(".ready")
-    owner.stopping = False
-    owner.consumers = set()
-    owner.exporter = None
-    owner._connection = None
+    owner._initialize_control()
     with (
         patch.object(
             daemon,

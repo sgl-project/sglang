@@ -2,16 +2,20 @@
 """CPU control-plane regressions; no checkpoint/GPU model is needed."""
 
 import os
+import signal
 import socket
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 
 from sglang.multimodal_gen.runtime.weight_cache import daemon
+from sglang.multimodal_gen.runtime.weight_cache.client import PROTOCOL
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.multimodal_gen.test.unit.test_weight_cache_status import owner_fixture
 from sglang.weight_cache_common.identity import default_runtime_dir
+from sglang.weight_cache_common.liveness import ProcessIdentity
 
 
 def test_device_and_socket_resources_both_exclude_second_owner(tmp_path, monkeypatch):
@@ -83,3 +87,54 @@ def test_endpoint_cleanup_errors_do_not_skip_drain(caplog):
     owner._remove_endpoints()
     owner.path.unlink.assert_called_once_with(missing_ok=True)
     assert "Cannot remove weight-cache endpoint" in caplog.text
+
+
+def test_delayed_socket_with_recycled_peer_identity_is_rejected_before_export():
+    owner = owner_fixture()
+    peer = ProcessIdentity.read(os.getpid())
+    request = {
+        **PROTOCOL,
+        "type": "fetch_component",
+        "component": "transformer",
+        "compatibility": owner.plan.to_dict(),
+        "generation": msgspec.to_builtins(owner.exporter.generation),
+        "consumer": {"pid": peer.pid, "start_ticks": peer.start_ticks - 1},
+    }
+    with pytest.raises(ProcessLookupError):
+        owner._request(request, peer)
+    assert not owner.consumers
+    owner.exporter._backend.export_entries.assert_not_called()
+
+
+def test_drain_signals_once_and_retains_owner_until_confirmed_exit(monkeypatch, caplog):
+    owner = owner_fixture()
+    peer = ProcessIdentity.read(os.getpid())
+    handle = Mock(identity=peer)
+    handle.is_alive.side_effect = [True, True, True, False]
+    owner.consumers[peer] = handle
+    exporter = owner.exporter
+    monkeypatch.setattr(daemon, "DRAIN_GRACE_SECONDS", 0)
+    with patch.object(daemon.time, "sleep") as sleep:
+        owner._drain()
+    assert [c.args[0] for c in handle.send_signal.call_args_list] == [
+        signal.SIGTERM,
+        signal.SIGKILL,
+    ]
+    assert sleep.call_count == 3
+    handle.close.assert_called_once()
+    assert owner.exporter is exporter and not owner.consumers
+    assert "drain stalled" in caplog.text
+
+
+def test_signalling_failure_does_not_abandon_live_allocations(monkeypatch, caplog):
+    owner = owner_fixture()
+    peer = ProcessIdentity.read(os.getpid())
+    handle = Mock(identity=peer)
+    handle.send_signal.side_effect = PermissionError("denied")
+    handle.is_alive.side_effect = [True, False]
+    owner.consumers[peer] = handle
+    monkeypatch.setattr(daemon, "DRAIN_GRACE_SECONDS", 0)
+    with patch.object(daemon.time, "sleep") as sleep:
+        owner._drain()
+    sleep.assert_called_once()
+    assert "retaining allocations" in caplog.text

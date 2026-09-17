@@ -40,18 +40,28 @@ def owner_fixture():
         ProcessIdentity.read(os.getpid()), "nonce", "digest", "gpu", "torch"
     )
     owner = object.__new__(DiffusionWeightCacheDaemon)
-    owner.stopping = False
+    owner._initialize_control()
     owner.plan = CacheCompatibilityPlan.from_fields(component={})
-    owner.consumers = set()
     owner.exporter = exporter
     return owner
 
 
 def request(owner, kind, **fields):
-    return owner._request(
-        {**PROTOCOL, "type": kind, "compatibility": owner.plan.to_dict(), **fields},
-        Mock(is_alive=Mock(return_value=True)),
-    )
+    peer = ProcessIdentity.read(os.getpid())
+    with patch(
+        "sglang.multimodal_gen.runtime.weight_cache.daemon.ProcessHandle"
+    ) as handle:
+        handle.return_value.is_alive.return_value = True
+        return owner._request(
+            {
+                **PROTOCOL,
+                "type": kind,
+                "compatibility": owner.plan.to_dict(),
+                "consumer": msgspec.to_builtins(peer),
+                **fields,
+            },
+            peer,
+        )
 
 
 def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
@@ -60,7 +70,7 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
     assert before["storage_count"] == 3
     assert before["fetches_remaining"] == 2  # storage cap wins, not 4
     assert before["active_consumers"] == 0
-    assert owner.consumers == set()
+    assert owner.consumers == {}
     owner.exporter._backend.export_entries.assert_not_called()
     # Failed deliveries reserve their entire budget; there is no refund.
     owner.exporter._backend.export_entries.side_effect = RuntimeError("partial export")
@@ -92,8 +102,8 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
             request_id=uuid.uuid4().hex,
         )
     # Dead consumers disappear from observations, but never refund sends.
-    for peer in owner.consumers:
-        peer.is_alive.return_value = False
+    for handle in owner.consumers.values():
+        handle.is_alive.return_value = False
     final = request(owner, "query_status")["cache_status"]
     assert final["active_consumers"] == 0
     assert final["storage_exports_reserved"] == 6
