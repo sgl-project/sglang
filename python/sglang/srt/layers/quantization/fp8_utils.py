@@ -584,11 +584,9 @@ def dispatch_w8a8_block_fp8_linear(
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
-
-    Only the Triton kernel reads the weight block size at launch; DeepGEMM, the
-    FlashInfer groupwise kernels and CUTLASS take 128-wide K blocks only, so any
-    other block shape goes to Triton regardless of the backend setting.
     """
+    # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
+    # groupwise kernels and CUTLASS take 128-wide K blocks only.
     if weight_block_size is not None and weight_block_size[1] != 128:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
@@ -721,15 +719,10 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on.
-
-    Only an explicit FlashInfer CUTLASS / CuTe-DSL ``--fp8-gemm-backend`` on
-    Blackwell qualifies: those kernels take a separately stored swizzled scale and
-    leave the weight untouched, so the block layout stays readable by the Triton
-    fallback and by consumers that use ``.weight`` directly. Anything else keeps
-    the block kernel.
-    """
+    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on."""
     backend = get_fp8_gemm_runner_backend()
+    # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
+    # the swizzled scale separately, so the block layout stays readable by Triton.
     if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
@@ -741,13 +734,8 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
 def can_serve_block_fp8_as_mxfp8(
     weight_block_size: Optional[List[int]], scale_fmt: Optional[str]
 ) -> bool:
-    """Whether a block-fp8 linear can run on the MXFP8 dense GEMMs instead of Triton.
-
-    A weight quantized with a 32-wide K block and ue8m0 (power-of-two) scales, paired
-    with per-32 ue8m0 activation scales, is an MXFP8 operand: repeating each block scale
-    over its rows gives the per-row [N, K // 32] e8m0 layout the MXFP8 kernels read, so
-    the GEMM consumes exactly the same fp8 values and scales.
-    """
+    """Whether a block-fp8 linear can run on the MXFP8 dense GEMMs instead of Triton:
+    a 32-wide-K ue8m0 block weight is an MXFP8 operand (block_fp8_scale_to_mxfp8_e8m0)."""
     if weight_block_size is None or len(weight_block_size) != 2:
         return False
     if weight_block_size[1] != 32 or scale_fmt != "ue8m0":

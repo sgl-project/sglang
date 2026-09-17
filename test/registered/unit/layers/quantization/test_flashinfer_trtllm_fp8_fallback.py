@@ -111,9 +111,8 @@ if __name__ == "__main__":
 
 
 class TestBlockSizeDispatch(CustomTestCase):
-    """dispatch_w8a8_block_fp8_linear keys on the weight block width: only the
-    Triton kernel reads the block size at launch, so non-128-wide K blocks go to it
-    regardless of --fp8-gemm-backend; 128-wide blocks keep the backend choice."""
+    """Non-128-wide K blocks dispatch to Triton regardless of --fp8-gemm-backend;
+    128-wide blocks keep the backend choice."""
 
     def test_128_wide_k_blocks_keep_the_backend_choice(self):
         for name in ("triton", "deep_gemm"):
