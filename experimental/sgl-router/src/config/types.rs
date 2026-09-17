@@ -568,10 +568,12 @@ pub struct AffinityConfig {
     /// (`--min-load-choices`); the least-pressured of the sample wins.
     /// [`DEFAULT_MIN_LOAD_CHOICES`] is the pre-existing power-of-2
     /// behavior, so upgrading changes nothing. `k >= pool` skips the
-    /// shuffle and returns the deterministic exact minimum (ties resolve in
-    /// pool order); `k = 1` is a uniform draw within the tier, and its
-    /// sample has no second member, so the proposal carries no backup and
-    /// admission loses its backup-admission and pressure-guard paths. The
+    /// shuffle and returns the exact minimum, with ties broken randomly
+    /// (an idle fleet ties on every comparison, so a fixed order would pin
+    /// every fallback dispatch to one worker); `k = 1` is a uniform draw
+    /// within the tier, and its sample has no second member, so the
+    /// proposal carries no backup and admission loses its backup-admission
+    /// and pressure-guard paths. The
     /// `--cache-candidate-*` knobs bound the cache-affinity OWNER candidate
     /// set; this bounds the min-load FALLBACK sample used when no owner is
     /// usable.

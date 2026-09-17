@@ -209,10 +209,12 @@ pub struct Cli {
     /// Number of random candidates sampled for the min-load fallback; the
     /// least-pressured of the sample wins. The default 2 keeps today's
     /// power-of-2 behavior unchanged. `k >= pool` skips the shuffle and
-    /// returns the deterministic exact minimum (ties resolve in pool
-    /// order); `k = 1` is a uniform draw within the tier, and because a
-    /// one-member sample has no runner-up the proposal carries no backup,
-    /// which disables the backup-admission and pressure-guard paths. Note
+    /// returns the exact minimum, with ties broken randomly — an idle
+    /// fleet ties on every comparison, so a fixed order would pin every
+    /// fallback dispatch to one worker; `k = 1` is a uniform draw within
+    /// the tier, and because a one-member sample has no runner-up the
+    /// proposal carries no backup, which disables the backup-admission
+    /// and pressure-guard paths. Note
     /// the division of labor with `--cache-candidate-min-workers`,
     /// `--cache-candidate-ratio`, and `--cache-candidate-max-workers`:
     /// those bound the cache-affinity OWNER candidate set; this flag

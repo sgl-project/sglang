@@ -116,11 +116,17 @@ fn sample_pool<'w>(
 }
 
 /// The sample's two least-pressured members, best first, as pool indices
-/// resolved to workers. `choices >= pool` skips the shuffle and scans in
-/// pool order, so the winner is the exact minimum and ties resolve in pool
-/// order; a smaller `choices` draws that many distinct indices, which
-/// `rand`'s `sample` returns fully shuffled, so ties inside a sample
-/// resolve randomly.
+/// resolved to workers. `choices >= pool` skips the shuffle and scans the
+/// whole pool from a random offset, so the winner is the exact minimum
+/// whenever pressures differ and ties resolve randomly rather than always
+/// at `pool[0]`; a smaller `choices` draws that many distinct indices,
+/// which `rand`'s `sample` returns fully shuffled, so ties inside a sample
+/// resolve randomly too.
+///
+/// Tie-breaking is not a detail of the large-`k` path: an idle fleet ties
+/// on every comparison, and the default `k = 2` is already `>= pool` on a
+/// two-worker fleet, so a fixed scan order would pin every fallback
+/// dispatch to the first worker.
 ///
 /// Both tiers scan linearly and never sort. `compare_prefill_pressure`
 /// is only a pairwise comparison: two workers that both publish
@@ -141,7 +147,12 @@ fn best_two_of_sample(
     }
     let choices = choices.max(1);
     let drawn: Vec<usize> = if choices >= len {
-        (0..len).collect()
+        // The whole pool, presented from a random offset. The scan below
+        // keeps the incumbent on a tie, so a fixed start would hand every
+        // tie to `pool[0]`; one rotation is O(1) randomness and leaves the
+        // exact minimum intact whenever the pressures actually differ.
+        let start = rand::thread_rng().gen_range(0..len);
+        (0..len).map(|offset| (start + offset) % len).collect()
     } else if choices == 1 {
         vec![rand::thread_rng().gen_range(0..len)]
     } else {
@@ -404,9 +415,54 @@ mod tests {
                 .expect("the pool is non-empty");
             assert_eq!(
                 selected.id, shallow.id,
-                "choices >= pool must be the deterministic exact minimum"
+                "choices >= pool must return the exact minimum whatever the scan offset"
             );
         }
+    }
+
+    /// A fleet with nothing in flight ties on every pressure comparison,
+    /// and the scan keeps its incumbent on a tie, so the scan order alone
+    /// decides where the request goes. Resolving that in pool order sends
+    /// every tied dispatch to `pool[0]` — and with the default `k = 2` on
+    /// a two-worker fleet the `choices >= pool` path takes every dispatch,
+    /// so the whole fallback pins to one worker. Caught by the hicache
+    /// storage-tier e2e test: all of its filler traffic landed on a single
+    /// engine, turning that engine's host tier over before the probe could
+    /// read the primed prefix back from it.
+    #[test]
+    fn a_tied_pool_spreads_instead_of_pinning_the_first_worker() {
+        let model = ModelId("model".into());
+        let first = worker("first");
+        let second = worker("second");
+        let workers = vec![Arc::clone(&first), Arc::clone(&second)];
+        // Equal pressure on both: an idle fleet's steady state, not an
+        // edge case.
+        let loads = snapshot(&[(&first, 0), (&second, 0)]);
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&loads);
+        let policy = PowerOfTwoChoicesPolicy::new().with_load_control(2, None);
+
+        let mut selected_second = false;
+        let mut proposed_second = false;
+        for _ in 0..256 {
+            selected_second |= select_k_with_snapshot(&workers, Some(&loads), 2, None)
+                .expect("the pool is non-empty")
+                .id
+                == second.id;
+            proposed_second |= policy
+                .propose(&workers, &ctx)
+                .expect("the pool is non-empty")
+                .primary
+                .id
+                == second.id;
+        }
+        assert!(
+            selected_second,
+            "a tie must not always resolve to the first worker in pool order"
+        );
+        assert!(
+            proposed_second,
+            "the proposal path shares the scan, so it must spread the same way"
+        );
     }
 
     #[test]
