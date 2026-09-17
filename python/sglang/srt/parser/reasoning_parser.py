@@ -2146,6 +2146,48 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
 
 
+class BerryLMDetector(BaseReasoningFormatDetector):
+    """
+    Detector for BerryLM models. Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    ``enable_thinking`` in the request switches between thinking mode and normal mode:
+      - enable_thinking=True: "<think>reasoning content</think>The answer is 42."
+      - enable_thinking=False: "The answer is 42." (no thinking tokens)
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ]
+        super().__init__(
+            "<think>",
+            "</think>",
+            think_excluded_tokens=think_excluded_tokens,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            # the model may open ``<tool_call>`` without closing ``</think>``: implicit reasoning end
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -2163,6 +2205,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "berrylm": BerryLMDetector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
