@@ -394,6 +394,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         if quant_info.use_mxfp8:
             recipe_a = recipe_b = tuple(quant_info.block_shape)
+        elif envs.SGLANG_USE_DEEPGEMM_W4A4.get() and quant_info.is_fp4_experts:
+            recipe_a, recipe_b = ((1, 32), (1, 32))
         elif quant_info.is_fp4_experts:
             recipe_a, recipe_b = (1, 128), (1, 32)
         else:
@@ -413,6 +415,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if (
             deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
             and not runner_input.hidden_states_scale_tma_aligned
+            and hidden_states_scale.dtype != torch.int
         ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
@@ -431,7 +434,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        if envs.SGLANG_USE_DEEPGEMM_W4A4.get() and quant_info.is_fp4_experts:
+            # Fused SiLU-mul + (1, 32) e2m1 quantization (hardware cvt).
+            from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                silu_mul_quant_mxfp4,
+            )
+
+            down_input_fp8, down_input_scale = silu_mul_quant_mxfp4(
+                gateup_output, self.swiglu_limit
+            )
+            del gateup_output
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -566,7 +579,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and down_input_scale.dtype != torch.int
+        ):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         recipe_a_down = (
@@ -1078,6 +1094,67 @@ def pre_permute_standard_to_deep_gemm(
             (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
         )
     else:
+        if envs.SGLANG_USE_DEEPGEMM_W4A4.get():
+            from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                quant_mxfp4_group32_v2,
+            )
+
+            # (T, K // 2) int8 packed e2m1 + (T, K // 128) int32 packed ue8m0
+            # (mn-major). Per-token scale word count (K // 128) matches the fp8
+            # path, so ep_scatter's scale copy works unchanged with
+            # hidden_size = K // 2 and quant_block_size = 64.
+            packed_input_source, packed_input_source_scale = quant_mxfp4_group32_v2(
+                hidden_states
+            )
+            packed_input = torch.empty(
+                (all_tokens, k // 2), device=hidden_states_device, dtype=torch.int8
+            )
+            scale_words = k // 128
+            packed_input_scale = torch.empty(
+                (scale_words, triton.cdiv(all_tokens, 4) * 4),
+                device=hidden_states_device,
+                dtype=torch.int32,
+            ).transpose(0, 1)[:all_tokens, :]
+            expert_start_loc = torch.empty(
+                num_experts, device=hidden_states_device, dtype=torch.int32
+            )
+            m_indices = torch.empty(
+                all_tokens, device=hidden_states_device, dtype=torch.int32
+            )
+            src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+            ep_scatter(
+                packed_input_source,
+                packed_input_source_scale,
+                topk_ids,
+                tokens_per_expert,
+                valid_tokens_per_expert,
+                expert_start_loc,
+                packed_input,
+                packed_input_scale,
+                m_indices,
+                src2dst,
+                scale_ue8m0=False,
+                quant_block_size=64,
+            )
+            if runner_config.inplace:
+                dispose_tensor(hidden_states_ref)
+            running_state["topk_ids"] = topk_ids
+            running_state["topk_weights"] = topk_weights
+            running_state["hidden_states_shape"] = hidden_states_shape
+            running_state["hidden_states_dtype"] = hidden_states_dtype
+            running_state["hidden_states_device"] = hidden_states_device
+            running_state["src2dst"] = src2dst
+            running_state["all_tokens"] = all_tokens
+            running_state["mxfp8_act_gran_k"] = (
+                quant_info.block_shape[1] if quant_info.block_shape else 128
+            )
+            return DeepGemmRunnerInput(
+                hidden_states=packed_input,
+                hidden_states_scale=packed_input_scale,
+                use_masked_gemm=False,
+                m_indices=m_indices,
+            )
+
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
