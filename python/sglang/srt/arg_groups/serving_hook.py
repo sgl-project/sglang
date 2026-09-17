@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_mm, get_platform
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -137,14 +137,14 @@ def handle_multimodal(server_args: Any):
                     f"but got {type(cfg.mm_process_config[key])}"
                 )
 
-    if get_mm().enable_mm_global_cache and get_platform().is_npu:
-        if get_mm().mm_global_cache_backend != "npu_memcache":
+    if cfg.enable_mm_global_cache and get_platform().is_npu:
+        if cfg.mm_global_cache_backend != "npu_memcache":
             logger.warning(
                 "--enable-mm-global-cache is enabled with "
                 "--mm-global-cache-backend=%s on NPU. The mooncake backend relies "
                 "on RDMA/mooncake master and is not supported on Ascend; use "
                 "--mm-global-cache-backend npu_memcache instead.",
-                get_mm().mm_global_cache_backend,
+                cfg.mm_global_cache_backend,
             )
 
 
