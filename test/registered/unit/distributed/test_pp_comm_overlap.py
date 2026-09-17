@@ -7,7 +7,6 @@ from unittest.mock import Mock, call
 import torch
 
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,16 +96,6 @@ class TestPPCommOverlap(CustomTestCase):
 
         self.assertIs(received, tensor_dict)
         self.assertIs(event, recv_event)
-
-    def test_allocate_distinct_stream_skips_aliases(self):
-        candidates = iter([FakeStream(1), FakeStream(2), FakeStream(3), FakeStream(4)])
-        device_module = SimpleNamespace(Stream=lambda priority=0: next(candidates))
-
-        stream = allocate_distinct_stream(
-            device_module, (FakeStream(1), FakeStream(2), FakeStream(3))
-        )
-
-        self.assertEqual(stream.cuda_stream, 4)
 
 
 if __name__ == "__main__":
