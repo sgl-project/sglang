@@ -112,10 +112,18 @@ class _IndexerQueryShard:
         out[: self.num_real] = x[self.start : self.start + self.num_real]
         return out
 
-    def gather(self, topk_indices: torch.Tensor) -> torch.Tensor:
+    def gather(self, topk_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """All-gather the per-rank top-k back to ``num_tokens`` rows.
+
+        ``num_tokens`` is the width of the query tensor this call was sliced
+        from: ``total`` padded up to a multiple of ``tp_size`` (see the gate in
+        ``_get_indexer_query_shard``). ``rows * tp_size`` is that same padded
+        width, so the gather buffer is already the right length and the slice
+        only trims when the caller passed an unpadded tensor.
+        """
         out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
-        return out[: self.total]
+        return out[:num_tokens]
 
 
 def _build_indexer_query_shard(
@@ -182,7 +190,27 @@ def _get_indexer_query_shard(
             forward_batch
         )
     shard = forward_batch.npu_indexer_query_shard
-    if shard is None or shard.total != num_tokens:
+    if shard is None:
+        return None
+    # ``num_tokens`` is the query tensor's width. SGLang pads that up to a
+    # multiple of attn_tp_size for the MLP reduce-scatter
+    # (``ForwardBatch.prepare_mlp_sync_batch``, ``ceil_align(n, attn_tp_size)``)
+    # while ``shard.total`` counts real tokens only. ``rows * tp_size`` is
+    # ``ceil_align(total, tp_size)`` -- exactly that padded width -- so the plan
+    # already covers the padding, and only a width outside [total, padded] means
+    # the plan does not describe this call.
+    #
+    # Comparing against ``total`` alone silently disabled sharding for every
+    # token count that was not already a multiple of attn_tp_size: 15 counts in
+    # 16, costing 16x the indexer. It went unnoticed because every test used
+    # 16384 -- the chunked-prefill size, and a multiple of 16 -- while the
+    # prefix-cached tails this is for compute whatever the prompt leaves over.
+    padded = shard.rows * shard.tp_size
+    if not shard.total <= num_tokens <= padded:
+        print_info_once(
+            "DSA indexer query sharding is off for this forward: "
+            f"num_tokens={num_tokens} is outside [{shard.total}, {padded}]"
+        )
         return None
     return shard
 
@@ -453,9 +481,10 @@ class DSANPUIndexerMixin:
                 else block_table
             )
             query = q.view(-1, self.n_heads, self.head_dim)
+            num_query_tokens = query.shape[0]
             shard = (
                 _get_indexer_query_shard(
-                    forward_batch, query.shape[0], layer_scatter_modes
+                    forward_batch, num_query_tokens, layer_scatter_modes
                 )
                 if is_prefill and _shard_indexer_queries
                 else None
@@ -506,7 +535,7 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                 )[0].squeeze(1)
             if shard is not None:
-                topk_indices = shard.gather(topk_indices)
+                topk_indices = shard.gather(topk_indices, num_query_tokens)
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
 
