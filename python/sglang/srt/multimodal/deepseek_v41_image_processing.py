@@ -19,6 +19,9 @@ from PIL import Image, ImageOps
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
 
+GPU_PLAN_KEY = "dsv41_gpu_plan"
+
+
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2
 
@@ -89,15 +92,15 @@ def plan_image_grid(width: int, height: int, args):
     )
 
 
-def decode_image(image: Image.Image) -> Image.Image:
+def to_rgb(image: Image.Image) -> Image.Image:
     """The same RGB conversion for every preprocessing backend."""
     return image.convert("RGB")
 
 
-def load_image(record, args):
-    """Load and transform one image record into ViT patches."""
+def patchify_image(image, args):
+    """Transform one decoded image into ViT patches."""
     p = args.vision_patch_size
-    image = decode_image(record)
+    image = to_rgb(image)
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
         image.width, image.height, args
     )
@@ -127,8 +130,8 @@ def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
     return torch.tensor(types, dtype=torch.int64)
 
 
-def prepare_image(record, args):
-    image = decode_image(record)
+def prepare_image(image, args):
+    image = to_rgb(image)
     lh, lw, height, width = plan_image_grid(image.width, image.height, args)
     stretch = (
         args.vision_max_wh_ratio is not None
@@ -152,8 +155,8 @@ def prepare_image(record, args):
     return np.array(image, dtype=np.uint8), plan, lh, lw
 
 
-def load_image_rust(record, args, *, resize_patchify):
-    pixels, plan, lh, lw = prepare_image(record, args)
+def patchify_image_rust(image, args, *, resize_patchify):
+    pixels, plan, lh, lw = prepare_image(image, args)
     bits = resize_patchify(
         pixels,
         (plan["height"], plan["width"]),
@@ -167,8 +170,8 @@ def load_image_rust(record, args, *, resize_patchify):
     return patches, h, w, lh, lw
 
 
-def prepare_image_gpu(record, args):
-    pixels, plan, lh, lw = prepare_image(record, args)
+def prepare_image_gpu(image, args):
+    pixels, plan, lh, lw = prepare_image(image, args)
     return torch.from_numpy(pixels).permute(2, 0, 1).contiguous(), plan, lh, lw
 
 

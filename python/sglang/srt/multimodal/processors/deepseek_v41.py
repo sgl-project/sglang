@@ -14,9 +14,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
+    GPU_PLAN_KEY,
     image_token_types,
-    load_image,
-    load_image_rust,
+    patchify_image,
+    patchify_image_rust,
     prepare_image_gpu,
 )
 from sglang.srt.multimodal.processors.base_processor import (
@@ -36,13 +37,13 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        self.image_backend = "cpu"
-        self.cpu_image_loader = load_image
+        self.preprocess_backend = "cpu"
+        self.cpu_patchify = patchify_image
         backend = get_mm().image_processor_backend
         if backend == "pil" or get_mm().disable_fast_image_processor:
-            self.image_backend = "cpu"
+            self.preprocess_backend = "cpu"
         elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
-            self.image_backend = "gpu"
+            self.preprocess_backend = "gpu"
         elif backend == "auto":
             # Resolve the optional extension once, before the base class builds
             # the preprocessing cache fingerprint. Image-processing errors are
@@ -57,9 +58,9 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
                     "V4.1 Rust image processor unavailable; using PIL: %s", error
                 )
             else:
-                self.image_backend = "rust"
-                self.cpu_image_loader = partial(
-                    load_image_rust, resize_patchify=resize_patchify
+                self.preprocess_backend = "rust"
+                self.cpu_patchify = partial(
+                    patchify_image_rust, resize_patchify=resize_patchify
                 )
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.image_token_id = hf_config.image_token_id
@@ -70,7 +71,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
 
     def preprocess_fingerprint_payload(self):
         payload = super().preprocess_fingerprint_payload()
-        payload["dsv41_image_backend"] = self.image_backend
+        payload["dsv41_preprocess_backend"] = self.preprocess_backend
         return payload
 
     async def process_mm_data_async(
@@ -94,7 +95,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
                 continue
             image = next(images)
             plan = None
-            if self.image_backend == "gpu":
+            if self.preprocess_backend == "gpu":
                 patches, plan, lh, lw = await asyncio.to_thread(
                     prepare_image_gpu, image, self.hf_config
                 )
@@ -102,13 +103,13 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
                 w = plan["width"] // plan["patch_size"]
             else:
                 patches, h, w, lh, lw = await asyncio.to_thread(
-                    self.cpu_image_loader, image, self.hf_config
+                    self.cpu_patchify, image, self.hf_config
                 )
             if self.keep_mm_features_on_device:
                 patches = patches.to(torch.device("cuda", self.server_args.base_gpu_id))
             metadata = {"n_vit_h": h, "n_vit_w": w}
             if plan is not None:
-                metadata["dsv41_gpu_plan"] = plan
+                metadata[GPU_PLAN_KEY] = plan
             count = len(image_token_types(lh, lw))
             start = len(tokens)
             tokens.extend([self.image_token_id] * count)
