@@ -1245,6 +1245,9 @@ class Envs:
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+    # Preserve the existing exact "1" provider-selection predicate at every
+    # attention call site and in the weight-cache publication identity.
+    SGLANG_INKLING_FA4_USE_PIP = EnvStr(None)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
@@ -1747,6 +1750,10 @@ class Envs:
     # ===================================================================
     # Weight Cache Daemon
     # ===================================================================
+    SGLANG_DIFFUSION_WEIGHT_CACHE_DIR = EnvStr(None)
+    SGLANG_TEST_WEIGHT_CACHE_MODEL = EnvStr("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+    SGLANG_TEST_WEIGHT_CACHE_QWEN_MODEL = EnvStr("Qwen/Qwen-Image")
+    SGLANG_TEST_WEIGHT_CACHE_MINIMAX_MODEL = EnvStr("MiniMaxAI/MiniMax-H3")
     # Paths the daemon and the engine ranks it serves must agree on. Both are
     # format templates and must keep the {device_uuid} placeholder: each daemon
     # is keyed by the physical GPU it runs on, so a GPU-independent path would

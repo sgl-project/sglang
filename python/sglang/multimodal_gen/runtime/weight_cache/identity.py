@@ -110,7 +110,7 @@ def dependency_identity(args):
     # installed distributions. It has no audited publication receipt here.
     if not envs.SGLANG_USE_SGL_FA3_KERNEL.get():
         raise ValueError("Weight cache requires SGLANG_USE_SGL_FA3_KERNEL=1")
-    pip_fa4 = os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1"
+    pip_fa4 = envs.SGLANG_INKLING_FA4_USE_PIP.get() == "1"
     providers = {"fa3": "sglang-kernel", "fa4": "pip" if pip_fa4 else "vendored"}
     required = {
         "torch",

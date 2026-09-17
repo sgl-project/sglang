@@ -11,6 +11,8 @@ from pathlib import Path
 
 import msgspec
 
+from sglang.srt.environ import envs
+
 from .descriptors import canonical_digest
 
 
@@ -98,7 +100,7 @@ def source_digest(package_root: Path) -> str:
 
 
 def default_runtime_dir() -> Path:
-    override = os.environ.get("SGLANG_DIFFUSION_WEIGHT_CACHE_DIR")
+    override = envs.SGLANG_DIFFUSION_WEIGHT_CACHE_DIR.get()
     if override:
         return Path(override)
     return (

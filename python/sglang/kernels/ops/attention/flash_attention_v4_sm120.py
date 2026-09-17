@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union
 
@@ -17,8 +16,9 @@ from sglang.kernels.ops.attention.flash_attention_v4 import (
     _pad_mla_q_heads,
     _unpad_mla_result,
 )
+from sglang.srt.environ import envs
 
-if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
+if envs.SGLANG_INKLING_FA4_USE_PIP.get() == "1":
     # The pip escape hatch deliberately bypasses SGLang-owned SM12x kernels.
     get_forward_arch = None
     resolve_runtime_policy = None

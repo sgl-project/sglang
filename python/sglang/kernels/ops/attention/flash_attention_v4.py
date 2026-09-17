@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
+    if envs.SGLANG_INKLING_FA4_USE_PIP.get() == "1":
         # A/B debug escape hatch: route through the pip flash-attn-4 package
         # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func

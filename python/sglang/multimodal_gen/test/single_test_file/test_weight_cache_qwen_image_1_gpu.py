@@ -4,7 +4,6 @@
 import hashlib
 import io
 import json
-import os
 import re
 import shlex
 import signal
@@ -29,6 +28,7 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _stop_owner,
     _weights_checksum,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
 from sglang.weight_cache_common.liveness import ProcessIdentity
 
@@ -66,7 +66,7 @@ def generate_qwen_image(context, model, case, *, steps=4):
 
 def test_qwen_image_weight_cache_recovery(tmp_path):
     model = maybe_download_model(
-        os.environ.get("SGLANG_WEIGHT_CACHE_QWEN_TEST_MODEL", "Qwen/Qwen-Image"),
+        envs.SGLANG_TEST_WEIGHT_CACHE_QWEN_MODEL.get(),
         force_diffusers_model=True,
         revision="75e0b4be04f60ec59a75f475837eced720f823b6",
     )

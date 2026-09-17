@@ -3,7 +3,6 @@
 
 import hashlib
 import json
-import os
 import re
 import shlex
 import signal
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _stop_owner,
     _weights_checksum,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
 from sglang.weight_cache_common.liveness import ProcessIdentity
 
@@ -82,9 +82,7 @@ def generate_minimax_h3(context, model, case, *, steps=4):
 
 def test_minimax_h3_weight_cache_recovery(tmp_path):
     model = maybe_download_model(
-        os.environ.get(
-            "SGLANG_WEIGHT_CACHE_MINIMAX_TEST_MODEL", "MiniMaxAI/MiniMax-H3"
-        ),
+        envs.SGLANG_TEST_WEIGHT_CACHE_MINIMAX_MODEL.get(),
         allow_patterns=["FL2VA/**"],
         revision="42ed227ee7df40d41602854ae760620d6eb651fe",
     )
