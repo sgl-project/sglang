@@ -103,6 +103,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
+- `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
