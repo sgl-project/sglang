@@ -10,6 +10,16 @@ VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
 
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
+# The scheduler drops a finished req before the TokenizerManager clears its rid,
+# and that clearing is not observable from the scheduler side, so this is a sleep
+# rather than a wait. Tuned on XPU, where 5 steps still raced and 20 was clear; a
+# device slow enough to exceed 40 fails as a duplicate-rid rejection.
+RID_RELEASE_SETTLE_STEPS: int = 40
+
+# The radix lock_ref drops one iteration after the KV pages, so a drain that waits
+# only on kv_pages returns while the caller's assert lock_refs == 0 still fails.
+DRAIN_RELEASE_STEPS: int = 12
+
 
 def base_engine_kwargs(
     *,
@@ -38,6 +48,24 @@ def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
+
+
+def run_until_finished_and_rid_released(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
+    yield from run_until_finished(handle, max_steps=max_steps)
+    for _ in range(RID_RELEASE_SETTLE_STEPS):
+        yield
+
+
+def drain_until_released(t, *handles, max_steps: int = DRAIN_RELEASE_STEPS):
+    for _ in range(max_steps):
+        if all(
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.kv.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):

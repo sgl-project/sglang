@@ -4,7 +4,9 @@ import time
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
+from sglang.srt.utils import get_device
 from sglang.test.run_eval import run_eval
+from sglang.test.scripted_runtime.http_server import CANARY_SUPPORTED_DEVICES
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -38,6 +40,14 @@ KV_CANARY_ARGS: List[str] = [
 ]
 
 
+def _canary_args(enabled: bool) -> List[str]:
+    # The canary's kernels are CUDA-only, so elsewhere they kill the server during
+    # alloc_memory_pool before any eval can run.
+    if enabled and get_device() in CANARY_SUPPORTED_DEVICES:
+        return list(KV_CANARY_ARGS)
+    return []
+
+
 class ChunkedGsm8kMixin:
     __test__ = False
     use_kv_canary: ClassVar[bool] = True
@@ -52,7 +62,7 @@ class ChunkedGsm8kMixin:
     gsm8k_threshold: ClassVar[float]
 
     def build_prefill_side_args(self) -> List[str]:
-        canary = list(KV_CANARY_ARGS) if self.use_kv_canary else []
+        canary = _canary_args(self.use_kv_canary)
         return (
             ["--chunked-prefill-size", str(self.chunked_prefill_size)]
             + list(self.feature_args)
@@ -118,7 +128,7 @@ class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):
         cls.extra_prefill_args = cls(
             "test_mixed_prefix_gsm8k_chunked"
         ).build_prefill_side_args()
-        canary = list(KV_CANARY_ARGS) if cls.use_kv_canary else []
+        canary = _canary_args(cls.use_kv_canary)
         cls.extra_decode_args = canary + list(cls.decode_feature_args)
         PDDisaggregationServerBase.setUpClass()
         cls.model = try_cached_model(cls.model)

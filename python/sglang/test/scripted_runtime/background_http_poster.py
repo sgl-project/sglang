@@ -26,9 +26,10 @@ class BackgroundHttpPoster:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def submit_coro(self, coro: Coroutine) -> None:
+    def submit_coro(self, coro: Coroutine) -> Future:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         future.add_done_callback(self._log_coro_exception)
+        return future
 
     @staticmethod
     def _log_coro_exception(future: Future) -> None:
@@ -42,7 +43,12 @@ class BackgroundHttpPoster:
     async def post(self, url: str, json: Any) -> None:
         session = self._ensure_session()
         async with session.post(url, json=json) as resp:
-            await resp.read()
+            body = await resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(
+                    f"POST {url} -> HTTP {resp.status}: "
+                    f"{body.decode(errors='replace')[:500]}"
+                )
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
