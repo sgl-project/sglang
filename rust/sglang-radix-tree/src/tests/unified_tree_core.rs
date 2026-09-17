@@ -4214,6 +4214,60 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
 }
 
 #[test]
+fn write_through_load_back_tracks_every_split_host_node() {
+    let mut tc = core();
+    tc.set_hicache_enabled();
+    let root = tc.arena.root();
+    let child = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2, 3, 4],
+            Tensor::from_slice(&[100i64, 101, 102, 103]),
+            (0..4).map(|i| format!("h{i}")).collect(),
+        )
+        .expect("live root node")
+        .inserted_host_node
+        .expect("inserted host node");
+    let parent = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+    assert_ne!(parent, child);
+    tc.sanity_check(&[], &[]);
+
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(child, /* req = */ None)
+        .expect("live test node");
+    assert_eq!(kv_xfer.nodes_to_load, Some(vec![parent, child]));
+    tc.commit_load_back(
+        child,
+        Tensor::from_slice(&[50i64, 51, 52, 53]),
+        kv_xfer,
+        comp_xfers,
+    )
+    .expect("live transfer nodes");
+    for node in [parent, child] {
+        let node_idx = tc.arena.resolve(node).expect("live test node");
+        assert!(!tc.arena.node(node_idx).is_load_back_pending());
+    }
+    // The orchestrator locks the loaded path until the ACK releases it.
+    tc.inc_lock_ref(child, ComponentSet::EMPTY)
+        .expect("live test node");
+    tc.dec_lock_ref(
+        child,
+        /* params = */ &DecLockRefParams::default(),
+        /* skip_swa = */ false,
+    )
+    .expect("live test node");
+    tc.finish_load_back(child).expect("live test node");
+    tc.sanity_check(&[], &[]);
+    for node in [parent, child] {
+        let node_idx = tc.arena.resolve(node).expect("live test node");
+        assert!(tc.full_coexisting_host_nodes.contains(node_idx));
+    }
+}
+
+#[test]
 fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     let mut tc = UnifiedTreeCore::new(
         CacheInitParams {

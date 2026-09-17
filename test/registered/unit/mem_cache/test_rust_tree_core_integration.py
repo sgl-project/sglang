@@ -678,6 +678,18 @@ def test_cache_salt_is_supported_by_all_key_entry_points():
         core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_indices.numel()
         == 0
     )
+    for key, indices in ((first_key, [10, 11]), (second_key, [20, 21])):
+        matched, node, pinned = core.match_full_device_prefix(key)
+        assert (matched, pinned) == (2, 2)
+        assert (
+            core.get_component_device_value(node, ComponentType.FULL).tolist()
+            == indices
+        )
+    assert core.match_full_device_prefix(_key([1, 2])) == (
+        0,
+        core.root_node_handle(),
+        0,
+    )
 
     host_core = _tree_core()
     host_core.set_hicache_enabled()
@@ -762,24 +774,36 @@ def test_set_hicache_enabled_marks_the_tree():
     assert core.enable_hicache
 
 
-def test_hicache_write_through_and_load_back_round_trip():
+@pytest.mark.parametrize("host_source", ["backup", "storage"])
+def test_hicache_write_through_and_load_back_round_trip(host_source):
     core = _tree_core()
     core.set_hicache_enabled()
-    _insert(core, [1, 2], [10, 11])
-    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
-    # Write-through: back the leaf up host-side, then demote it to host-only.
-    device_value, comp_xfers = core.build_backup_spec(leaf)
-    assert device_value.tolist() == [10, 11]
-    assert comp_xfers == {}
-    core.mark_write_through_pending([leaf], ack_id=leaf)
-    core.commit_backup(leaf, torch.tensor([100, 101], dtype=torch.int64), comp_xfers)
-    core.finish_write_through([leaf], leaf)
-    tracker = {ComponentType.FULL: 0}
-    device_frees, host_frees = {}, {}
-    _accumulate_step(core.demote(leaf), tracker, device_frees, host_frees)
-    assert tracker[ComponentType.FULL] == 2
-    assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
+    if host_source == "storage":
+        leaf = core.insert_host(
+            core.root_node_handle(),
+            _key([1, 2]),
+            torch.tensor([100, 101], dtype=torch.int64),
+            ["h0", "h1"],
+        ).inserted_host_node
+    else:
+        _insert(core, [1, 2], [10, 11])
+        leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+        # Write-through backs the leaf up before demoting it to host-only.
+        device_value, comp_xfers = core.build_backup_spec(leaf)
+        assert device_value.tolist() == [10, 11]
+        assert comp_xfers == {}
+        core.mark_write_through_pending([leaf], ack_id=leaf)
+        core.commit_backup(
+            leaf, torch.tensor([100, 101], dtype=torch.int64), comp_xfers
+        )
+        core.finish_write_through([leaf], leaf)
+        tracker = {ComponentType.FULL: 0}
+        device_frees, host_frees = {}, {}
+        _accumulate_step(core.demote(leaf), tracker, device_frees, host_frees)
+        assert tracker[ComponentType.FULL] == 2
+        assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
     assert core.component_has_host_value_only(leaf, ComponentType.FULL)
+    core.sanity_check([], [])
     # Load back host -> device; the match then serves device indices again.
     kv_xfer, comp_xfers = core.build_load_back_spec(leaf)
     assert kv_xfer.name == PoolName.KV

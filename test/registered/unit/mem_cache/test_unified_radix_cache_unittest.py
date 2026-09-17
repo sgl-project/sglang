@@ -1012,6 +1012,33 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         )
         cache.sanity_check()
 
+    def test_buffer_backup_snapshot_preserves_raw_bigram_key_and_namespace(self):
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        expected_tokens = tuple(tokens)
+        key = RadixKey(tokens, extra_key="adapter-a", cache_salt="tenant-a")
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=key, value=value))
+        leaf_id = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+        snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.key.token_ids, tokens)
+        self.assertTrue(snapshot.key.is_bigram)
+        self.assertEqual(snapshot.key.extra_key, "adapter-a")
+        self.assertEqual(snapshot.key.cache_salt, "tenant-a")
+        self.assertEqual(snapshot.prefix_keys, [])
+
+        snapshot.key.token_ids[0] = -1
+        fresh_snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertEqual(tuple(fresh_snapshot.key.token_ids), expected_tokens)
+
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -8572,6 +8599,20 @@ def _component_with_cache(component_type, cache):
 
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
+
+    def test_buffer_sanity_check_uses_snapshot_node_id(self):
+        cache = mock.Mock()
+        cache.session.any_holding_kv.return_value = False
+        cache.ongoing_load_back = {}
+        cache.buffer_pipeline.ongoing_write_through = {
+            7: SimpleNamespace(
+                intent=SimpleNamespace(snapshot=SimpleNamespace(node_id=10))
+            )
+        }
+
+        UnifiedRadixCache.sanity_check(cache)
+
+        cache.tree_core.sanity_check.assert_called_once_with([(7, 10)], [])
 
     def test_backup_publish_node_ids_collects_component_nodes_once(self):
         comp_xfers = {

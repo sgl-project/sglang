@@ -3548,7 +3548,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # can resolve + validate them without reaching into Controller state.
         if self.buffer_pipeline is not None:
             ongoing_write_through = [
-                (nid, entry.intent.node_id)
+                (nid, entry.intent.snapshot.node_id)
                 for nid, entry in self.buffer_pipeline.ongoing_write_through.items()
             ]
         else:
