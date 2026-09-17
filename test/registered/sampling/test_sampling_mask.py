@@ -21,8 +21,18 @@ from sglang.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import (
+    get_device,
+    get_device_module,
+    is_hip,
+    is_xpu,
+    kill_process_tree,
+)
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -33,6 +43,20 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
+# XPU runs the capture tests only; the server-backed classes below are skipped.
+register_xpu_ci(est_time=15, suite="stage-a-test-1-gpu-xpu")
+
+_DEVICE = get_device()
+# sgl-kernel-xpu mirrors the flashinfer sampling API, so both names select the
+# same fused-joint-sampler branch in sampler.py; only the label differs.
+_FUSED_BACKEND = "intel_xpu" if _DEVICE == "xpu" else "flashinfer"
+
+# The server-backed classes are backend-independent, so running them on XPU adds
+# no kernel coverage, and /generate wedges intermittently there (reproduces under
+# --sampling-backend pytorch, so it is not the fused XPU sampler).
+_skip_server_on_xpu = unittest.skipIf(
+    is_xpu(), "server-backed sampling-mask coverage is not validated on XPU"
+)
 
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
@@ -85,10 +109,10 @@ class TestSamplingMaskCapture(CustomTestCase):
             need_top_k_sampling=True,
             need_top_p_sampling=top_p < 1.0,
             need_min_p_sampling=min_p > 0.0,
-            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
-            top_ps=torch.full((batch_size,), top_p, device="cuda"),
-            min_ps=torch.full((batch_size,), min_p, device="cuda"),
-            sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device=_DEVICE),
+            top_ps=torch.full((batch_size,), top_p, device=_DEVICE),
+            min_ps=torch.full((batch_size,), min_p, device=_DEVICE),
+            sampling_mask_batch_indices=torch.tensor(requested_rows, device=_DEVICE),
         )
         with patch.object(
             sampler_module,
@@ -100,7 +124,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             return self.sampler._sample_from_probs(
                 probs,
                 sampling_info,
-                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                positions=torch.zeros(batch_size, dtype=torch.int64, device=_DEVICE),
                 simple_sampling_case=False,
             )
 
@@ -122,10 +146,10 @@ class TestSamplingMaskCapture(CustomTestCase):
         return output
 
     def test_min_p_capture_matches_filtered_support_and_logprob(self):
-        backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
+        backends = ("pytorch",) if is_hip() else ("pytorch", _FUSED_BACKEND)
         for backend in backends:
             with self.subTest(backend=backend):
-                probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device="cuda")
+                probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device=_DEVICE)
                 sampled, capture = self._sample(
                     probs, backend, top_k=3, top_p=1.0, min_p=0.6
                 )
@@ -139,20 +163,20 @@ class TestSamplingMaskCapture(CustomTestCase):
                 )
 
     def test_hard_exclusion_replay_in_mixed_batch(self):
-        backends = ["pytorch"] if is_hip() else ["pytorch", "flashinfer"]
+        backends = ["pytorch"] if is_hip() else ["pytorch", _FUSED_BACKEND]
         for backend in backends:
             with self.subTest(backend=backend):
                 logits = (
-                    torch.tensor([[0.3, 0.2, 0.5, 0.15, 0.1]], device="cuda")
+                    torch.tensor([[0.3, 0.2, 0.5, 0.15, 0.1]], device=_DEVICE)
                     .log()
                     .repeat(2, 1)
                 )
                 original = logits.clone()
                 info = SamplingBatchInfo(
-                    temperatures=torch.ones(2, 1, device="cuda"),
-                    top_ps=torch.full((2,), 0.9, device="cuda"),
-                    top_ks=torch.full((2,), 3, dtype=torch.int32, device="cuda"),
-                    min_ps=torch.zeros(2, device="cuda"),
+                    temperatures=torch.ones(2, 1, device=_DEVICE),
+                    top_ps=torch.full((2,), 0.9, device=_DEVICE),
+                    top_ks=torch.full((2,), 3, dtype=torch.int32, device=_DEVICE),
+                    min_ps=torch.zeros(2, device=_DEVICE),
                     is_all_greedy=False,
                     is_any_greedy=False,
                     need_top_p_sampling=True,
@@ -164,11 +188,11 @@ class TestSamplingMaskCapture(CustomTestCase):
                     custom_logit_processor={
                         0: (
                             DisallowedTokensLogitsProcessor(),
-                            torch.tensor([True, False], device="cuda"),
+                            torch.tensor([True, False], device=_DEVICE),
                         )
                     },
                     return_sampling_masks=[True, True],
-                    sampling_mask_batch_indices=torch.tensor([0, 1], device="cuda"),
+                    sampling_mask_batch_indices=torch.tensor([0, 1], device=_DEVICE),
                 )
                 logits = self.sampler._preprocess_logits(logits, info)
                 with patch(
@@ -180,7 +204,7 @@ class TestSamplingMaskCapture(CustomTestCase):
                     sampled, capture = self.sampler._sample_from_probs(
                         logits.softmax(-1),
                         info,
-                        positions=torch.zeros(2, dtype=torch.int64, device="cuda"),
+                        positions=torch.zeros(2, dtype=torch.int64, device=_DEVICE),
                         simple_sampling_case=False,
                     )
                 output = self._materialize(sampled, capture, requested_rows=[0, 1])
@@ -198,7 +222,7 @@ class TestSamplingMaskCapture(CustomTestCase):
         batch_size = 256
         top_k = 2
         top_p = 0.45
-        base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda")
+        base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device=_DEVICE)
         probs = base_probs.repeat(batch_size, 1)
 
         # Derive the threshold-based joint support independently. Both filters
@@ -214,7 +238,7 @@ class TestSamplingMaskCapture(CustomTestCase):
         expected_ids = expected_support.nonzero(as_tuple=True)[0].tolist()
         self.assertEqual(expected_ids, [0, 1, 2])
 
-        sampled, capture = self._sample(probs, "flashinfer", top_k=top_k, top_p=top_p)
+        sampled, capture = self._sample(probs, _FUSED_BACKEND, top_k=top_k, top_p=top_p)
 
         self.assertIsNotNone(capture)
         self.assertEqual(capture.batch_rows.cpu().tolist(), list(range(batch_size)))
@@ -231,7 +255,7 @@ class TestSamplingMaskCapture(CustomTestCase):
     def test_flashinfer_capture_only_materializes_requested_rows(self):
         batch_size = 4
         requested_rows = [1, 3]
-        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device=_DEVICE).repeat(
             batch_size, 1
         )
         with (
@@ -247,7 +271,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             ) as top_p_mock,
         ):
             sampled, capture = self._sample(
-                probs, "flashinfer", requested_rows=requested_rows
+                probs, _FUSED_BACKEND, requested_rows=requested_rows
             )
 
         self.assertIsNotNone(capture)
@@ -269,7 +293,7 @@ class TestSamplingMaskCapture(CustomTestCase):
     def test_pytorch_capture_compacts_requested_rows(self):
         batch_size = 4
         requested_rows = [1, 3]
-        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device=_DEVICE).repeat(
             batch_size, 1
         )
         sampled, capture = self._sample(probs, "pytorch", requested_rows=requested_rows)
@@ -362,6 +386,7 @@ class SamplingMaskTestMixin:
         return self._assert_sampling_masks(output_ids, meta_info)
 
 
+@_skip_server_on_xpu
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
     _sampling_backend = "flashinfer"
 
@@ -563,15 +588,17 @@ class TestSamplingMaskPacking(CustomTestCase):
     def test_greedy_device_output_survives_async_copy(self):
         from sglang.srt.managers.utils import GenerationBatchResult
 
-        tokens = torch.tensor([3, 4, 5], device="cuda")
+        tokens = torch.tensor([3, 4, 5], device=_DEVICE)
         output = LogitsProcessorOutput(
             next_token_logits=None,
             sampling_mask_output=self.sampler._build_greedy_sampling_mask_output(
-                torch.tensor([0, 2], device="cuda"), tokens
+                torch.tensor([0, 2], device=_DEVICE), tokens
             ),
         )
         result = GenerationBatchResult(
-            logits_output=output, next_token_ids=tokens, copy_done=torch.cuda.Event()
+            logits_output=output,
+            next_token_ids=tokens,
+            copy_done=get_device_module().Event(),
         )
         result.copy_to_cpu(return_logprob=False)
         result.copy_done.synchronize()
@@ -615,6 +642,7 @@ class TestSamplingMaskPacking(CustomTestCase):
         self.assertEqual(output.next_token_sampling_logprobs, [None])
 
 
+@_skip_server_on_xpu
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -651,6 +679,7 @@ class TestSamplingMaskPytorch(TestSamplingMask):
 
 
 @unittest.skipIf(is_hip(), "The AMD sampling-mask CI suite provides only one GPU.")
+@_skip_server_on_xpu
 class TestDistributedSamplingMask(CustomTestCase):
     def _check_parallel_config(self, *, tp_size, pp_size):
         process = None
