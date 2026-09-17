@@ -152,6 +152,8 @@ class UnifiedTreeCoreInterface(ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    # Whether the host tier stages one node per FIFO backup intent.
+    is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
@@ -184,6 +186,22 @@ class UnifiedTreeCoreInterface(ABC):
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
+
+    # Logical-page KV sharding: whether this core stamps and honors
+    # UnifiedTreeNode.rotation_base. A core that does not cannot serve a
+    # sharded allocator (it would never decline a cross-base graft), and
+    # UnifiedRadixCache.__init__ rejects that pairing at construction.
+    supports_rotation_base: bool = False
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain).
+
+        Concrete, not abstract: a core that does not track rotation bases
+        stays constructible, and its None means "sharding is off" -- never
+        "sharding is on but unknown", which the constructor gate rules out.
+        """
+        return None
 
     @abstractmethod
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
@@ -373,6 +391,21 @@ class UnifiedTreeCoreInterface(ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    @abstractmethod
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Return (matched tokens, deepest node, FULL tokens pinned by it)."""
+        ...
+
+    @abstractmethod
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only FULL device values on the node's root path."""
+        ...
+
+    @abstractmethod
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        """Release a pin acquired by inc_full_pin."""
+        ...
+
     def supports_fast_match_prefix(self) -> bool:
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False
@@ -441,6 +474,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_host_memory_buffer_only(self) -> None:
+        """Mark the host tier as buffer-only: one node staged per backup intent."""
+        ...
+
+    @abstractmethod
     def insert_host(
         self,
         node_id: NodeId,
@@ -475,6 +513,7 @@ class UnifiedTreeCoreInterface(ABC):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build a component's HiCache transfers for the given node and phase."""
