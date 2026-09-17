@@ -5,10 +5,10 @@ from unittest.mock import patch
 from sglang.srt.arg_groups.model_override_base import _MODEL_OVERRIDE_FNS
 from sglang.srt.arg_groups.model_overrides import kimi_k3
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKimiK3NpuDcpOverrides(CustomTestCase):
