@@ -217,12 +217,10 @@ class TestPrefillAdder(CustomTestCase):
             req.origin_input_ids = list(range(length))
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
-        limit = policy.shortest_prefill_chunk_limit(
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
             continuation, waiting, adder.rem_chunk_tokens, adder.page_size
         )
-        self.assertIs(
-            adder.add_chunked_req(continuation, max_chunk_tokens=limit), continuation
-        )
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(continuation.extend_range.length, 2560)
         for req in waiting:
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)

@@ -644,6 +644,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
         self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
 
@@ -1008,7 +1009,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req, max_chunk_tokens: Optional[int] = None):
+    def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1029,9 +1030,9 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
-        if max_chunk_tokens is not None:
-            assert max_chunk_tokens > 0
-            _rem_tokens = min(_rem_tokens, max_chunk_tokens)
+        if self.chunked_req_limit is not None:
+            assert self.chunked_req_limit > 0
+            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
