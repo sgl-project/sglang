@@ -258,6 +258,9 @@ def _populate_compress_metadata(
         core_attn_metadata.c128_page_indices = torch.zeros(
             (16, 1), dtype=torch.int32, device=device
         )
+        core_attn_metadata.sparse_page_indices = lambda ratio: (
+            core_attn_metadata.c128_page_indices if ratio == 128 else None
+        )
 
 
 @contextmanager
@@ -290,12 +293,19 @@ def _patched_compressed_sparse_cache_paths(compress_ratio: int):
     def fake_ensure_c128(self, c128_page_indices):
         _ = c128_page_indices
         n_compressed = 8
-        self.c128_flat_token_ids = torch.arange(
-            n_compressed, dtype=torch.int64, device=self.swa_token_ids.device
+        device = self.swa_token_ids.device
+        combined_indices, combined_lens = _with_compressed_prefix(self, n_compressed)
+        gather = CompressedGather(
+            flat_token_ids=torch.arange(n_compressed, dtype=torch.int64, device=device),
+            compressed_base=torch.zeros(
+                self.num_reqs, dtype=torch.int32, device=device
+            ),
+            swa_base=torch.zeros(self.num_reqs, dtype=torch.int32, device=device),
+            combined_indices=combined_indices,
+            combined_lens=combined_lens,
         )
-        self.c128_combined_indices, self.c128_combined_lens = _with_compressed_prefix(
-            self, n_compressed
-        )
+        self.compressed[128] = gather
+        return gather
 
     def fake_ensure_compressed(self, compress_ratio, page_table, extra_page_size):
         _ = page_table, extra_page_size
