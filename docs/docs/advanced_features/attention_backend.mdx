@@ -436,7 +436,7 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>flashmla_sparse_q8</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Native FP8 (q8×kv8) sparse prefill on Hopper (SM90); requires <code>--kv-cache-dtype fp8_e4m3</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8 (q8×kv8) sparse prefill on Hopper (SM90); the KV cache may be <code>bfloat16</code> or <code>fp8_e4m3</code> (q is cast to FP8 at call time, and a <code>bfloat16</code> cache's KV rows are cast with it)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>triton_sparse_mla</strong></td>
