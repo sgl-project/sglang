@@ -45,6 +45,31 @@ When refreshing a pool-specific reference, update its `runner_overrides` entry,
 not the shared `scenarios` entry. The baseline generation script writes shared
 scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
+### Cirrascale historical CI reference
+
+`b200-cirrascale1-0123` has separate E2E references of 1574.32 ms for
+`flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
+`qwen_image_2512_modelopt_nvfp4_t2i`. Only this measured runner is matched;
+other Cirrascale runners retain the defaults until calibrated.
+
+Historical jobs on this runner, all using driver 580.126.20, already recorded
+the slower timings before this PR's changes, with unchanged B200 case definitions:
+
+| PR / CI job | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
+| --- | ---: | ---: |
+| [#39021](https://github.com/sgl-project/sglang/actions/runs/34594936520/job/103248571918) | 1772.69 | 17836.93 |
+| [#38782](https://github.com/sgl-project/sglang/actions/runs/34595934993/job/103251774792) | 2617.81 | 17742.04 |
+| [#39022](https://github.com/sgl-project/sglang/actions/runs/34670636885/job/103506632867) | 1574.32 | 38392.34 |
+| [#39291](https://github.com/sgl-project/sglang/actions/runs/34750152864/job/103707842024) | 3942.31 | 19846.93 |
+
+Use the minimum observed E2E for each case, not the noisy maximum or a median
+inflated by slow runs. The existing 25% tolerance yields limits of 1967.90 ms
+and 22177.55 ms. Large transient slowdowns must still fail and use the bounded
+failed-item retry policy. Historical green jobs did not enforce the new E2E
+guard; their recorded timings, not their green status, support these references.
+This does not identify the underlying host/GPU contention mechanism. Loading,
+other metrics, other cases, and other runner references remain unchanged.
+
 ## Initial loading references
 
 The initial H100 loading references cover 28 cases with at least three distinct
