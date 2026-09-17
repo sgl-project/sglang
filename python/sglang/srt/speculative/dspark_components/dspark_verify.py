@@ -32,6 +32,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.acceptance_policy import (
+    DSparkAcceptancePolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -90,6 +93,7 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        acceptance_policy: Optional["DSparkAcceptancePolicy"] = None,
     ) -> None:
         self.target_worker = target_worker
         self.gamma = int(gamma)
@@ -98,6 +102,7 @@ class TargetVerifyExecutor:
         self.kv_injector = kv_injector
         self._tp_sync = tp_sync
         self.verify_epilogue = verify_epilogue
+        self._acceptance_policy = acceptance_policy
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
@@ -115,6 +120,7 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -124,18 +130,41 @@ class TargetVerifyExecutor:
         override.
         """
         if folded_accept:
+            if self._acceptance_policy is not None:
+                raise RuntimeError(
+                    "a DSpark acceptance policy cannot use folded native "
+                    "acceptance; disable the folded-accept path when a "
+                    "policy is active"
+                )
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
-        )
+        def native_accept():
+            return accept_draft_tokens(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=self.gamma,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                cutoff_layout=layout,
+            )
+
+        if self._acceptance_policy is None:
+            correct_len, bonus, cap_trim_lens = native_accept()
+        else:
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "DSpark acceptance policy requires request-pool indices"
+                )
+            correct_len, bonus, cap_trim_lens = self._acceptance_policy.accept(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                cutoff_verify_lens=(None if layout is None else layout.verify_lens),
+                req_pool_indices=req_pool_indices,
+                all_greedy=(sampling_info is None or sampling_info.is_all_greedy),
+                native_accept=native_accept,
+            )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
