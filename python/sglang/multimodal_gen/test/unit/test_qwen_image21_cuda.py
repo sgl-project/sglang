@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -110,8 +109,14 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     # Reuse loaded native components, then exercise the real adapter loader.
     monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
     pipeline = object.__new__(QwenImage21Pipeline)
-    pipeline.server_args = get_global_server_args()
-    config = pipeline.server_args.pipeline_config.dit_config
+    config = QwenImage21DitConfig(arch_config=model.config)
+    pipeline.server_args = ServerArgs(
+        model_path="Qwen/Qwen-Image-2.1",
+        num_gpus=1,
+        pipeline_config=QwenImage21PipelineConfig(dit_config=config),
+        attention_backend="torch_sdpa",
+    )
+    set_global_server_args(pipeline.server_args)
     actual_model = QwenImage21Transformer2DModel(config, {}).cuda().eval()
     reference = QwenImage21Transformer2DModel(config, {}).cuda().eval()
     for loaded in (actual_model, reference):
