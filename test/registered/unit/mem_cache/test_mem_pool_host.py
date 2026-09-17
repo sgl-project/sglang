@@ -7,19 +7,28 @@ import unittest.mock
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MambaPool, MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.ple_state_pool import (
+    PLE_NGRAM_STATE_LAYER_ID,
+    NGramPool,
+    ShortConvPool,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.ple import (
+    PleStatePoolHost,
+    collect_ple_state_regions,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 
 class TestHostKVCache(CustomTestCase):
@@ -324,6 +333,234 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertIsNone(group.resolve_host_transfers(transfers))
         self.assertIsNone(transfers[0].host_indices)
         self.assertEqual(group.available_size(PoolName.SWA), 2)
+
+
+# ===== Qwen4-Exp PLE state host pool =====
+
+PLE_SLOTS = 8
+PLE_HOST_SLOTS = 16
+PLE_SHORT_CONV_LAYER_IDS = [1, 3]
+PLE_CHANNELS = 6
+PLE_STATE_LEN = 4
+PLE_NGRAM_CONTEXT_LEN = 2
+
+PLE_SHORT_CONV_SLOT_BYTES = PLE_CHANNELS * PLE_STATE_LEN * torch.bfloat16.itemsize
+PLE_NGRAM_SLOT_BYTES = PLE_NGRAM_CONTEXT_LEN * torch.int64.itemsize
+
+
+def _mamba_pool_with_ple(*, enable_ple: bool = True, spec_draft_tokens=None):
+    """A MambaPool carrying only what the PLE host pool reads.
+
+    `__new__` skips the mamba_cache allocation and keeps the real
+    `register_slot_state` bookkeeping and sibling pools.
+    """
+    pool = MambaPool.__new__(MambaPool)
+    pool.size = PLE_SLOTS
+    pool.device = "cpu"
+    if not enable_ple:
+        return pool
+    pool.register_slot_state(
+        ShortConvPool(
+            size=PLE_SLOTS,
+            state_shape=(PLE_CHANNELS, PLE_STATE_LEN),
+            layer_ids=PLE_SHORT_CONV_LAYER_IDS,
+            dtype=torch.bfloat16,
+            device="cpu",
+            spec_state_size=PLE_SLOTS if spec_draft_tokens else 0,
+            speculative_num_draft_tokens=spec_draft_tokens,
+        )
+    )
+    pool.register_slot_state(
+        NGramPool(
+            size=PLE_SLOTS,
+            context_len=PLE_NGRAM_CONTEXT_LEN,
+            eos_token_id=0,
+            device="cpu",
+        )
+    )
+    return pool
+
+
+def _ple_anchor_host(size: int = PLE_HOST_SLOTS) -> MambaPoolHost:
+    anchor = MambaPoolHost.__new__(MambaPoolHost)
+    anchor.size = size
+    anchor.page_size = 1
+    anchor.device = "cpu"
+    anchor.lock = threading.RLock()
+    anchor.clear()
+    return anchor
+
+
+def _ple_host(layout: str = "page_first", anchor_size: int = PLE_HOST_SLOTS):
+    return PleStatePoolHost(
+        _mamba_pool_with_ple(),
+        _ple_anchor_host(anchor_size),
+        layout=layout,
+        pin_memory=False,
+        device="cpu",
+    )
+
+
+class TestPleStateRegions(CustomTestCase):
+    def test_slot_axis_is_normalized_to_dim_zero(self):
+        """Every transfer assumes an entry is [slots, *state_shape]; short-conv
+        keeps slots at dim 1 and N-gram has no layer dim at all."""
+        for region in collect_ple_state_regions(_mamba_pool_with_ple()):
+            for tensor in region.device_tensors:
+                self.assertEqual(tensor.shape[0], PLE_SLOTS + 1)
+                self.assertEqual(tuple(tensor.shape[1:]), region.state_shape)
+
+    def test_regions_group_by_field_dtype_and_shape(self):
+        regions = collect_ple_state_regions(_mamba_pool_with_ple())
+
+        # Field names are the PD transfer protocol's, not this module's.
+        self.assertEqual([r.field for r in regions], ["ple_short_conv", "ple_ngram"])
+        short_conv, ngram = regions
+        self.assertEqual(short_conv.dtype, torch.bfloat16)
+        self.assertEqual(short_conv.state_shape, (PLE_CHANNELS, PLE_STATE_LEN))
+        self.assertEqual(short_conv.layer_ids, PLE_SHORT_CONV_LAYER_IDS)
+        self.assertEqual(ngram.dtype, torch.int64)
+        self.assertEqual(ngram.state_shape, (PLE_NGRAM_CONTEXT_LEN,))
+        self.assertEqual(ngram.layer_ids, [PLE_NGRAM_STATE_LAYER_ID])
+
+    def test_intermediate_spec_scratch_is_excluded(self):
+        """`intermediate_*` is per-draft-token scratch; mirroring it would
+        restore a mid-verify window."""
+        regions = collect_ple_state_regions(_mamba_pool_with_ple(spec_draft_tokens=3))
+
+        short_conv = regions[0]
+        self.assertEqual(len(short_conv.device_tensors), len(PLE_SHORT_CONV_LAYER_IDS))
+        for tensor in short_conv.device_tensors:
+            self.assertEqual(tuple(tensor.shape[1:]), (PLE_CHANNELS, PLE_STATE_LEN))
+
+    def test_disabled_ple_yields_no_regions(self):
+        """A hybrid model without PLE still builds both sibling pools, disabled;
+        the assembler skips the PLE host pool on this."""
+        self.assertEqual(
+            collect_ple_state_regions(_mamba_pool_with_ple(enable_ple=False)), []
+        )
+
+
+class TestPleStatePoolHost(CustomTestCase):
+    def test_slots_mirror_the_anchor_pool(self):
+        """Transfers arrive with MAMBA's host indices, so sizing this pool
+        independently would index out of range."""
+        for anchor_size in (PLE_HOST_SLOTS, PLE_HOST_SLOTS * 3):
+            with self.subTest(anchor_size=anchor_size):
+                host = _ple_host(anchor_size=anchor_size)
+                self.assertEqual(host.size, anchor_size)
+                for buffer in host.region_buffers:
+                    self.assertEqual(buffer.shape[0], anchor_size)
+
+    def test_page_first_buffer_geometry(self):
+        """One slot's whole region stays contiguous, giving the
+        `slot_bytes * entries` row stride the transfer helpers assume."""
+        expected = {
+            "page_first": (
+                (PLE_HOST_SLOTS, 2, PLE_CHANNELS, PLE_STATE_LEN),
+                (PLE_HOST_SLOTS, 1, PLE_NGRAM_CONTEXT_LEN),
+            ),
+            "page_first_direct": (
+                (PLE_HOST_SLOTS, 2, 1, PLE_CHANNELS, PLE_STATE_LEN),
+                (PLE_HOST_SLOTS, 1, 1, PLE_NGRAM_CONTEXT_LEN),
+            ),
+        }
+        for layout, shapes in expected.items():
+            with self.subTest(layout=layout):
+                host = _ple_host(layout)
+                self.assertEqual(
+                    [tuple(b.shape) for b in host.region_buffers], list(shapes)
+                )
+
+    def test_layer_first_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "page-first layout"):
+            _ple_host("layer_first")
+
+    def test_pool_without_ple_state_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no slot-sibling"):
+            PleStatePoolHost(
+                _mamba_pool_with_ple(enable_ple=False),
+                _ple_anchor_host(),
+                layout="page_first",
+                pin_memory=False,
+                device="cpu",
+            )
+
+    def test_size_per_token_matches_allocated_bytes(self):
+        """HiCache budgets host pools as `size * size_per_token`, so a
+        per-token cost that counts an entry twice over-reserves silently."""
+        host = _ple_host()
+        expected = (
+            PLE_SHORT_CONV_SLOT_BYTES * len(PLE_SHORT_CONV_LAYER_IDS)
+            + PLE_NGRAM_SLOT_BYTES
+        )
+
+        self.assertEqual(host.size_per_token, expected)
+        self.assertEqual(
+            sum(b.numel() * b.element_size() for b in host.region_buffers),
+            expected * PLE_HOST_SLOTS,
+        )
+
+    def test_pool_is_a_single_transfer_unit(self):
+        """The per-layer load loop resolves a global layer to one local index,
+        and the N-gram context belongs to no model layer."""
+        host = _ple_host()
+
+        self.assertEqual(host.layer_num, 1)
+        with self.assertRaisesRegex(ValueError, "single transfer unit"):
+            host.load_to_device_per_layer(None, torch.tensor([0]), torch.tensor([0]), 1)
+
+    def test_model_layer_ids_exclude_the_ngram_sentinel(self):
+        """The assembler anchors the layer_mapping at min(model_layer_ids), and
+        the sentinel is outside the transfer loop's range."""
+        host = _ple_host()
+
+        self.assertEqual(host.model_layer_ids, PLE_SHORT_CONV_LAYER_IDS)
+        self.assertNotIn(PLE_NGRAM_STATE_LAYER_ID, host.model_layer_ids)
+
+    def test_page_buffer_meta_strides_by_region_row(self):
+        host = _ple_host()
+        row_bytes = [
+            PLE_SHORT_CONV_SLOT_BYTES * len(PLE_SHORT_CONV_LAYER_IDS),
+            PLE_NGRAM_SLOT_BYTES,
+        ]
+        bases = [buffer.data_ptr() for buffer in host.region_buffers]
+
+        ptrs, sizes = host.get_page_buffer_meta(torch.tensor([0, 2]))
+
+        # Region-major within each page, matching get_data_page's byte order.
+        self.assertEqual(
+            ptrs,
+            [
+                bases[0],
+                bases[1],
+                bases[0] + 2 * row_bytes[0],
+                bases[1] + 2 * row_bytes[1],
+            ],
+        )
+        self.assertEqual(sizes, row_bytes * 2)
+
+    def test_data_page_round_trips_through_flat_bytes(self):
+        """The L3 serialization pair must agree on region order and per-region
+        byte counts."""
+        host = _ple_host()
+        short_conv, ngram = host.region_buffers
+        conv_value = torch.arange(short_conv[3].numel(), dtype=torch.bfloat16).reshape(
+            short_conv[3].shape
+        )
+        ngram_value = torch.tensor([[7, 9]], dtype=torch.int64)
+        short_conv[3].copy_(conv_value)
+        ngram[3].copy_(ngram_value)
+
+        page = host.get_data_page(3)
+        self.assertEqual(page.numel(), host.size_per_token)
+
+        short_conv[3].zero_()
+        ngram[3].zero_()
+        host.set_from_flat_data_page(3, page)
+
+        self.assertTrue(torch.equal(short_conv[3], conv_value))
+        self.assertTrue(torch.equal(ngram[3], ngram_value))
 
 
 if __name__ == "__main__":
