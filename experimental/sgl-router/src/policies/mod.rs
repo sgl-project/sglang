@@ -16,6 +16,8 @@ pub mod selection;
 pub mod session_aware;
 pub mod sticky;
 
+pub use cache_aware::{CacheCandidate, CacheCandidateProposal};
+
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
@@ -322,46 +324,6 @@ pub struct SelectionProposal {
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
 
-/// Cache-Aware prefill candidate where `E = L - H`.
-#[derive(Clone)]
-pub struct CacheCandidate {
-    pub worker: Arc<Worker>,
-    pub matched_prefix_tokens: u64,
-    pub uncached_tokens: u64,
-    /// Matched prefix length in blocks, as reported by the prefix signal.
-    /// Selection reads `matched_prefix_tokens`; the block count exists for
-    /// observability (the diverted-overlap histogram reads against the
-    /// tree/indexer block domain).
-    pub matched_prefix_blocks: u32,
-    /// Domain containing this candidate.
-    pub candidate_range_id: String,
-    /// Optional pending prefill limit checked against `E`.
-    pub max_pending_prefill_tokens: Option<u64>,
-}
-
-/// Bounded set of Cache-Aware candidates.
-#[derive(Clone, Default)]
-pub struct CacheCandidateProposal {
-    pub candidates: Vec<CacheCandidate>,
-    pub cache_switch_margin_tokens: u64,
-    pub enable_pressure_guard: bool,
-    pub pressure_abs_threshold_tokens: u64,
-    pub pressure_abs_threshold_ms: Option<f64>,
-    pub pressure_rel_threshold: f64,
-    /// Queue gate: a candidate whose engine reports at least this many
-    /// waiting requests cannot win on cache affinity. `None` disables the
-    /// gate. See [`crate::config::AffinityConfig::worker_queue_limit`].
-    pub worker_queue_limit: Option<u64>,
-    /// Saturation pin: when no candidate survives the gate and hard
-    /// admission, at least one was queue-gate-rejected, and no worker in
-    /// the routable fleet has a fresh queue reading strictly below this
-    /// floor, the request pins to the least-pressured rejected prefix
-    /// owner instead of diverting — the diversion cannot dodge a wait and
-    /// would forfeit the matched prefix. `None` disables the pin. See
-    /// [`crate::config::AffinityConfig::saturation_queue_floor`].
-    pub saturation_queue_floor: Option<u64>,
-}
-
 /// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
 #[derive(Clone)]
 pub enum PrefillProposal {
@@ -570,9 +532,9 @@ mod tests {
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{
-        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
+        resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
-    use crate::policies::cache_aware::CacheAwarePolicy;
+    use crate::policies::cache_aware::{resolve_cache_candidates, CacheAwarePolicy};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
