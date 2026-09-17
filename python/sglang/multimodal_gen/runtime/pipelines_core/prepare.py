@@ -172,6 +172,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
                 spec.transformers_or_diffusers,
                 spec.architecture,
                 loader_cls=override,
+                discover_loaders=False,
             )
             if type(loader) is not selected.loader_cls:
                 raise ValueError(

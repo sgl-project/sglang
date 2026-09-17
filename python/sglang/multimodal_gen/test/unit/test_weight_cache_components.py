@@ -89,6 +89,28 @@ def test_generic_loader_has_no_implicit_cache_capability():
         GenericComponentLoader("diffusers", "Unknown").prepare_weight_cache(None, None)
 
 
+def test_preparation_never_discovers_unrelated_loaders(prepared_wan):
+    args, pipeline, prepare = prepared_wan
+    with (
+        patch.object(ComponentLoader, "_loaders_registered", False),
+        patch.object(
+            ComponentLoader,
+            "_ensure_loaders_registered",
+            side_effect=AssertionError("discovery"),
+        ),
+        patch.object(torch.nn.Module, "__init__", side_effect=AssertionError("module")),
+        patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("CUDA")),
+    ):
+        assert (
+            prepare(pipeline, args, required=True).component("transformer").loader_cls
+            is TransformerLoader
+        )
+        with pytest.raises(ValueError, match="No registered component loader"):
+            ComponentLoader.for_component_type(
+                "unregistered_test_component", "diffusers", discover_loaders=False
+            )
+
+
 def test_state_contract_rejects_same_named_unregistered_class():
     fake = type(WAN.model_name, (), {"__module__": WAN.model_module})
     with pytest.raises(ValueError, match="resolved model"):

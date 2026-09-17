@@ -695,6 +695,7 @@ class ComponentLoader(ABC):
         component_architecture: str | None = None,
         *,
         loader_cls: type["ComponentLoader"] | None = None,
+        discover_loaders: bool = True,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -702,8 +703,12 @@ class ComponentLoader(ABC):
         Args:
             component_type: Structural role (e.g. "vae" or "text_encoder")
             transformers_or_diffusers: Whether the component is from transformers or diffusers
+            discover_loaders: Import all loader modules if needed. Pure preparation
+                can resolve only already registered capabilities without triggering
+                unrelated third-party import-time model construction.
         """
-        cls._ensure_loaders_registered()
+        if discover_loaders:
+            cls._ensure_loaders_registered()
 
         # Map of component types to their loader classes and expected library
         structural_component_name = component_type
@@ -715,6 +720,8 @@ class ComponentLoader(ABC):
 
         if loader_cls is None:
             loader_cls = component_name_to_loader_cls.get(loader_type)
+        if loader_cls is None and not discover_loaders:
+            raise ValueError(f"No registered component loader for {component_type!r}")
         if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
