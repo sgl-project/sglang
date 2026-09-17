@@ -733,9 +733,6 @@ class PrefillAdder:
         total_tokens: int,
         swa_host_hit_length: int,
     ) -> tuple[bool, Optional[int]]:
-        mamba_slots = self._mamba_slots_for_req(req)
-        if self.rem_mamba_slots is not None and mamba_slots > self.rem_mamba_slots:
-            return False, None
         return self.memory_budget.check_prefill(
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
@@ -1171,6 +1168,17 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        # A staged checkpoint needs a node slot as well as the request state.
+        # Rejection participates in staged lifecycle even before materialization.
+        mamba_slots = self._mamba_slots_for_req(req)
+        if self.rem_mamba_slots is not None and mamba_slots > self.rem_mamba_slots:
+            pipeline = self.tree_cache.buffer_pipeline
+            if pipeline is not None:
+                pipeline.defer_staged_admission(req, pool="mamba")
+            # A dropped hold still has this round's FULL-only splice prefix.
+            # End the attempt; init_next_round_input rebuilds it next round.
+            return AddReqResult.NO_TOKEN
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
