@@ -913,6 +913,19 @@ def test_startup_rejects_speculative_without_draft_pools():
             )
 
 
+def test_owner_thread_stats_tick_during_startup_does_not_fault(harness, caplog):
+    # A stats interval shorter than core construction makes the first owner
+    # tick fire before __init__ returns; it must find the adapter in place.
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        h = harness(extra={"stats_log_interval_s": 0.001})
+        h.wait(lambda: h.linker.snapshot_stats() is not None)
+        time.sleep(0.05)
+    assert h.linker._adapter.healthy
+    assert not [r for r in caplog.records if "owner loop fault" in r.getMessage()]
+
+
 if __name__ == "__main__":
     import sys
 

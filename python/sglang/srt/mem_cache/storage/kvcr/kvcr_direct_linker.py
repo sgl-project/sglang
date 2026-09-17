@@ -644,6 +644,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             on_unhealthy=self._on_unhealthy,
         )
         adapter.add_ticker(self._tick)
+        # The ticker reads self._adapter and the stats clock from the owner
+        # thread, so both must be in place before the first iteration runs.
+        self._adapter = adapter
+        self._next_stats_log = time.monotonic() + self.config.stats_log_interval_s
         adapter.start()
         return adapter
 
