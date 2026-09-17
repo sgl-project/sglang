@@ -407,6 +407,8 @@ class InklingConvStateShape:
     # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
     # along the dim axis, so the dedup conv-intermediate layout must stay off.
     disable_conv_window_dedup: bool = True
+    # Speculative conv intermediates as strips of the fresh conv inputs; see fused_conv_strip_commit.
+    conv_intermediate_strip: bool = False
 
 
 @dataclass(kw_only=True, frozen=True)

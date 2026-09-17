@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -89,6 +90,11 @@ class TargetHiddenKvInjector:
             )
             return
 
+        swa_loc = None
+        if isinstance(pool, SWAKVPool):
+            # Hybrid draft pool: its window layers live in the SWA sub-pool,
+            # addressed through the target allocator's full->SWA mapping.
+            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc)
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
@@ -98,6 +104,7 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+                swa_loc=swa_loc,
             )
 
     def _inject_mla(

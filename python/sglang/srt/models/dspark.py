@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -81,6 +82,22 @@ def run_markov_block(
         torch.stack(sampled_tokens, dim=1),
         torch.cat(corrected_logits, dim=1) if collect_corrected else None,
     )
+
+
+def _target_hidden_write_locs(
+    cache_loc: torch.Tensor,
+    cache_loc_2d: Optional[torch.Tensor],
+    swa_loc: Optional[torch.Tensor],
+):
+    """Write locations for the injected context KV: bare full locs for a plain
+    pool, ``KVWriteLoc`` bundles carrying the SWA loc for a hybrid pool (whose
+    window layers are addressed in the SWA sub-pool)."""
+    if swa_loc is None:
+        return cache_loc, cache_loc_2d
+    loc_info_2d = None
+    if cache_loc_2d is not None:
+        loc_info_2d = KVWriteLoc(cache_loc_2d, swa_loc.view(cache_loc_2d.shape))
+    return KVWriteLoc(cache_loc, swa_loc), loc_info_2d
 
 
 class VanillaMarkov(nn.Module):
@@ -735,6 +752,7 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -742,7 +760,9 @@ class DSparkDraftMixin:
             else self.project_target_hidden(target_hidden)
         )
 
-        bundle = self._fused_kv_write_bundle(pool)
+        # The fused writer addresses per-layer buffers by full loc; a hybrid
+        # pool's window layers take the SWA loc, so they go through the pool.
+        bundle = None if swa_loc is not None else self._fused_kv_write_bundle(pool)
         if bundle is not None:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,
@@ -775,6 +795,9 @@ class DSparkDraftMixin:
             )
             return
 
+        loc_info, loc_info_2d = _target_hidden_write_locs(
+            cache_loc, cache_loc_2d, swa_loc
+        )
         stacked = self._stacked_ctx_kv_params()
         if stacked is not None:
             k_all, v_all = self._project_ctx_kv_stacked(
@@ -791,10 +814,10 @@ class DSparkDraftMixin:
                 k = attn.apply_k_rope(positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            if cache_loc_2d is not None and commit_lens is not None:
+            if loc_info_2d is not None and commit_lens is not None:
                 pool.set_kv_buffer_prefix_valid(
                     attn.attn,
-                    cache_loc_2d,
+                    loc_info_2d,
                     commit_lens,
                     k,
                     v,
@@ -804,7 +827,7 @@ class DSparkDraftMixin:
             else:
                 pool.set_kv_buffer(
                     attn.attn,
-                    cache_loc,
+                    loc_info,
                     k,
                     v,
                     attn.attn.k_scale,
