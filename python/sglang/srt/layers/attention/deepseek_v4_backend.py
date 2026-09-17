@@ -692,22 +692,15 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        # The distinct ratios this stage has, sorted -- not the per-layer
-        # hf_config.compress_ratios list. Nothing is built for a ratio outside
-        # this set.
-        model_ratios = set(self.token_to_kv_pool.compression_ratios)
-        self.present_ratios: Tuple[int, ...] = tuple(
-            ratio
-            for ratio in sorted(self.token_to_kv_pool.kv_pools)
-            if ratio in model_ratios
-        )
+        # Nothing is built for a compress ratio outside the pool's set.
+        self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
 
         kernel = get_exec().kernel

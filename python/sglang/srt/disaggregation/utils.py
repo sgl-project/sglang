@@ -122,19 +122,6 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
-def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.ndarray:
-    """PD transfer indices of the request-scoped state component (C128_STATE):
-    the c128 ring, whose item is one c128 page (or the single online row)."""
-    assert 128 in pool.kv_pools, (
-        "the request-scoped state component holds the c128 ring"
-    )
-    online = is_dsv4_c128_online_enabled()
-    ring_size = 1 if online else pool.get_ring_size(128)
-    return get_dsv4_c128_state_indices(
-        req_pool_idx, seq_len, online=online, ring_size=ring_size
-    )
-
-
 def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     """Return the request-pool row that owns a QSA pending-state ring."""
     req_pool_idx = req.kv.req_pool_idx
