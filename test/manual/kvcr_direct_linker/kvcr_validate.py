@@ -72,6 +72,7 @@ class Server:
         max_total_tokens: int,
         linker_config: dict | None,
         extra_args: list[str],
+        dp_rank: int | None = None,
     ) -> None:
         self.name = name
         self.port = port
@@ -108,6 +109,7 @@ class Server:
             ]
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpus)
         self.command = command
+        self.dp_rank = dp_rank
         self.log = open(self.log_path, "w")
         self.process = subprocess.Popen(
             command, stdout=self.log, stderr=subprocess.STDOUT, env=env
@@ -135,10 +137,20 @@ class Server:
         }
         if kv_hints is not None:
             payload["kv_hints"] = kv_hints
+        if self.dp_rank is not None:
+            # DP-attention ranks own separate caches; pin every request to one.
+            payload["routed_dp_rank"] = self.dp_rank
         return _post(f"{self.base}/generate", payload)
 
     def flush(self) -> None:
-        _post(f"{self.base}/flush_cache", {}, timeout=120.0)
+        # /flush_cache answers with plain text, not JSON.
+        request = urllib.request.Request(
+            f"{self.base}/flush_cache",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=120.0) as response:
+            response.read()
 
     def stats(self) -> dict[str, dict[str, str]]:
         """Latest stats line per rank from the log."""
@@ -243,6 +255,7 @@ def scenario_roundtrip(args, workdir: Path) -> dict:
             max_total_tokens=args.max_total_tokens,
             linker_config=linker,
             extra_args=args.extra,
+            dp_rank=args.dp_rank,
         )
         try:
             server.wait_ready()
@@ -302,6 +315,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         max_total_tokens=args.max_total_tokens,
         linker_config=_linker_config(args, control_port=source_control),
         extra_args=args.extra,
+        dp_rank=args.dp_rank,
     )
     target = Server(
         name="peer_target",
@@ -314,6 +328,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         max_total_tokens=args.max_total_tokens,
         linker_config=_linker_config(args, control_port=target_control),
         extra_args=args.extra,
+        dp_rank=args.dp_rank,
     )
     try:
         source.wait_ready()
@@ -374,6 +389,12 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--dp-rank",
+        type=int,
+        default=None,
+        help="pin requests to one attention-DP rank",
+    )
     parser.add_argument("--port", type=int, default=30100)
     parser.add_argument("--control-port", type=int, default=25100)
     parser.add_argument("--page-size", type=int, default=64)
