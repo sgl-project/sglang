@@ -368,8 +368,8 @@ class TestPDMuxScheduler(unittest.TestCase):
             yield
 
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
-        model_runner = SimpleNamespace(update_decode_attn_backend=lambda _idx: None)
-        return SimpleNamespace(
+        model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
+        scheduler = SimpleNamespace(
             split_prefill_batch=object(),
             pdmux_standard=False,
             draft_worker=None,
@@ -380,6 +380,12 @@ class TestPDMuxScheduler(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             stream_groups=[(f"p{i}", f"d{i}") for i in range(group_num)],
         )
+        scheduler._update_decode_attn_backends = lambda stream_idx: (
+            SchedulerMultiplexMixin._update_decode_attn_backends(
+                scheduler, stream_idx
+            )
+        )
+        return scheduler
 
     def test_manual_division_below_every_threshold_uses_first_shared_group(self):
         """A decode batch under every configured threshold still needs a group.
@@ -486,12 +492,21 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
     def test_pdmux_initialization_uses_parallel_state_gpu_id(self):
-        config = object()
+        config = SimpleNamespace(layer_prefill_chunk_round_robin=False)
         scheduler = SimpleNamespace(
             ps=SimpleNamespace(gpu_id=3),
+            pdmux_standard=False,
         )
 
         with (
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.Stream",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.stream",
+                return_value=object(),
+            ),
             patch(
                 "sglang.srt.multiplex.multiplexing_mixin.load_pdmux_config",
                 return_value=config,

@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -22,7 +22,7 @@ class TestDeepseekV4TopKDispatch(unittest.TestCase):
             "sglang.kernels.ops.attention.dsv4.topk._jit_topk_v2_module",
             return_value=module,
         ):
-            topk_transform_512_v2(
+            topk_transform_paged_v2(
                 scores,
                 seq_lens,
                 page_table,
@@ -32,7 +32,7 @@ class TestDeepseekV4TopKDispatch(unittest.TestCase):
                 enable_cluster=False,
             )
 
-        module.topk_transform.assert_called_once_with(
+        module.topk_transform_paged.assert_called_once_with(
             scores,
             seq_lens,
             page_table,

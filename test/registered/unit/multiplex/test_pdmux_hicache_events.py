@@ -61,6 +61,7 @@ class _DecodeBatch:
     """A non-empty decode batch, so split prefill advances one layer at a time."""
 
     batch_is_full = False
+    scheduler_global_num_tokens = [1]
 
     def is_empty(self):
         return False
@@ -73,10 +74,11 @@ class _SplitBatch:
     def __init__(self):
         self.split_index = 0
         self.extend_num_tokens = 1000
+        self.scheduler_global_num_tokens = [1000]
         self.split_forward_count = 0
         self.split_prefill_finished = False
         self.chunked_req = None
-        self.forward_mode = None
+        self.forward_mode = SimpleNamespace(is_idle=lambda: False)
         self.hicache_consumer_index = CONSUMER_INDEX
 
     def is_empty(self):
@@ -118,6 +120,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.sm_counts = [(1, 1)]
 
         self.request_receiver = SimpleNamespace(recv_requests=self._recv_requests)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
 
     # --- collaborators the loop drives -------------------------------------
 
@@ -129,6 +134,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
     def process_input_requests(self, recv_reqs):
         pass
+
+    def ingest_requests(self):
+        self.process_input_requests(self.request_receiver.recv_requests())
 
     def process_pending_chunked_abort(self):
         pass

@@ -43,6 +43,18 @@ class _FakeLayer:
         return hidden_states + residual + post + comb
 
 
+class _FakePrevLayer:
+    def __init__(self, layer_id):
+        self.layer_id = layer_id
+        self.engram = None
+        self.calls = []
+
+    def forward_hc_pre_from_prev(self, *, hidden_states, prev_pre, **kwargs):
+        self.calls.append(prev_pre)
+        value = self.layer_id + 1
+        return hidden_states + value, torch.tensor(float(value))
+
+
 class TestDeepseekV4SplitPrefill(unittest.TestCase):
     def _make_model(self):
         layers = [_FakeLayer(0), _FakeLayer(1)]
@@ -50,7 +62,9 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             embed_tokens=lambda input_ids: input_ids.float().unsqueeze(-1),
             hc_mult=2,
             layers=layers,
+            start_layer=0,
             end_layer=len(layers),
+            hc_pre_from_prev_sublayer=False,
             use_fused_mhc_post_pre=True,
             hc_head=lambda hidden, *args: hidden.sum(dim=1),
             hc_head_fn=None,
@@ -68,7 +82,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
                 return_value=SimpleNamespace(attn_dp_size=1),
             ),
             patch(
-                "sglang.srt.models.deepseek_v4.dsa_use_prefill_cp",
+                "sglang.srt.models.deepseek_v4.is_cp_active",
                 return_value=False,
             ),
             patch(
@@ -141,15 +155,47 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         for actual, expected in zip(split_aux, one_shot_aux):
             torch.testing.assert_close(actual, expected)
 
-    def test_causal_lm_initializes_cp_once_and_processes_final_logits(self):
-        prepare_cp = Mock()
+    def test_dsv41_split_preserves_predecessor_mhc_state(self):
+        layers = [_FakePrevLayer(0), _FakePrevLayer(1)]
+        model = SimpleNamespace(
+            embed_tokens=lambda input_ids: input_ids.float().unsqueeze(-1),
+            hc_mult=2,
+            layers=layers,
+            start_layer=0,
+            end_layer=2,
+            hc_pre_from_prev_sublayer=True,
+            engram_hasher=None,
+            late_layer_start=None,
+            config=SimpleNamespace(model_type="deepseek_v41", vision_n_layers=0),
+            norm=lambda hidden: hidden,
+            dspark_layers_to_capture=None,
+        )
+        forward_mode = SimpleNamespace(is_extend=lambda: True)
+        batch = SimpleNamespace(
+            hidden_states=None,
+            model_specific_states=None,
+            forward_mode=forward_mode,
+        )
+
+        with patch(
+            "sglang.kernels.ops.layernorm.mhc.hc_combine",
+            side_effect=lambda x, pre, *_: x + pre,
+        ):
+            self.assertIsNone(self._run_split(model, batch, (0, 1)))
+            result = self._run_split(model, batch, (1, 2))
+
+        self.assertIsNone(layers[0].calls[0])
+        self.assertEqual(layers[1].calls[0].item(), 1.0)
+        self.assertIsNotNone(result)
+
+    def test_causal_lm_processes_only_final_split_logits(self):
         model_forward = Mock(
             side_effect=[None, (torch.tensor([1.0]), torch.tensor([2.0]))]
         )
         logits_processor = Mock(return_value="logits")
         model = SimpleNamespace(
-            _prepare_dsa_prefill_cp=prepare_cp,
-            model=SimpleNamespace(forward_split_prefill=model_forward),
+            vision=None,
+            model=SimpleNamespace(start_layer=0, forward_split_prefill=model_forward),
             logits_processor=logits_processor,
             lm_head=object(),
             capture_aux_hidden_states=False,
@@ -177,14 +223,14 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             )
 
         self.assertEqual(result, "logits")
-        prepare_cp.assert_called_once_with(args[0], args[2])
         logits_processor.assert_called_once()
 
     def test_causal_lm_passes_split_dspark_captures_to_logits_processor(self):
         aux = [torch.tensor([[3.0]])]
         model = SimpleNamespace(
-            _prepare_dsa_prefill_cp=Mock(),
+            vision=None,
             model=SimpleNamespace(
+                start_layer=0,
                 forward_split_prefill=Mock(
                     return_value=((torch.tensor([1.0]), torch.tensor([2.0])), aux)
                 )

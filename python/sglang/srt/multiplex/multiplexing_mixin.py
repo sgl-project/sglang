@@ -317,7 +317,8 @@ class SchedulerMultiplexMixin:
         decode_stream,
         running_batch: ScheduleBatch,
     ) -> ScheduleBatch:
-        running_batch = self._merge_completed_prefill_batch(
+        running_batch = SchedulerMultiplexMixin._merge_completed_prefill_batch(
+            self,
             batch=self.split_prefill_batch,
             prefill_result=prefill_result,
             running_batch=running_batch,

@@ -200,6 +200,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.pdmux_prefill_stream = None
         self.tp_cpu_group = SimpleNamespace(allreduce=self._allreduce)
         self.request_receiver = SimpleNamespace(recv_requests=self._recv_requests)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
 
     # --- collaborators the loop drives -------------------------------------
 
@@ -701,9 +704,11 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
 
     @staticmethod
     def _args(**overrides):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
         base = dict(
             cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend="disabled")
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
             ),
             enable_multi_layer_eagle=False,
             enable_two_batch_overlap=False,
@@ -717,9 +722,11 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
         return SimpleNamespace(**base)
 
     def _check(self, **overrides):
-        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.arg_groups.validation_hook import (
+            _check_pdmux_standard_prefill,
+        )
 
-        ServerArgs._check_pdmux_standard_prefill(self._args(**overrides))
+        _check_pdmux_standard_prefill(self._args(**overrides))
 
     def test_a_clean_profile_is_accepted(self):
         self._check()
@@ -739,7 +746,6 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
             dict(enable_multi_layer_eagle=True),
             dict(enable_two_batch_overlap=True),
             dict(enable_unified_memory=True),
-            dict(enable_dp_attention=True),
             dict(ep_size=2),
             dict(attn_cp_size=2),
             dict(dcp_size=2),
@@ -748,6 +754,9 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
             with self.subTest(**{k: str(v) for k, v in overrides.items()}):
                 with self.assertRaises(AssertionError):
                     self._check(**overrides)
+
+    def test_dp_attention_is_supported(self):
+        self._check(enable_dp_attention=True)
 
 
 def _function_node(module, name: str) -> ast.FunctionDef:
