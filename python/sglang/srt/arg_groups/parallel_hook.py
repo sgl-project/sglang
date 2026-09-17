@@ -33,7 +33,7 @@ def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
     # position must also win here, or a package permitting prefill CP on its
-    # own qualified NPU/MUSA build would still hit the original rejection
+    # own qualified HIP/NPU/MUSA build would still hit the original rejection
     # at this later, nested call.
     run_hook(validate_prefill_cp_platform, server_args)
 
@@ -630,7 +630,7 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject platforms whose prefill CP paths have not migrated."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_npu or platform.is_musa):
+    if cfg.enable_prefill_cp and platform.is_musa:
         raise ValueError(
-            "Prefill CP on NPU/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )

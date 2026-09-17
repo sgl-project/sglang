@@ -22,7 +22,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")
 
     def test_platform_cp_rejected_before_model_lookup(self):
-        for platform in ("is_npu", "is_musa"):
+        for platform in ("is_musa",):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for strategy in (None, "zigzag", "interleave"):
@@ -37,7 +37,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                             validate_prefill_cp_platform(args)
 
     def test_context_parallel_handler_rejects_before_model_lookup(self):
-        for platform in ("is_npu", "is_musa"):
+        for platform in ("is_musa",):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             with self.subTest(platform=platform), override_platform(**facts):
@@ -50,7 +50,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                     handle_context_parallelism(args)
 
     def test_resolution_rejects_even_dummy_models(self):
-        for platform in ("is_npu", "is_musa"):
+        for platform in ("is_musa",):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for model_path in ("dummy", "none", "missing-model-must-not-be-loaded"):
