@@ -71,4 +71,59 @@ non-stop rate (1.25% vs 0.21%, the handbook wants < 0.5%). Turning off the index
 50/112 on the hard set), so that optimization is not the cause. The engine without speculation still sits ~4 points under the official
 endpoint, which points at the MXFP4 checkpoint; the MXFP8 checkpoint is probed below.
 
-PROBE_PLACEHOLDER
+### Per-config probe: one verifier loop (102 prompts) + raw sampling of the four long-context tool prompts (6 samples each)
+
+All with the lenient parser. "raw invokes" counts `<invoke ...>` tags in the model's raw text: well-formed `name="X">` vs anything else.
+
+| Config | ToolCalls-Match | Schema-Acc | raw invokes well-formed / malformed | EAGLE3 accept length |
+|---|---:|---:|---:|---:|
+| MXFP4, EAGLE3 GQA, index top-k shared across 4 layers (ATOM's config) | 0.970 | 0.952 | 10 / 32 | 2.65 |
+| same, no speculative decoding | 0.910 | 0.947 | 20 / 22 | - |
+| same, EAGLE3 with `--speculative-use-rejection-sampling` | 0.970 | 0.939 | 19 / 25 | 2.67 |
+| MXFP8 checkpoint, no speculative decoding | 0.920 | 0.883 | 20 / 32 | - |
+| MXFP8 checkpoint, EAGLE3 | 0.950 | 0.925 | 19 / 39 | 2.68 |
+| MXFP4, no spec, INT4 quick-reduce off | 0.950 | 0.950 | 14 / 24 | - |
+| MXFP4, no spec, bf16 KV + bf16 index cache | 0.930 | 0.910 | 26 / 19 | - |
+| MXFP4, no spec, Gluon sparse prefill off | 0.930 | 0.936 | 32 / 23 | - |
+| MXFP4, no spec, all of the above off + index top-k share frequency 1 | 0.990 | 0.964 | 48 / 0 | - |
+| MXFP4, no spec, **only** index top-k share frequency 1 | 0.970 | 0.976 | 48 / 0 | - |
+| MXFP4, EAGLE3, index top-k share frequency 2 | 0.990 | 0.976 | 39 / 5 | 2.94 |
+| **MXFP4, EAGLE3, index top-k share frequency 1 (production)** | **0.990** | **0.988** | **54 / 0** | **3.07** |
+
+The Inferact MHA draft (`Inferact/MiniMax-M3-EAGLE3`, 64 KV heads) did not fit next to the target at mem-fraction 0.9 (its draft KV
+cache is 16x the GQA one); not pursued. Single-loop match rates carry about +/-3 points of noise; the raw invoke counts are the signal.
+
+**Root cause:** sharing the sparse-attention index top-k across 4 layers (`SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4`, ATOM's
+`index_topk_freq`) is fine on GSM8K and aime25 but corrupts structured output once the context passes ~60K tokens: the model drops
+the `="` of its tool-call tags. Neither the checkpoint (MXFP4 vs MXFP8), speculative decoding, INT4 quick-reduce, the fp8 caches nor the
+Gluon prefill is the cause. The endpoint therefore runs frequency 1 (the AgentX benchmark configs keep 4 for their published numbers).
+Speculative decoding on top of frequency 4 made it worse (32/42 vs 22/42 malformed); at frequency 1 it is clean and accepts more.
+
+### Final production config: results
+
+`serve_endpoint.sh` as committed (EAGLE3 GQA 3 steps / 4 draft tokens, mem 0.9, `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1`, lenient tool parser).
+
+| Check | Result | Reference |
+|---|---|---|
+| Provider-Verifier pass@10 (10 x 102 prompts) | Query-Success 100%, ToolCalls-Match 97.8% (loops 0.96-0.99), Trigger-Similarity 99.4%, Schema-Accuracy 99.4%, Error-Only-Reasoning 0%, Language-Following 100%, Scenario-Check 90% (the single scenario prompt missed in 1 of 10 loops) | official MiniMax-M3: 100 / 98.8 (loops 0.98-0.99) / - / 98.9 / 0 / 100 / 100; vendor thresholds: 100 / ~98 +/-1 / >=98 / >=98 / 0 / >=40 / 100 |
+| aime25 pass@1 avg-of-16 | 86.46% +/- 4.94 (SEM 1.23), **non-stop 2.29%** (11/480 reached the 98304-token cap), avg 15.2K tokens. Without speculative decoding (`SPEC=none`): 87.50% +/- 5.09, non-stop 0.21% | official endpoint 91.46% +/- 3.84 (SEM 0.96), non-stop 0.21% |
+| m3_format_check text suite | 154 passed, 4 skipped, 1 xfailed; the 2 failures are the API-key cases on an eval server launched without a key (the keyed production launch passed all 156 earlier the same day) | 0 failures required |
+| Steady decode, 24 streams over ~70K-token contexts | 2,213 tok/s aggregate (92 tok/s per stream) | 2,475 tok/s with the top-k shared across 4 layers: the fix costs ~11% decode throughput at this context length |
+| Overload / auth / model name | as above (429 / 401 / 404 + `X-Request-Id`), unchanged | |
+
+## Recommendation
+
+Two launch shapes of the same image, both with the index top-k share frequency at 1 and the lenient parser:
+
+- **Acceptance-test shape (`SPEC=none`)**: passes every hard gate measured here: tool-call match ~97%, aime25 87.5% with non-stop 0.21%
+  (< 0.5% required), format suite clean. Decode is ~2.9K tok/s aggregate at 48 streams on 4 GPUs, i.e. ~60 tok/s per stream at that
+  concurrency; run the vendor's 60/80/100/120% load ladder to pick `MAXRUN` so P50 TPS stays above 60.
+- **Throughput shape (default, EAGLE3)**: ~2.2K tok/s at 24 streams over 70K contexts and 5.5K tok/s at 48 short streams, tool-call
+  match 97.8%, aime25 86.5%, but non-stop 1.3-2.3% on aime25, which fails the handbook's < 0.5%. The EAGLE3 verify path is the open
+  item: on the seven hardest aime25 problems it scores 50/112 against 64/112 without speculation, and rejection sampling, the
+  draft choice and the index top-k frequency do not change that, so the remaining suspect is the target-verify attention path for
+  the MiniMax sparse layers on very long generations (`pr/m3-eagle3-chain-verify`).
+
+Not adopted, and why: index top-k sharing (quality, above); fp4 MoE activations at decode and forced draft acceptance (lossy by
+construction, see `../OPTIMIZATIONS.md` section 4); online PTPC-FP8 dense layers (quality-neutral but measured slower on this build);
+DSpark (per the owner's decision, EAGLE3 stays); the MHA EAGLE3 draft (does not fit at mem 0.9).
