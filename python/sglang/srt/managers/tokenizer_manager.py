@@ -189,6 +189,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +497,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_last_error = None
         self.elastic_runtime_health = "healthy"
         self.elastic_runtime_error = None
+        self.elastic_scheduler_response_timeout = min(
+            _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS,
+            get_exec().moe.elastic_ep_scale_timeout,
+        )
         self.elastic_joining_rank_offset = None
         self.elastic_joining_rank_count = 0
         self.elastic_ready_rank_count = 0
@@ -3496,6 +3501,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self._elastic_scale_lock:
             return await self._scale_elastic_ep_locked(obj)
 
+    def _current_elastic_scale_output(
+        self, operation_id: str, new_ep_size: int
+    ) -> ScaleElasticEPReqOutput:
+        success = self.elastic_operation_succeeded is not False
+        return ScaleElasticEPReqOutput(
+            success=success,
+            message=(
+                self.elastic_last_error
+                if not success
+                else f"Returning existing Elastic EP operation {operation_id}."
+            ),
+            operation_id=operation_id,
+            instance_id=self.elastic_instance_id,
+            old_ep_size=self.elastic_worker_count,
+            new_ep_size=new_ep_size,
+            pending_ep_size=self.elastic_pending_ep_size,
+            scale_phase=self.elastic_scale_phase,
+            terminal=self.elastic_operation_succeeded is not None,
+            effective_ep_size=self.elastic_worker_count,
+        )
+
     async def _scale_elastic_ep_locked(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
@@ -3554,21 +3580,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     scale_phase=self.elastic_scale_phase,
                 )
             if self.elastic_scale_phase != "submission_unknown":
-                return ScaleElasticEPReqOutput(
-                    success=self.elastic_operation_succeeded is not False,
-                    message=(
-                        self.elastic_last_error
-                        if self.elastic_operation_succeeded is False
-                        else f"Returning existing Elastic EP operation {operation_id}."
-                    ),
-                    operation_id=operation_id,
-                    instance_id=self.elastic_instance_id,
-                    old_ep_size=self.elastic_worker_count,
-                    new_ep_size=obj.new_ep_size,
-                    pending_ep_size=self.elastic_pending_ep_size,
-                    scale_phase=self.elastic_scale_phase,
-                    terminal=self.elastic_operation_succeeded is not None,
-                    effective_ep_size=self.elastic_worker_count,
+                return self._current_elastic_scale_output(
+                    operation_id,
+                    obj.new_ep_size,
                 )
             self.elastic_scale_phase = "reconciling_submission"
             self.elastic_last_error = None
@@ -3613,16 +3627,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             expected_instance_id=obj.expected_instance_id,
             expected_joining_member_ids=obj.expected_joining_member_ids,
             runtime_instance_id=self.elastic_instance_id,
+            submission_id=uuid.uuid4().hex,
         )
         self.auto_create_handle_loop()
         try:
-            responses: List[
-                ScaleElasticEPReqOutput
-            ] = await self.scale_elastic_ep_communicator(scheduler_obj)
-        except BaseException as exc:
+            responses: List[ScaleElasticEPReqOutput] = await asyncio.wait_for(
+                self.scale_elastic_ep_communicator(scheduler_obj),
+                timeout=self.elastic_scheduler_response_timeout,
+            )
+        except asyncio.TimeoutError:
+            if self.elastic_operation_succeeded is not None:
+                return self._current_elastic_scale_output(
+                    operation_id,
+                    obj.new_ep_size,
+                )
             self.elastic_scale_phase = "submission_unknown"
-            self.elastic_last_error = f"Scale submission result is unknown: {exc}"
+            self.elastic_last_error = (
+                "Timed out waiting for Elastic EP scheduler responses."
+            )
             raise
+        except BaseException as exc:
+            if self.elastic_operation_succeeded is None:
+                self.elastic_scale_phase = "submission_unknown"
+                self.elastic_last_error = f"Scale submission result is unknown: {exc}"
+            raise
+        if self.elastic_operation_succeeded is not None:
+            return self._current_elastic_scale_output(
+                operation_id,
+                obj.new_ep_size,
+            )
         if not responses:
             error = "Scale submission returned no scheduler responses."
             self.elastic_scale_phase = "submission_unknown"

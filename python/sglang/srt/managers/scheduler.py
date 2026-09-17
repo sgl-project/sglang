@@ -5691,9 +5691,13 @@ class Scheduler(
         max_ep_size = get_parallel().max_world_size
         operation_id = recv_req.operation_id
         runtime_instance_id = recv_req.runtime_instance_id
+        make_output = partial(
+            ScaleElasticEPReqOutput,
+            submission_id=recv_req.submission_id,
+        )
 
         if operation_id is None or runtime_instance_id is None:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message="Elastic EP scale requests require runtime and operation IDs.",
                 operation_id=operation_id,
@@ -5724,7 +5728,7 @@ class Scheduler(
                     f"{existing_members}, not {expected_members}."
                 )
             if conflict is not None:
-                return ScaleElasticEPReqOutput(
+                return make_output(
                     success=False,
                     conflict=True,
                     message=conflict,
@@ -5739,7 +5743,7 @@ class Scheduler(
 
             terminal = state.operation_succeeded is not None
             success = state.operation_succeeded is not False
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=success,
                 message=(
                     state.last_error
@@ -5764,7 +5768,7 @@ class Scheduler(
         )
 
         if new_ep_size <= old_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) must be greater than current "
@@ -5777,7 +5781,7 @@ class Scheduler(
                 effective_ep_size=old_ep_size,
             )
         if new_ep_size > max_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
@@ -5790,7 +5794,7 @@ class Scheduler(
                 effective_ep_size=old_ep_size,
             )
         if ElasticEPStateManager.is_scaling():
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     "A previous scale operation has not completed yet. Wait until "
@@ -5811,7 +5815,7 @@ class Scheduler(
             operation_id,
             recv_req.expected_joining_member_ids,
         ):
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     "Failed to queue elastic EP scale: no elastic state or "
@@ -5834,7 +5838,7 @@ class Scheduler(
             new_ep_size,
         )
 
-        return ScaleElasticEPReqOutput(
+        return make_output(
             success=True,
             message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
             operation_id=operation_id,
