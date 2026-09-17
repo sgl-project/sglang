@@ -146,6 +146,21 @@ Each variant has 10 generation and six editing measurements at 1024px,
 These gains apply to this fixed B200 workload; other GPUs were not measured
 in this comparison.
 
+### Lossless LayerNorm modulation
+
+The DiT fuses affine-free LayerNorm and `* (1 + scale)` while retaining the
+eager Welford reduction and BF16 rounding order. Scale-only modulation skips
+the shift addition, including its effect on signed zeros. The first eager call
+checks the fused result against the native path and falls back on a mismatch.
+
+A B200 comparison on 2026-09-17 used `5bddbfca9b1` (including the preceding
+fusions) versus `162181ff0ec`. With resident weights, FlashAttention, eager
+execution, and the same four-startup protocol, generation decreased from
+**2.831 to 2.748 s** (2.92%) and editing from **3.436 to 3.358 s** (2.26%).
+Each variant has 10 generation and six editing measurements at 1024px,
+40 steps, seed 42, and CFG 1. Every corresponding RGBA pixel was identical.
+This comparison measures this B200 workload only.
+
 ## 2. Model capabilities
 
 Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
@@ -153,6 +168,11 @@ through one pipeline. Qwen3-VL encodes the instruction and reference images;
 a single-stream transformer inserts each reference image's latents into its
 corresponding position in that sequence. Block-causal attention keeps each
 image internally bidirectional while respecting the order of text and images.
+
+For successive edits, send the previous output as the next request's reference
+image. Requests do not retain dialogue history. Conditional KV is reused across
+denoising steps within one request and released afterward; cross-request caching
+and incremental dialogue-history caching are not implemented.
 
 Choose this pipeline for checkpoints declaring `QwenImage21Pipeline`,
 `QwenImage21Transformer2DModel`, and `AutoencoderKLQwenImage21`. The older
