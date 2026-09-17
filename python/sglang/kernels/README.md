@@ -58,6 +58,10 @@ The public wrappers currently default to the AOT `sgl_kernel` implementation
 registered alongside for inventory; where its signature differs, select it
 explicitly, e.g.:
 
+Optional **OpAuto** (`sglang.kernels.opauto`, off by default via
+`SGLANG_OPAUTO=0`) can reorder BaseFusedOp backends and sticky-demote failed
+JIT probes (cold-start skip on pre-Ampere). See `kernels/opauto/`.
+
 ```python
 from sglang.kernels import select_kernel, KernelBackend
 jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()

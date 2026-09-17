@@ -550,6 +550,18 @@ class RMSNorm(BaseFusedOp):
                     -1, post_residual_addition.shape[-1]
                 )
 
+        from sglang.kernels.opauto import should_prefer_native_aot_fallback
+
+        if should_prefer_native_aot_fallback("layernorm.rmsnorm"):
+            result = self.forward_native(x, residual, post_residual_addition)
+            if needs_reshape:
+                if residual is not None:
+                    return result[0].reshape(original_shape), result[1].reshape(
+                        residual_shape
+                    )
+                return result.reshape(original_shape)
+            return result
+
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (
