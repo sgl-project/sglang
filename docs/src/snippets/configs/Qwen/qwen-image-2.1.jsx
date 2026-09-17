@@ -96,21 +96,33 @@ const config = {
       id: "precision",
       title: "Precision",
       scope: "serve",
-      description: "Native precision is the default. Online FP8 reduces precision and requires image-quality validation for your workload.",
+      description: "Native precision is the default. FP8 changes image and alpha values. Serialized options require compatible component directories under Variables.",
       default: "native",
       options: [
         { id: "native", label: "Native BF16 / FP32", recommended: true },
         {
-          id: "fp8_dit", label: "FP8 DiT", flags: ["--component-quantizations.transformer fp8"],
+          id: "fp8_dit", label: "Online FP8 DiT", flags: ["--component-quantizations.transformer fp8"],
           soft: true, softReason: "Online FP8 passed 1024px/40-step generation and editing on one resident B200. Other hardware, alpha, and feature combinations remain unverified.",
         },
         {
-          id: "fp8_encoder", label: "FP8 encoder", flags: ["--component-quantizations.text_encoder fp8"],
+          id: "fp8_encoder", label: "Online FP8 encoder", flags: ["--component-quantizations.text_encoder fp8"],
           soft: true, softReason: "Online encoder FP8 passed 1024px/40-step generation and editing on one resident B200. It changes conditioning and output pixels.",
         },
         {
-          id: "fp8_both", label: "FP8 DiT + encoder", flags: ["--component-quantizations.transformer fp8", "--component-quantizations.text_encoder fp8"],
-          soft: true, softReason: "Online FP8 for both components passed generation and editing on one resident B200. This does not validate serialized quantized checkpoints.",
+          id: "fp8_both", label: "Online FP8 DiT + encoder", flags: ["--component-quantizations.transformer fp8", "--component-quantizations.text_encoder fp8"],
+          soft: true, softReason: "Online FP8 for both components passed generation, editing, and transparent output on one resident B200. Quality depends on the workload.",
+        },
+        {
+          id: "serialized_fp8_dit", label: "Serialized FP8 DiT", flags: ['--component-paths.transformer "{{FP8_DIT_PATH}}"'],
+          soft: true, softReason: "A tensorwise E4M3FN component export passed 1024px/40-step generation, editing, and transparent output on B200. Validate your exported checkpoint's quality.",
+        },
+        {
+          id: "serialized_fp8_encoder", label: "Serialized FP8 encoder", flags: ['--component-paths.text_encoder "{{FP8_ENCODER_PATH}}"'],
+          soft: true, softReason: "A tensorwise E4M3FN language encoder export passed generation, editing, and transparent output on B200; vision weights retain native precision.",
+        },
+        {
+          id: "serialized_fp8_both", label: "Serialized FP8 DiT + encoder", flags: ['--component-paths.transformer "{{FP8_DIT_PATH}}"', '--component-paths.text_encoder "{{FP8_ENCODER_PATH}}"'],
+          soft: true, softReason: "Exported components passed 1024px/40-step generation, editing, and transparent output on B200, including TP2 and all-component offload. Results are not bit-exact across these modes.",
         },
       ],
     },
@@ -284,6 +296,8 @@ const config = {
   modelNames: { default: "Qwen-Image-2.1" },
   placeholders: {
     MODEL_PATH: { target: "command", label: "Authorized checkpoint directory", default: "/models/qwen-image-2.1" },
+    FP8_DIT_PATH: { target: "command", label: "Serialized FP8 DiT directory", default: "/models/qwen-image-2.1-fp8/transformer" },
+    FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },

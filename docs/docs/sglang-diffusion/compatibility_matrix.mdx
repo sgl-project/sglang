@@ -49,9 +49,17 @@ matched the monolithic server exactly. Multi-host RDMA and multi-rank roles
 are not covered by that check.
 
 Online FP8 for the DiT, encoder, and both together passed 1024px/40-step HTTP
-generation and editing on one B200. These paths change numerical results;
-alpha quality, other hardware, and serialized quantized checkpoints remain
-unverified. Synthetic Diffusers-format LoRA passed dynamic loading, merging,
+generation and editing on one B200; both together also passed transparent PNG
+generation. Serialized E4M3FN FP8 component folders with scalar weight scales
+and dynamic activations passed generation, editing, and transparent output for
+each component and both together. The combined export also passed separate
+checks with TP2 plus encoder folding and with single-GPU all-component
+layerwise offload. The 476 loaded quantized matrices and
+scales matched their checkpoint values. Quantization and TP change numerical
+results; serialized offload also changed editing pixels (49.50 dB RGBA PSNR
+versus resident). See the cookbook for sample quality metrics. Other hardware
+and serialized formats remain unverified. Synthetic Diffusers-format LoRA
+passed dynamic loading, merging,
 and removal on one B200 and TP2 with encoder folding; both removal paths
 restored the base image exactly. Trained-adapter quality remains unverified.
 Platform latency measurements

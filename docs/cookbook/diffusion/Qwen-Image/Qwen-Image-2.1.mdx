@@ -264,8 +264,67 @@ Online FP8 is available independently for the DiT and encoder through
 passed 1024px/40-step HTTP generation and editing on a resident B200. FP8 changes
 the output: in one generation/edit pair, DiT-only FP8 gave RGBA PSNR
 37.56/41.07 dB against native precision; quantizing both gave 32.66/40.99 dB.
-These samples do not establish general quality, alpha fidelity, or compatibility
-with serialized FP8/NVFP4 checkpoints. Native precision remains the default.
+These samples do not establish general image or alpha quality. Native precision
+remains the default.
+
+### Serialized FP8 components
+
+Select a **Serialized FP8** precision option in the picker and set the component
+directories under **Variables**. The tested format is E4M3FN weights with one
+FP32 `weight_scale` per linear and dynamic activation quantization. Each
+component directory contains its own architecture `config.json`, weight shards,
+and index; merge this top-level quantization configuration into its `config.json`:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic"
+  }
+}
+```
+
+Load compatible exported components through the shared loader:
+
+```bash Command
+sglang serve \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --component-paths.transformer /models/qwen-image-2.1-fp8/transformer \
+  --component-paths.text_encoder /models/qwen-image-2.1-fp8/text_encoder \
+  --num-gpus 1 --performance-mode speed --attention-backend fa \
+  --host 0.0.0.0 --port 30010
+```
+
+Use either override independently, or both as shown. Omit online quantization
+flags: the component metadata selects serialized loading. Adding metadata to
+BF16 weights does not convert them. The validated export quantizes 224 DiT
+attention/MLP matrices and 252 Qwen3-VL language matrices; the vision encoder,
+embeddings, output head, other DiT projections, and VAE retain native precision.
+All 476 loaded matrices and scales matched their serialized values.
+
+At revision `5a117c9f3f`, DiT-only, encoder-only, and combined exports passed
+1024px/40-step generation, editing, and transparent PNG requests on B200 with
+FlashAttention, seed 42, and CFG 1. The combined export also passed TP2 with
+encoder folding and single-GPU `--layerwise-offload-components all`.
+Offload matched resident generation and transparent output exactly; the edit
+differed at 49.50 dB RGBA PSNR. TP2 also changes numerical results.
+
+| Serialized FP8 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 38.35 dB | 40.94 dB |
+| Encoder | 34.46 dB | 49.19 dB |
+| Both | 34.93 dB | 41.25 dB |
+
+For the combined export, the transparent cat's alpha channel measured 32.03 dB
+PSNR and 0.81 mean absolute error on the 0–255 scale against native precision;
+individual boundary pixels can differ substantially. Online FP8 for both
+components also produced a real transparent PNG in this check. These are
+single-example comparisons, not a quality guarantee. Offline tensorwise scales
+differ from B200 online FP8's channelwise scales. Other serialized formats,
+including NVFP4 and GGUF, remain unverified for this model.
+
+### LoRA and execution options
 
 LoRA uses the shared `--lora-path` and `--lora-merge-mode dynamic|merge` options
 and runtime adapter APIs. Diffusers keys prefixed with `transformer.` map to
