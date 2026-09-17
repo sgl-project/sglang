@@ -309,10 +309,15 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
+        # graphs. It still has no real request whose last token needs logits.
+        forward_mode = forward_batch.forward_mode
+        if forward_batch._original_forward_mode == ForwardMode.IDLE:
+            forward_mode = ForwardMode.IDLE
         if (
-            forward_batch.forward_mode.is_extend()
+            forward_mode.is_extend()
             and forward_batch.return_logprob
-            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_mode.is_target_verify()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
@@ -340,7 +345,7 @@ class LogitsMetadata:
             draft_extend_select_index = None
 
         return cls(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
