@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    fp4_index_logits_decode_paged,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 
 from .types import (
@@ -256,7 +258,8 @@ class DecodeScores(msgspec.Struct, frozen=True):
     bs: int
     lmax: int
     lens: torch.Tensor  # [bs]
-    slots: torch.Tensor  # [bs, lmax]
+    req_rows: torch.Tensor  # [bs] req_to_token row for each query row
+    ratio: int
     scores: torch.Tensor  # [bs, lmax]
 
 
@@ -360,23 +363,40 @@ def decode_scores(
         return None
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
-    j = torch.arange(lmax, device=pos.device)
-    valid = j[None, :] < lens[:, None]
-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
-    slots = slots.masked_fill(~valid, 0)
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
-    scores = fp4_index_logits_decode(
-        q, weights, slots, lens, table, table.shape[1] // 68
+    scores = fp4_index_logits_decode_paged(
+        q,
+        weights,
+        req_to_token,
+        req,
+        ratio,
+        lmax,
+        lens,
+        table,
+        table.shape[1] // 68,
     )
-    return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+    return DecodeScores(
+        bs=bs, lmax=lmax, lens=lens, req_rows=req, ratio=ratio, scores=scores
+    )
 
 
-def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
+def write_decode(
+    out: Selection,
+    d: DecodeScores,
+    idx: torch.Tensor,
+    req_to_token: torch.Tensor,
+) -> None:
     k = idx.shape[1]
     idx = idx.sort(dim=-1).values
     reach = idx < d.lens[:, None]
+    selected_slots = (
+        req_to_token[
+            d.req_rows[:, None], idx.clamp_max(d.lmax - 1) * d.ratio
+        ].to(torch.int64)
+        // d.ratio
+    )
     out.page_indices[: d.bs, :k] = torch.where(
-        reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
+        reach, selected_slots, -1
     ).to(torch.int32)
     if out.raw_indices is not None:
         out.raw_indices[: d.bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
