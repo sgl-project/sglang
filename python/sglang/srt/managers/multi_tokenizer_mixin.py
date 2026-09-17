@@ -661,7 +661,6 @@ def run_multi_detokenizer_router_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)
-    _init_router_tracing(server_args)
     parent_process = psutil.Process().parent()
 
     router = None
