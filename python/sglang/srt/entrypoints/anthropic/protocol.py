@@ -7,7 +7,7 @@ so each variant carries only the fields it actually uses.
 """
 
 import uuid
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -42,10 +42,10 @@ class AnthropicUsage(BaseModel):
     requires it only on ``message_start``). Non-streaming responses set both.
     """
 
-    input_tokens: Optional[NonNegativeInt] = None
-    output_tokens: Optional[NonNegativeInt] = None
-    cache_creation_input_tokens: Optional[NonNegativeInt] = None
-    cache_read_input_tokens: Optional[NonNegativeInt] = None
+    input_tokens: NonNegativeInt | None = None
+    output_tokens: NonNegativeInt | None = None
+    cache_creation_input_tokens: NonNegativeInt | None = None
+    cache_read_input_tokens: NonNegativeInt | None = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
@@ -60,7 +60,7 @@ class ImageBlock(BaseModel):
     type: Literal["image"] = "image"
     # Kept loosely typed for compat with both base64 and URL sources; the
     # serving layer normalises to OpenAI ``image_url`` parts.
-    source: Optional[Union[dict[str, Any], str]] = None
+    source: dict[str, Any] | str | None = None
 
 
 class ToolUseBlock(BaseModel):
@@ -72,60 +72,51 @@ class ToolUseBlock(BaseModel):
 
 class ToolResultBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
-    tool_use_id: Optional[str] = None
+    tool_use_id: str | None = None
     # Some legacy payloads use ``id`` instead of ``tool_use_id``.
-    id: Optional[str] = None
-    content: Optional[Union[str, list["AnthropicContentBlock"]]] = None
-    is_error: Optional[bool] = None
+    id: str | None = None
+    content: str | list["AnthropicContentBlock"] | None = None
+    is_error: bool | None = None
 
 
 class ToolReferenceBlock(BaseModel):
     """sglang extension: references a deferred-loaded tool by name."""
 
     type: Literal["tool_reference"] = "tool_reference"
-    name: Optional[str] = None
+    name: str | None = None
     # Anthropic-style payloads sometimes use ``tool_name``; accept both.
-    tool_name: Optional[str] = None
-    id: Optional[str] = None
+    tool_name: str | None = None
+    id: str | None = None
 
 
 class SearchResultBlock(BaseModel):
     type: Literal["search_result"] = "search_result"
     # ``source`` here is a URL/identifier string (unlike ImageBlock.source).
-    source: Optional[Union[str, dict[str, Any]]] = None
-    title: Optional[str] = None
-    content: Optional[list[dict[str, Any]]] = None
+    source: str | dict[str, Any] | None = None
+    title: str | None = None
+    content: list[dict[str, Any]] | None = None
 
 
 class ThinkingBlock(BaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str
-    signature: Optional[str] = None
+    signature: str | None = None
 
 
 class RedactedThinkingBlock(BaseModel):
     type: Literal["redacted_thinking"] = "redacted_thinking"
-    data: Optional[str] = None
+    data: str | None = None
 
 
 AnthropicContentBlock = Annotated[
-    Union[
-        TextBlock,
-        ImageBlock,
-        ToolUseBlock,
-        ToolResultBlock,
-        ToolReferenceBlock,
-        SearchResultBlock,
-        ThinkingBlock,
-        RedactedThinkingBlock,
-    ],
+    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ToolReferenceBlock | SearchResultBlock | ThinkingBlock | RedactedThinkingBlock,
     Field(discriminator="type"),
 ]
 
 
 class AnthropicMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
-    content: Union[str, list[AnthropicContentBlock]]
+    content: str | list[AnthropicContentBlock]
 
 
 # ---------- Tools (discriminated by ``type`` family) ----------
@@ -134,17 +125,17 @@ class AnthropicMessage(BaseModel):
 class AnthropicCustomTool(BaseModel):
     """Custom tool defined by the API user — requires ``input_schema``."""
 
-    type: Optional[Literal["custom"]] = None  # absent or explicit "custom"
+    type: Literal["custom"] | None = None  # absent or explicit "custom"
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     input_schema: dict[str, Any]
-    defer_loading: Optional[bool] = None
+    defer_loading: bool | None = None
 
     @field_validator("input_schema")
     @classmethod
     def _ensure_object_schema(cls, v):
         if not isinstance(v, dict):
-            raise ValueError("input_schema must be a dictionary")
+            raise TypeError("input_schema must be a dictionary")
         if "type" not in v:
             v["type"] = "object"
         return v
@@ -159,11 +150,11 @@ class AnthropicWebSearchTool(BaseModel):
 
     type: str = Field(pattern=r"^web_search_\d{8}$")
     name: Literal["web_search"] = "web_search"
-    description: Optional[str] = None
-    defer_loading: Optional[bool] = None
-    max_uses: Optional[int] = None
-    allowed_domains: Optional[list[str]] = None
-    blocked_domains: Optional[list[str]] = None
+    description: str | None = None
+    defer_loading: bool | None = None
+    max_uses: int | None = None
+    allowed_domains: list[str] | None = None
+    blocked_domains: list[str] | None = None
 
 
 class AnthropicComputerTool(BaseModel):
@@ -171,11 +162,11 @@ class AnthropicComputerTool(BaseModel):
 
     type: str = Field(pattern=r"^computer_\d{8}$")
     name: Literal["computer"] = "computer"
-    description: Optional[str] = None
-    defer_loading: Optional[bool] = None
-    display_width_px: Optional[int] = None
-    display_height_px: Optional[int] = None
-    display_number: Optional[int] = None
+    description: str | None = None
+    defer_loading: bool | None = None
+    display_width_px: int | None = None
+    display_height_px: int | None = None
+    display_number: int | None = None
 
 
 class AnthropicBashTool(BaseModel):
@@ -183,8 +174,8 @@ class AnthropicBashTool(BaseModel):
 
     type: str = Field(pattern=r"^bash_\d{8}$")
     name: Literal["bash"] = "bash"
-    description: Optional[str] = None
-    defer_loading: Optional[bool] = None
+    description: str | None = None
+    defer_loading: bool | None = None
 
 
 class AnthropicTextEditorTool(BaseModel):
@@ -192,8 +183,8 @@ class AnthropicTextEditorTool(BaseModel):
 
     type: str = Field(pattern=r"^text_editor_\d{8}$")
     name: Literal["str_replace_editor", "str_replace_based_edit_tool"]
-    description: Optional[str] = None
-    defer_loading: Optional[bool] = None
+    description: str | None = None
+    defer_loading: bool | None = None
 
 
 def _tool_discriminator(v) -> str:
@@ -221,13 +212,7 @@ def _tool_discriminator(v) -> str:
 
 
 AnthropicTool = Annotated[
-    Union[
-        Annotated[AnthropicCustomTool, Tag("custom")],
-        Annotated[AnthropicWebSearchTool, Tag("web_search")],
-        Annotated[AnthropicComputerTool, Tag("computer")],
-        Annotated[AnthropicBashTool, Tag("bash")],
-        Annotated[AnthropicTextEditorTool, Tag("text_editor")],
-    ],
+    Annotated[AnthropicCustomTool, Tag("custom")] | Annotated[AnthropicWebSearchTool, Tag("web_search")] | Annotated[AnthropicComputerTool, Tag("computer")] | Annotated[AnthropicBashTool, Tag("bash")] | Annotated[AnthropicTextEditorTool, Tag("text_editor")],
     Discriminator(_tool_discriminator),
 ]
 
@@ -249,7 +234,7 @@ class AnthropicToolChoice(BaseModel):
     """Tool choice strategy."""
 
     type: Literal["auto", "any", "tool", "none"]
-    name: Optional[str] = None
+    name: str | None = None
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -275,8 +260,8 @@ class AnthropicThinkingParam(BaseModel):
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
-    budget_tokens: Optional[int] = None
-    display: Optional[Literal["summarized", "omitted"]] = None
+    budget_tokens: int | None = None
+    display: Literal["summarized", "omitted"] | None = None
 
     @model_validator(mode="after")
     def _validate_thinking_shape(self):
@@ -288,9 +273,7 @@ class AnthropicThinkingParam(BaseModel):
                 )
             if self.budget_tokens < 1024:
                 raise ValueError(
-                    "thinking.budget_tokens must be >= 1024 (got {})".format(
-                        self.budget_tokens
-                    )
+                    f"thinking.budget_tokens must be >= 1024 (got {self.budget_tokens})"
                 )
         elif self.type == "disabled":
             if self.budget_tokens is not None:
@@ -322,7 +305,7 @@ class AnthropicTaskBudget(BaseModel):
 
     type: Literal["tokens"]
     total: int = Field(gt=0)
-    remaining: Optional[int] = Field(default=None, ge=0)
+    remaining: int | None = Field(default=None, ge=0)
 
 
 class AnthropicOutputConfig(BaseModel):
@@ -333,8 +316,8 @@ class AnthropicOutputConfig(BaseModel):
     ``task_budget`` is propagated as a custom-param hint.
     """
 
-    effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
-    task_budget: Optional[AnthropicTaskBudget] = None
+    effort: Literal["minimal", "low", "medium", "high", "xhigh", "max"] | None = None
+    task_budget: AnthropicTaskBudget | None = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -342,13 +325,13 @@ class AnthropicCountTokensRequest(BaseModel):
 
     model: str
     messages: list[AnthropicMessage]
-    system: Optional[Union[str, list[AnthropicContentBlock]]] = None
-    thinking: Optional[AnthropicThinkingParam] = None
-    tool_choice: Optional[AnthropicToolChoice] = None
-    tools: Optional[list[AnthropicTool]] = None
+    system: str | list[AnthropicContentBlock] | None = None
+    thinking: AnthropicThinkingParam | None = None
+    tool_choice: AnthropicToolChoice | None = None
+    tools: list[AnthropicTool] | None = None
     # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
-    output_config: Optional[AnthropicOutputConfig] = None
-    betas: Optional[list[str]] = None
+    output_config: AnthropicOutputConfig | None = None
+    betas: list[str] | None = None
 
 
 class AnthropicCountTokensResponse(BaseModel):
@@ -363,20 +346,20 @@ class AnthropicMessagesRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     max_tokens: int
-    metadata: Optional[dict[str, Any]] = None
-    stop_sequences: Optional[list[str]] = None
-    stream: Optional[bool] = False
-    system: Optional[Union[str, list[AnthropicContentBlock]]] = None
-    temperature: Optional[float] = None
-    thinking: Optional[AnthropicThinkingParam] = None
-    tool_choice: Optional[AnthropicToolChoice] = None
-    tools: Optional[list[AnthropicTool]] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
+    metadata: dict[str, Any] | None = None
+    stop_sequences: list[str] | None = None
+    stream: bool | None = False
+    system: str | list[AnthropicContentBlock] | None = None
+    temperature: float | None = None
+    thinking: AnthropicThinkingParam | None = None
+    tool_choice: AnthropicToolChoice | None = None
+    tools: list[AnthropicTool] | None = None
+    top_k: int | None = None
+    top_p: float | None = None
     # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
     # when targeting non-Anthropic backends, so the schema must accept them.
-    output_config: Optional[AnthropicOutputConfig] = None
-    betas: Optional[list[str]] = None
+    output_config: AnthropicOutputConfig | None = None
+    betas: list[str] | None = None
 
     @field_validator("model")
     @classmethod
@@ -419,7 +402,7 @@ class SignatureDelta(BaseModel):
 
 
 AnthropicContentDelta = Annotated[
-    Union[TextDelta, InputJsonDelta, ThinkingDelta, SignatureDelta],
+    TextDelta | InputJsonDelta | ThinkingDelta | SignatureDelta,
     Field(discriminator="type"),
 ]
 
@@ -432,10 +415,8 @@ class AnthropicMessageEndDelta(BaseModel):
     Stop reason and stop sequence are the only fields.
     """
 
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
-    stop_sequence: Optional[str] = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
+    stop_sequence: str | None = None
 
 
 # ---------- Stream events (discriminated by ``type``) ----------
@@ -483,16 +464,7 @@ class ErrorEvent(BaseModel):
 
 
 AnthropicStreamEvent = Annotated[
-    Union[
-        MessageStartEvent,
-        MessageDeltaEvent,
-        MessageStopEvent,
-        ContentBlockStartEvent,
-        ContentBlockDeltaEvent,
-        ContentBlockStopEvent,
-        PingEvent,
-        ErrorEvent,
-    ],
+    MessageStartEvent | MessageDeltaEvent | MessageStopEvent | ContentBlockStartEvent | ContentBlockDeltaEvent | ContentBlockStopEvent | PingEvent | ErrorEvent,
     Field(discriminator="type"),
 ]
 
@@ -505,11 +477,9 @@ class AnthropicMessagesResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: list[AnthropicContentBlock]
     model: str
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
-    stop_sequence: Optional[str] = None
-    usage: Optional[AnthropicUsage] = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
+    stop_sequence: str | None = None
+    usage: AnthropicUsage | None = None
 
 
 # Resolve forward references for nested types.

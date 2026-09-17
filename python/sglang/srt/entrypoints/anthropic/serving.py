@@ -10,12 +10,12 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
-
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -134,8 +134,8 @@ def _anthropic_usage_from_openai(
 
 
 def _extract_system_text(
-    content: Union[str, list[AnthropicContentBlock]],
-) -> Optional[str]:
+    content: str | list[AnthropicContentBlock],
+) -> str | None:
     """Flatten a system message's content to a trimmed string, or ``None``."""
     if isinstance(content, str):
         return content.strip() or None
@@ -194,7 +194,7 @@ class AnthropicServing:
             self._chat_template()
         )
 
-    def _chat_template(self) -> Optional[str]:
+    def _chat_template(self) -> str | None:
         tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
         if tokenizer_manager is None:
             return None
@@ -207,14 +207,14 @@ class AnthropicServing:
         self,
         request: AnthropicMessagesRequest,
         raw_request: Request,
-    ) -> Union[JSONResponse, StreamingResponse]:
+    ) -> JSONResponse | StreamingResponse:
         """Main entry point for /v1/messages endpoint."""
         try:
             chat_request = self._convert_to_chat_completion_request(request)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Error converting Anthropic request: %s", e)
+            logger.exception("Error converting Anthropic request:")
             return self._error_response(
                 status_code=400,
                 error_type="invalid_request_error",
@@ -234,7 +234,7 @@ class AnthropicServing:
 
         def _convert_anthropic_image_source_to_openai_part(
             source: Any,
-        ) -> Optional[dict]:
+        ) -> dict | None:
             # Source may arrive as a Pydantic model (typed ImageBlock.source)
             # or as a raw dict when parsed from a nested tool_result payload.
             if isinstance(source, BaseModel):
@@ -297,7 +297,7 @@ class AnthropicServing:
 
         def _convert_tool_result_content(
             content: Any,
-        ) -> tuple[list[Union[str, list[dict]]], str]:
+        ) -> tuple[list[str | list[dict]], str]:
             if isinstance(content, list):
                 tool_content_parts = []
                 tool_text_parts = []
@@ -355,7 +355,7 @@ class AnthropicServing:
                         tool_content_groups.append([])
                     tool_content_groups[-1].append(part)
 
-                tool_contents: list[Union[str, list[dict]]] = []
+                tool_contents: list[str | list[dict]] = []
                 for group in tool_content_groups:
                     if len(group) == 1 and group[0]["type"] == "text":
                         tool_contents.append(group[0]["text"])
@@ -368,7 +368,7 @@ class AnthropicServing:
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> tuple[Optional[str], Optional[str]]:
+        ) -> tuple[str | None, str | None]:
             """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
 
             At most one is set: encoders that frame the reasoning channel take
@@ -769,7 +769,7 @@ class AnthropicServing:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Error processing Anthropic request: %s", e)
+            logger.exception("Error processing Anthropic request:")
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -791,7 +791,7 @@ class AnthropicServing:
         chat_request: ChatCompletionRequest,
         anthropic_request: AnthropicMessagesRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, JSONResponse]:
+    ) -> StreamingResponse | JSONResponse:
         """Handle streaming Anthropic request."""
         received_time = monotonic_time()
 
@@ -814,7 +814,7 @@ class AnthropicServing:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Error converting streaming request: %s", e)
+            logger.exception("Error converting streaming request:")
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -849,10 +849,10 @@ class AnthropicServing:
 
         content_block_index = 0
         content_block_open = False
-        content_block_type: Optional[str] = None
+        content_block_type: str | None = None
         captured_thinking_signature: str = ""
-        finish_reason: Optional[str] = None
-        final_usage: Optional[AnthropicUsage] = None
+        finish_reason: str | None = None
+        final_usage: AnthropicUsage | None = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -969,7 +969,7 @@ class AnthropicServing:
             frames.append(_emit(MessageStopEvent()))
             return frames
 
-        def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
+        def _parse_upstream_error(data_str: str) -> tuple[str, str] | None:
             """Detect an OpenAI handler streaming-error envelope.
 
             ``OpenAIServingChat.create_streaming_error_response`` emits
@@ -1004,8 +1004,8 @@ class AnthropicServing:
         # and emit a clean Anthropic error sequence instead.
         try:
             stream_iter = openai_stream.__aiter__()
-        except Exception as e:
-            logger.exception("Failed to open OpenAI stream: %s", e)
+        except Exception:
+            logger.exception("Failed to open OpenAI stream:")
             for frame in _flush_on_error("api_error", "Internal server error"):
                 yield frame
             return
@@ -1028,8 +1028,8 @@ class AnthropicServing:
                 ):
                     yield frame
                 return
-            except Exception as e:
-                logger.exception("OpenAI stream raised mid-flight: %s", e)
+            except Exception:
+                logger.exception("OpenAI stream raised mid-flight:")
                 for frame in _flush_on_error("api_error", "Internal server error"):
                     yield frame
                 return
@@ -1346,7 +1346,7 @@ class AnthropicServing:
         body = getattr(response, "body", b"") or b""
         error_type = ERROR_TYPE_MAP.get(status_code, "api_error")
 
-        upstream_message: Optional[str] = None
+        upstream_message: str | None = None
         try:
             payload = json.loads(body.decode("utf-8")) if body else None
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1355,7 +1355,7 @@ class AnthropicServing:
             # useful hint instead of a generic placeholder.
             try:
                 upstream_message = body.decode("utf-8", errors="replace")[:500]
-            except Exception:
+            except Exception:  # noqa: BLE001
                 upstream_message = None
         else:
             if isinstance(payload, dict):
@@ -1387,7 +1387,7 @@ class AnthropicServing:
         status_code: int,
         error_type: str,
         message: str,
-        exception_name: Optional[str] = None,
+        exception_name: str | None = None,
     ) -> JSONResponse:
         """Create an Anthropic-format error response.
 
@@ -1437,7 +1437,7 @@ class AnthropicServing:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Error converting count_tokens request: %s", e)
+            logger.exception("Error converting count_tokens request:")
             return self._error_response(
                 status_code=400,
                 error_type="invalid_request_error",
@@ -1467,7 +1467,7 @@ class AnthropicServing:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Error counting tokens: %s", e)
+            logger.exception("Error counting tokens:")
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
