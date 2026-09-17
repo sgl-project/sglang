@@ -14,8 +14,8 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
-    SENSENOVA_U1_RESOLUTION_ALIGNMENT,
     _flatten_rgba_to_rgb,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -66,7 +66,7 @@ def _resize_input_to_budget(
     resized_height, resized_width = smart_resize(
         height=image.height,
         width=image.width,
-        factor=SENSENOVA_U1_RESOLUTION_ALIGNMENT,
+        factor=RESOLUTION_ALIGNMENT,
         min_pixels=input_max_pixels,
         max_pixels=input_max_pixels,
     )
@@ -143,7 +143,7 @@ def _resolve_edit_output_size(
     resized_height, resized_width = smart_resize(
         height=edit_images[0].height,
         width=edit_images[0].width,
-        factor=SENSENOVA_U1_RESOLUTION_ALIGNMENT,
+        factor=RESOLUTION_ALIGNMENT,
         min_pixels=target_pixels,
         max_pixels=target_pixels,
     )
