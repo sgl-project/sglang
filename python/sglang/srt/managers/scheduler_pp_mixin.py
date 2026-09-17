@@ -192,6 +192,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
+                self._sched_idled = True
                 self.on_idle()
 
     @DynamicGradMode()
@@ -377,8 +378,10 @@ class SchedulerPPMixin:
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.on_idle()
+            if server_is_idle:
+                self._sched_idled = True
+                if len(self.disagg_prefill_inflight_queue) == 0:
+                    self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -574,8 +577,10 @@ class SchedulerPPMixin:
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
-            if server_is_idle and queue_size == 0:
-                self.on_idle()
+            if server_is_idle:
+                self._sched_idled = True
+                if queue_size == 0:
+                    self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth

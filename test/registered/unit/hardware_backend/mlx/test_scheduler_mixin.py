@@ -32,6 +32,7 @@ class TestMlxLaunchBookkeeping(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         result = MagicMock()
         result.next_token_ids = None
         scheduler.tp_worker.finalize_mlx_result.return_value = result
@@ -111,6 +112,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (
             SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
         )
