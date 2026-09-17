@@ -290,22 +290,54 @@ class ParallelContext:
         raise AttributeError(f"ParallelContext has no {name!r}")
 
     def _v(self, name, getter):
-        overrides = self._overrides
-        return overrides[name] if name in overrides else getter()
+        """Scoped override, else the permanent stamp, else the live group.
 
-    def override_permanently(self, **widths) -> None:
-        """Permanently correct a derived width the published bag can't answer
+        The stamp sits in the middle for ranks exactly as it does for widths
+        (`_derived_width`): an elastic scale-up moves this process's attention
+        rank to a value no group coordinator answers with.
+        """
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
+        derived = self._derived
+        if name in derived:
+            return derived[name]
+        return getter()
+
+    def _stamped(self, name, why):
+        """A per-process fact no configuration implies: scoped override, else
+        the permanent stamp, else fail.
+
+        Unlike a width, this has nothing to fall back on -- the configuration
+        does not carry this process's rank, and there is no group to ask --
+        so an unstamped read is a missing initialization rather than a
+        missing override, and says so.
+        """
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
+        derived = self._derived
+        if name in derived:
+            return derived[name]
+        raise RuntimeError(f"parallel rank {name!r} is not available: {why}")
+
+    def override_permanently(self, **values) -> None:
+        """Permanently record a width or rank the published bag can't answer
         or no longer answers correctly -- not `RuntimeContext.override`,
-        because a derived width is not a resolved config leaf and this must
-        work with no config published at all (`multimodal_gen` lends a TP
-        group to `srt` layers with no `srt` config to publish against).
+        because neither is a resolved config leaf and this must work with no
+        config published at all (`multimodal_gen` lends a TP group to `srt`
+        layers with no `srt` config to publish against).
+
+        Widths are quotients of the configured leaves, so the bag can usually
+        answer and this only corrects it; a rank is a per-process fact the
+        configuration never carries, so for those this is the only source.
 
         Lives beside, not inside, the `@contextmanager` `override` above -- a
         name it cannot also have on this class -- because these are permanent
         for the process, not scoped to a `with` block: none of the real
         callers ever restore the value they set here.
         """
-        self._derived.update(widths)
+        self._derived.update(values)
 
     def clear_derived_widths(self) -> None:
         self._derived.clear()
@@ -401,7 +433,12 @@ class ParallelContext:
 
     @property
     def attn_dp_rank(self) -> int:
-        return self._v("attn_dp_rank", _dp().get_attention_dp_rank)
+        return self._stamped(
+            "attn_dp_rank",
+            "it is computed from this process's `tp_rank` when the attention "
+            "topology is initialized, so a process that never ran "
+            "`initialize_dp_attention` has no answer to give",
+        )
 
     @property
     def world_group(self) -> Any:

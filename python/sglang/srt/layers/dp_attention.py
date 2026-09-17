@@ -71,7 +71,9 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    get_parallel().override_permanently(attn_dp_size=new_dp_size)
+    get_parallel().override_permanently(
+        attn_dp_size=new_dp_size, attn_dp_rank=new_dp_rank
+    )
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -389,13 +391,12 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
+    _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    get_parallel().override_permanently(attn_dp_size=_ATTN_DP_SIZE)
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
+        attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
         # Reads the resolution, not a bag: this runs under
         # `initialize_dp_attention`, which the weight-cache daemon calls from
         # `_init_distributed` -- and other callers reach it from processes
@@ -403,6 +404,14 @@ def initialize_dp_attention(
         # itself publishes first, at `daemon.py:284`, before `:320`.)
         if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
+
+    # Stamped together, after the elastic adjustment: the width and the rank
+    # describe one topology, and a reader that caught them mid-update would
+    # see this process placed in a group it is not in.
+    _ATTN_DP_RANK, _ATTN_DP_SIZE = attn_dp_rank, attn_dp_size
+    get_parallel().override_permanently(
+        attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
+    )
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

@@ -65,7 +65,9 @@ _DP = "sglang.srt.layers.dp_attention"
 # anything, so there is nothing to derive them from. The quotients used to be
 # in this table and are not any more -- `attn_tp_size` and its siblings are
 # functions of the configured leaves, and `TestDerivedWidthsComeFromTheLeaves`
-# is what pins them.
+# is what pins them. `attn_dp_rank` is not here either: no group coordinator
+# knows it, so it is stamped when the attention topology is initialized and
+# `TestStampedRanks` is what pins it.
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
     ("world_rank", f"{_PS}.get_world_rank"),
@@ -77,7 +79,6 @@ SIZE_RANK_DELEGATIONS = [
     ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
     ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
     ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
-    ("attn_dp_rank", f"{_DP}.get_attention_dp_rank"),
 ]
 
 GROUP_DELEGATIONS = [
@@ -148,6 +149,64 @@ class TestParallelDelegation(_IsolatedOverrides):
         self.assertTrue(hasattr(ParallelContext, "tp_group"))
         # local_attn_dp is intentionally not part of the wrapper surface.
         self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
+
+
+class TestStampedRanks(_IsolatedOverrides):
+    """`attn_dp_rank` comes from the stamp, and says so when there is none.
+
+    It is the one rank no group answers with: `initialize_dp_attention`
+    computes it from this process's `tp_rank`, and an elastic scale-up
+    replaces it with a rank in the expanded WORLD. Falling back to anything
+    would be inventing a placement for this process.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_derived = dict(parallel._derived)
+        parallel.clear_derived_widths()
+        self.addCleanup(
+            lambda: (
+                parallel.clear_derived_widths(),
+                parallel.override_permanently(**self._saved_derived),
+            )
+        )
+
+    def test_the_stamp_is_the_answer(self):
+        parallel = get_parallel()
+        parallel.override_permanently(attn_dp_rank=3)
+        self.assertEqual(parallel.attn_dp_rank, 3)
+        # An elastic scale-up restamps it; the newest stamp wins.
+        parallel.override_permanently(attn_dp_rank=9)
+        self.assertEqual(parallel.attn_dp_rank, 9)
+
+    def test_a_scope_still_wins_over_the_stamp(self):
+        parallel = get_parallel()
+        parallel.override_permanently(attn_dp_rank=3)
+        with parallel.override(attn_dp_rank=0):
+            self.assertEqual(parallel.attn_dp_rank, 0)
+        self.assertEqual(parallel.attn_dp_rank, 3)
+
+    def test_unstamped_names_the_cause(self):
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_dp_rank
+        self.assertIn("initialize_dp_attention", str(caught.exception))
+
+    def test_a_scale_up_stamps_the_width_and_the_rank_together(self):
+        """The two describe one topology; a reader that saw only one moved
+        would place this process in a group it is not in."""
+        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+        # It also flips a process-wide gather flag; put it back, or every
+        # later test in this process runs as if a scale-up had happened.
+        dp_flags = get_flags().dp
+        saved_gather = dp_flags.use_world_group_for_gather
+        self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
+
+        parallel = get_parallel()
+        update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
+        self.assertEqual(parallel.attn_dp_size, 16)
+        self.assertEqual(parallel.attn_dp_rank, 11)
 
 
 class TestParallelOverride(_IsolatedOverrides):
