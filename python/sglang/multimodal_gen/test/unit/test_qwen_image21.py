@@ -21,6 +21,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ResidencyState,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
@@ -56,6 +62,44 @@ def test_prompt_conditioning_uses_pre_final_norm_hidden_state():
     assert slots.tolist() == [False, True, False]
     encoder.model.language_model.norm.assert_not_called()
     assert encoder.model.visual.fp32_position_interpolation is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_encoder_component_offload_preserves_loaded_dtypes():
+    encoder = torch.nn.Module()
+    encoder.model = torch.nn.Module()
+    encoder.model.visual = torch.nn.Module()
+    encoder.register_parameter(
+        "embedding", torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    )
+    encoder.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.tensor([0.25, -0.5]).to(torch.float8_e4m3fn), requires_grad=False
+        ),
+    )
+    frequencies = torch.tensor([1.0 / 3, 1.0 / 7])
+    encoder.register_buffer("inv_freq", frequencies.clone())
+    processor = Mock()
+    processor.apply_chat_template.return_value = [[1]]
+    stage = QwenImage21EncodingStage(encoder, processor, None, None)
+    use = stage.component_uses(None, "conditioning")[0]
+    strategy = ComponentOffloadStrategy()
+    state = ResidencyState(batch_is_warmup=False)
+    weight_bytes = encoder.weight.view(torch.uint8).clone()
+
+    for _ in range(2):
+        strategy.prefetch_for_use(encoder, use, state)
+        strategy.wait_for_use(encoder, use, state)
+        assert encoder.embedding.device.type == "cuda"
+        assert encoder.embedding.dtype == torch.bfloat16
+        assert encoder.weight.dtype == torch.float8_e4m3fn
+        assert encoder.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(encoder.inv_freq.cpu(), frequencies, atol=0, rtol=0)
+        assert torch.equal(encoder.weight.view(torch.uint8).cpu(), weight_bytes)
+        strategy.finish_use(encoder, use, state)
+        torch.cuda.synchronize()
+        assert encoder.embedding.device.type == "cpu"
 
 
 def test_condition_slots_expand_to_actual_latent_grid():
