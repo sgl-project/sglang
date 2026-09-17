@@ -959,6 +959,13 @@ class Envs:
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(False)
+    # DSA prefill: shard the whole attention block's TOKENS across the
+    # attention-TP group -- every rank computes every head for its own slice,
+    # instead of its own heads for every token. Consumes no ranks, so it
+    # composes with DCP. Supersedes the indexer-only sharding above, which must
+    # be off when this is on. Changes weight layout (q_b_proj and kv_b_proj go
+    # full-width), so it is read at startup, not per forward.
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
