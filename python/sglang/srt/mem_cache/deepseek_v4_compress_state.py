@@ -196,7 +196,9 @@ class CompressStatePool:
     ) -> torch.Tensor:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
-        # masked_fill_ passes the scalar by value; torch.where may stage host memory during capture.
+        # masked_fill_, not where(cond, -1, ...): a Scalar branch is passed by
+        # value, while the scalar overload of where may stage a host tensor and
+        # so cannot run inside a CUDA graph capture.
         return state_loc.masked_fill_(swa_loc < 0, -1)
 
     def translate_from_req_position_to_state_loc(
