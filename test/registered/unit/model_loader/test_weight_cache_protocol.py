@@ -536,6 +536,49 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
 
     KEY = "test-daemon-mode-refuses-disk-load"
 
+    def test_invalid_producer_has_contextual_error(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        loader = IpcModelLoader(
+            LoadConfig(load_format=LoadFormat.IPC_CACHE), socket_path="/test-owner.sock"
+        )
+        for pid in (None, True, -1):
+            with (
+                self.subTest(pid=pid),
+                self.assertRaisesRegex(RuntimeError, "IpcModelLoader.*test-owner.sock"),
+            ):
+                loader._start_daemon_liveness_watchdog(pid)
+
+    def test_failed_load_closes_guard_only_before_first_mapping(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        for started in (False, True):
+            loader = IpcModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+
+            def fail(*args):
+                loader._ipc_import_started = started
+                raise ValueError("original mapping diagnostic")
+
+            with (
+                self.subTest(started=started),
+                patch.object(
+                    loader,
+                    "_fetch_from_cache",
+                    return_value={"entries": {}, "pid": os.getpid()},
+                ),
+                patch(
+                    "sglang.srt.model_loader.loader._get_quantization_config",
+                    return_value=None,
+                ),
+                patch("sglang.srt.weight_cache.ipc_loader.ProducerWatchdog") as guard,
+                patch.object(loader, "_load_zero_copy_mode", side_effect=fail),
+                self.assertRaisesRegex(ValueError, "original mapping diagnostic"),
+            ):
+                loader.load_model(model_config=self._model_config(), device_config=None)
+            self.assertEqual(guard.return_value.close.call_count, 0 if started else 1)
+
     def test_shared_watchdog_starts_before_first_import(self):
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader

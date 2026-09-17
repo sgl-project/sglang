@@ -149,30 +149,35 @@ class IpcModelLoader(BaseModelLoader):
         # Protect the first mapping and all subsequent initialization, not just
         # the returned model. Failed partial imports may retain traceback refs.
         self._start_daemon_liveness_watchdog(cache_data.get("pid"))
-        model = self._load_zero_copy_mode(
-            model_config,
-            device_config,
-            entries,
-            quant_config,
-        )
+        self._ipc_import_started = False
+        try:
+            model = self._load_zero_copy_mode(
+                model_config,
+                device_config,
+                entries,
+                quant_config,
+            )
+            # Constructor-only views still refer to meta storage; rebuild
+            # them from imported tensors while producer monitoring is live.
+            self._rebuild_stale_views(model)
+            model._weight_cache_watchdog = self._daemon_watchdog
+            self._daemon_watchdog.check_alive()
+        except BaseException:
+            if not self._ipc_import_started:
+                self._daemon_watchdog.close()
+            else:
+                logger.exception(
+                    "[IpcModelLoader] Partial IPC load failed at %s; retaining "
+                    "producer monitoring for traceback-held mappings until worker exit",
+                    self.socket_path,
+                )
+            raise
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
         # IPC handles. Running it again would double-process (e.g.,
         # re-quantize already-quantized weights), corrupting tensor data.
-
-        # Rebuild stale tensor views. Some modules store tensor views as
-        # plain attributes (not parameters/buffers) during __init__. When
-        # the model is initialized on meta device and then weights are
-        # replaced via IPC mapping, these views still point to the old
-        # meta storage. We must recreate them from the now-valid tensors.
-        self._rebuild_stale_views(model)
-
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        model._weight_cache_watchdog = self._daemon_watchdog
-        self._daemon_watchdog.check_alive()
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -183,7 +188,13 @@ class IpcModelLoader(BaseModelLoader):
 
     def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
         """Use the shared pidfd/PID-start-identity, zombie-aware guard."""
-        self._daemon_watchdog = ProducerWatchdog(ProcessIdentity.read(daemon_pid))
+        try:
+            self._daemon_watchdog = ProducerWatchdog(ProcessIdentity.read(daemon_pid))
+        except (ValueError, OSError, RuntimeError) as error:
+            raise RuntimeError(
+                f"[IpcModelLoader] Cannot monitor weight-cache producer pid={daemon_pid!r} "
+                f"at {self.socket_path}: {error}"
+            ) from error
         logger.info(
             f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
         )
@@ -313,6 +324,9 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
+            # Set before reconstruction: even a failed import may retain a
+            # mapped storage in the exception traceback.
+            self._ipc_import_started = True
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
