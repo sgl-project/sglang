@@ -9,9 +9,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import sglang.srt.observability.trace as mod
+import sglang.srt.observability.trace_async as async_mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
@@ -746,8 +747,8 @@ class TestMergedAsyncTracing(CustomTestCase):
             {"prefill-0", "prefill-1"},
         )
 
-    def test_failed_send_drops_detached_ops_without_resending_them(self):
-        """Best-effort transport drops a failed step, but preserves the next step."""
+    def test_exhausted_send_drops_detached_ops_without_resending_them(self):
+        """An exhausted send does not accidentally resend ops on the next step."""
         for failure in (None, self.async_mod.zmq.Again(), RuntimeError("closed")):
             with self.subTest(failure=type(failure).__name__):
                 a, b = self._new_context(), self._new_context()
@@ -791,6 +792,30 @@ class TestMergedAsyncTracing(CustomTestCase):
         self.rts.flush_trace_batch(None)
         self.assertEqual(ctx._operations, before)
         self.assertEqual(self.messages, [])
+
+
+@unittest.skipUnless(async_mod._zmq_available, "pyzmq not installed")
+class TestTraceTransport(unittest.TestCase):
+    def test_send_retries(self):
+        for recovers in (True, False):
+            with self.subTest(recovers=recovers):
+                socket = Mock()
+                socket.send_pyobj.side_effect = (
+                    [async_mod.zmq.Again(), None] if recovers else async_mod.zmq.Again()
+                )
+                with (
+                    patch.object(async_mod, "_get_zmq_socket", return_value=socket),
+                    patch.object(async_mod.time, "sleep") as sleep,
+                    patch.dict(
+                        os.environ, {"SGLANG_TRACE_ASYNC_SEND_MAX_RETRIES": "3"}
+                    ),
+                ):
+                    result = async_mod._send_trace_message(
+                        {"action": "batch", "rid": "test", "operations": []}
+                    )
+                self.assertEqual(result, recovers)
+                self.assertEqual(socket.send_pyobj.call_count, 2 if recovers else 4)
+                self.assertEqual(sleep.call_count, 1 if recovers else 3)
 
 
 if __name__ == "__main__":

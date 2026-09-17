@@ -130,6 +130,49 @@ def _get_zmq_socket() -> Optional[_zmq_type.Socket]:
     return _thread_local.socket
 
 
+def _send_trace_message(message: Dict[str, Any]) -> bool:
+    """Retry ZMQ backpressure with 1/2/4/... ms exponential backoff.
+
+    Retry at most SGLANG_TRACE_ASYNC_SEND_MAX_RETRIES times on the same
+    socket. Other errors fail immediately; exhausted messages are dropped.
+    """
+    attempts = 0
+    log_level = logging.WARNING
+    reason = "trace socket unavailable"
+    try:
+        sock = _get_zmq_socket()
+        if sock is not None:
+            max_retries = max(0, envs.SGLANG_TRACE_ASYNC_SEND_MAX_RETRIES.get())
+            for retry in range(max_retries + 1):
+                attempts += 1
+                try:
+                    sock.send_pyobj(message, zmq.NOBLOCK)
+                    return True
+                except zmq.Again:
+                    if retry == max_retries:
+                        reason = "ZMQ send buffer full; retries exhausted"
+                        break
+                    time.sleep(0.001 * 2**retry)
+    except Exception as exc:
+        log_level = logging.ERROR
+        reason = str(exc)
+
+    # Count only on failure, keeping per-request work off the successful path.
+    batches = message.get("batches", [message])
+    logger.log(
+        log_level,
+        "Dropping async trace message: action=%s, batches=%d, ops=%d, "
+        "rid=%s, attempts=%d, reason=%s",
+        message["action"],
+        len(batches),
+        sum(len(batch.get("operations", ())) for batch in batches),
+        message.get("rid", "<merged>"),
+        attempts,
+        reason,
+    )
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -267,20 +310,7 @@ def flush_trace_contexts_merged(contexts: List[TraceReqContextAsync]) -> None:
     if not batches:
         return
 
-    sock = _get_zmq_socket()
-    if sock is None:
-        return
-
-    try:
-        sock.send_pyobj({"action": "multi_batch", "batches": batches}, zmq.NOBLOCK)
-    except zmq.Again:
-        logger.warning(
-            "ZMQ send buffer full, dropping %d merged trace batches (%d ops total)",
-            len(batches),
-            sum(len(b["operations"]) for b in batches),
-        )
-    except Exception as e:
-        logger.error("Failed to flush merged trace batches: %s", e)
+    _send_trace_message({"action": "multi_batch", "batches": batches})
 
 
 # ---------------------------------------------------------------------------
@@ -760,28 +790,14 @@ class TraceReqContextAsync:
         if ops is None:
             return
 
-        sock = _get_zmq_socket()
-        if sock is None:
-            return
-
-        try:
-            sock.send_pyobj(
-                {
-                    "action": "batch",
-                    "rid": self.rid,
-                    "context_id": self._context_id,
-                    "operations": ops,
-                },
-                zmq.NOBLOCK,
-            )
-        except zmq.Again:
-            logger.warning(
-                "ZMQ send buffer full, dropping %d trace ops for %s",
-                len(ops),
-                self.rid,
-            )
-        except Exception as e:
-            logger.error("Failed to flush trace for %s: %s", self.rid, e)
+        _send_trace_message(
+            {
+                "action": "batch",
+                "rid": self.rid,
+                "context_id": self._context_id,
+                "operations": ops,
+            }
+        )
 
     # -- trace interface (mirrors TraceReqContext) -----------------------
 
