@@ -129,7 +129,11 @@ class Server:
         raise TimeoutError(f"{self.name} did not become healthy")
 
     def generate(
-        self, token_ids: list[int], max_new_tokens: int, kv_hints=None
+        self,
+        token_ids: list[int],
+        max_new_tokens: int,
+        kv_hints=None,
+        extra_fields: dict | None = None,
     ) -> dict:
         payload = {
             "input_ids": token_ids,
@@ -140,6 +144,8 @@ class Server:
         if self.dp_rank is not None:
             # DP-attention ranks own separate caches; pin every request to one.
             payload["routed_dp_rank"] = self.dp_rank
+        if extra_fields:
+            payload.update(extra_fields)
         return _post(f"{self.base}/generate", payload)
 
     def flush(self) -> None:
@@ -383,9 +389,130 @@ def scenario_peer(args, workdir: Path) -> dict:
     return report
 
 
+def scenario_pd(args, workdir: Path) -> dict:
+    """Prefill worker with the linker plus a plain decode worker.
+
+    Requests carry the bootstrap fields a PD load balancer adds and are posted
+    to both workers, as the balancer does. The prefill worker must restore the
+    replayed prompt after GPU eviction while the decode worker keeps receiving
+    its KV through the ordinary prefill-to-decode transfer.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    rng = random.Random(args.seed)
+    prompt = _prompt(rng, args.prompt_tokens, args.vocab)
+    fillers = [
+        _prompt(rng, args.filler_tokens, args.vocab)
+        for _ in range(args.max_total_tokens // args.filler_tokens + 4)
+    ]
+    gpus = args.gpus.split(",")
+    bootstrap_port = args.control_port + 1000
+    report: dict = {"scenario": "pd", "tp": args.tp, "runs": {}}
+    for label, linker in (
+        ("control", None),
+        ("linker", _linker_config(args, control_port=None)),
+    ):
+        prefill = Server(
+            name=f"pd_prefill_{label}",
+            model=args.model,
+            port=args.port,
+            gpus=gpus[0],
+            tp=args.tp,
+            workdir=workdir,
+            page_size=args.page_size,
+            max_total_tokens=args.max_total_tokens,
+            linker_config=linker,
+            extra_args=[
+                *args.extra,
+                "--disaggregation-mode",
+                "prefill",
+                "--disaggregation-transfer-backend",
+                "nixl",
+                "--disaggregation-bootstrap-port",
+                str(bootstrap_port),
+            ],
+        )
+        decode = Server(
+            name=f"pd_decode_{label}",
+            model=args.model,
+            port=args.port + 1,
+            gpus=gpus[1],
+            tp=args.tp,
+            workdir=workdir,
+            page_size=args.page_size,
+            max_total_tokens=args.max_total_tokens,
+            linker_config=None,
+            extra_args=[
+                *args.extra,
+                "--disaggregation-mode",
+                "decode",
+                "--disaggregation-transfer-backend",
+                "nixl",
+            ],
+        )
+        pool = ThreadPoolExecutor(max_workers=2)
+
+        def pd_generate(token_ids: list[int], max_new_tokens: int) -> dict:
+            fields = {
+                "bootstrap_host": "127.0.0.1",
+                "bootstrap_port": bootstrap_port,
+                "bootstrap_room": random.randrange(1 << 62),
+            }
+            prefill_future = pool.submit(
+                prefill.generate, token_ids, max_new_tokens, None, fields
+            )
+            decode_future = pool.submit(
+                decode.generate, token_ids, max_new_tokens, None, fields
+            )
+            return {
+                "prefill": _summary(prefill_future.result()),
+                "decode": _summary(decode_future.result()),
+            }
+
+        try:
+            prefill.wait_ready()
+            decode.wait_ready()
+            first = pd_generate(prompt, args.max_new_tokens)
+            time.sleep(args.settle_s)
+            for filler in fillers:
+                pd_generate(filler, 1)
+            time.sleep(args.settle_s)
+            replay = pd_generate(prompt, args.max_new_tokens)
+            time.sleep(args.settle_s)
+            report["runs"][label] = {
+                "first": first,
+                "replay": replay,
+                "prefill_stats": prefill.stats(),
+                "commands": {"prefill": prefill.command, "decode": decode.command},
+            }
+        finally:
+            pool.shutdown(wait=False)
+            prefill.stop()
+            decode.stop()
+    control, linker = report["runs"]["control"], report["runs"]["linker"]
+    report["checks"] = {
+        "control_replay_recomputed": control["replay"]["prefill"]["cached_tokens"]
+        in (0, None),
+        "linker_replay_restored": (linker["replay"]["prefill"]["cached_tokens"] or 0)
+        > 0,
+        "decode_outputs_identical": control["first"]["decode"]["text"]
+        == control["replay"]["decode"]["text"]
+        == linker["first"]["decode"]["text"]
+        == linker["replay"]["decode"]["text"],
+    }
+    return report
+
+
+_SCENARIOS = {
+    "roundtrip": scenario_roundtrip,
+    "peer": scenario_peer,
+    "pd": scenario_pd,
+}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("scenario", choices=["roundtrip", "peer"])
+    parser.add_argument("scenario", choices=sorted(_SCENARIOS))
     parser.add_argument("--model", required=True)
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--tp", type=int, default=1)
@@ -413,9 +540,7 @@ def main() -> int:
     args, args.extra = parser.parse_known_args()
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    report = (scenario_roundtrip if args.scenario == "roundtrip" else scenario_peer)(
-        args, workdir
-    )
+    report = _SCENARIOS[args.scenario](args, workdir)
     Path(args.report).write_text(json.dumps(report, indent=2))
     print(json.dumps(report["checks"], indent=2))
     return (
