@@ -929,6 +929,10 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # Select the AITER MLA kernel for DCP decode. "gluon" preserves the native
+    # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
+    # runs mla_decode_fwd with persistent metadata and return_lse=True.
+    SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
