@@ -262,8 +262,10 @@ class QwenImage21TransformerBlock(nn.Module):
     ):
         prefix = prefix_state.get("hidden_states")
         scale1, gate1, scale2, gate2 = modulation[:, None].chunk(4, dim=-1)
-        ps1, pg1, ps2, pg2 = prefix_modulation[:, None].chunk(4, dim=-1)
-        p = None if cache else self.img_norm1(prefix) * (1 + ps1)
+        p = None
+        if not cache:
+            ps1, pg1, ps2, pg2 = prefix_modulation[:, None].chunk(4, dim=-1)
+            p = self.img_norm1(prefix) * (1 + ps1)
         attention, prefix_attention = self.attn(
             self.img_norm1(hidden_states) * (1 + scale1),
             rope,
@@ -359,12 +361,13 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         start, end = rank * local_len, (rank + 1) * local_len
         images = self.img_in(hidden_states[:, start:end])
         temb = self.time_text_embed((timestep.to(images.dtype) / 1000), images.dtype)
-        zero_temb = self.time_text_embed(
-            timestep.new_zeros(1).to(images.dtype), images.dtype
-        )
-        modulation, prefix_modulation = self.modulation(temb), self.modulation(
-            zero_temb
-        )
+        modulation = self.modulation(temb)
+        prefix_modulation = None
+        if prefix_caches is None or any(not cache[0] for cache in prefix_caches):
+            zero_temb = self.time_text_embed(
+                timestep.new_zeros(1).to(images.dtype), images.dtype
+            )
+            prefix_modulation = self.modulation(zero_temb)
         outputs = []
         for sample, layout in enumerate(layouts):
             caches = (
