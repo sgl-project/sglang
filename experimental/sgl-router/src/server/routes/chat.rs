@@ -504,16 +504,16 @@ pub async fn chat_completions(
 
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the
-    // MODEL (does it have a chat encoder so the router can produce
+    // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * `has_chat_encoder` → a chat request on this model yields
+    //   * Forwarding is enabled and `has_chat_formatter` -> a chat request yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
     //   * `needs_request_tokens()` → the cache-aware policy ALSO wants the
     //     raw-prompt path tokenized for tree matching even on a model with no
-    //     chat encoder (`/v1/completions` / `text`), which the first gate
+    //     chat formatter (`/v1/completions` / `text`), which the first gate
     //     alone wouldn't trigger.
     //
     //   * Bucket routing also needs the prompt token count.
@@ -523,8 +523,10 @@ pub async fn chat_completions(
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
+    let can_forward_input_ids = !ctx.config.model.disable_input_ids_forwarding
+        && ctx.tokenizers.has_chat_formatter(&model_str);
     let want_tokens = should_tokenize_request(
-        ctx.tokenizers.has_chat_encoder(&model_str),
+        can_forward_input_ids,
         policy.needs_request_tokens(),
         ctx.bucket_selector.is_enabled(),
     );
@@ -798,8 +800,9 @@ pub async fn chat_completions(
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
-    // engine-equivalent (chat-encoder path) AND the request contains nothing
-    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
+    // enabled for this model, engine-equivalent (chat-formatter path), and
+    // the request has no unreplicated rendering controls (see
+    // `input_ids_safe_to_forward`).
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
@@ -807,19 +810,21 @@ pub async fn chat_completions(
     // predicate always has a parsed body to inspect.
     let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
     {
-        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
+        (Some(t), Some(v))
+            if can_forward_input_ids && t.rendered_from_chat && input_ids_safe_to_forward(v) =>
+        {
             Some(t.ids.as_slice())
         }
         _ => None,
     };
 
-    // Surface a broken offload: when the encoder SHOULD have produced
+    // Surface a broken offload: when the formatter SHOULD have produced
     // engine-equivalent ids but didn't, the chat request silently fell back to
     // engine-side tokenization. Count only that case (see
     // `ingress_tokenize_offload_failed`); successful forwards and expected
     // omissions are not problems.
     if ingress_tokenize_offload_failed(
-        ctx.tokenizers.has_chat_encoder(&model_str),
+        can_forward_input_ids,
         request_value.as_ref(),
         request_tokens.as_ref(),
     ) {
@@ -1198,11 +1203,11 @@ fn parse_optional_positive_f64_header(
 }
 
 fn should_tokenize_request(
-    has_chat_encoder: bool,
+    can_forward_input_ids: bool,
     policy_needs_request_tokens: bool,
     bucket_enabled: bool,
 ) -> bool {
-    has_chat_encoder || policy_needs_request_tokens || bucket_enabled
+    can_forward_input_ids || policy_needs_request_tokens || bucket_enabled
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -1247,6 +1252,55 @@ struct BootstrapFields {
     room: u64,
 }
 
+/// Write `members` in as top-level keys of the JSON object in `body`, without
+/// parsing it.
+///
+/// WHY: going through `serde_json` costs a full parse into a `Value` plus a
+/// full re-serialize, over a body that runs to [`MAX_CHAT_BODY_BYTES`].
+///
+/// Members go in before the CLOSING brace so they win the last-wins reading
+/// every JSON parser performs — the authority `obj.insert` has on the parse
+/// path. Inserting after the opening brace would lose to a client's own later
+/// copy of the key, which a request sending an explicit `null` for a governed
+/// parameter has: the probe reads `null` as absent, so the value IS injected.
+/// The last `}` is the object's closing brace, since `parse_probe` proved the
+/// body is an object and only whitespace may follow it.
+///
+/// `None` (braces not located) falls back to the parse path rather than
+/// panicking on a shape `parse_probe` should already have rejected.
+fn splice_top_level(
+    body: &Bytes,
+    members: &[(SamplingField, serde_json::Number)],
+) -> Option<Bytes> {
+    use std::io::Write as _;
+
+    let open = body.iter().position(|&b| b == b'{')?;
+    let close = body.iter().rposition(|&b| b == b'}')?;
+    if close <= open {
+        return None;
+    }
+    // An empty object takes no separating comma: `{"temperature":1}`, not
+    // `{,"temperature":1}`.
+    let has_members = body[open + 1..close]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace());
+    // 24 bytes per member covers `"repetition_penalty":` plus a short number;
+    // an over-run just costs one realloc, never correctness.
+    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
+    out.extend_from_slice(&body[..close]);
+    for (i, (field, value)) in members.iter().enumerate() {
+        if has_members || i > 0 {
+            out.push(b',');
+        }
+        // Wire names are a fixed set of JSON-safe identifiers and a
+        // `serde_json::Number` renders as valid JSON, so neither needs
+        // escaping. Written straight into `out` — no intermediate `String`.
+        write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+    }
+    out.extend_from_slice(&body[close..]);
+    Some(Bytes::from(out))
+}
+
 /// Build the body forwarded to the engine, injecting (when present) the
 /// precomputed `input_ids`, the PD `bootstrap_*` fields and the fleet-wide
 /// sampling values into the already-parsed request object and serializing
@@ -1258,12 +1312,12 @@ struct BootstrapFields {
 /// tokens, tool-call constraint and response shape it still derives from them.
 /// Set only when `input_ids_safe_to_forward` held.
 ///
-/// `value` is the ingress parse when one is on hand (the cache-aware path
-/// parses once at ingress); it is consumed so the mutation reuses that parse.
-/// It is `None` for a load-only policy — a path that never parses at ingress —
-/// so injection re-parses the bytes here. The body shape was validated by
-/// `parse_probe`; the non-object arm defends against a TOCTOU regression
-/// rather than panicking.
+/// `value` is the ingress parse when one is on hand, reused rather than
+/// repeated — and dropped unused when splicing makes it unnecessary. Sampling
+/// alone never reaches `serde_json`: only `input_ids` and bootstrap injection
+/// do, because those may have to OVERWRITE a key the client sent, which
+/// [`splice_top_level`] cannot. The non-object arm defends against a TOCTOU
+/// regression rather than panicking.
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
@@ -1271,13 +1325,33 @@ fn build_outgoing_body(
     bootstrap: Option<&BootstrapFields>,
     sampling: &[(SamplingField, serde_json::Number)],
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() && sampling.is_empty() {
+    // `input_ids` and bootstrap injection may have to OVERWRITE a key the
+    // client sent, which only the parse path can do; sampling injection never
+    // does, because the inject-set holds only keys the request omitted.
+    let only_sampling = input_ids.is_none() && bootstrap.is_none();
+    if only_sampling && sampling.is_empty() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
+    // Splice regardless of whether a parse is already on hand: `value` is
+    // read-only up to this point, so having one does not make splicing wrong —
+    // it only means the parse was already paid for elsewhere. Gating on
+    // `value.is_none()` would confine the splice to the load-only path and
+    // skip every configuration that parses at ingress without forwarding
+    // `input_ids`: the cache-aware policy, bucket routing, and a chat-encoder
+    // model whose request `input_ids_safe_to_forward` withholds (tools,
+    // multimodal, thinking). A chat-encoder model on a plain request is NOT
+    // one of them — there `input_ids` is `Some`, so the parse path runs
+    // either way.
+    if only_sampling {
+        if let Some(spliced) = splice_top_level(body, sampling) {
+            return Ok(spliced);
+        }
+    }
     let parsed = match value {
         Some(v) => v,
-        // The ingress skipped the parse, so re-parse for the injection.
+        // The ingress skipped the parse, so re-parse. Reached for bootstrap
+        // injection, and as the fallback if `splice_top_level` declined.
         None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?,
@@ -1332,50 +1406,30 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Whether the router's `input_ids` may be forwarded for this request.
+/// Forward generated IDs only for request shapes verified against the engine.
+/// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
-/// We forward only when the engine, fed `input_ids`, would have produced the
-/// SAME prompt the router tokenized. When `input_ids` is present the engine
-/// uses it verbatim and ignores everything that would otherwise steer its
-/// `messages`-side tokenization (only stop tokens / tool-call constraint are
-/// still taken from `messages`). So any request field that changes that
-/// tokenization but which the router's chat encoder does not replicate makes
-/// the forwarded ids wrong. This predicate is conservative by construction —
-/// any such signal returns `false` and the engine tokenizes from `messages`
-/// (always correct).
+/// Exclude requests that may render differently with dynamo-render:
+/// - Non-leading system turns or consecutive users, which strict templates rewrite.
+/// - Historical `reasoning_content`, which may be injected into message content.
+/// - Tools and tool-call history, which the engine merges and normalizes
+///   before rendering.
+/// - Non-string or missing content, which the engine flattens or blanks.
+/// - Template overrides, kwargs, reasoning controls, or task selection.
+/// - Assistant continuations, whose final turn the engine handles separately.
 ///
-/// Replicated-and-safe: plain text `messages` with a string `content`.
-/// Not replicated → omit:
-///   * `tools` / `functions` — the encoder doesn't render tool schemas.
-///   * multimodal (array) `content` — a text tokenizer can't represent images.
-///   * `chat_template` — an OpenAI-compatible per-request template override
-///     (e.g. vLLM); the router renders with the model's default template, so a
-///     custom one would diverge. (SGLang ignores it today, but block it so the
-///     offload stays correct across engines / future versions.)
-///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
-///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
-///     encoder renders in the engine's default mode only.
-///   * `continue_final_message: true`, or a trailing `assistant` message — the
-///     engine rewrites/strips the final assistant turn; the encoder renders it
-///     verbatim.
-///
-/// NOTE: the router's chat encoder renders in the engine's default
-/// (non-thinking) mode. Current sglang derives thinking from the request
-/// (`chat_template_kwargs`), which this guard already omits, so a plain request
-/// the router rendered matches the engine. The only way to diverge is an engine
-/// build that applies a non-default thinking mode the router can't observe from
-/// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on. The same assumption covers
-/// `add_special_tokens`: the router renders specials via the chat template, which
-/// matches the engine on tokenizers that auto-add them (the common case); a
-/// tokenizer that does not would diverge by a leading special, again undetectable
-/// from the request.
+/// Matching model files and engine defaults are still required. Worker template
+/// overrides and default kwargs cannot be inferred from the request.
+/// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_is_multimodal(value) {
+    if request_has_tools(value)
+        || request_has_non_text_content(value)
+        || request_has_reasoning_content(value)
+        || request_has_role_rewrites(value)
+    {
         return false;
     }
-    // Fields that steer the engine's template tokenization but which the
-    // router's encoder does not thread through.
+    // Request controls whose rendering has not been verified against the engine.
     for key in [
         "chat_template",
         "chat_template_kwargs",
@@ -1397,36 +1451,26 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether the ingress tokenization offload was expected to fire but failed —
-/// the condition behind `sgl_router_ingress_tokenize_errors_total`.
+/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
 ///
-/// True only when ALL of:
-///   * the model has a chat encoder (`has_chat_encoder`), so a chat request
-///     on it SHOULD have produced engine-equivalent ids;
-///   * the request is a chat request (`messages` array present);
-///   * the tokens are absent OR not engine-equivalent — i.e. `encode_chat`
-///     render/encode failed and the request silently fell back to engine-side
-///     tokenization.
-///
-/// Non-chat-encoder / non-`messages` requests never expected the offload, so
-/// they are not failures. A tools / multimodal / thinking request on a
-/// chat-encoder model still gets engine-equivalent ids (`encode_chat`
-/// succeeded; the safe-predicate withholds forwarding for other reasons), so it
-/// is an expected omission, not a failure.
+/// Count chats with forwarding enabled that pass the forwarding guard
+/// but lack chat-rendered tokens. Excluded requests are expected fallbacks,
+/// even when rendering fails.
 fn ingress_tokenize_offload_failed(
-    has_chat_encoder: bool,
+    can_forward_input_ids: bool,
     request_value: Option<&serde_json::Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> bool {
-    if !has_chat_encoder {
+    if !can_forward_input_ids {
         return false;
     }
-    let chat_request =
-        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    let chat_request = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array()) && input_ids_safe_to_forward(v)
+    });
     if !chat_request {
         return false;
     }
-    !request_tokens.is_some_and(|t| t.engine_equivalent)
+    !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -1441,31 +1485,68 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Whether the request carries tool / function definitions. The router's chat
-/// encoder renders only `messages`, so its `input_ids` would omit the tool
-/// schemas the engine's template injects into the prompt — the caller must let
-/// the engine tokenize these itself.
+/// Tool schemas and tool-call history require engine normalization before
+/// rendering: the engine merges message-level `tools` into the template's tools
+/// and parses `tool_calls` arguments; dynamo-render does neither the same way.
 fn request_has_tools(value: &serde_json::Value) -> bool {
-    let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        })
+    let nonempty = |v: &serde_json::Value| match v {
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
     };
-    nonempty("tools") || nonempty("functions")
+    if ["tools", "functions"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(nonempty))
+    {
+        return true;
+    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    || ["tools", "tool_calls", "function_call"]
+                        .iter()
+                        .any(|key| message.get(key).is_some_and(nonempty))
+            })
+        })
 }
 
-/// Whether any message carries non-string (array / multimodal) content. A text
-/// tokenizer cannot represent image content, so the router's `input_ids` would
-/// drop it — the caller must let the engine handle these requests.
-fn request_is_multimodal(value: &serde_json::Value) -> bool {
+/// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
+fn request_has_reasoning_content(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null())
+            })
+        })
+}
+
+/// Message orders dynamo-render may rewrite for strict templates.
+fn request_has_role_rewrites(value: &serde_json::Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().skip(1).any(|m| m["role"] == "system")
+        || messages
+            .windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user")
+}
+
+/// Detect non-string or missing content, which requires engine tokenization:
+/// the engine normalizes arrays and nulls differently from dynamo-render.
+fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
         .and_then(|m| m.as_array())
         .is_some_and(|msgs| {
             msgs.iter()
-                .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
+                .any(|m| !matches!(m.get("content"), Some(serde_json::Value::String(_))))
         })
 }
 
@@ -1756,8 +1837,8 @@ mod tests {
         );
     }
 
-    /// Tool / function requests are detected so the caller omits `input_ids`
-    /// (the router's encoder doesn't render tools).
+    /// Tool schemas and tool-call history are detected so the caller omits
+    /// `input_ids`; empty lists and nulls are not tools.
     #[test]
     fn request_has_tools_detects_tools_and_functions() {
         assert!(request_has_tools(
@@ -1768,16 +1849,35 @@ mod tests {
         ));
         assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+        for message in [
+            serde_json::json!({"role":"system","content":"s","tools":[{"type":"function"}]}),
+            serde_json::json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}),
+        ] {
+            assert!(request_has_tools(
+                &serde_json::json!({"messages":[message]})
+            ));
+        }
     }
 
-    /// Array (multimodal) message content is detected so the caller omits
-    /// `input_ids` (a text tokenizer can't represent image content).
+    /// Arrays, nulls, and missing content block `input_ids` forwarding.
     #[test]
-    fn request_is_multimodal_detects_array_content() {
-        assert!(request_is_multimodal(&serde_json::json!({
-            "messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]
+    fn request_has_non_text_content_detects_non_string_content() {
+        for content in [
+            serde_json::json!([{"type":"image_url","image_url":"x"}]),
+            serde_json::json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                request_has_non_text_content(&serde_json::json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":content}]
+                })),
+                "content {content} must block"
+            );
+        }
+        assert!(request_has_non_text_content(&serde_json::json!({
+            "messages":[{"role":"assistant","tool_calls":[]}]
         })));
-        assert!(!request_is_multimodal(&serde_json::json!({
+        assert!(!request_has_non_text_content(&serde_json::json!({
             "messages":[{"role":"user","content":"hello"}]
         })));
     }
@@ -1790,8 +1890,49 @@ mod tests {
         })));
     }
 
+    #[test]
+    fn reasoning_history_is_an_expected_forwarding_omission() {
+        let mut value = serde_json::json!({"messages": [
+            {"role":"user", "content":"hi"},
+            {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+            {"role":"user", "content":"next"}
+        ]});
+        assert!(!input_ids_safe_to_forward(&value));
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        value["messages"][1]["reasoning_content"] = serde_json::Value::Null;
+        assert!(input_ids_safe_to_forward(&value));
+        value["messages"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        assert!(input_ids_safe_to_forward(&value));
+    }
+
+    #[test]
+    fn role_rewrites_are_expected_forwarding_omissions() {
+        for roles in [
+            vec!["user", "user"],
+            vec!["system", "system", "user"],
+            vec!["user", "assistant", "system", "user"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| serde_json::json!({"role": role, "content": "text"}))
+                .collect();
+            let value = serde_json::json!({"messages": messages});
+            assert!(!input_ids_safe_to_forward(&value), "{roles:?}");
+            assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        }
+        assert!(input_ids_safe_to_forward(&serde_json::json!({"messages": [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]})));
+    }
+
     /// Every field the engine honors on the `messages` path but which the
-    /// router's encoder does not replicate must block forwarding — otherwise
+    /// router's formatter does not replicate must block forwarding — otherwise
     /// the engine uses the router's ids verbatim and silently runs a different
     /// prompt than the request asked for.
     #[test]
@@ -1847,14 +1988,14 @@ mod tests {
         assert!(parsed.get("input_ids").is_none());
     }
 
-    /// A chat request on a chat-encoder model that yields engine-equivalent
+    /// A chat request on a chat-formatter model that yields engine-equivalent
     /// ids (encode succeeded) is NOT a failure — the offload worked.
     #[test]
-    fn offload_failed_false_when_tokens_engine_equivalent() {
+    fn offload_failed_false_when_tokens_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            engine_equivalent: true,
+            rendered_from_chat: true,
         };
         assert!(!ingress_tokenize_offload_failed(
             true,
@@ -1863,24 +2004,32 @@ mod tests {
         ));
     }
 
-    /// A chat request on a chat-encoder model whose tokenization yielded NO
-    /// tokens (encode_chat returned None → request_tokens None) IS a failure:
-    /// the encoder should have fired but didn't.
+    /// Excluded requests are expected fallbacks, even without rendered tokens.
     #[test]
-    fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
+    fn offload_failed_false_for_unforwardable_request() {
+        let value = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]
+        });
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    /// Missing tokens count as a failure for an eligible chat with a formatter.
+    #[test]
+    fn offload_failed_true_when_chat_formatter_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
-    /// Encode produced ids but NOT via the chat encoder (raw fallback,
-    /// `engine_equivalent = false`) on a chat-encoder model + chat request →
+    /// Encode produced ids but NOT via the chat formatter (raw fallback,
+    /// `rendered_from_chat = false`) on a chat-formatter model + chat request →
     /// the chat-encode render/encode failed and fell through to the raw path.
     #[test]
-    fn offload_failed_true_when_tokens_not_engine_equivalent() {
+    fn offload_failed_true_when_tokens_not_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            engine_equivalent: false,
+            rendered_from_chat: false,
         };
         assert!(ingress_tokenize_offload_failed(
             true,
@@ -1889,15 +2038,15 @@ mod tests {
         ));
     }
 
-    /// Non-chat-encoder models never expected the offload → not a failure even
+    /// Non-chat-formatter models never expected the offload -> not a failure even
     /// with no tokens.
     #[test]
-    fn offload_failed_false_without_chat_encoder() {
+    fn offload_failed_false_without_chat_formatter() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
     }
 
-    /// A non-chat (no `messages`) request on a chat-encoder model — e.g.
+    /// A non-chat (no `messages`) request on a chat-formatter model, e.g.
     /// `/v1/completions` `prompt` — never expected the chat-encode offload, so
     /// the absence of engine-equivalent ids is not a failure.
     #[test]
@@ -2393,6 +2542,59 @@ mod tests {
         );
     }
 
+    /// The steady state of a governed fleet: a load-only policy on a model
+    /// with no chat encoder, so the ingress never parsed, and only sampling
+    /// scalars to add. This must NOT re-parse and re-serialize the body —
+    /// proven by the original bytes surviving verbatim, which a
+    /// `serde_json::Value` round-trip would have normalized away.
+    #[test]
+    fn build_outgoing_body_splices_sampling_without_reparsing() {
+        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0, "n": 1}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.get("model"), Some(&serde_json::json!("x")));
+    }
+
+    /// Splice edge cases: an empty object must not gain a trailing comma, and
+    /// leading whitespace before the root brace must not shift the insert.
+    #[test]
+    fn splice_top_level_handles_empty_objects_and_leading_whitespace() {
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        for (raw, want) in [
+            (r#"{}"#, r#"{"temperature":1.0}"#),
+            (r#"{ }"#, r#"{ "temperature":1.0}"#),
+            ("\n\t {\"a\":1}", "\n\t {\"a\":1,\"temperature\":1.0}"),
+            // A `}` inside a string literal is not the closing brace.
+            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0}"#),
+            // Trailing whitespace stays outside the object.
+            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
+        ] {
+            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
+            serde_json::from_slice::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
+        }
+    }
+
     /// Nothing configured -> the body is forwarded as the same `Bytes`, with
     /// neither a parse nor a copy.
     #[test]
@@ -2685,6 +2887,54 @@ mod tests {
             parse_as_engine_number(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
             "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
             "a value at the cap is still read"
+        );
+    }
+
+    /// A request sending an explicit `null` for a governed parameter is the
+    /// one case where the inject-set and a key PRESENT in the body overlap:
+    /// the probe reads `null` as absent (the OpenAI contract), so the value is
+    /// injected even though the key is there. The injected value therefore has
+    /// to win the engine's last-wins parse — which is why members are spliced
+    /// in before the CLOSING brace. Inserting after the opening brace would
+    /// leave the client's trailing `null` authoritative and silently defeat
+    /// the contract.
+    #[test]
+    fn spliced_value_outranks_an_explicit_null_the_client_sent() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let raw = r#"{"model":"x","temperature":null}"#;
+        let body = Bytes::copy_from_slice(raw.as_bytes());
+        let inject = apply_sampling_overrides(&overrides, &probe_of(raw), &metrics()).unwrap();
+        assert_eq!(inject.len(), 1, "null must be treated as omitted");
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("temperature"),
+            Some(&serde_json::json!(1.0)),
+            "the engine must read the configured value, not the client's null: {}",
+            std::str::from_utf8(&out).unwrap()
+        );
+    }
+
+    /// The splice must also fire when the ingress ALREADY parsed the body, as
+    /// long as nothing needs overwriting — see the WHY on the unconditional
+    /// splice in `build_outgoing_body` for which configurations those are.
+    #[test]
+    fn splice_fires_even_when_a_parse_is_already_on_hand() {
+        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, Some(value), None, None, &inject).unwrap();
+        // Byte-identical to the no-parse case: the parse was dropped unused.
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,"temperature":1.0}"#
         );
     }
 }
