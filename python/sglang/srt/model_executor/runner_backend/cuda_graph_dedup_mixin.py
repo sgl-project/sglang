@@ -43,20 +43,6 @@ def maybe_cuda_result(result):
     return None if int(result[0]) != 0 else checkCudaErrors(result)
 
 
-def kernel_name(params) -> str:
-    assert cuda_drv is not None
-    for handle, getter in (
-        (getattr(params, "kern", None), cuda_drv.cuKernelGetName),
-        (getattr(params, "func", None), cuda_drv.cuFuncGetName),
-    ):
-        if handle is None or int(handle) == 0:
-            continue
-        name = maybe_cuda_result(getter(handle))
-        if name is not None:
-            return name.decode("utf-8", "replace")
-    return f"func:{int(getattr(params, 'func', 0))}"
-
-
 def kernel_attrs(node) -> tuple[tuple[str, object], ...]:
     assert cuda_drv is not None
     attrs = []
@@ -107,10 +93,13 @@ def kernel_attrs(node) -> tuple[tuple[str, object], ...]:
 def kernel_node_payload(node):
     assert cuda_drv is not None
     params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
+    # Grid dimensions vary across buckets and are validated by the exec update.
+    # The handles subsume the kernel name; they are here because
+    # cuGraphKernelNodeGetAttribute cannot read preferred cluster dimension back
+    # and cudaGraphExecUpdate reports success when it changes (sgl-project/sglang#37657).
+    # Once the driver reports that mismatch, the handles can go too.
     return (
-        kernel_name(params),
         (int(params.kern), int(params.func)),
-        (int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)),
         (int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)),
         int(params.sharedMemBytes),
         kernel_attrs(node),
@@ -186,7 +175,6 @@ def graph_signature(raw_graph: int):
 class GraphExecGroup:
     graph_exec: int
     current_raw_graph: int
-    compat_exec: int | None
     graphs: list[DedupedCudaGraph] = field(default_factory=list)
 
 
@@ -227,9 +215,10 @@ class DedupedCudaGraphRegistry:
 
         group = self.groups.get(signature)
         if group is not None:
-            assert group.compat_exec is not None
-            ok, detail = dedup_update(group.compat_exec, graph.raw_graph)
+            # An incompatible cudaGraphExecUpdate does not modify the executable.
+            ok, detail = dedup_update(group.graph_exec, graph.raw_graph)
             assert ok, f"CUDA graph dedup register update failed ({detail})"
+            group.current_raw_graph = graph.raw_graph
             graph.group = group
             group.graphs.append(graph)
             return graph
@@ -237,7 +226,6 @@ class DedupedCudaGraphRegistry:
         group = GraphExecGroup(
             graph_exec=self.instantiate(graph.raw_graph),
             current_raw_graph=graph.raw_graph,
-            compat_exec=self.instantiate(graph.raw_graph),
             graphs=[graph],
         )
         graph.group = group
@@ -245,13 +233,7 @@ class DedupedCudaGraphRegistry:
         return graph
 
     def seal(self) -> None:
-        if self.sealed:
-            return
         self.sealed = True
-        for group in self.groups.values():
-            if group.compat_exec is not None:
-                self.destroy_exec(group.compat_exec)
-                group.compat_exec = None
 
     def stats(self) -> tuple[int, int]:
         return sum(len(group.graphs) for group in self.groups.values()), len(
@@ -281,9 +263,6 @@ class DedupedCudaGraphRegistry:
         self.sealed = True
 
         for group in self.groups.values():
-            if group.compat_exec is not None:
-                self.destroy_exec(group.compat_exec)
-                group.compat_exec = None
             self.destroy_exec(group.graph_exec)
             for graph in group.graphs:
                 if graph.original_graph is not None:

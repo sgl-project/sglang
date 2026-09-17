@@ -90,7 +90,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 @contextmanager
