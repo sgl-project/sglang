@@ -575,7 +575,6 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_attn_tp_comm = (
             get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
-            and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
         shared_experts_tp_kwargs = {}
@@ -1936,12 +1935,7 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    # Honor the fused-KDA-decode handoff: when the backend will
-                    # apply f_b inside the fused decode kernel
-                    # (SGLANG_K3_KDA_FUSED_BACKEND=aiter), hand it f_a as-is.
-                    # Applying f_b here and then flagging the gate as deferred
-                    # made the backend re-apply f_b on a full-width gate
-                    # (mat1 (bs,1536) x mat2 (128,1536) at graph capture).
+                    # Fused KDA decode consumes f_a and applies f_b itself.
                     forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 

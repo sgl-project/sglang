@@ -129,6 +129,8 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    supports_draft_extend_metadata_staging: bool = False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
@@ -150,6 +152,13 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    # Backends may keep MIXED prefill eager under DP attention when replaying
+    # the EXTEND graph is a known serving-performance regression.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
@@ -173,13 +182,6 @@ class AttentionBackend(ABC):
     # assume that generic ForwardBatch metadata is sufficient for every
     # attention implementation.
     supports_full_cuda_graph_chunked_prefix: bool = False
-    # Off CUDA, breakable prefill graphs route MLA extend through the MHA
-    # companion, and the prefill runner rejects any batch with a cached prefix
-    # (every MIXED batch and every later prefill chunk) because the generic
-    # chunked-prefix MHA merge is CUDA-only. A backend whose MHA-method extend
-    # gathers the prefix itself inside the (eager) attention break can serve
-    # those batches from the captured graph and opts in here.
-    supports_breakable_cuda_graph_prefix_off_cuda: bool = False
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,
