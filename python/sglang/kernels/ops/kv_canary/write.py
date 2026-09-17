@@ -184,7 +184,8 @@ def launch_canary_write_kernel(
         - Input-verification mismatch records violations but does NOT abort the chain.
         - kernel_run_counter is bumped every call.
         - Safe in cuda-graph capture; caller refills input_ids / positions / out_cache_loc / plan
-          in-place before replay.
+          in-place before replay. The torch reference is not: it does host work and D2H, so
+          install_canary refuses a captured decode on a device that routes to it.
 
     Pinned by torch reference
     :func:`sglang.kernels.ops.kv_canary.write_ref.launch_canary_write_kernel_torch_reference`; CUDA must match

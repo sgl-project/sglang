@@ -100,6 +100,8 @@ def launch_canary_plan_kernels(
     Calling contract:
         - Pure side-effect; no host work, no D2H.
         - Safe in cuda-graph capture; caller refills all input tensors in-place before replay.
+          The torch reference is not: it does host work and D2H, so install_canary refuses a
+          captured decode on a device that routes to it.
         - The wrapper launches the plan sub-kernels needed to fill both plans end-to-end.
         - Padding rows contribute zero entries.
 

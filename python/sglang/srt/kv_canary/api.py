@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
@@ -18,6 +19,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_spec,
@@ -29,6 +31,22 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
+    """Whether ``device`` would capture a decode graph over the canary torch reference.
+
+    install_canary runs before decode graph capture, so on a device without the canary
+    CUDA kernels the reference launches fall inside the captured region -- except they
+    do host work and D2H, so nothing lands in the graph and every replayed decode
+    verifies clean. A silently inert canary reporting "no violations" is worse than a
+    refusal, hence the caller raises.
+    """
+    return (
+        use_torch_reference(device)
+        and current_platform.support_cuda_graph()
+        and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+    )
 
 
 def install_canary(
@@ -49,6 +67,12 @@ def install_canary(
 
     perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
+    if torch_reference_conflicts_with_decode_graph(device):
+        raise ValueError(
+            f"kv-canary: {device.type} has no canary CUDA kernels and its torch reference "
+            "cannot be graph-captured; pass --disable-cuda-graph (or "
+            "--cuda-graph-backend-decode=disabled) when canary is enabled"
+        )
     # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;
     # target pools have no such shift. Threaded into the plan-side expected-token gather kernel.
     kv_token_id_vs_position_offset = 1 if model_runner.is_draft_worker else 0

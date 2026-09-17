@@ -12,11 +12,18 @@ import torch
 
 from sglang.srt.utils import get_device
 from sglang.srt.utils.phase_checker import SimplePhaseChecker
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, stage="stage-b", runner_config="1-gpu-small-amd")
+# Nightly, not a blocking lane: one case spawns a subprocess that trips a device-side
+# assert, so a wedge costs the whole subprocess timeout below.
+register_xpu_ci(est_time=300, suite="nightly-xpu-1-gpu", nightly=True)
 
 _DEVICE: torch.device = torch.device(get_device(device_id=0))
 _DEVICE_MODULE = torch.get_device_module(_DEVICE)
@@ -170,9 +177,10 @@ class TestUpdateAssertEnabled(CustomTestCase):
             [sys.executable, "-c", script],
             capture_output=True,
             text=True,
-            # Cold-Triton-cache compile on XPU takes minutes; too tight a timeout
-            # surfaces as a spurious returncode=-9, not a real assert regression.
-            timeout=600,
+            # Cold-Triton-cache compile takes minutes on XPU, where this file runs
+            # nightly; too tight a timeout surfaces as a spurious returncode=-9, not
+            # a real assert regression.
+            timeout=180 if _DEVICE.type == "cuda" else 600,
         )
         # The FAIL line is the evidence that the kernel-side check fired. How the
         # process then dies is not: the CUDA coredump handler may abort it, and sync
@@ -445,7 +453,7 @@ class TestCudaGraphCapture(CustomTestCase):
         # Replay with assert OFF tolerates a deliberately diverged phase.
         checker._phase.fill_(999)
         graph.replay()
-        _DEVICE_MODULE.synchronize()  # no raise — flag is OFF
+        _DEVICE_MODULE.synchronize()  # no raise -- flag is OFF
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
         # Now turn on asserts (also resets phase -> IDLE) and replay.
@@ -454,7 +462,7 @@ class TestCudaGraphCapture(CustomTestCase):
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
         graph.replay()
-        _DEVICE_MODULE.synchronize()  # no raise — phase matched expect
+        _DEVICE_MODULE.synchronize()  # no raise -- phase matched expect
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
 

@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
-from sglang.srt.utils import create_device_stream, current_device_stream
+from sglang.srt.utils import create_device_stream, get_current_device_stream_fast
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -31,7 +31,7 @@ class TestFutureTensors(CustomTestCase):
     def test_device_stage_then_wait_returns_host_copy(self) -> None:
         """Verify staged device tensors are copied back on wait."""
         alt_stream = create_device_stream(DEFAULT_DEVICE)
-        default_stream = current_device_stream(DEFAULT_DEVICE)
+        default_stream = get_current_device_stream_fast()
         self.assertNotEqual(alt_stream.stream_id, default_stream.stream_id)
 
         src_first = torch.tensor([41], dtype=torch.int32, device=DEFAULT_DEVICE)
