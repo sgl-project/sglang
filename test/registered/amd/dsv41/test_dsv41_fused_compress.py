@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -356,6 +357,30 @@ class TestFusedLowRatioCompress(CustomTestCase):
             for n in (1, 64):
                 with self.subTest(ratio=ratio, n=n):
                     self._check_step(_build(n, ratio, seed=100 + n + ratio), ratio)
+
+    @unittest.skipUnless(is_hip(), "HIP fused pair-state writer")
+    def test_pair_state_survives_the_next_decode_step(self):
+        t = _build(8, 2, seed=3000)
+        t.req.copy_(t.req.roll(1))
+        state = t.backend.token_to_kv_pool.get_attention_compress_states(
+            t.layer.layer_id
+        ).kv_score_buffer.kv_score
+        complete_slots = t.out_loc.clone()
+        t.pos.sub_(1)
+        t.out_loc.fill_(-1)
+        projected = t.compressor.project_fused(t.x)
+        expected_state = state.clone()
+        write_rows = t.req * t.ring_size + t.pos % t.ring_size
+        expected_state[write_rows] = projected
+        self._check_step(t, 2)
+        self.assertTrue(torch.equal(state, expected_state))
+
+        t.pair_state = expected_state
+        t.pos.add_(1)
+        t.out_loc.copy_(complete_slots)
+        t.x.normal_()
+        self._check_step(t, 2)
+        self.assertTrue(torch.equal(state, expected_state))
 
     def test_static_verify_dispatch_and_real_pool_writes(self):
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (

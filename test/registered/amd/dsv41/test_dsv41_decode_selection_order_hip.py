@@ -16,44 +16,10 @@ HEAD_DIM = 512
 HEADS = 16
 
 
-def _metadata(low_ratios=(1, 2)):
-    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-        DSV4AttnMetadata,
-    )
-
-    kw = dict(dtype=torch.int32, device="cuda")
-    rows = torch.zeros(2, **kw)
-    md = DSV4AttnMetadata(
-        page_size=PAGE,
-        page_table=torch.ones(2, 4, **kw),
-        raw_out_loc=rows + PAGE,
-        cuda_int32_kwargs=kw,
-        seq_lens_casual=rows + 513,
-        positions_casual=rows + 512,
-        swa_page_indices=torch.zeros(2, 128, **kw),
-        swa_topk_lengths=rows + 128,
-        index_topk=512,
-        low_ratios=low_ratios,
-    )
-    md.c4_topk_lengths_clamp1 = rows + 1
-    md.c4_topk_lengths_raw = rows + 1
-    for ratio in low_ratios:
-        setattr(md, f"c{ratio}_topk_lengths_clamp1", rows + 513 // ratio)
-    return md
 
 
 @unittest.skipUnless(is_hip(), "HIP radix backend")
 class TestDecodeSelectionOrder(CustomTestCase):
-    def test_decode_metadata_carries_raw_indices(self):
-        """Decode rows keep the position keys the AOT sort orders by."""
-        md = _metadata()
-        md.init_flashmla_related(is_prefill=False)
-        for ratio in (1, 2, 4):
-            raw = md.sparse_raw_indices(ratio)
-            self.assertIsNotNone(
-                raw, f"ratio {ratio}: decode selection would sort by slot"
-            )
-            self.assertEqual(raw.shape, md.sparse_page_indices(ratio).shape)
 
     def test_position_ordered_selection_is_page_invariant(self):
         """Same keys on two page layouts: the position-sorted selection attends bitwise

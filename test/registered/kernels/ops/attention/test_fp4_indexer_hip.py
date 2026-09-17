@@ -325,12 +325,15 @@ def test_index_q_pack_weights_matches_standalone(
     assert torch.equal(q_fp4, ref_fp4)
     assert torch.equal(q_scale, ref_scale)
     assert torch.equal(weights, ref_w)
+    exact_weights = (x.double() @ w.double().T * scale).bfloat16()
+    ulps = (weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()).abs()
+    assert int(ulps.max()) <= 1
     # repeatable, and a row alone equals the row inside the batch
     again = index_q_pack_weights_hip(
         q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
     )
     assert all(torch.equal(a, b) for a, b in zip(again, (q_fp4, q_scale, weights)))
-    one_fp4, one_scale, _ = index_q_pack_weights_hip(
+    one_fp4, one_scale, one_weights = index_q_pack_weights_hip(
         q[:1],
         freqs,
         pos[:1],
@@ -340,6 +343,7 @@ def test_index_q_pack_weights_matches_standalone(
         num_heads=num_heads,
     )
     assert torch.equal(one_fp4, q_fp4[:1]) and torch.equal(one_scale, q_scale[:1])
+    assert torch.equal(one_weights, weights[:1])
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
