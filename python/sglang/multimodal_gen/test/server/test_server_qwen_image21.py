@@ -69,6 +69,7 @@ def case(request):
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
+        expected_model_id="Qwen-Image-2.1",
         run_t2v_input_reference_check=False,
     )
 

@@ -1413,9 +1413,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             model["object"] == "model"
         ), f"Expected object='model', got {model.get('object')}"
+        expected_model_id = case.expected_model_id or case.server_args.model_path
         assert (
-            model["id"] == case.server_args.model_path
-        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+            model["id"] == expected_model_id
+        ), f"Model ID mismatch: expected {expected_model_id}, got {model['id']}"
 
         # Verify extended diffusion-specific fields
         assert "num_gpus" in model, "Model missing 'num_gpus' field"
