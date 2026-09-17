@@ -365,9 +365,8 @@ def hc_split_sinkhorn(
 ):
     b, s, _ = mixes.size()
     if b * s == 0:
-        # DP attention's idle forward carries no tokens. Every backend below
-        # derives its grid from the token count, and CUDA rejects a launch with
-        # a zero-sized grid, so answer the empty batch directly.
+        # DP attention's idle forward carries no tokens, and every backend below
+        # derives a CUDA grid from the token count; a zero-sized grid is rejected.
         return (
             mixes.new_empty(b, s, hc_mult),
             mixes.new_empty(b, s, hc_mult),
@@ -2054,9 +2053,7 @@ def _hc_mix_stats_partial_kernel(
     BLOCK_K: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    """Mixing dot products and row sum of squares over one K slice; the slicing
-    and tiles are compile-time constants, so a row's fp32 operation sequence
-    does not depend on the batch size."""
+    """Mixing dot products and row sum of squares over one K slice."""
     pid_m = tl.program_id(0)
     pid_s = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -2127,7 +2124,7 @@ def _hc_mix_stats_reduce_kernel(
 
 
 # K slicing, BLOCK_K and dot precision must stay independent of M;
-# a row must produce the same bits alone and in any batch.
+# a row must produce the same bits alone and in any batch routed to this backend.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
@@ -2155,7 +2152,6 @@ def _block_m_for(m: int) -> int:
 
 def _num_stages_for(m: int, k: int) -> int:
     # GB300 verify batches benefit from a smaller shared-memory footprint.
-    # This changes memory scheduling only; K tiles and reduction order stay fixed.
     if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
         return 1
     return _HC_MIX_NUM_STAGES
@@ -2176,7 +2172,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
 
     x_flat is [M, K] in any float dtype; hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
     K slicing and reduction order are independent of M, so each row is bitwise
-    identical whether computed alone or in a batch.
+    identical whether computed alone or in any batch routed to this backend.
     """
     assert x_flat.dim() == 2 and hc_fn.dim() == 2
     assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
@@ -2248,9 +2244,7 @@ def _hc_mix_reduce_sinkhorn_kernel(
     EPS: tl.constexpr,
     part_mix_residual_ptr=None,
 ):
-    """One CTA per row keeps the sinkhorn reductions two-dimensional.
-    Per-row arithmetic follows the slice reduction, then the Triton sinkhorn.
-    """
+    """One CTA per row keeps the sinkhorn reductions two-dimensional."""
     row = tl.program_id(0)
     if row >= m:
         return
@@ -2308,8 +2302,8 @@ def hc_mix_stats_sinkhorn(
 ):
     """Fuse the reduce and sinkhorn stages of hc_mix_stats followed by hc_split_sinkhorn.
 
-    The split-K kernel fixes the reduction order and preserves batch invariance.
-    Sinkhorn uses the Triton port's transcendental lowering, which differs from TileLang.
+    The split-K kernel fixes the reduction order; sinkhorn uses the Triton port's
+    transcendental lowering, which differs from TileLang.
     """
     assert x_flat.dim() == 2 and hc_fn.dim() == 2
     assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
@@ -2363,6 +2357,191 @@ def hc_mix_stats_sinkhorn(
         NUM_SLICES=num_slices,
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
+# Compensated projections: the fp32 mixing weight is split into components the
+# tensor cores take exactly (three bf16 parts, or a tf32 high part and its fp32
+# residual), accumulated over a fixed slice count to bound the fp32 error.
+_HC_MIX_COMPENSATED_SLICES = 16
+_HC_MIX_BF16X3_BLOCK_M = 128
+
+
+def split_bf16_hc_weight(weight: torch.Tensor):
+    assert weight.dtype == torch.float32 and weight.is_contiguous()
+    high = weight.bfloat16()
+    residual = weight - high.float()
+    middle = residual.bfloat16()
+    low = (residual - middle.float()).bfloat16()
+    return high, middle, low
+
+
+def split_tf32_hc_weight(weight: torch.Tensor):
+    assert weight.dtype == torch.float32 and weight.is_contiguous()
+    high = (weight.view(torch.int32) & -8192).view(torch.float32)
+    return high, weight - high
+
+
+@triton.jit
+def _hc_mix_stats_bf16x3_kernel(
+    X,
+    W_HI,
+    W_MID,
+    W_LO,
+    MIX,
+    SQ,
+    M,
+    K: tl.constexpr,
+    K_PER_SLICE: tl.constexpr,
+    MIX_COLS: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # M stays runtime-valued so variable prefill lengths reuse the same binary.
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, MIX_PAD)
+    start = tl.program_id(1) * K_PER_SLICE
+    ks = start + tl.arange(0, BLOCK_K)
+    hi = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    mid = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    lo = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    sq = tl.zeros((BLOCK_M,), tl.float32)
+    for block in range(K_PER_SLICE // BLOCK_K):
+        k = ks + block * BLOCK_K
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * K + k[None, :],
+            rows[:, None] < M,
+            0,
+        )
+        offsets = cols[None, :] * K + k[:, None]
+        w_hi = tl.load(W_HI + offsets, cols[None, :] < MIX_COLS, 0)
+        w_mid = tl.load(W_MID + offsets, cols[None, :] < MIX_COLS, 0)
+        w_lo = tl.load(W_LO + offsets, cols[None, :] < MIX_COLS, 0)
+        hi = tl.dot(x, w_hi, hi)
+        mid = tl.dot(x, w_mid, mid)
+        lo = tl.dot(x, w_lo, lo)
+        xf = x.to(tl.float32)
+        sq += tl.sum(xf * xf, 1)
+    offsets = (tl.program_id(1) * M + rows[:, None]) * MIX_COLS + cols[None, :]
+    tl.store(
+        MIX + offsets, (hi + mid) + lo, (rows[:, None] < M) & (cols[None, :] < MIX_COLS)
+    )
+    tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
+
+
+def hc_mix_stats_sinkhorn_bf16x3(
+    x: torch.Tensor,
+    weight_parts,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    m, k = x.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _HC_MIX_COMPENSATED_SLICES
+    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert len(weight_parts) == 3
+    assert all(
+        w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
+        for w in weight_parts
+    )
+    part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
+    sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
+    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
+        x,
+        *weight_parts,
+        part_mix,
+        sq,
+        m,
+        K=k,
+        K_PER_SLICE=k // slices,
+        MIX_COLS=mix,
+        MIX_PAD=triton.next_power_of_2(mix),
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_M=_HC_MIX_BF16X3_BLOCK_M,
+        num_warps=4,
+        num_stages=3,
+    )
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part_mix,
+        sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
+def hc_mix_stats_sinkhorn_deepgemm(
+    x_flat: torch.Tensor,
+    weight_parts,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
+    m, k = x_flat.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _HC_MIX_COMPENSATED_SLICES
+    high, low = weight_parts
+    assert high.shape == low.shape == (mix, k)
+    dev = x_flat.device
+    pre = torch.empty((m, hc_mult), dtype=torch.float32, device=dev)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), dtype=torch.float32, device=dev)
+    if m == 0:
+        return pre, post, comb
+
+    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_lo = torch.empty_like(mix_hi)
+    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
+    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+    # sq depends only on x_flat, so the second projection recomputes the same
+    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        mix_hi,
+        sq,
+        hc_scale,
+        hc_base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        part_mix_residual_ptr=mix_lo,
         num_warps=1,
     )
     return pre, post, comb
