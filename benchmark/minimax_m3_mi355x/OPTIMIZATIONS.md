@@ -90,7 +90,7 @@ Also on `M3-perf` only (not upstreamed): `benchmark/minimax_m3_mi355x/` launch s
 | `--spec-decode-acceptance-rate 0.5933` | forced acceptance (performance-only) | `SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token` | same floor/ceil schedule; outputs are not the model's |
 | Quick-reduce INT4 | yes | `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` (applies to >= 64 MB messages, i.e. prefill only) | 197K fresh prefill 7.2 -> 6.1 s; GSM8K 0.886 |
 | Custom all-reduce | yes | `SGLANG_M3_ALLOW_CUSTOM_AR=1` (aiter 2-stage; fastest at decode sizes, 17 us vs NCCL 48) | +37% at 1 stream, +7-10% at 8 |
-| index_topk_freq 4 | yes | `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4` | 57 -> 15 full-context index scorings per step; GSM8K unchanged |
+| index_topk_freq 4 | yes | `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4` in the AgentX benchmark configs; **1 for the external endpoint** (`endpoint/serve_endpoint.sh`) | 57 -> 15 full-context index scorings per step; GSM8K unchanged, **but past ~60K tokens of context the model drops the `="` of its tool-call tags** (Provider-Verifier raw invokes 32/42 malformed at 4, 5/44 at 2, 0/54 at 1; see `endpoint/ENDPOINT.md`). EAGLE3 accept length also rises 2.65 -> 3.07 at 1. |
 | gpu-mem 0.9, max-num-seqs 2 x conc | yes | `MEMFRAC=0.9` (lossy config), `--max-running-requests 48` | more KV; 64 running was neutral |
 | prefill chunk 16384 | yes | 8192 kept | 16384 neutral per token under prefill graphs and doubles the decode stall per chunk |
 | PTPC-FP8 attention/dense | yes | `SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1 SGLANG_USE_AITER_FP8_PER_TOKEN=1` + tuned rows (branch above) | quality-neutral, speed within noise |
@@ -100,6 +100,7 @@ Also on `M3-perf` only (not upstreamed): `benchmark/minimax_m3_mi355x/` launch s
 
 ## 4. Tested and rejected (numbers in `M3_MI350X_STATUS.md`)
 
+- Index top-k sharing across layers (`SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ` > 1) for the external endpoint: quality-neutral on GSM8K and on aime25, but it corrupts long-context structured output (tool-call tags at 60-80K tokens; 2026-09-17 bisection over quick-reduce INT4, fp8 KV/index caches, Gluon prefill and this knob found it to be the only cause). The endpoint runs 1; the AgentX benchmark configs keep 4 for the published numbers.
 - PTPC-FP8 dense (online per-token FP8 for the quark-excluded linears, tuned aiter a8w8 rows): neutral when adopted, but on the 2026-09-15 build it costs 9% decode at 24 streams (A/B: 2,732 vs 3,006 tok/s, same GPUs). Off by default; `PTPC_FP8=1` turns it back on.
 - Cleanup regression, fixed: "keep the long-prefix extend route out of graph capture" tested the combined capture-mode getter, which is also true while a breakable prefill graph replays, so every prefill over a cached prefix fell back to the plain Triton extend kernel (fresh 100K prefill 2.5 -> 3.0 s). The gate now reads the real capture flag only.
 
