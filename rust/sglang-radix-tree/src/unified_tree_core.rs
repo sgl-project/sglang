@@ -4079,7 +4079,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Snapshot matched nodes and their spans without splitting or refreshing them.
-    fn walk_span_(
+    fn collect_matched_spans_(
         &self,
         key: &K,
         namespace: KeyNamespaceRef<'_>,
@@ -4141,7 +4141,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if start == end {
             return Ok(ranges);
         }
-        for (child_id, pos, prefix_len) in self.walk_span_(key, namespace, end) {
+        for (child_id, pos, prefix_len) in self.collect_matched_spans_(key, namespace, end) {
             let seg_end = pos + prefix_len;
             if seg_end <= start || self.arena.has_device_value(child_id, SWA) {
                 continue;
@@ -4193,7 +4193,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             return Err("attach_swa_window boundaries must be page aligned".into());
         }
-        let spans = self.walk_span_(key, namespace, window_end);
+        let spans = self.collect_matched_spans_(key, namespace, window_end);
         let mut covered = window_start;
         for &(child_id, pos, prefix_len) in &spans {
             if pos + prefix_len <= window_start {

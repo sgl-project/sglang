@@ -40,7 +40,7 @@ _RUST_TREE_CORE_MANIFEST = (
 logger = logging.getLogger(__name__)
 
 
-def _rust_unsupported_reason(params: CacheInitParams) -> Optional[str]:
+def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
@@ -87,7 +87,7 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """
     if name != "rust":
         return name
-    reason = _rust_unsupported_reason(params)
+    reason = _rust_fallback_reason(params)
     if reason is not None:
         logger.info("Using the Python TreeCore: %s", reason)
         return "python"

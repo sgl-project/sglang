@@ -212,7 +212,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             mock.patch.dict(os.environ),
             mock.patch.object(
                 tree_core_registry,
-                "_rust_unsupported_reason",
+                "_rust_fallback_reason",
                 return_value=None,
             ),
             mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}),
@@ -228,7 +228,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             mock.patch.dict(os.environ),
             mock.patch.object(
                 tree_core_registry,
-                "_rust_unsupported_reason",
+                "_rust_fallback_reason",
                 return_value=None,
             ),
             mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}),
