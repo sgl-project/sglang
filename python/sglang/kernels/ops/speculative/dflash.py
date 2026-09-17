@@ -271,8 +271,11 @@ def _selector_walk_kernel(
             tl.float32
         )
         if greedy:
-            best = tl.max(scores, axis=0)
-            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            # First candidate that no other candidate strictly beats. Total over
+            # any row (there is always at least one), so index < top_k and the
+            # row never resolves to a neighbour's candidates.
+            beaten = tl.sum((scores[None, :] > scores[:, None]).to(tl.int32), axis=1)
+            index = tl.min(tl.where(beaten == 0, offsets, top_k), axis=0)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
             scaled = scores / temperature
