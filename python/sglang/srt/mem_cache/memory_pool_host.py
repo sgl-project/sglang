@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
@@ -193,9 +194,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
-        # A page row of the FP4 indexer buffers is a grouped slot layout rather
-        # than a flat token array, so the token-granular copy used for fused
-        # DSv4 C4 rows does not apply and only whole pages may move.
+        # The token-granular copy below addresses the fused DSv4 C4 row. Neither
+        # the FP4 indexer, whose page rows group their slots, nor unified_kv,
+        # whose page row is a flat run of tokens, has that layout, so those may
+        # only move whole pages.
         self.page_aligned_only = page_aligned_only
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
@@ -283,10 +285,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             device=self.gpu_device,
         )
         self.data_ptrs = (
-            torch.tensor(
-                [x.data_ptr() for x in self.data_refs],
-                dtype=torch.uint64,
-                device=self.gpu_device,
+            make_kernel_ptr_table(
+                self.data_refs,
+                self.gpu_device,
+                host_memory_registered=self.pin_memory,
             )
             if self.data_refs
             else None
@@ -336,7 +338,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_contiguous_buf_infos(self):
         """Return per-layer page-row buffers for PD direct-to-host transfer."""
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = [tensor.data_ptr() for tensor in self.data_refs]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
         return data_ptrs, data_lens, item_lens
@@ -787,10 +789,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
             device=self.gpu_device,
         )
         self.data_ptrs = (
-            torch.tensor(
-                [x.data_ptr() for x in self.data_refs],
-                dtype=torch.uint64,
-                device=self.gpu_device,
+            make_kernel_ptr_table(
+                self.data_refs,
+                self.gpu_device,
+                host_memory_registered=self.pin_memory,
             )
             if self.data_refs
             else None

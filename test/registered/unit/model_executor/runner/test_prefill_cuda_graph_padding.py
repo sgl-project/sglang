@@ -2,6 +2,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
+import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -13,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,23 +31,29 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = Backend.TC_PIECEWISE
         runner.has_mha_companion_layers = False
+        runner.prefer_eager_mixed_prefill = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
+        runner.max_context_size = None
         runner.max_num_tokens = 16
         return runner
 
-    def _make_forward_batch(self, num_tokens):
+    def _make_forward_batch(self, num_tokens, mode=ForwardMode.EXTEND):
         return SimpleNamespace(
             batch_size=1,
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=mode,
+            global_forward_mode=None,
+            _original_forward_mode=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             return_logprob=False,
             input_ids=list(range(num_tokens)),
             extend_prefix_lens_cpu=[0],
+            seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int64),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int64),
         )
 
     def test_rejects_more_than_two_x_token_padding(self):
@@ -56,6 +66,14 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
 
+    def test_mixed_batch_uses_scoped_runner_policy(self):
+        runner = self._make_runner()
+        batch = self._make_forward_batch(8, mode=ForwardMode.MIXED)
+
+        self.assertTrue(runner.can_run_graph(batch))
+        runner.prefer_eager_mixed_prefill = True
+        self.assertFalse(runner.can_run_graph(batch))
+
     def test_replay_snapshot_uses_padded_token_count(self):
         runner = self._make_runner()
         runner.use_captured_attn_metadata = False
@@ -67,7 +85,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner._prepare_forward_metadata_for_replay(
             forward_batch,
             static_forward_batch,
-            num_tokens=16,
+            shape_key=ShapeKey(size=16),
         )
 
         attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
@@ -136,6 +154,28 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     SimpleNamespace(global_num_tokens_cpu=[8, 0])
                 )
             )
+
+    def test_rejects_context_above_fixed_maximum(self):
+        runner = self._make_runner()
+        runner.max_context_size = 700
+
+        much_shorter = self._make_forward_batch(4)
+        much_shorter.seq_lens_cpu.fill_(200)
+        self.assertTrue(runner.can_run_graph(much_shorter))
+
+        uncovered = self._make_forward_batch(4)
+        uncovered.seq_lens_cpu.fill_(701)
+        self.assertFalse(runner.can_run_graph(uncovered))
+
+    def test_unsupported_path_ignores_max_context_size(self):
+        runner = self._make_runner()
+        runner.max_context_size = 1024
+
+        with self.assertLogs(runner_module.logger, level="WARNING") as logs:
+            runner._ignore_max_context_size("test path")
+
+        self.assertIsNone(runner.max_context_size)
+        self.assertIn("fixed metadata extent", "\n".join(logs.output))
 
 
 if __name__ == "__main__":
