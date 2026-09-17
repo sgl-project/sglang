@@ -235,12 +235,6 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
-def _resolve_adaptive_cuda_graph_bs(cuda_graph_config):
-    """Read adaptive capture buckets from the resolved canonical config."""
-    decode_config = cuda_graph_config.decode
-    return None if decode_config.backend == Backend.DISABLED else decode_config.bs
-
-
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -1403,9 +1397,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
+                decode_graph_config = get_exec().graph.cuda_graph_config.decode
                 self.adaptive_controller.init_states(
-                    cuda_graph_bs=_resolve_adaptive_cuda_graph_bs(
-                        get_exec().graph.cuda_graph_config
+                    cuda_graph_bs=(
+                        None
+                        if decode_graph_config.backend == Backend.DISABLED
+                        else decode_graph_config.bs
                     ),
                 )
 
