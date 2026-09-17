@@ -210,6 +210,7 @@ class _Preparation:
         "bytes_confirmed",
         "peer_hinted",
         "miss_reason",
+        "ready_observed",
     )
 
     def __init__(
@@ -238,6 +239,7 @@ class _Preparation:
         self.bytes_confirmed = 0
         self.peer_hinted = hint is not None
         self.miss_reason: Optional[str] = None
+        self.ready_observed = False
 
 
 class _LoadPool:
@@ -1022,7 +1024,28 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 return True
             if self._unhealthy is not None and prep.state == _State.FETCHING:
                 self._mark_miss_locked(prep, "unhealthy")
-            return prep.state != _State.FETCHING
+            ready = prep.state != _State.FETCHING
+            if ready and not prep.ready_observed:
+                # Scheduler-observed wait from enqueue to admissibility; the
+                # owner-thread preparation time is tracked separately.
+                prep.ready_observed = True
+                waited = time.monotonic() - prep.started_at
+                self.stats["admission_wait_s_sum"] += waited
+                self.stats["admission_wait_s_max"] = max(
+                    self.stats["admission_wait_s_max"], waited
+                )
+                if self.stats["prepare_requests"] <= 3:
+                    logger.info(
+                        "KVCR linker preparation observed ready: rid=%s state=%s "
+                        "pages=%d restorable=%d waited=%.3fs reason=%s",
+                        prep.handle.rid,
+                        prep.state,
+                        len(prep.page_hashes),
+                        prep.restorable[-1] if prep.restorable else 0,
+                        waited,
+                        prep.miss_reason,
+                    )
+            return ready
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         kv = next((t for t in transfers if t.name == PoolName.KV), None)
