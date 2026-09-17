@@ -35,7 +35,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from sglang.srt.arg_groups import model_override_base
 from sglang.srt.arg_groups.arg_utils import (
@@ -86,7 +87,7 @@ from sglang.srt.utils.common import (
 
 # Registered post-process passes. This is a registry, not an execution order:
 # each pass is invoked from its own slot via run_post_process_pass.
-POST_PROCESS_PASSES: List[Callable[..., dict]] = []
+POST_PROCESS_PASSES: list[Callable[..., dict]] = []
 
 
 def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
@@ -262,7 +263,7 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
-def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
+def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: float | None) -> float:
     """The activation working-set reserve held back before cuda-graph capture.
 
     The config-shaped half of the pair; `runtime_context` carries the
@@ -310,7 +311,7 @@ def modelexpress_config_of(cfg: Any) -> dict:
     return raw
 
 
-def modelexpress_url_of(cfg: Any) -> Optional[str]:
+def modelexpress_url_of(cfg: Any) -> str | None:
     """The modelexpress endpoint a config-shaped object points at."""
     return modelexpress_config_of(cfg).get("url")
 
@@ -352,7 +353,7 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
 
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
-) -> List[Tuple[str, Dict[str, Any]]]:
+) -> list[tuple[str, dict[str, Any]]]:
     """Collect ``(source, declaration)`` pairs for one architecture.
 
     Application order (last writer wins downstream in the gate): the constant
@@ -362,7 +363,7 @@ def collect_model_override_declarations(
     """
     # Off the module, not through the imported names: the registrars append to
     # the base's objects, and a copied name here would be a second binding.
-    declarations: List[Tuple[str, Dict[str, Any]]] = []
+    declarations: list[tuple[str, dict[str, Any]]] = []
     const = model_override_base.MODEL_OVERRIDES.get(architecture)
     if const:
         declarations.append((f"MODEL_OVERRIDES[{architecture!r}]", dict(const)))
@@ -396,7 +397,7 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
     if is_attention_backend_not_set(cfg):
         if get_platform().is_blackwell:
             logger.info("Auto-select fa4 attention backend for Step3p7 on Blackwell.")
@@ -499,8 +500,15 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
     if get_platform().is_xpu:
         return False
+    spec = get_linear_attn_spec_by_arch(model_arch)
+    if spec is not None and spec.support_mamba_cache_extra_buffer:
+        return view.linear_attn_backend == "triton"
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
@@ -537,7 +545,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if view.disable_radix_cache:
         return {}
 
-    declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
+    declared: dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
@@ -616,8 +624,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
 def _check_dsa_backend_constraints(
     kv_cache_dtype: str,
-    prefill_backend: Optional[str],
-    decode_backend: Optional[str],
+    prefill_backend: str | None,
+    decode_backend: str | None,
     *,
     hip: bool,
 ) -> None:
@@ -645,8 +653,8 @@ def _check_dsa_backend_constraints(
 
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
-    prefill_backend: Optional[str],
-    decode_backend: Optional[str],
+    prefill_backend: str | None,
+    decode_backend: str | None,
     *,
     hip: bool,
 ) -> None:
@@ -671,7 +679,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if get_platform().is_npu:
         return {}
     if get_platform().is_xpu:
-        declared: Dict[str, Any] = {}
+        declared: dict[str, Any] = {}
         if view.dsa_prefill_backend is None:
             declared["dsa_prefill_backend"] = "intel_xpu"
         if view.dsa_decode_backend is None:
@@ -695,7 +703,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
-    declared: Dict[str, Any] = {}
+    declared: dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
     is_glm_sm12_fp8 = (
         model_arch == "GlmMoeDsaForCausalLM"
@@ -819,7 +827,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
     if get_platform().is_sm100:
         quant_method = get_quantization_config(hf_config)
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
@@ -1629,7 +1637,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
-        "deepep_v2",
     }
 )
 
@@ -1754,7 +1761,7 @@ def _dllm_page_size(view: Any) -> dict:
 
 def validate_declarations(
     server_args: Any,
-    declarations: Sequence[Tuple[str, Dict[str, Any]]],
+    declarations: Sequence[tuple[str, dict[str, Any]]],
 ) -> None:
     """Fail-fast whitelist check at declaration time: a registry typo or a
     not-yet-resolvable field must be rejected at its slot, not only at
@@ -1923,7 +1930,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     return server_args._mamba_cache_chunk_size
 
 
-def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
+def max_speculative_num_draft_tokens(server_args: Any) -> int | None:
     """Return the maximum draft-token count speculative decoding may use.
 
     Memoized only once the record is resolved: an answer computed off a raw

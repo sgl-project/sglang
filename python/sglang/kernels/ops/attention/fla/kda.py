@@ -6,12 +6,10 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
@@ -407,7 +405,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
     p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+    for j in range(min(BC, T - i_t * BT - i_i * BC)):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
         b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32) * gk_scale
         b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
@@ -1017,11 +1015,11 @@ def kda_gate_chunk_cumsum(
     A_log: torch.Tensor,
     chunk_size: int,
     scale: float = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    output_dtype: Optional[torch.dtype] = torch.float,
-    chunk_indices: Optional[torch.LongTensor] = None,
-    lower_bound: Optional[float] = None,
+    dt_bias: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = torch.float,
+    chunk_indices: torch.LongTensor | None = None,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """
     Fused KDA gate activation + chunk-local cumulative sum.
@@ -1089,13 +1087,14 @@ def chunk_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    A_log: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    lower_bound: Optional[float] = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     output_intermediate_states: bool = False,
-    track_state: Optional[torch.Tensor] = None,
-    track_chunk_idx: Optional[torch.Tensor] = None,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
+    fused_intra: bool | None = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1146,6 +1145,7 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    _fused_intra = _small_grid if fused_intra is None else bool(fused_intra)
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1157,8 +1157,8 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         safe_gate=lower_bound is not None,
-        fuse_diagonal=_small_grid,
-        fuse_recompute=_small_grid,
+        fuse_diagonal=_fused_intra,
+        fuse_recompute=_fused_intra,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -1209,14 +1209,15 @@ def chunk_kda(
     initial_state: torch.Tensor = None,
     initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    A_log: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    lower_bound: Optional[float] = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     output_intermediate_states: bool = False,
-    track_state: Optional[torch.Tensor] = None,
-    track_chunk_idx: Optional[torch.Tensor] = None,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
     beta_is_raw: bool = False,
+    fused_intra: bool | None = None,
     **kwargs,
 ):
     if scale is None:
@@ -1246,4 +1247,5 @@ def chunk_kda(
         output_intermediate_states=output_intermediate_states,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
+        fused_intra=fused_intra,
     )
