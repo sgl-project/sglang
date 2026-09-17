@@ -51,6 +51,34 @@ def test_cache_pins_resident_and_raw_off_variant_is_independent():
     assert "transformer" in args._required_resident_components
 
 
+@pytest.mark.parametrize("stale_prepared", [None, object()])
+def test_cache_off_never_enters_cache_preparation(stale_prepared):
+    """Off must preserve automatic attention/device/config selection, even if
+    a caller reused arguments containing an old cache plan.
+    """
+    from sglang.multimodal_gen.runtime import pipelines_core
+
+    args = SimpleNamespace(
+        weight_cache_mode="off",
+        _prepared_pipeline=stale_prepared,
+        model_path="ordinary-model",
+        attention_backend=None,
+        base_gpu_id=3,
+    )
+    constructor = Mock()
+    with (
+        patch.object(
+            pipelines_core, "resolve_pipeline_class", return_value=constructor
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.prepare.prepare_pipeline",
+            side_effect=AssertionError("cache preparation on ordinary path"),
+        ),
+    ):
+        assert pipelines_core.build_pipeline(args) is constructor.return_value
+    constructor.assert_called_once_with("ordinary-model", args)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

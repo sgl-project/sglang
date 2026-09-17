@@ -71,24 +71,30 @@ def resolve_pipeline_class(server_args: ServerArgs):
 
 
 def build_pipeline(server_args: ServerArgs) -> PipelineWithLoRA:
-    from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
-
-    prepared = server_args._prepared_pipeline
-    if prepared is None:
+    if server_args.weight_cache_mode == "off":
+        # Preserve ordinary backend/device/config resolution. Cache preparation
+        # freezes a narrower FA/resident recipe and must never implicitly opt
+        # ordinary users into it, including when arguments contain an old plan.
         pipeline_cls = resolve_pipeline_class(server_args)
-        prepared = prepare_pipeline(
-            pipeline_cls, server_args, required=server_args.weight_cache_mode != "off"
+        pipeline = pipeline_cls(server_args.model_path, server_args)
+    elif server_args.weight_cache_mode == "client":
+        from sglang.multimodal_gen.runtime.pipelines_core.prepare import (
+            prepare_pipeline,
         )
-    if server_args.weight_cache_mode == "client":
         from sglang.multimodal_gen.runtime.weight_cache.client import (
             materialize_from_cache,
         )
 
+        prepared = server_args._prepared_pipeline
+        if prepared is None:
+            prepared = prepare_pipeline(
+                resolve_pipeline_class(server_args), server_args, required=True
+            )
         pipeline = materialize_from_cache(prepared, server_args)
-    elif prepared is not None:
-        pipeline = prepared.materialize(server_args)
     else:
-        pipeline = pipeline_cls(server_args.model_path, server_args)
+        raise ValueError(
+            f"Unsupported weight-cache mode: {server_args.weight_cache_mode}"
+        )
 
     logger.info("Pipeline instantiated")
 

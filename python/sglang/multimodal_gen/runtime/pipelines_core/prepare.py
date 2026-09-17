@@ -65,9 +65,9 @@ class PreparedPipeline:
 def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     """Resolve admitted DiTs without constructing a pipeline/module.
 
-    This is an explicit preparation context, not an uninitialized fake pipeline
-    instance. Ordinary eligible pipelines and cache mode consume the same recipe.
-    Other pipeline/configurations remain on their existing ordinary path.
+    This is an explicit cache preparation context, not an uninitialized fake
+    pipeline instance. Ordinary serving never enters this pipeline-level path;
+    both paths still share TransformerLoader's resolver and materializer.
     """
     if not current_platform.is_cuda():
         if required:
@@ -156,6 +156,10 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     loader.resolve_component_direct_gpu_loading(args, "transformer")
     transformer_backend, _ = args.resolve_component_attention_backend("transformer")
     attention = str(transformer_backend) if transformer_backend is not None else "fa"
+    if required and transformer_backend is None:
+        logger.info(
+            "Weight-cache transformer recipe uses FA attention; ordinary auto selection is unchanged"
+        )
     try:
         if hasattr(adapter, "validate_model_index"):
             adapter.validate_model_index(model_index)
@@ -163,7 +167,11 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
             paths["transformer"],
             args,
             "transformer",
-            planned_device=torch.device("cuda", local_device_index(args)),
+            planned_device=(
+                torch.device("cuda", local_device_index(args))
+                if args.weight_cache_mode != "off"
+                else None
+            ),
         ).freeze()
         adapter.validate_supported(
             frozen, pipeline_name=pipeline_cls.__name__, attention=attention
