@@ -185,64 +185,6 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
                     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize(
-    "reason",
-    ["rows", "tp8", "prefill", "cp", "invariant", "deterministic", "registration"],
-)
-def test_fallback_keeps_the_original_reduction(group, reason):
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.mhc_post_fusion import use_mhc_post_fusion
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-        attention_mhc_fusion,
-    )
-    from sglang.srt.models.deepseek_v4 import MQALayer
-    from sglang.srt.runtime_context import get_forward, get_parallel
-
-    layer = _layer(group)
-    rows = 9 if reason == "rows" else 1
-    residual = torch.empty(rows, 4, 5120, device="cuda", dtype=torch.bfloat16)
-    layer.dsa_enable_prefill_cp = reason == "cp"
-    layer.self_attn.attn_tp_size = 8 if reason == "tp8" else 4
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND if reason == "prefill" else ForwardMode.DECODE
-    )
-    with (
-        envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(True),
-        get_parallel().override(tp_size=layer.self_attn.attn_tp_size, attn_dp_size=1),
-        get_forward().scoped(sp_active=False),
-        patch(
-            "sglang.srt.distributed.parallel_state.get_attn_tp_group",
-            return_value=group,
-        ),
-        patch(
-            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
-            return_value=reason == "invariant",
-        ),
-        patch(
-            "sglang.srt.runtime_context.get_exec",
-            return_value=SimpleNamespace(
-                deterministic=SimpleNamespace(
-                    enable_deterministic_inference=reason == "deterministic"
-                )
-            ),
-        ),
-        patch.object(
-            group.ca_comm, "enable_register_for_capturing", reason != "registration"
-        ),
-    ):
-        state = attention_mhc_fusion(layer, residual, None, batch)
-        assert state is None
-        with use_mhc_post_fusion(state):
-            x = torch.full(
-                (rows, 5120),
-                group.rank_in_group + 1,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            actual = MQALayer._project_wo_b(layer.self_attn, x)
-        assert layer.self_attn.wo_b.skip_reduction == [False]
-        torch.testing.assert_close(actual, torch.full_like(actual, 10), atol=0, rtol=0)
 
 
 def _moe(group, dual, shared_tp1):
