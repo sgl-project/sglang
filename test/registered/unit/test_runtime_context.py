@@ -293,6 +293,72 @@ class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
                 pass
 
 
+class TestReadsWithoutAPublishedConfig(_IsolatedOverrides):
+    """The namespace has to answer in a process that publishes nothing.
+
+    `multimodal_gen` lends its own TP group to shared `srt` layers from a
+    process with no `srt` config to publish against, and those layers ask for
+    `attn_tp_size` anyway -- through code `multimodal_gen` does not own, which
+    is why grepping that package for `get_parallel()` finds nothing while the
+    read plainly happens.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_derived_widths(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_a_stamped_width_reads_with_nothing_published(self):
+        parallel = get_parallel()
+        self.assertIsNone(parallel._config)
+        parallel.override_permanently(
+            **derive_parallel_widths(
+                tp_size=2,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
+        self.assertEqual(parallel.attn_tp_size, 2)
+        self.assertEqual(parallel.moe_tp_size, 2)
+
+    def test_an_unstamped_width_still_names_the_cause(self):
+        """Without a stamp there is nothing to answer with, and the failure
+        has to say so rather than invent a width."""
+        with self.assertRaisesRegex(RuntimeError, r"not available"):
+            get_parallel().attn_tp_size
+
+
+class TestPrivateAttributeProbing(_IsolatedOverrides):
+    def test_probing_a_private_name_does_not_recurse(self):
+        """`copy` and `pickle` probe for hooks before `__init__` has run.
+
+        `__getattr__` reaches for `self._config`, so if it did not refuse
+        underscore names outright, probing one on a half-built instance would
+        recurse until the stack ran out.
+        """
+        fresh = ParallelContext.__new__(ParallelContext)  # slots unset
+        for probe in ("_config", "_stamp", "_overrides", "__deepcopy__"):
+            with self.assertRaises(AttributeError, msg=probe):
+                getattr(fresh, probe)
+
+    def test_a_built_context_survives_a_copy(self):
+        import copy
+
+        self.assertIsInstance(copy.copy(get_parallel()), ParallelContext)
+
+
 class TestParallelOverride(_IsolatedOverrides):
     def test_override_takes_precedence(self):
         p = get_parallel()
