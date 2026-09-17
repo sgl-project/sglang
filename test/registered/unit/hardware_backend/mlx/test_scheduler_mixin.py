@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
 
@@ -247,7 +248,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestOverlapLoopGracefulExit(unittest.TestCase):
+class TestOverlapLoopGracefulExit(CustomTestCase):
     """The MLX overlap loop must honor ``gracefully_exit`` like the standard loops.
 
     ``handle_shutdown`` (ShutdownReq) only sets ``scheduler.gracefully_exit``;
@@ -263,13 +264,18 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
     def _make_scheduler(self, *, recv_side_effect):
         from collections import deque
 
+        from sglang.srt.managers.scheduler import Scheduler
+
         scheduler = MagicMock()
         scheduler.forward_ct = 0
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.ingest_requests.side_effect = recv_side_effect
+        scheduler.request_receiver.recv_requests.side_effect = recv_side_effect
+        scheduler.ingest_requests.side_effect = lambda: Scheduler.ingest_requests(
+            scheduler
+        )
         # Model handle_shutdown: processing a non-empty recv batch (the
         # ShutdownReq) flips the flag; the loop must notice at the top of the
         # next iteration instead of polling forever.
@@ -296,6 +302,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         ) as synchronize:
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
+        self.assertTrue(scheduler.gracefully_exit)
         self.assertEqual(scheduler.ingest_requests.call_count, 1)
         synchronize.assert_called_once_with()
 
@@ -317,6 +324,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         ) as synchronize:
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
+        self.assertTrue(scheduler.gracefully_exit)
         self.assertEqual(scheduler.ingest_requests.call_count, 1)
         scheduler.get_next_batch_to_run.assert_not_called()
         synchronize.assert_called_once_with()
