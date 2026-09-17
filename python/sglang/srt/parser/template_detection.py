@@ -818,14 +818,10 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, before anything publishes ``server_args``.
+    """Resolve parser fields explicitly set to `auto`.
 
-    Performs a lightweight tokenizer load, so it runs once in engine init. The
-    decision goes to this instance's declaration stash, so every holder of it
-    carries it -- the schedulers it forks, the HTTP server, the tokenizer
-    workers it is serialized for -- and each publishes bags projected from it.
-    The fields stay what the operator passed.
+    Checkpoint `response_template` metadata takes precedence over chat-template
+    and architecture detection.
     """
     cfg = resolving_view(server_args)
     needs = tuple(
@@ -856,6 +852,43 @@ def resolve_auto_parsers(server_args) -> None:
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
+
+    if tokenizer is not None:
+        from sglang.srt.parser.response_template_config import (
+            resolve_detector_response_template,
+        )
+
+        response_template = resolve_detector_response_template(tokenizer, None)
+        if response_template is not None:
+            from sglang.srt.parser.chat_parsing.response_templates import (
+                load_response_template,
+            )
+
+            try:
+                fields = load_response_template(response_template).fields
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring invalid response_template from tokenizer configuration: %s",
+                    exc,
+                )
+            else:
+                parser_fields = {
+                    "reasoning_parser": "thinking",
+                    "tool_call_parser": "tool_calls",
+                }
+                detected = {
+                    attr: "response_template" if parser_fields[attr] in fields else None
+                    for attr in needs
+                }
+                logger.info(
+                    "Auto-detected response-template parsers from tokenizer configuration"
+                )
+                declare_resolution(
+                    server_args,
+                    "template-detection",
+                    **detected,
+                )
+                return
 
     template = explicit_jinja_template
     if template is None and tokenizer is not None:

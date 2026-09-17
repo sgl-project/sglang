@@ -1086,8 +1086,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
+        # Needs tokenizer metadata, so it cannot live in the pipeline. Run
+        # after plugins, which may register a parser selected by detection.
         parsers = resolving_view(server_args)
         if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
             resolve_auto_parsers(server_args)

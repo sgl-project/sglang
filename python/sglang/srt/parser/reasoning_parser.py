@@ -45,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_CONTROL_TOKENS,
     MESSAGE_MODEL,
 )
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 
 
 class StreamingParseResult:
@@ -2195,6 +2196,9 @@ class ReasoningParser:
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }
+    _InternalDetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
+        "response_template": ResponseTemplateReasoningDetector,
+    }
 
     def __init__(
         self,
@@ -2204,11 +2208,14 @@ class ReasoningParser:
         request: ChatCompletionRequest = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
+        prefix: str | None = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
 
-        detector_class = self.DetectorMap.get(model_type.lower())
+        detector_class = self.DetectorMap.get(
+            model_type.lower()
+        ) or self._InternalDetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -2273,6 +2280,10 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
+
+        sig = inspect.signature(detector_class)
+        if "prefix" in sig.parameters:
+            kwargs["prefix"] = prefix
 
         self.detector = detector_class(**kwargs)
 

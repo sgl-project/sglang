@@ -57,6 +57,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +113,27 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
     }
+    _InternalToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "response_template": ResponseTemplateToolDetector,
+    }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
-        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        prefix: str | None = None,
+    ):
+        detector_class = self.ToolCallParserEnum.get(
+            tool_call_parser
+        ) or self._InternalToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
-            if tokenizer is not None:
-                sig = inspect.signature(detector_class)
-                if "tokenizer" in sig.parameters:
-                    kwargs["tokenizer"] = tokenizer
+            sig = inspect.signature(detector_class)
+            if tokenizer is not None and "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
+            if "prefix" in sig.parameters:
+                kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -277,10 +290,24 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
+        strict_requested = (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        should_constrain_auto = tool_choice == "auto" and strict_requested
+        if (
+            strict_requested
+            and getattr(
+                self.detector,
+                "reject_strict_without_constraints",
+                False,
+            )
+            and not self.detector.supports_structural_tag()
+        ):
+            raise ValueError(
+                f"{type(self.detector).__name__} does not support strict tool "
+                "constraints"
+            )
 
         try:
             if (
