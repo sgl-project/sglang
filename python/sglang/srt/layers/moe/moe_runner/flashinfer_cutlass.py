@@ -82,16 +82,8 @@ def materialize_swiglu_params_for_cutlass(
     clamp_limit = runner_config.gemm1_clamp_limit or runner_config.swiglu_limit
     if clamp_limit is None:
         return None, None, None
-    alpha = (
-        runner_config.gemm1_alpha
-        if runner_config.gemm1_alpha is not None
-        else 1.0
-    )
-    beta = (
-        runner_config.gemm1_beta
-        if runner_config.gemm1_beta is not None
-        else 0.0
-    )
+    alpha = runner_config.gemm1_alpha if runner_config.gemm1_alpha is not None else 1.0
+    beta = runner_config.gemm1_beta if runner_config.gemm1_beta is not None else 0.0
     return (
         torch.full(
             (num_local_experts,), float(alpha), dtype=torch.float32, device=device
@@ -100,8 +92,10 @@ def materialize_swiglu_params_for_cutlass(
             (num_local_experts,), float(beta), dtype=torch.float32, device=device
         ),
         torch.full(
-            (num_local_experts,), float(clamp_limit),
-            dtype=torch.float32, device=device,
+            (num_local_experts,),
+            float(clamp_limit),
+            dtype=torch.float32,
+            device=device,
         ),
     )
 
