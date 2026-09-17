@@ -552,6 +552,7 @@ fn insert_params_swa<'k>(
         swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }

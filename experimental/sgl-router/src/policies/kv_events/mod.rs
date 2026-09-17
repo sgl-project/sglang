@@ -10,7 +10,8 @@
 //! - [`wire`] — msgpack types and [`decode_event_batch`]; the contract
 //!   with the SGLang publisher. Pure decoding; no I/O.
 //! - [`hash`] — block-hash compute mirroring SGLang `RadixKey.hash_page`.
-//! - [`tree`] — hash-keyed radix tree consumed by the routing path.
+//! - [`tree`] — hash-keyed radix tree consumed by the routing path,
+//!   tracking the storage tier each worker holds a block on.
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
@@ -29,7 +30,7 @@ pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-pub use tree::{HashTree, KvWorkerId, MatchResult};
+pub use tree::{HashTree, KvWorkerId, MatchResult, Tiers};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };

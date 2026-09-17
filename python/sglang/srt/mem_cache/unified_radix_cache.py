@@ -977,6 +977,7 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                session_id=req.session_id,
                 rotation_base=req.kv_rotation_base,
             )
 
@@ -1113,6 +1114,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
@@ -1900,7 +1902,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
-    @rank_consensus(same_params=["req_id", "len(new_input_tokens)"])
+    @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
         request: CacheRequestHandle,
