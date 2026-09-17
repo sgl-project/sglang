@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 # detokenized display string (that loses fragmentary bytes as U+FFFD).
 _BYTE_DECODER: Dict[str, int] = {}
 
+# Tokenizer-level cache: once verified, we know whether *all* tokens from a
+# given tokenizer can safely use the byte decoder. Avoids per-token checks.
+_BYTE_LEVEL_TOKENIZERS: set = set()
+
 
 def _build_byte_decoder() -> Dict[str, int]:
     bs = (
@@ -39,13 +43,66 @@ def _build_byte_decoder() -> Dict[str, int]:
     return dict(zip(cs, bs))
 
 
+def _is_byte_level_tokenizer(tokenizer) -> bool:
+    """Heuristically determine whether *tokenizer* uses GPT-2 byte-level BPE.
+
+    Only GPT-2 family (GPT2Tokenizer, Llama, Qwen, etc.) store vocabulary
+    tokens as the ``bytes_to_unicode`` printable-char mapping. SentencePiece
+    tokenizers (Mistral, Gemma, T5) store raw Unicode pieces, so applying the
+    byte decoder to them corrupts multi-byte characters.
+
+    We probe by checking ``is_byte_level`` (HuggingFace fast tokenizers) or
+    by verifying that a known multi-byte character (é, U+00E9) round-trips:
+    GPT-2 encodes it as a single byte-level piece ``chr(233)`` whose byte
+    decoder output [233] does NOT form valid UTF-8, while SentencePiece stores
+    the full character ``é`` whose UTF-8 is [195, 169].
+    """
+    tid = id(tokenizer)
+    if tid in _BYTE_LEVEL_TOKENIZERS:
+        return True
+
+    # Fast path: HuggingFace fast tokenizers expose is_byte_level.
+    is_bl = getattr(tokenizer, "is_byte_level", None)
+    if isinstance(is_bl, bool):
+        if is_bl:
+            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        return is_bl
+
+    # Slow path: probe with a known é token.
+    global _BYTE_DECODER
+    if not _BYTE_DECODER:
+        _BYTE_DECODER = _build_byte_decoder()
+    try:
+        vocab_size = len(tokenizer.get_vocab())
+        # Sample a few tokens to check if all chars are byte-decodable.
+        sample_ids = [0, 1, 2, 3, vocab_size // 2, vocab_size - 2]
+        for sid in sample_ids:
+            if sid < 0 or sid >= vocab_size:
+                continue
+            piece = tokenizer.convert_ids_to_tokens(sid)
+            if piece is None or not piece:
+                continue
+            # If any char in the piece is NOT in the byte decoder table,
+            # this tokenizer does NOT use byte-level encoding.
+            if any(ch not in _BYTE_DECODER for ch in piece):
+                return False
+        # All sampled tokens are byte-decodable → likely byte-level BPE.
+        _BYTE_LEVEL_TOKENIZERS.add(tid)
+        return True
+    except Exception:
+        return False
+
+
 def token_id_to_bytes(tokenizer, token_id) -> Optional[List[int]]:
-    """Raw UTF-8 bytes for a byte-level-BPE token id.
+    """Raw bytes for a byte-level-BPE token id.
 
     Returns the token's original bytes via the GPT-2 byte decoder, or None when
-    the token is not byte-level representable (e.g. special ids / non byte BPE),
-    so callers can fall back to the detokenized display string.
+    the token is not byte-level representable (e.g. special ids / non byte BPE
+    tokenizers like SentencePiece), so callers can fall back to the detokenized
+    display string.
     """
+    if not _is_byte_level_tokenizer(tokenizer):
+        return None
     global _BYTE_DECODER
     if not _BYTE_DECODER:
         _BYTE_DECODER = _build_byte_decoder()
@@ -121,8 +178,17 @@ def _lossless_token_text(tokenizer, token_id, token_text):
     """Return a lossless display string for one engine logprob triple.
 
     Fragmentary byte-level tokens decode to U+FFFD in the display string.  When
-    we can recover the true raw bytes from the token id (byte-level BPE), render
-    them as latin-1 so every byte round-trips; otherwise keep the display text.
+    we can recover the true raw bytes from the token id (byte-level BPE), we
+    validate that the recovered bytes do NOT form valid UTF-8 (a real fragment
+    never does), then render them as latin-1 so every byte round-trips.
+
+    Three safeguards address the reviewer's concerns:
+    1. Non-byte-level tokenizers (SentencePiece/Mistral) are detected and
+       skipped, so multi-byte characters like é are NOT corrupted to [233].
+    2. Legitimate U+FFFD text (e.g. GPT-2 token 4210 = bytes [239,191,189])
+       round-trips as valid UTF-8, so we keep the original display text.
+    3. The latin-1 representation is only applied to genuine fragments (bytes
+       that fail UTF-8 decode), avoiding key collisions in top_logprobs.
     """
     if token_text is not None and "\ufffd" not in token_text:
         return token_text
@@ -131,10 +197,21 @@ def _lossless_token_text(tokenizer, token_id, token_text):
     raw = token_id_to_bytes(tokenizer, token_id)
     if raw is None:
         return token_text if token_text is not None else ""
+    # Only treat as a fragment if the recovered bytes do NOT form valid UTF-8.
+    # A complete token whose display text happens to contain U+FFFD (e.g. token
+    # 4210 = bytes [239,191,189] = valid UTF-8 for U+FFFD) must be left alone.
+    try:
+        bytes(raw).decode("utf-8")
+        # Valid UTF-8 → this is NOT a fragment; keep the original display text.
+        return token_text if token_text is not None else ""
+    except UnicodeDecodeError:
+        pass
+    # Genuine fragment: render as latin-1 (one char per byte, lossless).
     try:
         return bytes(raw).decode("latin-1")
     except Exception:
         return token_text if token_text is not None else ""
+
 
 
 def process_hidden_states_from_ret(

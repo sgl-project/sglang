@@ -2396,14 +2396,24 @@ class OpenAIServingChat(OpenAIServingBase):
         U+FFFD).  Recovering the OpenAI ``bytes`` field from the display text
         therefore corrupts fragments; we recover the true bytes from the token
         id through the GPT-2 byte decoder instead.
+
+        Only byte-level BPE tokenizers (GPT-2 family) use the byte decoder;
+        SentencePiece tokenizers (Mistral, Gemma) fall back to the display
+        text, so multi-byte characters like é are NOT corrupted to [233].
         """
         tokenizer = self.tokenizer_manager.tokenizer
+        from sglang.srt.entrypoints.openai.utils import _is_byte_level_tokenizer
+
+        is_byte_level = _is_byte_level_tokenizer(tokenizer)
         token_logprobs: List[ChatCompletionTokenLogprob] = []
 
         for token_idx, item in enumerate(output_token_logprobs):
             # item = (logprob, token_id, token_text)
             logprob, token_id, token_text = item
-            token_bytes = token_id_to_bytes(tokenizer, token_id)
+            if is_byte_level:
+                token_bytes = token_id_to_bytes(tokenizer, token_id)
+            else:
+                token_bytes = None
             if token_bytes is None:
                 token_bytes = list((token_text or "").encode("utf-8"))
 
@@ -2418,7 +2428,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     top_row = output_top_logprobs[top_row_idx]
                     if top_row is not None:
                         for top_logprob, top_id, top_text in top_row:
-                            top_bytes = token_id_to_bytes(tokenizer, top_id)
+                            if is_byte_level:
+                                top_bytes = token_id_to_bytes(tokenizer, top_id)
+                            else:
+                                top_bytes = None
                             if top_bytes is None:
                                 top_bytes = list((top_text or "").encode("utf-8"))
                             top_logprobs.append(
