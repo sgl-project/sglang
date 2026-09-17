@@ -266,6 +266,8 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
+    validate_intel_xpu_sampling_backend(cfg.sampling_backend, cfg.device)
+
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
     if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
@@ -382,6 +384,18 @@ def check_load_publish_args(server_args: Any):
     )
     if reason:
         raise ValueError(reason)
+
+
+def validate_intel_xpu_sampling_backend(
+    sampling_backend: Optional[str], device: str
+) -> None:
+    # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
+    # device the backend either aliases to flashinfer's names or NameErrors on
+    # the first non-greedy decode.
+    if sampling_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
 
 
 def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:
