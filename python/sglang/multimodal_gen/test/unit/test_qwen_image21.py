@@ -65,7 +65,12 @@ def test_prompt_conditioning_uses_pre_final_norm_hidden_state():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_encoder_component_offload_preserves_loaded_dtypes():
+def test_encoder_component_offload_preserves_loaded_dtypes(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.managers.memory_managers."
+        "component_residency_strategies.get_local_torch_device",
+        lambda: torch.device("cuda", torch.cuda.current_device()),
+    )
     encoder = torch.nn.Module()
     encoder.model = torch.nn.Module()
     encoder.model.visual = torch.nn.Module()
