@@ -1447,10 +1447,6 @@ class DeepseekV4AttnBackend(
                     (0, padded_num_tokens - swa_replay_start.shape[0]),
                 )
 
-        # Eager CP writes only logical tokens. BCG gathers a fixed global
-        # bucket, including dummy rows, into the KV/compressor store paths.
-        # Keep those write buffers fixed while expanding causal metadata from
-        # the real extend lengths and partitioning queries over physical rows.
         num_write_tokens = (
             out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
         )
@@ -2444,10 +2440,6 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
-        # SparsePrefillChunkCache uses global request offsets. CP has already
-        # interleaved the query rows, so even the large-query heuristic must
-        # stay on the CP-compatible paged attention path. Disabling the env
-        # switch alone does not disable that heuristic.
         return (
             forward_batch.forward_mode.is_extend_without_speculative()
             and not is_cp_active(forward_batch)

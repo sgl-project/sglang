@@ -270,12 +270,6 @@ class PrefillCPBCGInput:
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
-            # DSV4's layer-internal KV/compressor gathers are captured too. Their
-            # global output rows and cache-write buffers must retain the bucket
-            # shape even when the live batch is smaller. Shard using the real
-            # lengths above, then expose the fixed geometry to the model body.
-            # Sequence/extend lengths stay live for causal and compressor plans;
-            # the registry zeroes the unused cache locations (the dummy slot).
             metadata = forward_batch.attn_cp_metadata
             cp_size = len(metadata.per_rank_actual_token)
             base, remainder = divmod(static_num_tokens, cp_size)
