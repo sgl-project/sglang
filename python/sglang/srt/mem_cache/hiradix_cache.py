@@ -1271,6 +1271,9 @@ class HiRadixCache(RadixCache):
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
+                # Fresh backup then demotion: same device-tier exit as
+                # _evict_backuped, so it gets the same sample.
+                self._observe_kv_eviction(x, len(x.value), "device", "demoted")
                 x.protect_host()
                 staged.append((x, x.value))
                 num_evicted += self._detach_backuped(x)
@@ -1761,7 +1764,9 @@ class HiRadixCache(RadixCache):
         value, last_node = self._match_prefix_helper(
             self.root_node, key, observe_kv_age=observe_kv_age
         )
-        if observe_kv_age and value:
+        # Any non-root match consumed the observation: `value` holds device
+        # indices only, so a host-only HiCache hit leaves it empty.
+        if observe_kv_age and last_node is not self.root_node:
             mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)

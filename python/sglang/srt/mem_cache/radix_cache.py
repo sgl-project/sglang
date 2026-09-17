@@ -450,7 +450,9 @@ class RadixCache(BasePrefixCache):
         value, last_node = self._match_prefix_helper(
             self.root_node, key, observe_kv_age=observe_kv_age
         )
-        if observe_kv_age and value:
+        # Any non-root match consumed the observation: `value` holds device
+        # indices only, so a host-only HiCache hit leaves it empty.
+        if observe_kv_age and last_node is not self.root_node:
             mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
