@@ -205,6 +205,7 @@ class TestNpuSamplingMaskMaxTokensPD(TestDisaggregationBase):
             "-m",
             "sglang_router.launch_router",
             "--pd-disaggregation",
+            "--mini-lb",
             "--prefill",
             cls.prefill_url,
             cls.bootstrap_port,
