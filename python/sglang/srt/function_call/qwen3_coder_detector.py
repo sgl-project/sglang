@@ -29,6 +29,18 @@ def _escape_inner_quotes(value: str) -> str:
     return _INNER_QUOTE.sub(r'\\"', value)
 
 
+def _unescape_prequoted(value: str) -> str:
+    """A model that writes the JSON object already escaped, `{\\"summary\\": \\"...\\"}`, produces text that is
+    not JSON (a backslash outside any string). When every quote in the value is backslash-escaped, dropping the
+    backslashes recovers the object the model meant (inner quotes are then handled by _escape_inner_quotes)."""
+    stripped = value.strip()
+    if not (stripped.startswith(('{\\"', '[\\"')) and '"' in stripped):
+        return value
+    if re.search(r'(?<!\\)"', stripped):
+        return value
+    return stripped.replace('\\"', '"')
+
+
 class Qwen3CoderDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
@@ -173,8 +185,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_value = json.loads(param_value)
                     return param_value
                 except Exception:
-                    repaired = _escape_inner_quotes(param_value)
-                    if repaired != param_value:
+                    for repaired in (
+                        _unescape_prequoted(param_value),
+                        _escape_inner_quotes(param_value),
+                        _escape_inner_quotes(_unescape_prequoted(param_value)),
+                    ):
+                        if repaired == param_value:
+                            continue
                         try:
                             return json.loads(repaired)
                         except Exception:
