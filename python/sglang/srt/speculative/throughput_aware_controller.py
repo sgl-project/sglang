@@ -86,7 +86,7 @@ from sglang.srt.speculative.throughput_aware_spec_params import (
     pick_best_step_with_hysteresis,
     score_candidates,
 )
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.common import log_debug_on_rank0, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -328,12 +328,12 @@ class ThroughputAwarePolicy:
             n_measure=self._profile_n_measure,
         )
 
-    def record_profile(self, batch_size: int, steps: int, avg_ms: float) -> None:
-        self._cost_table.set(batch_size, steps, avg_ms)
-        log_info_on_rank0(
+    def record_profile(self, batch_size: int, steps: int, median_ms: float) -> None:
+        self._cost_table.set(batch_size, steps, median_ms)
+        log_debug_on_rank0(
             logger,
             f"[ThroughputAware] steps={steps:2d}  bs={batch_size:4d}  "
-            f"decode_avg={avg_ms:.3f}ms",
+            f"decode_median={median_ms:.3f}ms",
         )
 
     def profile_summary(self) -> str:

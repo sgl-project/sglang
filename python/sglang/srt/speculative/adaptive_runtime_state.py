@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from tqdm.auto import tqdm
+
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -100,7 +102,7 @@ class AdaptiveProfilingPolicy(Protocol):
         self, worker: AdaptiveSpecWorker, *, max_running_requests: int
     ) -> SpecProfilePlan: ...
 
-    def record_profile(self, batch_size: int, steps: int, avg_ms: float) -> None: ...
+    def record_profile(self, batch_size: int, steps: int, median_ms: float) -> None: ...
 
     def profile_summary(self) -> str: ...
 
@@ -126,6 +128,20 @@ def _broadcast_float_from_rank0(value: float) -> float:
     value_tensor = torch.tensor([value], dtype=torch.float64, device=tp_group.device)
     dist.broadcast(value_tensor, src=0, group=tp_group.device_group)
     return float(value_tensor.item())
+
+
+def _is_tp_rank0() -> bool:
+    """Return whether this process should render TP-local startup progress."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return True
+    try:
+        from sglang.srt.distributed import get_tp_group
+
+        return get_tp_group().rank_in_group == 0
+    except Exception:
+        return dist.get_rank() == 0
 
 
 class AdaptiveController:
@@ -223,25 +239,40 @@ class AdaptiveController:
             f"seq_len={profile.seq_len}, n_warmup={profile.n_warmup}, "
             f"n_measure={profile.n_measure}",
         )
-        for point in profile.points:
-            self._activate(point.steps)
-            avg_ms = SpecProfilingSession(
-                worker=self.worker,
-                tree_cache=tree_cache,
-                batch_size=point.batch_size,
-                num_steps=point.steps,
-                seq_len=profile.seq_len,
-                n_warmup=profile.n_warmup,
-                n_measure=profile.n_measure,
-            ).measure()
-            self.params.record_profile(
-                point.batch_size, point.steps, _broadcast_float_from_rank0(avg_ms)
-            )
+        progress = tqdm(
+            total=len(profile.points),
+            desc="Adaptive speculative profiling",
+            unit="point",
+            disable=not (_is_tp_rank0() and logger.isEnabledFor(logging.INFO)),
+        )
+        try:
+            for point in profile.points:
+                self._activate(point.steps)
+                median_ms = SpecProfilingSession(
+                    worker=self.worker,
+                    tree_cache=tree_cache,
+                    batch_size=point.batch_size,
+                    num_steps=point.steps,
+                    seq_len=profile.seq_len,
+                    n_warmup=profile.n_warmup,
+                    n_measure=profile.n_measure,
+                ).measure()
+                median_ms = _broadcast_float_from_rank0(median_ms)
+                self.params.record_profile(point.batch_size, point.steps, median_ms)
+                progress.set_postfix(
+                    bs=point.batch_size,
+                    steps=point.steps,
+                    median=f"{median_ms:.2f}ms",
+                    refresh=False,
+                )
+                progress.update(1)
+        finally:
+            progress.close()
 
         self._activate(original_steps)
         log_info_on_rank0(
             logger,
-            f"Adaptive speculative profiling complete: {self.params.profile_summary()}",
+            f"Adaptive speculative profiling complete: {len(profile.points)} points.",
         )
 
     def _activate(self, speculative_num_steps: int) -> None:

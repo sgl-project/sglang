@@ -218,12 +218,33 @@ class TestThroughputAwareController(unittest.TestCase):
     def test_profiling_populates_costs_and_restores_initial_step(self):
         controller = self.make_controller()
         session = SimpleNamespace(measure=lambda: 2.5)
-        with patch(
-            "sglang.srt.speculative.spec_profiling_session.SpecProfilingSession",
-            return_value=session,
-        ) as factory:
+        progress = SimpleNamespace(
+            set_postfix=lambda **kwargs: None,
+            update=lambda count: None,
+            close=lambda: None,
+        )
+        with (
+            patch(
+                "sglang.srt.speculative.spec_profiling_session.SpecProfilingSession",
+                return_value=session,
+            ) as factory,
+            patch(
+                "sglang.srt.speculative.adaptive_runtime_state.tqdm",
+                return_value=progress,
+            ) as progress_factory,
+            patch(
+                "sglang.srt.speculative.adaptive_runtime_state.logger.isEnabledFor",
+                return_value=True,
+            ),
+        ):
             controller.run_profiling(object(), max_running_requests=4)
         self.assertEqual(factory.call_count, 4)
+        progress_factory.assert_called_once_with(
+            total=4,
+            desc="Adaptive speculative profiling",
+            unit="point",
+            disable=False,
+        )
         self.assertEqual(controller.params._cost_table.lookup(4, 3), 2.5)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
         self.assertEqual(controller.params._batches_since_reevaluation, 0)
