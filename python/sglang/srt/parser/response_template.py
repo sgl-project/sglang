@@ -130,6 +130,7 @@ class ResponseTemplateStreamAdapter:
         self._passthrough = False
         self._pending_reasoning = ""
         self._pending_tool_raw = ""
+        self._pending_tool_streamed = False
         self._finalized = False
 
     @property
@@ -212,6 +213,9 @@ class ResponseTemplateStreamAdapter:
             )
             self._passthrough = True
             if self._mode == AdapterMode.TOOL:
+                if self._pending_tool_streamed:
+                    self._pending_tool_raw = ""
+                    return [], True
                 passthrough = self._raw_tool_events(
                     initial_events
                 ) + self._recover_failed_tool_input(text)
@@ -247,6 +251,9 @@ class ResponseTemplateStreamAdapter:
             )
             self._passthrough = True
             if self._mode == AdapterMode.TOOL:
+                if self._pending_tool_streamed:
+                    self._pending_tool_raw = ""
+                    return [], True
                 passthrough = self._raw_tool_events(
                     initial_events
                 ) + self._recover_failed_tool_input("")
@@ -295,6 +302,7 @@ class ResponseTemplateStreamAdapter:
         self,
         events: List[dict],
         *,
+        on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
     ) -> str:
         normal_parts: List[str] = []
@@ -306,16 +314,24 @@ class ResponseTemplateStreamAdapter:
             elif field == self._tool_field:
                 if etype == "region_open":
                     self._pending_tool_raw = event.get("raw", "")
+                    if on_tool_open is not None:
+                        self._pending_tool_streamed = on_tool_open(
+                            self._pending_tool_raw
+                        )
                 elif etype == "region_chunk":
                     self._pending_tool_raw += event["text"]
                 elif etype == "region_close":
                     raw_close = event.get("raw", "")
                     if raw_close:
-                        if not on_tool_close(event["value"]):
+                        if (
+                            not on_tool_close(event["value"])
+                            and not self._pending_tool_streamed
+                        ):
                             normal_parts.append(self._pending_tool_raw + raw_close)
-                    else:
+                    elif not self._pending_tool_streamed:
                         normal_parts.append(self._pending_tool_raw)
                     self._pending_tool_raw = ""
+                    self._pending_tool_streamed = False
         return "".join(normal_parts)
 
 
@@ -440,6 +456,15 @@ class ResponseTemplateToolDetector(
         )
         tool_spec = template["fields"][self.tool_field]
         self._tool_open_re = _field_open_re(tool_spec)
+        self._tool_name_template = None
+        if not tool_spec.get("transform_each", False):
+            transform = tool_spec.get("transform")
+            if isinstance(transform, dict):
+                function = transform.get("function")
+                if isinstance(function, dict):
+                    name_template = function.get("name")
+                    if isinstance(name_template, str):
+                        self._tool_name_template = name_template
         self.bot_token = ""
         self.eot_token = ""
         if isinstance(tool_spec.get("close"), str):
@@ -451,6 +476,23 @@ class ResponseTemplateToolDetector(
         if self._tool_open_re is None:
             return False
         return self._tool_open_re.search(text) is not None
+
+    def _tool_name_from_open(self, raw: str) -> str | None:
+        if self._tool_open_re is None or self._tool_name_template is None:
+            return None
+        match = self._tool_open_re.fullmatch(raw)
+        if match is None:
+            return None
+        placeholder = re.fullmatch(
+            r"\{(?P<capture>\w+(?:\.\w+)*)\}",
+            self._tool_name_template,
+        )
+        if placeholder is None:
+            return self._tool_name_template
+        capture = placeholder.group("capture")
+        if "." in capture:
+            return None
+        return match.groupdict().get(capture)
 
     def _to_tool_call_item(
         self, value: Any, tool_indices: Dict[str, int], tool_index: int
@@ -479,6 +521,7 @@ class ResponseTemplateToolDetector(
     def _emit_tool_call(
         self, item: ToolCallItem, pending_calls: List[ToolCallItem]
     ) -> None:
+        name_was_streamed = self.current_tool_name_sent
         if self.current_tool_id == -1:
             self.current_tool_id = 0
             self.prev_tool_call_arr = []
@@ -497,9 +540,29 @@ class ResponseTemplateToolDetector(
             "arguments": parsed_args,
         }
         self.streamed_args_for_tool[self.current_tool_id] = item.parameters
+        if name_was_streamed:
+            item = item.model_copy(update={"name": None})
         pending_calls.append(item)
         self.current_tool_id += 1
         self.current_tool_name_sent = False
+
+    def _emit_tool_name(self, name: str, pending_calls: List[ToolCallItem]) -> None:
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = [""]
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        pending_calls.append(
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                name=name,
+                parameters="",
+            )
+        )
+        self.current_tool_name_sent = True
 
     def _route_tool_events(
         self, events: List[dict], tool_indices: Dict[str, int]
@@ -558,6 +621,18 @@ class ResponseTemplateToolDetector(
 
         pending_calls: List[ToolCallItem] = []
 
+        def on_open(raw: str) -> bool:
+            name = self._tool_name_from_open(raw)
+            if name is None:
+                return False
+            if (
+                name not in self._tool_indices
+                and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+            ):
+                return False
+            self._emit_tool_name(name, pending_calls)
+            return True
+
         def on_close(value: Any) -> bool:
             tool_index = self.current_tool_id if self.current_tool_id >= 0 else 0
             item = self._to_tool_call_item(value, self._tool_indices, tool_index)
@@ -566,7 +641,11 @@ class ResponseTemplateToolDetector(
             self._emit_tool_call(item, pending_calls)
             return True
 
-        normal_text = self._adapter.route_tool_events(events, on_tool_close=on_close)
+        normal_text = self._adapter.route_tool_events(
+            events,
+            on_tool_open=on_open,
+            on_tool_close=on_close,
+        )
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
     def supports_structural_tag(self) -> bool:

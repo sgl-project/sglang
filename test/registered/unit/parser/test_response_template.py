@@ -265,6 +265,27 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
                     _collect_tool_stream(existing, chunks),
                 )
 
+    def test_streaming_tool_name_timing_parity(self):
+        opening = "<|tool_call>call:get_weather{"
+        for detector in (
+            Gemma4ToolDetector(),
+            ResponseTemplateToolDetector(
+                response_template=GEMMA4_RESPONSE_TEMPLATE,
+                prefix=PREFIX,
+            ),
+        ):
+            with self.subTest(detector=type(detector).__name__):
+                parsed = detector.parse_streaming_increment(opening, [_tool()])
+
+                self.assertEqual(parsed.normal_text, "")
+                self.assertEqual(
+                    [
+                        (call.tool_index, call.name, call.parameters)
+                        for call in parsed.calls
+                    ],
+                    [(0, "get_weather", "")],
+                )
+
 
 class TestResponseTemplateAdapters(unittest.TestCase):
     def test_response_template_backend_is_internal(self):
@@ -382,27 +403,72 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertEqual(result.normal_text, malformed)
         self.assertEqual(result.calls, [])
 
-    def test_streaming_malformed_call_restores_buffered_input(self):
+    def test_streaming_malformed_call_restores_input_before_emission(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,
         )
         malformed = TOOL_CALL.replace("<tool_call|>", "unexpected<tool_call|>")
-        normal_parts = []
-        calls = []
 
-        for index in range(0, len(malformed), 7):
-            parsed = detector.parse_streaming_increment(
-                malformed[index : index + 7],
-                [_tool()],
-            )
-            normal_parts.append(parsed.normal_text)
-            calls.extend(parsed.calls)
-        finished = detector.finish([_tool()])
-        normal_parts.append(finished.normal_text)
-        calls.extend(finished.calls)
+        parsed = detector.parse_streaming_increment(malformed, [_tool()])
 
-        self.assertEqual("".join(normal_parts), malformed)
-        self.assertEqual(calls, [])
+        self.assertEqual(parsed.normal_text, malformed)
+        self.assertEqual(parsed.calls, [])
+
+    def test_streaming_malformed_call_does_not_roll_back_emitted_name(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        opening, body = TOOL_CALL.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        failed = detector.parse_streaming_increment(
+            body.replace("<tool_call|>", "unexpected<tool_call|>"),
+            [_tool()],
+        )
+
+        self.assertEqual(
+            [(call.name, call.parameters) for call in opened.calls],
+            [("get_weather", "")],
+        )
+        self.assertEqual(failed.normal_text, "")
+        self.assertEqual(failed.calls, [])
+
+    def test_streaming_waits_when_tool_name_depends_on_content(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                    "repeats": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "{content.name}",
+                            "arguments": "{content.arguments}",
+                        },
+                    },
+                },
+            },
+        }
+        detector = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+
+        opened = detector.parse_streaming_increment("<call>", [_tool()])
+        closed = detector.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"location":"Paris"}}</call>',
+            [_tool()],
+        )
+
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in closed.calls],
+            [("get_weather", {"location": "Paris"})],
+        )
 
     def test_streaming_failure_does_not_repeat_emitted_content(self):
         detector = ResponseTemplateToolDetector(
@@ -441,8 +507,11 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         streamed = detector.parse_streaming_increment(truncated, [_tool()])
         finished = detector.finish([_tool()])
 
-        self.assertEqual(streamed.calls, [])
-        self.assertEqual(streamed.normal_text + finished.normal_text, truncated)
+        self.assertEqual(
+            [(call.name, call.parameters) for call in streamed.calls],
+            [("get_weather", "")],
+        )
+        self.assertEqual(streamed.normal_text + finished.normal_text, "")
         self.assertEqual(finished.calls, [])
 
     def test_unknown_tool_is_preserved_when_forwarding_is_disabled(self):
@@ -455,6 +524,20 @@ class TestResponseTemplateAdapters(unittest.TestCase):
 
         self.assertEqual(result.normal_text, unknown)
         self.assertEqual(result.calls, [])
+
+    def test_streaming_unknown_tool_is_not_emitted_early(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        unknown = TOOL_CALL.replace("get_weather", "unknown")
+        opening, body = unknown.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        closed = detector.parse_streaming_increment(body, [_tool()])
+
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(closed.normal_text, unknown)
+        self.assertEqual(closed.calls, [])
 
     def test_strict_tools_require_native_constraint_support(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
