@@ -44,6 +44,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -472,6 +474,12 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_static_tensor_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        # A weight-only checkpoint has no input_activations at all; without
+        # this guard the num_bits read below raises AttributeError instead of
+        # falling through to the weight-only branches.
+        if weight_quant is None or input_quant is None:
+            return False
+
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
@@ -490,6 +498,12 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_dynamic_token_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        # A weight-only checkpoint has no input_activations at all; without
+        # this guard the num_bits read below raises AttributeError instead of
+        # falling through to the weight-only branches.
+        if weight_quant is None or input_quant is None:
+            return False
+
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
@@ -595,6 +609,21 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_fp4a16_nvfp4(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ):
+        """Weight-only NVFP4: fp4 weights, unquantized activations."""
+        if weight_quant is None or input_quant is not None:
+            return False
+
+        return (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 4
+            and weight_quant.group_size == 16
+            and weight_quant.symmetric
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -604,11 +633,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
+        # GROUP strategy alone does not imply integer weights: the float4
+        # weight-only formats (nvfp4a16, mxfp4a16) also match it, and routing
+        # them here reports a misleading W4A16Sparse24 error instead of falling
+        # through to the fp4 branches below.
+        is_int_type = weight_quant.type == QuantizationType.INT
 
         # Both symmetric and asymmetric weight quant are handled by
         # CompressedTensorsWNA16 via the Marlin kernel path; asymmetric
         # checkpoints carry a weight zero-point.
-        return is_channel_group and input_quant_none and is_static
+        return is_channel_group and input_quant_none and is_static and is_int_type
 
     def _is_wna16_triton_moe_supported(self, weight_quant: BaseModel) -> bool:
         return (
@@ -708,16 +742,42 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
         if is_activation_quantization_format(quant_format):
+            if self._is_fp4a16_nvfp4(weight_quant, input_quant):
+                return CompressedTensorsW4A16Fp4()
+
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
                 )
                 if is_fp4a4_nvfp4_supported:
                     return CompressedTensorsW4A4Fp4()
-                else:
-                    raise NotImplementedError(
-                        "Current platform does not support w4a4 nvfp4 quantization."
-                    )
+                # note: input_global_scale will be present for w4a4 checkpoints;
+                # it is dropped post loading and activations stay unquantized.
+                logger.warning_once(
+                    "NVFP4 w4a4 requires compute capability >= 10.0; serving "
+                    "this checkpoint weight-only via FP4 Marlin instead. "
+                    "Activation quantization is ignored."
+                )
+                return CompressedTensorsW4A16Fp4(has_input_global_scale=True)
+
+            # Activation-quantized float4 that is not the nvfp4 layout: the
+            # branch above returns for every nvfp4 case, native or downgraded,
+            # so reaching here means the strategy or group_size is unsupported.
+            # Reported explicitly rather than falling through to the generic
+            # "no scheme found", which hides which field is at fault.
+            is_non_nvfp4_fp4a4 = (
+                weight_quant is not None
+                and input_quant is not None
+                and weight_quant.num_bits == 4
+                and weight_quant.type == QuantizationType.FLOAT
+            )
+            if is_non_nvfp4_fp4a4:
+                raise NotImplementedError(
+                    "Activation-quantized float4 is only supported in the NVFP4 "
+                    "layout (tensor_group, group_size 16); got "
+                    f"strategy={weight_quant.strategy}, "
+                    f"group_size={weight_quant.group_size}."
+                )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 if _is_xpu:
@@ -869,9 +929,23 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_fp4a16_nvfp4(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW4A16Nvfp4MoE")
+            return CompressedTensorsW4A16Nvfp4MoE()
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
-            logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
-            return CompressedTensorsW4A4Nvfp4MoE()
+            if self._check_scheme_supported(
+                CompressedTensorsW4A4Nvfp4MoE.get_min_capability(), error=False
+            ):
+                logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
+                return CompressedTensorsW4A4Nvfp4MoE()
+            # input_global_scale is present for w4a4 checkpoints; it is dropped
+            # post loading and activations stay unquantized.
+            logger.warning_once(
+                "NVFP4 w4a4 MoE requires compute capability >= 10.0; serving "
+                "this checkpoint weight-only via FP4 Marlin instead. "
+                "Activation quantization is ignored."
+            )
+            return CompressedTensorsW4A16Nvfp4MoE(has_input_global_scale=True)
         elif self._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
