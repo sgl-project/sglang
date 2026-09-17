@@ -461,7 +461,10 @@ class _ProfilerRPD(_ProfilerConcreteBase):
 
 
 def build_step_span_name(
-    forward_batch: ForwardBatch, detailed_annotations: bool | None = None
+    forward_batch: ForwardBatch,
+    detailed_annotations: bool | None = None,
+    *,
+    is_draft_worker: bool = False,
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
@@ -469,17 +472,27 @@ def build_step_span_name(
     build_detailed_annotation_suffix) when enabled. detailed_annotations
     defaults to the process-wide toggle (detailed_annotations_enabled, set
     by the profiler manager); pass an explicit bool to override (e.g. in tests).
+
+    The target-verify step is labeled ``VERIFY``; every step a draft model
+    runner emits is labeled ``DRAFT`` (some draft paths borrow the TARGET_VERIFY
+    mode, so the mode name alone cannot tell the two models apart).
     """
     if detailed_annotations is None:
         detailed_annotations = detailed_annotations_enabled()
 
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
+    if is_draft_worker:
+        stage = "DRAFT"
+    elif mode == ForwardMode.TARGET_VERIFY:
+        stage = "VERIFY"
+    else:
+        stage = mode.name
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        base = f"step[EXTEND bs={bs} toks={ext_toks}"
+        base = f"step[{stage} bs={bs} toks={ext_toks}"
     else:
-        base = f"step[{mode.name} bs={bs}"
+        base = f"step[{stage} bs={bs}"
 
     if detailed_annotations:
         suffix = build_detailed_annotation_suffix(forward_batch)
