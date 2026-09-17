@@ -13,7 +13,10 @@ from sglang.srt.disaggregation.checksum import (
 )
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import (
+    MetadataBuffers,
+    aux_buffer_pair_count,
+)
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -67,9 +70,51 @@ class TestMetadataBuffers(unittest.TestCase):
 
     def test_set_get_kv_checksum_roundtrip(self):
         buf = _make_buf()
-        buf.set_kv_checksum(SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(0), 0)
+        buf.set_kv_checksum(
+            SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF, 0xABCDEF
+        )
+        self.assertEqual(buf.get_kv_checksum(1), (0xDEADBEEF, 0xABCDEF))
+        # An untouched row reads as "no digest".
+        self.assertEqual(buf.get_kv_checksum(0), (0, 0))
+
+
+class TestAuxBufferPairCount(unittest.TestCase):
+    """A peer with a different aux-buffer count must not walk off the list."""
+
+    def test_equal_counts_pass_through(self):
+        logged = set()
+        self.assertEqual(aux_buffer_pair_count(5, 5, logged, "t"), 5)
+        self.assertEqual(logged, set())
+
+    def test_mismatch_clamps_and_logs_once(self):
+        logged = set()
+        self.assertEqual(aux_buffer_pair_count(5, 6, logged, "t"), 5)
+        self.assertEqual(aux_buffer_pair_count(6, 5, logged, "t"), 5)
+        self.assertEqual(aux_buffer_pair_count(5, 6, logged, "t"), 5)
+        self.assertEqual(len(logged), 2)
+
+
+class TestKvChecksumSignature(unittest.TestCase):
+    def test_signature_tracks_layout_and_is_never_zero(self):
+        def make(**kw):
+            base = dict(
+                kv_data_ptrs=[1, 2],
+                kv_item_lens=[64, 64],
+                state_data_ptrs=[3],
+                state_item_lens=[32],
+                page_size=1,
+            )
+            base.update(kw)
+            return KvChecksumComputer(torch.device("cpu"), **base).signature
+
+        same = make()
+        self.assertNotEqual(same, 0)
+        self.assertEqual(same, make())
+        # A different TP width shows up as different per-page item lengths.
+        self.assertNotEqual(same, make(kv_item_lens=[32, 32]))
+        # A layer-sharded or PP prefill owns fewer buffers.
+        self.assertNotEqual(same, make(kv_data_ptrs=[1], kv_item_lens=[64]))
+        self.assertNotEqual(same, make(page_size=16))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -190,7 +235,9 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
+            page_size=1,
+            get_kvcache=lambda: SimpleNamespace(),
+            translate_kv_indices_for_transfer=lambda x: x,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
@@ -198,6 +245,8 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
         self.streamed_aborts = []
+        # Single-rank: the mismatch reduce is a no-op.
+        self.attn_tp_cpu_group = None
 
     def stream_output(self, reqs, return_logprob):
         self.streamed_aborts.extend(reqs)
@@ -231,7 +280,7 @@ class TestPrefillHealthCheckChecksum(unittest.TestCase):
             lambda *args, **kwargs: None,
         ):
             sched.send_kv_chunk(req, last_chunk=True)
-        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0)
+        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0, 0)
 
 
 class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
@@ -324,6 +373,40 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self._run_once(sched)
         self.assertEqual(sched.waiting_queue, [req])
         self.assertEqual(sched.streamed_aborts, [])
+
+    def test_mismatch_decision_is_all_reduced(self):
+        """Every rank drops the same requests, even if only one saw the fault."""
+        sched = self._make_sched(_SENTINEL)
+        clean = _make_req(self.true_chksum, self.num_pages, rid="clean")
+        sched.waiting_queue = [clean]
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch.object(
+                SchedulerDisaggregationDecodeMixin,
+                "_all_reduce_kv_checksum_mismatches",
+                lambda s, flags: [1] * len(flags),
+            ),
+        ):
+            self._run_once(sched)
+        self.assertEqual(sched.waiting_queue, [])
+        self.assertEqual(sched.streamed_aborts, [clean])
+
+    def test_injected_mismatch_aborts_without_killing_the_scheduler(self):
+        """The injector must not trip the in-CI raise it exists to exercise."""
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(0xDEADBEEF, self.num_pages)
+        sched.waiting_queue = [req]
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.override(1.0),
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            self._run_once(sched)
+        self.assertEqual(sched.waiting_queue, [])
+        mock_abort.assert_called_once()
 
     def test_disabled_delegates_to_batch_builder(self):
         sched = self._make_sched(computer=None)

@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    aux_buffer_pair_count,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -408,6 +409,9 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    # Peers that registered a different number of aux buffers are
+    # reported once, not once per transfer.
+    _logged_aux_count_mismatch: set = set()
     # The decode control socket multiplexes tagged messages, so the status
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
@@ -2211,7 +2215,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i, _ in enumerate(dst_aux_ptrs):
+        num_bufs = aux_buffer_pair_count(
+            len(prefill_aux_ptrs),
+            len(dst_aux_ptrs),
+            self._logged_aux_count_mismatch,
+            "nixl send_aux",
+        )
+        for i in range(num_bufs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
