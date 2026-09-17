@@ -109,6 +109,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
+from sglang.srt.utils import ImageData
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -350,7 +351,6 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.chat_encoding_spec == "dsv41"
             else None
         )
-        self._dsv41_unsupported_efforts_warned: set = set()
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
@@ -699,15 +699,11 @@ class OpenAIServingChat(OpenAIServingBase):
         return parsed
 
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
-        """Request effort for the V4.1 encoder; unsupported tiers warn once and fall back."""
+        """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
         effort = chat_encoding.parse_dsv41_reasoning_effort(value)
         if effort is not None:
             return effort
-        if (
-            value is not None
-            and repr(value) not in self._dsv41_unsupported_efforts_warned
-        ):
-            self._dsv41_unsupported_efforts_warned.add(repr(value))
+        if value is not None and value != "none":
             logger.warning(
                 "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
                 "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
@@ -1528,7 +1524,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if media["images"]:
                     if not is_multimodal:
                         raise ValueError("image input is not supported for this model")
-                    image_data.extend(image["url"] for image in media["images"])
+                    image_data.extend(
+                        ImageData(url=image["url"]) for image in media["images"]
+                    )
                     tokenizer = self.tokenizer_manager.tokenizer
                     real_input = real_input.replace(
                         encoding_dsv41.IMAGE_PLACEHOLDER,

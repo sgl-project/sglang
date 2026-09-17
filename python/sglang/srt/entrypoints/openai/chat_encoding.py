@@ -165,7 +165,7 @@ def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
     if isinstance(value, int):
         return value if 1 <= value <= 100 else None
     if isinstance(value, float):
-        return min(100, max(1, round(value * 100)))
+        return max(1, round(value * 100)) if 0.0 <= value <= 0.99 else None
     if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
         return value
     return None
