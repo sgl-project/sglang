@@ -6,17 +6,20 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from unified_allocator_fixtures import (
+    build_swa_pool,
+    build_tri_pool,
+    reset_context,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDynamicGateCapacity(CustomTestCase):
     def setUp(self):
-        import test_unified_tri_joint_reclaim as fixtures
-
-        self.fixture = fixtures.TestTriJointReclaim()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.tearDown)
+        self.addCleanup(reset_context)
+        setup_allocator_context()
 
     def assert_dynamic_views(self, allocator, state):
         members = allocator._move_gate_targets()
@@ -46,14 +49,10 @@ class TestDynamicGateCapacity(CustomTestCase):
         self.assertNotEqual(observed[0], observed[1])
 
     def test_two_pool_public_gate_transitions(self):
-        import test_unified_joint_allocation_eviction as fixtures
-
         for ps in (1, 4, 16):
             for initially_open in (False, True):
                 with self.subTest(page_size=ps, initially_open=initially_open):
-                    a, _ = fixtures.TestUnifiedJointAllocationEviction.build_cache(
-                        self.fixture, occupancy=0, lazy=True, page_size=ps
-                    )
+                    a, _ = build_swa_pool(occupancy=0, lazy=True, page_size=ps)
                     slots = a.alloc(96 * ps)
                     a.free_swa(slots[: 40 * ps])
                     # Prime ungated memo, then install the public gate.
@@ -75,7 +74,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         for ps in (1, 4, 16):
             for empty_float in (False, True):
                 with self.subTest(page_size=ps, empty_float=empty_float):
-                    b, a, _ = self.fixture.build(
+                    b, a, _ = build_tri_pool(
                         lazy=True, page_size=ps, state_cache=False, temporal=(1, 4, 8)
                     )
                     states = a.mamba_allocator.alloc(8)
@@ -90,16 +89,12 @@ class TestDynamicGateCapacity(CustomTestCase):
                     self.assert_dynamic_views(a, state)
 
     def test_real_prefill_queue_gate(self):
-        import test_unified_joint_allocation_eviction as fixtures
-
         from sglang.srt.disaggregation.utils import (
             DisaggregationMode,
             unified_memory_disagg_move_gate,
         )
 
-        a, _ = fixtures.TestUnifiedJointAllocationEviction.build_cache(
-            self.fixture, occupancy=0, lazy=True
-        )
+        a, _ = build_swa_pool(occupancy=0, lazy=True)
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         scheduler = SimpleNamespace(
@@ -119,11 +114,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         self.assertEqual(a.verify_byte_accounting(), [])
 
     def test_ungated_view_keeps_its_memo(self):
-        import test_unified_joint_allocation_eviction as fixtures
-
-        a, _ = fixtures.TestUnifiedJointAllocationEviction.build_cache(
-            self.fixture, occupancy=0, lazy=True
-        )
+        a, _ = build_swa_pool(occupancy=0, lazy=True)
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         x = a.full_attn_allocator
