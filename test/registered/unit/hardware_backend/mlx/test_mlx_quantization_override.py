@@ -10,12 +10,13 @@ import unittest
 
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 
-class TestMlxQuantizationOverride(unittest.TestCase):
+class TestMlxQuantizationOverride(CustomTestCase):
     """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``.
 
     The override is a classmethod over a dict; no mlx / Apple Silicon
@@ -73,11 +74,36 @@ class TestMlxQuantizationOverride(unittest.TestCase):
                 {"bits": "4", "group_size": 64}, None
             )
         )
-        # Unsupported bit-width.
+        # Non-positive values.
         self.assertIsNone(
             MlxQuantizationConfig.override_quantization_method(
-                {"bits": 2, "group_size": 64}, None
+                {"bits": 0, "group_size": 64}, None
             )
+        )
+
+    def test_non_preset_bitwidth_passthrough(self):
+        """Already-quantized MLX dumps that are not q4/q8 map to ``mlx``.
+
+        mlx_lm.load instantiates the modules; the runner must not treat this
+        as an on-the-fly mlx_q4/mlx_q8 request.
+        """
+        self.assertEqual(
+            MlxQuantizationConfig.override_quantization_method(
+                {"group_size": 64, "bits": 6, "mode": "affine"}, None
+            ),
+            "mlx",
+        )
+        self.assertEqual(
+            MlxQuantizationConfig.override_quantization_method(
+                {"group_size": 64, "bits": 5}, None
+            ),
+            "mlx",
+        )
+        self.assertEqual(
+            MlxQuantizationConfig.override_quantization_method(
+                {"group_size": 64, "bits": 2}, None
+            ),
+            "mlx",
         )
 
     def test_user_quant_explicit_defers_to_user(self):

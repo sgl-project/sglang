@@ -7,17 +7,21 @@ path.
 
 This module serves two purposes:
 
-1. Registry registration. Listing ``mlx_q4`` and ``mlx_q8`` in
+1. Registry registration. Listing ``mlx``, ``mlx_q4``, and ``mlx_q8`` in
    ``QUANTIZATION_METHODS`` lets :meth:`ModelConfig._verify_quantization`
    recognize them as known methods without backend-specific exceptions in
-   the generic config code.
+   the generic config code. ``mlx_q4`` / ``mlx_q8`` are on-the-fly load
+   presets. ``mlx`` is a passthrough marker for already-quantized MLX
+   checkpoints whose bit-width is not one of those presets.
 
 2. Auto-detection for mlx-community HF repos.
    :meth:`override_quantization_method` claims ``config.json`` blocks of
    the form ``{"group_size": <int>, "bits": <int>}`` with no
-   ``quant_method`` key and resolves them to the matching preset.
-   Already-quantized mlx-community repos load on Apple Silicon without the
-   user passing ``--quantization`` on the CLI. Resolves #25119.
+   ``quant_method`` key. ``bits=4`` / ``bits=8`` map to the on-the-fly
+   preset names; any other integer bit-width (5, 6, mixed Hub dumps, …)
+   maps to ``mlx``. ``mlx_lm.load`` already instantiated the quantized
+   modules, so the runner does not requantize. Resolves #25119 for 4/8
+   and the same validator failure for other MLX bit-widths.
 
 The PyTorch path constructors (``from_config``, ``get_quant_method``) raise
 ``NotImplementedError`` with a clear pointer to ``SGLANG_USE_MLX=1``, since
@@ -92,10 +96,11 @@ class MlxQuantizationConfig(QuantizationConfig):
         without the user having to pass ``--quantization`` on the CLI.
 
         Returns ``None`` for any input that does not look like a bare MLX
-        preset: non-dict, dict with an explicit ``quant_method``, missing
-        keys, non-integer values, or unsupported bit-width. Also defers to
-        any explicit ``--quantization`` CLI choice (``user_quant``) per the
-        registry contract: CLI selection takes priority over auto-detect.
+        config: non-dict, dict with an explicit ``quant_method``, missing
+        keys, or non-integer values. Extra keys (e.g. ``mode: affine``) are
+        ignored. Also defers to any explicit ``--quantization`` CLI choice
+        (``user_quant``) per the registry contract: CLI selection takes
+        priority over auto-detect.
         """
         if user_quant is not None:
             # User passed --quantization explicitly; respect that choice
@@ -112,11 +117,16 @@ class MlxQuantizationConfig(QuantizationConfig):
         group_size = hf_quant_cfg.get("group_size")
         if not isinstance(bits, int) or not isinstance(group_size, int):
             return None
+        if bits <= 0 or group_size <= 0:
+            return None
         if bits == 4:
             return "mlx_q4"
         if bits == 8:
             return "mlx_q8"
-        return None
+        # Pre-quantized Hub dumps (6-bit affine, 5-bit LM Studio, …). The
+        # MLX runner loads via mlx_lm and ignores on-the-fly presets when
+        # the checkpoint already has a quantization block.
+        return "mlx"
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
