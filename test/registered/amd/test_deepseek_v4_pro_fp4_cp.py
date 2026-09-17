@@ -23,7 +23,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    nightly=True,
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -37,7 +39,6 @@ SERVER_LAUNCH_TIMEOUT = 5400
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_DP_USE_GATHERV": "1",
     "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",

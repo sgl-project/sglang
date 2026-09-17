@@ -20,7 +20,7 @@ from sglang.test.kv_canary.runner_test_base import (
     make_manager,
 )
 
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 
@@ -91,7 +91,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -144,7 +144,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7], dtype=torch.int32, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -182,7 +182,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -218,7 +218,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [[7, 8]], dtype=torch.int64, device=self.device
         )[:, 0]
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),

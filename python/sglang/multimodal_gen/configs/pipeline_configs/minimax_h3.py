@@ -260,6 +260,32 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
         if selected_backend is None:
             return
+        if selected_backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+            attention_config = server_args.attention_backend_config or {}
+            compute_mode = str(attention_config.get("compute_mode", "bf16"))
+            if compute_mode not in ("bf16", "sage_fp8"):
+                raise ValueError(
+                    "SubBlock compute_mode must be 'bf16' or 'sage_fp8', got "
+                    f"{compute_mode!r}."
+                )
+            if compute_mode == "sage_fp8":
+                capability = current_platform.get_device_capability()
+                if capability is None or capability.to_int() != 90:
+                    found = (
+                        capability.as_version_str()
+                        if capability is not None
+                        else "unknown"
+                    )
+                    raise ValueError(
+                        "MiniMax-H3 SubBlock compute_mode='sage_fp8' currently "
+                        "requires SM90 (compute capability 9.0); "
+                        f"found {found}."
+                    )
+                from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+                    _load_sparge_attention_sm90_ops,
+                )
+
+                _load_sparge_attention_sm90_ops()
         if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
             if server_args.ring_degree > 1:
                 raise ValueError(

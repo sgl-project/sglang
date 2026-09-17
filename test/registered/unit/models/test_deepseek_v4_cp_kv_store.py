@@ -12,6 +12,60 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4CPKVStore(unittest.TestCase):
+    def test_unified_cp_gathers_current_chunk_for_two_source_attention(self):
+        layer = MQALayer.__new__(MQALayer)
+        layer.fuse_wqa_wkv = False
+        layer.wq_a = mock.Mock(return_value=(torch.ones(2, 2), None))
+        layer.q_norm = mock.Mock(side_effect=lambda value: value)
+        q = torch.ones(2, 1, 2)
+        layer._compute_q_b = mock.Mock(return_value=q)
+        local_kv = torch.arange(8, dtype=torch.float32).view(2, 4)
+        layer._compute_kv_bf16 = mock.Mock(return_value=local_kv)
+        layer.indexer = None
+        layer.compressor = None
+
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: False,
+                is_target_verify=lambda: False,
+            )
+        )
+        global_kv = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+        with (
+            mock.patch.object(deepseek_v4, "_is_hip", True),
+            mock.patch.object(deepseek_v4, "_is_npu", False),
+            mock.patch.object(deepseek_v4, "is_cp_active", return_value=True),
+            mock.patch.object(
+                deepseek_v4, "get_token_to_kv_pool", return_value=object()
+            ),
+            mock.patch.object(
+                deepseek_v4,
+                "cp_materialize_global_token_order",
+                return_value=global_kv,
+            ) as materialize,
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_fp8",
+                return_value=False,
+            ),
+            mock.patch.object(torch.cuda, "current_stream", return_value=object()),
+        ):
+            returned_q, returned_kv = layer._forward_prepare(
+                torch.zeros(2, 4),
+                torch.arange(2),
+                forward_batch,
+                object(),
+            )
+
+        self.assertIs(returned_q, q)
+        self.assertIs(returned_kv, global_kv)
+        torch.testing.assert_close(materialize.call_args.args[0], local_kv)
+        self.assertIs(materialize.call_args.args[1], forward_batch)
+
     def test_fused_cp_store_reuses_transformed_kv(self):
         layer = MQALayer.__new__(MQALayer)
         layer.fuse_wqa_wkv = True
@@ -60,7 +114,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
         gathered_kv = object()
         with (
             mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
-            mock.patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=True),
+            mock.patch.object(deepseek_v4, "is_cp_active", return_value=True),
             mock.patch.object(
                 deepseek_v4, "get_token_to_kv_pool", return_value=token_to_kv_pool
             ),

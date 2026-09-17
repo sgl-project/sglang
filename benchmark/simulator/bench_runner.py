@@ -4,10 +4,10 @@ import asyncio
 import atexit
 import json
 import os
-from dataclasses import asdict
 from typing import Iterator
 
 import numpy as np
+from msgspec.structs import asdict
 from sglang_simulator.compat import apply_simulator_server_args
 from sglang_simulator.dataset import BaseDataset, GenericRequest
 from sglang_simulator.simulation.benchmark import BaseBenchmarkRunner, BenchmarkConfig

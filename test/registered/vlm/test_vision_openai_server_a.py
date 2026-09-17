@@ -29,7 +29,7 @@ from sglang.test.vlm_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=578, stage="base-b", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------
