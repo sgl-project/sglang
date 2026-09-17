@@ -34,25 +34,18 @@ If you only need to use the distributed environment without model parallelism,
 import contextlib
 import datetime
 import os
-import weakref
-from collections import namedtuple
-from collections.abc import Callable
 from contextlib import contextmanager
-from multiprocessing import shared_memory
-from typing import Any, List, Optional
-from unittest.mock import patch
+from typing import List, Optional
 
 import torch
 import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .group_coordinator import (
     GroupCoordinator,
-    PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
     new_device_group,
@@ -64,7 +57,7 @@ logger = init_logger(__name__)
 _WORLD: GroupCoordinator | None = None
 _TP: GroupCoordinator | None = None
 _SP: SequenceParallelGroupCoordinator | None = None
-_PP: PipelineGroupCoordinator | None = None
+_PP: GroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 # all ranks serving one pipeline replica (every dim except dp); with
@@ -79,53 +72,6 @@ _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
 _REPLICA_PARALLEL_AXES = "tp-sp-pp-cfg"
 _ENCODER_DP_PARALLEL_AXES = "sp-pp-cfg"
-
-TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
-
-
-def _split_tensor_dict(
-    tensor_dict: dict[str, torch.Tensor | Any],
-) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
-    """Split the tensor dictionary into two parts:
-    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
-         by its metadata.
-    2. A list of tensors.
-    """
-    metadata_list: list[tuple[str, Any]] = []
-    tensor_list: list[torch.Tensor] = []
-    for key, value in tensor_dict.items():
-        if isinstance(value, torch.Tensor):
-            # Note: we cannot use `value.device` here,
-            # because it contains not only the device type but also the device
-            # index (e.g. "cuda:0"). We only need the device type.
-            # receiving side will set the device index.
-            device = value.device.type
-            metadata_list.append(
-                (key, TensorMetadata(device, value.dtype, value.size()))
-            )
-            tensor_list.append(value)
-        else:
-            metadata_list.append((key, value))
-    return metadata_list, tensor_list
-
-
-_groups: dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
-
-
-def _register_group(group: "GroupCoordinator") -> None:
-    _groups[group.unique_name] = weakref.ref(group)
-
-
-def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
-    if group is None:
-        raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor)
-
-
-def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    return torch.empty_like(tensor)
 
 
 def get_world_group() -> GroupCoordinator:
@@ -227,14 +173,7 @@ def init_parallel_group_coordinator(
         "replica",
         "encoder_data",
     ], f"parallel_mode {parallel_mode} is not supported"
-    if parallel_mode == "pipeline":
-        return PipelineGroupCoordinator(
-            group_ranks=group_ranks,
-            local_rank=local_rank,
-            torch_distributed_backend=backend,
-            group_name="pp_group",
-        )
-    elif parallel_mode == "sequence":
+    if parallel_mode == "sequence":
         return SequenceParallelGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
@@ -244,6 +183,7 @@ def init_parallel_group_coordinator(
         )
     else:
         group_name = {
+            "pipeline": "pp_group",
             "tensor": "tp_group",
             "vae_decode": "vae_decode_group",
             "replica": "replica_group",
@@ -808,96 +748,6 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
         ray.shutdown()
 
 
-def is_the_same_node_as(
-    pg: ProcessGroup | StatelessProcessGroup, source_rank: int = 0
-) -> list[int]:
-    """
-    This is a collective operation that returns if each rank is in the same node
-    as the source rank. It tests if processes are attached to the same
-    memory system (shared access to shared memory).
-    """
-    if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
-        # local rank inside the group
-        rank = torch.distributed.get_rank(group=pg)
-        world_size = torch.distributed.get_world_size(group=pg)
-
-        # global ranks of the processes in the group
-        ranks = torch.distributed.get_process_group_ranks(pg)
-    else:
-        rank = pg.rank
-        world_size = pg.world_size
-        ranks = list(range(world_size))
-
-    # local tensor in each process to store the result
-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
-
-    magic_message = b"magic_message"
-    shm = None
-
-    try:
-        with contextlib.suppress(OSError):
-            if rank == source_rank:
-                # create a shared memory segment
-                shm = shared_memory.SharedMemory(create=True, size=128)
-                shm.buf[: len(magic_message)] = magic_message
-                if isinstance(pg, ProcessGroup):
-                    torch.distributed.broadcast_object_list(
-                        [shm.name], src=ranks[source_rank], group=pg
-                    )
-                else:
-                    pg.broadcast_obj(shm.name, src=source_rank)
-                is_in_the_same_node[rank] = 1
-            else:
-                # try to open the shared memory segment
-                if isinstance(pg, ProcessGroup):
-                    recv = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, src=ranks[source_rank], group=pg
-                    )
-                    name = recv[0]
-                else:
-                    name = pg.broadcast_obj(None, src=source_rank)
-                # fix to https://stackoverflow.com/q/62748654/9191338
-                # Python incorrectly tracks shared memory even if it is not
-                # created by the process. The following patch is a workaround.
-                with patch(
-                    "multiprocessing.resource_tracker.register",
-                    lambda *args, **kwargs: None,
-                ):
-                    shm = shared_memory.SharedMemory(name=name)
-                if shm.buf[: len(magic_message)] == magic_message:
-                    is_in_the_same_node[rank] = 1
-    except Exception as e:
-        logger.error("Error ignored in is_in_the_same_node: %s", e)
-    finally:
-        if shm:
-            shm.close()
-
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.barrier(group=pg)
-    else:
-        pg.barrier()
-
-    # clean up the shared memory segment
-    with contextlib.suppress(OSError):
-        if rank == source_rank and shm:
-            shm.unlink()
-
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.all_reduce(is_in_the_same_node, group=pg)
-        aggregated_data = is_in_the_same_node
-    else:
-        aggregated_data = torch.zeros_like(is_in_the_same_node)
-        for i in range(world_size):
-            rank_data = pg.broadcast_obj(is_in_the_same_node, src=i)
-            aggregated_data += rank_data
-
-    return [x == 1 for x in aggregated_data.tolist()]
-
-
 def get_tensor_model_parallel_world_size() -> int:
     """Return world size for the tensor model parallel group."""
     return get_tp_world_size()
@@ -950,7 +800,7 @@ def get_ring_ctx() -> tuple[int, int]:
 
 
 # PP
-def get_pp_group() -> PipelineGroupCoordinator:
+def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
