@@ -2021,6 +2021,11 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
+                if batch is None:
+                    # This iteration launched no batch, so no forward released
+                    # the GIL, and on_idle -- which would yield -- is skipped
+                    # while last_batch is still pending.
+                    self._yield_to_storage_threads()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -4883,10 +4888,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
-                # Storage workers need the GIL between I/O calls. Yield while
-                # there is no GPU batch so polling cannot starve their acks.
-                time.sleep(0)
+            # A stall is the case the sleeper below cannot cover: requests are
+            # in flight, so we never reach it, yet no batch ran to yield for us.
+            # A request parked on a storage transfer is waiting on a thread that
+            # only runs if we let go.
+            self._yield_to_storage_threads()
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5842,8 +5848,42 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+        if self.idle_sleeper is None:
+            self._yield_to_storage_threads()
+            return
+        # The sleeper parks on the request sockets for a second. A storage
+        # backend that advances its state from check_hicache_events has work
+        # no socket will ever wake us for -- a P2P source serving a peer's pull
+        # is the case -- so it caps the park at its own tick cadence.
+        self.idle_sleeper.maybe_sleep(
+            timeout_ms=self._hicache_storage_idle_poll_timeout_ms()
+        )
+
+    def _yield_to_storage_threads(self) -> None:
+        """Release the GIL so a storage backend's transfer threads can run.
+
+        A loop iteration that runs no batch still holds the GIL end to end, and
+        the transfer its stalled requests wait on is driven by daemon threads in
+        this same process; CPython will not preempt us for them on its own.
+        Independent of --sleep-on-idle: a rank with no sleeper has no park at
+        all, and the no-batch-but-not-idle stall never reaches the sleeper.
+
+        A backend that declares a cadence is parked for it, which is what a
+        transfer needing several handoffs to finish requires; sleep(0) yields
+        once and hands the GIL straight back if nothing else is runnable.
+        """
+        if not self.enable_hicache_storage:
+            return
+        timeout_ms = self._hicache_storage_idle_poll_timeout_ms()
+        time.sleep(0 if timeout_ms is None else timeout_ms / 1000)
+
+    def _hicache_storage_idle_poll_timeout_ms(self) -> Optional[int]:
+        if not self.enable_hierarchical_cache or not self.enable_hicache_storage:
+            return None
+        if not self.tree_cache.enable_storage:
+            return None
+        backend = self.tree_cache.cache_controller.storage_backend
+        return backend.idle_poll_timeout_ms()
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""

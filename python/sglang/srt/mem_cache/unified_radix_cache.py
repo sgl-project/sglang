@@ -3321,6 +3321,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
+        # Before the drains below: a backend that only moves when ticked may be
+        # what puts the completions into those queues.
+        if self.enable_storage:
+            self.cache_controller.storage_backend.tick()
+
         (
             write_finish_count,
             load_finish_count,

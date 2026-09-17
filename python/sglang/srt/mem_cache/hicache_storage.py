@@ -359,6 +359,32 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    def tick(self) -> None:
+        """Advance backend-owned state, on the scheduler thread.
+
+        Called once per scheduler loop from ``check_hicache_events``, idle
+        iterations included. A backend whose state machine only moves when
+        somebody calls it -- a P2P source serving a peer's pull, say -- would
+        otherwise need a polling thread of its own. It must not block: the
+        caller is the thread that runs forward passes.
+        """
+
+    def idle_poll_timeout_ms(self) -> Optional[int]:
+        """Cap on how long ``--sleep-on-idle`` may park, in ms, or None.
+
+        The sleeper parks on the request sockets for a second, which for a
+        ticking backend means one ``tick`` per second -- a P2P source serving a
+        peer's pull stalls behind a socket that will never see traffic. A
+        backend returning a smaller value shortens that park to its own cadence.
+
+        Shorten, never skip. The scheduler main loop holds the GIL while it
+        spins, and the transfer it is waiting on is driven by daemon threads in
+        the same process; a loop that never parks starves them, which costs more
+        than the park does. Gates the sleep only -- not ``is_fully_idle``, which
+        admits flush and attach.
+        """
+        return None
+
 
 class MetadataCache:
     def __init__(self, ttl_seconds: float):

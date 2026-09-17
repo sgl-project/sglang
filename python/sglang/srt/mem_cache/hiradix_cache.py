@@ -1579,6 +1579,11 @@ class HiRadixCache(RadixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        # Before the drains below: a backend that only moves when ticked may be
+        # what puts the completions into those queues.
+        if self.enable_storage:
+            self.cache_controller.storage_backend.tick()
+
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
