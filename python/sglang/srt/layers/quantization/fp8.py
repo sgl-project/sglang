@@ -1407,7 +1407,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
-                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+                fp4_scale_dtype = (
+                    torch.float8_e8m0fnu if _use_aiter or is_xpu() else torch.float32
+                )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -2356,10 +2358,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
         num_experts = int(layer.num_local_experts)
         device = layer.w13_weight.device
+        clamp_limit = (
+            self.moe_runner_config.gemm1_clamp_limit
+            if self.moe_runner_config.gemm1_clamp_limit is not None
+            else self.moe_runner_config.swiglu_limit
+        )
         for name, value in (
             ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
             ("gemm1_beta", self.moe_runner_config.gemm1_beta),
-            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+            ("gemm1_clamp_limit", clamp_limit),
         ):
             tensor = (
                 None

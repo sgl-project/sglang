@@ -8,7 +8,6 @@ Guards, on a gfx950 device:
     each trigger a rebuild, cached output bit-identical to uncached.
 """
 
-import ctypes
 import math
 import unittest
 
@@ -143,14 +142,6 @@ class TestVattnSegPlan(CustomTestCase):
         exp_tn = [nseg[s] for s, ql in enumerate(qlens) for _ in range(ql)]
         self.assertEqual(tok_nseg.tolist(), exp_tn)
 
-    def test_hip_runtime_matches_torch(self):
-        # A second HIP runtime has separate stream state, even at the same version.
-        torch_hip = ctypes.CDLL(torch._C.__file__)
-        self.assertEqual(
-            ctypes.cast(self.V._hip_lib().hipModuleLaunchKernel, ctypes.c_void_p).value,
-            ctypes.cast(torch_hip.hipModuleLaunchKernel, ctypes.c_void_p).value,
-        )
-
     def test_planned_split_matches_reference(self):
         V = self.V
         for lens, qlens, hq, hkv, tag in CASES:
@@ -173,6 +164,39 @@ class TestVattnSegPlan(CustomTestCase):
                 # same error budget as the fixed split (fp8 KV dominates); 0.02 floor for the tiny cases
                 self.assertLessEqual(e_plan, max(2 * e_leg, 0.02))
                 torch.cuda.empty_cache()
+
+    def test_launches_on_a_side_stream_and_under_graph_capture(self):
+        # ROCm 10 images carry two libamdhip64 of the same SONAME (torch loads
+        # _rocm_sdk_core, LD_LIBRARY_PATH points at _rocm_sdk_devel). Binding
+        # the wrong one still loads the module and still launches on the default
+        # stream, so only a torch stream catches it: every launch there fails
+        # with hipErrorContextIsDestroyed (709). Decode captures graphs, so this
+        # is the path serving actually takes.
+        V = self.V
+        lens, qlens, hq, hkv = [4096, 3777], [4, 2], 16, 1
+        k, v, bt, q, cu_q, seq_lens, kd, vd = make(lens, qlens, hq, hkv)
+        scale = 1.0 / math.sqrt(HD)
+        r = ref(k, v, bt, q, cu_q, seq_lens, kd, vd, hq, hkv)
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            eager = V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+            )
+        stream.synchronize()
+        self.assertLess((eager.float() - r).abs().max().item(), 0.05)
+
+        out = torch.empty_like(eager)
+        g = torch.cuda.CUDAGraph()
+        V.reset_seg_plan_cache()
+        with torch.cuda.graph(g, stream=stream):
+            V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale, out=out
+            )
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertLess((out.float() - r).abs().max().item(), 0.05)
 
     def test_plan_cache_per_forward(self):
         V = self.V
