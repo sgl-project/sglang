@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -117,11 +118,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -399,20 +399,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        # When kv_len <= index_topk the top-k selects ALL valid positions, so the
-        # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
-        # topk_transform(dummy_logits) already yields the correct "select-all"
-        # (physical page-slot) indices. Skipping the logits path is safe here.
-        #
-        # Prefill/extend: original fast path, all platforms.
-        # Decode: new here, and ROCm-only for now (see the _is_hip gate below).
-        # Under a captured decode cuda graph the chosen branch is frozen at
-        # capture time and would replay incorrectly for kv_len > index_topk, so
-        # the decode skip is not decided per-step during capture; it is driven by
-        # which graph variant is being captured instead.
+        # topk_transform selects every valid page slot when kv_len <= index_topk;
+        # logits are unnecessary in that case.
         fb = forward_batch
 
-        # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
+        # Prefill/extend.
         if fb.forward_mode.is_extend_without_speculative():
             if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
                 return False
@@ -420,41 +411,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
-            # Decode k-only skip (both the captured dual-graph "dense" variant
-            # and the eager per-step skip below) is currently HIP-only. On CUDA
-            # this common code keeps the original behavior (decode never skips
-            # the indexer, i.e. always runs the full logits path) because the
-            # decode k-only path has not been validated on CUDA yet. Mirrors the
-            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
-            # already prevents the CUDA capture path from setting a "dense"
-            # variant.
-            if not _is_hip:
-                return False
             if get_is_capture_mode():
-                # Under a captured decode cuda graph the taken branch is frozen at
-                # capture time, so we must NOT branch on a runtime seq_len (also a
-                # host sync would break capture). The chosen branch is instead
-                # driven by which graph variant is being captured.
-                #
-                # The decode runner captures a "dense" (k-only) and a "sparse"
-                # (full indexer) graph per bs bucket and dispatches on max_kv_len
-                # at replay. The capture-variant signal tells us which one to
-                # bake in.
+                # Graph replay freezes this branch; use the capture variant,
+                # not capture-time sequence lengths.
                 from sglang.srt.model_executor.runner_utils.capture_mode import (
-                    get_capture_dsa_variant,
+                    get_capture_attention_variant,
                 )
 
-                variant = get_capture_dsa_variant()
-                if variant == "dense":
-                    return True
-                if variant == "sparse":
-                    return False
-
-                # No dual-variant capture signal: default to the correct-for-all
-                # full-indexer (sparse) path.
+                # No variant means the full indexer path for any context length.
+                return get_capture_attention_variant() == DSA_DENSE
+            # Eager k-only decode skip is validated on ROCm only.
+            if not _is_hip:
                 return False
-            # Eager decode: safe to check per-step (host sync OK); correct for both
-            # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())
             elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
@@ -530,11 +498,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif (
-            self.alt_stream is not None
-            and forward_batch.attn_cp_metadata is not None
-            and self.dsa_enable_prefill_cp
-        ):
+        elif self.alt_stream is not None and is_cp_active(forward_batch):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -543,17 +507,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                if is_cp_v2_active(forward_batch):
-                    key = get_cp_strategy().materialize_full_indexer_k_cache(
-                        key, forward_batch
-                    )
-                else:
-                    key = cp_all_gather_rerange_output(
-                        key.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                key = get_cp_strategy().materialize_full_indexer_k_cache(
+                    key, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
@@ -561,15 +517,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key = self._maybe_rotate(key)
 
         # allgather+rerrange
-        if is_cp_v2_active(forward_batch):
+        if is_cp_active(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
-        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
         return query, key, weights_raw
 
     def _get_k_bf16(

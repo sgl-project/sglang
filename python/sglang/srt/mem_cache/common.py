@@ -10,7 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -101,22 +101,21 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Local import: the unified allocators import this module lazily for
-        # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+        token_to_kv_pool_allocator.free_swa_segment(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
-
-        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # Contiguous range with host-int bounds: hand the composite its
-            # start position so the free stays host-sync-free (`free_segment`
-            # derives page reps by stride math instead of `torch.unique`).
-            token_to_kv_pool_allocator.free_swa(
-                free_slots, start_pos=req.kv.swa_evicted_seqlen
-            )
-        else:
-            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+
+
+def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def free_kv_row_segments(
@@ -161,33 +160,38 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
+    if tree_cache is not None and not tree_cache.is_chunk_cache():
+        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+            tree_cache, num_tokens
+        )
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> None:
+    """Keep evicting the shortfall until `num_tokens` are allocatable.
+
+    Under classed page sharding available_size() reports the MIN-CLASS
+    capacity floor, so a single evict() sized in tokens can raise that floor by
+    less than the number of tokens it freed: the evicted pages spread across
+    all owner classes. Looping is deterministic, so it stays mirrored across
+    the ranks of a shard group. Stock allocators need no extra pass.
+    """
+    if page_interleave_shard_size(allocator) <= 1:
         return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
+    while True:
         available_size = allocator.available_size()
-        if available_size < num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
-            )
+        if available_size >= num_tokens:
+            return
+        shortfall = num_tokens - available_size
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(shortfall, allocator.page_size))
+        )
+        if result.num_tokens_evicted == 0:
+            return
 
 
 def retraction_backup(
@@ -306,12 +310,16 @@ def _release_overallocated_kv_indices(
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
+    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
+    # page: paged free() releases the whole page containing any freed index, so
+    # a boundary aligned only to the kernel page could free a widened page whose
+    # head rows are still live.
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        # start_p is aligned to the allocator's physical page size above, so it
-        # never shares a page with cache_finished_req's tail free in this group.
+        # start_p is aligned to the allocator's page above, so it never shares a
+        # page with cache_finished_req's tail free in this group.
         tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
 
 

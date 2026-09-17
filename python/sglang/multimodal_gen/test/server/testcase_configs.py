@@ -127,6 +127,11 @@ class ScenarioConfig:
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
+    # Per-case override for the wall-clock tolerances (e2e, denoise and stage
+    # timings) when a case's runtime is dominated by shared-runner host I/O
+    # rather than by the code under test. Memory guards keep the profile
+    # tolerance -- they are what such a case actually protects.
+    timing_tolerance: float | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -148,6 +153,7 @@ class ScenarioConfig:
             runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            timing_tolerance=optional_float("timing_tolerance"),
         )
 
 

@@ -700,6 +700,13 @@ class DiffusionServerBase:
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
+        # a per-case timing tolerance is a deliberate property of the case, not a
+        # measurement: carry it into the suggested entry so a baseline refresh
+        # cannot silently drop it
+        existing = BASELINE_CONFIG.scenarios.get(case.id)
+        if existing is not None and existing.timing_tolerance is not None:
+            baseline["timing_tolerance"] = existing.timing_tolerance
+
         # Video-specific metrics
         if case.server_args.modality == "video":
             if "per_frame_generation" not in baseline["stages_ms"]:

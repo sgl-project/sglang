@@ -48,7 +48,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["mamba_full_memory_ratio"] = 0.1
     # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
     # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
-    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
+    # Inkling, so pin it here. Yields to an explicit --mamba-radix-cache-strategy.
     #
     # Compared against the unresolved token rather than the class default: the
     # default only answers "unset" while nothing has declared the field first,

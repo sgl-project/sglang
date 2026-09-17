@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -53,13 +54,14 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
-    is_cuda,
     is_hip,
     is_npu,
     support_triton,
@@ -67,6 +69,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -81,6 +84,74 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _build_forward_token_modalities(
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
+        return None
+    if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
+        raise ValueError(
+            "Multimodal metadata batch dimensions do not match: "
+            f"mm_inputs={len(mm_inputs)}, prefixes={len(extend_prefix_lens)}, "
+            f"extend_lens={len(extend_seq_lens)}"
+        )
+
+    modalities = []
+    has_multimodal_tokens = False
+    for mm_input, prefix_len, extend_len in zip(
+        mm_inputs, extend_prefix_lens, extend_seq_lens
+    ):
+        if mm_input is None or mm_input.token_modalities is None:
+            modalities.extend([0] * extend_len)
+            continue
+        end = prefix_len + extend_len
+        request_modalities = mm_input.token_modalities[prefix_len:end]
+        if len(request_modalities) != extend_len:
+            raise ValueError(
+                "Multimodal token metadata is shorter than the active forward span: "
+                f"prefix_len={prefix_len}, extend_len={extend_len}, "
+                f"metadata_len={len(mm_input.token_modalities)}"
+            )
+        has_multimodal_tokens |= any(request_modalities)
+        modalities.extend(request_modalities)
+
+    if len(modalities) != num_tokens:
+        raise ValueError(
+            "Multimodal token metadata does not match the forward batch: "
+            f"metadata_tokens={len(modalities)}, forward_tokens={num_tokens}"
+        )
+    if not has_multimodal_tokens:
+        return None
+    return torch.tensor(
+        modalities,
+        dtype=torch.int8,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
+
+
+def _maybe_build_forward_token_modalities(
+    model_config: ModelConfig,
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not model_config.requires_mm_token_modalities:
+        return None
+    return _build_forward_token_modalities(
+        mm_inputs,
+        extend_prefix_lens,
+        extend_seq_lens,
+        num_tokens,
+        device,
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -302,14 +373,20 @@ def compute_local_num_token_non_padded_cpu(
 
 
 def prefill_graph_tolerates_sum_len() -> bool:
-    """Whether MegaMoE may replay prefill graphs with local shapes."""
+    """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
+
+    The graph body is captured with MAX_LEN geometry, so a graph that recorded
+    a DP gather/scatter only replays correctly when every rank uses one bucket.
+    """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-    from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
+    from sglang.srt.layers.cp.utils import is_mla_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
+    if get_flags().dp.prefill_graph_has_dp_gather:
+        return False
+    return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
 
 @dataclass
@@ -475,6 +552,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_token_modalities: Optional[torch.Tensor] = None
+    multi_gate_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Encoder-decoder host fields
     encoder_cached: Optional[List[bool]] = None
@@ -564,6 +643,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Prefill body-CUDA-graph context limit. Attention backends that allocate
+    # context-shaped metadata use this fixed maximum instead of deriving a
+    # shape from the live batch. None preserves eager/default graph behavior.
+    max_seq_len_override: Optional[int] = None
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
@@ -856,6 +940,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
+        ret.mm_token_modalities = _maybe_build_forward_token_modalities(
+            model_runner.model_config,
+            ret.mm_inputs,
+            extend_prefix_lens if isinstance(extend_prefix_lens, list) else None,
+            extend_seq_lens if isinstance(extend_seq_lens, list) else None,
+            len(batch.input_ids) if batch.input_ids is not None else 0,
+            device,
+        )
+
         model_runner.kv_index_translator.rebind_write_loc(ret)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -1059,28 +1152,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sharded=sharded,
         )
 
-    def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of this extend chunk covered by the tracked mamba state,
+        floored to the mamba_cache_chunk_size boundary the scheduler snapshots at;
+        the +1 that _force_track_h adds cancels under the floor.
+        Sole home of this math: every side state snapshotting alongside mamba calls it.
+        None means tracking is skipped for this forward:
+        no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
+        Masked-off rows hold garbage.
         """
-        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
-
-        Returns:
-            if none, current batch contains no multimodal input
-
-        """
-        if not self.mm_inputs or all(x is None for x in self.mm_inputs):
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
             return None
-        # Filter out None values
-        valid_inputs = [x for x in self.mm_inputs if x is not None]
 
-        # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
-        merged = valid_inputs[0].__class__(mm_items=[])
-
-        # Merge remaining inputs
-        for mm_input in valid_inputs:
-            merged.merge(mm_input)
-
-        return merged
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
 
     def contains_image_inputs(self) -> bool:
         if self.mm_inputs is None:
@@ -1302,7 +1392,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :,
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
                 ]
-                if mrope_positions.numel() == 0:
+                if (
+                    batch.reqs[batch_idx].session is not None
+                    and mrope_positions.shape[1] < extend_seq_len
+                ):
+                    # Session history includes generated and appended text that
+                    # is not covered by the saved prompt positions.
+                    tail_len = extend_seq_len - mrope_positions.shape[1]
+                    tail_start = extend_prefix_len + mrope_positions.shape[1]
+                    text_positions = self._expand_mrope_from_input(
+                        mm_input, tail_start + 1
+                    ) + torch.arange(tail_len)
+                    mrope_positions = torch.cat(
+                        [mrope_positions, text_positions], dim=1
+                    )
+                elif mrope_positions.numel() == 0:
                     mrope_positions = self._expand_mrope_from_input(
                         mm_input, seq_lens_cpu[batch_idx]
                     )
@@ -1331,10 +1435,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local imports: module-level CP helper imports here are circular (#27014).
-        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-        from sglang.srt.layers.cp.utils import enable_cp_v2
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -1347,16 +1447,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-
-        # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
-        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
-        # prefill with NaN draft logits, see #23269).
-        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
-            cp_align_size = get_cp_padding_align_size()
-            for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1910,18 +2000,6 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
-
-
-def _clamp_position_native(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
-if is_cuda() or is_hip():
-    from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
-
-    clamp_position = clamp_position_cuda
-else:
-    clamp_position = _clamp_position_native
 
 
 def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
