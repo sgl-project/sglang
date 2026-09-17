@@ -228,10 +228,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else get_schedule().max_total_tokens or kvc.model_config.context_len
         )
 
-        # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
-        # Assumes draft and target share the same per-layer KV size (head_dim,
-        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
-        # reuse the target architecture's attention config.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -272,6 +268,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         * dcp_size
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
+                elif not kvc.use_mla_backend and not is_minimax_sparse(
+                    kvc.model_config.hf_config
+                ):
+                    self._cell_size += (
+                        self._compute_cell_size(kvc, draft_num_layers, is_draft=True)
+                        * kvc.ps.attn_dcp_size
+                    )
                 else:
                     draft_num_layers *= kvc.ps.attn_dcp_size
                     self._cell_size = int(
@@ -302,7 +305,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
+    def _compute_cell_size(
+        self, kvc: KVCacheConfigurator, num_layers: int, is_draft: bool = False
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
         model_config = kvc.model_config
@@ -319,7 +324,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
-        dcp_size = get_parallel().attn_dcp_size
+        dcp_size = 1 if is_draft else get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
