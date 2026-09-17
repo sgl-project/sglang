@@ -6,10 +6,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
-from sglang.srt.arg_groups.validation_hook import (
-    validate_ib_devices,
-    validate_intel_xpu_sampling_backend,
-)
+from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,6 +44,7 @@ class TestServerArgsCPUBackend(CustomTestCase):
             resolution_result(server_args, "attention_backend"), "intel_amx"
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
+
 
 class TestServerArgsIBDeviceValidation(CustomTestCase):
     def _validate_ib_devices(self, device_str, available_devices=None):
