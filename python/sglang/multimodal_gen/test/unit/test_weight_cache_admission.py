@@ -210,9 +210,17 @@ def test_physical_gpu_compatibility_does_not_include_local_ordinal():
         ),
     ):
         prepared = SimpleNamespace(
-            pipeline_cls=SimpleNamespace(__name__="WanPipeline"),
-            transformer=None,
-            adapter=SimpleNamespace(fingerprint_fields=Mock(return_value={})),
+            pipeline_cls=SimpleNamespace(__module__="test", __qualname__="WanPipeline"),
+            binding_id="test",
+            model_path="/published",
+            cached_component_names=("transformer",),
+            cached_components=(
+                SimpleNamespace(
+                    name="transformer",
+                    fingerprint_fields=Mock(return_value={}),
+                    consumed_files=Mock(return_value=()),
+                ),
+            ),
         )
         a = identity.compatibility_plan(
             prepared, SimpleNamespace(gpu_ids=None, base_gpu_id=0)
@@ -345,12 +353,12 @@ def prepared_wan(tmp_path):
 
     from safetensors.torch import save_file
 
+    from sglang.multimodal_gen.runtime.loader.native_dit_state import (
+        WAN_CONFIG as EXPECTED_CONFIG,
+    )
     from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
     from sglang.multimodal_gen.runtime.pipelines.wan_pipeline import WanPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
-    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
-        EXPECTED_CONFIG,
-    )
 
     index = {
         "_class_name": "WanPipeline",
@@ -410,10 +418,6 @@ def test_post_import_preparation_constructs_no_modules_or_cuda_state(prepared_wa
 
 
 def test_uncached_placement_changes_execution_not_cache_fingerprint(prepared_wan):
-    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
-        fingerprint_fields,
-    )
-
     args, pipeline, prepare = prepared_wan
     a = prepare(pipeline, args, required=True)
     other = make_args(
@@ -421,9 +425,15 @@ def test_uncached_placement_changes_execution_not_cache_fingerprint(prepared_wan
     )
     b = prepare(pipeline, other, required=True)
     assert a.execution_plan != b.execution_plan
-    assert fingerprint_fields(a.transformer) == fingerprint_fields(b.transformer)
+    assert (
+        a.component("transformer").fingerprint_fields()
+        == b.component("transformer").fingerprint_fields()
+    )
     ordinary = prepare(pipeline, args.resolve_variant(weight_cache_mode="off"))
-    assert fingerprint_fields(a.transformer) == fingerprint_fields(ordinary.transformer)
+    assert (
+        a.component("transformer").fingerprint_fields()
+        == ordinary.component("transformer").fingerprint_fields()
+    )
     assert a.specs == ordinary.specs
 
 
@@ -440,15 +450,15 @@ def test_uncached_placement_changes_execution_not_cache_fingerprint(prepared_wan
         "tp",
     ],
 )
-def test_resolved_adapter_rejects_unverified_variants(prepared_wan, variant):
+def test_resolved_contract_rejects_unverified_variants(prepared_wan, variant):
     import torch
 
-    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
-        validate_supported,
-    )
+    from sglang.multimodal_gen.runtime.loader.native_dit_state import WAN
 
     args, pipeline, prepare = prepared_wan
-    recipe = prepare(pipeline, args, required=True).transformer.thaw()
+    recipe = (
+        prepare(pipeline, args, required=True).component("transformer").recipe.thaw()
+    )
     attention = "fa"
     if variant == "same_named_class":
         recipe.model_cls = type("WanTransformer3DModel", (), {})
@@ -471,7 +481,7 @@ def test_resolved_adapter_rejects_unverified_variants(prepared_wan, variant):
     frozen = Mock()
     frozen.thaw.return_value = recipe
     with pytest.raises(ValueError):
-        validate_supported(frozen, pipeline_name="WanPipeline", attention=attention)
+        WAN.validate_supported(frozen, attention=attention)
 
 
 def test_custom_loader_is_not_silently_bypassed(prepared_wan):

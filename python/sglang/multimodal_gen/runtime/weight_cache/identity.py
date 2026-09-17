@@ -30,23 +30,13 @@ from sglang.weight_cache_common.identity import FileStamp, socket_path, source_d
 
 def consumed_files(prepared):
     root = Path(prepared.model_path)
-    recipe = prepared.transformer.thaw()
-    files = [
-        root / "model_index.json",
-        Path(recipe.server_args.model_paths["transformer"]) / "config.json",
-    ]
-    files.extend(Path(path) for path in recipe.weight_files)
-    for filename in (
-        "diffusion_pytorch_model.safetensors.index.json",
-        "model.safetensors.index.json",
-    ):
-        index = Path(recipe.server_args.model_paths["transformer"]) / filename
-        if index.exists():
-            files.append(index)
+    files = {root / "model_index.json"}
+    for component in prepared.cached_components:
+        files.update(component.consumed_files())
     # Exact consumed paths, including any index which selected the shards.
     if any(not path.absolute().is_relative_to(root.absolute()) for path in files):
         raise ValueError(
-            "Weight cache initial adapter requires component weights/configs inside the model directory"
+            "Weight cache requires component weights/configs inside the published model directory"
         )
     return root, tuple(sorted(path.relative_to(root).as_posix() for path in files))
 
@@ -189,10 +179,22 @@ def compatibility_plan(prepared, args, *, verify_checkpoint=False):
     # CUDA_VISIBLE_DEVICES may renumber the same physical GPU in the consumer.
     rank_fields.pop("local_device")
     return CacheCompatibilityPlan.from_fields(
-        pipeline=prepared.pipeline_cls.__name__,
+        pipeline={
+            "class": f"{prepared.pipeline_cls.__module__}.{prepared.pipeline_cls.__qualname__}",
+            "binding": prepared.binding_id,
+        },
         rank=rank_fields,
-        requested=["transformer"],
-        component=prepared.adapter.fingerprint_fields(prepared.transformer),
+        requested=list(prepared.cached_component_names),
+        components={
+            component.name: {
+                **component.fingerprint_fields(),
+                "checkpoint_files": sorted(
+                    path.relative_to(prepared.model_path).as_posix()
+                    for path in component.consumed_files()
+                ),
+            }
+            for component in prepared.cached_components
+        },
         checkpoint=checkpoint_identity(prepared, args, verify=verify_checkpoint),
         environment=environment_identity(args),
     )

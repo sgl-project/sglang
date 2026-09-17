@@ -138,12 +138,17 @@ def materialize_from_cache(prepared, args):
         # Watchdog is live before even requesting any counted send references.
         importer = CudaIpcImporter(generation, manifest)
         guarded = time.perf_counter()
-        model = prepared.adapter.build_meta(prepared.transformer)
+        # Protocol v1 serves one component. The following bundle migration
+        # replaces this restriction without changing component capabilities.
+        if len(prepared.cached_components) != 1:
+            raise ValueError("Protocol v1 requires one cached component")
+        component = prepared.cached_components[0]
+        model = component.build_meta()
         constructed = time.perf_counter()
         request_id = uuid.uuid4().hex
         response = client.request(
             "fetch_component",
-            component="transformer",
+            component=component.name,
             generation=msgspec.to_builtins(generation),
             request_id=request_id,
         )
@@ -157,7 +162,7 @@ def materialize_from_cache(prepared, args):
         fetched = time.perf_counter()
         importer.receive(delivery, model, request_id=request_id)
         mapped = time.perf_counter()
-        model = prepared.adapter.finalize_after_import(model)
+        model = component.finalize_after_import(model)
     finalized = time.perf_counter()
     elapsed = finalized - start
     logger.info(
@@ -181,8 +186,8 @@ def materialize_from_cache(prepared, args):
             sort_keys=True,
         ),
     )
-    pipeline = prepared.materialize(args, loaded_modules={"transformer": model})
-    pipeline.memory_usages["transformer"] = manifest.unique_storage_bytes / (1024**3)
+    pipeline = prepared.materialize(args, loaded_modules={component.name: model})
+    pipeline.memory_usages[component.name] = manifest.unique_storage_bytes / (1024**3)
     pipeline._weight_cache_import_seconds = elapsed
     importer.check_alive()
     return pipeline

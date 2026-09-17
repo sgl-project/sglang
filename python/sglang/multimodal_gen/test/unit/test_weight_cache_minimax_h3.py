@@ -15,12 +15,16 @@ from safetensors.torch import save_file
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.loader import native_dit_state
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
+from sglang.multimodal_gen.runtime.loader.native_dit_state import MINIMAX_H3
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.weight_cache.adapters import common, dit_minimax_h3
 from sglang.multimodal_gen.runtime.weight_cache.identity import checkpoint_identity
 from sglang.weight_cache_common.mapping import validate_meta_schema
 from sglang.weight_cache_common.traversal import snapshot_module
@@ -55,9 +59,7 @@ def h3_args(tmp_path):
     index["transformer"] = ["diffusers", "MiniMaxH3DiTModel"]
     (root / "model_index.json").write_text(json.dumps(index))
     (root / "transformer/config.json").write_text(
-        json.dumps(
-            {"_class_name": "MiniMaxH3DiTModel", **dit_minimax_h3.EXPECTED_CONFIG}
-        )
+        json.dumps({"_class_name": "MiniMaxH3DiTModel", **MINIMAX_H3.expected_config})
     )
     save_file({}, root / "transformer/model.safetensors")
     (root / "transformer/model.safetensors.index.json").write_text(
@@ -86,7 +88,6 @@ def h3_args(tmp_path):
 
 
 def test_h3_reuses_ordinary_loader_and_pure_frozen_preparation(h3_args):
-    assert dit_minimax_h3.load_ordinary is common.load_ordinary
     with (
         patch.object(torch.nn.Module, "__init__", side_effect=AssertionError("module")),
         patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("CUDA")),
@@ -96,15 +97,16 @@ def test_h3_reuses_ordinary_loader_and_pure_frozen_preparation(h3_args):
         ),
     ):
         prepared = prepare_pipeline(MiniMaxH3Pipeline, h3_args, required=True)
-    assert prepared.adapter is dit_minimax_h3
+    assert prepared.component("transformer").contract is MINIMAX_H3
     assert prepared.model_path == str(Path(h3_args.model_path) / "FL2VA")
     assert h3_args.model_subfolder is None and h3_args.model_paths == {}
     off = prepare_pipeline(
         MiniMaxH3Pipeline, h3_args.resolve_variant(weight_cache_mode="off")
     )
     assert prepared.specs == off.specs
-    assert prepared.adapter.fingerprint_fields(prepared.transformer) == (
-        off.adapter.fingerprint_fields(off.transformer)
+    assert (
+        prepared.component("transformer").fingerprint_fields()
+        == off.component("transformer").fingerprint_fields()
     )
     args = copy.deepcopy(h3_args)
     prepared.apply_config(args)
@@ -145,9 +147,11 @@ def test_h3_reuses_ordinary_loader_and_pure_frozen_preparation(h3_args):
     ],
 )
 def test_h3_rejects_unverified_representations(h3_args, variant):
-    recipe = prepare_pipeline(
-        MiniMaxH3Pipeline, h3_args, required=True
-    ).transformer.thaw()
+    recipe = (
+        prepare_pipeline(MiniMaxH3Pipeline, h3_args, required=True)
+        .component("transformer")
+        .recipe.thaw()
+    )
     attention = "fa"
     arch = recipe.init_params["config"].arch_config
     if variant == "class":
@@ -177,9 +181,8 @@ def test_h3_rejects_unverified_representations(h3_args, variant):
     elif variant == "compile":
         recipe.server_args.enable_torch_compile = True
     with pytest.raises(ValueError):
-        dit_minimax_h3.validate_supported(
+        MINIMAX_H3.validate_supported(
             SimpleNamespace(thaw=lambda: recipe),
-            pipeline_name="MiniMaxH3Pipeline",
             attention=attention,
         )
 
@@ -231,14 +234,14 @@ def test_fast_h3_and_diffusers_layout_not_admitted(h3_args):
     from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
         FastH3Pipeline,
     )
-    from sglang.multimodal_gen.runtime.weight_cache import adapters
+    from sglang.multimodal_gen.runtime.weight_cache import policy
 
-    assert adapters.for_pipeline(FastH3Pipeline) is None
+    assert policy.for_pipeline(FastH3Pipeline) is None
     config = {
         "_class_name": "MiniMaxH3Transformer3DModel",
-        **dit_minimax_h3.EXPECTED_CONFIG,
+        **MINIMAX_H3.expected_config,
     }
-    assert not dit_minimax_h3.supports_config(config)
+    assert not MINIMAX_H3.supports_config(config)
 
 
 def test_finalized_rope_kind_matches_ordinary_assign_loader():
@@ -257,9 +260,7 @@ def test_finalized_rope_kind_matches_ordinary_assign_loader():
     assert "inv_freq" in ordinary.rope._parameters
     with torch.device("meta"):
         meta = skeleton()
-    with patch.object(common, "build_meta", return_value=meta) as build:
-        assert dit_minimax_h3.build_meta("frozen") is meta
-    build.assert_called_once_with("frozen")
+    assert MINIMAX_H3.adapt_meta_schema(meta) is meta
     validate_meta_schema(meta, snapshot_module(ordinary).manifest)
 
 
@@ -285,13 +286,13 @@ def test_import_only_runs_read_only_native_precision_checks(field):
     )
     if field is not None:
         setattr(model, field, True)
-    with patch.object(dit_minimax_h3, "finalize_loaded_model", return_value=model):
+    with patch.object(native_dit_state, "finalize_loaded_model", return_value=model):
         if field is None:
-            assert dit_minimax_h3.finalize_after_import(model) is model
+            assert MINIMAX_H3.finalize_after_import(model) is model
             model.post_load_weights.assert_called_once_with()
         else:
             with pytest.raises(ValueError, match="AdaLN"):
-                dit_minimax_h3.finalize_after_import(model)
+                MINIMAX_H3.finalize_after_import(model)
             model.post_load_weights.assert_not_called()
 
 
@@ -308,10 +309,20 @@ def _hf_prepared(tmp_path, partition):
         (root / name).write_text("{}")
     args = SimpleNamespace(model_paths={"transformer": str(component)})
     recipe = SimpleNamespace(
-        server_args=args, weight_files=[str(component / "model.safetensors")]
+        server_args=args,
+        component_name="transformer",
+        weight_files=[str(component / "model.safetensors")],
     )
     return SimpleNamespace(
-        model_path=str(root), transformer=SimpleNamespace(thaw=lambda: recipe)
+        model_path=str(root),
+        recipe=recipe,
+        cached_components=(
+            SimpleNamespace(
+                consumed_files=lambda: TransformerLoader().prepared_checkpoint_files(
+                    SimpleNamespace(thaw=lambda: recipe)
+                )
+            ),
+        ),
     )
 
 
@@ -343,7 +354,7 @@ def test_hf_root_identity_stays_compatible_and_bad_revision_fails_closed(tmp_pat
     original = Path(prepared.model_path)
     bad = original.with_name("not-a-pinned-revision")
     original.rename(bad)
-    recipe = prepared.transformer.thaw()
+    recipe = prepared.recipe
     recipe.server_args.model_paths["transformer"] = str(bad / "transformer")
     recipe.weight_files = [str(bad / "transformer/model.safetensors")]
     prepared.model_path = str(bad)

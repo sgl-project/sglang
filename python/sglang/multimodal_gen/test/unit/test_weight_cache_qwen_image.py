@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen adapter decisions without loading checkpoint tensors."""
+"""Qwen state-contract decisions without loading checkpoint tensors."""
 
 import json
 import multiprocessing as mp
@@ -14,15 +14,12 @@ from safetensors.torch import save_file
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.runtime.loader import native_dit_state
+from sglang.multimodal_gen.runtime.loader.native_dit_state import QWEN_IMAGE
 from sglang.multimodal_gen.runtime.pipelines.qwen_image import QwenImagePipeline
 from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.weight_cache import adapters
-from sglang.multimodal_gen.runtime.weight_cache.adapters import (
-    common,
-    dit_qwen_image,
-    dit_wan,
-)
+from sglang.multimodal_gen.runtime.weight_cache import policy
 
 
 @pytest.fixture
@@ -44,7 +41,7 @@ def prepared_qwen(tmp_path):
         json.dumps(
             {
                 "_class_name": "QwenImageTransformer2DModel",
-                **dit_qwen_image.EXPECTED_CONFIG,
+                **QWEN_IMAGE.expected_config,
             }
         )
     )
@@ -145,12 +142,7 @@ def test_auto_tuning_across_bare_owner_worker_memory_states(prepared_qwen):
     assert results[0]["execution"] != results[1]["execution"]
 
 
-def test_both_adapters_use_the_same_ordinary_and_meta_loaders():
-    assert dit_qwen_image.load_ordinary is dit_wan.load_ordinary is common.load_ordinary
-    assert dit_qwen_image.build_meta is dit_wan.build_meta is common.build_meta
-
-
-def test_qwen_preparation_is_pure_and_freezes_adapter(prepared_qwen):
+def test_qwen_preparation_is_pure_and_freezes_contract(prepared_qwen):
     from sglang.multimodal_gen.runtime.loader.component_loaders import (
         transformer_loader,
     )
@@ -169,19 +161,20 @@ def test_qwen_preparation_is_pure_and_freezes_adapter(prepared_qwen):
         ),
     ):
         prepared = prepare_pipeline(QwenImagePipeline, prepared_qwen, required=True)
-    assert prepared.adapter_id == dit_qwen_image.ADAPTER_ID
+    assert prepared.component("transformer").contract is QWEN_IMAGE
     assert prepared_qwen.model_paths == {}
     with patch.object(
-        adapters, "for_pipeline", side_effect=AssertionError("rediscovery")
+        policy, "for_pipeline", side_effect=AssertionError("rediscovery")
     ):
-        assert prepared.adapter is dit_qwen_image
+        assert prepared.component("transformer").contract is QWEN_IMAGE
     ordinary = prepare_pipeline(
         QwenImagePipeline, prepared_qwen.resolve_variant(weight_cache_mode="off")
     )
     assert prepared.specs == ordinary.specs
-    assert prepared.adapter.fingerprint_fields(
-        prepared.transformer
-    ) == ordinary.adapter.fingerprint_fields(ordinary.transformer)
+    assert (
+        prepared.component("transformer").fingerprint_fields()
+        == ordinary.component("transformer").fingerprint_fields()
+    )
 
 
 @pytest.mark.parametrize(
@@ -199,10 +192,12 @@ def test_qwen_preparation_is_pure_and_freezes_adapter(prepared_qwen):
         "compile",
     ],
 )
-def test_qwen_adapter_rejects_unverified_representations(prepared_qwen, variant):
-    recipe = prepare_pipeline(
-        QwenImagePipeline, prepared_qwen, required=True
-    ).transformer.thaw()
+def test_qwen_contract_rejects_unverified_representations(prepared_qwen, variant):
+    recipe = (
+        prepare_pipeline(QwenImagePipeline, prepared_qwen, required=True)
+        .component("transformer")
+        .recipe.thaw()
+    )
     attention = "fa"
     if variant == "class":
         recipe.model_cls = type("QwenImageTransformer2DModel", (), {})
@@ -227,9 +222,7 @@ def test_qwen_adapter_rejects_unverified_representations(prepared_qwen, variant)
     frozen = Mock()
     frozen.thaw.return_value = recipe
     with pytest.raises(ValueError):
-        dit_qwen_image.validate_supported(
-            frozen, pipeline_name="QwenImagePipeline", attention=attention
-        )
+        QWEN_IMAGE.validate_supported(frozen, attention=attention)
 
 
 def test_forced_pipeline_does_not_admit_edit_checkpoint(prepared_qwen):
@@ -239,7 +232,7 @@ def test_forced_pipeline_does_not_admit_edit_checkpoint(prepared_qwen):
     index = json.loads(path.read_text())
     index["_class_name"] = "QwenImageEditPipeline"
     path.write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="admitted single-transformer"):
+    with pytest.raises(ValueError, match="audited pipeline component layout"):
         prepare_pipeline(QwenImagePipeline, prepared_qwen, required=True)
     assert (
         prepare_pipeline(
@@ -249,9 +242,11 @@ def test_forced_pipeline_does_not_admit_edit_checkpoint(prepared_qwen):
     )
 
 
-def test_unknown_prepared_adapter_fails_closed():
-    with pytest.raises(ValueError, match="Unknown prepared"):
-        adapters.by_id("unverified")
+def test_unbound_pipeline_with_same_model_is_not_admitted():
+    class UnverifiedPipeline(QwenImagePipeline):
+        pass
+
+    assert policy.for_pipeline(UnverifiedPipeline) is None
 
 
 @pytest.mark.parametrize("enabled", [None, *range(5)])
@@ -271,13 +266,13 @@ def test_import_finalization_rejects_quantized_derived_state(enabled):
         post_load_weights=Mock(side_effect=AssertionError("Repeated weight transform")),
     )
     with patch.object(
-        dit_qwen_image, "finalize_loaded_model", return_value=model
+        native_dit_state, "finalize_loaded_model", return_value=model
     ) as finalize:
         if enabled is None:
-            assert dit_qwen_image.finalize_after_import(model) is model
+            assert QWEN_IMAGE.finalize_after_import(model) is model
             finalize.assert_called_once_with(model)
         else:
             with pytest.raises(ValueError, match="derived state"):
-                dit_qwen_image.finalize_after_import(model)
+                QWEN_IMAGE.finalize_after_import(model)
             finalize.assert_not_called()
     model.post_load_weights.assert_not_called()

@@ -668,15 +668,11 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            if prepared is not None and module_name == "transformer":
-                from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-                    TransformerLoader,
-                )
-                from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-                module, memory_usage = TransformerLoader().load_prepared(
-                    prepared.transformer, attention_backend=AttentionBackendEnum.FA
-                )
+            prepared_component = (
+                prepared.component(module_name) if prepared is not None else None
+            )
+            if prepared_component is not None:
+                module, memory_usage = prepared_component.load_ordinary()
             else:
                 module, memory_usage = PipelineComponentLoader.load_component(
                     component_name=module_name,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real diffusion UDS/IPC orchestration with a tiny, test-only CUDA adapter.
+"""Real diffusion UDS/IPC orchestration with a tiny, test-only CUDA component.
 
 Only checkpoint resolution and distributed bootstrap are substituted. Requests,
 generation admission, mapping, finalization ordering, and watchdogs are real.
@@ -30,7 +30,9 @@ register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC")
 
 
-class TinyAdapter:
+class TinyComponent:
+    name = "transformer"
+
     def __init__(self, connection=None, pause=None):
         self.connection = connection
         self.pause = pause
@@ -42,13 +44,13 @@ class TinyAdapter:
             # real watchdog must remain live. Parent never releases this wait.
             assert self.connection.recv() == "continue"
 
-    def load_ordinary(self, _):
+    def load_ordinary(self):
         model = torch.nn.Linear(4, 4, bias=False, device="cuda:0")
         with torch.no_grad():
             model.weight.fill_(2)
-        return model.eval()
+        return model.eval(), 0
 
-    def build_meta(self, _):
+    def build_meta(self):
         self._pause("before_fetch")
         return torch.nn.Linear(4, 4, bias=False, device="meta").eval()
 
@@ -58,13 +60,11 @@ class TinyAdapter:
 
 
 class TinyPrepared:
-    transformer = None
-
     def __init__(self, connection=None, pause=None):
-        self.adapter = TinyAdapter(connection, pause)
+        self.cached_components = (TinyComponent(connection, pause),)
 
     def materialize(self, args, *, loaded_modules):
-        self.adapter._pause("uncached_load")
+        self.cached_components[0]._pause("uncached_load")
         torch.testing.assert_close(
             loaded_modules["transformer"].weight.cpu(), torch.full((4, 4), 2.0)
         )

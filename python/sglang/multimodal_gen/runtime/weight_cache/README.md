@@ -1,6 +1,6 @@
 # Diffusion weight-cache recovery
 
-Three explicit native transformer adapters are supported: Wan2.1 T2V 1.3B,
+Three audited pipeline bindings are supported: Wan2.1 T2V 1.3B,
 original Qwen-Image (not Edit, Layered or 2512), and original MiniMax-H3 FL2VA
 (not Ref2VA, FastH3, pruned or Diffusers-layout H3). All require CUDA,
 single GPU/rank/node, bf16, resident non-FSDP weights, FA attention and eager
@@ -92,14 +92,25 @@ Set the owner's `--weight-cache-max-deliveries` to configure the delivery cap
 | Weight loading and finalization | Existing diffusion `TransformerLoader` and `ComponentLoader`, using frozen decisions |
 | Pipeline component materialization | Existing `ComposedPipelineBase` load loop, including uncached components |
 | Runtime initialization | Shared diffusion worker/owner bootstrap |
-| New diffusion-specific logic | Component adapter, prepared pipeline, compatibility/execution plans, strict admission and owner/client orchestration |
+| New diffusion-specific logic | Pipeline bindings, prepared components, state contracts, compatibility/execution plans, strict admission and owner/client orchestration |
 
 Storage aliases and exact object ties require a component state manifest on top
 of the existing tensor transport. The component layer does not implement Torch
 CUDA handle creation/reconstruction or a second serializer.
 
-All adapters reuse the same ordinary loader, meta constructor, common admission
-checks and fingerprint mechanics. Qwen's packed text QKV is imported in its
+`PreparedPipeline.cached_components` holds frozen loader-owned recipes. The
+existing `ComponentLoader.for_component_type` selects the actual loader, which
+must explicitly implement cache preparation. `weight_cache/policy.py` separately
+admits pipeline/component/loader/contract combinations: sharing a model class
+does not automatically admit another pipeline. `loader/native_dit_state.py`
+declares the three audited representations with shared validation and small
+schema/finalization hooks, not one complete cache adapter file per model.
+Uncached components still use the ordinary pipeline load loop. Checkpoint
+identity covers the deduplicated union of all cached components' consumed files;
+the current publication contract still requires one model root.
+
+All three DiTs reuse the same ordinary loader and meta constructor.
+Qwen's packed text QKV is imported in its
 ordinary finalized layout. RoPE frequencies, modulation caches and the small
 `timestep_zero` constant are process-local derived state, not shared weights.
 
@@ -108,7 +119,7 @@ only by the ordinary loader, never again after import. Its persistent FP32 RoPE
 is shared in the loader's finalized parameter registration; its lazy timestep
 frequency buffer is process-local. Prepared and ordinary construction share
 partition resolution and release-metadata validation. AdaLN side/online caches
-are not supported by this adapter.
+are not supported by this state contract.
 
 For native MiniMax-H3, use the pinned **repository root** and
 `--model-variant fl2va` for both owner and client. A repository can also contain a
@@ -181,7 +192,7 @@ from fresh interpreter startup, including launcher and spawned worker, with a
 positive rejection control. It allows header/stat/config and uncached-component
 reads, runs two simultaneous Wan consumers, checks output/weight parity, and
 checks real owner status through budget exhaustion and client exit. It is not a
-generic syscall/security sandbox. The lifecycle test uses a tiny CUDA adapter
+generic syscall/security sandbox. The lifecycle test uses a tiny CUDA component
 with real diffusion socket/IPC orchestration and injects generation replacement
 and producer death before fetch, during finalize, and during slow uncached load.
 It also blocks two fresh workers in meta construction simultaneously, checks

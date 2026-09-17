@@ -345,7 +345,9 @@ class DiffusionWeightCacheDaemon:
                 rendezvous=NetworkAddress("127.0.0.1", get_free_port()),
                 role="diffusion_weight_cache_daemon",
             )
-            model = self.prepared.adapter.load_ordinary(self.prepared.transformer)
+            if len(self.prepared.cached_components) != 1:
+                raise ValueError("Protocol v1 requires one cached component")
+            model, _ = self.prepared.cached_components[0].load_ordinary()
             self.exporter = CudaIpcExporter(
                 model, max_deliveries=self.args.weight_cache_max_deliveries
             )

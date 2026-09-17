@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Component capabilities are loader-owned, frozen, and separately admitted."""
 
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import pytest
 import torch
 
@@ -62,14 +65,15 @@ def test_existing_rows_share_actual_loader_capability(request, fixture_name, con
     ):
         component = loader.prepare_weight_cache(
             spec,
-            prepared.transformer.thaw().server_args,
+            prepared.component("transformer").recipe.thaw().server_args,
             planned_device=torch.device("cuda", 0),
         )
     assert component.contract is contract
     assert component.loader_cls is TransformerLoader
     assert component.name == "transformer"
     assert (
-        component.recipe.thaw().weight_files == prepared.transformer.thaw().weight_files
+        component.recipe.thaw().weight_files
+        == prepared.component("transformer").recipe.thaw().weight_files
     )
     fingerprint = component.fingerprint_fields()
     assert fingerprint["contract"] == contract.contract_id
@@ -89,3 +93,68 @@ def test_state_contract_rejects_same_named_unregistered_class():
     fake = type(WAN.model_name, (), {"__module__": WAN.model_module})
     with pytest.raises(ValueError, match="resolved model"):
         for_model(fake)
+
+
+def test_pipeline_binding_and_state_capability_are_both_required(prepared_wan):
+    from sglang.multimodal_gen.runtime.weight_cache import policy
+
+    args, pipeline, prepare = prepared_wan
+    binding = policy.for_pipeline(pipeline)
+    wrong = msgspec.structs.replace(
+        binding,
+        components=(
+            msgspec.structs.replace(
+                binding.components[0], contract_id=QWEN_IMAGE.contract_id
+            ),
+        ),
+    )
+    with patch.object(policy, "for_pipeline", return_value=wrong):
+        with pytest.raises(ValueError, match="differs from audited pipeline binding"):
+            prepare(pipeline, args, required=True)
+
+
+def test_prepared_component_collection_and_identity_cover_every_input(prepared_wan):
+    from sglang.multimodal_gen.runtime.weight_cache import identity
+
+    args, pipeline, prepare = prepared_wan
+    args.weight_cache_allow_weak_checkpoint_identity = True
+    prepared = prepare(pipeline, args, required=True)
+    first = prepared.cached_components[0]
+    other_file = Path(prepared.model_path) / "test_encoder.weights"
+    other_file.write_bytes(b"test-only second component")
+    second = SimpleNamespace(
+        name="text_encoder",
+        consumed_files=lambda: (other_file, *first.consumed_files()),
+        fingerprint_fields=lambda: {"contract": "test.encoder.v1"},
+    )
+    multi = msgspec.structs.replace(prepared, cached_components=(first, second))
+    assert multi.cached_component_names == ("transformer", "text_encoder")
+    assert multi.component("text_encoder") is second
+    assert multi.component("vae") is None
+    _, names = identity.consumed_files(multi)
+    assert len(names) == len(set(names))
+    assert "test_encoder.weights" in names
+    with (
+        patch.object(identity, "environment_identity", return_value={}),
+        patch.object(
+            identity.current_platform, "get_device_uuid", return_value="test-gpu"
+        ),
+    ):
+        plan = identity.compatibility_plan(multi, args)
+        fields = plan.to_dict()
+        assert set(fields["components"]) == {"transformer", "text_encoder"}
+        assert fields["components"]["text_encoder"]["checkpoint_files"] == sorted(
+            [
+                "test_encoder.weights",
+                *fields["components"]["transformer"]["checkpoint_files"],
+            ]
+        )
+        second.fingerprint_fields = lambda: {"contract": "test.encoder.v2"}
+        assert identity.compatibility_plan(multi, args) != plan
+    with pytest.raises(ValueError, match="distinct"):
+        msgspec.structs.replace(prepared, cached_components=(first, first))
+    with pytest.raises(ValueError, match="absent"):
+        msgspec.structs.replace(
+            prepared,
+            cached_components=(msgspec.structs.replace(first, name="missing"),),
+        )
