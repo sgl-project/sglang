@@ -7,19 +7,24 @@ Usage:
 """
 
 import unittest
+from contextlib import contextmanager
 from typing import List
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
+    get_fp8_gemm_runner_backend,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     torch_w8a8_block_fp8_linear,
 )
+from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+from sglang.srt.server_args import prepare_server_args
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,6 +65,22 @@ def reference_block_fp8_matmul(
     return output
 
 
+@contextmanager
+def fp8_gemm_backend_from_cli(backend: str):
+    """Parse --fp8-gemm-backend through the CLI, publish it, and initialize from it."""
+    server_args = prepare_server_args(
+        ["--model-path", "dummy", "--fp8-gemm-backend", backend]
+    )
+    reset_context()
+    publish(server_args, role="test", ranks=SpawnRanks(world_rank=0, dp_rank=None))
+    try:
+        with patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None):
+            fp8_utils.initialize_fp8_gemm_config()
+            yield
+    finally:
+        reset_context()
+
+
 class TestXPUFP8Linear(CustomTestCase):
     def setUp(self):
         if not torch.xpu.is_available():
@@ -70,6 +91,39 @@ class TestXPUFP8Linear(CustomTestCase):
         """Verify that dispatch_w8a8_block_fp8_linear cleanly routes to torch_w8a8_block_fp8_linear on XPU."""
         dispatched_fn = dispatch_w8a8_block_fp8_linear()
         self.assertIs(dispatched_fn, torch_w8a8_block_fp8_linear)
+
+    def test_default_auto_backend_resolves_to_xpu_scaled_mm(self):
+        """The default --fp8-gemm-backend=auto is pinned to xpu_scaled_mm on XPU."""
+        with fp8_gemm_backend_from_cli("auto"):
+            self.assertTrue(get_fp8_gemm_runner_backend().is_xpu_scaled_mm())
+
+    def test_explicit_xpu_scaled_mm_backend_serves_block_fp8(self):
+        """--fp8-gemm-backend=xpu_scaled_mm parses, initializes, and runs block FP8."""
+        with fp8_gemm_backend_from_cli("xpu_scaled_mm"):
+            self.assertTrue(get_fp8_gemm_runner_backend().is_xpu_scaled_mm())
+            method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+                )
+            )
+        self.assertIs(method.w8a8_block_fp8_linear, torch_w8a8_block_fp8_linear)
+
+        M, K, N = 16, 256, 384
+        block_size = [128, 128]
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = (
+            torch.rand(N // 128, K // 128, dtype=torch.float32, device=self.device)
+            + 0.1
+        )
+        out = method.w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
+        q_input, input_scale = per_token_group_quant_fp8(x, block_size[1])
+        ref = reference_block_fp8_matmul(
+            q_input, input_scale, weight, block_size, weight_scale
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
 
     def test_torch_w8a8_block_fp8_linear_shapes_and_dims(self):
         """Test small sizes with varied M, 2D/3D shapes, and bias to keep memory minimal."""
