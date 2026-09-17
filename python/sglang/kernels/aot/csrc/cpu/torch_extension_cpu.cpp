@@ -1023,10 +1023,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // raw base pointers), which schema-level alias annotations cannot express.
   m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
   m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
+}
 
-  TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
-    m.impl("init_cpu_threads_env", init_cpu_threads_env);
-    m.impl("initialize", &initialize);
-  }
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+  m.impl("init_cpu_threads_env", init_cpu_threads_env);
+  m.impl("initialize", &initialize);
+}
 
-  REGISTER_EXTENSION(common_ops)
+REGISTER_EXTENSION(common_ops)

@@ -528,6 +528,7 @@ def apply_qk_norm(
             eps=q_eps,
         )
         return q, k
+
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
