@@ -163,7 +163,7 @@ class TestStampedRanks(_IsolatedOverrides):
     def setUp(self):
         super().setUp()
         parallel = get_parallel()
-        self._saved_derived = dict(parallel._derived)
+        self._saved_derived = dict(parallel._stamp)
         parallel.clear_derived_widths()
         self.addCleanup(
             lambda: (
@@ -278,9 +278,14 @@ class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
         leaves, and both are ahead of the live getter once a configuration is
         published: a name in `_LIVE_READS` and in either of them would answer
         from the getter before publish and from the bag after."""
-        from sglang.srt.runtime_context import _LIVE_READS, _parallel_config_leaves
+        from sglang.srt.runtime_context import (
+            _LIVE_READS,
+            _derived_widths,
+            _parallel_config_leaves,
+        )
 
         self.assertEqual(set(_LIVE_READS) & _parallel_config_leaves(), set())
+        self.assertEqual(set(_LIVE_READS) & set(_derived_widths()), set())
 
     def test_an_undeclared_name_is_refused(self):
         with self.assertRaises(ValueError):
@@ -1568,7 +1573,7 @@ class TestDerivedWidths(_IsolatedOverrides):
     def setUp(self):
         super().setUp()
         parallel = get_parallel()
-        self._saved_derived = dict(parallel._derived)
+        self._saved_derived = dict(parallel._stamp)
         parallel.clear_derived_widths()
         self.addCleanup(
             lambda: (
@@ -1725,7 +1730,7 @@ class TestDerivedWidths(_IsolatedOverrides):
     def test_reset_context_drops_the_permanent_override(self):
         """The permanent override belongs to the lifecycle that made it.
 
-        `_derived_width` prefers it over the published leaf, so one that
+        `_read` prefers it over the published leaf, so one that
         outlived `reset_context()` would let the next test read the previous
         topology.
         """
@@ -1761,8 +1766,7 @@ class TestDerivedWidths(_IsolatedOverrides):
     def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
         """`initialize_model_parallel` no longer overrides anything -- see
         `test_initialize_model_parallel_no_longer_touches_the_bag` below --
-        which makes this the load-bearing half of 16-field-registry-design.md
-        §6e: every real caller must forward leaves that already match its own
+        so every real caller must forward leaves that already match its own
         published config, because nothing corrects a mismatch anymore.
         `scheduler.py`'s `ps.attn_dp_size`/`ps.moe_ep_size`/etc, and the
         weight-cache daemon's own already-published config, both do -- this
@@ -1818,7 +1822,7 @@ class TestDerivedWidths(_IsolatedOverrides):
                 self.assertEqual(published, recomputed)
 
     def test_initialize_model_parallel_no_longer_touches_the_bag(self):
-        """§6e, landed: `initialize_model_parallel` used to recompute and
+        """`initialize_model_parallel` used to recompute and
         permanently override the six derived widths on `get_parallel()`
         after building its groups; that call is gone. Publish a placeholder
         config (tp_size defaults to 1), then build real groups at a
