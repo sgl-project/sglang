@@ -1628,7 +1628,7 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
     # sparse prefill main attention through AITER's Gluon paged attention, Triton on unsupported cases
-    SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL = EnvBool(True)
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
     # per-buffer cap on the Gluon gather scratch; a batch span above it falls back to Triton
     SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB = EnvInt(2048)
 

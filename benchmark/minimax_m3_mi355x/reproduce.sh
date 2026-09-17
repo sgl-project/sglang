@@ -57,7 +57,7 @@ serve() {  # $1 = real | lossy
   export HIP_VISIBLE_DEVICES=$GPUS CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 PYTHONPATH=$SGLANG_DIR/python${PYTHONPATH:+:$PYTHONPATH}
   export SGLANG_USE_AITER=1 NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1
   export SGLANG_M3_ALLOW_CUSTOM_AR=1 ROCM_QUICK_REDUCE_QUANTIZATION=INT4 SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144   # all-reduce: custom AR, INT4 quick-reduce for >=64 MB, 1-stage kernel under 256 KB
-  export SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4                                    # Gluon sparse prefill on fp8 KV; indexer top-k every 4th layer
+  export SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL=1 SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4                                    # Gluon sparse prefill on fp8 KV; indexer top-k every 4th layer
   export SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1  # long-cached-prefix extends: Triton route, aiter paged batch-prefill
   export SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5 SGLANG_TIMEOUT_KEEP_ALIVE=3600                                     # short extends share the chunk budget; idle client connections stay open
   if [ -n "${PTPC_FP8:-}" ]; then  # optional: quark-excluded dense layers as per-token FP8; measured -9% decode at 24 streams on 2026-09-15, so off by default
