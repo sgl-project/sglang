@@ -1648,6 +1648,7 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_rank{global_rank}.ready"
     )
+    SGLANG_NPU_SPARSE_ATTN_A2A = EnvBool(False)
 
 
 envs = Envs()

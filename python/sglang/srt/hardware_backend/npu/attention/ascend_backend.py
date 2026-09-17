@@ -32,6 +32,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
@@ -392,6 +393,12 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         self.needs_cpu_seq_lens = envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
+
+        # AllToAll optimization for sparse attention across attention TP ranks
+        self.use_sparse_attn_a2a = (
+            envs.SGLANG_NPU_SPARSE_ATTN_A2A.get()
+            and get_parallel().attn_tp_size > 1
+        )
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -1203,6 +1210,73 @@ class AscendAttnBackend(AttentionBackend):
             )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
+    def _a2a_q(self, x: torch.Tensor, attn_tp_size: int) -> torch.Tensor:
+        num_tokens = x.shape[0]
+        local_heads = x.shape[1]
+        head_dim = x.shape[2]
+        tokens_per_rank = num_tokens // attn_tp_size
+        x_flat = x.reshape(num_tokens, -1)
+        output = torch.empty_like(x_flat)
+        get_attn_tp_group().all_to_all_single(output, x_flat)
+        return (
+            output.view(attn_tp_size, tokens_per_rank, local_heads, head_dim)
+            .transpose(0, 1)
+            .contiguous()
+            .view(tokens_per_rank, attn_tp_size * local_heads, head_dim)
+        )
+
+    def _a2a_attn_out(
+        self, x: torch.Tensor, attn_tp_size: int, local_heads: int
+    ) -> torch.Tensor:
+        tokens_per_rank = x.shape[0]
+        head_dim = x.shape[-1]
+        num_tokens = tokens_per_rank * attn_tp_size
+        x_flat = (
+            x.view(tokens_per_rank, attn_tp_size, local_heads, head_dim)
+            .transpose(0, 1)
+            .contiguous()
+            .view(num_tokens, -1)
+        )
+        output = torch.empty_like(x_flat)
+        get_attn_tp_group().all_to_all_single(output, x_flat)
+        return output.view(num_tokens, local_heads, head_dim)
+
+    def _ulysses_split_seq_metadata(
+        self,
+        actual_seq_qlen: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_tables: Optional[torch.Tensor],
+        num_tokens: int,
+        attn_tp_rank: int,
+        attn_tp_size: int,
+    ):
+        tokens_per_rank = num_tokens // attn_tp_size
+        start_tok = attn_tp_rank * tokens_per_rank
+        end_tok = start_tok + tokens_per_rank
+
+        npu_device = block_tables.device if block_tables is not None else torch.device("npu")
+        actual_seq_qlen = actual_seq_qlen.to(device=npu_device)
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(device=npu_device)
+
+        dtype = actual_seq_qlen.dtype
+        seq_starts = torch.cat(
+            [torch.zeros(1, dtype=dtype, device=npu_device), actual_seq_qlen[:-1]]
+        )
+        seq_ends = actual_seq_qlen
+
+        overlap_start = seq_starts.clamp(min=start_tok)
+        overlap_end = seq_ends.clamp(max=end_tok)
+        new_qlens = (overlap_end - overlap_start).clamp(min=0)
+        mask = new_qlens > 0
+
+        rank_seq_qlen = torch.cumsum(new_qlens[mask], dim=0).to(torch.int32)
+        rank_seq_kvlen = actual_seq_lengths_kv[mask].contiguous()
+        rank_block_tables = (
+            block_tables[mask].contiguous() if block_tables is not None else None
+        )
+
+        return rank_seq_qlen, rank_seq_kvlen, rank_block_tables
+
     def do_cp_attn_fia(
         self,
         q: torch.Tensor,
@@ -1282,6 +1356,401 @@ class AscendAttnBackend(AttentionBackend):
 
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_sparse_attn_tp_a2a_prefill(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        topk_indices: torch.Tensor,
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+
+        if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "Packed FP8 DSA sparse attention requires BF16 q_nope "
+                f"and q_rope, got {q_nope.dtype} and {q_pe.dtype}."
+            )
+        packed_cache_dim = get_dsa_fp8_packed_cache_dim(
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        if k_nope.shape[-1] != packed_cache_dim:
+            raise RuntimeError(
+                f"Unexpected packed DSA KV width {k_nope.shape[-1]}, "
+                f"expected {packed_cache_dim}."
+            )
+        if k_nope.dtype == torch.uint8:
+            k_nope = k_nope.view(torch.float8_e4m3fn)
+        if k_nope.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"Unexpected packed DSA KV dtype {k_nope.dtype}, "
+                f"expected {torch.float8_e4m3fn}."
+            )
+
+        orig_num_heads = q_nope.shape[1]
+        if (
+            self.q_head_num_padding is not None
+            and self.q_head_num_padding > orig_num_heads
+        ):
+            pad_size = self.q_head_num_padding - orig_num_heads
+            q_nope = torch.cat(
+                [
+                    q_nope,
+                    torch.zeros(
+                        q_nope.shape[0],
+                        pad_size,
+                        q_nope.shape[2],
+                        dtype=q_nope.dtype,
+                        device=q_nope.device,
+                    ),
+                ],
+                dim=1,
+            ).contiguous()
+            q_pe = torch.cat(
+                [
+                    q_pe,
+                    torch.zeros(
+                        q_pe.shape[0],
+                        pad_size,
+                        q_pe.shape[2],
+                        dtype=q_pe.dtype,
+                        device=q_pe.device,
+                    ),
+                ],
+                dim=1,
+            ).contiguous()
+        q = torch.cat((q_nope, q_pe), dim=-1).contiguous()
+        k = k_nope.view(-1, self.page_size, 1, packed_cache_dim)
+
+        padded_local_heads = q.shape[1]
+
+        attn_tp_rank = get_parallel().attn_tp_rank
+        num_tokens = q.shape[0]
+
+        attn_tp_size = get_parallel().attn_tp_size
+        remainder = num_tokens % attn_tp_size
+        if remainder > 0:
+            pad_size = attn_tp_size - remainder
+            q = torch.cat(
+                [
+                    q,
+                    q.new_zeros(
+                        pad_size, q.shape[1], q.shape[2],
+                    ),
+                ],
+                dim=0,
+            )
+            topk_indices = torch.cat(
+                [
+                    topk_indices,
+                    torch.full(
+                        (pad_size,) + tuple(topk_indices.shape[1:]),
+                        0,
+                        dtype=topk_indices.dtype,
+                        device=topk_indices.device,
+                    ),
+                ],
+                dim=0,
+            )
+            actual_seq_qlen = actual_seq_qlen.clone()
+            actual_seq_qlen[-1] = actual_seq_qlen[-1] + pad_size
+
+        num_tokens_padded = q.shape[0]
+        tokens_per_rank = num_tokens_padded // attn_tp_size
+
+        q = self._a2a_q(q, attn_tp_size)
+
+        start_tok = attn_tp_rank * tokens_per_rank
+        topk_indices = topk_indices[start_tok: start_tok + tokens_per_rank]
+
+        rank_seq_qlen, rank_seq_kvlen, rank_block_tables = (
+            self._ulysses_split_seq_metadata(
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+                self.forward_metadata.block_tables,
+                num_tokens_padded,
+                attn_tp_rank,
+                attn_tp_size,
+            )
+        )
+
+        attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=q,
+            key=k,
+            value=k,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=rank_seq_qlen.to(
+                device=q.device,
+                dtype=torch.int32,
+            ),
+            actual_seq_lengths_kv=rank_seq_kvlen.to(
+                device=q.device,
+                dtype=torch.int32,
+            ),
+            block_table=rank_block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=DSA_KV_QUANT_TILE_SIZE,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
+
+        attn_out = self._a2a_attn_out(
+            attn_out, attn_tp_size, padded_local_heads
+        )
+        attn_out = attn_out[:num_tokens]
+
+        if self.q_head_num_padding is not None and self.q_head_num_padding > orig_num_heads:
+            attn_out = attn_out[:, :orig_num_heads, :]
+        return attn_out
+
+    def _forward_sparse_attn_tp_a2a_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        topk_indices: torch.Tensor,
+        layer: RadixAttention,
+        actual_seq_lengths_kv: torch.Tensor,
+        tokens_per_req: int,
+    ) -> torch.Tensor:
+        """AllToAll-accelerated sparse attention for target_verify with attn_tp > 1.
+
+        Redistributes query tokens across the attn_tp group so that each
+        rank processes T/tp tokens with all q heads (instead of T tokens
+        with H/tp heads), improving NPU sparse attention kernel utilization.
+
+        Supports target_verify where each request contributes
+        ``tokens_per_req`` (= speculative_num_draft_tokens) query tokens.
+        Padding ensures T_padded is divisible by (attn_tp_size * tokens_per_req)
+        so every rank receives a whole number of complete requests.
+
+        Only for multi-query attention (kv head_num = 1); the KV cache is
+        full on every rank and needs no communication.
+
+        Graph-safe: no CPU synchronization, all ops are capturable.
+        """
+        attn_tp_size = get_parallel().attn_tp_size
+        attn_tp_group = get_parallel().attn_tp_group
+        attn_tp_rank = get_parallel().attn_tp_rank
+
+        T = q_nope.shape[0]  # num_tokens = batch_size * tokens_per_req
+        H_local = q_nope.shape[1]
+        D_nope = q_nope.shape[2]
+        D_rope = q_pe.shape[2]
+        D_total = D_nope + D_rope
+        K_sparse = topk_indices.shape[-1]
+
+        if T == 0:
+            return q_nope.new_zeros(0, H_local, D_nope)
+
+        # --- Padded sizes ---
+        # T_padded must be divisible by (attn_tp_size * tokens_per_req) so
+        # that T_local = T_padded / attn_tp_size is a whole number of requests.
+        unit = attn_tp_size * tokens_per_req
+        T_padded = ((T + unit - 1) // unit) * unit
+        T_local = T_padded // attn_tp_size
+        num_local_reqs = T_local // tokens_per_req
+        num_total_reqs_padded = T_padded // tokens_per_req
+
+        # --- Head padding (power-of-2 for NPU kernel) ---
+        H_local_padded = (
+            self.q_head_num_padding
+            if (
+                self.q_head_num_padding is not None
+                and self.q_head_num_padding > H_local
+            )
+            else H_local
+        )
+        if H_local_padded > H_local:
+            pad_h = H_local_padded - H_local
+            q_nope = torch.cat(
+                [q_nope, q_nope.new_zeros(T, pad_h, D_nope)], dim=1
+            )
+            q_pe = torch.cat(
+                [q_pe, q_pe.new_zeros(T, pad_h, D_rope)], dim=1
+            )
+
+        # --- Pad tokens to T_padded ---
+        if T_padded > T:
+            pad_t = T_padded - T
+            q_nope = torch.cat(
+                [q_nope, q_nope.new_zeros(pad_t, H_local_padded, D_nope)],
+                dim=0,
+            )
+            q_pe = torch.cat(
+                [q_pe, q_pe.new_zeros(pad_t, H_local_padded, D_rope)],
+                dim=0,
+            )
+            if topk_indices.dim() == 3:
+                topk_indices = topk_indices.squeeze(-2)
+            topk_indices = torch.cat(
+                [
+                    topk_indices,
+                    torch.full(
+                        (pad_t, K_sparse),
+                        -1,
+                        dtype=topk_indices.dtype,
+                        device=topk_indices.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+        # --- Concatenate q_nope + q_pe ---
+        q_concat = torch.cat((q_nope, q_pe), dim=-1).contiguous()
+        # [T_padded, H_local_padded, D_total]
+
+        # ============================================================
+        # Forward AllToAll: [T_padded, H_local, D] -> [T_local, H_total, D]
+        # ============================================================
+        # Direct flatten: all_to_all_single splits into tp equal chunks.
+        # Chunk j = q_concat[j*T_local : (j+1)*T_local].flatten()
+        #   => rank j receives tokens [j*T_local : (j+1)*T_local] (contiguous)
+        q_send = q_concat.view(-1)
+        q_recv = torch.empty_like(q_send)
+        attn_tp_group.all_to_all_single(q_recv, q_send)
+
+        # Reshape: [tp, T_local, H_local, D] -> [T_local, tp*H_local, D]
+        q_local = (
+            q_recv.view(attn_tp_size, T_local, H_local_padded, D_total)
+            .transpose(0, 1)
+            .contiguous()
+            .view(T_local, attn_tp_size * H_local_padded, D_total)
+        )
+
+        # ============================================================
+        # Adapt metadata for local token/request subset (contiguous slice)
+        # ============================================================
+        token_start = attn_tp_rank * T_local
+        req_start = attn_tp_rank * num_local_reqs
+
+        # sparse_indices: per-token, slice by token offset -> [T_local, 1, K]
+        topk_indices_local = topk_indices[token_start : token_start + T_local]
+        topk_indices_local = topk_indices_local.unsqueeze(-2)
+
+        # actual_seq_lengths_query: cumulative [s, 2s, ..., num_local_reqs*s]
+        actual_seq_qlen_local = torch.arange(
+            tokens_per_req,
+            tokens_per_req * (num_local_reqs + 1),
+            tokens_per_req,
+            dtype=torch.int32,
+            device=q_nope.device,
+        )
+
+        # actual_seq_lengths_kv: per-request, slice by request offset
+        actual_seq_lengths_kv_dev = actual_seq_lengths_kv.to(
+            device=q_nope.device, dtype=torch.int32
+        )
+        if num_total_reqs_padded > actual_seq_lengths_kv_dev.shape[0]:
+            pad_kv = torch.ones(
+                num_total_reqs_padded - actual_seq_lengths_kv_dev.shape[0],
+                dtype=torch.int32,
+                device=q_nope.device,
+            )
+            actual_seq_lengths_kv_padded = torch.cat(
+                [actual_seq_lengths_kv_dev, pad_kv], dim=0
+            )
+        else:
+            actual_seq_lengths_kv_padded = actual_seq_lengths_kv_dev[
+                :num_total_reqs_padded
+            ]
+        actual_seq_lengths_kv_local = actual_seq_lengths_kv_padded[
+            req_start : req_start + num_local_reqs
+        ]
+
+        # block_table: per-request, slice by request offset
+        block_table = self.forward_metadata.block_tables
+        if num_total_reqs_padded > block_table.shape[0]:
+            pad_bt = torch.zeros(
+                num_total_reqs_padded - block_table.shape[0],
+                block_table.shape[1],
+                dtype=block_table.dtype,
+                device=block_table.device,
+            )
+            block_table_padded = torch.cat([block_table, pad_bt], dim=0)
+        else:
+            block_table_padded = block_table[:num_total_reqs_padded]
+        block_table_local = block_table_padded[
+            req_start : req_start + num_local_reqs
+        ]
+
+        # --- KV cache dtype handling ---
+        packed_cache_dim = get_dsa_fp8_packed_cache_dim(
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        if k_nope.dtype == torch.uint8:
+            k_nope = k_nope.view(torch.float8_e4m3fn)
+
+        # ============================================================
+        # Kernel call: full heads on T_local tokens
+        # ============================================================
+        attn_out_local = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=q_local.contiguous(),
+            key=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
+            value=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
+            sparse_indices=topk_indices_local.contiguous(),
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=actual_seq_qlen_local,
+            actual_seq_lengths_kv=actual_seq_lengths_kv_local,
+            block_table=block_table_local,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=DSA_KV_QUANT_TILE_SIZE,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
+        # [T_local, tp * H_local_padded, D_out]
+
+        D_out = attn_out_local.shape[-1]
+
+        # ============================================================
+        # Reverse AllToAll: [T_local, H_total, D] -> [T_padded, H_local, D]
+        # ============================================================
+        # Group heads by destination rank, then all_to_all.
+        attn_out_send = (
+            attn_out_local.view(
+                T_local, attn_tp_size, H_local_padded, D_out
+            )
+            .transpose(0, 1)  # [tp, T_local, H_local, D_out]
+            .contiguous()
+            .view(-1)
+        )
+
+        attn_out_recv = torch.empty_like(attn_out_send)
+        attn_tp_group.all_to_all_single(attn_out_recv, attn_out_send)
+
+        # Direct view to [T_padded, H_local, D_out]
+        attn_out_full = attn_out_recv.view(
+            T_padded, H_local_padded, D_out
+        )
+
+        # --- Unpad tokens and heads ---
+        attn_out = attn_out_full[:T]
+        if H_local_padded > H_local:
+            attn_out = attn_out[:, :H_local, :]
+
+        return attn_out
 
     def forward_sparse(
         self,
@@ -1367,6 +1836,45 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+            # --- AllToAll optimization for prefill and target_verify with attn_tp > 1 ---
+            if (
+                self.use_sparse_attn_a2a
+                and not is_prefill
+                and forward_batch.forward_mode.is_target_verify()
+                and self.token_to_kv_pool.dsa_kv_cache_store_fp8
+                and topk_indices is not None
+            ):
+                tokens_per_req = (
+                    self.speculative_num_draft_tokens
+                    if self.speculative_num_draft_tokens is not None
+                    else 1
+                )
+                return self._forward_sparse_attn_tp_a2a_decode(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_lengths_kv,
+                    tokens_per_req,
+                )
+            elif (
+                self.use_sparse_attn_a2a
+                and is_prefill
+                and self.token_to_kv_pool.dsa_kv_cache_store_fp8
+                and topk_indices is not None
+            ):
+                return self._forward_sparse_attn_tp_a2a_prefill(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
+                )
+
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
