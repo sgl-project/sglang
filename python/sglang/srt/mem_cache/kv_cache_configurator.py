@@ -1680,9 +1680,9 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
+            dcp_replicated=self.loc_space_scale > 1,
             **pool_kwargs,
         )
-        token_to_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(
@@ -1890,6 +1890,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    dcp_replicated=self.loc_space_scale > 1,
                     index_buf_size=self._replicated_dsa_indexer_size(
                         max_total_num_tokens
                     ),
@@ -1968,8 +1969,6 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
-        if extra_args.get("use_dsa"):
-            token_to_kv_pool.full_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
