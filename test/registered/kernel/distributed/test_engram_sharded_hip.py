@@ -3,8 +3,10 @@
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
+
 import pytest
 import torch
+
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -18,10 +20,6 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
-
-
-
-
 
 register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
@@ -72,7 +70,7 @@ def table(rows):
     return embed, reference
 
 
-@pytest.mark.parametrize("rows", [1, 17, 32], ids=['1', '17', '32'])
+@pytest.mark.parametrize("rows", [1, 17, 32], ids=["1", "17", "32"])
 def test_eager_and_graph_reconstruction(group, rows):
     """Reconstructing a sharded row must retain signed zero and BF16 subnormals."""
     embed, reference = table(rows)
@@ -95,7 +93,7 @@ def test_eager_and_graph_reconstruction(group, rows):
             )
 
 
-@pytest.mark.parametrize("scatter", [False, True], ids=['False', 'True'])
+@pytest.mark.parametrize("scatter", [False, True], ids=["False", "True"])
 def test_dp_shard_reconstruction(group, scatter):
     """DP distribution must preserve the owning shard's BF16 payload bits."""
     embed, reference = table(17)

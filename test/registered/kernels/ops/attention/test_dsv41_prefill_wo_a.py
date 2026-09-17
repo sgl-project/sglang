@@ -1,17 +1,11 @@
-
 import unittest
+
 import torch
+
 from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
-import unittest
-import torch
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-
-
-
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -38,18 +32,6 @@ class TestPrefillWoA(CustomTestCase):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 self.assertTrue(actual.is_contiguous())
                 self.assertEqual(actual.flatten(1).data_ptr(), actual.data_ptr())
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")

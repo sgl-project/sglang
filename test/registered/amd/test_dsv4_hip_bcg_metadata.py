@@ -112,7 +112,6 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
 
-
     def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.low_ratios = ()

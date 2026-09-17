@@ -5,16 +5,14 @@ import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as dist
+
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
-
-
-
-
 
 register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
@@ -127,7 +125,9 @@ def _layer(group):
     return layer
 
 
-@pytest.mark.parametrize("rows,verify", [(1, False), (8, True)], ids=["decode", "verify"])
+@pytest.mark.parametrize(
+    "rows,verify", [(1, False), (8, True)], ids=["decode", "verify"]
+)
 def test_model_handoff_and_graph_replay(group, rows, verify):
     from sglang.srt.environ import envs
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -233,7 +233,16 @@ def _moe(group, dual, shared_tp1):
     return Moe()
 
 
-@pytest.mark.parametrize("rows,dual,defer,shared_tp1", [(1, False, False, False), (8, False, True, False), (8, True, True, False), (8, False, True, True)], ids=["unfused", "deferred", "dual-stream", "shared-tp1"])
+@pytest.mark.parametrize(
+    "rows,dual,defer,shared_tp1",
+    [
+        (1, False, False, False),
+        (8, False, True, False),
+        (8, True, True, False),
+        (8, False, True, True),
+    ],
+    ids=["unfused", "deferred", "dual-stream", "shared-tp1"],
+)
 def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import MoeA2ABackend
@@ -322,8 +331,12 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             )
 
 
-@pytest.mark.parametrize("dual", [False, True], ids=['False', 'True'])
-@pytest.mark.parametrize("flag", ["mlp_reduce_scatter", "fuse_mlp_allreduce"], ids=["'mlp_reduce_scatter'", "'fuse_mlp_allreduce'"])
+@pytest.mark.parametrize("dual", [False, True], ids=["False", "True"])
+@pytest.mark.parametrize(
+    "flag",
+    ["mlp_reduce_scatter", "fuse_mlp_allreduce"],
+    ids=["'mlp_reduce_scatter'", "'fuse_mlp_allreduce'"],
+)
 def test_moe_skipped_reduction_does_not_apply_post(group, dual, flag):
     from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion, use_mhc_post_fusion
     from sglang.srt.runtime_context import get_forward

@@ -1,14 +1,12 @@
 """HIP candidate selection ignores unreachable logits."""
 
 import unittest
+
 import torch
+
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
-
-
-
-
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 

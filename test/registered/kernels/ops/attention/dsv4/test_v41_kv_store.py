@@ -5,38 +5,23 @@ the two formats (``torch_quant.quantize_k_cache_v41`` / ``_v41_fp4``), which
 follow the decode kernel's own reference quantizer.
 """
 
-import unittest
-import torch
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test import dsv41_kv_quant_reference as tq
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
-import unittest
-import torch
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test import dsv41_kv_quant_reference as tq
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
 import math
 import unittest
 from itertools import product
+
 import torch
+
 from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_k_norm_rope_flashmla,
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
-
-
-
-
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
@@ -473,22 +458,6 @@ class TestV41KVStore(CustomTestCase):
                     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 CASES = {
     KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
     KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
@@ -601,26 +570,6 @@ class TestV41KVDequant(CustomTestCase):
                 # NaN payloads (fp8 0x7F / e4m3 NaN scales) compare through their bits.
                 self.assertTrue(torch.equal(bits(workspace[5:]), bits(ref)))
                 self.assertEqual(int(workspace[:5].abs().sum()), 0)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 HEAD_DIM, ROPE_DIM, NOPE_DIM = 512, 64, 448

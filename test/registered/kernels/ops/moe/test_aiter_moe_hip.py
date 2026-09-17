@@ -1,25 +1,13 @@
 """The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's `moe_sorting` and `topk_gating` bit for bit."""
 
 import unittest
+from types import SimpleNamespace
+
 import torch
+
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
-import unittest
-from types import SimpleNamespace
-import torch
-from sglang.test.test_utils import CustomTestCase
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-import unittest
-import torch
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
-
-
-
-
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
@@ -219,7 +207,6 @@ class TestRocmRouterGate(CustomTestCase):
             out_w, out_i = self.gate(logits, bias, topk, renorm, rsf)
             self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg} topk {topk}")
             self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg} topk {topk}")
-
 
     def test_gate_matches_aiter_on_ties(self):
         zero_bias = torch.zeros(NUM_EXPERTS, device=self.device, dtype=torch.bfloat16)
@@ -456,19 +443,6 @@ class TestRocmRouterGateSort(CustomTestCase):
                                 )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 @unittest.skipUnless(is_hip(), "requires HIP")
 class TestRouterFp32(CustomTestCase):
     def setUp(self):
@@ -512,16 +486,6 @@ class TestRouterFp32(CustomTestCase):
                         output[:, :16], expected.expand(rows, -1), rtol=0, atol=0
                     )
                     self.assertEqual(torch.unique(output[0, :16]).numel(), 16)
-
-
-
-
-
-
-
-
-
-
 
 
 D, TOPK, E = 5120, 6, 384

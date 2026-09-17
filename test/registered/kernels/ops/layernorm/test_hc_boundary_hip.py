@@ -1,27 +1,19 @@
 """The ROCm fused mHC boundary, its gfx950 prefill regime and the norm launch hosting the reduce + sinkhorn must match the torch forms and the standalone launches bitwise."""
 
 import unittest
+from types import SimpleNamespace
+
 import torch
+
 from sglang.kernels.ops.layernorm.mhc import (
     _hc_split_sinkhorn_torch,
     hc_combine,
     hc_mix_stats_sinkhorn,
 )
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
-import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
-import torch
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
-
-
-
-
+from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
@@ -320,22 +312,6 @@ class TestHcBoundaryPrefill(CustomTestCase):
         self.assertTrue(_all_equal(sub[2:], [t[idx] for t in full[2:]]))
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
 class TestMhcPostSplitH(CustomTestCase):
     def setUp(self):
@@ -364,7 +340,6 @@ class TestMhcPostSplitH(CustomTestCase):
 
     def test_model_dispatch_and_graph_replay(self):
         from aiter.ops.mhc import mhc_post
-
 
         for rows in (1024, 1025):
             with self.subTest(rows=rows):

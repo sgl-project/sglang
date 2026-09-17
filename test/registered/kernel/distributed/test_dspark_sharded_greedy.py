@@ -3,9 +3,11 @@
 import atexit
 import gc
 import os
+
 import pytest
 import torch
 import torch.distributed as dist
+
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
@@ -16,10 +18,6 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
-
-
-
-
 
 register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
@@ -60,8 +58,6 @@ def group():
 
     atexit.register(cleanup)
     return coordinator
-
-
 
 
 def _replay_and_check(m, width, last, perturb):
@@ -127,7 +123,11 @@ def _inf(replay, storage, base, bias, real):
         base[:, replay % real] = float("inf")
 
 
-@pytest.mark.parametrize("m,width,last", [(1, 32320, 32320), (4, 8192, 17), (64, 8, 0)], ids=["full", "partial", "empty"])
+@pytest.mark.parametrize(
+    "m,width,last",
+    [(1, 32320, 32320), (4, 8192, 17), (64, 8, 0)],
+    ids=["full", "partial", "empty"],
+)
 def test_random_logits(m, width, last):
     _replay_and_check(m, width, last, _random)
 
