@@ -77,6 +77,51 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
 
+        # Fused GDN prefill handoff (attempt-and-verify). The model offers its
+        # output-norm weight here before calling try_fused_gdn_prefill; the
+        # backend consumes it and publishes the FP8 activations, or leaves it
+        # unconsumed so the model runs its own gated RMSNorm.
+        self._gdn_onorm_args = None
+        self._gdn_onorm_consumed = False
+        self._gdn_fp8_out = None
+
+    def try_fused_gdn_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        projected_qkvz: torch.Tensor,
+        projected_ba: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Side-effect-free attempt at AITER's fused GDN prefill.
+
+        Returns the post-gated-RMSNorm output (and marks this layer's stash
+        consumed) when a covered kernel runs, else ``None`` so the caller runs
+        the ordinary split + conv + delta + norm chain. Declines the graph and
+        DP-padding envelopes handled specially in ``forward``; only the GDN
+        backend implements the kernel, so any other backend also declines.
+        """
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return None
+        if get_tc_piecewise_forward_context() is not None:
+            return None
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        backend = get_attn_backend()
+        # Hybrid models wrap the linear (GDN) backend; unwrap to reach it.
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.linear_attn_backend
+        if not isinstance(backend, GDNAttnBackend):
+            return None
+        return backend.try_fused_gdn_prefill(
+            self, forward_batch, projected_qkvz, projected_ba
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
