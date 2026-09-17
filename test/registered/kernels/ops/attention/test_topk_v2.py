@@ -470,7 +470,9 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
-@pytest.mark.skipif(not is_hip(), reason="packed layout is compiled under USE_ROCM only")
+@pytest.mark.skipif(
+    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
+)
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
@@ -541,7 +543,9 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
-@pytest.mark.skipif(not is_hip(), reason="packed layout is compiled under USE_ROCM only")
+@pytest.mark.skipif(
+    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
+)
 @pytest.mark.parametrize("residue", [1, 2, 3])
 @pytest.mark.parametrize("boundary", [8192, 16384])
 @torch.inference_mode()
