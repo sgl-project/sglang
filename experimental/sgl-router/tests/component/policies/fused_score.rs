@@ -13,10 +13,8 @@
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
-use sgl_router::policies::load_based::LoadBasedPolicy;
-use sgl_router::policies::scoring::{
-    prefix_cache::PrefixCachePolicy, FusedScorePolicy, ScorePolicy,
-};
+use sgl_router::policies::balancing::LoadBasedPolicy;
+use sgl_router::policies::scoring::{FusedScorePolicy, PrefixCachePolicy, ScorePolicy};
 use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::workers::engine_reports::{EngineSnapshot, EngineWorkerLoad};
 use sgl_router::workers::Worker;

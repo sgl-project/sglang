@@ -3,9 +3,9 @@
 
 use crate::config::Config;
 
+use crate::kv_events::RadixTreePrefixProvider;
 use crate::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::buckets::BucketSelector;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;

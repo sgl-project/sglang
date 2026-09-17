@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::round_robin::RoundRobinPolicy;
+use sgl_router::policies::balancing::RoundRobinPolicy;
 use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::workers::Worker;
 use std::sync::Arc;

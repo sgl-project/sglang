@@ -4,17 +4,14 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
-use sgl_router::kv_events::{BlockSizeOracle, KvEventIndex};
+use sgl_router::kv_events::{BlockSizeOracle, KvEventIndex, RadixTreePrefixProvider};
 use sgl_router::workers::request_tracker::{
     spawn_janitor, JanitorHandle, RequestTracker, SystemTimeClock,
 };
 use sgl_router::{
     config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
+    policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
     tokenizer::TokenizerRegistry,

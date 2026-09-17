@@ -17,11 +17,7 @@
 //! ([`HashTree::state`]). The match path takes a read-lock and updates
 //! `last_used` via an [`AtomicU64`] so that routing decisions across tokio
 //! worker threads do not serialise on the lock. Mutations (insert / remove
-//! / clear / evict) take a write-lock. We accept the coarse granularity
-//! for v1 on the write side — correctness over throughput — and the
-//! existing text-tree at `super::super::tree` is what serves the high-RPS
-//! mesh-fallback path. This module is only on the cache-aware-from-events
-//! path.
+//! / clear / evict) take a write-lock.
 //!
 //! # Reverse index
 //!

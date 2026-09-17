@@ -8,7 +8,7 @@
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};
-use sgl_router::policies::decode::{
+use sgl_router::policies::balancing::{
     resolve_decode_with_capacity_fallback, DecodePolicy, DecodePowerOfTwoPolicy,
     DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };

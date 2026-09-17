@@ -6,11 +6,12 @@ mod preparation;
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::kv_events::request_block_hashes;
+use crate::kv_events::PrefixSignal;
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
-use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::policies::Policy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -122,7 +123,7 @@ fn capture_load_snapshot(
 }
 
 struct RoutingContext<'a> {
-    prefix_matches: Option<ExternalPrefixSignal>,
+    prefix_matches: Option<PrefixSignal>,
     load_snapshot: Option<EngineSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
@@ -240,26 +241,23 @@ fn pick_decode_worker(
 async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedChatRequest,
-) -> Result<Option<ExternalPrefixSignal>, ApiError> {
+) -> Result<Option<PrefixSignal>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),
         request.tokens.as_ref(),
         ctx.block_size_oracle.get(),
     ) {
         // Remote indexer: hash tokens into blocks and match against the KV index.
-        (Some(index), Some(tokens), Some(block_size)) => {
-            let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
-            } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
-            };
+        (Some(index), Some(tokens), Some(_)) => {
+            let hashes = request_block_hashes(&ctx.block_size_oracle, &tokens.ids)
+                .expect("block size was checked");
             let query_blocks = hashes.len();
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
                 resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
             };
-            Some(ExternalPrefixSignal {
+            Some(PrefixSignal {
                 outcome,
                 query_blocks,
             })

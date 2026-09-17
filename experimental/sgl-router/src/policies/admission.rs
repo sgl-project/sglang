@@ -17,8 +17,10 @@
 //! fleet reads below the floor, the request pins to the least-pressured
 //! prefix owner instead of cold-prefilling on a non-owner.
 
-use crate::policies::power_of_two::select_with_snapshot;
-use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::policies::balancing::select_with_snapshot;
+use crate::policies::{
+    CacheCandidate, CacheCandidateProposal, GuardHints, Policy, SelectionContext, SelectionProposal,
+};
 use crate::workers::engine_reports::{EngineSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -1040,6 +1042,133 @@ fn pressure_guard_prefers_backup(
             > backup_load.num_waiting_uncached_tokens as f64 * hints.pressure_rel_threshold
 }
 
+/// What a filter means when it has rejected every worker it was shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnEmpty {
+    /// Ignore this filter when it rejects every candidate.
+    Abstain,
+    /// Keep the rejection: no worker is admissible.
+    Hold,
+}
+
+/// A hard constraint applied before scoring.
+pub trait EligibilityFilter: Send + Sync + std::fmt::Debug {
+    /// Returns one admission flag per worker; `true` keeps the candidate.
+    fn keep(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<bool>;
+
+    /// Whether this constraint reads `ctx.request_tokens()`.
+    fn needs_tokens(&self) -> bool {
+        false
+    }
+
+    /// Controls the result when this filter rejects every candidate.
+    fn on_empty(&self) -> OnEmpty {
+        OnEmpty::Abstain
+    }
+}
+
+/// Applies ordered filters. `None` means a holding filter rejected all candidates.
+pub fn apply_filters<'f>(
+    filters: impl IntoIterator<Item = &'f dyn EligibilityFilter>,
+    workers: &[Arc<Worker>],
+    ctx: &SelectionContext<'_>,
+) -> Option<Vec<Arc<Worker>>> {
+    let mut alive: Vec<Arc<Worker>> = workers.to_vec();
+
+    for filter in filters {
+        if alive.is_empty() {
+            break;
+        }
+        let flags = filter.keep(&alive, ctx);
+        let on_empty = filter.on_empty();
+        if flags.len() != alive.len() {
+            tracing::debug!(
+                filter = ?filter,
+                n_workers = alive.len(),
+                n_flags = flags.len(),
+                "eligibility filter returned the wrong arity",
+            );
+            if on_empty == OnEmpty::Hold {
+                return None;
+            }
+        }
+        let untouched = alive.len() == workers.len();
+
+        let next: Vec<Arc<Worker>> = (alive.iter().enumerate())
+            .filter(|(i, _)| flags.get(*i).copied().unwrap_or(true))
+            .map(|(_, w)| Arc::clone(w))
+            .collect();
+
+        if next.is_empty() {
+            match on_empty {
+                OnEmpty::Hold => return None,
+                OnEmpty::Abstain if untouched => {
+                    tracing::debug!(
+                        filter = ?filter,
+                        n_workers = workers.len(),
+                        "eligibility filter has no eligible workers; falling back to the full candidate set",
+                    );
+                    continue;
+                }
+                OnEmpty::Abstain => {
+                    tracing::debug!(
+                        filter = ?filter,
+                        n_alive = alive.len(),
+                        "eligibility filter conflicts with a higher-priority one; yielding",
+                    );
+                    continue;
+                }
+            }
+        }
+        alive = next;
+    }
+
+    Some(alive)
+}
+
+/// Rejects workers at the router-local in-flight limit.
+#[derive(Debug)]
+pub struct Overloaded {
+    max_in_flight: usize,
+}
+
+impl Overloaded {
+    pub fn new(max_in_flight: usize) -> Self {
+        Self { max_in_flight }
+    }
+}
+
+impl EligibilityFilter for Overloaded {
+    fn keep(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<bool> {
+        (workers.iter())
+            .map(|w| w.active_load() < self.max_in_flight)
+            .collect()
+    }
+
+    /// Do not route to an over-capacity worker.
+    fn on_empty(&self) -> OnEmpty {
+        OnEmpty::Hold
+    }
+}
+
+impl Policy for Overloaded {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        let eligible: Vec<Arc<Worker>> = (workers.iter())
+            .zip(self.keep(workers, ctx))
+            .filter(|(_, ok)| *ok)
+            .map(|(w, _)| Arc::clone(w))
+            .collect();
+        eligible
+            .iter()
+            .min_by_key(|w| w.active_load())
+            .map(Arc::clone)
+    }
+
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        Some(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1812,6 +1941,293 @@ mod tests {
         .expect("an all-queueing fleet must still route");
 
         assert_eq!(decision.selected.id, right.id);
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
+    }
+}
+
+#[cfg(test)]
+mod overloaded_tests {
+    use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::scoring::refs;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    #[test]
+    fn the_cap_is_a_strict_ceiling() {
+        assert!(!Overloaded::new(3).needs_load_snapshot());
+        let ws = vec![worker("idle"), worker("under"), worker("at")];
+        let _under: Vec<_> = (0..2).map(|_| ws[1].load_guard()).collect();
+        let _at: Vec<_> = (0..3).map(|_| ws[2].load_guard()).collect();
+
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        assert_eq!(
+            Overloaded::new(3).keep(&ws, &ctx),
+            vec![true, true, false],
+            "load 3 against a cap of 3 is over",
+        );
+    }
+
+    #[test]
+    fn a_full_fleet_refuses_rather_than_picking_the_least_bad() {
+        let ws = vec![worker("a"), worker("b")];
+        let _a: Vec<_> = (0..5).map(|_| ws[0].load_guard()).collect();
+        let _b: Vec<_> = (0..9).map(|_| ws[1].load_guard()).collect();
+
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let full: Vec<Box<dyn EligibilityFilter>> = vec![Box::new(Overloaded::new(4))];
+        assert!(
+            apply_filters(refs(&full), &ws, &ctx).is_none(),
+            "both over the cap, and the filter Holds",
+        );
+
+        let some: Vec<Box<dyn EligibilityFilter>> = vec![Box::new(Overloaded::new(6))];
+        let out = apply_filters(refs(&some), &ws, &ctx).expect("a is under the cap");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, ws[0].url);
+    }
+
+    #[test]
+    fn hold_does_not_yield_to_a_later_filter() {
+        #[derive(Debug)]
+        struct AdmitAll;
+        impl EligibilityFilter for AdmitAll {
+            fn keep(&self, ws: &[Arc<Worker>], _: &SelectionContext<'_>) -> Vec<bool> {
+                vec![true; ws.len()]
+            }
+        }
+        let ws = vec![worker("a")];
+        let _busy: Vec<_> = (0..9).map(|_| ws[0].load_guard()).collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+
+        let chain: Vec<Box<dyn EligibilityFilter>> =
+            vec![Box::new(Overloaded::new(2)), Box::new(AdmitAll)];
+        assert!(apply_filters(refs(&chain), &ws, &ctx).is_none());
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use crate::policies::admission::resolve_prefill;
+    use crate::policies::admission::CandidateRange;
+    use crate::policies::admission::DecisionReason;
+    use crate::policies::admission::FreshLoadLookup;
+    use crate::policies::test_support::snapshot;
+    use crate::policies::test_support::worker;
+    use crate::policies::test_support::TestEngineLoad;
+    use crate::policies::*;
+    #[test]
+    fn decode_pressure_tie_is_not_broken_by_worker_id() {
+        let a = worker("a");
+        let z = worker("z");
+        assert_eq!(
+            admission::compare_decode_pressure(&a, &z, None),
+            std::cmp::Ordering::Equal,
+            "P2 must preserve random sampling when observable pressure is equal"
+        );
+    }
+
+    #[test]
+    fn mixed_freshness_uses_one_captured_local_level_for_the_candidate_set() {
+        let aggregate_idle = worker("aggregate-idle");
+        let aggregate_busy = worker("aggregate-busy");
+        let stale = worker("stale");
+        aggregate_idle
+            .active_requests
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        aggregate_busy
+            .active_requests
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = snapshot(&[
+            (
+                &aggregate_idle,
+                TestEngineLoad {
+                    num_waiting_reqs: 0,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &aggregate_busy,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let lookup =
+            FreshLoadLookup::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
+        assert!(lookup.get(&aggregate_idle.id).is_some());
+        assert!(lookup.get(&stale.id).is_none());
+        assert_eq!(
+            lookup.compare_prefill_pressure(&aggregate_idle, &aggregate_busy),
+            std::cmp::Ordering::Greater,
+            "one stale member makes the complete candidate set compare by the captured local level"
+        );
+    }
+
+    #[test]
+    fn admission_uses_admitted_backup_before_scanning_candidate_range() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_running_reqs: 4,
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                TestEngineLoad {
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let range = CandidateRange::global(&workers);
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None)
+            .expect("an admitted backup must be selected");
+
+        assert_eq!(decision.selected.id, backup.id);
+        assert_eq!(decision.reason, DecisionReason::BackupPrimaryAdmission);
+    }
+
+    #[test]
+    fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
+        let primary = worker("primary");
+        let workers = vec![Arc::clone(&primary)];
+        let snapshot = EngineSnapshot::default();
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &SelectionProposal::primary(Arc::clone(&primary)),
+            1_000_000,
+            &snapshot,
+            None,
+        )
+        .expect("disabled reporting must preserve the healthy registry candidate");
+
+        assert_eq!(decision.selected.id, primary.id);
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn prefill_pair_keeps_primary_when_both_workers_fit_capacity() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_waiting_reqs: 200,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_waiting_reqs: 20,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup);
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            80,
+            &snapshot,
+            None,
+        )
+        .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn admission_scans_range_only_after_primary_and_backup_both_fail() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_running_reqs: 4,
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                TestEngineLoad {
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup);
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+        )
+        .expect("an admitted range fallback must be selected");
+
+        assert_eq!(decision.selected.id, fallback.id);
         assert_eq!(decision.reason, DecisionReason::RangeFallback);
     }
 }
