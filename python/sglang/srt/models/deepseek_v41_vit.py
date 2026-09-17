@@ -1,4 +1,4 @@
-"""Vision tower and aligner from the 260903 reference implementation."""
+"""DeepSeek-V4.1 vision tower and aligner."""
 
 from functools import lru_cache
 
@@ -11,6 +11,12 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.layernorm import RMSNorm
+
+
+def _rms_norm(dim: int) -> RMSNorm:
+    # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
+    return RMSNorm(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
 
 
 @lru_cache(8)
@@ -27,19 +33,6 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     dtype = x.dtype
     x1, x2 = x.float().chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(dtype)
 
 
 class PatchEmbed(nn.Module):
@@ -81,7 +74,6 @@ class Attention(VisionAttention):
                 x,
                 position_embeddings=(cos, sin),
                 forward_metadata=metadata,
-                max_seqlen=x.shape[0],
             )
             .squeeze(0)
         )
@@ -101,9 +93,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.norm1 = RMSNorm(args.vision_dim)
+        self.norm1 = _rms_norm(args.vision_dim)
         self.attn = Attention(args)
-        self.norm2 = RMSNorm(args.vision_dim)
+        self.norm2 = _rms_norm(args.vision_dim)
         self.mlp = MLP(args)
 
     def forward(
@@ -126,14 +118,13 @@ class ViT(nn.Module):
         self.rope_theta = args.vision_rope_theta
         self.patch_embed = PatchEmbed(args)
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
-        self.norm = RMSNorm(args.vision_dim)
+        self.norm = _rms_norm(args.vision_dim)
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         x = self.patch_embed(patches)
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
         cos, sin = cos.to(x.device), sin.to(x.device)
-        # One image is one full, bidirectional sequence. Supplying its known
-        # length avoids device-to-host length discovery in every encoder layer.
+        # Passing the known length avoids device-to-host length discovery per layer.
         metadata = prepare_vision_attention_metadata(
             torch.tensor([0, x.shape[0]], dtype=torch.int32),
             x.device,

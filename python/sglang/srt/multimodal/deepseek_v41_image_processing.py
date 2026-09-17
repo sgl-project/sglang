@@ -9,10 +9,7 @@ Every one of those positions carries `image_token_id` in `input_ids`; only the t
 apart. The IMAGE slots are filled with aligner rows in reading order.
 """
 
-import base64
-import io
 import math
-from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -20,6 +17,9 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
+
+
+GPU_PLAN_KEY = "dsv41_gpu_plan"
 
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
@@ -67,37 +67,6 @@ def safe_resize(
     return n_llm_h, n_llm_w, best_height, best_width
 
 
-def load_image_bytes(record) -> bytes:
-    """Load image bytes from raw/base64 data, an Anthropic source, URL, or path."""
-    data = record.get("data")
-    if isinstance(data, bytes):
-        return data
-    if isinstance(data, str):
-        return base64.b64decode(data)
-
-    source = record.get("source")
-    if isinstance(source, dict):
-        if source.get("data") is not None:
-            return base64.b64decode(source["data"])
-        if source.get("url"):
-            return load_image_bytes({"url": source["url"]})
-
-    url = record.get("url")
-    if isinstance(url, str) and url:
-        if url.startswith("data:"):
-            header, _, payload = url.partition(",")
-            if ";base64" not in header:
-                raise ValueError(f"Unsupported data URL encoding: {header}")
-            return base64.b64decode(payload)
-        if url.startswith(("http://", "https://")):
-            with urlopen(url, timeout=30) as response:
-                return response.read()
-        with open(url, "rb") as file:
-            return file.read()
-
-    raise ValueError(f"Cannot load image from record: {list(record.keys())}")
-
-
 def plan_image_grid(width: int, height: int, args):
     """Resize plan for an image of the given original size; a pure function of its arguments."""
     p = args.vision_patch_size
@@ -123,20 +92,14 @@ def plan_image_grid(width: int, height: int, args):
     )
 
 
-def decode_image(record):
-    """Decode using the same RGB conversion for every preprocessing backend."""
-    if isinstance(record, Image.Image):
-        image = record.convert("RGB")
-    else:
-        with Image.open(io.BytesIO(load_image_bytes(record))) as source:
-            image = source.convert("RGB")
-    return image
+def to_rgb(image: Image.Image) -> Image.Image:
+    """The same RGB conversion for every preprocessing backend."""
+    return image.convert("RGB")
 
 
-def load_image(record, args):
-    """Load and transform one image record into ViT patches."""
+def patchify_image(image, args):
     p = args.vision_patch_size
-    image = decode_image(record)
+    image = to_rgb(image)
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
         image.width, image.height, args
     )
@@ -159,15 +122,14 @@ def load_image(record, args):
 
 
 def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
-    """Default layout: the aligner grid in reading order, one IMAGE_NEW_LINE per row."""
     types = [IMAGE_START]
     types += ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h
     types.append(IMAGE_END)
     return torch.tensor(types, dtype=torch.int64)
 
 
-def prepare_image(record, args):
-    image = decode_image(record)
+def prepare_image(image, args):
+    image = to_rgb(image)
     lh, lw, height, width = plan_image_grid(image.width, image.height, args)
     stretch = (
         args.vision_max_wh_ratio is not None
@@ -191,8 +153,8 @@ def prepare_image(record, args):
     return np.array(image, dtype=np.uint8), plan, lh, lw
 
 
-def load_image_rust(record, args, *, resize_patchify):
-    pixels, plan, lh, lw = prepare_image(record, args)
+def patchify_image_rust(image, args, *, resize_patchify):
+    pixels, plan, lh, lw = prepare_image(image, args)
     bits = resize_patchify(
         pixels,
         (plan["height"], plan["width"]),
@@ -206,8 +168,8 @@ def load_image_rust(record, args, *, resize_patchify):
     return patches, h, w, lh, lw
 
 
-def prepare_image_gpu(record, args):
-    pixels, plan, lh, lw = prepare_image(record, args)
+def prepare_image_gpu(image, args):
+    pixels, plan, lh, lw = prepare_image(image, args)
     return torch.from_numpy(pixels).permute(2, 0, 1).contiguous(), plan, lh, lw
 
 
@@ -215,9 +177,8 @@ def materialize_image_gpu(pixels: torch.Tensor, plan: dict) -> torch.Tensor:
     """Resize, pad, normalize and patchify on the input tensor's device."""
     x = pixels.unsqueeze(0).float()
     target = (plan["resize_h"], plan["resize_w"])
-    # PIL uses separable passes, with uint8 rounding/clamping after each pass.
-    # Keep those boundaries; a single 2D float resize preserves overshoots
-    # between passes and can diverge substantially on high-contrast images.
+    # PIL resizes separably, rounding and clamping to uint8 after each pass;
+    # fusing the two passes into one float resize diverges on high-contrast images.
     for size in ((x.shape[-2], target[1]), target):
         if x.shape[-2:] != size:
             x = (
