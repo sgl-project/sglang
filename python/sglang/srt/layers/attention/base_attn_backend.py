@@ -85,6 +85,10 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    # Optional device-specific replacement for the CUDA/Triton DCP metadata
+    # builder. The shared planner keeps the CUDA path as its default.
+    dcp_metadata_builder = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

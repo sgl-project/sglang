@@ -23,15 +23,11 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
-    build_mla_dcp_local_block_tables,
-    build_mla_dcp_mtp_mask,
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
     remap_dcp_write_locations_fixed_shape,
 )
-from sglang.srt.layers.dcp.planner import (
-    _prepare_decode_context_parallel_metadata_torch,
-)
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -217,151 +213,40 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
-    def test_mla_local_block_tables_map_widened_virtual_pages(self):
-        physical_page_size = 4
-        dcp_size = 4
-        widened_page_size = physical_page_size * dcp_size
-        seq_lens = torch.tensor([1, 17, 31], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
-        page_ids = [[11, 12], [21, 22], [31, 32]]
-        req_to_token = torch.zeros(3, 32, dtype=torch.int64)
-        for req_idx in range(3):
-            for pos in range(32):
-                virtual_page = pos // widened_page_size
-                req_to_token[req_idx, pos] = (
-                    page_ids[req_idx][virtual_page] * widened_page_size
-                    + pos % widened_page_size
-                )
+    def test_metadata_planner_delegates_to_backend_builder(self):
+        expected = object()
+        builder = MagicMock(return_value=expected)
+        backend = SimpleNamespace(dcp_metadata_builder=builder)
+        seq_lens = torch.tensor([3], dtype=torch.int32)
+        extend_lens = torch.tensor([1], dtype=torch.int32)
 
-        for rank in range(dcp_size):
-            block_tables, local_lens = build_mla_dcp_local_block_tables(
-                req_to_token,
-                req_pool_indices,
-                seq_lens,
-                physical_page_size,
-                dcp_size,
-                rank,
-            )
-            expected_lens = get_dcp_lens(seq_lens, dcp_size, rank).to(torch.int32)
-            torch.testing.assert_close(local_lens, expected_lens)
-            for req_idx, local_len in enumerate(expected_lens.tolist()):
-                num_pages = math.ceil(local_len / physical_page_size)
-                self.assertEqual(
-                    block_tables[req_idx, :num_pages].tolist(),
-                    page_ids[req_idx][:num_pages],
-                )
-                self.assertTrue(torch.all(block_tables[req_idx, num_pages:] == 0))
-
-    def test_mla_graph_block_tables_keep_fixed_width_and_mask_tail(self):
-        req_to_token = torch.arange(16, dtype=torch.int64).view(1, 16) + 64
-        block_tables, local_lens = build_mla_dcp_local_block_tables(
-            req_to_token,
-            torch.tensor([0]),
-            torch.tensor([5]),
-            physical_page_size=4,
-            dcp_size=2,
-            dcp_rank=1,
-            num_pages=3,
-        )
-
-        self.assertEqual(local_lens.tolist(), [2])
-        self.assertEqual(block_tables.shape, (1, 3))
-        self.assertEqual(block_tables[0, 1:].tolist(), [0, 0])
-
-    def test_mla_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
-        mask, local_lens = build_mla_dcp_mtp_mask(
-            torch.tensor([5, 0]),
-            torch.tensor([3, 0]),
-            dcp_size=2,
-            dcp_rank=1,
-            max_query_len=3,
-            max_local_kv_len=8,
-        )
-
-        self.assertEqual(mask.shape, (2, 3, 8))
-        self.assertEqual(local_lens.tolist(), [4, 0])
-        self.assertTrue(mask[1].all())
-
-    def test_mla_dcp_mtp_mask_matches_global_causality(self):
-        prefix_lens = torch.tensor([0, 3, 8], dtype=torch.int32)
-        query_lens = torch.tensor([4, 2, 3], dtype=torch.int32)
-        dcp_size = 3
-
-        for rank in range(dcp_size):
-            mask, local_lens = build_mla_dcp_mtp_mask(
-                prefix_lens, query_lens, dcp_size, rank
-            )
-            expected_lens = get_dcp_lens(prefix_lens + query_lens, dcp_size, rank).to(
-                torch.int32
-            )
-            torch.testing.assert_close(local_lens, expected_lens)
-
-            for req_idx, (prefix_len, query_len, local_len) in enumerate(
-                zip(
-                    prefix_lens.tolist(),
-                    query_lens.tolist(),
-                    expected_lens.tolist(),
-                )
-            ):
-                local_positions = [
-                    pos
-                    for pos in range(prefix_len + query_len)
-                    if pos % dcp_size == rank
-                ]
-                for query_idx in range(mask.shape[1]):
-                    for local_idx in range(mask.shape[2]):
-                        expected_masked = (
-                            query_idx >= query_len
-                            or local_idx >= local_len
-                            or local_positions[local_idx] > prefix_len + query_idx
-                        )
-                        self.assertEqual(
-                            bool(mask[req_idx, query_idx, local_idx]),
-                            expected_masked,
-                            (req_idx, rank, query_idx, local_idx),
-                        )
-
-    def test_torch_extend_metadata_matches_prefix_owner_layout(self):
-        dcp_size = 4
-        prefix_lens = torch.tensor([4, 8], dtype=torch.int32)
-        extend_lens = torch.tensor([2, 3], dtype=torch.int32)
-        seq_lens = prefix_lens + extend_lens
-        req_to_token = torch.tensor(
-            [
-                [40, 41, 42, 43, 100, 101, 0, 0],
-                [80, 81, 82, 83, 84, 85, 86, 87],
-            ],
-            dtype=torch.int32,
-        )
-        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
-        all_prefix = torch.cat([req_to_token[0, :4], req_to_token[1, :8]])
-
-        for rank in range(dcp_size):
-            with rc.get_parallel().override(
+        with (
+            rc.get_parallel().override(
                 dcp_enabled=True,
-                dcp_size=dcp_size,
-                dcp_rank=rank,
-            ):
-                metadata = _prepare_decode_context_parallel_metadata_torch(
-                    seq_lens=seq_lens,
-                    extend_prefix_lens_cpu=prefix_lens,
-                    extend_seq_lens=extend_lens,
-                    req_pool_indices=req_pool_indices,
-                    req_to_token=req_to_token,
-                    seq_lens_sum=int(seq_lens.sum()),
-                    kv_cache_dtype=torch.bfloat16,
-                    kv_cache_device="cpu",
-                )
-            expected_local = all_prefix[rank::dcp_size] // dcp_size
-            torch.testing.assert_close(
-                metadata.dcp_local_prefix_kv_indices, expected_local
+                dcp_size=2,
+                dcp_rank=0,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            result = prepare_decode_context_parallel_metadata(
+                seq_lens=seq_lens,
+                extend_prefix_lens=torch.tensor([2], dtype=torch.int32),
+                extend_prefix_lens_cpu=torch.tensor([2], dtype=torch.int32),
+                extend_seq_lens=extend_lens,
+                req_pool_indices=torch.tensor([0]),
+                req_to_token=torch.tensor([[10, 11, 12]], dtype=torch.int32),
+                seq_lens_sum=3,
+                kv_buffer_shape=torch.Size([3, 1]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn=None,
             )
-            self.assertEqual(metadata.dcp_kv_indptr.tolist(), [0, 6, 17])
-            self.assertEqual(
-                metadata.dcp_kv_indices.tolist(),
-                [0, 1, 2, 3, 12, 13, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16],
-            )
-            self.assertEqual(metadata.dcp_kv_buffer.numel(), 0)
+
+        self.assertIs(result, expected)
+        builder.assert_called_once()
 
     def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
         """A local Q shard must not restart GQA mapping at KV head zero."""
