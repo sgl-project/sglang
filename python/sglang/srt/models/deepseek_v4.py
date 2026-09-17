@@ -2771,7 +2771,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.get()
             and not is_batch_invariant_mode_enabled()
         ):
-            from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+            from sglang.kernels.ops.layernorm.mhc import (
                 split_bf16_hc_weight,
             )
 

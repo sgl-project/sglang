@@ -59,7 +59,7 @@ class TestDsv41Fp4TieRoundingHip(CustomTestCase):
             read_fp4_index_k_split,
             store_fp4_index_k_cache_split,
         )
-        from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 

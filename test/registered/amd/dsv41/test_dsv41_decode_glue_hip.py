@@ -260,7 +260,7 @@ def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
 
 @pytest.mark.parametrize("compressed_kv", [False, True])
 def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
-    from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
         rope_tail_fake_quant_fp4,
     )
 

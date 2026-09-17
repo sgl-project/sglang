@@ -295,7 +295,7 @@ def test_index_q_pack_weights_matches_standalone(
         pack_fp4_query_flydsl,
         rocm_indexer_head_weights,
     )
-    from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
         rope_tail_fake_quant_fp4,
     )
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
