@@ -31,6 +31,12 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.checksum import (
+    KvChecksumComputer,
+    is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
@@ -52,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
@@ -66,6 +73,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -203,6 +211,17 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        if get_disagg().disaggregation_enable_kv_checksum:
+            kv_args = self.kv_manager.kv_args
+            self.scheduler.kv_checksum_computer = KvChecksumComputer(
+                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                kv_data_ptrs=kv_args.kv_data_ptrs,
+                kv_item_lens=kv_args.kv_item_lens,
+                state_data_ptrs=kv_args.state_data_ptrs,
+                state_item_lens=kv_args.state_item_lens,
+            )
+        else:
+            self.scheduler.kv_checksum_computer = None
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -396,6 +415,13 @@ class PrefillBootstrapQueue:
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
+        # Rejected at intake: `set_finish_with_abort` left the verdict in
+        # `to_finish`, which `finished()` does not read, and swapped the prompt
+        # for a one-token stub. Bootstrapping it costs a handshake, a metadata
+        # buffer and a forward pass before anything unwinds it.
+        if is_unadmitted_reject(req):
+            self.scheduler.retire_unadmitted_request(req)
+            return
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
@@ -591,6 +617,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self._process_hicache_events()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -999,6 +1026,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self.tree_cache.finish(
+                    req.cache_request_handle, CacheRequestOutcome.SUCCESS
+                )
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1070,6 +1100,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1111,7 +1142,7 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
@@ -1143,7 +1174,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -1259,6 +1290,25 @@ class SchedulerDisaggregationPrefillMixin:
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
+        self,
+        req: Req,
+        last_chunk: bool = False,
+        end_idx: Optional[int] = None,
+    ) -> None:
+        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        if last_chunk and computer is not None:
+            if is_health_check_req(req):
+                value = 0
+            else:
+                if end_idx is None:
+                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                page_indices_gpu = page_indices_for_request(self, req, end_idx)
+                state_indices = state_indices_for_request(self, req, end_idx)
+                value = computer.compute(page_indices_gpu, state_indices)
+            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+
+    def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
@@ -1328,7 +1378,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
                     )
                 )
@@ -1466,6 +1516,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
+        self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
         req.output_ids = array("q")
@@ -1478,6 +1529,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.output_dsa_topk_indices = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
+        req.advance_cache_request_handle()
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
