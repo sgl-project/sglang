@@ -9,7 +9,6 @@ import numpy as np
 
 import sglang as sgl
 from sglang.srt.utils import is_hip
-from sglang.utils import download_and_cache_file, read_jsonl
 
 _is_hip = is_hip()
 
@@ -515,10 +514,16 @@ def test_hellaswag_select():
             ret += get_one_example(lines, i, True) + "\n\n"
         return ret
 
-    # Read data
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    # Read data. The jsonl this used to fetch lived in the rowanz/hellaswag
+    # GitHub repo, which now answers HTTP 451, so the dataset is read from its
+    # canonical HuggingFace mirror instead. That copy types `label` as a string
+    # where the jsonl had an int, and it is used both to index `endings` and to
+    # compare against `preds` below, so it is coerced back here.
+    from datasets import load_dataset
+
+    lines = load_dataset("Rowan/hellaswag", split="validation").to_list()
+    for line in lines:
+        line["label"] = int(line["label"])
 
     # Construct prompts
     num_questions = 200
