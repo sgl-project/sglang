@@ -132,9 +132,9 @@ def import_state(
                 tensor = nn.Parameter(tensor, requires_grad=descriptor.requires_grad)
                 # Local constructor metadata only: no remote Python state or
                 # daemon-bound methods. Adapters own post-load derived state.
-                tensor.__dict__.update(old[descriptor.name].__dict__)
             else:
                 tensor.requires_grad_(descriptor.requires_grad)
+            tensor.__dict__.update(old[descriptor.name].__dict__)
             objects[descriptor.tensor_group] = tensor
         replacements[descriptor.name] = tensor
 

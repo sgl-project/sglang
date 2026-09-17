@@ -108,6 +108,13 @@ class TestStateMapping(unittest.TestCase):
         self.assertIs(target.weight, old_weight)
         self.assertEqual(target.weight.device.type, "meta")
 
+    def test_buffer_constructor_metadata_survives_import(self):
+        target = _model("meta")
+        target.persistent.local_scale = 2.0
+        import_state(target, self.snapshot.manifest, storage_byte_views(self.snapshot))
+        self.assertEqual(target.persistent.local_scale, 2.0)
+        self.assertIs(target.persistent, target.child.scratch)
+
     def test_bad_storage_view_does_not_replace_parameters(self):
         target = _model("meta")
         views = storage_byte_views(self.snapshot)
