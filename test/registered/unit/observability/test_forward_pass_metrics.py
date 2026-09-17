@@ -27,7 +27,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     _FpmPublisherThread,
@@ -523,6 +523,7 @@ class TestForwardPassMetrics(unittest.TestCase):
     def test_pp_launch_and_output_ring_keep_rank_local_timing(self):
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
         scheduler = self.scheduler
+        scheduler._pp_spec_relay = False
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = object()
@@ -545,6 +546,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         scheduler.run_batch = wrap_forward_with_fpm(forward, timer)
         batch = self._make_batch(
             forward_mode=ForwardMode.DECODE,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             seq_lens_cpu=[128],
             reqs=[_FakeReq(128)],
             return_logprob=False,
@@ -570,6 +572,60 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.reporter._emit_forward_pass_metrics(batch, rebuilt)
         self.assertEqual(len(scheduler._fpm_publisher.metrics), 1)
         self.assertAlmostEqual(scheduler._fpm_publisher.metrics[0].wall_time, 0.009)
+
+    def test_pp_spec_relay_publishes_when_rank_local_timing_is_ready(self):
+        timer = DeviceTimer()
+        interval = FakeInterval(9)
+        with patch.object(_TimingInterval, "create", return_value=interval):
+            with capture_timing(timer) as timing:
+                with timer.wrap({"category": "verify"}):
+                    pass
+
+        req = _FakeReq(128, output_len=1)
+        req.rid = "req-0"
+        forward_batch = self._make_batch(
+            forward_mode=ForwardMode.DECODE,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            reqs=[req],
+            seq_lens_cpu=None,
+        )
+        live_batch = self._make_batch(
+            reqs=[req],
+            return_logprob=False,
+            seq_lens=torch.tensor([128]),
+            seq_lens_cpu=None,
+            spec_info=None,
+        )
+        receiver = SchedulerPPMixin()
+        receiver._pp_spec_relay = True
+        receiver.pp_group = types.SimpleNamespace(is_first_rank=False)
+        metadata = PPBatchMetadata(
+            can_run_cuda_graph=True, fwd_batch=forward_batch, fpm_timing=timing
+        )
+        wire = PPProxyTensors(
+            {
+                "next_token_ids": torch.tensor([7, 8, 0]),
+                "spec_accept_lens": torch.tensor([2]),
+                "spec_new_seq_lens": torch.tensor([130]),
+                "spec_bonus_tokens": torch.tensor([8]),
+            }
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+            return_value=types.SimpleNamespace(speculative_num_draft_tokens=3),
+        ):
+            result = receiver._pp_prep_batch_result(live_batch, metadata, wire)
+
+        self.reporter.snapshot_spec_decode_metrics(forward_batch, result)
+        self.reporter._emit_forward_pass_metrics(forward_batch, result)
+        self.assertEqual(self.scheduler._fpm_publisher.metrics, [])
+        interval.ready = True
+        timer._report()
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        metrics = self.scheduler._fpm_publisher.metrics[0]
+        self.assertAlmostEqual(metrics.wall_time, 0.009)
+        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 1)
+        self.assertEqual(metrics.scheduled_requests.sum_decode_kv_tokens, 128)
 
     def test_pp_skipped_output_comm_keeps_timing(self):
         timing = object()
