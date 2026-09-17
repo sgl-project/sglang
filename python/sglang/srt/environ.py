@@ -1474,6 +1474,15 @@ class Envs:
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
 
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
