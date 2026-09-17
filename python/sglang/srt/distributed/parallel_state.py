@@ -1092,7 +1092,17 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            assert input.numel() == output.numel() * self.world_size
+            # Reduction order must be independent of the receiving rank.
+            # Preserve input even when all_reduce mutates its argument.
+            reduced = self.all_reduce(input.clone())
+            output.copy_(
+                reduced.reshape(-1)
+                .narrow(0, self.rank_in_group * output.numel(), output.numel())
+                .view_as(output)
+            )
+        elif _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1173,6 +1183,33 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def _deterministic_reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        output: Optional[torch.Tensor],
+        sizes: Optional[List[int]],
+    ) -> torch.Tensor:
+        # Reduction order must be independent of the receiving rank.
+        # Offsets are a prefix sum, so unequal `sizes` work unchanged.
+        if sizes is not None:
+            assert len(sizes) == self.world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+            offset = sum(sizes[: self.rank_in_group])
+        else:
+            assert input_.shape[0] % self.world_size == 0
+            chunk_size = input_.shape[0] // self.world_size
+            offset = chunk_size * self.rank_in_group
+        output_shape = (chunk_size,) + input_.shape[1:]
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
+        # Preserve input even when all_reduce mutates its argument.
+        reduced = self.all_reduce(input_.clone())
+        output.copy_(reduced.narrow(0, offset, chunk_size))
+        return output
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1181,6 +1218,9 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
+
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            return self._deterministic_reduce_scatterv(input_, output, sizes)
 
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (
@@ -3121,6 +3161,26 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def abort_distributed_environment() -> None:
+    """Drop this rank's communicators locally.
+
+    ``destroy_process_group`` is collective and blocks when a peer is gone,
+    which on a shutdown path is the common case.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+    if abort is None:
+        # Older torch exposes no non-collective teardown,
+        # and the collective one is what this function exists to avoid.
+        return
+    try:
+        # No argument aborts every group, the default one included.
+        abort()
+    except Exception as e:
+        logger.warning(f"NCCL abort on shutdown failed, {type(e).__name__}: {e}")
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):

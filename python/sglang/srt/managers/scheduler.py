@@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -98,7 +99,10 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    abort_distributed_environment,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
@@ -435,6 +439,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     def __init__(
         self,
@@ -973,11 +978,10 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        config_to_check = self.model_config.hf_config
-        if hasattr(self.model_config.hf_config, "text_config"):
-            config_to_check = self.model_config.hf_config.text_config
-        elif hasattr(self.model_config, "hf_text_config"):
-            config_to_check = self.model_config.hf_text_config
+        # Use the language config already normalized by ModelConfig. Multimodal
+        # wrappers expose it under different attributes (for example,
+        # ``text_config`` or ``llm_config``).
+        config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -1020,6 +1024,17 @@ class Scheduler(
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            # PP+spec: the draft model (MTP layer) needs final hidden states and
+            # the lm_head, both of which live on the last PP stage only.
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -1152,7 +1167,9 @@ class Scheduler(
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # PP+spec: non-last stages have no draft worker; they run the
+            # verify-shaped target forward through the plain tp_worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1519,6 +1536,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             # The decode requests polling kv cache
@@ -1566,6 +1584,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1677,11 +1696,6 @@ class Scheduler(
             self.tp_worker.model_runner.ngram_embedding_manager
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
-        if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
-            hf_config = self.tp_worker.model_config.hf_config
-            self.ngram_embedding_n = hf_config.ngram_embedding_n
-            self.ngram_embedding_k = hf_config.ngram_embedding_k
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2165,7 +2179,8 @@ class Scheduler(
                     tokenized_req.mm_inputs, MultimodalInputs
                 ):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
-                        tokenized_req.mm_inputs
+                        tokenized_req.mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
             except Exception as error:
                 local_error = f"{type(error).__name__}: {error}"
@@ -2273,13 +2288,16 @@ class Scheduler(
             self.rust_server = None
             return
 
-        rust_server = RustServer.launch(self)
+        rust_server = self.get_rust_server_class().launch(self)
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
+    def get_rust_server_class(self) -> type[RustServer]:
+        return RustServer
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
@@ -2520,23 +2538,28 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget:
-        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
-        req.sampling_params.max_new_tokens = max(
+        # Keep this bound consistent with PrefillAdder's admission budget.
+        max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
-                - paged_input_len
-                - self.page_size
-                - 1,
             ),
         )
+        max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
+            input_len,
+            max_new_tokens,
+            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            sliding_window_size=self.sliding_window_size,
+            chunk_size=self.chunked_prefill_size,
+        )
+        if max_new_tokens is None:
+            req.set_finish_with_abort(
+                f"Request prompt exceeds the KV memory budget: input_len={input_len}."
+            )
+            max_new_tokens = 0
+
+        req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
@@ -2592,7 +2615,10 @@ class Scheduler(
         if self.dp_tp_group.rank_in_group == 0:
             try:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
             except Exception as error:
                 result = _MultimodalInputBroadcast(
@@ -2623,7 +2649,10 @@ class Scheduler(
                 result = obj_list[0]
             else:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
 
         if result.error is not None:
@@ -2638,7 +2667,10 @@ class Scheduler(
 
         if get_mm().enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs)
-        return MultimodalInputs.from_processor_output(mm_inputs)
+        return MultimodalInputs.from_processor_output(
+            mm_inputs,
+            requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+        )
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
@@ -3074,7 +3106,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3093,6 +3125,9 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            req.storage_prefetch_last_match_len = matched_len
+
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
@@ -3101,7 +3136,6 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
@@ -3120,41 +3154,102 @@ class Scheduler(
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    storage_hit_end=storage_hit_end,
                 )
 
-    def _retry_missed_storage_prefetches(self):
-        """Re-issue the availability check for queued requests whose prefetch
-        missed. Pacing counts scheduling passes so TP ranks re-issue on the
-        same pass; a sweep (the admission loop stops at the first
-        unschedulable request) covers the whole queue."""
-        interval = get_memory().hicache_storage_prefetch_retry_poll_interval
-        if interval <= 0 or not self.waiting_queue:
+    def _process_storage_prefetch_retries(self):
+        """Issue due L3 attempts in the current waiting-queue order."""
+        retries = self.tree_cache.storage_prefetch_retries
+        if retries is None:
             return
+        memory = get_memory()
+        for req, storage_hit_end in retries.pop_ready(
+            self.waiting_queue,
+            memory.hicache_storage_prefetch_retry_poll_interval,
+            memory.hicache_storage_prefetch_retry_max_attempts,
+        ):
+            self._retry_storage_prefetch(req, storage_hit_end)
+
+    def _retry_storage_prefetch(
+        self, req: Req, storage_hit_end: Optional[int] = None
+    ) -> None:
+        req.storage_prefetch_retry_attempts += 1
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
-        for req in self.waiting_queue:
-            if self.tree_cache.pop_storage_prefetch_miss(req.cache_request_handle):
-                req.storage_prefetch_retry_pending = True
-                req.storage_prefetch_retry_wait_polls = 0
-            if (
-                not req.storage_prefetch_retry_pending
-                or req.storage_prefetch_retry_attempts >= max_attempts
-            ):
-                continue
-            req.storage_prefetch_retry_wait_polls += 1
-            if req.storage_prefetch_retry_wait_polls <= interval:
-                continue
-            req.storage_prefetch_retry_pending = False
-            req.storage_prefetch_retry_attempts += 1
-            logger.debug(
-                "HiCache storage prefetch retry req=%s attempt=%d",
+        if req.storage_prefetch_retry_attempts >= max_attempts:
+            logger.warning(
+                "HiCache storage prefetch reissue cap reached req=%s attempts=%d; "
+                "the request is admitted without further L3 lookups",
                 req.rid,
                 req.storage_prefetch_retry_attempts,
             )
-            self._prefetch_kvcache(req)
+        else:
+            logger.debug(
+                "HiCache storage prefetch re-issue req=%s attempt=%d",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+        self._prefetch_kvcache(req, storage_hit_end)
+
+    def _prefetch_after_device_hit_loss(self, req: Req) -> bool:
+        """Re-query an L3 range newly exposed by queue-time device eviction."""
+        previous_match_len = req.storage_prefetch_last_match_len
+        buffer_pipeline = self.tree_cache.buffer_pipeline
+        if not previous_match_len or (
+            buffer_pipeline is not None
+            and buffer_pipeline.has_staged(req.cache_request_handle)
+        ):
+            return False
+        current_match_len = len(req.prefix_indices) + req.host_hit_length
+        if current_match_len >= previous_match_len:
+            return False
+        if (
+            req.storage_prefetch_retry_attempts
+            >= get_memory().hicache_storage_prefetch_retry_max_attempts
+        ):
+            # Past the re-issue cap the shorter live match is admitted as is.
+            req.storage_prefetch_last_match_len = current_match_len
+            return False
+        logger.warning(
+            "HiCache device prefix shrank before admission req=%s "
+            "lookup_match=%d current_match=%d; reissuing storage lookup",
+            req.rid,
+            previous_match_len,
+            current_match_len,
+        )
+        self._retry_storage_prefetch(req)
+        return True
+
+    def retire_unadmitted_request(self, req: Req) -> None:
+        """Finish a request the disaggregation queues rejected at their door."""
+        # `create_req` marks a streaming session in-flight, and the pre-abort
+        # detach lives in `StreamingSession.find_active_slot`, which only runs
+        # while scheduling; a session left in-flight rejects every later request.
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
+            req.session = None
+        # `beam_coordinator.validate_and_init` counts the group in ahead of the
+        # checks that reject; no-op when the request has no group.
+        self.beam_coordinator.retire_group(req)
+        # PREFILL runs `_prefetch_kvcache` before its door, so even the
+        # one-token stub is registered with the cache by now:
+        # `prefetch_from_storage` arms the paced-retry set for this attempt's
+        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
+        # that, and a retired request reaches neither.
+        self._release_aborted_request(req)
+        # `update_finish_state` returns early once `finished()`, so an already
+        # set `finished_reason` is what the client receives; report the same.
+        reason = req.finished_reason or req.to_finish
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.update_finish_state()
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if is_retracted:
+            req.storage_prefetch_retry_attempts = 0
+            req.storage_prefetch_last_match_len = None
+            req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -3504,11 +3599,24 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _process_hicache_events(self) -> None:
+        # The HiCache drain is TP-wide consensus; run it before rank-local
+        # decisions (_should_defer_prefill) or ranks enter different collectives.
+        if (
+            self.enable_hierarchical_cache
+            or get_memory().enable_flexkv
+            or self.enable_unified_cache_external_linker
+        ):
+            self.tree_cache.check_hicache_events()
+            if self.enable_hicache_storage:
+                self._process_storage_prefetch_retries()
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self._process_hicache_events()
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3710,15 +3818,6 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if (
-            self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
-        ):
-            self.tree_cache.check_hicache_events()
-            if self.enable_hicache_storage:
-                self._retry_missed_storage_prefetches()
-
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -3823,6 +3922,7 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -3870,32 +3970,16 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage and (
+                self._prefetch_after_device_hit_loss(req)
+            ):
+                continue
             if (
                 self.enable_hicache_storage
-                and get_memory().hicache_host_memory_mode == "buffer_only"
+                and buffer_pipeline is not None
+                and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
-                # Buffer mode: surface a staged prefetch as the request's host
-                # hit (consumed through init_load_back) plus its SWA window,
-                # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Planned against the same
-                # live prefix admission uses, so only the splice-able span
-                # tail is charged and unusable holds are freed. Set AFTER
-                # init_next_round_input (which recomputes host_hit). Mamba
-                # (fenced in init_hicache) will need the same charge via
-                # mamba_host_hit_length.
-                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
-                    req.cache_request_handle, len(req.prefix_indices)
-                )
-                if held_tokens > 0:
-                    req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = held_swa_tokens
-                    req.storage_hit_length = held_tokens
-                    req.storage_hit_start = len(req.prefix_indices)
-                    req.host_hit_is_storage = True
-                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                    req.storage_hit_length = 0
-                    req.storage_hit_start = None
-                    req.host_hit_is_storage = False
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3943,6 +4027,10 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        retries = self.tree_cache.storage_prefetch_retries
+        if self.enable_hicache_storage and retries is not None:
+            for req in can_run_list:
+                retries.cancel(req.rid)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -4348,31 +4436,99 @@ class Scheduler(
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
+                is_verify_round = self.ps.pp_size > 1 and not (
+                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
+                )
+                # The relayed tree is what the requests carry between rounds;
+                # the rebuild below swaps it for this round's verify input, so
+                # hold on to it and put it back once the forward is done.
+                relay_input = batch.spec_info if is_verify_round else None
+                if is_verify_round:
+                    # PP+spec decode: every stage rebuilds the same verify
+                    # input from relayed per-req state (draft lives on the
+                    # last stage only).
+                    self._pp_spec_rebuild_verify_input(batch)
+                if not self.pp_group.is_last_rank:
+                    # PP+spec: non-last stages run only their model chunk on
+                    # the verify-shaped batch; sampling, accept and draft all
+                    # live on the last stage. The plain tp_worker path already
+                    # returns pp_hidden_states_proxy_tensors for relay.
+                    resolve_forward_inputs(batch, self.future_map)
+                    if is_verify_round:
+                        from sglang.srt.speculative.eagle_utils import (
+                            eagle_prepare_for_verify,
+                        )
+
+                        # Isolation is load-bearing: eagle_prepare_for_verify
+                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
+                        # input_ids, out_cache_loc); without the restore the
+                        # next get_next_batch_to_run treats this decode batch
+                        # as extend and re-merges it (duplicate reqs).
+                        with self._forward_isolation(batch, overlap=False):
+                            verify_forward_batch, can_run_cuda_graph = (
+                                eagle_prepare_for_verify(
+                                    batch.spec_info,
+                                    self.req_to_token_pool,
+                                    batch,
+                                    self.tp_worker,
+                                )
+                            )
+                            batch_result = self.tp_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                                is_verify=True,
+                            )
+                        batch_result.can_run_cuda_graph = can_run_cuda_graph
+                        # The isolation above restores batch.out_cache_loc, but
+                        # this stage still has to compact its own accepted-path
+                        # KV once the last stage relays which nodes it kept, so
+                        # the verify slots have to outlive the forward.
+                        batch_result.spec_verify_out_cache_loc = (
+                            verify_forward_batch.out_cache_loc
+                        )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    batch.input_ids = None
+                    # The verify input is per-round; between iterations
+                    # spec_info carries the relayed tree, which is
+                    # merge/filter-safe.
+                    batch.spec_info = relay_input
+                else:
+                    # Non-overlap: drive the V2 worker synchronously (no
+                    # future_map relay / on_publish).
+                    resolve_forward_inputs(batch, self.future_map)
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter. Under PP the
+                    # tail draft already consumed the draft input in-round, and
+                    # the next round's tree comes from the relay, so the last
+                    # stage carries the same relayed tree as the others.
+                    batch.spec_info = (
+                        relay_input
+                        if is_verify_round
+                        else batch_result.next_draft_input
                     )
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Only the last PP rank owns real results requiring D2H; other ranks
-                # consume device tensors rebuilt from the output ring.
-                batch_result.copy_done = self.device_module.Event()
-                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    # Only the last PP rank owns real results requiring D2H; other ranks
+                    # consume device tensors rebuilt from the output ring.
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -4692,7 +4848,7 @@ class Scheduler(
         # (queues parked under KV pressure / disagg transfer) has no
         # process_batch_result to publish the growing gauge, and gating here
         # froze /get_loads, DP balancing, and the LoadStat for the stall. This
-        # path spins without sleeping, so a wall-clock floor bounds the
+        # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
         fully_idle = self.is_fully_idle()
@@ -4705,6 +4861,10 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+            if self.enable_hicache_storage:
+                # Storage workers need the GIL between I/O calls. Yield while
+                # there is no GPU batch so polling cannot starve their acks.
+                time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5790,7 +5950,7 @@ def run_scheduler_process(
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"
@@ -5841,6 +6001,8 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+                # Last: anything above may still need a working communicator.
+                abort_distributed_environment()
 
 
 def _make_abort_req(
