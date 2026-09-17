@@ -42,6 +42,7 @@ class TestBasicSanityEagle3(
     fwd_occupancy_acc_length_threshold: float = 1.6
 
     model = DEFAULT_TARGET_MODEL_EAGLE3
+    mmlu_accept_length_thres = 1.5
 
     @classmethod
     def setUpClass(cls):

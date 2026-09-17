@@ -48,7 +48,8 @@ class TestBasicSanityDSpark(
     fwd_occupancy_max_new_tokens = 4096
     fwd_occupancy_acc_length_threshold: float = 2.0
 
-    mmlu_accept_length_thres = 2.0
+    mmlu_score_threshold = 0.70
+    mmlu_accept_length_thres = 3.0
 
     attention_backend = ATTENTION_BACKEND
     draft_attention_backend = DRAFT_ATTENTION_BACKEND
