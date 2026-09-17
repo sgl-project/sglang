@@ -750,6 +750,11 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Reduce the HiCache ack counts across TP ranks asynchronously: issue the
+    # all_reduce at the end of a step and read it on the next one, so the
+    # scheduler thread never blocks on the collective. Falls back to the
+    # blocking reduce under PP or when CP and TP both need a reduce.
+    SGLANG_ENABLE_HICACHE_ASYNC_ACK_SYNC = EnvBool(True)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

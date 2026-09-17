@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -63,6 +63,8 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
+        cache._hicache_async_ack_sync = False
+        cache._pending_ready_counts = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
@@ -113,3 +115,80 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnifiedAsyncAckSync(unittest.TestCase):
+    """The pipelined ack-count reduce: nothing is popped on the first step, the
+    previous step's reduced counts are popped on the next one, and the reduce
+    issued after popping counts only the acks still queued."""
+
+    def _make_cache(self, write_ready):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(
+            enable_storage=False,
+            write_back_duplicate_reclaim_digest=0,
+        )
+        cache.pp_rank = 0
+        cache.pp_size = 1
+        cache.enable_storage = False
+        cache.enable_storage_metrics = False
+        cache.storage_metrics_collector = None
+        cache.buffer_pipeline = None
+        cache.linker = None
+        cache._hicache_async_ack_sync = True
+        cache._pending_ready_counts = None
+        cache._ready_counts_group = object()
+        cache._drain_async_work = MagicMock()
+        cache.loading_check = MagicMock()
+        cache.cache_controller = SimpleNamespace(
+            start_writing=MagicMock(),
+            ack_write_queue=[
+                SimpleNamespace(
+                    finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
+                )
+                for ready in write_ready
+            ],
+            ack_load_queue=[],
+        )
+        popped = []
+
+        def writing_check(finish_count):
+            popped.append(finish_count)
+            del cache.cache_controller.ack_write_queue[:finish_count]
+
+        cache.writing_check = writing_check
+        return cache, popped
+
+    def test_pops_previous_counts_then_reduces_the_remainder(self):
+        cache, popped = self._make_cache([True, True, False])
+        issued = []
+
+        def fake_all_reduce(tensor, op, group, async_op):
+            issued.append(tensor.clone())
+            return SimpleNamespace(wait=MagicMock())
+
+        with patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            cache.check_hicache_events()
+            # First step: nothing to consume, one reduce issued with 2 ready acks.
+            self.assertEqual(popped, [])
+            self.assertEqual(issued[0][0].item(), 2)
+
+            cache.check_hicache_events()
+            # Second step: pop the 2 acks from step one, then reduce the rest.
+            self.assertEqual(popped, [2])
+            self.assertEqual(len(cache.cache_controller.ack_write_queue), 1)
+            self.assertEqual(issued[1][0].item(), 0)
+
+    def test_reduce_result_is_waited_before_use(self):
+        cache, popped = self._make_cache([True])
+        waited = MagicMock()
+
+        def fake_all_reduce(tensor, op, group, async_op):
+            return SimpleNamespace(wait=waited)
+
+        with patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            cache.check_hicache_events()
+            waited.assert_not_called()
+            cache.check_hicache_events()
+            waited.assert_called_once()
+            self.assertEqual(popped, [1])

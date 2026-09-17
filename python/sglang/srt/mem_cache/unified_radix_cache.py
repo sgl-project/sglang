@@ -256,6 +256,17 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self._ready_counts_group = self._single_ready_counts_group()
+        # One collective per step is the precondition for pipelining it; CP+TP
+        # (two groups) and PP pipelines keep the blocking path.
+        self._hicache_async_ack_sync = (
+            envs.SGLANG_ENABLE_HICACHE_ASYNC_ACK_SYNC.get()
+            and self.pp_size == 1
+            and self._ready_counts_group is not None
+        )
+        self._pending_ready_counts: Optional[
+            tuple[torch.distributed.Work, torch.Tensor, tuple, int]
+        ] = None
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -299,6 +310,20 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
         )
+
+    def _single_ready_counts_group(self):
+        """The one process group _all_reduce_attn_groups would reduce over, or
+        None when it would reduce over two groups or over nobody."""
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if len(groups) == 1:
+            return groups[0]
+        if not groups and self.tp_world_size > 1:
+            return self.tp_group
+        return None
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -3071,9 +3096,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
-    def _sync_hicache_ready_counts(
-        self,
-    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+    def _ready_counts_tensor(self) -> tuple[torch.Tensor, tuple[PoolName, ...], int]:
+        """Local ack counts, storage queue sizes, and the reclaim digest, laid
+        out for a MIN all_reduce across ranks."""
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
@@ -3115,8 +3140,17 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        return ready_counts, extra_pool_names, digest
 
+    def _sync_hicache_ready_counts(
+        self,
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+        ready_counts, extra_pool_names, digest = self._ready_counts_tensor()
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        return self._parse_ready_counts(ready_counts, extra_pool_names, digest)
+
+    @staticmethod
+    def _parse_ready_counts(ready_counts, extra_pool_names, digest):
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
@@ -3127,6 +3161,31 @@ class UnifiedRadixCache(BasePrefixCache):
             tuple(count_values[2:-2]),
             extra_pool_names,
         )
+
+    def _issue_async_ready_counts(self) -> None:
+        """Start this step's MIN all_reduce of the local ack counts; the result
+        is read one step later. Must run after this step's acks were popped,
+        or the popped acks would be counted a second time."""
+        ready_counts, extra_pool_names, digest = self._ready_counts_tensor()
+        work = torch.distributed.all_reduce(
+            ready_counts,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._ready_counts_group,
+            async_op=True,
+        )
+        self._pending_ready_counts = (work, ready_counts, extra_pool_names, digest)
+
+    def _consume_async_ready_counts(self):
+        """The previous step's reduced counts, or None on the first step. Every
+        count is a MIN over what each rank had ready then, so it is still safe
+        to pop now: acks only accumulate between two steps."""
+        pending = self._pending_ready_counts
+        if pending is None:
+            return None
+        self._pending_ready_counts = None
+        work, ready_counts, extra_pool_names, digest = pending
+        work.wait()
+        return self._parse_ready_counts(ready_counts, extra_pool_names, digest)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
@@ -3318,12 +3377,33 @@ class UnifiedRadixCache(BasePrefixCache):
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
-        (
-            write_finish_count,
-            load_finish_count,
-            storage_queue_sizes,
-            extra_pool_names,
-        ) = self._sync_hicache_ready_counts()
+        if self._hicache_async_ack_sync:
+            ready = self._consume_async_ready_counts()
+        else:
+            ready = self._sync_hicache_ready_counts()
+        if ready is not None:
+            self._apply_ready_counts(*ready)
+        if self._hicache_async_ack_sync:
+            # After the pops above, so the next reduce counts only unpopped acks.
+            self._issue_async_ready_counts()
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.flush_pending_writes()
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            storage_metrics = self.cache_controller.storage_backend.get_stats()
+            if storage_metrics is None:
+                storage_metrics = StorageMetrics()
+            if not hasattr(storage_metrics, "prefetch_stats"):
+                storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
+            self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _apply_ready_counts(
+        self,
+        write_finish_count: int,
+        load_finish_count: int,
+        storage_queue_sizes: tuple[int, ...],
+        extra_pool_names: tuple[PoolName, ...],
+    ) -> None:
+        """Pop the acks and storage-queue entries every rank agreed are ready."""
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
@@ -3341,15 +3421,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
-        if self.buffer_pipeline is not None:
-            self.buffer_pipeline.flush_pending_writes()
-        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
-            storage_metrics = self.cache_controller.storage_backend.get_stats()
-            if storage_metrics is None:
-                storage_metrics = StorageMetrics()
-            if not hasattr(storage_metrics, "prefetch_stats"):
-                storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
-            self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""
