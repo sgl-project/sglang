@@ -524,6 +524,17 @@ class ComponentLoader(ABC):
         """Opt-in frozen decisions; retain this loader's shared finalization."""
         raise NotImplementedError(f"{type(self).__name__} has no prepared load")
 
+    def prepare_weight_cache(self, spec, server_args, *, planned_device=None):
+        """Explicit capability; generic/native fallback is never cache admission.
+
+        Opted-in loaders return a PreparedComponent binding their exact recipe,
+        construction methods and an audited ComponentStateContract. The ordinary
+        cache-off path does not call this method.
+        """
+        raise ValueError(
+            f"{type(self).__name__} has no audited weight-cache capability"
+        )
+
     def load_native(
         self,
         component_model_path: str,

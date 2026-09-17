@@ -1,8 +1,10 @@
 import copy
+import dataclasses
 import logging
 import pickle
 from collections.abc import Callable
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -589,6 +591,90 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             checkpoint_key_filter=checkpoint_key_filter,
             quantized_attn_backend=quantized_attn_backend,
         )
+
+    def prepare_weight_cache(self, spec, server_args, *, planned_device=None):
+        from sglang.multimodal_gen.runtime.loader.component_state import (
+            PreparedComponent,
+        )
+        from sglang.multimodal_gen.runtime.loader.native_dit_state import for_model
+
+        if type(self) is not TransformerLoader:
+            raise ValueError(
+                "Weight cache has no audited capability for a custom transformer loader"
+            )
+        name = spec.module_name
+        self.component_load_precision(server_args, name)
+        self.resolve_component_quantization_override(server_args, name)
+        self.resolve_component_direct_gpu_loading(server_args, name)
+        backend, _ = server_args.resolve_component_attention_backend(
+            name, spec.load_module_name
+        )
+        backend = backend or AttentionBackendEnum.FA
+        frozen = self.prepare_customized(
+            spec.component_model_path, server_args, name, planned_device=planned_device
+        ).freeze()
+        contract = for_model(frozen.thaw().model_cls)
+        contract.validate_supported(frozen, attention=str(backend))
+        return PreparedComponent(
+            name,
+            spec.load_module_name,
+            spec.architecture,
+            type(self),
+            frozen,
+            contract,
+            backend,
+        )
+
+    def build_prepared_meta(self, frozen, *, attention_backend):
+        from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+            initialize_model_for_inference,
+        )
+
+        recipe = frozen.thaw()
+        with component_attn_backend_context_manager(
+            attention_backend, component_name=recipe.component_name
+        ):
+            model, _ = initialize_model_for_inference(
+                recipe.model_cls,
+                recipe.init_params,
+                param_dtype=recipe.quant_spec.param_dtype,
+            )
+        return model.eval().requires_grad_(False)
+
+    def apply_prepared_config(self, frozen, server_args):
+        recipe = frozen.thaw()
+        name = recipe.component_name
+        structural_name = self.structural_component_name(name)
+        config_field = (
+            "audio_dit_config" if structural_name == "audio_dit" else "dit_config"
+        )
+        setattr(server_args.pipeline_config, config_field, recipe.init_params["config"])
+        server_args.model_paths[name] = recipe.server_args.model_paths[name]
+
+    def prepared_checkpoint_files(self, frozen):
+        recipe = frozen.thaw()
+        root = Path(recipe.server_args.model_paths[recipe.component_name])
+        files = [root / "config.json", *(Path(path) for path in recipe.weight_files)]
+        for filename in (
+            "diffusion_pytorch_model.safetensors.index.json",
+            "model.safetensors.index.json",
+        ):
+            if (root / filename).exists():
+                files.append(root / filename)
+        return tuple(files)
+
+    def prepared_fingerprint(self, frozen):
+        recipe = frozen.thaw()
+        return {
+            "model_cls": f"{recipe.model_cls.__module__}.{recipe.model_cls.__qualname__}",
+            "config": dataclasses.asdict(recipe.init_params["config"]),
+            "hf_config": recipe.init_params["hf_config"],
+            "dtype": str(recipe.quant_spec.param_dtype),
+            "quantization": None,
+            "resident": True,
+            "fsdp": False,
+            "direct_gpu_weight_loading": recipe.weight_load_plan.load_full_state_dict_on_device,
+        }
 
     def load_prepared(self, frozen: FrozenTransformerLoad, *, attention_backend):
         recipe = frozen.thaw()
