@@ -48,9 +48,9 @@ impl ScoringPolicy for LoadBasedPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::scoring::argmax::TIE_EPSILON;
     use crate::policies::Policy;
+    use crate::workers::engine_reports::{EngineSnapshot, EngineWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -107,7 +107,7 @@ mod tests {
         // After the request snapshot, local counters say w0 is lighter.
         // The policy must still preserve the frozen Engine Load ordering.
         let _after_snapshot: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
-        let snapshot = EngineLoadSnapshot::from_workers(
+        let snapshot = EngineSnapshot::from_workers(
             23,
             HashMap::from([
                 (
@@ -148,7 +148,7 @@ mod tests {
         let w0 = worker("w0");
         let w1 = worker("w1");
         let captured_at = Instant::now();
-        let snapshot = EngineLoadSnapshot::from_workers(
+        let snapshot = EngineSnapshot::from_workers(
             37,
             HashMap::from([
                 (
@@ -192,7 +192,7 @@ mod tests {
         let _before_snapshot = [w0.timestamped_load_guard(), w0.timestamped_load_guard()];
         std::thread::sleep(std::time::Duration::from_millis(5));
         let captured_at = Instant::now();
-        let snapshot = EngineLoadSnapshot::from_workers(
+        let snapshot = EngineSnapshot::from_workers(
             41,
             HashMap::from([
                 (
@@ -233,7 +233,7 @@ mod tests {
         let w0 = worker("w0");
         let w1 = worker("w1");
         let _local_load = [w0.load_guard(), w0.load_guard()];
-        let snapshot = EngineLoadSnapshot::from_workers(
+        let snapshot = EngineSnapshot::from_workers(
             43,
             HashMap::from([(
                 w0.url.clone(),

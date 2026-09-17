@@ -1,16 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Engine-reported runtime load, fed by the load subscriber.
+//! Engine-published queue, capacity, and throughput observations.
 //!
-//! Workers publish a [`LoadStat`] gauge on their dedicated load socket (see
-//! `python/sglang/srt/managers/scheduler_components/load_publisher.py`). The
-//! load subscriber routes those into this table, keyed per
-//! `(worker_url, dp_rank)`. Request handling captures the freshest complete
-//! aggregate and falls back to Router-local load when it is unavailable.
-//!
-//! Load is a *gauge*, not a delta: last value wins, no sequence/replay
-//! semantics. Entries older than [`EngineLoadTable::freshness`] are ignored.
+//! Reports are gauges keyed by worker URL and DP rank. Capturing a snapshot
+//! excludes stale or rank-incomplete workers; routing chooses how to fall back
+//! when an observation is unavailable.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -94,13 +89,13 @@ pub struct NativeCacheWorkerLoad {
 /// Keys are worker URLs used for dispatch. Missing, stale, or rank-incomplete
 /// workers are omitted and must use Router-local active load.
 #[derive(Debug, Clone, Default)]
-pub struct EngineLoadSnapshot {
+pub struct EngineSnapshot {
     pub version: u64,
     workers: HashMap<String, EngineWorkerLoad>,
     native_cache_workers: HashMap<String, NativeCacheWorkerLoad>,
 }
 
-impl EngineLoadSnapshot {
+impl EngineSnapshot {
     pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineWorkerLoad> {
         self.workers.get(worker_url)
     }
@@ -141,7 +136,7 @@ impl EngineLoadSnapshot {
     }
 
     /// Builds a view from worker data that already passed freshness and rank checks.
-    /// Production requests should use [`EngineLoadTable::capture_snapshot`].
+    /// Production requests should use [`EngineReports::capture_snapshot`].
     pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
         Self {
             version,
@@ -151,7 +146,7 @@ impl EngineLoadSnapshot {
     }
 
     /// Builds a test snapshot from complete native monitor data.
-    /// Production requests must use [`EngineLoadTable::capture_snapshot`].
+    /// Production requests must use [`EngineReports::capture_snapshot`].
     pub fn from_native_cache_workers(
         version: u64,
         workers: HashMap<String, NativeCacheWorkerLoad>,
@@ -292,7 +287,7 @@ type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
 /// Per-`(worker_url, dp_rank)` engine-reported load, written by the load
 /// subscriber pump and captured once at request ingress.
 #[derive(Debug)]
-pub struct EngineLoadTable {
+pub struct EngineReports {
     by_rank: DashMap<(String, u32), LoadEntry>,
     /// Per-rank publishers the worker advertised. A worker is usable only
     /// when every advertised rank has a fresh value; accepting a partial
@@ -302,7 +297,7 @@ pub struct EngineLoadTable {
     version: AtomicU64,
 }
 
-impl EngineLoadTable {
+impl EngineReports {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             by_rank: DashMap::new(),
@@ -540,8 +535,8 @@ impl EngineLoadTable {
     }
 
     /// Captures one immutable view for all routing decisions in a request.
-    pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
-        EngineLoadSnapshot {
+    pub fn capture_snapshot(&self, now: Instant) -> EngineSnapshot {
+        EngineSnapshot {
             version: self.version.load(Ordering::Acquire),
             workers: self.fresh_worker_loads(now),
             native_cache_workers: self.fresh_native_cache_worker_loads(now),
@@ -635,7 +630,7 @@ mod tests {
 
     #[test]
     fn sums_queue_depth_across_ranks() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         let now = Instant::now();
         t.set("http://w:30000", 0, load(5, 1), now);
         t.set("http://w:30000", 1, load(3, 2), now);
@@ -647,7 +642,7 @@ mod tests {
 
     #[test]
     fn stale_entries_are_dropped_from_snapshot() {
-        let t = EngineLoadTable::with_freshness(Duration::from_millis(10));
+        let t = EngineReports::with_freshness(Duration::from_millis(10));
         let old = Instant::now();
         t.set("http://w:30000", 0, load(9, 9), old);
         // A read far in the future sees the entry as stale -> worker absent.
@@ -660,7 +655,7 @@ mod tests {
 
     #[test]
     fn forget_worker_clears_all_ranks() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         let now = Instant::now();
         t.set("http://w:30000", 0, load(1, 0), now);
         t.set("http://w:30000", 1, load(1, 0), now);
@@ -677,7 +672,7 @@ mod tests {
     /// router-side counter instead of looking misleadingly idle.
     #[test]
     fn partial_freshness_excludes_worker() {
-        let t = EngineLoadTable::with_freshness(Duration::from_secs(5));
+        let t = EngineReports::with_freshness(Duration::from_secs(5));
         let now = Instant::now();
         let stale = now - Duration::from_secs(3600);
         t.set("http://w:30000", 0, load(5, 1), now); // fresh
@@ -692,7 +687,7 @@ mod tests {
 
     #[test]
     fn missing_expected_rank_excludes_worker() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         let now = Instant::now();
         t.mark_expected_rank("http://w:30000", 0);
         t.mark_expected_rank("http://w:30000", 1);
@@ -712,7 +707,7 @@ mod tests {
 
     #[test]
     fn capture_snapshot_uses_the_earliest_rank_timestamp() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         let earlier = Instant::now() - Duration::from_secs(2);
         let later = earlier + Duration::from_secs(1);
         t.set("http://w:30000", 0, load(5, 1), later);
@@ -726,7 +721,7 @@ mod tests {
 
     #[test]
     fn expected_count_tracks_marked_workers_and_forget() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         assert_eq!(t.expected_count(), 0);
         t.mark_expected_rank("http://w:30000", 0);
         t.mark_expected_rank("http://w:30000", 1); // same worker
@@ -738,7 +733,7 @@ mod tests {
 
     #[test]
     fn complete_v3_semantic_samples_derive_prefill_queue_time() {
-        let t = EngineLoadTable::new();
+        let t = EngineReports::new();
         let first = Instant::now();
         let second = first + Duration::from_secs(2);
         let mut old = load(2, 3);

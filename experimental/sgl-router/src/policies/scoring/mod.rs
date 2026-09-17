@@ -417,11 +417,11 @@ mod tests {
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::load_based::LoadBasedPolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::workers::engine_reports::{EngineSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -439,8 +439,8 @@ mod tests {
         vec![worker("a"), worker("b"), worker("c")]
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineSnapshot {
+        EngineSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
@@ -783,7 +783,7 @@ mod tests {
         );
         assert_eq!(proposal.primary.id, ws[2].id);
 
-        let snapshot = EngineLoadSnapshot::default();
+        let snapshot = EngineSnapshot::default();
         let decision =
             resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
                 .expect("an eligible escape worker exists");

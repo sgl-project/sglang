@@ -6,9 +6,7 @@ mod preparation;
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::engine_load::EngineLoadSnapshot;
-use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
@@ -16,6 +14,8 @@ use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
+use crate::workers::engine_reports::EngineSnapshot;
+use crate::workers::pools::{PdPoolResolver, PdResolveError};
 use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
@@ -113,17 +113,17 @@ fn capture_load_snapshot(
     ctx: &AppContext,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
-) -> Option<EngineLoadSnapshot> {
+) -> Option<EngineSnapshot> {
     let needed = policy.needs_load_snapshot()
         || candidates
             .iter()
             .any(|worker| worker.mode() == WorkerMode::Prefill);
-    needed.then(|| ctx.engine_load.capture_snapshot(Instant::now()))
+    needed.then(|| ctx.engine_reports.capture_snapshot(Instant::now()))
 }
 
 struct RoutingContext<'a> {
     prefix_matches: Option<ExternalPrefixSignal>,
-    load_snapshot: Option<EngineLoadSnapshot>,
+    load_snapshot: Option<EngineSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
     routing_key: Option<&'a str>,

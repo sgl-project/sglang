@@ -4,9 +4,9 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::policies::active_load::ActiveLoadRegistry;
-use crate::policies::kv_events::KvEventIndex;
+use crate::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
+use crate::workers::request_tracker::RequestTracker;
 use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// manager does not need a handle to the proxy.
 ///
 /// When `kv_index` is `None`, KV-event and load-subscriber state is disabled; when
-/// `active_load` is `None` the active-load bookkeeping is not pruned
+/// `request_tracker` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
@@ -123,14 +123,14 @@ pub async fn run_with_config(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    request_tracker: Option<Arc<RequestTracker>>,
 ) {
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
-        active_load,
+        request_tracker,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -146,7 +146,7 @@ pub async fn run_with_introspector(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    request_tracker: Option<Arc<RequestTracker>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     run_with_introspector_and_reconcile(
@@ -154,7 +154,7 @@ pub async fn run_with_introspector(
         registry,
         cfg,
         kv_index,
-        active_load,
+        request_tracker,
         introspector,
         RECONCILE_INTERVAL,
     )
@@ -186,7 +186,7 @@ pub async fn run_with_introspector_and_reconcile(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    request_tracker: Option<Arc<RequestTracker>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -226,7 +226,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &registry,
                     &cfg,
                     &kv_index,
-                    &active_load,
+                    &request_tracker,
                     &introspector,
                     &mut pending,
                 )
@@ -264,7 +264,7 @@ async fn handle_discovery_event(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
-    active_load: &Option<Arc<ActiveLoadRegistry>>,
+    request_tracker: &Option<Arc<RequestTracker>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -327,7 +327,7 @@ async fn handle_discovery_event(
             // per-worker counters slot will not be re-created
             // (selectors no longer see the worker, so no new
             // requests can register against it).
-            if let Some(al) = active_load {
+            if let Some(al) = request_tracker {
                 al.forget_worker(&id);
             }
         }
@@ -969,7 +969,7 @@ mod tests {
     }
 
     /// Task B: `DiscoveryEvent::Removed` calls
-    /// `ActiveLoadRegistry::forget_worker` so the per-worker counters
+    /// `RequestTracker::forget_worker` so the per-worker counters
     /// slot is reaped. Without this, a long-lived cluster with worker
     /// churn would leak one `WorkerCounters` entry per departed worker.
     #[tokio::test]
@@ -983,14 +983,14 @@ mod tests {
             spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
 
         let registry = Arc::new(WorkerRegistry::default());
-        let active_load = ActiveLoadRegistry::with_defaults();
+        let request_tracker = RequestTracker::with_defaults();
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            Some(Arc::clone(&active_load)),
+            Some(Arc::clone(&request_tracker)),
             fast_introspector(),
         ));
 
@@ -1018,8 +1018,8 @@ mod tests {
 
         // Mint a guard to force the active-load registry to create a
         // per-worker counters slot for this id.
-        let _g = active_load.register(id.clone(), "test://", 10, 1);
-        assert!(active_load.is_known(&id));
+        let _g = request_tracker.register(id.clone(), "test://", 10, 1);
+        assert!(request_tracker.is_known(&id));
 
         // Now drive the Removed event and assert the counters slot is
         // gone.  We tear down the guard last so the request entry is
@@ -1029,7 +1029,7 @@ mod tests {
             .unwrap();
         let removed = timeout(Duration::from_secs(2), async {
             loop {
-                if !active_load.is_known(&id) && registry.get(&id).is_none() {
+                if !request_tracker.is_known(&id) && registry.get(&id).is_none() {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1038,7 +1038,7 @@ mod tests {
         .await;
         assert!(
             removed.is_ok(),
-            "manager must call active_load.forget_worker on Removed",
+            "manager must call request_tracker.forget_worker on Removed",
         );
 
         drop(tx);
