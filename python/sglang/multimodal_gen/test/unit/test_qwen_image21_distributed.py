@@ -128,8 +128,9 @@ def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
 
 @pytest.mark.parametrize("height", [4, 5])
 @pytest.mark.parametrize("residual", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @torch.no_grad()
-def test_vae_spatial_shard_matches_full_decode(height, residual):
+def test_vae_spatial_shard_matches_full_decode(height, residual, dtype):
     arch = QwenImage21VAEArchConfig(
         base_dim=4,
         decoder_base_dim=4,
@@ -162,7 +163,9 @@ def test_vae_spatial_shard_matches_full_decode(height, residual):
     assert parallel.spatial_parallel
     z = torch.randn(1, 4, 1, height, 4, device="cuda")
     torch.distributed.broadcast(z, src=0)
-    expected = reference.decode(z)
-    actual = parallel.decode(z)
+    expected = reference.to(dtype).decode(z.to(dtype))
+    actual = parallel.to(dtype).decode(z.to(dtype))
     assert actual.shape == expected.shape == (1, 4, 1, height * 16, 64)
-    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    # full and sharded convolutions select different FP32 reduction kernels
+    tolerance = 1e-10 if dtype == torch.float64 else 1e-4
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
