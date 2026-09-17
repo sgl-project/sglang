@@ -340,7 +340,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 [[base + 11, base + 12], [base + 13, base + 14]], dtype=torch.int32
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
-            c4_sparse_topk=128,
+            index_topk=128,
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
@@ -452,7 +452,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 metadata = backend.forward_metadata
                 if builds:
                     backend._build_sparse_prefill_chunk_cache.assert_called_once_with(
-                        batch, num_qo_tokens=num_qo_tokens
+                        batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
                     )
                     self.assertIs(metadata.sparse_prefill_cache, cache)
                 else:

@@ -219,7 +219,12 @@ def _make_sparse_prefill_case(
         * 0.05
     ).to(torch.bfloat16)
     attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
-    core_attn_metadata = SimpleNamespace()
+    # position + 1 of the five query rows: seq_lens [96, 144], extend [3, 2]
+    core_attn_metadata = SimpleNamespace(
+        seq_lens_casual=torch.tensor(
+            [94, 95, 96, 143, 144], dtype=torch.int32, device=device
+        )
+    )
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
 
 
@@ -235,6 +240,10 @@ def _populate_compress_metadata(
         )
         core_attn_metadata.c4_sparse_raw_indices = torch.zeros(
             (16, 1), dtype=torch.int32, device=device
+        )
+        # The sparse prefill path selects the ratio's raw top-k through this accessor.
+        core_attn_metadata.sparse_raw_indices = lambda ratio: (
+            core_attn_metadata.c4_sparse_raw_indices if ratio == 4 else None
         )
     elif compress_ratio == 128:
         core_attn_metadata.c128_page_indices = torch.zeros(
