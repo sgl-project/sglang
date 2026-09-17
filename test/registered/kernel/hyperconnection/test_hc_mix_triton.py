@@ -1,9 +1,11 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers import hc_mix_triton, hyperconnection
 from sglang.srt.layers.hc_mix_triton import (
     _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
@@ -49,6 +51,99 @@ _TOLERANCES = {
     torch.bfloat16: dict(rtol=1e-2, atol=5e-3),
     torch.float16: dict(rtol=2e-3, atol=1e-3),
 }
+
+
+@pytest.mark.parametrize("npu_platform", [False, True])
+def test_hyperconnection_fallback_compile_policy(monkeypatch, npu_platform):
+    calls = []
+
+    def record_compile(fn, **kwargs):
+        calls.append((fn.__name__, kwargs))
+        return fn
+
+    monkeypatch.setattr(hyperconnection, "_is_npu", npu_platform)
+    monkeypatch.setattr(torch, "compile", record_compile)
+    # The fallback functions are created regardless of weight allocation.
+    hyperconnection.GatedResidual(
+        hyperconnection.HyperConnectionConfig(), use_mix=False, use_combine=False
+    )
+    assert calls == [
+        ("_mix_compute", {"disable": npu_platform}),
+        ("_combine_compute", {"disable": npu_platform}),
+    ]
+
+
+@pytest.mark.parametrize("npu_platform", [False, True])
+@pytest.mark.parametrize("tensor_is_cuda", [False, True])
+@pytest.mark.parametrize("ple_norm", [False, True])
+def test_grouped_norm_cuda_jit_dispatch(
+    monkeypatch, npu_platform, tensor_is_cuda, ple_norm
+):
+    from sglang.kernels.ops.layernorm import grouped_gemma_rmsnorm as norm_kernel
+    from sglang.srt.models import qwen4_exp
+
+    norm_cls = (
+        qwen4_exp.Qwen4ExpPLEGroupedNorm
+        if ple_norm
+        else hyperconnection.GroupedGemmaRMSNorm
+    )
+    norm = norm_cls(1024, group_size=512).to(dtype=torch.bfloat16)
+    x = torch.ones(2, 1024, dtype=torch.bfloat16)
+    sentinel = torch.full_like(x, 7)
+    calls = []
+
+    def fake_cuda_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(hyperconnection, "_is_npu", npu_platform)
+    monkeypatch.setattr(qwen4_exp, "_is_npu", npu_platform)
+    # Exercise the actual forwards without needing a CUDA device or compiler.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: tensor_is_cuda))
+    monkeypatch.setattr(norm_kernel, "grouped_gemma_rmsnorm", fake_cuda_kernel)
+    actual = norm(x)
+    if not npu_platform and tensor_is_cuda:
+        assert actual is sentinel
+        assert len(calls) == 1
+    else:
+        assert not calls
+        torch.testing.assert_close(actual, x)
+
+
+def test_npu_cuda_compat_shim_does_not_enable_cuda_kernels(monkeypatch):
+    # No device/dtype/shape attributes: the platform gate must short-circuit.
+    tensor = SimpleNamespace(is_cuda=True)
+    monkeypatch.setattr(hc_mix_triton, "_is_npu", True)
+    monkeypatch.setattr(hc_mix_triton, "_deterministic_inference", lambda: False)
+    assert not fused_hc_mix_supported(tensor, tensor, tensor)
+
+
+@pytest.mark.parametrize("ple_norm", [False, True])
+def test_npu_grouped_norm_fallback_matches_reference(monkeypatch, ple_norm):
+    from sglang.srt.models import qwen4_exp
+
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    monkeypatch.setattr(hyperconnection, "_is_npu", True)
+    monkeypatch.setattr(qwen4_exp, "_is_npu", True)
+    norm_cls = (
+        qwen4_exp.Qwen4ExpPLEGroupedNorm
+        if ple_norm
+        else hyperconnection.GroupedGemmaRMSNorm
+    )
+    norm = norm_cls(1024, group_size=512).to(device="npu:0", dtype=torch.bfloat16)
+    torch.manual_seed(7)
+    x = torch.randn(3, 1024, dtype=torch.bfloat16, device="npu:0")
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn_like(norm.weight) * 0.1)
+    assert norm._jit_group_size == 512
+    actual = norm(x)
+    grouped = x.cpu().float().reshape(3, 2, 512)
+    normalized = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + 1e-6)
+    expected = (
+        normalized.reshape(3, 1024) * (1 + norm.weight.detach().cpu().float())
+    ).to(x.dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

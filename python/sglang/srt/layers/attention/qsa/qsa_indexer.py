@@ -22,6 +22,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -119,7 +122,8 @@ class QSAIndexer(MultiPlatformOp):
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
         return (
-            tensor.is_cuda
+            not _is_npu
+            and tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim % 2 == 0
@@ -495,7 +499,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
         )
-        if logits.is_cuda and self.block_topk == 512:
+        if not _is_npu and logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk
@@ -626,6 +630,18 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        # Share the orchestration; individual operators select Torch on NPU.
+        return self.forward_cuda(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 

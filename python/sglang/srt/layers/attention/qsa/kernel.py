@@ -8,6 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+# FP32 has 24 bits of significand precision, so every integer from zero
+# through this inclusive limit is exactly representable.
+# Used to check sorting-key precision after QSA block expansion.
+_FP32_EXACT_INT_MAX = 2**24
+
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -30,7 +39,7 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
-    if logits.is_cuda:
+    if not _is_npu and logits.is_cuda:
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
@@ -50,13 +59,33 @@ def qsa_fast_topk(
             f"supported values are {supported_topk}"
         )
 
-    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     output = torch.full(
         (logits.shape[0], topk),
         -1,
         dtype=torch.int32,
         device=logits.device,
     )
+    if _is_npu:
+        # Keep row bounds on device and use a fixed-width, batched top-k
+        # so NPU graph capture needs no device-to-host scalar reads.
+        width = min(topk, logits.shape[1])
+        if width == 0 or logits.shape[0] == 0:
+            return output
+        columns = torch.arange(logits.shape[1], device=logits.device).unsqueeze(0)
+        valid = (columns >= starts.unsqueeze(1)) & (
+            columns < (starts + lengths).unsqueeze(1)
+        )
+        selected = torch.topk(
+            logits.masked_fill(~valid, -float("inf")), width, dim=1
+        ).indices
+        relative = (selected - starts.unsqueeze(1)).to(torch.int32)
+        ranks = torch.arange(width, device=logits.device).unsqueeze(0)
+        output[:, :width] = torch.where(
+            ranks < valid.sum(dim=1, keepdim=True), relative, -1
+        )
+        return output
+
+    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     for row in range(logits.shape[0]):
         start = int(starts[row])
         length = int(lengths[row])
@@ -121,6 +150,10 @@ def torch_expand_qsa_block_indices(
     result = torch.cat([expanded, tail], dim=1)
     # Keep all valid entries contiguous. This is required by the FA2 packing path.
     order = torch.arange(final_topk, device=device).unsqueeze(0).expand(rows, -1)
+    if _is_npu and 2 * final_topk - 1 <= _FP32_EXACT_INT_MAX:
+        # NPU integer argsort falls back to AiCpu. Convert only when the
+        # largest positional key, including padding, is exact in FP32.
+        order = order.float()
     sort_key = torch.where(result >= 0, order, order + final_topk)
     return result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(torch.int32)
 
@@ -238,7 +271,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with platform kernels or the Torch fallback."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -249,7 +282,22 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
-    if block_indices.is_cuda:
+    if _is_npu:
+        from sgl_kernel_npu.qwen3_8_flash_next.expansion import (
+            can_run_block_expansion,
+            expand_blocks,
+        )
+
+        args = (
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            token_topk,
+        )
+        if can_run_block_expansion(*args):
+            return expand_blocks(*args)
+    if not _is_npu and block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
         return triton_expand_qsa_block_indices(
@@ -275,8 +323,11 @@ def qsa_sparse_attention(
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Torch reference for sparse GQA over physical token slots."""
+    """Dispatch sparse GQA over physical token slots."""
 
+    if _is_npu:
+        k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
+        v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
     if token_slots.ndim != 2 or token_slots.shape[0] != q.shape[0]:
@@ -288,9 +339,31 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if _is_npu:
+        from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import (
+            can_run_sparse_attention,
+            sparse_attention,
+        )
+
+        if can_run_sparse_attention(q, k_cache, v_cache, token_slots):
+            return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )
+
+
+def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
+    """Adapt NPU KV cache layouts for the Torch reference.
+
+    The original reference path receives rank-3 [slots, heads, dim] caches.
+    NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
+    """
+    if cache.ndim == 3:
+        return cache
+    if cache.ndim == 4:
+        # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
+        return cache.flatten(0, 1)
+    raise ValueError(f"{name} must be rank 3 or 4, got shape {tuple(cache.shape)}")
 
 
 def qsa_sparse_attention_reference(
@@ -303,6 +376,33 @@ def qsa_sparse_attention_reference(
     """Device-agnostic sparse GQA reference."""
 
     scale = softmax_scale or q.shape[-1] ** -0.5
+    if _is_npu:
+        if q.shape[0] == 0 or token_slots.shape[1] == 0:
+            return torch.zeros_like(q)
+        outputs = []
+        repeats = q.shape[1] // k_cache.shape[1]
+        for row in range(q.shape[0]):
+            valid = token_slots[row] >= 0
+            # Preserve the fixed width; boolean indexing creates dynamic shapes
+            # and requires a device-to-host synchronization on NPU.
+            slots = token_slots[row].clamp_min(0).long()
+            keys = k_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
+            values = v_cache.index_select(0, slots)
+            # Zero invalid values so NaN/Inf padding cannot contaminate the sum.
+            values = values.masked_fill(~valid[:, None, None], 0.0)
+            values = values.repeat_interleave(repeats, dim=1)
+            scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
+            valid = valid.unsqueeze(0)
+            probabilities = torch.softmax(
+                scores.masked_fill(~valid, -float("inf")), dim=-1
+            )
+            # softmax of an all-padding row is NaN; its output must instead be zero.
+            probabilities = torch.where(valid, probabilities, 0.0)
+            outputs.append(
+                torch.einsum("hk,khd->hd", probabilities, values.float()).to(q.dtype)
+            )
+        return torch.stack(outputs)
+
     outputs = []
     repeats = q.shape[1] // k_cache.shape[1]
     for row in range(q.shape[0]):

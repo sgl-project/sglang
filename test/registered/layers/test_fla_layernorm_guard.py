@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import sglang.kernels.ops.attention.fla.layernorm_gated as gated_norm
 from sglang.kernels.ops.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
@@ -390,6 +391,98 @@ def _layernorm_guard_misc_worker(
             out = layernorm_fn(x, w, b, z=None, eps=eps)
             ref = layer_norm_ref(x, w, b, z=None, eps=eps, is_rms_norm=False)
             torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@pytest.mark.parametrize("layout", ["2d", "3d_input", "strided_gate", "no_gate"])
+@pytest.mark.parametrize("is_rms_norm,group_size", [(True, None), (False, 32)])
+def test_npu_sigmoid_gated_norm(
+    monkeypatch, device, dtype, norm_before_gate, layout, is_rms_norm, group_size
+):
+    if device == "npu":
+        if not gated_norm._is_npu:
+            pytest.skip("NPU is not available")
+    else:
+        # Exercise adapter dispatch even on CI machines without an NPU.
+        def ungated_norm(x, weight, bias, eps, **kwargs):
+            assert kwargs["z"] is None
+            return layer_norm_ref(x, weight, bias, eps=eps, **kwargs), None, None
+
+        monkeypatch.setattr(gated_norm, "_is_npu", True)
+        monkeypatch.setattr(gated_norm, "_layer_norm_fwd", ungated_norm)
+
+    generator = torch.Generator(device="cpu").manual_seed(42)
+    x = torch.randn(15, 128, generator=generator).to(dtype)
+    weight = torch.randn(128, generator=generator).to(dtype)
+    bias = None if is_rms_norm else torch.randn(128, generator=generator).to(dtype)
+    # Include zero and saturated positive/negative gates.
+    z = torch.linspace(-20, 20, 15 * 128).reshape(15, 128).to(dtype)
+    z[:, 0] = 0
+    if layout == "3d_input":
+        x, z = x.reshape(5, 3, 128), z.reshape(5, 3, 128)
+    elif layout == "no_gate":
+        z = None
+
+    # Keep the reference in FP32 through norm and gate, without the adapter's
+    # intermediate low-precision rounding at the kernel boundary.
+    gate = None if z is None else z.float().sigmoid()
+    ref_input = x.float()
+    if gate is not None and not norm_before_gate:
+        ref_input = ref_input * gate
+    expected = layer_norm_ref(
+        ref_input,
+        weight.float(),
+        None if bias is None else bias.float(),
+        group_size=group_size,
+        is_rms_norm=is_rms_norm,
+    )
+    if gate is not None and norm_before_gate:
+        expected = expected * gate
+
+    x, weight = x.to(device), weight.to(device)
+    bias = None if bias is None else bias.to(device)
+    z = None if z is None else z.to(device)
+    if layout == "strided_gate":
+        storage = torch.empty((5, 3, 256), device=device, dtype=dtype)
+        storage[..., :128].copy_(z.reshape(5, 3, 128))
+        z = storage[..., :128]
+        assert not z.is_contiguous()
+    actual = layernorm_fn(
+        x,
+        weight,
+        bias,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+        activation="sigmoid",
+    )
+    assert actual.shape == x.shape
+    assert actual.dtype == dtype
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(
+        actual.cpu(), expected.to(dtype), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("is_npu,activation", [(True, "swish"), (False, "sigmoid")])
+def test_npu_sigmoid_adapter_preserves_other_dispatch(monkeypatch, is_npu, activation):
+    x = torch.ones(2, 128)
+    z = torch.zeros_like(x)
+    calls = []
+
+    def backend(x, weight, bias, eps, **kwargs):
+        calls.append(kwargs)
+        return x, None, None
+
+    monkeypatch.setattr(gated_norm, "_is_npu", is_npu)
+    monkeypatch.setattr(gated_norm, "_layer_norm_fwd", backend)
+    layernorm_fn(x, torch.ones(128), None, z=z, activation=activation)
+    assert len(calls) == 1
+    assert calls[0]["activation"] == activation
+    torch.testing.assert_close(calls[0]["z"], z)
 
 
 if __name__ == "__main__":
