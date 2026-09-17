@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-from sglang.srt.weight_sync.nccl_m2n import M2NFP8Storage, NcclM2NReceiver
+from sglang.srt.weight_sync.nccl_m2n import NcclM2NReceiver
 
 _TOPOLOGY = {
     "tp_rank": 0,
@@ -34,11 +34,11 @@ _QUANTIZATION = {
     "weight_block_size": [128, 128],
     "weight_dtype": "float8_e4m3fn",
     "scale_dtype": "float32",
-    "scale_format": "canonical",
+    "scale_format": "ue8m0_unpacked",
 }
 
 
-def _model(*, fp8=True, moe_tp=False):
+def _model(*, fp8=True, moe_tp=False, device="cpu"):
     root = torch.nn.Module()
     root.model = torch.nn.Module()
     root.model.layers = torch.nn.ModuleList([torch.nn.Module()])
@@ -54,23 +54,28 @@ def _model(*, fp8=True, moe_tp=False):
             name,
             torch.nn.Parameter(
                 torch.zeros(
-                    shape, dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16
+                    shape,
+                    dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             ),
         )
         if fp8:
-            scale_shape = (shape[0], shape[1] // 128, shape[2] // 128)
-            setattr(
-                experts,
-                name + "_scale_inv",
-                torch.nn.Parameter(torch.zeros(scale_shape), requires_grad=False),
-            )
+            # Packed inference scales have padded, transposed strides.
+            words = (shape[2] // 128 + 3) // 4
+            value = torch.zeros(
+                (shape[0], words, shape[1] + 4), dtype=torch.int32, device=device
+            )[:, :, : shape[1]].transpose(1, 2)
+            scale = torch.nn.Parameter(value, requires_grad=False)
+            scale.format_ue8m0 = True
+            setattr(experts, name + "_scale_inv", scale)
     experts.quant_method = SimpleNamespace(
         block_quant=True,
         use_mxfp8=False,
         is_fp4_expert=False,
         load_up_proj_weight_first=False,
+        is_deepgemm_moe_runner_backend_enabled=Mock(return_value=True),
         quant_config=SimpleNamespace(
             use_mxfp8=False,
             is_fp4_experts=False,
@@ -168,9 +173,11 @@ def _receiver(manifest=None, *, model=None, topology=None):
 
 def _concurrent_pp_receivers(*, fp8=True, layers_per_stage=(1, 1)):
     model = _model() if fp8 else _model(fp8=False, moe_tp=True)
-    template = model.model.layers[0]
     model.model.layers = torch.nn.ModuleList(
-        [deepcopy(template) for _ in range(sum(layers_per_stage))]
+        [
+            _model(fp8=fp8, moe_tp=not fp8).model.layers[0]
+            for _ in range(sum(layers_per_stage))
+        ]
     )
     base_manifest = _manifest() if fp8 else _manifest(fp8=False, moe_tp=True)
     receivers = []
@@ -251,7 +258,7 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
             assert (
                 tensor is not None
             ), "receive buffer released before its stream completed"
-            tensor.fill_(comm_ptr - 100 + update)
+            tensor.fill_(2 ** (comm_ptr - 100 + update))
 
         pending[comm_ptr].append(complete)
 
@@ -286,6 +293,10 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
         ),
         patch("torch.cuda.current_stream"),
         patch("torch.cuda.stream", side_effect=stream_context),
+        patch(
+            "sglang.srt.weight_sync.nccl_m2n._pack_fp8_scales",
+            side_effect=_pack_scales_reference,
+        ),
     ):
         for update in (0, 2):
             events.clear()
@@ -299,8 +310,22 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
             assert all(not work for work in pending.values())
             assert handoffs == [receiver._pg for receiver in receivers]
             for layer, stage in enumerate((0, 1, 1)):
-                for parameter in model.model.layers[layer].mlp.experts.parameters():
-                    assert torch.all(parameter.float() == stage + 1 + update)
+                experts = model.model.layers[layer].mlp.experts
+                value = 2 ** (stage + 1 + update)
+                for name, parameter in experts.named_parameters():
+                    if name.endswith("_scale_inv"):
+                        weight = getattr(experts, name.removesuffix("_scale_inv"))
+                        shape = (
+                            weight.shape[0],
+                            weight.shape[1] // 128,
+                            weight.shape[2] // 128,
+                        )
+                        expected = _pack_scales_reference(
+                            torch.full(shape, float(value))
+                        )
+                        torch.testing.assert_close(parameter, expected)
+                    else:
+                        assert torch.all(parameter.float() == value)
 
 
 def test_concurrent_receive_failure_drains_all_streams_before_releasing_buffers():
@@ -485,51 +510,27 @@ def test_gate_up_weights_and_scales_use_the_same_effective_order(method_first, t
     experts = receiver.model.model.layers[0].mlp.experts
     experts.quant_method.load_up_proj_weight_first = method_first
     experts.use_flashinfer_trtllm_moe = trtllm
-    for entry in receiver.manifest["entries"]:
-        component = entry["destination"]["recipe"].removesuffix("_scale")
-        value = {"expert_gate": 1, "expert_up": 2, "expert_down": 3}[component]
-        if entry["tensor_role"] == "scale":
-            value += 4
-        tensor, copy_back = receiver._destination(
-            entry, tuple(entry["destination"]["local_shape"])
-        )
-        tensor.fill_(value)
-        if copy_back is not None:
-            copy_back()
+    with patch(
+        "sglang.srt.weight_sync.nccl_m2n._pack_fp8_scales",
+        side_effect=_pack_scales_reference,
+    ):
+        for entry in receiver.manifest["entries"]:
+            component = entry["destination"]["recipe"].removesuffix("_scale")
+            value = {"expert_gate": 1, "expert_up": 2, "expert_down": 3}[component]
+            if entry["tensor_role"] == "scale":
+                value = 2**value
+            tensor, copy_back = receiver._destination(
+                entry, tuple(entry["destination"]["local_shape"])
+            )
+            tensor.fill_(value)
+            if copy_back is not None:
+                copy_back()
     order = [2, 1] if method_first != trtllm else [1, 2]
     for weight, value in zip(experts.w13_weight.chunk(2, dim=1), order):
         assert torch.all(weight.float() == value)
     for scale, value in zip(experts.w13_weight_scale_inv.chunk(2, dim=1), order):
-        assert torch.all(scale == value + 4)
-
-
-def _mock_fp8_postprocess(model, *, packed, replace_parameters=False):
-    """Simulate rebinding by quant hooks; this does not test FP8 numerics."""
-    for module in model.modules():
-        for name, param in list(module.named_parameters(recurse=False)):
-            is_scale = name.endswith("_scale_inv")
-            value = param.detach().clone()
-            if packed and is_scale:
-                weight = getattr(module, name.removesuffix("_scale_inv"))
-                rows = weight.shape[-2]
-                words = (weight.shape[-1] // 128 + 3) // 4
-                # Packed DeepGEMM scales use int32 with a padded, transposed
-                # layout. Retain nontrivial strides to catch contiguous rebinds.
-                value = torch.empty(
-                    (weight.shape[0], words, rows + 4),
-                    dtype=torch.int32,
-                    device=param.device,
-                )[:, :, :rows].transpose(1, 2)
-                value.fill_(int(param.flatten()[0].item()))
-            if replace_parameters:
-                replacement = torch.nn.Parameter(value, requires_grad=False)
-                replacement.__dict__.update(param.__dict__)
-                setattr(module, name, replacement)
-                param = replacement
-            else:
-                param.data = value
-            if is_scale:
-                param.format_ue8m0 = packed
+        expected = _pack_scales_reference(torch.full((1, 2, 2), float(2**value)))
+        torch.testing.assert_close(scale, expected)
 
 
 def _pack_scales_reference(scales):
@@ -564,15 +565,10 @@ def _pack_scales_reference(scales):
 def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
     device, moe_tp, up_first
 ):
-    model = _model(moe_tp=moe_tp).to(device)
+    model = _model(moe_tp=moe_tp, device=device)
     experts = model.model.layers[0].mlp.experts
-    experts.quant_method.is_deepgemm_moe_runner_backend_enabled = Mock(
-        return_value=True
-    )
     experts.quant_method.load_up_proj_weight_first = up_first
-    _mock_fp8_postprocess(model, packed=True)
     manifest = _manifest(moe_tp=moe_tp)
-    manifest["quantization"]["scale_format"] = "ue8m0_unpacked"
     receiver = _receiver(
         manifest, model=model, topology=_MOE_TP_TOPOLOGY if moe_tp else _TOPOLOGY
     )
@@ -596,8 +592,6 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
             read_weights()
 
     for update in (1, 2):
-        storage = M2NFP8Storage(model, [manifest])
-        assert not storage._buffers  # No copy-back safety net for this path.
         payloads = {}
         for index, entry in enumerate(manifest["entries"]):
             shape = entry["destination"]["local_shape"]
@@ -670,116 +664,26 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
 
 
 @pytest.mark.parametrize(
-    "scale_format,deepgemm,packed",
-    [
-        ("canonical", True, True),
-        ("ue8m0_unpacked", False, True),
-        ("ue8m0_unpacked", True, False),
-    ],
+    "incompatible",
+    ["wire_format", "backend", "unpacked", "weight_layout", "scale_shape"],
 )
-def test_packing_only_requires_explicit_wire_format_and_compatible_backend(
-    scale_format, deepgemm, packed
-):
+def test_fp8_rejects_incompatible_formats_without_replacing_storage(incompatible):
     model = _model()
     experts = model.model.layers[0].mlp.experts
-    experts.quant_method.is_deepgemm_moe_runner_backend_enabled = Mock(
-        return_value=deepgemm
-    )
-    _mock_fp8_postprocess(model, packed=packed)
     manifest = _manifest()
-    manifest["quantization"]["scale_format"] = scale_format
-    receiver = _receiver(manifest, model=model)
-    storage = M2NFP8Storage(model, [manifest])
-    assert set(storage._buffers) == set(dict(model.named_parameters()))
-    receiver._prepare_fp8_destinations()
-    assert not receiver._packing_only_fp8_parameters
-    assert not experts.w13_weight_scale_inv.format_ue8m0
-
-
-@pytest.mark.parametrize(
-    "device,packed,replace_parameters",
-    [
-        ("cpu", False, False),
-        ("cpu", True, True),
-        pytest.param(
-            "cuda",
-            True,
-            True,
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA graphs"
-            ),
-        ),
-    ],
-)
-def test_fp8_refits_preserve_storage_and_captured_graph(
-    device, packed, replace_parameters
-):
-    receiver = _receiver(
-        _manifest(moe_tp=True),
-        model=_model(moe_tp=True).to(device),
-        topology=_MOE_TP_TOPOLOGY,
-    )
-    receiver.device = torch.device(device)
-    _mock_fp8_postprocess(receiver.model, packed=packed)
-    receiver._params = dict(receiver.model.named_parameters())
-    receiver._entries = receiver._validate_manifest(4)
-    receiver._pg = object()
-    receiver.comm_ptr = 123
-    receiver.stream = Mock()
-    # These references model the pointers/strides captured at model startup.
-    graph_buffers = {
-        name: param.detach() for name, param in receiver.model.named_parameters()
-    }
-    pointers = {name: value.data_ptr() for name, value in graph_buffers.items()}
-    strides = {name: value.stride() for name, value in graph_buffers.items()}
-    if packed:
-        scales = receiver.model.model.layers[0].mlp.experts.w13_weight_scale_inv
-        assert not scales.is_contiguous()
-    graph = None
-    if device == "cuda":
-        output = torch.empty((), device=device)
-
-        def read_weights():
-            output.copy_(sum(value.float().sum() for value in graph_buffers.values()))
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                read_weights()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            read_weights()
-    m2n = Mock()
-
-    for update in (1, 2):
-        storage = M2NFP8Storage(receiver.model, [receiver.manifest])
-        m2n.reshard.side_effect = (
-            lambda source, destination, *args, update=update, **kwargs: (
-                destination.fill_(update)
-            )
-        )
-        with (
-            patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n),
-            patch("torch.cuda.current_stream"),
-            patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
-        ):
-            receiver.receive()
-        _mock_fp8_postprocess(
-            receiver.model, packed=packed, replace_parameters=replace_parameters
-        )
-        storage.restore(receiver.model)
-
-        for name, param in receiver.model.named_parameters():
-            assert param.data_ptr() == pointers[name]
-            assert param.stride() == strides[name]
-            assert torch.all(graph_buffers[name].float() == update)
-            if name.endswith("_scale_inv"):
-                assert param.format_ue8m0 is packed
-                assert param.dtype == (torch.int32 if packed else torch.float32)
-        if graph is not None:
-            graph.replay()
-            assert output.item() == update * sum(
-                value.numel() for value in graph_buffers.values()
-            )
+    if incompatible == "wire_format":
+        manifest["quantization"]["scale_format"] = "canonical"
+    elif incompatible == "backend":
+        experts.quant_method.is_deepgemm_moe_runner_backend_enabled.return_value = False
+    elif incompatible == "unpacked":
+        experts.w13_weight_scale_inv.format_ue8m0 = False
+    elif incompatible == "weight_layout":
+        experts.w13_weight.data = experts.w13_weight.data.transpose(1, 2)
+    else:
+        experts.w13_weight_scale_inv.data = torch.zeros((1, 2, 2), dtype=torch.int32)
+    buffers = {name: param.detach() for name, param in model.named_parameters()}
+    with pytest.raises(ValueError):
+        _receiver(manifest, model=model)
+    for name, parameter in model.named_parameters():
+        assert parameter.data_ptr() == buffers[name].data_ptr()
+        assert parameter.stride() == buffers[name].stride()
