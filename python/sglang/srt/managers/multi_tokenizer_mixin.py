@@ -179,6 +179,9 @@ def _handle_output_by_index(output, i):
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
             read_offsets=_extract_field_by_index(output, "read_offsets", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
+            output_text_required=_extract_field_by_index(
+                output, "output_text_required", i
+            ),
             skip_special_tokens=_extract_field_by_index(
                 output, "skip_special_tokens", i
             ),
