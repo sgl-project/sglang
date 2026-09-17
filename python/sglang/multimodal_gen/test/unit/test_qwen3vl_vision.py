@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -26,6 +27,24 @@ from sglang.srt.models.qwen3_vl import (
     Qwen3VLVisionPatchEmbed,
 )
 from sglang.srt.runtime_context import get_parallel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim", [36, 40, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vision_rope_device_transfer_matches_resident_initialization(dim, dtype):
+    with torch.device("cpu"):
+        transferred = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        expected_cpu = transferred(64).clone()
+    with torch.device("cuda"):
+        resident = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        expected_cuda = resident(64)
+
+    transferred.cuda()
+    torch.testing.assert_close(transferred(64), expected_cuda, atol=0, rtol=0)
+    torch.testing.assert_close(transferred(64), expected_cuda, atol=0, rtol=0)
+    transferred.cpu()
+    torch.testing.assert_close(transferred(64), expected_cpu, atol=0, rtol=0)
 
 
 def test_native_vision_layout_matches_qwen3_merge_order():
