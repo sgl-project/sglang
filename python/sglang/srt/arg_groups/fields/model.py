@@ -9,7 +9,6 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     Dict,
     List,
@@ -17,6 +16,8 @@ from typing import (
     Optional,
     Union,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -34,8 +35,7 @@ from sglang.srt.utils.common import (
 )
 
 
-@dataclasses.dataclass
-class Model:
+class Model(msgspec.Struct):
     """Namespace ``model``."""
 
     _NS_PATH = "model"

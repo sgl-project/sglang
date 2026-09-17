@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -68,6 +69,10 @@ from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     ServerArgsAutoTuner,
 )
 from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
+from sglang.multimodal_gen.runtime.utils.argparse import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
@@ -78,14 +83,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
-)
-from sglang.multimodal_gen.utils import (
-    PRECISION_TO_TYPE,
-    FlexibleArgumentParser,
-    StoreBoolean,
-    expand_path_fields,
 )
 
 logger = init_logger(__name__)
@@ -275,6 +275,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Attention
     attention_backend: str = None
+    # Time the viable attention backends on the model's own tensors during
+    # warmup and keep the fastest per layer. Off by default: it has only been
+    # measured on sm90 and sm12x.
+    enable_attention_backend_autotune: bool = False
     attention_backend_config: addict.Dict | None = None
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
@@ -585,6 +589,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -1462,9 +1467,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
@@ -2886,6 +2893,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",

@@ -13,14 +13,15 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_ltx2_qknorm_split_rope_module() -> Module:
+def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Module:
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
         cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run",
+                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run"
+                f"<{str(round_intermediates).lower()}>",
             )
         ],
     )
@@ -38,6 +39,7 @@ def _fake_impl(
     eps: float,
     num_heads: int,
     head_dim: int,
+    round_intermediates: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(q, dtype=torch.bfloat16), torch.empty_like(
         k, dtype=torch.bfloat16
@@ -61,10 +63,11 @@ def _ltx2_qknorm_split_rope_custom_op(
     eps: float,
     num_heads: int,
     head_dim: int,
+    round_intermediates: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q_out = torch.empty_like(q, dtype=torch.bfloat16)
     k_out = torch.empty_like(k, dtype=torch.bfloat16)
-    module = _jit_ltx2_qknorm_split_rope_module()
+    module = _jit_ltx2_qknorm_split_rope_module(round_intermediates)
     module.ltx2_qknorm_split_rope_pair(
         q_out,
         k_out,
@@ -215,4 +218,5 @@ def ltx2_qknorm_split_rope_cuda(
         float(eps),
         int(num_heads),
         int(head_dim),
+        round_intermediates=allow_sm90 and _is_sm90(q),
     )

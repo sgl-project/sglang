@@ -24,6 +24,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
@@ -471,12 +472,16 @@ class RayEngine(Engine):
             f"enable_dp_attention={parallel.enable_dp_attention}"
         )
 
-        # Set dist_init_addr on server_args so PortArgs.init_new() can compute
-        # TCP addresses correctly (required for DP attention path).
-        dp_server_args = server_args.replace_resolved(
+        # Declared on the record itself so `PortArgs.init_new()` can compute
+        # TCP addresses (required for the DP attention path). No copy: this
+        # process does not publish here, and every other reader of the field
+        # goes through the bags its own process projects.
+        declare_resolution(
+            server_args,
             "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
+        dp_server_args = server_args
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(

@@ -315,7 +315,14 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             packed_modules_mapping={},
         )
 
-    def _reason_on_cuda(self, quant_config):
+    def _width_only_config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            moe_intermediate_size=1024,
+            moe_shared_expert_intermediate_size=1024,
+        )
+
+    def _reason_on_cuda(self, quant_config, config=None, model_class=None):
         bailing_moe_v3, _ = _import_bailing_modules()
 
         self._seed()
@@ -328,10 +335,60 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             ),
         ):
             return self._reason(
-                bailing_moe_v3.BailingMoeV3ForCausalLM,
-                self._config(),
+                model_class or bailing_moe_v3.BailingMoeV3ForCausalLM,
+                config if config is not None else self._config(),
                 quant_config,
             )
+
+    def test_width_only_fp4_mixed_experts_cannot_fuse(self):
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        reason = self._reason_on_cuda(quant_config, self._width_only_config())
+        self.assertIn("different quant methods", reason)
+
+    def test_vl_wrapper_checks_the_width_on_its_text_config(self):
+        from sglang.srt.models.bailing_mm_v3 import (
+            BailingMoeV3VLForConditionalGeneration,
+        )
+
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        config = SimpleNamespace(text_config=self._width_only_config())
+        reason = self._reason_on_cuda(
+            quant_config, config, BailingMoeV3VLForConditionalGeneration
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_only_bf16_experts_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._width_only_config()))
+
+    def test_num_shared_experts_only_config_still_fuses(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._config()))
+
+    def test_width_only_int4_mixed_experts_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                [r"re:.*mlp\.shared_experts\.(gate|up|down)_proj.*"]
+            ),
+            self._width_only_config(),
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_controls_construction_count(self):
+        bailing_moe_v3, _ = _import_bailing_modules()
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._width_only_config()),
+            1,
+        )
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._config()), 1
+        )
+        legacy_multi_shared = self._config()
+        legacy_multi_shared.num_shared_experts = 2
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(legacy_multi_shared), 2
+        )
+        no_shared = self._width_only_config()
+        no_shared.moe_shared_expert_intermediate_size = 0
+        self.assertEqual(bailing_moe_v3._get_bailing_num_shared_experts(no_shared), 0)
 
     def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
         reason = self._reason_on_cuda(
@@ -656,7 +713,20 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         )
 
         # The normalization the constructor applies, shared with the gate.
-        self.assertIsNone(_mtp_quant_config(_quant("modelopt_mixed")))
+        mixed_bf16_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
+        )
+        self.assertIsNone(_mtp_quant_config(mixed_bf16_mtp))
+        # MIXED_PRECISION checkpoints that quantize the MTP head keep it.
+        mixed_fp8_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
+            },
+        )
+        self.assertIs(_mtp_quant_config(mixed_fp8_mtp), mixed_fp8_mtp)
         serialized = SimpleNamespace(
             get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
         )
