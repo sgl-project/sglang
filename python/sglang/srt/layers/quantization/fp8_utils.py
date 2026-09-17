@@ -720,6 +720,78 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
     )
 
 
+def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
+    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on.
+
+    Only an explicit FlashInfer CUTLASS / CuTe-DSL ``--fp8-gemm-backend`` on
+    Blackwell qualifies: those kernels take a separately stored swizzled scale and
+    leave the weight untouched, so the block layout stays readable by the Triton
+    fallback and by consumers that use ``.weight`` directly. Anything else keeps
+    the block kernel.
+    """
+    backend = get_fp8_gemm_runner_backend()
+    if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
+        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
+        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    resolved = resolve_mxfp8_dense_gemm_backend()
+    return resolved if resolved.is_flashinfer() else Mxfp8DenseGemmBackend.UNSUPPORTED
+
+
+def can_serve_block_fp8_as_mxfp8(
+    weight_block_size: Optional[List[int]], scale_fmt: Optional[str]
+) -> bool:
+    """Whether a block-fp8 linear can run on the MXFP8 dense GEMMs instead of Triton.
+
+    A weight quantized with a 32-wide K block and ue8m0 (power-of-two) scales, paired
+    with per-32 ue8m0 activation scales, is an MXFP8 operand: repeating each block scale
+    over its rows gives the per-row [N, K // 32] e8m0 layout the MXFP8 kernels read, so
+    the GEMM consumes exactly the same fp8 values and scales.
+    """
+    if weight_block_size is None or len(weight_block_size) != 2:
+        return False
+    if weight_block_size[1] != 32 or scale_fmt != "ue8m0":
+        return False
+    return not resolve_block_fp8_mxfp8_backend().is_unsupported()
+
+
+def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
+    """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if backend.is_flashinfer_cutlass():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
+    if backend.is_flashinfer_cutedsl():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    return _unsupported_mxfp8_linear
+
+
+def block_fp8_scale_to_mxfp8_e8m0(
+    weight_scale: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    weight_block_size: List[int],
+) -> torch.Tensor:
+    """Expand fp32 power-of-two block scales [ceil(N / bn), K // 32] into the MXFP8
+    per-row e8m0 layout [N, K // 32] (uint8 exponent bytes), bit-exact."""
+    n, k = weight_shape
+    block_n, block_k = weight_block_size
+    if block_k != 32 or k % 32 != 0:
+        raise ValueError(
+            f"MXFP8 needs a 32-wide K block and K % 32 == 0, got {block_k=} {k=}"
+        )
+    scale = weight_scale.detach().float().contiguous()
+    if tuple(scale.shape) != (ceil_div(n, block_n), k // 32):
+        raise ValueError(
+            f"unexpected block scale shape {tuple(scale.shape)} for weight {weight_shape}"
+        )
+    bits = scale.view(torch.int32)
+    # A positive normal power of two has a zero mantissa; its exponent field is the e8m0 code.
+    if not bool(torch.all((bits & 0x7FFFFF) == 0)) or not bool(torch.all(scale > 0)):
+        raise ValueError(
+            "block scales are not positive powers of two; cannot encode as e8m0"
+        )
+    e8m0 = (bits >> 23).to(torch.uint8)
+    return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
