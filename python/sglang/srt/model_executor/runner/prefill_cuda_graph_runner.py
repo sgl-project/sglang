@@ -1847,7 +1847,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
-        static_forward_batch.ngram_history = forward_batch.ngram_history
+        static_forward_batch.engram_history = forward_batch.engram_history
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
                 static_forward_batch.next_token_logits_buffer
