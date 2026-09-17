@@ -72,7 +72,16 @@ passed TP2 with encoder folding; separate all-component layerwise and
 whole-encoder CPU offload checks matched resident RGBA pixels exactly.
 Quantization and TP change output pixels, including alpha. These checks cover
 the documented private exports, not arbitrary community checkpoints. Other
-GGUF types, hardware, and NVFP4 remain unverified for this model.
+GGUF types and hardware remain unverified for this model.
+
+Calibrated ModelOpt-format NVFP4 component directories also passed the same
+six-configuration B200 HTTP matrix: each component, both together, two offload
+modes, and TP2 with encoder folding. All 476 packed matrices and their scales
+matched the exports after runtime layout transforms. Both offload modes
+matched resident RGBA pixels exactly. NVFP4 and TP2 change image and alpha
+values; this private export uses max calibration on only six requests, without
+SVDQuant or AWQ. See the cookbook for measured errors. Native FP4 requires
+Blackwell, and this model's NVFP4 exports remain unverified on RTX 5090.
 
 Synthetic Diffusers-format LoRA passed dynamic loading, merging,
 and removal on one B200 and TP2 with encoder folding; both removal paths

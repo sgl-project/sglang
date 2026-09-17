@@ -1,6 +1,6 @@
 export const config = (() => {
 const platformAttention = (s) => s.hw === "rtx5090" ? "sdpa" : "fa";
-const effectiveAttention = (s) => s.attention === "platform" ? platformAttention(s) : s.attention;
+const effectiveAttention = (s) => s.attention === "platform" || (s.hw === "rtx5090" && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
   modelName: "Qwen-Image 2.1",
@@ -78,7 +78,7 @@ const config = {
           flags: (s) => [`--attention-backend ${platformAttention(s) === "sdpa" ? "torch_sdpa" : "fa"}`],
           description: "Uses the measured recommendation: SDPA on RTX 5090, FlashAttention on the other listed GPUs.",
         },
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel; available on all listed platforms." },
+        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX 5090." },
         {
           id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"],
           soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("sdpa") && Number(s.gpus_per_node) === r.gpus_per_node),
@@ -96,7 +96,7 @@ const config = {
       id: "precision",
       title: "Precision",
       scope: "serve",
-      description: "Native precision is the default. Quantization changes image and alpha values. Set compatible FP8 directories or GGUF files under Variables.",
+      description: "Native precision is the default. Quantization changes image and alpha values. Set compatible FP8/NVFP4 directories or GGUF files under Variables.",
       default: "native",
       options: [
         { id: "native", label: "Native BF16 / FP32", recommended: true },
@@ -135,6 +135,24 @@ const config = {
         {
           id: "gguf_both", label: "GGUF DiT + encoder", flags: ['--component-weights-paths.transformer "{{GGUF_DIT_PATH}}"', '--component-weights-paths.text_encoder "{{GGUF_ENCODER_PATH}}"'],
           soft: true, softReason: "Combined Q4_0 exports passed 1024px/40-step generation, editing, and transparent output on B200. GGUF reduces weight memory; output quality and speed depend on the export and workload.",
+        },
+        {
+          id: "nvfp4_dit", label: "NVFP4 DiT", flags: ['--component-paths.transformer "{{NVFP4_DIT_PATH}}"'],
+          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
+          soft: true, softReason: "A calibrated ModelOpt-format DiT export passed 1024px/40-step generation, editing, and transparent output on B200. Other exports and RTX 5090 need validation.",
+        },
+        {
+          id: "nvfp4_encoder", label: "NVFP4 encoder", flags: ['--component-paths.text_encoder "{{NVFP4_ENCODER_PATH}}"'],
+          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
+          soft: true, softReason: "A calibrated language-encoder export passed generation, editing, and transparent output on B200; vision weights retain native precision. Output quality requires validation.",
+        },
+        {
+          id: "nvfp4_both", label: "NVFP4 DiT + encoder", flags: ['--component-paths.transformer "{{NVFP4_DIT_PATH}}"', '--component-paths.text_encoder "{{NVFP4_ENCODER_PATH}}"'],
+          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
+          soft: true, softReason: "Combined exports passed generation, editing, transparent output, offload, and TP2 on B200. The small max-calibration sample changes image and alpha values; validate your exported checkpoint.",
         },
       ],
     },
@@ -239,7 +257,7 @@ const config = {
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
         { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
-        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
+        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
       ],
       autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
@@ -254,6 +272,7 @@ const config = {
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
         if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
+        if (s.precision?.startsWith("nvfp4_") && !["b200", "rtx5090"].includes(s.hw)) errors.push("Native NVFP4 requires a Blackwell GPU. Select B200 or RTX 5090.");
         if (perNode === 1 && ["rtx5090", "rtx4090"].includes(s.hw) && s.placement === "resident") errors.push("The full resident pipeline exceeds this GPU's memory. Select CPU offload.");
         return errors;
       },
@@ -297,7 +316,8 @@ const config = {
             request: errors.length ? "error" : requestVerified ? "verified" : "unverified",
           },
           resolvedSettings: {
-            attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)` : undefined,
+            attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)`
+              : s.hw === "rtx5090" && s.attention === "fa" ? "Torch SDPA (FA fallback)" : undefined,
             encoder: s.encoder === "auto" && world === 1 ? "Single GPU (auto)" : undefined,
           },
         },
@@ -312,6 +332,8 @@ const config = {
     FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
     GGUF_DIT_PATH: { target: "command", label: "GGUF DiT file", default: "/models/qwen-image-2.1-gguf/transformer-Q4_0.gguf" },
     GGUF_ENCODER_PATH: { target: "command", label: "GGUF encoder file", default: "/models/qwen-image-2.1-gguf/text_encoder-Q4_0.gguf" },
+    NVFP4_DIT_PATH: { target: "command", label: "NVFP4 DiT directory", default: "/models/qwen-image-2.1-nvfp4/transformer" },
+    NVFP4_ENCODER_PATH: { target: "command", label: "NVFP4 encoder directory", default: "/models/qwen-image-2.1-nvfp4/text_encoder" },
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },

@@ -71,8 +71,11 @@ a 50 GiB process-group memory limit on a roughly 60 GiB host; this is a tested
 budget, not a minimum host-memory requirement.
 
 B200 FlashAttention was faster than SDPA in this comparison (3.44 vs 3.70 s).
-On RTX 5090 the two were within 1% (14.30 s SDPA vs 14.39 s FlashAttention);
-both passed, and the picker defaults to SDPA. Keeping eight DiT layers resident
+On RTX 5090, both commands used Torch SDPA: this runtime falls back to SDPA
+when `--attention-backend fa` is selected on SM120. The measured 14.30 s
+(explicit SDPA) and 14.39 s (FA selection with SDPA fallback) therefore do not
+compare different backends. The picker defaults to SDPA and rejects Ring with
+either selection on RTX 5090. Keeping eight DiT layers resident
 did not improve the RTX 5090 generation median, so that flag is omitted.
 On RTX 4090, DiT offload alone passed generation but ran out of memory during
 editing. The recommended command also sets `--text-encoder-cpu-offload true`;
@@ -383,9 +386,55 @@ required.
 
 GGUF reduces weight storage; it is not a promise of lower latency. The runtime
 dequantizes packed linears before BF16 matrix multiplication. Other GGUF tensor
-types, exports, and hardware need separate validation. NVFP4 remains unverified
-for this model. See the shared [GGUF guide](/docs/sglang-diffusion/quantization#gguf)
+types, exports, and hardware need separate validation.
+See the shared [GGUF guide](/docs/sglang-diffusion/quantization#gguf)
 for loader and parallelism constraints.
+
+### NVFP4 components
+
+Select **NVFP4 DiT**, **NVFP4 encoder**, or **NVFP4 DiT + encoder** in the
+picker, then set the component directories under **Variables**. These options
+require Blackwell; H200 and RTX 4090 cannot run this native FP4 path. B200 has
+completed the checks below. RTX 5090 remains unverified for this model's NVFP4
+exports; its FlashInfer backend defaults to `auto`, because TensorRT-LLM FP4
+GEMM does not support SM120. Keep that default on RTX 5090.
+
+Each exported directory contains its architecture config, weight shards, and
+index. The config declares `quant_method: modelopt`, `quant_algo: NVFP4`, and
+block size 16, with exclusions for native-precision layers. Use
+`--component-paths.transformer` and/or `--component-paths.text_encoder` to load
+the exported directories. Omit online quantization flags; metadata alone does
+not convert native weights into an NVFP4 checkpoint.
+
+The private validation export quantizes the same 224 DiT and 252 language
+matrices as the FP8 example. Vision, embeddings, the output head, other DiT
+projections, and VAE retain native precision. Weight quantization uses ModelOpt
+0.46.1 with max calibration; static activation scales come from six separate
+1024px/40-step requests, including two edits and one transparent generation.
+This small calibration set does not establish general quality. It does not
+use SVDQuant or AWQ. All 476 loaded packed weights, block scales, and global
+scales matched the export after the runtime's layout transforms.
+
+At revision `57b625d3e3`, each component and both together passed 1024px/40-step
+HTTP generation, editing, and transparent PNG output on B200 with
+FlashAttention, seed 42, CFG 1, and FlashInfer TensorRT-LLM FP4 GEMM. The combined
+export also passed TP2 with encoder folding. Single-GPU all-component layerwise
+offload and whole-encoder CPU offload each matched the combined resident RGBA
+pixels exactly. TP2 changed numerical results.
+
+| NVFP4 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 24.97 dB | 31.56 dB |
+| Encoder | 26.48 dB | 36.63 dB |
+| Both | 19.36 dB | 29.96 dB |
+
+The combined export's transparent cat retained alpha from 0 to 255, with
+67.8% of pixels at alpha 5 or below. Against native precision, alpha PSNR was
+23.81 dB and mean absolute error was 2.22/255; some boundary pixels differed
+by 255. These are single-example comparisons of private exports, not download
+targets or quality guarantees. Native precision remains the default. See the
+shared [NVFP4 guide](/docs/sglang-diffusion/quantization#modelopt-nvfp4) for loader
+details.
 
 ### LoRA and execution options
 
