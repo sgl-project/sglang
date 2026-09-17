@@ -2384,7 +2384,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ne_skip_token_table_update: torch.Tensor = None
     # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
     # of each request's first extend token (NgramEmbeddingManager).
-    ne_history: Optional[torch.Tensor] = None
+    engram_history: Optional[torch.Tensor] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64

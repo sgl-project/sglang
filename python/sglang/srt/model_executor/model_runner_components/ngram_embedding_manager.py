@@ -59,7 +59,7 @@ class NgramEmbeddingManager:
                         max_running_requests, chunked_prefill_size, device
                     )
         engram_hasher = None
-        if model_config.engram_ngram_size > 0:
+        if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
 
             for module in model.modules():
@@ -70,7 +70,7 @@ class NgramEmbeddingManager:
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
-            n=model_config.ngram_context_size,
+            n=model_config.ngram_embedding_n,
             engram_hasher=engram_hasher,
         )
 
@@ -199,7 +199,7 @@ class NgramEmbeddingManager:
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
             rows.append([0] * (n1 - len(ids)) + list(ids))
-        batch.ne_history = torch.tensor(
+        batch.engram_history = torch.tensor(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
         ).view(len(rows), n1)
 

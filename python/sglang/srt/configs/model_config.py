@@ -687,11 +687,11 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
-        # Tokens (the token itself plus its predecessors) each position reads from the
-        # per-request n-gram token table (LongCat); 0 disables the table.
-        self.ngram_context_size = ngram_context_size(self.hf_config)
-        self.use_ngram_embedding = self.ngram_context_size > 0
-        self.engram_ngram_size = engram_ngram_size(self.hf_config)
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.ngram_embedding_n = (
+            self.hf_config.ngram_embedding_n if self.use_ngram_embedding else 0
+        )
+        self.use_engram = bool(getattr(self.hf_config, "engram_layer_ids", ()))
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
@@ -2540,15 +2540,3 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
-
-
-def ngram_context_size(hf_config) -> int:
-    if getattr(hf_config, "use_ngram_embedding", False):
-        return hf_config.ngram_embedding_n
-    return 0
-
-
-def engram_ngram_size(hf_config) -> int:
-    if getattr(hf_config, "engram_layer_ids", ()):
-        return hf_config.engram_max_ngram_size
-    return 0

@@ -50,13 +50,19 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+
+
+def _cuda_kernels(t: torch.Tensor) -> bool:
+    """The Triton kernels serve CUDA tensors on CUDA builds; ROCm and CPU take the
+    torch paths."""
+    return t.is_cuda and is_cuda()
 
 
 def _is_prime(n: int) -> bool:
@@ -253,7 +259,9 @@ class EngramHasher(nn.Module):
         self.pad_row = num_req_slots
 
     @classmethod
-    def from_config(cls, config, layout: EngramLayout) -> EngramHasher:
+    def from_config(
+        cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
+    ) -> EngramHasher:
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -269,11 +277,7 @@ class EngramHasher(nn.Module):
             config.engram_pad_token_id,
             config.engram_compressed_vocab_size,
         )
-        result.image_token_id = (
-            config.image_token_id
-            if config.model_type == "deepseek_v41" and config.vision_n_layers > 0
-            else None
-        )
+        result.image_token_id = image_token_id
         return result
 
     def forward(
@@ -317,12 +321,12 @@ class EngramHasher(nn.Module):
             row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
             num_real = row.shape[0]
             kmode = MODE_EXTEND
-            if forward_batch.ngram_history is not None:
-                history, hist_via_slots = forward_batch.ngram_history, False
+            if forward_batch.engram_history is not None:
+                history, hist_via_slots = forward_batch.engram_history, False
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
-        if input_ids.is_cuda and torch.version.cuda is not None:
+        if _cuda_kernels(input_ids):
             if kmode == MODE_DECODE:
                 # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
                 assert forward_batch.out_cache_loc is not None
@@ -457,7 +461,7 @@ class EngramHasher(nn.Module):
     ) -> None:
         """Commit anchor + accepted drafts; the bonus is the next block's anchor."""
         assert self.history is not None, "EngramHasher.init_history was not called"
-        if self.history.is_cuda:
+        if _cuda_kernels(self.history):
             engram_commit_history(
                 self.history, verify_ids_2d, req_pool_indices, commit_lens
             )
@@ -555,6 +559,9 @@ def _drop_page_cache_once(reason: str) -> None:
 
 class _HostTable:
     """Host-memory backing for one engram table.
+
+    Lives for the whole process: the mapping, the memfd and the cudaHostRegister
+    pin are never released because the table is read by every forward.
 
     Layouts:
       shared   one memfd holding every row, mapped by all ranks of the group;
@@ -807,9 +814,7 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        if self.host_table is None and (
-            not indices.is_cuda or torch.version.cuda is None
-        ):
+        if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
@@ -881,8 +886,7 @@ def engram_gate(
     The fused kernel serves every token count on CUDA; the torch path below is the
     non-CUDA fallback and materializes fp32 copies of x, key and value."""
     if (
-        x.is_cuda
-        and torch.version.cuda is not None
+        _cuda_kernels(x)
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype

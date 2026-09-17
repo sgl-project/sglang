@@ -73,8 +73,8 @@ def _stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,
-        ngram_context_size=0,
-        engram_ngram_size=0,
+        ngram_embedding_n=0,
+        use_engram=False,
     )
     return stub
 
