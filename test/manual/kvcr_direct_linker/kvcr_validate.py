@@ -234,6 +234,8 @@ def _linker_config(args, *, control_port: int | None) -> dict:
             control_port=control_port,
             control_advertise_host="127.0.0.1",
         )
+    if args.linker_config_json:
+        config.update(json.loads(args.linker_config_json))
     return config
 
 
@@ -534,6 +536,9 @@ def main() -> int:
     parser.add_argument("--deadline-ms", type=int, default=5000)
     parser.add_argument("--settle-s", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--linker-config-json", default=None, help="JSON merged into the linker config"
+    )
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--report", required=True)
     # Unknown flags are forwarded to sglang.launch_server verbatim.

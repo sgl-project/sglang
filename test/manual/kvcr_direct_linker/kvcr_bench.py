@@ -153,6 +153,9 @@ def main() -> int:
     parser.add_argument("--deadline-ms", type=int, default=5000)
     parser.add_argument("--settle-s", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument(
+        "--linker-config-json", default=None, help="JSON merged into the linker config"
+    )
     parser.add_argument("--configs", default="none,hicache,kvcr")
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--report", required=True)
