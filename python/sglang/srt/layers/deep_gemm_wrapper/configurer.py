@@ -43,3 +43,20 @@ DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     get_platform().is_sm100 or get_device_sm() == 120
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+
+
+def _supports_paged_sparse_mqa_logits() -> bool:
+    if not DEEPGEMM_BLACKWELL:
+        return False
+    import deep_gemm
+
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "get_paged_sparse_mqa_logits_metadata",
+            "fp8_fp4_paged_sparse_mqa_logits",
+        )
+    )
+
+
+DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()

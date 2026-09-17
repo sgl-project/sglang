@@ -983,6 +983,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
+    # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
+    SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
@@ -1344,6 +1347,8 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Currently supported by the Kimi-K2.5 image processor only.
+    SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
