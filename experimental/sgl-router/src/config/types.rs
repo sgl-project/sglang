@@ -248,6 +248,65 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
+    /// before the HTTP server stops accepting. The default covers both
+    /// deregistration paths: endpoint removal reaching kube-proxy after the
+    /// pod's `deletionTimestamp` is stamped, and a probe-driven load balancer,
+    /// which cannot act until `failureThreshold * periodSeconds` of `/readyz`
+    /// failures have accumulated.
+    ///
+    /// Note that it equals the k8s default `terminationGracePeriodSeconds`, so
+    /// a pod that has not raised its grace period is left with nothing for the
+    /// in-flight drain that follows the pause, and
+    /// [`shutdown_drain_advisory`](crate::config::shutdown_drain_advisory)
+    /// warns at every startup. That is the intended reading rather than a
+    /// misconfigured default: a router whose completions stream for minutes
+    /// cannot terminate cleanly inside 30 s at all, and the grace period is the
+    /// thing to raise. 0 disables the pause.
+    pub shutdown_drain_secs: u64,
+    /// The pod's actual `terminationGracePeriodSeconds`, when the operator
+    /// declares it. The router cannot read its own pod spec, so without this
+    /// the startup advisory can only compare the drain against the k8s
+    /// default — and warns, wrongly, about a deployment that raised the grace
+    /// period on purpose. `None` means "assume the default".
+    pub termination_grace_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// [`Self::shutdown_drain_secs`] as a `Duration`. Keeps the seconds-to-
+    /// `Duration` conversion in the library, where a test can pin it, rather
+    /// than in `main.rs` where a `from_secs`/`from_millis` slip would silently
+    /// shorten every drain by a factor of 1000.
+    pub fn shutdown_drain(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_drain_secs)
+    }
+}
+
+pub fn default_host() -> String {
+    "127.0.0.1".into()
+}
+
+pub fn default_port() -> u16 {
+    30000
+}
+
+pub fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+/// Exists so test fixtures can spell out only the fields they care about
+/// (`tests/` is a separate crate, so a `#[cfg(test)]` constructor cannot reach
+/// the integration fixtures). Keep `Cli::into_config` exhaustive so adding a
+/// field still forces a decision on the production path.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            termination_grace_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -475,7 +534,31 @@ pub struct AffinityConfig {
     /// Note the firing point scales with `dp_size`: the sample sums `waiting`
     /// across a worker's DP ranks while a request lands on one of them, so
     /// scale the limit with `--dp-size` on DP-attention deployments.
+    ///
+    /// The companion `saturation_queue_floor` cancels the gate's diversions
+    /// when they have no payoff (nothing in the fleet reads below the
+    /// floor).
     pub worker_queue_limit: Option<u64>,
+    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
+    /// diversions that have no payoff. When no cache candidate survives
+    /// both `worker_queue_limit` and hard admission, at least one was over
+    /// the limit, AND no worker in the routable fleet has a fresh queue
+    /// reading strictly below this floor, the diverted request would wait
+    /// wherever it lands — so it pins to the least-pressured prefix owner
+    /// instead of cold-prefilling on a non-owner (which evicts other
+    /// prefixes and manufactures the next round of misses). `None` — the
+    /// default — preserves the pure gate behavior.
+    ///
+    /// Polarity note: a worker with no fresh sample does NOT count as idle
+    /// — the opposite of the gate's fail-open, and deliberately so. The
+    /// gate keeps affinity because that is the safe default action; the
+    /// pin asks whether a *provably better* destination exists, and an
+    /// unknown queue is not proof. Both polarities leave the request with
+    /// its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker_queue_limit` and requires the
+    /// gate; like the limit, scale the floor with `dp_size`.
+    pub saturation_queue_floor: Option<u64>,
 }
 
 impl Default for AffinityConfig {
@@ -499,6 +582,7 @@ impl Default for AffinityConfig {
             cache_candidate_max_workers: 32,
             cache_switch_margin_tokens: 1_024,
             worker_queue_limit: None,
+            saturation_queue_floor: None,
         }
     }
 }
