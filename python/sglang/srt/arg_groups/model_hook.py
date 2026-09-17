@@ -451,12 +451,11 @@ def handle_model_specific_adjustments(server_args: Any):
             and cfg.nnodes == 1
             and get_platform().is_hip
         ):
-            declare_resolution(
-                server_args,
-                "_handle_model_specific_adjustments",
-                enable_aiter_allreduce_fusion=True,
-            )
-            logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            # TODO (Hubert): Put this back later
+            # server_args.enable_aiter_allreduce_fusion = True
+            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            pass
+
         quantization_config = getattr(hf_config, "quantization_config", None)
         is_mxfp4_quant_format = (
             quantization_config is not None
