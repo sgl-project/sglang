@@ -3042,7 +3042,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.use_mxfp8:
             gemm1_alpha = self.moe_runner_config.gemm1_alpha
-            if gemm1_alpha is not None and gemm1_alpha != 1.702:
+            if gemm1_alpha != 1.702:
                 raise NotImplementedError(
                     f"AITER MXFP8 MoE only supports swiglu-oai "
                     f"alpha=1.702, got {gemm1_alpha=}."
