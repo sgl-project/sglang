@@ -2321,16 +2321,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 if transfer.keys is None:
                     keep_pages = 0
                 elif count < len(transfer.keys):
-                    # Coarse ALL_PAGES pools count physical objects; trailing
-                    # pools instead invalidate from the start of their window.
-                    pool_keep_pages = (
-                        count * transfer.logical_pages_per_object
-                        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
-                        else max(0, len(invalidation_hashes) - len(transfer.keys))
-                    )
+                    # Aux transfers key the chain's trailing pages.
                     keep_pages = min(
                         keep_pages,
-                        pool_keep_pages,
+                        max(0, len(invalidation_hashes) - len(transfer.keys)),
                     )
             self.storage_existence_cache.invalidate_beyond(
                 PoolName.KV, invalidation_hashes, keep_pages=keep_pages
