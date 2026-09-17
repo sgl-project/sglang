@@ -235,6 +235,13 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+
+# Setting this knob also drops the world_size==8 override below, whose comment
+# records a measurement at K=7168 only. Unset leaves both paths as they were.
+_AR_1STAGE_MAX_BYTES = envs.SGLANG_1STAGE_ALLREDUCE_MAX_SIZE_KB.get() * 1024
+_AR_1STAGE_TUNED = envs.SGLANG_1STAGE_ALLREDUCE_MAX_SIZE_KB.is_set()
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -813,7 +820,7 @@ class GroupCoordinator:
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            use_1stage_ar = total_bytes <= _AR_1STAGE_MAX_BYTES
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -890,12 +897,13 @@ class GroupCoordinator:
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             token_num = input_.numel() // K
-            use_1stage_ar = total_bytes <= 128 * 1024
+            use_1stage_ar = total_bytes <= _AR_1STAGE_MAX_BYTES
             if (
                 # Keep the default 128 KiB cutoff except for the measured TP=8
                 # K=7168 graph-replay crossover. K=4096 remains on the default
                 # rule because token_num=8/16 still favored 1-stage there.
-                self.world_size == 8
+                not _AR_1STAGE_TUNED
+                and self.world_size == 8
                 and 4096 < K <= 7168
                 and token_num >= 8
                 and use_1stage_ar

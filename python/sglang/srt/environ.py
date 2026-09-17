@@ -1286,6 +1286,9 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
+    # Size cutoff under which fused AR+RMSNorm takes its 1-stage path. The
+    # kernel launches one block per token and caps at 80; 128 is 10.7 at K=6144.
+    SGLANG_1STAGE_ALLREDUCE_MAX_SIZE_KB = EnvInt(128)
     # NCCL channel count pinned on CUDA so the all-reduce reduces a token the
     # same way whatever else shares its batch. Raise it to buy back bandwidth
     # on links that can drive more channels.
