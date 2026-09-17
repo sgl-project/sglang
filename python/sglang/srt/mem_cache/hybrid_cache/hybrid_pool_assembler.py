@@ -44,14 +44,6 @@ def _get_allocator_type() -> str:
     return get_allocator_type()
 
 
-def _dsv4_host_pin_memory(
-    storage_backend: Optional[str], storage_backend_extra_config: Optional[dict]
-) -> bool:
-    """Keep NPU-pinned L2 except when MemFabric must register it for RoCE."""
-    protocol = str((storage_backend_extra_config or {}).get("protocol", "")).lower()
-    return not (storage_backend == "npu_memcache" and protocol == "device_rdma")
-
-
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -594,9 +586,6 @@ def build_deepseek_v4_hicache_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
-    host_pin_memory = _dsv4_host_pin_memory(
-        storage_backend, storage_backend_extra_config
-    )
     transfer_layer_num = layer_mappings.transfer_layer_num
     full_layer_mapping = layer_mappings.full
 
@@ -668,7 +657,6 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=swa_num_host_pages,
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
-            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -699,7 +687,6 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
-            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         entries.append(
@@ -721,7 +708,6 @@ def build_deepseek_v4_hicache_stack(
                         item_bytes=region.item_bytes,
                         num_host_pages=num_host_pages,
                         slot_page_size=region.slot_page_size,
-                        pin_memory=host_pin_memory,
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
                         page_aligned_only=region.page_aligned_only,
@@ -742,7 +728,6 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
-                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -754,7 +739,6 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
-                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
             entries.extend(
@@ -795,7 +779,6 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
-            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         # C128 state pool is intentionally not registered with hicache.
@@ -1259,7 +1242,6 @@ def build_swa_draft_pools(
             num_host_pages=target_swa_host_pool.num_host_pages,
             slot_page_size=draft_swa_pool.page_size,
             layout=target_swa_host_pool.layout,
-            pin_memory=target_swa_host_pool.pin_memory,
             allocator_type=_get_allocator_type(),
         )
     else:

@@ -97,10 +97,12 @@ the C128 component. For an L3 replay check, use `write_through` with
 then flush L1/L2 without clearing the storage backend. Compare against a repeated
 resident-cache run at the same cached-prefix boundary, not against cold prefill.
 
-The DSV4 `device_sdma` path stages I/O through ordinary CPU memory because
-NPU-pinned Host pointers cannot be registered as ordinary Host memory with this
-transport. DSV4 `device_rdma` keeps registered Host buffers. Both defer transport
-initialization until the first backup; metadata-only clear remains available
+DSV4 keeps the default NPU-pinned Host pools and passes their buffers directly
+to MemCache without CPU staging. On A3, `device_rdma` requires the MemFabric
+Host/HBM classification fix: unpatched 1.1.4 and 1.2.0 misclassify pinned Host
+addresses and fail RDMA registration. Testing currently uses a locally patched
+1.1.4 build; pinned RDMA model end-to-end validation is still pending. Both device
+transports defer initialization until the first backup; metadata-only clear remains available
 before that point. The external MemCache services must have usable Holder
 capacity before starting the test; a healthy Meta endpoint alone is insufficient.
 

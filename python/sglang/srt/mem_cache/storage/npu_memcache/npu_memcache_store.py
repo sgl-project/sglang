@@ -663,19 +663,15 @@ class NpuMemcacheStore(HiCacheStorage):
                 transfer.keys, transfer
             )
             ex = self._batch_exist(self._tag_keys(component_keys))
-            page_exists = (
-                [
-                    all(
-                        result == 1
-                        for result in ex[
-                            index * key_multiplier : (index + 1) * key_multiplier
-                        ]
-                    )
-                    for index in range(len(transfer.keys))
-                ]
-                if key_multiplier > 0
-                else [False] * len(transfer.keys)
-            )
+            page_exists = [
+                all(
+                    result == 1
+                    for result in ex[
+                        index * key_multiplier : (index + 1) * key_multiplier
+                    ]
+                )
+                for index in range(len(transfer.keys))
+            ]
             successful_objects = (
                 page_exists.index(False) if False in page_exists else len(page_exists)
             )
