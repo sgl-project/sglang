@@ -1165,11 +1165,17 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.pending_bootstrap = False
+        # The session cache must observe an abort before releasing ownership,
+        # otherwise it commits the failed turn as successful session history.
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
+        if req.session is not None and req.session.streaming:
+            # Bootstrap can fail before any KV is allocated, so cache cleanup
+            # may not run. Keep the last successful history and permit retry.
+            req.session.abort_req()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
