@@ -112,6 +112,7 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "x".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
@@ -126,6 +127,7 @@ mod tests {
                 affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {

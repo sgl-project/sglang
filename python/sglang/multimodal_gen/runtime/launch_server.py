@@ -150,24 +150,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     rank_offset = node_rank * local_num_gpus
     processes = []
 
-    # Pipes for master to talk to slaves (local to this node)
-    task_pipes_to_slaves_w = []
-    task_pipes_to_slaves_r = []
-    for _ in range(local_num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        task_pipes_to_slaves_r.append(r)
-        task_pipes_to_slaves_w.append(w)
-
-    # Pipes for slaves to talk to master (local to this node)
-    result_pipes_from_slaves_w = []
-    result_pipes_from_slaves_r = []
-    for _ in range(local_num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        result_pipes_from_slaves_r.append(r)
-        result_pipes_from_slaves_w.append(w)
-
-    # Launch this node's local worker processes
-    master_port = server_args.master_port
+    # Launch this node's local worker processes.
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
@@ -175,40 +158,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         rank = rank_offset + i
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        if i == 0:  # This node's local pipe master
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    rank,
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_w,
-                    result_pipes_from_slaves_r,
-                ),
-                name=f"sglang-diffusionWorker-{rank}",
-                daemon=True,
-            )
-        else:  # Slave workers
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    rank,
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_r[i - 1],
-                    result_pipes_from_slaves_w[i - 1],
-                ),
-                name=f"sglang-diffusionWorker-{rank}",
-                daemon=True,
-            )
+        process = mp.Process(
+            target=run_scheduler_process,
+            args=(i, rank, server_args, writer),
+            name=f"sglang-diffusionWorker-{rank}",
+            daemon=True,
+        )
         scheduler_pipe_readers.append(reader)
         process.start()
         processes.append(process)
@@ -217,16 +172,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_infos = []
     for writer in scheduler_pipe_writers:
         writer.close()
-
-    # Close unused pipe ends in parent process
-    for p in task_pipes_to_slaves_w:
-        p.close()
-    for p in task_pipes_to_slaves_r:
-        p.close()
-    for p in result_pipes_from_slaves_w:
-        p.close()
-    for p in result_pipes_from_slaves_r:
-        p.close()
 
     for i, reader in enumerate(scheduler_pipe_readers):
         try:
@@ -428,7 +373,7 @@ def launch_pool_disagg_server(
 
                 process = pool_ctx.Process(
                     target=_run_disagg_role_process,
-                    args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+                    args=(gpu_id, rank_idx, role_args, writer),
                     name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
                     daemon=True,
                 )
@@ -502,12 +447,9 @@ def launch_pool_disagg_server(
 
 def _run_disagg_role_process(
     gpu_id: int,
-    _local_rank: int,
     rank: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    task_pipes: list,
-    result_pipes: list,
 ):
     """Entry point for a disagg role process.
 
@@ -519,13 +461,8 @@ def _run_disagg_role_process(
     run_scheduler_process(
         local_rank=gpu_id,
         rank=rank,
-        master_port=server_args.master_port,
         server_args=server_args,
         pipe_writer=pipe_writer,
-        task_pipe_r=None,
-        result_pipe_w=None,
-        task_pipes_to_slaves=task_pipes,
-        result_pipes_from_slaves=result_pipes,
     )
 
 
@@ -767,7 +704,7 @@ def launch_disagg_role(server_args: ServerArgs):
 
         process = pool_ctx.Process(
             target=_run_disagg_role_process,
-            args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+            args=(gpu_id, rank_idx, role_args, writer),
             name=f"sglang-{role_type.value}-r{rank_idx}",
             daemon=True,
         )
