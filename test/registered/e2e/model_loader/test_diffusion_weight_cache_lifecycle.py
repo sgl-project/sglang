@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.weight_cache.daemon import DiffusionWeightCac
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC")
 
 
@@ -40,8 +40,7 @@ class TinyAdapter:
             self.connection.send(stage)
             # Simulate blocked finalization/slow uncached loading while the
             # real watchdog must remain live. Parent never releases this wait.
-            self.connection.recv()
-            raise AssertionError("Fault barrier unexpectedly released")
+            assert self.connection.recv() == "continue"
 
     def load_ordinary(self, _):
         model = torch.nn.Linear(4, 4, bias=False, device="cuda:0")
@@ -227,6 +226,34 @@ def test_owner_replacement_between_manifest_and_worker_rejects_generation(servic
         assert status["deliveries_reserved"] == 0
         assert status["active_consumers"] == 0
     assert second.is_alive()
+
+
+def test_concurrent_worker_admission_and_status_during_meta_construction(service):
+    owner = service.start_owner()
+    with WeightCacheClient(service.plan, service.args) as client:
+        generation, _ = client.manifest()
+    workers = [service.start_worker(generation, "before_fetch") for _ in range(2)]
+    for worker, connection in workers:
+        assert connection.poll(60), "another client monopolized owner admission"
+        assert connection.recv() == "before_fetch"
+    with WeightCacheClient(service.plan, service.args) as client:
+        assert client.status()["deliveries_reserved"] == 0
+    for _, connection in workers:
+        connection.send("continue")
+    for _, connection in workers:
+        assert connection.poll(60)
+        assert connection.recv() == "pipeline_ready"
+    with WeightCacheClient(service.plan, service.args) as client:
+        status = client.status()
+        assert status["active_consumers"] == 2
+        assert status["deliveries_reserved"] == 2
+        assert status["fetches_remaining"] == 6
+    owner.terminate()
+    owner.join(10)
+    assert owner.exitcode == 0
+    for worker, _ in workers:
+        worker.join(10)
+        assert not worker.is_alive()
 
 
 if __name__ == "__main__":

@@ -317,9 +317,12 @@ def test_daemon_stop_interrupts_idle_control_connection():
     owner = object.__new__(DiffusionWeightCacheDaemon)
     left, right = socket.socketpair()
     try:
-        owner._connection = left
-        owner.stopping = False
+        owner._initialize_control()
+        owner.args = SimpleNamespace(weight_cache_timeout=2)
+        owner._dispatch_connection(left)
+        right.settimeout(2)
         owner.stop()
+        owner._close_connections()
         assert owner.stopping
         assert right.recv(1) == b""
     finally:

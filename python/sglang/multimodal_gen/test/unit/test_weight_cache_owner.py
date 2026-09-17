@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
@@ -14,8 +15,35 @@ from sglang.multimodal_gen.runtime.weight_cache import daemon
 from sglang.multimodal_gen.runtime.weight_cache.client import PROTOCOL
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.multimodal_gen.test.unit.test_weight_cache_status import owner_fixture
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 from sglang.weight_cache_common.identity import default_runtime_dir
 from sglang.weight_cache_common.liveness import ProcessIdentity
+
+
+def test_idle_connection_cannot_block_status_or_protocol_errors():
+    owner = owner_fixture()
+    owner.args = SimpleNamespace(weight_cache_timeout=2)
+    idle, idle_server = socket.socketpair()
+    client, server = socket.socketpair()
+    client.settimeout(1)
+    try:
+        owner._dispatch_connection(idle_server)
+        owner._dispatch_connection(server)
+        send_msg(
+            client,
+            {**PROTOCOL, "type": "query_status", "compatibility": owner.plan.to_dict()},
+        )
+        assert recv_msg(client)["cache_status"]["fetches_remaining"] == 2
+        send_msg(client, {**PROTOCOL, "type": "query_status", "compatibility": {}})
+        response = recv_msg(client)
+        assert response["status"] == "error"
+        assert "compatibility mismatch" in response["error"]
+    finally:
+        owner.stop()
+        owner._close_connections()
+        idle.close()
+        client.close()
+    assert not owner._connections
 
 
 def test_device_and_socket_resources_both_exclude_second_owner(tmp_path, monkeypatch):

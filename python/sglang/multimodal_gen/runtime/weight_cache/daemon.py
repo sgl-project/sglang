@@ -42,16 +42,13 @@ from sglang.multimodal_gen.runtime.weight_cache.identity import (
 from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_index
 from sglang.multimodal_gen.runtime.weight_cache.plan import plan_diff
 from sglang.srt.utils.network import NetworkAddress, get_free_port
-from sglang.srt.weight_cache.protocol import (
-    CLIENT_CONNECTION_TIMEOUT,
-    recv_msg,
-    send_msg,
-)
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 from sglang.weight_cache_common.identity import default_runtime_dir
 from sglang.weight_cache_common.liveness import ProcessHandle, ProcessIdentity
 from sglang.weight_cache_common.transport import CudaIpcExporter
 
 logger = init_logger(__name__)
+MAX_CONTROL_CONNECTIONS = 16
 DRAIN_GRACE_SECONDS = 5.0
 
 
@@ -103,17 +100,17 @@ class DiffusionWeightCacheDaemon:
         self.consumers = {}
         self._consumers_lock = threading.Lock()
         self.exporter = None
-        self._connection = None
+        self._connections = {}
+        self._connections_lock = threading.Lock()
 
     def stop(self, *_):
+        # Signal handlers must not acquire locks also used by request threads.
+        # run() wakes accepted sockets and joins handlers before draining.
+        if self.stopping:
+            logger.warning(
+                "Owner is draining; allocations remain pinned until consumers exit"
+            )
         self.stopping = True
-        # Wake an idle/partial control exchange without waiting for its timeout.
-        # The generation and registered consumers still go through _drain().
-        if self._connection is not None:
-            try:
-                self._connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
 
     def _live_consumers(self):
         with self._consumers_lock:
@@ -223,6 +220,61 @@ class DiffusionWeightCacheDaemon:
                 )
                 next_report = now + 10
             time.sleep(0.1)
+
+    def _serve_connection(self, conn):
+        try:
+            with conn:
+                conn.settimeout(self.args.weight_cache_timeout)
+                try:
+                    peer = peer_identity(conn)
+                    while not self.stopping:
+                        request = recv_msg(conn)
+                        response = self._request(request, peer)
+                        send_msg(conn, {**PROTOCOL, "status": "ok", **response})
+                except TimeoutError:
+                    logger.warning("Weight-cache control connection timed out")
+                except (EOFError, ConnectionError):
+                    pass
+                except Exception as error:
+                    logger.warning("Weight-cache request failed: %s", error)
+                    try:
+                        send_msg(
+                            conn, {**PROTOCOL, "status": "error", "error": str(error)}
+                        )
+                    except OSError:
+                        pass
+        finally:
+            with self._connections_lock:
+                self._connections.pop(conn, None)
+
+    def _dispatch_connection(self, conn):
+        with self._connections_lock:
+            if self.stopping or len(self._connections) >= MAX_CONTROL_CONNECTIONS:
+                conn.close()
+                return
+            thread = threading.Thread(
+                target=self._serve_connection, args=(conn,), daemon=True
+            )
+            self._connections[conn] = thread
+            try:
+                thread.start()
+            except BaseException:
+                del self._connections[conn]
+                conn.close()
+                raise
+
+    def _close_connections(self):
+        with self._connections_lock:
+            connections = list(self._connections.items())
+        for conn, _ in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        # Do not free an exporter while a handler could still be exporting or
+        # registering a consumer. A wedged CUDA export retains its producer.
+        for _, thread in connections:
+            thread.join()
 
     def _cleanup_stale_files(self):
         # Both device and path locks are held. Never signal a PID from .ready:
@@ -338,34 +390,12 @@ class DiffusionWeightCacheDaemon:
                     conn, _ = listener.accept()
                 except TimeoutError:
                     continue
-                with conn:
-                    self._connection = conn
-                    conn.settimeout(
-                        min(CLIENT_CONNECTION_TIMEOUT, self.args.weight_cache_timeout)
-                    )
-                    try:
-                        peer = peer_identity(conn)
-                        while not self.stopping:
-                            request = recv_msg(conn)
-                            response = self._request(request, peer)
-                            send_msg(conn, {**PROTOCOL, "status": "ok", **response})
-                    except (EOFError, ConnectionError, TimeoutError):
-                        pass
-                    except Exception as error:
-                        logger.warning("Weight-cache request failed: %s", error)
-                        try:
-                            send_msg(
-                                conn,
-                                {**PROTOCOL, "status": "error", "error": str(error)},
-                            )
-                        except (OSError, EOFError):
-                            pass
-                    finally:
-                        self._connection = None
+                self._dispatch_connection(conn)
         finally:
             self.stopping = True
             if listener is not None:
                 listener.close()
+            self._close_connections()
             if published:
                 self._remove_endpoints()
             self._drain()
