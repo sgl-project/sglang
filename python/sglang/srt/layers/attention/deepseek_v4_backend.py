@@ -464,13 +464,14 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     index_topk: int
+    # Sorted compress ratios present in this stage; absent ratios keep no
+    # buffers or schedules.
+    present_ratios: Tuple[int, ...]
     # SWA KV-store write target (out_cache_loc translated to SWA space), computed
     # once per iteration in make_core_attn_metadata and read by the store path.
     request_window_layout: Optional[object] = None
+    # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    # Sorted compress ratios present in this stage; absent ratios keep no buffers
-    # or schedules. The default (4, 128) supports V4 metadata constructed by hand.
-    present_ratios: Tuple[int, ...] = (4, 128)
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
