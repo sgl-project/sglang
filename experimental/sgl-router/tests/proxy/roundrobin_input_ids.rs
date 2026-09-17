@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `input_ids` forwarding is policy-independent: a load-only **round-robin**
-//! policy on a chat-encoder model still forwards `input_ids` to the engine
+//! policy on a chat-formatter model still forwards `input_ids` to the engine
 //! (the engine-tokenization offload), even though it picks workers round-robin
 //! and ignores the tokens for routing. Tokenization is gated on the model's
-//! chat encoder at ingress, not on the policy.
+//! chat formatter at ingress, not on the policy.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -36,6 +36,7 @@ fn config() -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
@@ -65,7 +66,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
     // The handler tokenizes via the AppContext's registry (which carries the V4
     // encoder); the RoundRobin policy itself needs no tokenizer.
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    assert!(tokenizers.has_chat_encoder(MODEL));
+    assert!(tokenizers.has_chat_formatter(MODEL));
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
         id: WorkerId(url.clone()),
@@ -102,7 +103,7 @@ fn captured(mock: &MockWorker) -> Value {
 }
 
 /// A round-robin (load-only) policy still forwards `input_ids` on a
-/// chat-encoder model — the offload is decoupled from routing.
+/// chat-formatter model — the offload is decoupled from routing.
 #[tokio::test]
 async fn round_robin_plain_chat_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
@@ -121,7 +122,7 @@ async fn round_robin_plain_chat_forwards_input_ids() {
     let ids = body.get("input_ids").and_then(|v| v.as_array());
     assert!(
         ids.is_some_and(|a| !a.is_empty()),
-        "round-robin must forward input_ids on a chat-encoder model; got {body}"
+        "round-robin must forward input_ids on a chat-formatter model; got {body}"
     );
     assert!(
         body.get("messages").is_some(),
@@ -153,7 +154,7 @@ async fn round_robin_tool_request_omits_input_ids() {
     );
 }
 
-/// A successful plain-chat forward on a chat-encoder model must NOT emit
+/// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
 /// offload was expected but the encoder failed. A tool request on the same model
 /// is an *expected* omission (its ids are still engine-equivalent; the

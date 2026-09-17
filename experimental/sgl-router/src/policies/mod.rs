@@ -34,8 +34,9 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
-    pub engine_equivalent: bool,
+    /// Whether the IDs came from rendered chat messages.
+    /// Forwarding also requires the request safety guard.
+    pub rendered_from_chat: bool,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -45,19 +46,18 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-encoder tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
+/// Tokenizes requests for routing, preferring chat rendering over raw text.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_encoder(&model_id.0) {
+    if tokenizers.has_chat_formatter(&model_id.0) {
         if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
             if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
                 return Some(RequestTokens {
                     ids,
-                    engine_equivalent: true,
+                    rendered_from_chat: true,
                 });
             }
         }
@@ -66,7 +66,7 @@ pub fn request_tokens_for(
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
-        engine_equivalent: false,
+        rendered_from_chat: false,
     })
 }
 
@@ -356,6 +356,14 @@ pub struct CacheCandidateProposal {
     /// waiting requests cannot win on cache affinity. `None` disables the
     /// gate. See [`crate::config::AffinityConfig::worker_queue_limit`].
     pub worker_queue_limit: Option<u64>,
+    /// Saturation pin: when no candidate survives the gate and hard
+    /// admission, at least one was queue-gate-rejected, and no worker in
+    /// the routable fleet has a fresh queue reading strictly below this
+    /// floor, the request pins to the least-pressured rejected prefix
+    /// owner instead of diverting — the diversion cannot dodge a wait and
+    /// would forfeit the matched prefix. `None` disables the pin. See
+    /// [`crate::config::AffinityConfig::saturation_queue_floor`].
+    pub saturation_queue_floor: Option<u64>,
 }
 
 /// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
@@ -503,11 +511,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 
     /// Whether this policy's routing decision needs request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
-    /// gated on this — that is a model property (`has_chat_encoder`) decided at
+    /// gated on this — that is a model property (`has_chat_formatter`) decided at
     /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
     /// keeps the cache-aware policy's RAW-prompt routing path alive: a
-    /// cache-aware model with no chat encoder still wants its `/v1/completions`
-    /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`
+    /// cache-aware model with no chat formatter still wants its `/v1/completions`
+    /// /`text` prompt tokenized for tree matching, which `has_chat_formatter`
     /// alone would not trigger. Default `false` for load-only and sticky
     /// routes; only the cache-aware policy overrides it.
     fn needs_request_tokens(&self) -> bool {
