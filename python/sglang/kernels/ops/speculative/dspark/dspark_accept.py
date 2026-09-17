@@ -40,6 +40,8 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        uniform_samples: Optional[torch.Tensor] = None,
+        uniform_samples_final: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
@@ -50,6 +52,8 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            uniform_samples=uniform_samples,
+            uniform_samples_final=uniform_samples_final,
         )
 
     @classmethod
@@ -64,6 +68,8 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        uniform_samples: Optional[torch.Tensor] = None,
+        uniform_samples_final: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
@@ -74,6 +80,8 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            uniform_samples=uniform_samples,
+            uniform_samples_final=uniform_samples_final,
         )
 
 
@@ -87,6 +95,8 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    uniform_samples: Optional[torch.Tensor],
+    uniform_samples_final: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -117,8 +127,10 @@ def _accept_sampling_core(
         draft_token_num=verify_num_draft_tokens,
         device=device,
     )
-    uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
-    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    if uniform_samples is None:
+        uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
+    if uniform_samples_final is None:
+        uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -155,6 +167,8 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_final: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -167,6 +181,8 @@ def accept_sampling(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
@@ -223,6 +239,8 @@ def accept_sampling_triton(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_final: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
         candidates=candidates,
@@ -233,6 +251,8 @@ def accept_sampling_triton(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len

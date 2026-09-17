@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import os
 from typing import Optional
 
 import msgspec
@@ -29,6 +31,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -709,6 +712,351 @@ class DsparkVerifyEpilogue:
             )
 
 
+def _dspark_rs_chunk_size() -> int:
+    value = os.environ.get("SGLANG_DSPARK_RS_CHUNK_SIZE", "0")
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return 0
+
+
+def _dspark_rs_full_batch_max() -> int:
+    """Keep small batches on the original full-batch path.
+
+    Chunking is intended to cap the probability workspace for large batches.
+    Repeating the sampling kernel for small batches only adds launch and
+    Python scheduling overhead, so callers can set this threshold explicitly.
+    """
+    value = os.environ.get("SGLANG_DSPARK_RS_FULL_BATCH_MAX", "0")
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return 0
+
+
+def _dspark_rs_max_workspace_bytes() -> int:
+    """Return the probability-workspace budget, or zero when disabled."""
+    value = os.environ.get("SGLANG_DSPARK_RS_MAX_WORKSPACE_BYTES", "0")
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return 0
+
+
+def _dspark_rs_dynamic_memory_enabled() -> bool:
+    """Use current CUDA free memory when choosing the verification chunk."""
+    return os.environ.get("SGLANG_DSPARK_RS_DYNAMIC_MEMORY", "1") == "1"
+
+
+def _dspark_rs_memory_headroom_bytes() -> int:
+    value = os.environ.get("SGLANG_DSPARK_RS_MEMORY_HEADROOM_BYTES", str(512 * 1024**2))
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return 512 * 1024**2
+
+
+def _dspark_rs_available_workspace_bytes(device: Optional[torch.device]) -> int:
+    """Return free CUDA memory available for probability workspaces."""
+    if (
+        not _dspark_rs_dynamic_memory_enabled()
+        or device is None
+        or device.type != "cuda"
+        or not torch.cuda.is_available()
+    ):
+        return 0
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        reserved_bytes = torch.cuda.memory_reserved(device)
+        allocated_bytes = torch.cuda.memory_allocated(device)
+    except RuntimeError:
+        return 0
+    allocator_reusable = max(int(reserved_bytes) - int(allocated_bytes), 0)
+    return max(
+        int(free_bytes) + allocator_reusable - _dspark_rs_memory_headroom_bytes(),
+        0,
+    )
+
+
+def _dspark_rs_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_DSPARK_RS_TRACE", "0") == "1"
+
+
+def _dspark_rs_memory_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_DSPARK_RS_MEMORY_TRACE", "0") == "1"
+
+
+def _dspark_rs_memory_snapshot(stage: str) -> None:
+    if not _dspark_rs_memory_trace_enabled() or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    print(
+        "[DSPARK_RS_MEMORY] "
+        f"stage={stage} "
+        f"allocated={torch.cuda.memory_allocated()} "
+        f"reserved={torch.cuda.memory_reserved()} "
+        f"peak_allocated={torch.cuda.max_memory_allocated()} "
+        f"peak_reserved={torch.cuda.max_memory_reserved()}",
+        flush=True,
+    )
+
+
+def _dspark_rs_estimate_workspace_bytes(
+    *, bs: int, gamma_rows: int, verify_num_draft_tokens: int, vocab: int
+) -> int:
+    """Estimate simultaneous FP32 draft/target probability workspace."""
+    return (
+        bs
+        * (gamma_rows + verify_num_draft_tokens)
+        * vocab
+        * 4  # FP32 probability workspace
+    )
+
+
+def _dspark_rs_plan_chunk_size(
+    *,
+    bs: int,
+    gamma_rows: int,
+    verify_num_draft_tokens: int,
+    vocab: int,
+    device: Optional[torch.device] = None,
+    available_workspace_bytes: Optional[int] = None,
+) -> tuple[int, int, int]:
+    """Return (chunk_size, full_workspace_bytes, max_workspace_bytes).
+
+    A positive ``SGLANG_DSPARK_RS_MAX_WORKSPACE_BYTES`` sets the target budget for the estimated
+    simultaneous draft/target probability tensors.  With dynamic memory
+    planning enabled, current free CUDA memory is also considered; the
+    full-batch fast path is retained whenever it fits.  A positive fixed
+    chunk size remains an upper bound for controlled tests.
+    """
+    full_workspace_bytes = _dspark_rs_estimate_workspace_bytes(
+        bs=bs,
+        gamma_rows=gamma_rows,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        vocab=vocab,
+    )
+    max_workspace_bytes = _dspark_rs_max_workspace_bytes()
+    fixed_chunk_size = _dspark_rs_chunk_size()
+    full_batch_max = _dspark_rs_full_batch_max()
+    if available_workspace_bytes is None:
+        available_workspace_bytes = (
+            _dspark_rs_available_workspace_bytes(device)
+            if max_workspace_bytes > 0
+            else 0
+        )
+
+    planned_chunk_size = bs
+    effective_workspace_bytes = max_workspace_bytes
+    if available_workspace_bytes > 0:
+        if full_workspace_bytes <= available_workspace_bytes:
+            effective_workspace_bytes = 0
+        elif effective_workspace_bytes <= 0:
+            effective_workspace_bytes = available_workspace_bytes
+        else:
+            effective_workspace_bytes = min(
+                effective_workspace_bytes, available_workspace_bytes
+            )
+    if effective_workspace_bytes > 0:
+        per_request_bytes = _dspark_rs_estimate_workspace_bytes(
+            bs=1,
+            gamma_rows=gamma_rows,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            vocab=vocab,
+        )
+        budget_chunk_size = max(1, effective_workspace_bytes // per_request_bytes)
+        planned_chunk_size = min(planned_chunk_size, budget_chunk_size)
+    if fixed_chunk_size > 0:
+        planned_chunk_size = min(planned_chunk_size, fixed_chunk_size)
+
+    if planned_chunk_size >= bs:
+        if full_batch_max > 0 and bs > full_batch_max:
+            planned_chunk_size = full_batch_max
+        else:
+            return 0, full_workspace_bytes, max_workspace_bytes
+
+    if planned_chunk_size <= 0:
+        return 0, full_workspace_bytes, max_workspace_bytes
+    return planned_chunk_size, full_workspace_bytes, max_workspace_bytes
+
+
+def _dspark_rs_trace(
+    *,
+    bs: int,
+    gamma_rows: int,
+    verify_num_draft_tokens: int,
+    vocab: int,
+    chunk_size: int,
+    full_workspace_bytes: int,
+    max_workspace_bytes: int,
+) -> None:
+    if not _dspark_rs_trace_enabled():
+        return
+    num_chunks = 1 if chunk_size == 0 else (bs + chunk_size - 1) // chunk_size
+    print(
+        "[DSPARK_RS_TRACE] "
+        f"bs={bs} gamma_rows={gamma_rows} verify_rows={verify_num_draft_tokens} "
+        f"vocab={vocab} chunk_size={chunk_size or bs} chunks={num_chunks} "
+        f"full_workspace_bytes={full_workspace_bytes} "
+        f"max_workspace_bytes={max_workspace_bytes}",
+        flush=True,
+    )
+
+
+def _dspark_can_slice_sampling_info(sampling_info) -> bool:
+    if sampling_info is None:
+        return False
+    if getattr(sampling_info, "need_min_p_sampling", False):
+        return False
+    if getattr(sampling_info, "has_custom_logit_processor", False):
+        return False
+    if getattr(sampling_info, "grammar_mask", None) is not None:
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    if getattr(sampling_info, "grammars", None):
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and getattr(penalizer, "is_required", False):
+        return False
+    return True
+
+
+def _dspark_slice_sampling_info(sampling_info, start: int, end: int):
+    sliced = dataclasses.replace(sampling_info)
+    for name in ("temperatures", "top_ps", "top_ks", "min_ps", "sampling_seed"):
+        value = getattr(sampling_info, name, None)
+        if value is not None:
+            setattr(sliced, name, value[start:end])
+    if getattr(sampling_info, "return_sampling_masks", None) is not None:
+        sliced.return_sampling_masks = sampling_info.return_sampling_masks[start:end]
+    sliced.is_all_greedy = bool(torch.all(sliced.top_ks <= 1).item())
+    sliced.is_any_greedy = bool(torch.any(sliced.top_ks <= 1).item())
+    sliced.need_top_p_sampling = bool(torch.any(sliced.top_ps != 1.0).item())
+    sliced.need_top_k_sampling = bool(torch.any(sliced.top_ks != TOP_K_ALL).item())
+    return sliced
+
+
+def _dspark_slice_draft_input(draft_input, sampling_info, start: int, end: int):
+    """Keep DSpark top-k metadata local to the current request chunk."""
+    if draft_input is None:
+        return None
+    chunk_top_ks = sampling_info.top_ks[start:end]
+    chunk_max_top_k = max(int(chunk_top_ks.max().item()), 1)
+    uniform_top_k_value = None
+    if bool(torch.all(chunk_top_ks == chunk_top_ks[0]).item()):
+        uniform_top_k_value = int(chunk_top_ks[0].item())
+    return dataclasses.replace(
+        draft_input,
+        max_top_k=chunk_max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+    )
+
+
+def _accept_sampling_chunked(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_block: DraftBlockResult,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor],
+    chunk_size: int,
+    greedy_mask: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    uniform_samples = torch.rand(
+        (bs, gamma), dtype=torch.float32, device=target_logits.device
+    )
+    uniform_samples_final = torch.rand(
+        (bs,), dtype=torch.float32, device=target_logits.device
+    )
+    correct_out = None
+    bonus_out = None
+    trim_out = None
+    for start in range(0, bs, chunk_size):
+        end = min(start + chunk_size, bs)
+        chunk_bs = end - start
+        chunk_sampling_info = _dspark_slice_sampling_info(sampling_info, start, end)
+        chunk_draft_input = _dspark_slice_draft_input(
+            draft_input, sampling_info, start, end
+        )
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits[start:end].reshape(
+                chunk_bs * gamma_rows, vocab
+            ),
+            temperatures=draft_block.temperatures[start:end],
+            rows_per_request=gamma_rows,
+        ).view(chunk_bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
+        if start == 0:
+            _dspark_rs_memory_snapshot("after_first_draft_probs")
+        chunk_target_logits = target_logits[
+            start * verify_num_draft_tokens : end * verify_num_draft_tokens
+        ]
+        chunk_cutoff = (
+            None if cutoff_verify_lens is None else cutoff_verify_lens[start:end]
+        )
+        sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
+            candidates=candidates[start:end],
+            target_logits=chunk_target_logits,
+            draft_probs=draft_probs,
+            sampling_info=chunk_sampling_info,
+            draft_input=chunk_draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=chunk_cutoff,
+            uniform_samples=uniform_samples[start:end],
+            uniform_samples_final=uniform_samples_final[start:end],
+        )
+        if chunk_sampling_info.is_any_greedy:
+            # Keep the mixed-batch semantics of the original full path: run
+            # both acceptors for the chunk, then select per request.
+            greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
+                candidates=candidates[start:end],
+                target_logits=chunk_target_logits,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                cutoff_verify_lens=chunk_cutoff,
+            )
+            selected = SelectMixedAccept.execute(
+                greedy_mask=greedy_mask[start:end],
+                greedy_len=greedy_len,
+                greedy_bonus=greedy_bonus,
+                greedy_trim=greedy_trim,
+                sampling_len=sampling_len,
+                sampling_bonus=sampling_bonus,
+                sampling_trim=sampling_trim,
+            )
+            correct_len, bonus, cap_trim_lens = (
+                selected.correct_len,
+                selected.bonus,
+                selected.cap_trim_lens,
+            )
+        else:
+            correct_len, bonus, cap_trim_lens = (
+                sampling_len,
+                sampling_bonus,
+                sampling_trim,
+            )
+        if start == 0:
+            _dspark_rs_memory_snapshot("after_first_accept_sampling")
+        if correct_out is None:
+            correct_out = torch.empty(
+                (bs,), dtype=correct_len.dtype, device=correct_len.device
+            )
+            bonus_out = torch.empty((bs,), dtype=bonus.dtype, device=bonus.device)
+            trim_out = torch.empty(
+                (bs,), dtype=cap_trim_lens.dtype, device=cap_trim_lens.device
+            )
+        correct_out[start:end].copy_(correct_len)
+        bonus_out[start:end].copy_(bonus)
+        trim_out[start:end].copy_(cap_trim_lens)
+    _dspark_rs_memory_snapshot("after_chunked_accept_sampling")
+    return correct_out, bonus_out, trim_out
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -731,14 +1079,51 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    chunk_size, full_workspace_bytes, max_workspace_bytes = _dspark_rs_plan_chunk_size(
+        bs=bs,
+        gamma_rows=gamma_rows,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        vocab=vocab,
+        device=target_logits.device,
+    )
+    _dspark_rs_trace(
+        bs=bs,
+        gamma_rows=gamma_rows,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        vocab=vocab,
+        chunk_size=chunk_size,
+        full_workspace_bytes=full_workspace_bytes,
+        max_workspace_bytes=max_workspace_bytes,
+    )
+    if _dspark_rs_memory_trace_enabled():
+        torch.cuda.reset_peak_memory_stats()
+        _dspark_rs_memory_snapshot("before_draft_probs")
+    if (
+        chunk_size > 0
+        and bs > chunk_size
+        and _dspark_can_slice_sampling_info(sampling_info)
+    ):
+        return _accept_sampling_chunked(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            chunk_size=chunk_size,
+            greedy_mask=greedy_mask,
+        )
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
         temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
     ).view(bs, gamma_rows, vocab)
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    _dspark_rs_memory_snapshot("after_full_draft_probs")
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+        result = AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -748,6 +1133,8 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+        _dspark_rs_memory_snapshot("after_full_accept_sampling")
+        return result
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
@@ -773,4 +1160,6 @@ def accept_draft_tokens(
         sampling_bonus=sampling_bonus,
         sampling_trim=sampling_trim,
     )
-    return selected.correct_len, selected.bonus, selected.cap_trim_lens
+    result = selected.correct_len, selected.bonus, selected.cap_trim_lens
+    _dspark_rs_memory_snapshot("after_mixed_accept_sampling")
+    return result
