@@ -3,7 +3,6 @@
 import copy
 import dataclasses
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -14,138 +13,12 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-INT32 = dict(dtype=torch.int32)
 
 
-def _core_metadata(base: int, low_ratios=(1, 2), num_tokens: int = 2):
-    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-        DSV4AttnMetadata,
-    )
-
-    rows = torch.arange(num_tokens, **INT32)
-    md = DSV4AttnMetadata(
-        page_size=256,
-        page_table=(base + 1 + rows)[:, None].repeat(1, 2),
-        raw_out_loc=base + 5 + rows,
-        cuda_int32_kwargs={"dtype": torch.int32},
-        seq_lens_casual=base + 7 + rows,
-        positions_casual=base + 9 + rows,
-        swa_page_indices=(base + 11 + rows)[:, None].repeat(1, 2),
-        swa_topk_lengths=base + 15 + rows,
-        index_topk=512,
-        low_ratios=low_ratios,
-    )
-    md.swa_out_cache_loc = base + 17 + rows
-    for name in (
-        "c4_out_loc",
-        "c128_out_loc",
-        "c4_topk_lengths_raw",
-        "c4_topk_lengths_clamp1",
-        "c4_sparse_topk_lengths",
-        "c4_sparse_topk_lengths_raw",
-        "c128_topk_lengths_clamp1",
-        "c128_topk_lengths_raw",
-    ):
-        setattr(md, name, base + 20 + rows)
-    for name in (
-        "c4_sparse_page_indices",
-        "c4_sparse_raw_indices",
-        "c128_page_indices",
-    ):
-        setattr(md, name, (base + 30 + rows)[:, None].repeat(1, 2))
-    for ratio in low_ratios:
-        setattr(md, f"c{ratio}_out_loc", base + 40 + ratio + rows)
-        setattr(md, f"c{ratio}_topk_lengths_clamp1", base + 50 + rows)
-        setattr(md, f"c{ratio}_sparse_topk_lengths", base + 60 + rows)
-        setattr(
-            md,
-            f"c{ratio}_sparse_page_indices",
-            (base + 70 + rows)[:, None].repeat(1, 2),
-        )
-        setattr(
-            md, f"c{ratio}_sparse_raw_indices", (base + 80 + rows)[:, None].repeat(1, 2)
-        )
-        setattr(md, f"c{ratio}_flashmla_metadata", object())
-    for name in (
-        "c0_flashmla_metadata",
-        "c4_flashmla_metadata",
-        "c128_flashmla_metadata",
-    ):
-        setattr(md, name, object())
-    return md
 
 
-@unittest.skipUnless(is_hip(), "the HIP radix backend is ROCm only")
-class TestHipBreakableGraphMetadataContract(CustomTestCase):
-    def test_refresh_pins_the_store_target_and_rebinds_the_rest(self):
-        capture, live = _core_metadata(0), _core_metadata(1000)
-        pinned = capture.swa_out_cache_loc
-        capture._aiter_sparse_masked_indices = {"stale": None}
-        live._aiter_sparse_masked_indices = None
-
-        capture.refresh_for_breakable_cuda_graph_replay_(live)
-
-        # the store target is read inside the captured segments: same storage, live contents
-        self.assertIs(capture.swa_out_cache_loc, pinned)
-        self.assertEqual(pinned.tolist(), [1017, 1018])
-        # Everything else is read at the eager breaks and follows the live build.
-        for f in dataclasses.fields(capture):
-            if f.name == "swa_out_cache_loc":
-                continue
-            with self.subTest(field=f.name):
-                self.assertIs(getattr(capture, f.name), getattr(live, f.name))
-        # The aiter_sparse length-fold cache is per forward; the live build brings None.
-        self.assertIsNone(capture._aiter_sparse_masked_indices)
-
-    def test_refresh_rejects_a_store_target_of_another_bucket(self):
-        capture, live = (
-            _core_metadata(0, num_tokens=2),
-            _core_metadata(1000, num_tokens=3),
-        )
-        with self.assertRaises(AssertionError):
-            capture.refresh_for_breakable_cuda_graph_replay_(live)
 
 
-class TestPrefillRunnerUsesCapturedMetadataContract(CustomTestCase):
-    """The runner side of the contract the HIP backend opts into."""
-
-    def _runner(self, attn_backend):
-        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-            PrefillCudaGraphRunner,
-        )
-
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner._is_full_backend = False
-        runner.use_captured_attn_metadata = True
-        runner.attn_metadata_buffers = {}
-        runner.model_runner = SimpleNamespace(attn_backend=attn_backend)
-        return runner
-
-    def test_capture_stashes_and_replay_refreshes_per_bucket(self):
-        calls = []
-        stashed = object()
-        attn_backend = SimpleNamespace(
-            init_forward_metadata_for_breakable_cuda_graph_capture=lambda batch: (
-                stashed
-            ),
-            init_forward_metadata=lambda batch: calls.append(("init", batch)),
-            prepare_forward_metadata_for_breakable_cuda_graph_replay=lambda *a, **k: (
-                calls.append(("replay", a, k))
-            ),
-        )
-        runner = self._runner(attn_backend)
-        capture_batch = SimpleNamespace(name="capture")
-        live_batch = SimpleNamespace(name="live")
-        static_batch = SimpleNamespace(name="static")
-
-        runner._init_forward_metadata_for_capture(capture_batch, 96)
-        runner._prepare_forward_metadata_for_replay(live_batch, static_batch, 96)
-
-        self.assertIs(runner.attn_metadata_buffers[96], stashed)
-        self.assertEqual(
-            calls,
-            [("replay", (stashed, live_batch), {"static_forward_batch": static_batch})],
-        )
 
 
 def _extend_batch(

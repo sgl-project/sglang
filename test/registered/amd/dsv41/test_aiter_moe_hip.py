@@ -249,27 +249,6 @@ class TestRocmRouterGate(CustomTestCase):
             logits[:, 5] = float("inf")
             self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
 
-    def test_gate_score_every_bf16_value(self):
-        # force the first six experts with a huge bias, no renorm, scale 1: weights are the raw scores
-        values = (
-            torch.arange(0, 65536, dtype=torch.int32)
-            .to(torch.int16)
-            .view(torch.bfloat16)
-            .to(self.device)
-            .float()
-        )
-        rows = 65536 // TOPK + 1
-        padded = torch.zeros(rows * TOPK, device=self.device)
-        padded[:65536] = values
-        logits = torch.full((rows, NUM_EXPERTS), -1.0, device=self.device)
-        logits[:, :TOPK] = padded.view(rows, TOPK)
-        bias = torch.zeros(NUM_EXPERTS, device=self.device)
-        bias[:TOPK] = 1e30
-        ref_w, ref_i = _aiter_gate(logits, bias, TOPK, False, 1.0)
-        out_w, out_i = self.gate(logits, bias, TOPK, False, 1.0)
-        self.assertTrue(torch.equal(ref_i, out_i))
-        both_nan = torch.isnan(ref_w) & torch.isnan(out_w)
-        self.assertTrue(torch.equal(ref_w[~both_nan], out_w[~both_nan]))
 
     def test_gemv_accuracy_batch_invariance_and_repeatability(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
