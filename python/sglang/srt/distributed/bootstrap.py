@@ -101,6 +101,7 @@ def init_torch_distributed(
         # Only initialize the distributed environment on the target model worker.
         _init_parallel_groups(
             backend=backend,
+            device=device,
             dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
@@ -250,6 +251,7 @@ def _init_cpu_threads_env(
 def _init_parallel_groups(
     *,
     backend: str,
+    device: str,
     dist_init_method: str,
     server_args: ServerArgs,
     model_config: ModelConfig,

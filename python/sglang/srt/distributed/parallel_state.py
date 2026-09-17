@@ -2576,7 +2576,8 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # Joiners construct their local TP/PP layout in global rank space.
+    # Joiners construct their local TP/PP layout in global rank space. Scale
+    # cohorts are static local groups with a non-zero global rank offset.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
         if recovered_rank or rank_offset > 0
