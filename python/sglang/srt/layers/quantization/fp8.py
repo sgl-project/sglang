@@ -185,7 +185,7 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
         3.0,
         4.0,
         6.0,
-        0.0,
+        -0.0,
         -0.5,
         -1.0,
         -1.5,
@@ -1407,7 +1407,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
-                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+                fp4_scale_dtype = (
+                    torch.float8_e8m0fnu if _use_aiter or is_xpu() else torch.float32
+                )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
