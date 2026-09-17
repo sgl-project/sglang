@@ -812,12 +812,10 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
-            if (
-                result.accept_index is not None
-                and get_spec().speculative_eagle_topk > 1
-            ):
-                # Only a tree needs it: a chain's accepted path is already the
-                # front of each block, so compacting it is an identity.
+            if result.accept_index is not None:
+                # Tree verification needs this to compact KV. Hybrid linear
+                # attention also needs it for the accepted-step recurrent-state
+                # commit on non-last PP stages, including topk=1 chains.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -1149,6 +1147,7 @@ class SchedulerPPMixin:
         if verify_out_cache_loc is None:
             return
         from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
         )
 
@@ -1166,12 +1165,30 @@ class SchedulerPPMixin:
             return
         fwd_batch.seq_lens = seq_lens
         fwd_batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            fwd_batch,
-            accept_index.to(device),
-            pp_outputs["spec_accept_lens"].to(device) - 1,
-            self.token_to_kv_pool_allocator,
-        )
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage commits its accepted recurrent state inside
+        # run_eagle_verify. Earlier stages only run target verify, so perform
+        # the same commit after acceptance has returned through the PP relay
+        # and before seq_lens advances below. Without this, hybrid KDA/Mamba
+        # stages keep the pre-verify state while the last stage advances.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+            )
+
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
