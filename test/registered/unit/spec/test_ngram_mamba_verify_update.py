@@ -453,6 +453,71 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
             result, torch.tensor([17, 64, 31], dtype=torch.int32)
         )
 
+    def test_pp_commit_runs_without_verify_kv_address(self):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        scheduler = MagicMock()
+        scheduler.pp_group.is_last_rank = False
+        scheduler.tp_worker = MagicMock()
+        batch = MagicMock()
+        batch.seq_lens = torch.tensor([11, 22], dtype=torch.int64)
+        batch.tree_cache = MagicMock()
+        fwd_batch = MagicMock()
+        fwd_batch.forward_mode.is_idle.return_value = False
+        fwd_batch.seq_lens_cpu = torch.tensor([10, 20], dtype=torch.int64)
+        outputs = MagicMock()
+        outputs.tensors = {
+            "spec_accept_index": torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
+        }
+        outputs.__getitem__.return_value = torch.tensor([2, 1], dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify"
+            ) as commit,
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=2),
+            ),
+        ):
+            SchedulerPPMixin._pp_spec_compact_accept_kv(
+                scheduler,
+                batch,
+                fwd_batch,
+                ["a", "b"],
+                ["a", "b"],
+                None,
+                outputs,
+            )
+
+        commit.assert_called_once()
+        torch.testing.assert_close(
+            commit.call_args.args[2], outputs["spec_accept_lens"]
+        )
+
+    def test_pp_recomposed_batch_requires_seq_len_snapshot(self):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        scheduler = MagicMock()
+        batch = MagicMock()
+        batch.seq_lens = torch.tensor([11], dtype=torch.int64)
+        fwd_batch = MagicMock()
+        fwd_batch.forward_mode.is_idle.return_value = False
+        fwd_batch.seq_lens_cpu = None
+        outputs = MagicMock()
+        outputs.tensors = {"spec_accept_index": torch.tensor([[0]], dtype=torch.int32)}
+
+        with self.assertRaisesRegex(AssertionError, "forward-time seq_lens_cpu"):
+            SchedulerPPMixin._pp_spec_compact_accept_kv(
+                scheduler,
+                batch,
+                fwd_batch,
+                ["before"],
+                ["after"],
+                None,
+                outputs,
+            )
+
     def test_request_slots_override_stale_forward_metadata(self):
         """A delayed PP relay must commit the batch that produced the accept result."""
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

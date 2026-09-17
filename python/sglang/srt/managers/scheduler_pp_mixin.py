@@ -1160,8 +1160,6 @@ class SchedulerPPMixin:
         accept_index = pp_outputs.tensors.get("spec_accept_index")
         if accept_index is None or fwd_batch.forward_mode.is_idle():
             return
-        if verify_out_cache_loc is None:
-            return
         from sglang.srt.speculative.spec_utils import (
             commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
@@ -1172,15 +1170,21 @@ class SchedulerPPMixin:
         # that snapshot is already in the forward's row order -- the live batch
         # may have been filtered or merged since, and reindexing it would skip
         # exactly the rounds whose composition changed.
-        device = verify_out_cache_loc.device
+        device = (
+            verify_out_cache_loc.device
+            if verify_out_cache_loc is not None
+            else batch.seq_lens.device
+        )
         if fwd_batch.seq_lens_cpu is not None:
             seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
         elif live_rids == fwd_rids:
             seq_lens = batch.seq_lens
         else:
-            return
+            raise AssertionError(
+                "PP-spec delayed relay cannot commit a recomposed micro-batch "
+                "without its forward-time seq_lens_cpu snapshot"
+            )
         fwd_batch.seq_lens = seq_lens
-        fwd_batch.out_cache_loc = verify_out_cache_loc
         # ScheduleBatch.copy() intentionally keeps only result-processing
         # fields and drops tree_cache.  The shared commit helper needs its page
         # size to derive the Mamba tracking grid, so restore this scheduler's
@@ -1202,6 +1206,12 @@ class SchedulerPPMixin:
                 accept_index,
                 get_spec().speculative_num_draft_tokens,
             )
+
+        # A recurrent target still needs the accepted state commit even when
+        # this stage has no dense-attention KV address to compact.
+        if verify_out_cache_loc is None:
+            return
+        fwd_batch.out_cache_loc = verify_out_cache_loc
 
         if get_spec().speculative_eagle_topk > 1:
             move_accept_tokens_to_target_kvcache(
