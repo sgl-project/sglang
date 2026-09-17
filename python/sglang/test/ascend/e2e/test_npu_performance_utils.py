@@ -166,6 +166,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 )
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
+GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -181,6 +182,10 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 )
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
+)
+# DeepSeek-V4-Flash default model for a5 testcase
+DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"

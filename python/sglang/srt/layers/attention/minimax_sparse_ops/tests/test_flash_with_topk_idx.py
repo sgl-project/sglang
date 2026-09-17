@@ -7,8 +7,9 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
     flash_decode_with_topk_idx,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_device, is_xpu
 
-DEVICE = "cuda"
+DEVICE = get_device()
 RTOL_VS_REF = 5e-3
 ATOL_VS_REF = 5e-3
 
@@ -416,6 +417,10 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
             assert (topk_new[h, b, actual_k:] == -1).all()
 
 
+@pytest.mark.skipif(
+    is_xpu(),
+    reason="XPU does not support trtllm_mha/fa3 dense backend",
+)
 def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
     torch.manual_seed(321)
     bs, nqh, nkh, hd, blk, tk, page_size = 3, 4, 1, 128, 64, 32, 1

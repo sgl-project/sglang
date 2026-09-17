@@ -71,9 +71,6 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
-    def should_use_fsdp_for_component(self, _component_name):
-        return False
-
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
 
@@ -317,7 +314,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 "optimize_vae",
                 side_effect=lambda vae: vae,
             ),
-            patch.object(vae_loader, "safetensors_load_file") as legacy_load,
+            patch("safetensors.torch.load_file") as legacy_load,
         ):
             safetensors_save_file(
                 {"proj.weight": expected_weight, "scale": expected_scale},
@@ -615,12 +612,6 @@ class TestVAELoader(unittest.TestCase):
 
         native_load.assert_not_called()
 
-    def test_pipeline_config_declares_an_empty_native_only_default(self):
-        loader = vae_loader.VAELoader()
-        server_args = _FakeServerArgs(QwenImagePipelineConfig())
-
-        self.assertFalse(loader.should_raise_customized_load_error(server_args, "vae"))
-
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
             "per_channel_statistics.mean-of-means": torch.tensor([1.0, 2.0]),
@@ -756,9 +747,20 @@ class TestVAELoader(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=False),
         ):
             server_args = _FakeServerArgs(QwenImagePipelineConfig())
             self.assertFalse(_should_use_channels_last_3d(server_args, "vae"))
+
+    def test_channels_last_3d_selected_on_xpu(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=True),
+        ):
+            server_args = _FakeServerArgs(QwenImagePipelineConfig())
+            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
@@ -772,10 +774,29 @@ class TestVAELoader(unittest.TestCase):
         with (
             patch.object(wanvae.current_platform, "is_cuda", return_value=False),
             patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_uses_channels_last_3d_on_xpu(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=True),
+        ):
+            out = wanvae.match_conv3d_input_format(x, weight)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"

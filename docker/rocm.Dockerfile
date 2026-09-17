@@ -398,7 +398,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="7c51d18fda59457cc9238ed262bd93c8cad906c9"
+ARG MORI_COMMIT="879983bdbd8c65c52e9f79ad836a61cbffef98b6"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -568,12 +568,13 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick 8578af1 commit for v4 fp4 indexer kv-cache fix, may be removed in next aiter upgrade
+# cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c \
+ && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
+ && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \

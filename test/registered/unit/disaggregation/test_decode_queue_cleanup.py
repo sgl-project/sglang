@@ -14,7 +14,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,6 +35,12 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
@@ -120,6 +127,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.metrics_reporter.enable_metrics = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -174,6 +182,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -234,6 +243,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler

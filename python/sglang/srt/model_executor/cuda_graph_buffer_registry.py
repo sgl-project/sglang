@@ -14,10 +14,9 @@
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
-used by capture / replay. It replaces the per-runner ``DecodeInputBuffers`` /
-``PrefillInputBuffers`` dataclasses and their hand-written
-``populate_from_forward_batch`` methods with a single ``GraphSlot``-driven
-registry.
+used by capture / replay. It replaces the hand-written per-runner buffer
+population logic with a single ``GraphSlot``-driven registry while adopting
+the storage allocated by ``DecodeInputBuffers`` / ``PrefillInputBuffers``.
 
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
@@ -761,7 +760,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # .get(): a proxy entry can be absent (e.g. topk_indices
+                    # when a DSA model runs a dense attention backend);
+                    # returning None skips the copy for that slot.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
