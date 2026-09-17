@@ -453,9 +453,6 @@ class RuntimeHandle:
         """Return the tokenizer manager's authoritative generation pause state."""
         return self.tokenizer_manager.is_pause
 
-    def server_status(self) -> str:
-        return self.tokenizer_manager.server_status.value
-
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
         tokens = tokenizer.encode(text, add_special_tokens=add_special_tokens)

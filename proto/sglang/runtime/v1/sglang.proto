@@ -179,13 +179,6 @@ message HealthCheckResponse {
 
 message WatchEngineStateRequest {}
 
-enum ServerStatus {
-  SERVER_STATUS_UNSPECIFIED = 0;
-  SERVER_STATUS_STARTING = 1;
-  SERVER_STATUS_UP = 2;
-  SERVER_STATUS_UNHEALTHY = 3;
-}
-
 // A complete discovery and lifecycle snapshot. The JSON discovery payloads
 // intentionally retain the same wire shape as GetModelInfo/GetServerInfo.
 message EngineStateSnapshot {
@@ -194,11 +187,9 @@ message EngineStateSnapshot {
   // Starts at one and increases for each snapshot from this instance.
   uint64 revision = 2;
   bool healthy = 3;
-  ServerStatus server_status = 4;
-  bool is_pause = 5;
-  GetModelInfoResponse model_info = 6;
-  GetServerInfoResponse server_info = 7;
-  ListModelsResponse models = 8;
+  bool is_pause = 4;
+  GetModelInfoResponse model_info = 5;
+  GetServerInfoResponse server_info = 6;
 }
 
 // ---- Model info ----

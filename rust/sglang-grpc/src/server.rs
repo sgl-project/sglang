@@ -67,7 +67,6 @@ impl EngineStatePublisher {
             instance_id = snapshot.instance_id,
             revision = snapshot.revision,
             healthy = snapshot.healthy,
-            server_status = snapshot.server_status,
             is_pause = snapshot.is_pause,
             "publishing SGLang engine state"
         );
@@ -84,32 +83,19 @@ async fn build_engine_state_snapshot(
     let values = tokio::task::spawn_blocking(move || {
         Ok::<_, PyErr>((
             bridge.health_check()?,
-            bridge.server_status()?,
             bridge.is_pause()?,
             bridge.get_model_info()?,
             bridge.get_server_info()?,
-            bridge.list_models()?,
         ))
     })
     .await
     .map_err(|error| Status::internal(format!("engine snapshot task failed: {error}")))?
     .map_err(|error| pyerr_to_status(error, "Failed to build engine state snapshot"))?;
-    let (healthy, server_status, is_pause, model_json, server_json, models_json) = values;
-    let server_status = match server_status.as_str() {
-        "Starting" => proto::ServerStatus::Starting,
-        "Up" => proto::ServerStatus::Up,
-        "UnHealthy" => proto::ServerStatus::Unhealthy,
-        value => {
-            return Err(Status::internal(format!(
-                "unknown Python server status: {value}"
-            )));
-        }
-    };
+    let (healthy, is_pause, model_json, server_json) = values;
     Ok(proto::EngineStateSnapshot {
         instance_id,
         revision,
         healthy,
-        server_status: server_status as i32,
         is_pause,
         model_info: Some(proto::GetModelInfoResponse {
             model_path: extract_model_path(&model_json),
@@ -118,30 +104,7 @@ async fn build_engine_state_snapshot(
         server_info: Some(proto::GetServerInfoResponse {
             json_info: server_json,
         }),
-        models: Some(proto::ListModelsResponse {
-            models: parse_models(&models_json)?,
-        }),
     })
-}
-
-fn parse_models(json: &str) -> Result<Vec<proto::ModelCard>, Status> {
-    let models: Vec<serde_json::Value> = serde_json::from_str(json)
-        .map_err(|error| Status::internal(format!("Failed to parse models JSON: {error}")))?;
-    Ok(models
-        .iter()
-        .map(|model| proto::ModelCard {
-            id: model["id"].as_str().unwrap_or("").to_string(),
-            root: model["root"].as_str().unwrap_or("").to_string(),
-            parent: model
-                .get("parent")
-                .and_then(|value| value.as_str())
-                .map(String::from),
-            max_model_len: model
-                .get("max_model_len")
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32),
-        })
-        .collect())
 }
 
 /// 64 MiB — leaves headroom for multimodal inputs and OpenAI JSON pass-through bodies,
@@ -732,9 +695,23 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .blocking_bridge_call("Failed to list models", PyBridge::list_models)
             .await?;
 
-        Ok(Response::new(proto::ListModelsResponse {
-            models: parse_models(&json_str)?,
-        }))
+        let models_arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
+            .map_err(|e| Status::internal(format!("Failed to parse models JSON: {}", e)))?;
+
+        let models = models_arr
+            .iter()
+            .map(|m| proto::ModelCard {
+                id: m["id"].as_str().unwrap_or("").to_string(),
+                root: m["root"].as_str().unwrap_or("").to_string(),
+                parent: m.get("parent").and_then(|v| v.as_str()).map(String::from),
+                max_model_len: m
+                    .get("max_model_len")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as i32),
+            })
+            .collect();
+
+        Ok(Response::new(proto::ListModelsResponse { models }))
     }
 
     async fn get_load(

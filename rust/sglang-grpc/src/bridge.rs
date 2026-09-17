@@ -309,13 +309,6 @@ impl PyBridge {
         })
     }
 
-    pub fn server_status(&self) -> PyResult<String> {
-        Python::attach(|py| {
-            let result = self.runtime_handle.call_method0(py, "server_status")?;
-            result.extract::<String>(py)
-        })
-    }
-
     pub fn set_engine_state_changed_callback(&self, sender: Sender<()>) -> PyResult<()> {
         Python::attach(|py| {
             let callback = Py::new(py, EngineStateChangedCallback { sender })?;
