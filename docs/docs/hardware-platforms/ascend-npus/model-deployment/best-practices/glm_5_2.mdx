@@ -7,14 +7,14 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for GLM-5.2 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [GLM-5.2 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.2 | Atlas 800I A3 | 32 | PD Disaggregation | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-2-w4a8-3p1d-32p-in16k-out1k-50ms) |
+| GLM-5.2 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-2-w4a8-3p1d-32p-in16k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -24,7 +24,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: GLM-5.2
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 

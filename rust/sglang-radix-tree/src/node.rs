@@ -1137,7 +1137,7 @@ impl<K: ChildKeyType> NodeArena<K> {
             .filter_map(|(idx, slot)| slot.as_ref().map(|_| NodeIdx_(idx)))
     }
 
-    /// Per-page hash values for a node's key, chained from its parent's last hash.
+    /// Chain page hashes from the parent, or seed a new chain with the namespace.
     pub fn compute_node_hash_values(&self, node_id: NodeIdx_, page_size: usize) -> Vec<String> {
         let node = self.node(node_id);
         let parent_hash = node.parent.and_then(|parent_id| {
@@ -1148,7 +1148,27 @@ impl<K: ChildKeyType> NodeArena<K> {
                 None
             }
         });
-        crate::node::get_hash_str::<K>(node.key.as_ref(), parent_hash, page_size)
+        let prior = parent_hash.map(str::to_owned).or_else(|| {
+            let namespace = node.namespace.as_ref();
+            if namespace == KeyNamespaceRef::default() {
+                return None;
+            }
+            // Match Python's storage_namespace_seed byte for byte.
+            let mut hasher = Sha256::new();
+            hasher.update(b"sglang-cache-namespace-v1");
+            for part in [namespace.extra_key, namespace.cache_salt] {
+                match part {
+                    None => hasher.update([0u8]),
+                    Some(part) => {
+                        hasher.update([1u8]);
+                        hasher.update((part.len() as u64).to_le_bytes());
+                        hasher.update(part.as_bytes());
+                    }
+                }
+            }
+            Some(digest_to_hex(&hasher.finalize().into()))
+        });
+        crate::node::get_hash_str::<K>(node.key.as_ref(), prior.as_deref(), page_size)
     }
 
     /// The ancestor chain's hash values ending at `node_id`, in root-to-node
