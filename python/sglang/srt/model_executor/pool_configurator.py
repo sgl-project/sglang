@@ -71,6 +71,7 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    unified_memory_pool_bytes: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -698,6 +699,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_cell_size
         )
 
+    def _unified_pool_bytes(self, full_tokens: int, swa_tokens: int) -> int:
+        return (
+            full_tokens * self._full_per_token * self._full_layers_num
+            + swa_tokens * self._swa_per_token * self._swa_layers_num
+        )
+
     def _max_unified_full_tokens(
         self,
         available_bytes: int,
@@ -707,7 +714,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         """Find the largest page-aligned full capacity whose allocations fit."""
         draft_bytes_per_token = self._draft_pool_bytes_per_token()
         target_full_bytes_per_token = self._full_per_token * self._full_layers_num
-        target_swa_bytes_per_token = self._swa_per_token * self._swa_layers_num
         assert target_full_bytes_per_token > 0
 
         def allocation_bytes(full_pages: int) -> int:
@@ -719,10 +725,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 // page_size
                 * page_size
             )
-            target_bytes = (
-                full_tokens * target_full_bytes_per_token
-                + swa_tokens * target_swa_bytes_per_token
-            )
+            target_bytes = self._unified_pool_bytes(full_tokens, swa_tokens)
             virtual_span = max(target_bytes // target_full_bytes_per_token - 1, 0)
             draft_tokens = ceil_align(virtual_span, page_size) + page_size
             return target_bytes + draft_tokens * draft_bytes_per_token
@@ -760,29 +763,34 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        self.validate_swa_pool_size(
-            swa_tokens, self._sliding_window_size, self._page_size
-        )
+        if not self._enable_unified_memory:
+            self.validate_swa_pool_size(
+                swa_tokens, self._sliding_window_size, self._page_size
+            )
 
         logger.info(
             f"Use sliding window memory pool. "
             f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )
 
+        return self._make_pool_config(full_tokens, swa_tokens)
+
+    def _make_pool_config(self, full_tokens: int, swa_tokens: int) -> MemoryPoolConfig:
         return MemoryPoolConfig(
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            unified_memory_pool_bytes=(
+                self._unified_pool_bytes(full_tokens, swa_tokens)
+                if self._enable_unified_memory
+                else None
+            ),
         )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        if (
-            self._enable_unified_memory
-            and self._full_layers_num > 0
-            and self._draft_pool_bytes_per_token() > 0
-        ):
+        if self._enable_unified_memory and self._full_layers_num > 0:
             max_total_num_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size
             )
@@ -873,7 +881,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             * self._swa_per_token
             * (self._swa_layers_num + self._draft_swa_layers_num)
         )
-        if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
+        if self._enable_unified_memory:
             full_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
@@ -894,11 +902,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 f"Reduce --max-running-requests, lower SGLANG_SWA_EVICTION_INTERVAL, "
                 f"or increase --mem-fraction-static."
             )
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=swa_tokens,
-        )
+        return self._make_pool_config(full_tokens, swa_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
@@ -906,10 +910,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # Constrained max_total goes to the full pool; SWA stays at its cap.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         full_tokens = (max_total_num_tokens // page_size) * page_size
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=min(swa_tokens, max_total_num_tokens),
+        return self._make_pool_config(
+            full_tokens, min(swa_tokens, max_total_num_tokens)
         )
 
 

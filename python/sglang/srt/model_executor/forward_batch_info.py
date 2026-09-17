@@ -69,6 +69,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -83,6 +84,74 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _build_forward_token_modalities(
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
+        return None
+    if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
+        raise ValueError(
+            "Multimodal metadata batch dimensions do not match: "
+            f"mm_inputs={len(mm_inputs)}, prefixes={len(extend_prefix_lens)}, "
+            f"extend_lens={len(extend_seq_lens)}"
+        )
+
+    modalities = []
+    has_multimodal_tokens = False
+    for mm_input, prefix_len, extend_len in zip(
+        mm_inputs, extend_prefix_lens, extend_seq_lens
+    ):
+        if mm_input is None or mm_input.token_modalities is None:
+            modalities.extend([0] * extend_len)
+            continue
+        end = prefix_len + extend_len
+        request_modalities = mm_input.token_modalities[prefix_len:end]
+        if len(request_modalities) != extend_len:
+            raise ValueError(
+                "Multimodal token metadata is shorter than the active forward span: "
+                f"prefix_len={prefix_len}, extend_len={extend_len}, "
+                f"metadata_len={len(mm_input.token_modalities)}"
+            )
+        has_multimodal_tokens |= any(request_modalities)
+        modalities.extend(request_modalities)
+
+    if len(modalities) != num_tokens:
+        raise ValueError(
+            "Multimodal token metadata does not match the forward batch: "
+            f"metadata_tokens={len(modalities)}, forward_tokens={num_tokens}"
+        )
+    if not has_multimodal_tokens:
+        return None
+    return torch.tensor(
+        modalities,
+        dtype=torch.int8,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
+
+
+def _maybe_build_forward_token_modalities(
+    model_config: ModelConfig,
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not model_config.requires_mm_token_modalities:
+        return None
+    return _build_forward_token_modalities(
+        mm_inputs,
+        extend_prefix_lens,
+        extend_seq_lens,
+        num_tokens,
+        device,
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -483,6 +552,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_token_modalities: Optional[torch.Tensor] = None
+    multi_gate_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Encoder-decoder host fields
     encoder_cached: Optional[List[bool]] = None
@@ -572,6 +643,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Prefill body-CUDA-graph context limit. Attention backends that allocate
+    # context-shaped metadata use this fixed maximum instead of deriving a
+    # shape from the live batch. None preserves eager/default graph behavior.
+    max_seq_len_override: Optional[int] = None
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
@@ -864,6 +940,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
+        ret.mm_token_modalities = _maybe_build_forward_token_modalities(
+            model_runner.model_config,
+            ret.mm_inputs,
+            extend_prefix_lens if isinstance(extend_prefix_lens, list) else None,
+            extend_seq_lens if isinstance(extend_seq_lens, list) else None,
+            len(batch.input_ids) if batch.input_ids is not None else 0,
+            device,
+        )
+
         model_runner.kv_index_translator.rebind_write_loc(ret)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -1086,29 +1171,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         chunk_size = mamba_cache_chunk_size()
         lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
         return (lens_to_track // chunk_size) * chunk_size
-
-    def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
-        """
-        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
-
-        Returns:
-            if none, current batch contains no multimodal input
-
-        """
-        if not self.mm_inputs or all(x is None for x in self.mm_inputs):
-            return None
-        # Filter out None values
-        valid_inputs = [x for x in self.mm_inputs if x is not None]
-
-        # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
-        merged = valid_inputs[0].__class__(mm_items=[])
-
-        # Merge remaining inputs
-        for mm_input in valid_inputs:
-            merged.merge(mm_input)
-
-        return merged
 
     def contains_image_inputs(self) -> bool:
         if self.mm_inputs is None:
