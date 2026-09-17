@@ -188,13 +188,15 @@ class TestQueueTimeAcrossRetraction(CustomTestCase):
         (sample,) = stats.metrics_collector.observe_queue_time.call_args.args
         self.assertAlmostEqual(sample, 0.1)
 
-    def test_decode_quick_finish_after_rebootstrap_counts_both_waits(self):
+    def test_decode_rebootstrap_counts_both_waits(self):
         stats = self._stats(disagg_mode=rts.DisaggregationMode.DECODE)
         stats.set_wait_queue_entry_time(self.T0 + 0.00)
         stats.set_forward_entry_time(self.T0 + 0.10)
+        # held for re-bootstrap: not in the waiting queue until [1.00, 1.25)
         stats.set_retract_time(self.T0 + 0.50)
         stats.set_wait_queue_entry_time(self.T0 + 1.00)
-        stats.set_quick_finish_time(self.T0 + 1.25)
+        stats.set_forward_entry_time(self.T0 + 1.25)
+        stats.set_quick_finish_time(self.T0 + 1.30)
 
         self.assertAlmostEqual(stats.get_queueing_time(), 0.35)
 

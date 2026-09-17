@@ -649,7 +649,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Seconds spent in the waiting queue over every entry (a retracted request
     # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
     queue_duration_s: float = 0.0
-    queue_wait_open: bool = False
 
     has_timing_data: bool = False
 
@@ -663,9 +662,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
-            # An open wait is closed at the send point; the receiver cannot end it.
-            "queue_duration_s": self.get_queueing_time(),
-            "queue_wait_open": False,
+            # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
+            "queue_duration_s": self.queue_duration_s,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -749,12 +747,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
         self.queue_duration_s = 0.0
-        self.queue_wait_open = False
-
-    def _close_queue_wait(self, ts: float):
-        if self.queue_wait_open:
-            self.queue_duration_s += max(0.0, ts - self.wait_queue_entry_time)
-            self.queue_wait_open = False
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -775,17 +767,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         else:
             self.set_retract_time(ts)
 
-        self._close_queue_wait(ts)
         self.wait_queue_entry_time = ts
-        self.queue_wait_open = True
 
     def set_forward_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
-        # Called again for every prefill chunk; only the first call closes a wait.
-        self._close_queue_wait(ts)
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
             if self.enable_metrics:
                 # One sample per request: the wait before the first forward.
@@ -816,7 +805,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         convert_time_to_realtime_ns(ts),
                     )
         elif self.last_forward_entry_time == 0.0:
+            # First forward after a retraction; later prefill chunks skip this branch.
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
     def set_last_chunked_prefill_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1007,7 +998,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_quick_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.set_completion_time(ts)
-        self._close_queue_wait(ts)
         self.forward_entry_time = ts
 
     def set_prefill_bootstrap_queue_entry_time(self, ts=None):
@@ -1074,10 +1064,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.trace_slice(stage, self.last_forward_entry_time, ts)
 
     def get_queueing_time(self) -> float:
-        if not self.queue_wait_open:
-            return self.queue_duration_s
-        end = self.completion_time or time.perf_counter()
-        return self.queue_duration_s + max(0.0, end - self.wait_queue_entry_time)
+        return self.queue_duration_s
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
