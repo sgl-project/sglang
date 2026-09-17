@@ -197,6 +197,7 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        max_seq_len_override=forward_batch.max_seq_len_override,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
@@ -252,10 +253,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        if self.use_ngram_embedding:
-            hf_config = model_runner.model_config.hf_config
-            self.ngram_embedding_n = hf_config.ngram_embedding_n
-            self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
@@ -879,18 +876,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
-        buffers.num_token_non_padded[...] = num_tokens
-        if (
-            enable_num_token_non_padded()
-            and not self.enable_prefill_cp
-            and attn_tp_sharded
-        ):
-            local = compute_local_num_token_non_padded(
-                global_num_token_non_padded=buffers.num_token_non_padded,
-                num_tokens_per_dp=num_tokens,
-                sharded=True,
-            )
-            buffers.num_token_non_padded.copy_(local)
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
+            if not self.enable_prefill_cp and attn_tp_sharded:
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=buffers.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens,
+                    sharded=True,
+                )
+                buffers.num_token_non_padded.copy_(local)
 
         pp_proxy_tensors = None
         # pipeline parallelism
@@ -1264,6 +1258,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # PP + spec verify: the pre-planned load ran without the proxy
+                # (eagle_prepare_for_verify has no access to it), so the
+                # graph's proxy input buffers must be refreshed here -- the
+                # captured graph reads these rows (mirrors fill_from's
+                # side-slot copy).
+                for k, v in pp_proxy_tensors.tensors.items():
+                    buf = self.buffers.pp_proxy_tensors.get(k)
+                    if buf is not None:  # skip markers like __msg_type__
+                        buf[: v.shape[0]].copy_(v)
+            if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
@@ -1470,7 +1477,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice in token rows, not request rows: under speculative verify
+            # each request carries captured_req_width tokens (identical for
+            # plain decode, where captured_req_width == 1).
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.captured_req_width]
+                    for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
