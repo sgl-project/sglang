@@ -181,6 +181,7 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
+    GPU_PLAN_KEY,
     image_token_types,
     materialize_image_gpu,
 )
@@ -4747,7 +4748,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
-            plan = item.model_specific_data.get("dsv41_gpu_plan")
+            plan = item.model_specific_data.get(GPU_PLAN_KEY)
             patches = (
                 materialize_image_gpu(pixels, plan).to(dtype)
                 if plan is not None
