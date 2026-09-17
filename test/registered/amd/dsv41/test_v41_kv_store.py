@@ -325,7 +325,6 @@ class TestV41KVStore(CustomTestCase):
                 )
                 self.assert_rows_close(cache, unfused, layout, page_size, locs[valid])
 
-
     def test_compress_norm_rope_store(self):
         """The ratio-4 / ratio-128 writer (norm + RoPE + store from a decode plan) in
         the V4.1 layouts: bitwise on exact-norm rows, one-code close on general rows."""

@@ -249,7 +249,6 @@ class TestRocmRouterGate(CustomTestCase):
             logits[:, 5] = float("inf")
             self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
 
-
     def test_gemv_accuracy_batch_invariance_and_repeatability(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
         x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)

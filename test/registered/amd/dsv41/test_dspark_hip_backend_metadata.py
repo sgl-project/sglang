@@ -143,8 +143,6 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         self.assertIsNone(core.c4_sparse_page_indices)
         self.assertEqual(metadata.low_ratio_indexer_metadata_by_ratio(), {})
 
-
-
     def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
         self._check_block_window_replay(cpu_mirror=True)
 
@@ -290,8 +288,6 @@ class TestAiterSparseLengthFoldPerStep(CustomTestCase):
         self.assertFalse(torch.equal(got, warm))
 
 
-
-
 @unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
 class TestLowRatioTargetVerifyHip(CustomTestCase):
     def setUp(self):
@@ -348,9 +344,6 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                     ),
                     name,
                 )
-
-
-
 
     def test_in_graph_hoists_verify_rows_and_builds_decode_workspaces(self):
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
@@ -541,8 +534,6 @@ class TestLowRatioPrepareStreams(CustomTestCase):
             torch.testing.assert_close(
                 output, (x + 1) * 3 + (x * 2 + x + 1) + (x * 4 + 5)
             )
-
-
 
 
 if __name__ == "__main__":
