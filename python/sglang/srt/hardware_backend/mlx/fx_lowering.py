@@ -315,8 +315,16 @@ def _lower_sdpa(mx, args, kwargs):
         )
         scores = scores + causal_mask
     if attention_mask is not None:
-        scores = scores + attention_mask
-    return mx.softmax(scores, axis=-1) @ value
+        if attention_mask.dtype == mx.bool_:
+            scores = mx.where(attention_mask, scores, -float("inf"))
+        else:
+            scores = scores + attention_mask
+    # Torch SDPA returns zero for fully masked rows. Avoid softmax(-inf, ...)
+    # without replacing unrelated NaNs that should still propagate.
+    fully_masked = mx.all(scores == -float("inf"), axis=-1, keepdims=True)
+    probabilities = mx.softmax(mx.where(fully_masked, 0, scores), axis=-1)
+    probabilities = mx.where(fully_masked, 0, probabilities)
+    return probabilities @ value
 
 
 @_lowering("silu", aten=(torch.ops.aten.silu.default,), functions=(F.silu,))
