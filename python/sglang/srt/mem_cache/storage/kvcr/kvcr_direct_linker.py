@@ -620,7 +620,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             ),
         )
         factory = self._kvcr_factory or KVCR
-        return factory(config, bindings, backend_configs)
+        try:
+            return factory(config, bindings, backend_configs)
+        except Exception as error:
+            # NIXL registers GPU memory with every transport UCX selected; an
+            # InfiniBand device without GPUDirect RDMA peer memory refuses it.
+            raise RuntimeError(
+                "KVCR linker could not start its KVCR core (registering "
+                f"{len(self._framework_regions)} framework regions over "
+                f"{self.config.nixl_backend}). If the log shows ibv_reg_mr "
+                "failing on a cuda address, the host has no GPUDirect RDMA peer "
+                "memory: set UCX_TLS=cuda_copy,cuda_ipc,sm,tcp for same-node "
+                "transfers or enable nvidia_peermem."
+            ) from error
 
     def _start_adapter(self, kvcr) -> KVCRAdapter:
         adapter = KVCRAdapter(

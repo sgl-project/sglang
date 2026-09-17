@@ -40,6 +40,13 @@ Requirements: the `kvcr` package with typed framework memory regions
 (`KVCRBackendConfigs.framework_regions`) and `nixl==1.3.2` with the UCX plugin,
 installed in the same environment. CUDA only.
 
+UCX must be able to register GPU memory with every transport it selects. On a
+host with InfiniBand devices but without GPUDirect RDMA peer memory
+(`nvidia_peermem` or dmabuf support), registration fails with
+`ibv_reg_mr ... Bad address`; restrict the transports for same-node use with
+`UCX_TLS=cuda_copy,cuda_ipc,sm,tcp`, or enable GPUDirect RDMA for cross-node
+peer transfers.
+
 ### Configuration
 
 | Option | Default | Meaning |

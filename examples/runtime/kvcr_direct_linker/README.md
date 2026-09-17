@@ -30,6 +30,11 @@ hop; it is not a remote-to-GPU transfer.
   only; pipeline parallelism, Mamba, HiSparse, and DP without attention DP are
   rejected at startup.
 
+- UCX able to register GPU memory. On hosts with InfiniBand devices but no
+  GPUDirect RDMA peer memory (`nvidia_peermem`), set
+  `UCX_TLS=cuda_copy,cuda_ipc,sm,tcp` for same-node transfers; otherwise
+  registration fails at startup with `ibv_reg_mr ... Bad address`.
+
 ## Launch
 
 ```bash
