@@ -576,25 +576,6 @@ def test_logical_anchor_backup_requires_successful_physical_pool_write(stored):
     assert operation.completed_tokens == (2048 if stored else 0)
 
 
-def test_backup_exception_returns_failed_operation_to_ack_queue():
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.storage_stop_event = threading.Event()
-    controller.backup_queue = Queue()
-    controller.ack_backup_queue = Queue()
-    operation = SimpleNamespace(id=1, completed_tokens=128)
-    controller.backup_queue.put(operation)
-
-    def failed_backup(_operation):
-        controller.storage_stop_event.set()
-        raise RuntimeError("MemCache write failed")
-
-    controller._page_backup = failed_backup
-    controller.backup_thread_func()
-
-    assert controller.ack_backup_queue.get_nowait() is operation
-    assert operation.completed_tokens == 0
-
-
 def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
     controller = HybridCacheController.__new__(HybridCacheController)
     controller.page_size = 128
@@ -779,19 +760,6 @@ def test_hybrid_prefetch_worker_emits_terminal_ack_on_success():
     assert acks[0].rid == operation.request_id
     assert acks[0].completed_req is True
     assert not operation.is_terminated()
-
-
-def test_hybrid_prefetch_worker_emits_terminal_ack_on_failure():
-    def fail_transfer(_operation):
-        raise RuntimeError("injected prefetch failure")
-
-    operation, acks = _run_one_hybrid_prefetch_worker(fail_transfer)
-
-    assert len(acks) == 1
-    assert acks[0].operation is operation
-    assert acks[0].completed_req is True
-    assert operation.is_terminated()
-    assert operation.pool_transfers_done is True
 
 
 def test_c128_prefetch_transfer_uses_runtime_coverage():

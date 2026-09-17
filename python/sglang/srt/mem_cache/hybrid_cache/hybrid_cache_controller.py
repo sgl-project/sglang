@@ -867,46 +867,8 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                try:
-                    self._page_backup(operation)
-                except Exception:
-                    operation.completed_tokens = 0
-                    logger.exception(
-                        "HiCache storage backup operation %s failed.", operation.id
-                    )
-                finally:
-                    self.ack_backup_queue.put(operation)
-            except Empty:
-                continue
-
-    def prefetch_io_aux_func(self):
-        """Keep the storage worker alive across individual I/O failures."""
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                try:
-                    self._page_transfer(operation)
-                except Exception:
-                    operation.mark_terminate()
-                    operation.pool_transfers_done = True
-                    logger.exception(
-                        "HiCache storage prefetch operation %s failed.",
-                        operation.request_id,
-                    )
-                finally:
-                    # Preserve the base controller's PrefetchAck protocol: the
-                    # terminal ACK must be the last ACK for an operation.  The
-                    # scheduler owns result commit and tail-buffer release after
-                    # consuming this ACK; releasing here races with that commit.
-                    self.prefetch_sync_queue.put(
-                        PrefetchAck(
-                            rid=operation.request_id,
-                            completed_req=True,
-                            operation=operation,
-                        )
-                    )
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
             except Empty:
                 continue
 
