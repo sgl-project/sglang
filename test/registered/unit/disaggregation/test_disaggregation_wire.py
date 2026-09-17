@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
     c4_state_transfer_indices,
     request_scoped_state_transfer_indices,
 )
@@ -839,6 +840,60 @@ class TestDSV4C128StateIndices(unittest.TestCase):
             ),
             np.array([15], dtype=np.int32),
         )
+
+
+def _make_state_pool(*, ratio, request_scoped, online=False, ring_size=256):
+    pool = object.__new__(CompressStatePool)
+    pool.ratio = ratio
+    pool.request_scoped = request_scoped
+    pool.online = online
+    pool.ring_size = ring_size
+    return pool
+
+
+class TestDSV4RequestStateTransfer(unittest.TestCase):
+    def _kv(self, *pools):
+        kv = object.__new__(DeepSeekV4TokenToKVPool)
+        kv.compress_state_pools = [None, *pools]
+        return kv
+
+    def test_pool_delegates_to_its_request_scoped_state_pool(self):
+        kv = self._kv(
+            _make_state_pool(ratio=4, request_scoped=False),
+            _make_state_pool(ratio=128, request_scoped=True, ring_size=256),
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 129),
+            request_scoped_state_transfer_indices(
+                7, 129, ratio=128, online=False, ring_size=256
+            ),
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 256), np.empty((0,), dtype=np.int32)
+        )
+
+    def test_online_pool_ships_the_request_row(self):
+        kv = self._kv(
+            _make_state_pool(ratio=128, request_scoped=True, online=True, ring_size=1)
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 257), np.array([7], dtype=np.int32)
+        )
+
+    def test_requires_exactly_one_request_scoped_pool(self):
+        with self.assertRaises(AssertionError):
+            self._kv(
+                _make_state_pool(ratio=4, request_scoped=False)
+            ).request_state_transfer_indices(0, 5)
+        with self.assertRaises(AssertionError):
+            self._kv(
+                _make_state_pool(ratio=2, request_scoped=True),
+                _make_state_pool(ratio=128, request_scoped=True),
+            ).request_state_transfer_indices(0, 5)
+
+    def test_page_scoped_pool_has_no_transfer_indices(self):
+        with self.assertRaises(AssertionError):
+            _make_state_pool(ratio=4, request_scoped=False).transfer_indices(0, 5)
 
 
 def _buf_infos(*ptrs):
