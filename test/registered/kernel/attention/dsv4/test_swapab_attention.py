@@ -1,16 +1,19 @@
 """V4 packed-page addressing, softmax/sink and dynamic graph replay checks."""
 
 import unittest
-
 import torch
-
 from sglang.kernels.ops.attention.dsv4.swapab_attention import swapab_attention
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+
+
+
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# backend-specific: HIP swapAB dispatch and fused inverse RoPE use ROCm kernels.
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 def make_cache(page, pages=11):

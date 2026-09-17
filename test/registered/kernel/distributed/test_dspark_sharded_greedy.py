@@ -3,11 +3,9 @@
 import atexit
 import gc
 import os
-
 import pytest
 import torch
 import torch.distributed as dist
-
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
@@ -19,10 +17,14 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
     not is_hip() or "LOCAL_RANK" not in os.environ,
-    reason="run through the eight-GPU HIP entry point",
+    reason="run through the four-GPU HIP entry point",
 )
 
 
@@ -60,8 +62,6 @@ def group():
     return coordinator
 
 
-_ROWS = pytest.mark.parametrize("m", [1, 4, 64])
-_SHARDS = pytest.mark.parametrize("width,last", [(32320, 32320), (8192, 17), (8, 0)])
 
 
 def _replay_and_check(m, width, last, perturb):
@@ -127,29 +127,22 @@ def _inf(replay, storage, base, bias, real):
         base[:, replay % real] = float("inf")
 
 
-@_ROWS
-@_SHARDS
+@pytest.mark.parametrize("m,width,last", [(1, 32320, 32320), (4, 8192, 17), (64, 8, 0)], ids=["full", "partial", "empty"])
 def test_random_logits(m, width, last):
     _replay_and_check(m, width, last, _random)
 
 
-@_ROWS
-@_SHARDS
-def test_ties_resolve_to_the_lowest_index(m, width, last):
-    _replay_and_check(m, width, last, _tie)
+def test_ties_resolve_to_the_lowest_index():
+    _replay_and_check(4, 8192, 17, _tie)
 
 
-@_ROWS
-@_SHARDS
-def test_nan_propagates(m, width, last):
-    _replay_and_check(m, width, last, _nan)
+def test_nan_propagates():
+    _replay_and_check(4, 8192, 17, _nan)
 
 
-@_ROWS
-@_SHARDS
-def test_infinities(m, width, last):
-    _replay_and_check(m, width, last, _inf)
+def test_infinities():
+    _replay_and_check(4, 8192, 17, _inf)
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4,))

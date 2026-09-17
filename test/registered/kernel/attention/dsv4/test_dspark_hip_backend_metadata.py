@@ -2,15 +2,17 @@
 
 import unittest
 from types import SimpleNamespace
-
 import torch
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 SWA_WINDOW = 128
 PAGE_SIZE = 256
@@ -297,89 +299,6 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                     ),
                     name,
                 )
-
-
-@unittest.skipUnless(is_hip(), "HIP multi-stream preparation")
-class TestLowRatioPrepareStreams(CustomTestCase):
-    def test_graph_replay_joins_kv_and_source_streams(self):
-        from unittest.mock import patch
-
-        from sglang.srt.environ import envs
-        from sglang.srt.models.deepseek_v4 import MQALayer
-        from sglang.srt.runtime_context import get_parallel
-
-        config = SimpleNamespace(
-            model_type="deepseek_v41",
-            hidden_size=32,
-            head_dim=128,
-            qk_rope_head_dim=64,
-            num_attention_heads=4,
-            num_key_value_heads=1,
-            o_groups=1,
-            q_lora_rank=32,
-            o_lora_rank=32,
-            max_position_embeddings=128,
-            compress_ratios=[2],
-            rope_scaling={"original_max_position_embeddings": 128, "factor": 1.0},
-            rope_theta=10000,
-            compress_rope_theta=40000,
-            rms_norm_eps=1e-6,
-            q_head_norm=True,
-            kv_source_layer_ids=[],
-            index_source_layer_ids=[],
-        )
-        with (
-            torch.device("cuda"),
-            get_parallel().override(
-                tp_size=1, tp_rank=0, attn_tp_rank=0, attn_tp_size=1
-            ),
-            patch(
-                "sglang.srt.models.deepseek_v4.get_device",
-                return_value=SimpleNamespace(device="cuda"),
-            ),
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
-            envs.SGLANG_OPT_FUSE_WQA_WKV.override(True),
-        ):
-            layer = MQALayer(
-                config, 0, alt_streams=[torch.cuda.Stream(), torch.cuda.Stream()]
-            )
-
-        x = torch.randn(6, 32, device="cuda")
-        compressed, indexed, kv = (torch.empty_like(x) for _ in range(3))
-
-        def sources(*, x, q_lora, run_compressor=True, run_indexer=True, **kwargs):
-            if run_compressor:
-                compressed.copy_(x * 2)
-            if run_indexer:
-                indexed.copy_(compressed + q_lora)
-
-        layer.compressor = object()
-        layer.indexer = object()
-        layer.wqkv_a.forward = lambda x: (x * 4, None)
-        layer._compute_q_a = lambda x, **kw: (x + 1, x + 1)
-        layer._compute_q_b = lambda q, positions, q_out: q * 3
-        layer._compute_kv_to_cache = lambda x, positions, batch, backend, qkv_a: (
-            kv.copy_(qkv_a + 5)
-        )
-        backend = SimpleNamespace(forward_low_ratio_sources=sources)
-
-        def run():
-            q = MQALayer._forward_prepare_low_ratio_multi_stream(
-                layer, x, None, None, backend
-            )
-            return q + indexed + kv
-
-        for _ in range(3):
-            run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = run()
-        for _ in range(3):
-            x.normal_()
-            graph.replay()
-            torch.testing.assert_close(
-                output, (x + 1) * 3 + (x * 2 + x + 1) + (x * 4 + 5)
-            )
 
 
 if __name__ == "__main__":

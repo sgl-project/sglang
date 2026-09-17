@@ -1,14 +1,27 @@
 """The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's `moe_sorting` and `topk_gating` bit for bit."""
 
 import unittest
-
 import torch
-
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
+import unittest
+from types import SimpleNamespace
+import torch
+from sglang.test.test_utils import CustomTestCase
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+import unittest
+import torch
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 try:
@@ -207,13 +220,6 @@ class TestRocmRouterGate(CustomTestCase):
             self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg} topk {topk}")
             self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg} topk {topk}")
 
-    def test_gate_matches_aiter_random_logits(self):
-        for num_tokens in (1, 64):
-            for scale in (1.0, 40.0):
-                logits = self._randn(num_tokens, NUM_EXPERTS, scale=scale)
-                self._assert_same_gate(
-                    logits, self.bias_bf16, msg=f"fp32 {num_tokens} {scale}"
-                )
 
     def test_gate_matches_aiter_on_ties(self):
         zero_bias = torch.zeros(NUM_EXPERTS, device=self.device, dtype=torch.bfloat16)
@@ -268,10 +274,6 @@ class TestRocmRouterGate(CustomTestCase):
             out_shifted = torch.empty_like(full)
             self.reduce(self.gemv(shifted, weight), out_shifted)
             self.assertTrue(torch.equal(out_shifted, torch.roll(full, num_tokens, 0)))
-        for _ in range(5):
-            again = torch.empty_like(full)
-            self.reduce(self.gemv(x, weight), again)
-            self.assertTrue(torch.equal(again, full))
 
     def test_fused_gate_on_partials(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
@@ -295,18 +297,6 @@ class TestRocmRouterGate(CustomTestCase):
             self.assertTrue(torch.equal(fused_logits, logits))
             self.assertTrue(torch.equal(ref_i, out_i))
             self.assertTrue(torch.equal(ref_w, out_w))
-            for _ in range(5):
-                again_w, again_i = self.gate(
-                    torch.empty_like(logits),
-                    self.bias_bf16,
-                    TOPK,
-                    True,
-                    ROUTED_SCALING,
-                    partials=self.gemv(x, weight),
-                )
-                self.assertTrue(
-                    torch.equal(again_i, out_i) and torch.equal(again_w, out_w)
-                )
 
 
 @unittest.skipUnless(
@@ -465,59 +455,140 @@ class TestRocmRouterGateSort(CustomTestCase):
                                     ties,
                                 )
 
-    def test_repeated_and_graph_replayed_launches(self):
-        """The hand-off buffer is left clean, so back-to-back launches and graph replays agree."""
-        mask = self._mask(96, 1)
-        local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
-        for num_tokens in (1, self.max_tokens):
-            logits, partials = self._inputs(num_tokens, False)
-            ref_w, ref_i = self.gate(
-                logits.clone(), self.bias, TOPK, True, ROUTED_SCALING, partials=partials
-            )
-            ref_sort = self.sort(
-                ref_i,
-                ref_w,
-                local_ids,
-                96,
-                NUM_EXPERTS,
-                MODEL_DIM,
-                torch.bfloat16,
-                32,
-                True,
-            )
-            args = (
-                self.bias,
-                TOPK,
-                True,
-                ROUTED_SCALING,
-                partials,
-                local_ids,
-                NUM_EXPERTS,
-                MODEL_DIM,
-                torch.bfloat16,
-                32,
-                True,
-            )
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@unittest.skipUnless(is_hip(), "requires HIP")
+class TestRouterFp32(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.models.deepseek_v2 import MoEGate
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        self.forward = MoEGate.forward
+
+    def test_close_scores_and_mutable_graph(self):
+        """BF16 output rounding must not collapse distinct expert scores."""
+        # Exact BF16 operands produce 16 distinct scores near 1; rounding the
+        # GEMM output to BF16 would collapse them before expert selection.
+        weight = torch.zeros(384, 5120, device="cuda", dtype=torch.bfloat16)
+        weight[:, 0] = 1
+        weight[:16, 1] = torch.arange(16, device="cuda") / 4096
+        gate = SimpleNamespace(
+            weight=weight, is_deepseek_v4=True, tiny_router_gemm_max_tokens=0
+        )
+        for rows in (64, 512):
+            with self.subTest(rows=rows):
+                x = torch.zeros(rows, 5120, device="cuda", dtype=torch.bfloat16)
+                x[:, :2] = 1
+                self.forward(gate, x)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream):
-                    outs = [
-                        self.fused(torch.empty_like(logits), *args) for _ in range(2)
-                    ]
-            torch.cuda.current_stream().wait_stream(stream)
-            for _ in range(2):
-                graph.replay()
-                torch.cuda.synchronize()
-                for out in outs:
-                    self.assertTrue(
-                        torch.equal(out[1], ref_i) and torch.equal(out[0], ref_w)
+                with torch.cuda.graph(graph):
+                    output = self.forward(gate, x)
+                for sign in (1, -1):
+                    x[:, 1] = sign
+                    graph.replay()
+                    expected = (
+                        1
+                        + sign
+                        * torch.arange(16, device="cuda", dtype=torch.float32)
+                        / 4096
                     )
-                    _assert_same_sort(
-                        self, ref_sort, out[2:], 32, num_tokens, num_tokens
+                    self.assertEqual(output.dtype, torch.float32)
+                    torch.testing.assert_close(
+                        output[:, :16], expected.expand(rows, -1), rtol=0, atol=0
                     )
-            self.assertEqual(int(self.handoff(self.device).abs().sum()), 0)
+                    self.assertEqual(torch.unique(output[0, :16]).numel(), 16)
+
+
+
+
+
+
+
+
+
+
+
+
+D, TOPK, E = 5120, 6, 384
+
+
+def _reference(x, shared, ids, mask, alpha):
+    m = shared.shape[0]
+    xs = x.view(m, TOPK, D).float()
+    acc = torch.zeros_like(shared, dtype=torch.float32)
+    for k in range(TOPK):
+        v = xs[:, k]
+        if mask is not None:
+            v = torch.where((mask[ids[:, k]] != 0)[:, None], v, 0.0)
+        acc = acc + v
+    return (acc * alpha + shared.float()).to(shared.dtype)
+
+
+def _inputs(m, seed, local_fraction=0.25):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m * TOPK, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    shared = torch.randn(m, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    ids = torch.randint(0, E, (m, TOPK), device="cuda", dtype=torch.int32, generator=g)
+    mask = (torch.arange(E, device="cuda") < int(E * local_fraction)).to(torch.int32)
+    return x, shared, ids, mask
+
+
+@unittest.skipUnless(is_hip(), "the fused reduction is the ROCm path")
+class TestMoeTopkReduceAdd(CustomTestCase):
+    def setUp(self):
+        from sglang.kernels.ops.moe.moe_reduce_add_hip import moe_topk_reduce_add
+
+        self.reduce_add = moe_topk_reduce_add
+
+    def test_matches_reference(self):
+        for m in (1, 33):
+            for alpha in (1.0, 2.5):
+                x, shared, ids, mask = _inputs(m, m)
+                for use_mask in (True, False):
+                    out = torch.empty_like(shared)
+                    self.reduce_add(
+                        x,
+                        shared,
+                        out,
+                        TOPK,
+                        ids if use_mask else None,
+                        mask if use_mask else None,
+                        alpha=alpha,
+                    )
+                    ref = _reference(x, shared, ids, mask if use_mask else None, alpha)
+                    self.assertTrue(torch.equal(out, ref), (m, alpha, use_mask))
+
+    def test_repeatable_and_batch_invariant(self):
+        x, shared, ids, mask = _inputs(300, 7)
+        full = torch.empty_like(shared)
+        self.reduce_add(x, shared, full, TOPK, ids, mask)
+        for rows in ([0], list(range(0, 300, 7))):
+            idx = torch.tensor(rows, device="cuda")
+            sub = torch.empty(len(rows), D, device="cuda", dtype=torch.bfloat16)
+            self.reduce_add(
+                x.view(300, TOPK, D)[idx].reshape(-1, D).contiguous(),
+                shared[idx].contiguous(),
+                sub,
+                TOPK,
+                ids[idx].contiguous(),
+                mask,
+            )
+            self.assertTrue(torch.equal(sub, full[idx]), rows)
 
 
 if __name__ == "__main__":

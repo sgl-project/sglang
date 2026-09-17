@@ -1,14 +1,16 @@
 """The HIP decode top-k must be ordered by position, not slot: the aiter sparse kernel sums in list order, so a slot-ordered row makes the attention bits depend on which pages a request landed on."""
 
 import unittest
-
 import torch
-
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 PAGE = 256
 ROW_BYTES = 584  # DSV4 packed fp8 K row: 448 nope fp8 + 64 rope bf16 + scales
