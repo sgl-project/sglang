@@ -7,6 +7,7 @@ do not silently reuse each other's cache entries.
 Issue: https://github.com/sgl-project/sglang/issues/33268
 """
 
+import json
 import os
 import tempfile
 
@@ -85,9 +86,9 @@ class TestHiCacheDtypeKeyCollision:
                 f"dtype leaked into suffix when kv_cache_dtype is None: "
                 f"{cache.config_suffix}"
             )
-            assert (
-                cache.config_suffix == "_DeepSeek-V4-Flash"
-            ), f"Unexpected suffix for None dtype: {cache.config_suffix}"
+            assert cache.config_suffix == "_DeepSeek-V4-Flash", (
+                f"Unexpected suffix for None dtype: {cache.config_suffix}"
+            )
 
     def test_same_dtype_produces_same_suffix(self):
         """Two configs with the same kv_cache_dtype must produce the same suffix."""
@@ -136,7 +137,7 @@ class TestHiCacheDtypeKeyCollision:
             dtype_pos = cache.config_suffix.find("_dtype_")
             assert cp_pos >= 0 and dtype_pos >= 0
             assert dtype_pos > cp_pos, (
-                f"dtype suffix should come after CP suffix: " f"{cache.config_suffix}"
+                f"dtype suffix should come after CP suffix: {cache.config_suffix}"
             )
 
     def test_empty_string_dtype_treated_as_set(self):
@@ -251,6 +252,44 @@ class TestHf3fsDtypeKeyRoundTrip:
     """
 
     PAGE_BYTES = 256
+
+    @pytest.mark.parametrize("extra_config", [None, {}])
+    @pytest.mark.parametrize("use_config_file", [False, True])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype", [None, "torch.bfloat16", "torch.float8_e4m3fn"]
+    )
+    def test_factory_preserves_dtype_namespace(
+        self, monkeypatch, tmp_path, extra_config, use_config_file, kv_cache_dtype
+    ):
+        from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
+
+        config = _make_config(kv_cache_dtype, is_mla_model=False, tp_rank=2)
+        config.extra_config = extra_config
+        prefix = "/data/hicache"
+        monkeypatch.delenv(HiCacheHF3FS.default_env_var, raising=False)
+        if use_config_file:
+            prefix = str(tmp_path / "cache")
+            config_path = tmp_path / "hf3fs.json"
+            config_path.write_text(
+                json.dumps(
+                    dict(file_path_prefix=prefix, file_size=4096, numjobs=1, entries=8)
+                )
+            )
+            monkeypatch.setenv(HiCacheHF3FS.default_env_var, str(config_path))
+
+        # Inspect factory configuration without opening the default 1 TiB store
+        # or requiring a native HF3FS client. Round-trip tests cover the I/O.
+        def capture_config(self, *, kv_cache_dtype=None, **kwargs):
+            self.kv_cache_dtype = kv_cache_dtype
+            self.file_path = kwargs["file_path"]
+
+        monkeypatch.setattr(HiCacheHF3FS, "__init__", capture_config)
+        backend = HiCacheHF3FS.from_env_config(
+            self.PAGE_BYTES, torch.uint8, storage_config=config
+        )
+        dtype_segment = f".{kv_cache_dtype}" if kv_cache_dtype else ""
+        assert backend.file_path == f"{prefix}{dtype_segment}.2.bin"
+        assert backend.kv_cache_dtype == kv_cache_dtype
 
     def _backend(self, path, metadata_client, kv_cache_dtype):
         from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS

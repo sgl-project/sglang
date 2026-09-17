@@ -295,12 +295,12 @@ class HiCacheHF3FS(HiCacheStorage):
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
+            kv_cache_dtype = storage_config.kv_cache_dtype
 
             if storage_config.extra_config is not None:
                 use_mock_client = storage_config.extra_config.get(
                     "use_mock_hf3fs_client", False
                 )
-                kv_cache_dtype = storage_config.kv_cache_dtype
         else:
             rank, is_mla_model, is_page_first_layout = (
                 0,
@@ -310,6 +310,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
+        dtype_segment = f".{kv_cache_dtype}" if kv_cache_dtype else ""
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
             if is_mla_model:
@@ -317,7 +318,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
             return HiCacheHF3FS(
                 rank=rank,
-                file_path=f"/data/hicache.{rank}.bin",
+                file_path=f"/data/hicache{dtype_segment}.{rank}.bin",
                 file_size=1 << 40,
                 numjobs=16,
                 bytes_per_page=bytes_per_page,
@@ -327,6 +328,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
+                kv_cache_dtype=kv_cache_dtype,
             )
 
         try:
@@ -364,7 +366,6 @@ class HiCacheHF3FS(HiCacheStorage):
             metadata_client = Hf3fsLocalMetadataClient()
 
         rank_for_path = 0 if is_mla_model else rank
-        dtype_segment = f".{kv_cache_dtype}" if kv_cache_dtype else ""
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
