@@ -33,7 +33,7 @@ _EMBED_ATTR_NAMES: Tuple[str, ...] = (
     "embed",
 )
 # Checkpoint spellings of the input embedding, most common first.
-_EMBED_KEY_CANDIDATES: Tuple[str, ...] = (
+EMBED_KEY_CANDIDATES: Tuple[str, ...] = (
     "model.embed_tokens.weight",
     "model.language_model.embed_tokens.weight",
     "language_model.model.embed_tokens.weight",
@@ -46,6 +46,15 @@ _EMBED_KEY_SUFFIXES: Tuple[str, ...] = tuple(f"{n}.weight" for n in _EMBED_ATTR_
 # MTP / NextN layers carry their own embedding under ``layers.<n>.``; never pick it.
 _LAYER_KEY_RE = re.compile(r"(^|\.)layers\.\d+\.")
 _DRAFT_SUBMODULE_MARKERS: Tuple[str, ...] = ("mtp", "nextn", "eagle", "draft")
+# Streaming and cache-transport formats have no weight files to re-open.
+_REOPENABLE_LOAD_FORMATS = (
+    LoadFormat.AUTO,
+    LoadFormat.SAFETENSORS,
+    LoadFormat.FASTSAFETENSORS,
+    LoadFormat.MISTRAL,
+    LoadFormat.PT,
+    LoadFormat.NPCACHE,
+)
 
 
 def _target_input_embedding_is_missing(target_model: nn.Module) -> bool:
@@ -69,13 +78,8 @@ def _weight_or_none(module: Optional[nn.Module]) -> Optional[torch.Tensor]:
 def resolve_target_embed_and_head(
     target_model: nn.Module, *, is_first_pp_rank: bool
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """PP-safe ``target_model.get_embed_and_head()``.
-
-    Most targets implement the getter as ``self.model.embed_tokens.weight,
-    self.lm_head.weight``; on a non-first stage ``embed_tokens`` is a
-    ``PPMissingLayer`` and ``.weight`` raises. Only that case maps to
-    ``embed=None``; any other ``AttributeError`` is a real bug and propagates.
-    """
+    """PP-safe getter: a PPMissingLayer embedding on a non-first stage maps to
+    ``embed=None``; any other AttributeError propagates."""
     try:
         return target_model.get_embed_and_head()
     except AttributeError:
@@ -122,7 +126,7 @@ def _is_input_embedding_key(key: str) -> bool:
 
 def _pick_embedding_key(keys: Iterable[str]) -> Optional[str]:
     keys = set(keys)
-    for candidate in _EMBED_KEY_CANDIDATES:
+    for candidate in EMBED_KEY_CANDIDATES:
         if candidate in keys:
             return candidate
     fallback = sorted((k for k in keys if _is_input_embedding_key(k)), key=len)
@@ -146,13 +150,16 @@ def _read_safetensors_tensor(path: str, key: str) -> torch.Tensor:
 def prepare_checkpoint_files(
     model_path: str, *, revision: Optional[str], load_config: LoadConfig
 ) -> Tuple[str, List[str], bool]:
-    """``(folder, weight_files, use_safetensors)`` via the standard model loader.
-
-    Reusing the loader keeps ModelScope resolution, ``--download-dir`` and the
-    selected ``load_format``; a model already loaded from this path is a cache hit.
-    """
+    """``(folder, weight_files, use_safetensors)`` via the standard model loader,
+    so ModelScope resolution, ``--download-dir`` and ``load_format`` are honored."""
     from sglang.srt.model_loader.loader import DefaultModelLoader
 
+    if load_config.load_format not in _REOPENABLE_LOAD_FORMATS:
+        raise ValueError(
+            "Pipeline-parallel speculative decoding needs to re-open the target "
+            f"checkpoint for the draft embedding, which load format "
+            f"{load_config.load_format!r} does not allow; use a disk-backed format."
+        )
     return DefaultModelLoader(load_config)._prepare_weights(
         model_path, revision, fall_back_to_pt=True
     )
@@ -161,11 +168,8 @@ def prepare_checkpoint_files(
 def load_embedding_tensor(
     folder: str, weight_files: List[str], *, use_safetensors: bool
 ) -> Tuple[str, torch.Tensor]:
-    """Return ``(key, tensor)`` of the checkpoint's input embedding.
-
-    Safetensors with an index touch one shard; without an index the shard headers
-    are scanned so the key is chosen over the whole checkpoint, not per shard.
-    """
+    """``(key, tensor)`` of the checkpoint's input embedding; with an index only
+    the owning shard is read, otherwise the key is picked over all shard headers."""
     if use_safetensors:
         index_file = os.path.join(folder, SAFETENSORS_INDEX_NAME)
         if os.path.exists(index_file):
@@ -184,11 +188,11 @@ def load_embedding_tensor(
         from sglang.srt.model_loader.weight_utils import pt_weights_iterator
 
         for name, tensor in pt_weights_iterator(weight_files):
-            if name in _EMBED_KEY_CANDIDATES or _is_input_embedding_key(name):
+            if name in EMBED_KEY_CANDIDATES or _is_input_embedding_key(name):
                 return name, tensor
     raise ValueError(
         f"No input embedding found in checkpoint under {folder}; looked for "
-        f"{_EMBED_KEY_CANDIDATES} or '*.<{'|'.join(_EMBED_ATTR_NAMES)}>.weight'."
+        f"{EMBED_KEY_CANDIDATES} or '*.<{'|'.join(_EMBED_ATTR_NAMES)}>.weight'."
     )
 
 
@@ -199,13 +203,8 @@ def load_draft_embedding_from_checkpoint(
     revision: Optional[str],
     load_config: LoadConfig,
 ) -> nn.Parameter:
-    """Load the target checkpoint's input embedding into the draft's own parameter.
-
-    Returns the (now initialized) draft parameter so callers can hand it to the
-    draft's ``set_embed_and_head`` exactly like a shared target embedding. The
-    parameter's own ``weight_loader`` receives the full-vocab tensor and applies
-    the TP shard; a pre-sharded draft embedding is not supported here.
-    """
+    """Load the checkpoint's input embedding into the draft's own parameter and
+    return it; the parameter's ``weight_loader`` applies the TP shard."""
     found = find_draft_embedding_param(draft_model)
     if found is None:
         raise ValueError(

@@ -219,6 +219,17 @@ class TestLoadDraftEmbeddingFromCheckpoint(CustomTestCase):
         )
         self.assertIs(param, draft.model.embed_tokens.weight)
 
+    def test_streaming_load_format_is_rejected_before_touching_disk(self):
+        # Streaming formats have no weight files to re-open; a silent fallthrough
+        # would leave the draft embedding randomly initialized.
+        with self.assertRaises(ValueError):
+            load_draft_embedding_from_checkpoint(
+                _Draft(),
+                "/nonexistent",
+                revision=None,
+                load_config=LoadConfig(load_format=LoadFormat.REMOTE_INSTANCE),
+            )
+
     def test_draft_without_embedding_fails_loudly(self):
         draft = _Draft(with_embedding=False)
         self.assertIsNotNone(find_draft_embedding_param(draft))
