@@ -26,6 +26,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 transfer_state_per_layer_direct_pf_lf = None
 transfer_state_all_layer_direct_lf_pf = None
+transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
