@@ -1258,8 +1258,8 @@ def _extra_metadata_indices(
     """
     if compress_ratio == 4:
         return (
-            core_metadata.c4_sparse_page_indices,
-            core_metadata.c4_sparse_topk_lengths,
+            core_metadata.sparse_page_indices(compress_ratio),
+            core_metadata.sparse_topk_lengths(compress_ratio),
         )
     if compress_ratio == 128:
         return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
@@ -1401,7 +1401,8 @@ def _seed_c4_sparse_indices(
     non-trivial extra contribution.
     """
     md = fixture.backend.forward_metadata.core_metadata
-    sparse_indices = md.c4_sparse_page_indices
+    ratio = fixture.case.compress_ratio
+    sparse_indices = md.sparse_page_indices(ratio)
     num_q, sparse_topk = sparse_indices.shape
     seed = torch.full(
         (num_q, sparse_topk),
@@ -1412,12 +1413,12 @@ def _seed_c4_sparse_indices(
     seed[:, :num_entries] = torch.arange(
         num_entries, dtype=sparse_indices.dtype, device=sparse_indices.device
     )
-    md.c4_sparse_page_indices = seed
-    md.c4_sparse_topk_lengths = torch.full(
-        (num_q,),
-        num_entries,
-        dtype=md.c4_sparse_topk_lengths.dtype,
-        device=md.c4_sparse_topk_lengths.device,
+    lengths = md.sparse_topk_lengths(ratio)
+    setattr(md, f"c{ratio}_sparse_page_indices", seed)
+    setattr(
+        md,
+        f"c{ratio}_sparse_topk_lengths",
+        torch.full((num_q,), num_entries, dtype=lengths.dtype, device=lengths.device),
     )
 
 
@@ -1438,10 +1439,11 @@ def _seed_c4_sparse_prefill_indices(
     asserted below.
     """
     md = fixture.backend.forward_metadata.core_metadata
-    raw_indices = md.c4_sparse_raw_indices
+    ratio = fixture.case.compress_ratio
+    raw_indices = md.sparse_raw_indices(ratio)
     assert raw_indices is not None, "requires init_flashmla_related(is_prefill=True)"
     num_q, width = raw_indices.shape
-    lens = (md.positions_casual + 1) // 4
+    lens = (md.positions_casual + 1) // ratio
     max_len = int(lens.max().item())
     pool = fixture.runner.token_to_kv_pool
     c4_page_size = pool.get_extra_key_page_size(layer_id=0)
@@ -1457,9 +1459,10 @@ def _seed_c4_sparse_prefill_indices(
         .expand(num_q, -1)
     )
     seeded = torch.where(seq < lens.unsqueeze(1), seq, seq.new_full((), -1))
-    md.c4_sparse_raw_indices = seeded
-    md.c4_sparse_page_indices = seeded.clone()
-    md.c4_sparse_topk_lengths = lens.to(md.c4_sparse_topk_lengths.dtype)
+    lengths = md.sparse_topk_lengths(ratio)
+    setattr(md, f"c{ratio}_sparse_raw_indices", seeded)
+    setattr(md, f"c{ratio}_sparse_page_indices", seeded.clone())
+    setattr(md, f"c{ratio}_sparse_topk_lengths", lens.to(lengths.dtype))
 
 
 def run_dsv4_target_verify_attention_case(

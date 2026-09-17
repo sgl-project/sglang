@@ -1836,8 +1836,10 @@ class DeepseekV4AttnBackend(
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                extra_indices = core_attn_metadata.c4_sparse_page_indices
-                extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
+                extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
+                extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
+                    compress_ratio
+                )
             elif compress_ratio == 128:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
