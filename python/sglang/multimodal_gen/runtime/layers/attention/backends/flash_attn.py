@@ -366,7 +366,9 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl):
-    has_native_varlen_kernel: bool = True
+    @classmethod
+    def has_native_varlen_kernel(cls) -> bool:
+        return True
 
     def __init__(
         self,

@@ -1088,7 +1088,7 @@ class USPAttention(nn.Module):
                 if (
                     _PACKED_VARLEN_ENABLED
                     and attn_mask_meta is not None
-                    and self.attn_impl.has_native_varlen_kernel
+                    and self.attn_impl.has_native_varlen_kernel()
                     and attn_mask.dim() == 2
                     and attn_mask.dtype
                     in (torch.bool, torch.uint8, torch.int32, torch.int64)
@@ -1222,7 +1222,7 @@ class USPAttention(nn.Module):
 
             if (
                 _PACKED_VARLEN_ENABLED
-                and self.attn_impl.has_native_varlen_kernel
+                and self.attn_impl.has_native_varlen_kernel()
                 and meta_pad_start is not None
                 and meta_pad_end is not None
                 and meta_pad_end > meta_pad_start
@@ -1305,7 +1305,7 @@ class USPAttention(nn.Module):
                 )
             if (
                 _PACKED_VARLEN_ENABLED
-                and self.attn_impl.has_native_varlen_kernel
+                and self.attn_impl.has_native_varlen_kernel()
                 and gathered_mask.dtype
                 in (torch.bool, torch.uint8, torch.int32, torch.int64)
                 and q.device.type == "cuda"
@@ -1561,7 +1561,7 @@ class USPAttention(nn.Module):
 
         if (
             _PACKED_VARLEN_ENABLED
-            and self.attn_impl.has_native_varlen_kernel
+            and self.attn_impl.has_native_varlen_kernel()
             and q.device.type == "cuda"
             and q.dtype in (torch.float16, torch.bfloat16)
         ):
@@ -1811,7 +1811,7 @@ class USPAttention(nn.Module):
         if (
             _PACKED_VARLEN_ENABLED
             and attn_mask_meta is not None
-            and self.attn_impl.has_native_varlen_kernel
+            and self.attn_impl.has_native_varlen_kernel()
             and attn_mask.dtype in (torch.bool, torch.uint8, torch.int32, torch.int64)
             and q.device.type == "cuda"
             and attn_mask.device == q.device

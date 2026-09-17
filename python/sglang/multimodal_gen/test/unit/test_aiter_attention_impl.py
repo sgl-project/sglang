@@ -36,9 +36,9 @@ def test_rejects_kv_heads_that_do_not_divide_the_query_heads():
 
 
 def test_advertises_a_native_varlen_kernel():
-    # USPAttention's masked path keys off this flag to pick packed varlen over
-    # the SDPA fallback; clearing it silently drops AITer back to SDPA.
-    assert _impl_cls().has_native_varlen_kernel
+    # USPAttention's masked path keys off this to pick packed varlen over the
+    # SDPA fallback; clearing it silently drops AITer back to SDPA.
+    assert _impl_cls().has_native_varlen_kernel()
 
 
 def test_key_bounds_reach_the_aiter_kernel(monkeypatch):

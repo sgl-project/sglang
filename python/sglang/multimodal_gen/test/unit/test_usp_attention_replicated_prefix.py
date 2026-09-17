@@ -39,7 +39,9 @@ def _fake_output_all_to_all(x, **_):
 class _CaptureAttn:
     """Stand-in attn backend that records the q/k/v it receives."""
 
-    has_native_varlen_kernel = False
+    @staticmethod
+    def has_native_varlen_kernel() -> bool:
+        return False
 
     def __init__(self):
         self.q = self.k = self.v = None

@@ -117,7 +117,9 @@ class AITerImpl(AttentionImpl):
     Implementation of attention using AITemplate.
     """
 
-    has_native_varlen_kernel: bool = True
+    @classmethod
+    def has_native_varlen_kernel(cls) -> bool:
+        return True
 
     def __init__(
         self,
