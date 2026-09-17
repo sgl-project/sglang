@@ -1998,6 +1998,13 @@ class DeepseekSparseAttnBackend(
             if forward_batch.forward_mode.is_extend_without_speculative():
                 assert k is not None
                 kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
+                # NOTE(kpham-sgl): Map RAGGED offsets into gathered KV without reordering KV.
+                kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
+                page_table_1 = torch.where(
+                    page_table_1 >= 0,
+                    kv_indices[page_table_1.clamp_min(0)],
+                    -1,
+                )
             elif forward_batch.forward_mode.is_target_verify():
                 page_table_1 = self._dcp_global_to_local_kv_indices(page_table_1)
 
@@ -3002,8 +3009,7 @@ class DeepseekSparseAttnBackend(
             k_nope=k_nope,
             k_pe=k_nope[..., :0],
         )
-        # NOTE(kpham-sgl): RAGGED top-k requires this per-request [prefix; extend] order.
-        return metadata.dcp_kv_buffer[metadata.dcp_kv_indices]
+        return metadata.dcp_kv_buffer
 
     def _forward_tilelang(
         self,
