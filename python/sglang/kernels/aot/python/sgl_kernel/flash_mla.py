@@ -368,9 +368,7 @@ def get_mla_capabilities() -> dict:
         "architecture": f"sm{major}{minor}",
         "mixed_kvcache_supported": supported,
         "supported_mixed_layout_pairs": (
-            [["V4", "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"]]
-            if supported
-            else []
+            [["V4", "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"]] if supported else []
         ),
         "supported_num_heads": [64, 128],
         "supported_main_page_slots": [128, 256],

@@ -1178,9 +1178,7 @@ class DeepseekV4AttnBackend(
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
-        self.dsv41_main_kv_consumer = getattr(
-            kernel, "dsv41_main_kv_consumer", "auto"
-        )
+        self.dsv41_main_kv_consumer = getattr(kernel, "dsv41_main_kv_consumer", "auto")
         if self.dsv41_main_kv_consumer == "direct":
             capabilities = _get_flashmla_capabilities()
             if (
@@ -3536,9 +3534,7 @@ class DeepseekV4AttnBackend(
             # which the sparse chunk cache ignores.
             if (
                 packed_main_view is None
-                and self._use_sparse_prefill(
-                    forward_batch, num_qo_tokens=q.shape[0]
-                )
+                and self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):

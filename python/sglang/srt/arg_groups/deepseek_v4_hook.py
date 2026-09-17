@@ -241,8 +241,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
     elif cfg.dsv41_main_kv_consumer == "direct":
         raise ValueError(
-            "--dsv41-main-kv-consumer=direct requires "
-            "--dsv41-main-kv-layout=packed_fp4"
+            "--dsv41-main-kv-consumer=direct requires --dsv41-main-kv-layout=packed_fp4"
         )
     if cfg.dsv41_main_kv_layout == "flashmla_fp8" and (
         envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41"

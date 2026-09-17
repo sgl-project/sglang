@@ -1,17 +1,16 @@
 import pytest
 import torch
-
 from sgl_kernel.flash_mla import (
     flash_mla_with_mixed_kvcache,
     get_mla_capabilities,
     get_mla_metadata,
 )
-from sglang.srt.layers.attention.dsv4.torch_quant import (
-    cast_scale_inv_to_ue8m0,
+
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    ceil_pow2_scale,
     dequantize_dsv41_packed_main_kv,
     quantize_dsv41_packed_main_kv,
 )
-
 
 MAIN_LAYOUT = "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"
 
@@ -19,27 +18,22 @@ MAIN_LAYOUT = "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"
 def _quantize_v4(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     num_pages, page_slots, _, _ = k.shape
     nope = k.squeeze(2)[..., :448].float().view(num_pages, page_slots, 7, 64)
-    scales = cast_scale_inv_to_ue8m0(nope.abs().amax(dim=-1) / 448.0)
+    scales = ceil_pow2_scale(nope.abs().amax(dim=-1) / 448.0)
     quantized = (nope / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
     pages = torch.zeros(
         (num_pages, page_slots * 584), dtype=torch.uint8, device=k.device
     )
     data = pages[:, : page_slots * 576].view(num_pages, page_slots, 576)
-    data[..., :448] = quantized.view(torch.uint8).reshape(
-        num_pages, page_slots, 448
-    )
-    data[..., 448:] = (
-        k.squeeze(2)[..., 448:].contiguous().view(torch.uint8)
-    )
+    data[..., :448] = quantized.view(torch.uint8).reshape(num_pages, page_slots, 448)
+    data[..., 448:] = k.squeeze(2)[..., 448:].contiguous().view(torch.uint8)
     scale_rows = pages[:, page_slots * 576 :].view(num_pages, page_slots, 8)
     scale_rows[..., :7] = scales.to(torch.float8_e8m0fnu).view(torch.uint8)
 
     decoded = torch.cat(
         (
             (
-                quantized.to(torch.bfloat16)
-                * scales.to(torch.bfloat16).unsqueeze(-1)
+                quantized.to(torch.bfloat16) * scales.to(torch.bfloat16).unsqueeze(-1)
             ).reshape(num_pages, page_slots, 448),
             k.squeeze(2)[..., 448:],
         ),
@@ -54,9 +48,8 @@ def _gather(
     b, s_q, topk = indices.shape
     cache = cache.reshape(-1, 512)
     invalid = (indices < 0) | (indices >= cache.shape[0])
-    invalid |= (
-        torch.arange(topk, device=indices.device).view(1, 1, -1)
-        >= lengths.view(b, 1, 1)
+    invalid |= torch.arange(topk, device=indices.device).view(1, 1, -1) >= lengths.view(
+        b, 1, 1
     )
     safe = indices.masked_fill(invalid, 0)
     return (
@@ -94,15 +87,11 @@ def _reference(
 def _inputs(num_heads: int):
     torch.manual_seed(20260916 + num_heads)
     b, s_q, topk, swa_page_slots, main_page_slots = 2, 2, 64, 128, 128
-    q = (torch.randn(b, s_q, num_heads, 512, device="cuda") / 10).to(
-        torch.bfloat16
-    )
+    q = (torch.randn(b, s_q, num_heads, 512, device="cuda") / 10).to(torch.bfloat16)
     swa = (torch.randn(2, swa_page_slots, 1, 512, device="cuda") / 10).to(
         torch.bfloat16
     )
-    main = (torch.randn(2, main_page_slots, 512, device="cuda") / 10).to(
-        torch.bfloat16
-    )
+    main = (torch.randn(2, main_page_slots, 512, device="cuda") / 10).to(torch.bfloat16)
     swa_cache, swa_dequant = _quantize_v4(swa)
     main_cache = quantize_dsv41_packed_main_kv(main)
     main_dequant = dequantize_dsv41_packed_main_kv(main_cache, main_page_slots)
