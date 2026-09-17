@@ -144,7 +144,7 @@ def _receiver(manifest=None, *, model=None, topology=None):
     pg = Mock()
     pg.rank.return_value = 2
     with (
-        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl"),
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n"),
         patch(
             "sglang.srt.weight_sync.nccl_m2n._warm_and_borrow_nccl_comm",
             return_value=123,
@@ -279,7 +279,7 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
     # and hide a premature release by the receiver.
     m2n.reshard = transfer
     with (
-        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n),
         patch(
             "torch.distributed.barrier",
             side_effect=lambda group: handoffs.append(group),
@@ -334,7 +334,7 @@ def test_concurrent_receive_failure_drains_all_streams_before_releasing_buffers(
     m2n = Mock()
     m2n.reshard = transfer
     with (
-        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n),
         patch("torch.cuda.current_stream"),
         patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
         pytest.raises(RuntimeError, match="injected copy failure"),
@@ -345,7 +345,7 @@ def test_concurrent_receive_failure_drains_all_streams_before_releasing_buffers(
     with pytest.raises(RuntimeError, match="destroyed before retrying"):
         receivers[0]._prepare_receive()
     # The failed receiver retains its buffer through a failed teardown too.
-    with patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n):
+    with patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n):
         receivers[0].stream.synchronize.side_effect = RuntimeError("drain failed again")
         with pytest.raises(RuntimeError, match="drain failed again"):
             receivers[0].destroy()
@@ -442,7 +442,7 @@ def test_bf16_refits_preserve_expert_layout_and_values(
             )
         )
         with (
-            patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+            patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n),
             patch("torch.cuda.current_stream"),
             patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
         ):
@@ -597,7 +597,7 @@ def test_fp8_refits_preserve_storage_and_captured_graph(
             )
         )
         with (
-            patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+            patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n),
             patch("torch.cuda.current_stream"),
             patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
         ):

@@ -1,4 +1,4 @@
-"""nccl-rl destination adapter for Miles weight updates."""
+"""NCCL M2N destination adapter for Miles weight updates."""
 
 from __future__ import annotations
 
@@ -33,12 +33,12 @@ _FP8_QUANTIZATION = {
 }
 
 
-def _nccl_rl() -> Any:
+def _nccl_m2n() -> Any:
     try:
         from nccl import m2n
     except Exception as exc:
         raise RuntimeError(
-            "nccl-rl was selected, but its nccl.m2n package or native library "
+            "NCCL M2N was selected, but its nccl.m2n package or native library "
             "is unavailable"
         ) from exc
     return m2n
@@ -47,7 +47,7 @@ def _nccl_rl() -> Any:
 def _dtype(name: str) -> torch.dtype:
     dtype = getattr(torch, name, None)
     if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported nccl-rl dtype {name!r}")
+        raise ValueError(f"Unsupported NCCL M2N dtype {name!r}")
     return dtype
 
 
@@ -217,7 +217,7 @@ def _m2n_placements(m2n: Any, layout: _Layout) -> list[Any]:
 
 def _warm_and_borrow_nccl_comm(pg: dist.ProcessGroup, device: torch.device) -> int:
     if device.type != "cuda":
-        raise RuntimeError(f"nccl-rl requires CUDA, got {device}")
+        raise RuntimeError(f"NCCL M2N requires CUDA, got {device}")
     torch.cuda.set_device(device)
     dist.all_reduce(torch.zeros(1, device=device), group=pg)
     torch.cuda.synchronize(device)
@@ -239,7 +239,7 @@ class NcclM2NReceiver:
         static_expert_placement: bool,
     ) -> None:
         if manifest.get("schema_version") != 1 or not manifest.get("entries"):
-            raise ValueError("Unsupported or empty Miles nccl-rl manifest")
+            raise ValueError("Unsupported or empty Miles NCCL M2N manifest")
         expected_hash = manifest.get("manifest_hash")
         if expected_hash is not None:
             payload = {
@@ -249,7 +249,7 @@ class NcclM2NReceiver:
                 json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
             if expected_hash != actual_hash:
-                raise ValueError("Miles nccl-rl manifest hash mismatch")
+                raise ValueError("Miles NCCL M2N manifest hash mismatch")
         self.manifest = manifest
         self._pg = pg
         self.model = model
@@ -258,7 +258,7 @@ class NcclM2NReceiver:
             if device.type == "cuda" and device.index is None
             else device
         )
-        _nccl_rl()
+        _nccl_m2n()
 
         # Warm first so one worker's model validation cannot strand its peers.
         self.comm_ptr = _warm_and_borrow_nccl_comm(pg, self.device)
@@ -297,7 +297,7 @@ class NcclM2NReceiver:
             "pp_size",
         )
         if any(key not in topology for key in required):
-            raise ValueError("Incomplete SGLang topology for nccl-rl")
+            raise ValueError("Incomplete SGLang topology for NCCL M2N")
         ep_layout = (
             topology["tp_size"] == topology["moe_ep_size"]
             and topology["moe_tp_size"] == 1
@@ -314,7 +314,7 @@ class NcclM2NReceiver:
             or topology["pp_rank"] != 0
         ):
             raise ValueError(
-                "nccl-rl requires SGLang EP=TP with MoE-TP=1 or EP=1 "
+                "NCCL M2N requires SGLang EP=TP with MoE-TP=1 or EP=1 "
                 "with MoE-TP=TP, plus DP=1 and PP=1; "
                 f"got {dict(topology)}"
             )
@@ -326,7 +326,7 @@ class NcclM2NReceiver:
             raise ValueError(f"Invalid SGLang MoE-TP rank in {dict(topology)}")
         if not static_expert_placement:
             raise ValueError(
-                "nccl-rl requires static contiguous experts without EPLB, "
+                "NCCL M2N requires static contiguous experts without EPLB, "
                 "elastic EP, or redundant experts"
             )
 
@@ -467,7 +467,7 @@ class NcclM2NReceiver:
                 or not isinstance(pp_rank, int)
                 or pp_rank < 0
             ):
-                raise ValueError(f"Invalid nccl-rl entry {name!r} family {family!r}")
+                raise ValueError(f"Invalid NCCL M2N entry {name!r} family {family!r}")
             names.add(name)
 
             global_shape = tuple(entry["global_shape"])
@@ -519,7 +519,9 @@ class NcclM2NReceiver:
                 raise ValueError(f"{name} has an incomplete source/destination recipe")
             parameter = destination["parameter"]
             if parameter not in self._params:
-                raise ValueError(f"Missing nccl-rl destination parameter {parameter!r}")
+                raise ValueError(
+                    f"Missing NCCL M2N destination parameter {parameter!r}"
+                )
             recipe = destination["recipe"]
             if (family == "routed_expert") != recipe.startswith("expert_"):
                 raise ValueError(
@@ -533,7 +535,9 @@ class NcclM2NReceiver:
                 elif recipe.removesuffix("_scale") == "expert_down":
                     expected_shard_dim = 2
                 else:
-                    raise ValueError(f"Unknown nccl-rl routed-expert recipe {recipe!r}")
+                    raise ValueError(
+                        f"Unknown NCCL M2N routed-expert recipe {recipe!r}"
+                    )
                 if dst_shard_dim != expected_shard_dim:
                     raise ValueError(
                         f"{name} destination must shard dimension {expected_shard_dim} "
@@ -606,7 +610,7 @@ class NcclM2NReceiver:
             self._validate_fp8_pairs(pairs)
         elif "quantization" in self.manifest:
             raise ValueError(
-                "Unquantized nccl-rl manifests must not include quantization metadata"
+                "Unquantized NCCL M2N manifests must not include quantization metadata"
             )
         return entries
 
@@ -663,7 +667,7 @@ class NcclM2NReceiver:
                 tuple(param.shape) == local_shape and param.is_contiguous()
             )
         else:
-            raise ValueError(f"Unknown nccl-rl destination recipe {recipe!r}")
+            raise ValueError(f"Unknown NCCL M2N destination recipe {recipe!r}")
         if (
             not valid
             and allow_packed_expert_weights
@@ -885,7 +889,7 @@ class NcclM2NReceiver:
 
     def _receive_entries(self, in_flight: list):
         """Enqueue one entry at a time, retaining its buffers until completion."""
-        m2n = _nccl_rl()
+        m2n = _nccl_m2n()
         previous_source_mesh = None
         for entry, src_layout, dst_layout in self._entries:
             with torch.cuda.stream(self.stream):
@@ -1015,6 +1019,6 @@ class NcclM2NReceiver:
             self.stream.synchronize()
         self._failed_receive_buffers = None
         if getattr(self, "comm_ptr", None) is not None:
-            _nccl_rl().finalize()
+            _nccl_m2n().finalize()
         self.stream = None
         self.comm_ptr = None
