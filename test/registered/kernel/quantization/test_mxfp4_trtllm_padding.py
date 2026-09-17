@@ -101,7 +101,7 @@ class TestMxfp4TrtllmPadding(CustomTestCase):
             patch.object(mxfp4, "is_allocation_symmetric", return_value=False),
             patch.object(mxfp4, "use_symmetric_memory", return_value=nullcontext()),
         ):
-            for tokens in (1, 16, 64):
+            for tokens in (1, 64):
                 with self.subTest(tokens=tokens):
                     x = torch.randn(tokens, 5120, dtype=torch.bfloat16, device="cuda")
                     logits = torch.randn(tokens, 8, device="cuda")

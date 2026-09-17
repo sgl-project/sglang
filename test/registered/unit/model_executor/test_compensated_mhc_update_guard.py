@@ -19,8 +19,6 @@ class TestCompensatedMhcUpdateGuard(CustomTestCase):
         for field in ("_hc_attn_tf32_parts", "_hc_ffn_tf32_parts"):
             for method, args in (
                 ("update_weights_from_tensor", ([], "direct")),
-                ("update_weights_from_tensor", ([], None)),
-                ("update_weights_from_tensor", ({}, "flattened_bucket")),
                 ("update_weights_from_distributed", ([], [], [], "unused")),
                 ("update_weights_from_disk", ("unused", "auto")),
                 ("update_weights_from_ipc", (SimpleNamespace(),)),

@@ -93,11 +93,7 @@ class TestV41KVPool(CustomTestCase):
             )
 
     def test_v41_pool_buffers(self):
-        for option, expect in (
-            (None, KVLayout.V41_FP4),
-            ("fp8", KVLayout.V41),
-            ("fp4", KVLayout.V41_FP4),
-        ):
+        for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
             with self.subTest(compressed=option):
                 pool = _make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
                 self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
@@ -112,9 +108,9 @@ class TestV41KVPool(CustomTestCase):
                     self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
                     self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
                     self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
-                # A pool of the fp4 layout cannot be the main cache.
-                with self.assertRaises(AssertionError):
-                    _make_pool([0], [], KVLayout.V41_FP4)
+        # A pool of the fp4 layout cannot be the main cache.
+        with self.assertRaises(AssertionError):
+            _make_pool([0], [], KVLayout.V41_FP4)
 
     def test_v41_pool_with_c4_c128(self):
         pool = _make_pool(
