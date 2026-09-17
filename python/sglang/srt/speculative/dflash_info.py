@@ -49,6 +49,9 @@ class DFlashVerifyInput(SpecInput):
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
+    # Conservative request-lifetime bound for candidate graph dispatch when
+    # DSpark keeps committed lengths on the GPU only.
+    candidate_max_seq_len_upper_bound: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

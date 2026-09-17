@@ -26,5 +26,6 @@ class ShapeKey:
     stream_idx: Optional[int] = None
     # LoRA or prefill-prefix variant; None selects the default.
     variant_label: Optional[str] = None
-    # Independent attention variant; None selects the default.
+    # Independent attention variant (DSA dense/sparse, DeepSeek-V4.1
+    # candidate_*); None selects the default.
     attention_variant: Optional[str] = None
