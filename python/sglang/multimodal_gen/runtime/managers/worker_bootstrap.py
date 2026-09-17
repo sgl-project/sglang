@@ -41,7 +41,6 @@ _RUNTIME_NAMESPACES = (
 # complete as subpackages are added.
 _PRE_ACTIVATION_MODULES = (
     "sglang.multimodal_gen.envs",
-    "sglang.multimodal_gen.runtime.plugins",
     "sglang.multimodal_gen.runtime.platforms",
     "sglang.multimodal_gen.runtime.utils",
     "sglang.multimodal_gen.runtime.managers.worker_bootstrap",
@@ -131,7 +130,10 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
 
     initialize_current_platform()
 
-    from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks, load_plugins
+    from sglang.multimodal_gen.runtime.platforms.plugins import (
+        apply_plugin_hooks,
+        load_plugins,
+    )
 
     load_plugins()
     apply_plugin_hooks()
@@ -161,7 +163,10 @@ def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
 
     # No initialize_current_platform() here: this child serves HTTP and never
     # touches the device, so it has no reason to bring up a vendor backend.
-    from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks, load_plugins
+    from sglang.multimodal_gen.runtime.platforms.plugins import (
+        apply_plugin_hooks,
+        load_plugins,
+    )
 
     load_plugins()
     apply_plugin_hooks()

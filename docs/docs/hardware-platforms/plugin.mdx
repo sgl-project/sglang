@@ -227,9 +227,9 @@ if __name__ == "__main__":
 `DiffGenerator` on the `sglang.multimodal_gen` facade is a lazy proxy, so
 binding it at module scope costs no diffusion import and the child still reaches
 `initialize_current_platform()` with a clean module table. Module scope also
-stays open to `envs`, `runtime.plugins` and `runtime.platforms`, which the contract
-already keeps import-safe — a plugin must import the last of those to subclass
-`Platform`. Everything else, including `SamplingParams` and `PipelineConfig`
+stays open to `envs` and `runtime.platforms`, including `runtime.platforms.plugins`.
+These modules remain import-safe so a plugin can subclass `Platform` and register
+hooks before backend initialization. Everything else, including `SamplingParams` and `PipelineConfig`
 from the same facade, belongs inside the `if __name__ == "__main__":` guard or
 inside the function that uses it. A child
 that finds runtime modules already imported names them in a warning: hook
@@ -806,7 +806,7 @@ General function plugins inject behavior into SRT or diffusion **without requiri
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 # Diffusion plugin
-from sglang.multimodal_gen.runtime.plugins import HookType, plugin_hook
+from sglang.multimodal_gen.runtime.platforms.plugins import HookType, plugin_hook
 ```
 
 Register an SRT plugin under `sglang.srt.plugins` and a diffusion plugin under
@@ -814,7 +814,8 @@ Register an SRT plugin under `sglang.srt.plugins` and a diffusion plugin under
 module above. Each runtime applies only its own registry, so a hook registered
 through the other runtime's API never runs. The examples below use SRT.
 
-The diffusion hook API lives in `sglang.multimodal_gen.runtime.plugins`;
+The diffusion hook API lives alongside platform discovery in
+`sglang.multimodal_gen.runtime.platforms.plugins`;
 `sglang.multimodal_gen.plugins` is its entry-point group, not a Python module path.
 
 Use cases include:
@@ -1064,7 +1065,7 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
       <td>Diffusion <code>current_platform</code> lazy singleton and built-in fallback order</td>
     </tr>
     <tr>
-      <td><code>sglang/multimodal_gen/runtime/plugins.py</code></td>
+      <td><code>sglang/multimodal_gen/runtime/platforms/plugins.py</code></td>
       <td>Diffusion plugin registration, explicit hook-application phase, and hook registry</td>
     </tr>
     <tr>

@@ -79,7 +79,7 @@ def register():
     generator_imported_when_plugin_ran = GENERATOR_MODULE in sys.modules
     server_args_imported_when_plugin_ran = SERVER_ARGS_MODULE in sys.modules
 
-    from sglang.multimodal_gen.runtime.plugins import HookRegistry, HookType
+    from sglang.multimodal_gen.runtime.platforms.plugins import HookRegistry, HookType
 
     HookRegistry.register(
         WORKER_MODULE + ".run_scheduler_process", replacement, HookType.REPLACE

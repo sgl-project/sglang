@@ -4,7 +4,7 @@
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
 
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
-from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 

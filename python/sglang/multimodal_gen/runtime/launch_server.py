@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.observability.metrics import (
     configure_metrics,
     start_role_metrics_server,
 )
-from sglang.multimodal_gen.runtime.plugins import apply_plugin_hooks
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,

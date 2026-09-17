@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.multimodal_gen.runtime import plugins
+from sglang.multimodal_gen.runtime.platforms import plugins
 from sglang.srt.plugins.hook_registry import HookRegistry as SrtHookRegistry
 from sglang.srt.plugins.hook_registry import (
     HookSource,

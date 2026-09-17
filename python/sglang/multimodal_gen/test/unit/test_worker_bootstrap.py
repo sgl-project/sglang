@@ -77,7 +77,7 @@ def _check_cli_import_order(pipe_writer) -> None:
 
 
 def _check_http_server_import_order(pipe_writer) -> None:
-    from sglang.multimodal_gen.runtime import plugins
+    from sglang.multimodal_gen.runtime.platforms import plugins
 
     class StopAtPluginBoundary(Exception):
         pass
@@ -109,6 +109,7 @@ class TestBootstrapImportBoundary(unittest.TestCase):
     def test_manager_namespace_does_not_hide_early_worker_imports(self):
         for module, warned in (
             ("sglang.multimodal_gen.runtime.managers", False),
+            ("sglang.multimodal_gen.runtime.platforms.plugins", False),
             (worker_bootstrap.__name__, False),
             (WORKER_MODULE, True),
         ):
