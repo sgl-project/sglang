@@ -97,42 +97,58 @@ def _parallel_config_leaves() -> frozenset:
     )
 
 
-_PARALLEL_FIELDS = frozenset(
-    {
-        "world_size",
-        "world_rank",
-        "tp_size",
-        "tp_rank",
-        "pp_size",
-        "pp_rank",
-        "moe_ep_size",
-        "moe_ep_rank",
-        "moe_dp_size",
-        "moe_dp_rank",
-        "moe_tp_size",
-        "moe_tp_rank",
-        "attn_tp_size",
-        "attn_tp_rank",
-        "attn_cp_size",
-        "attn_cp_rank",
-        "dcp_enabled",
-        "dcp_size",
-        "dcp_rank",
-        "attn_dcp_size",
-        "attn_dcp_rank",
-        "attn_dp_size",
-        "attn_dp_rank",
-        "world_group",
-        "tp_group",
-        "pp_group",
-        "moe_ep_group",
-        "moe_dp_group",
-        "moe_tp_group",
-        "attn_tp_group",
-        "attn_cp_group",
-        "dcp_group",
+# Ranks and group handles: the names no configuration carries, each with the
+# canonical getter that answers it live. This table is their declaration, the
+# way `arg_groups/fields/parallel.py` is the leaves' and `Derived` is the
+# widths'. `None` marks a name only a stamp can answer: no coordinator knows
+# this process's attention-DP rank.
+_LIVE_READS: dict = {
+    "world_size": "get_world_size",
+    "world_rank": "get_world_rank",
+    "tp_rank": "get_tensor_model_parallel_rank",
+    "pp_rank": "get_pipeline_model_parallel_rank",
+    "moe_ep_rank": "get_moe_expert_parallel_rank",
+    "moe_dp_rank": "get_moe_data_parallel_rank",
+    "moe_tp_rank": "get_moe_tensor_parallel_rank",
+    "attn_tp_rank": "get_attn_tensor_model_parallel_rank",
+    "attn_cp_rank": "get_attn_context_model_parallel_rank",
+    "dcp_rank": "get_dcp_rank",
+    "attn_dcp_rank": None,
+    "attn_dp_rank": None,
+    "world_group": "get_world_group",
+    "tp_group": "get_tp_group",
+    "pp_group": "get_pp_group",
+    "moe_ep_group": "get_moe_ep_group",
+    "moe_dp_group": "get_moe_dp_group",
+    "moe_tp_group": "get_moe_tp_group",
+    "attn_tp_group": "get_attn_tp_group",
+    "attn_cp_group": "get_attn_cp_group",
+    "dcp_group": "get_dcp_group",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _parallel_fields() -> frozenset:
+    """Every name `ParallelContext` answers for, read from the declarations.
+
+    Three sources, because the namespace has three kinds of name and each one
+    declares itself somewhere already:
+
+    * configured leaves -- the `parallel` namespace of the record;
+    * derived widths -- the `Derived` declarations beside those leaves;
+    * ranks and group handles -- `_LIVE_READS`, which is where they are
+      declared because no configuration carries them.
+
+    The set is the union of those three, so `override()` cannot refuse a name
+    the class answers for.
+    """
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.fields.parallel import Parallel
+
+    derived = {
+        name for name, decl in vars(Parallel).items() if isinstance(decl, Derived)
     }
-)
+    return frozenset(_parallel_config_leaves() | derived | set(_LIVE_READS))
 
 
 def derive_attention_widths(
@@ -374,7 +390,7 @@ class ParallelContext:
     def override(self, **kwargs):
         """Temporarily force parallel values, restoring on exit. Validates keys and
         supports nesting."""
-        unknown = set(kwargs) - _PARALLEL_FIELDS
+        unknown = set(kwargs) - _parallel_fields()
         if unknown:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
         saved = dict(self._overrides)

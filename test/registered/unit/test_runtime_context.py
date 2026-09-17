@@ -232,6 +232,62 @@ class TestStampedRanks(_IsolatedOverrides):
         self.assertEqual(parallel.attn_dp_rank, 11)
 
 
+class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
+    """The overridable set is read from the declarations, not maintained by hand.
+
+    It used to be a literal frozenset, so a width or leaf added next to its
+    siblings needed a second edit here; forgetting it left a name that read
+    fine and could not be stated, which is indistinguishable from the override
+    silently not working.
+    """
+
+    def test_every_declared_name_can_be_stated_and_reads_back(self):
+        from sglang.srt.runtime_context import _parallel_fields
+
+        names = sorted(_parallel_fields())
+        # Sizes, ranks, groups and the configured leaves of the namespace.
+        self.assertGreater(len(names), 30)
+        parallel = get_parallel()
+        for name in names:
+            sentinel = object()
+            with parallel.override(**{name: sentinel}):
+                self.assertIs(getattr(parallel, name), sentinel, msg=name)
+
+    def test_every_name_the_class_answers_for_is_in_the_set(self):
+        """Cross-check from the other side: the class's own surface.
+
+        Derived from the class rather than from the same declarations the set
+        is built from, so a source dropped out of `_parallel_fields` shows up
+        here instead of agreeing with itself.
+        """
+        from sglang.srt.runtime_context import _parallel_fields
+
+        answered = {
+            name
+            for name, value in vars(ParallelContext).items()
+            if isinstance(value, property)
+        }
+        self.assertTrue(answered)
+        self.assertEqual(answered - _parallel_fields(), set())
+
+    def test_a_live_name_is_never_also_answered_from_the_bag(self):
+        """The two answer differently, so a name in both would make the read
+        order -- not the declaration -- decide which one a caller gets.
+
+        The bag carries the declared quotients as well as the operator's
+        leaves, and both are ahead of the live getter once a configuration is
+        published: a name in `_LIVE_READS` and in either of them would answer
+        from the getter before publish and from the bag after."""
+        from sglang.srt.runtime_context import _LIVE_READS, _parallel_config_leaves
+
+        self.assertEqual(set(_LIVE_READS) & _parallel_config_leaves(), set())
+
+    def test_an_undeclared_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            with get_parallel().override(not_a_parallel_name=1):
+                pass
+
+
 class TestParallelOverride(_IsolatedOverrides):
     def test_override_takes_precedence(self):
         p = get_parallel()
