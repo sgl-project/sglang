@@ -20,6 +20,9 @@ class FanOutCommunicator(Generic[T]):
       receive the same result when it completes.
 
     Only one request is in-flight at any time in either mode.
+
+    ``correlation_attr`` optionally rejects late responses from an abandoned
+    queueing call after its caller has timed out or been cancelled.
     """
 
     def __init__(
@@ -27,16 +30,20 @@ class FanOutCommunicator(Generic[T]):
         send: Callable[[T], None],
         fan_out: int,
         mode: str = "queueing",
+        correlation_attr: Optional[str] = None,
     ):
         self._send = send
         self._fan_out = fan_out
         self._mode = mode
+        self._correlation_attr = correlation_attr
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._result_fan_out: Optional[int] = None
+        self._result_correlation: Optional[object] = None
         self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
+        assert correlation_attr is None or mode == "queueing"
 
     async def queueing_call(self, obj: T):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
@@ -44,17 +51,25 @@ class FanOutCommunicator(Generic[T]):
         # arrival order. It also releases on exception/cancellation, so a
         # failed caller never blocks the callers queued behind it.
         async with self._queueing_lock:
-            if obj is not None:
-                self._send(obj)
-
-            self._result_event = asyncio.Event()
+            event = asyncio.Event()
+            self._result_event = event
             self._result_values = []
             self._result_fan_out = self._fan_out
-            await self._result_event.wait()
-            result_values = self._result_values
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
-            return result_values
+            self._result_correlation = (
+                getattr(obj, self._correlation_attr)
+                if obj is not None and self._correlation_attr is not None
+                else None
+            )
+            try:
+                if obj is not None:
+                    self._send(obj)
+                await event.wait()
+                return self._result_values
+            finally:
+                if self._result_event is event:
+                    self._result_event = self._result_values = None
+                    self._result_fan_out = None
+                    self._result_correlation = None
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -96,6 +111,17 @@ class FanOutCommunicator(Generic[T]):
             logger.debug(
                 "Dropping communicator response without active waiter: %s",
                 type(recv_obj).__name__,
+            )
+            return
+        if (
+            self._correlation_attr is not None
+            and getattr(recv_obj, self._correlation_attr, None)
+            != self._result_correlation
+        ):
+            logger.debug(
+                "Dropping communicator response with stale %s: %s",
+                self._correlation_attr,
+                getattr(recv_obj, self._correlation_attr, None),
             )
             return
         self._result_values.append(recv_obj)
