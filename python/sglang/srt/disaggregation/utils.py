@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_spec,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -47,7 +47,6 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
-_IS_HIP = is_hip()
 
 
 def poll_and_all_reduce_pp(
@@ -77,11 +76,6 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     if not is_deepseek_dsa(hf_config):
         return 0
     return get_dsa_mtp_topk_width(hf_config)
-
-
-def is_dsv4_c128_online_enabled() -> bool:
-    """Return whether DSV4 C128 uses request-scoped online state."""
-    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_dsv4_c4_state_indices(
