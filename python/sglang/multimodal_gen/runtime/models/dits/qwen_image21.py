@@ -9,9 +9,11 @@ from torch import nn
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_complex_rope,
+    can_use_fused_layernorm_modulate,
     can_use_fused_silu_mul,
     can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
+    fused_layernorm_modulate,
     fused_silu_mul_bitexact,
     residual_gate_add,
     rmsnorm_preserve_reduction,
@@ -43,6 +45,7 @@ logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
+_MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -121,6 +124,21 @@ def apply_qk_norm(x, norm):
     out = norm(x)
     if fused is not None:
         return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
+    return out
+
+
+def apply_modulation(x, norm, scale):
+    fused = None
+    if (
+        can_use_fused_layernorm_modulate(x, scale.squeeze(1), None)
+        and _MODULATION_FUSION.can_attempt_once()
+    ):
+        fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
+        if _MODULATION_FUSION.verified:
+            return fused
+    out = norm(x) * (1 + scale)
+    if fused is not None:
+        return _MODULATION_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
 
 
@@ -317,9 +335,9 @@ class QwenImage21TransformerBlock(nn.Module):
         p = None
         if not cache:
             ps1, pg1, ps2, pg2 = prefix_modulation[:, None].chunk(4, dim=-1)
-            p = self.img_norm1(prefix) * (1 + ps1)
+            p = apply_modulation(prefix, self.img_norm1, ps1)
         attention, prefix_attention = self.attn(
-            self.img_norm1(hidden_states) * (1 + scale1),
+            apply_modulation(hidden_states, self.img_norm1, scale1),
             rope,
             p,
             layout["prefix_rope"],
@@ -329,14 +347,14 @@ class QwenImage21TransformerBlock(nn.Module):
         hidden_states = residual_gate_add(hidden_states, attention, gate1.tanh())
         hidden_states = residual_gate_add(
             hidden_states,
-            self.img_mlp(self.img_norm2(hidden_states) * (1 + scale2)),
+            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
             gate2.tanh(),
         )
         if prefix_attention is not None:
             prefix = residual_gate_add(prefix, prefix_attention, pg1.tanh())
             prefix = residual_gate_add(
                 prefix,
-                self.img_mlp(self.img_norm2(prefix) * (1 + ps2)),
+                self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
                 pg2.tanh(),
             )
         prefix_state["hidden_states"] = prefix
@@ -350,7 +368,9 @@ class QwenImage21OutputNorm(nn.Module):
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
 
     def forward(self, x, temb):
-        return self.norm(x) * (1 + self.linear(nn.functional.silu(temb))[:, None])
+        return apply_modulation(
+            x, self.norm, self.linear(nn.functional.silu(temb))[:, None]
+        )
 
 
 class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
