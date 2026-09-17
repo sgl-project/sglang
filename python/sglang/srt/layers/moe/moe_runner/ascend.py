@@ -217,7 +217,12 @@ class AscendRunnerCore(MoeRunnerCore):
             # Grouped-row activations require dispatch metadata.
             if isinstance(
                 self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu, NPUSituMXFP8Quant, NPUSwigluMxfp8Quant),
+                (
+                    NPUSwigluDeepEPKernel,
+                    NPUSitu,
+                    NPUSituMXFP8Quant,
+                    NPUSwigluMxfp8Quant,
+                ),
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
