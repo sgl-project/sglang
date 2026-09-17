@@ -157,7 +157,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             backend._attach_unified_kv_prefill_meta.call_args.kwargs["exact_num_tokens"]
         )
 
-    def test_cp_prefill_attaches_global_metadata_before_reindex(self):
+    def test_cp_draft_prefill_attaches_before_reindex_without_flashmla(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
@@ -211,7 +211,34 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         )
         self.assertEqual(events, ["attach", "reindex"])
         core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
-        core.init_flashmla_related.assert_called_once_with(is_prefill=True)
+        core.init_flashmla_related.assert_not_called()
+
+    def test_cp_reindex_skips_absent_compression_fields(self):
+        core = self._make_core_metadata(0)
+        core.seq_lens_casual = torch.tensor([1, 2, 3, 1], dtype=torch.int32)
+        core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
+        core.swa_page_indices = torch.arange(8, dtype=torch.int32).view(4, 2)
+        core.swa_topk_lengths = torch.tensor([1, 2, 3, 1], dtype=torch.int32)
+        core.page_table = torch.arange(8, dtype=torch.int32).view(4, 2)
+        core.raw_out_loc = torch.arange(3, dtype=torch.int64)
+        core.swa_out_cache_loc = torch.arange(3, dtype=torch.int64)
+        core.c4_out_loc = None
+        core.c128_out_loc = None
+        core.unified = None
+        for field_name in core._CP_OPTIONAL_REINDEX_FIELDS:
+            setattr(core, field_name, None)
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
+        ):
+            core.apply_cp_reindex(num_tokens=3)
+
+        self.assertEqual(core.positions_casual.tolist(), [1, 0])
+        for field_name in core._CP_REQUIRED_REINDEX_FIELDS:
+            self.assertEqual(getattr(core, field_name).shape[0], 2)
+        for field_name in core._CP_OPTIONAL_REINDEX_FIELDS:
+            self.assertIsNone(getattr(core, field_name))
 
     def test_cp_unified_uses_inert_query_padding_and_logical_ring_rows(self):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime

@@ -346,18 +346,21 @@ class DSV4AttnMetadata:
             self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
             self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
-    _CP_REINDEX_FIELDS = [
+    _CP_REQUIRED_REINDEX_FIELDS = [
         "seq_lens_casual",
         "positions_casual",
         "swa_page_indices",
         "swa_topk_lengths",
         "page_table",
+    ]
+    _CP_OPTIONAL_REINDEX_FIELDS = [
         "c4_topk_lengths_raw",
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
         "c128_topk_lengths_raw",
     ]
+    _CP_REINDEX_FIELDS = _CP_REQUIRED_REINDEX_FIELDS + _CP_OPTIONAL_REINDEX_FIELDS
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
         "swa_out_cache_loc",
@@ -379,13 +382,20 @@ class DSV4AttnMetadata:
             num_tokens = pre_global_len
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
+            if val is None:
+                assert field_name in self._CP_OPTIONAL_REINDEX_FIELDS, (
+                    f"CP reindex: required field {field_name} is None"
+                )
+                continue
             assert isinstance(val, torch.Tensor), (
                 f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             )
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name)
+            val = getattr(self, field_name, None)
+            if val is None:
+                continue
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
                 f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
@@ -735,7 +745,8 @@ class DeepseekV4HipRadixBackend(
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
-            core_attn_metadata.init_flashmla_related(is_prefill=True)
+            if need_compress:
+                core_attn_metadata.init_flashmla_related(is_prefill=True)
         if attach_decode_streams:
             # Target-verify runs through the unified_kv DECODE kernel, so build
             # per-token decode streams here. req_pool_indices_repeated is the
