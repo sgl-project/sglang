@@ -4,9 +4,57 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
+
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _preshuffle_tile() -> int:
+    """Tile width for the index-K cache, or 0 to keep the row-major layout."""
+    return (
+        INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0
+    )
+
+
+@triton.jit
+def _kpool_cache_k_offsets(
+    page,
+    slot,
+    cols,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+):
+    """Offsets of one pooled token's index-K row inside the paged buffer.
+
+    With PRESHUFFLE_TILE set the row is scattered into TILE x TILE tiles, which
+    is what aiter's preshuffle paged-MQA kernel reads. The layout mirrors
+    _set_k_and_s_triton_kernel in kernels/ops/attention/dsa/index_buf_accessor.py,
+    which already writes the non-pooled indexer cache this way; the two must
+    agree because both are consumed by the same aiter kernel.
+
+    Factored out rather than inlined because the k-pool path writes this buffer
+    from four kernels and reads it back from a fifth.
+    """
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile_id = slot // tile
+        token_in_tile = slot % tile
+        col_tile_id = cols // tile
+        col_in_tile = cols % tile
+        return (
+            page * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * HEAD_DIM)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    return page * BUF_NUMEL_PER_PAGE + slot * HEAD_DIM + cols
 
 
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
@@ -59,6 +107,7 @@ def gather_index_k_scale_prefix_into(
         scale_out,
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        PRESHUFFLE_TILE=_preshuffle_tile(),
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
@@ -76,6 +125,7 @@ def _gather_index_k_scale_prefix_into_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -85,7 +135,14 @@ def _gather_index_k_scale_prefix_into_kernel(
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
-    src_k_offsets = page * BUF_NUMEL_PER_PAGE + token_offset_in_page * HEAD_DIM + offs
+    src_k_offsets = _kpool_cache_k_offsets(
+        page,
+        token_offset_in_page,
+        offs,
+        BUF_NUMEL_PER_PAGE,
+        HEAD_DIM,
+        PRESHUFFLE_TILE,
+    )
     dst_k_offsets = token_id * HEAD_DIM + offs
     k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask)
     tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
@@ -725,6 +782,7 @@ def kpool_softmax_rotate_write_cache(
         ape.stride(0),
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * pool.index_head_dim,
@@ -818,6 +876,7 @@ def kpool_decode_update_and_maybe_write_cache(
         REQ_POOL_SIZE=tail_k.shape[0],
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=pool.index_kpool,
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=tail_k.shape[2],
@@ -872,6 +931,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     POOL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     RETURN_COMPRESSED: tl.constexpr,
@@ -947,10 +1007,13 @@ def _kpool_softmax_rotate_write_cache_kernel(
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
         loc_page_index = loc // PAGE_SIZE
         loc_token_offset_in_page = loc % PAGE_SIZE
-        out_k_offsets = (
-            loc_page_index * BUF_NUMEL_PER_PAGE
-            + loc_token_offset_in_page * HEAD_DIM
-            + offs
+        out_k_offsets = _kpool_cache_k_offsets(
+            loc_page_index,
+            loc_token_offset_in_page,
+            offs,
+            BUF_NUMEL_PER_PAGE,
+            HEAD_DIM,
+            PRESHUFFLE_TILE,
         )
         out_s_offset = (
             loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1000,6 +1063,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_TABLE_COLS: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SLOTS_PER_PAGE: tl.constexpr,
@@ -1112,10 +1176,13 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         )
         loc_page_index = packed_page.to(tl.int64)
         loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
-        out_k_offsets = (
-            loc_page_index * BUF_NUMEL_PER_PAGE
-            + loc_token_offset_in_page * HEAD_DIM
-            + offs
+        out_k_offsets = _kpool_cache_k_offsets(
+            loc_page_index,
+            loc_token_offset_in_page,
+            offs,
+            BUF_NUMEL_PER_PAGE,
+            HEAD_DIM,
+            PRESHUFFLE_TILE,
         )
         out_s_offset = (
             loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1175,6 +1242,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1222,8 +1290,13 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     loc = tl.load(loc_ptr + row)
     loc_page_index = loc // SLOTS_PER_PAGE
     loc_token_offset_in_page = loc % SLOTS_PER_PAGE
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * HEAD_DIM + offs
+    out_k_offsets = _kpool_cache_k_offsets(
+        loc_page_index,
+        loc_token_offset_in_page,
+        offs,
+        BUF_NUMEL_PER_PAGE,
+        HEAD_DIM,
+        PRESHUFFLE_TILE,
     )
     out_s_offset = (
         loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1290,6 +1363,7 @@ def kpool_assemble_softmax_rotate_write_cache(
         tail_k.stride(1),
         ape.stride(0),
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=pool_size,
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
@@ -1537,6 +1611,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     SLOTS_PER_PAGE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
@@ -1601,10 +1676,13 @@ def _kpool_write_tail_and_maybe_compress_kernel(
             loc = tl.load(write_loc_ptr + b * write_loc_stride_0 + p)
             loc_page_index = loc // SLOTS_PER_PAGE
             loc_token_offset_in_page = loc % SLOTS_PER_PAGE
-            out_k_offsets = (
-                loc_page_index * BUF_NUMEL_PER_PAGE
-                + loc_token_offset_in_page * HEAD_DIM
-                + offs
+            out_k_offsets = _kpool_cache_k_offsets(
+                loc_page_index,
+                loc_token_offset_in_page,
+                offs,
+                BUF_NUMEL_PER_PAGE,
+                HEAD_DIM,
+                PRESHUFFLE_TILE,
             )
             out_s_offset = (
                 loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1694,6 +1772,7 @@ def kpool_write_tail_and_maybe_compress(
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
         SLOTS_PER_PAGE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        PRESHUFFLE_TILE=_preshuffle_tile(),
         S_OFFSET_NBYTES_IN_PAGE=slots_per_page * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
