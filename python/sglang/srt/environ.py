@@ -1022,11 +1022,14 @@ class Envs:
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
-    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
+    # cutedsl mega kernels (BF16 / MXFP8xBF16 / NVFP4 / MXFP8). Deletes the multi-GB combine staging
     # region and can win at large batch, but makes the output accumulation order
     # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
+    # Optional JSON object of CuTeDSL MegaMOE tuner knobs. Lists are accepted
+    # for tuple-valued knobs so this can be supplied directly as JSON.
+    SGLANG_FLASHINFER_MEGAMOE_KNOBS = EnvJSON(None)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
     # kernel. "bf16" is exact/default; "mxfp8" and "nvfp4" reduce combine
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
