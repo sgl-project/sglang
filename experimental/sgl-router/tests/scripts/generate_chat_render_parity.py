@@ -8,6 +8,8 @@ import json
 import pathlib
 import sys
 
+from transformers.utils.hub import cached_file
+
 from sglang.srt.entrypoints.openai import encoding_dsv4
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
@@ -23,7 +25,6 @@ from sglang.srt.parser.jinja_template_utils import (
     process_content_for_template_format,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from transformers.utils.hub import cached_file
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "chat_render_parity"
 
@@ -67,7 +68,9 @@ SHAPES = {
 
 
 def snapshot_dir(model_id):
-    return pathlib.Path(cached_file(model_id, "config.json", local_files_only=True)).parent
+    return pathlib.Path(
+        cached_file(model_id, "config.json", local_files_only=True)
+    ).parent
 
 
 def engine_messages(request, content_format):
@@ -78,8 +81,12 @@ def engine_messages(request, content_format):
     for msg in copy.deepcopy(messages):
         if msg.get("content") is None:
             msg["content"] = ""
-        processed = process_content_for_template_format(msg, content_format, [], [], [], [])
-        processed["content"] = normalize_tool_content(processed["role"], processed.get("content"))
+        processed = process_content_for_template_format(
+            msg, content_format, [], [], [], []
+        )
+        processed["content"] = normalize_tool_content(
+            processed["role"], processed.get("content")
+        )
         out.append(processed)
     return out
 
@@ -113,7 +120,12 @@ def engine_prompt_ids(model_id, tok, request):
     if request.chat_template_kwargs:
         extra.update(request.chat_template_kwargs)
     rendered = tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, tools=None, return_dict=False, **extra
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=None,
+        return_dict=False,
+        **extra,
     )
     encode_kwargs = {"add_special_tokens": False} if len(tok.encode("")) > 0 else {}
     return tok.encode(rendered, **encode_kwargs)
@@ -136,7 +148,8 @@ def main():
         out = ROOT / f"{slug}.json"
         lines = [json.dumps(case, ensure_ascii=False) for case in cases]
         out.write_text(
-            '{"model_id": %s, "cases": [\n%s\n]}\n' % (json.dumps(model_id), ",\n".join(lines))
+            '{"model_id": %s, "cases": [\n%s\n]}\n'
+            % (json.dumps(model_id), ",\n".join(lines))
         )
         print(f"wrote {out} ({len(cases)} cases)")
 

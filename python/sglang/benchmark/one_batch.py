@@ -69,6 +69,7 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolving_view,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -369,6 +370,15 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
+        # bench_one_batch bypasses the Scheduler, so the Mamba SSU backend that
+        # Scheduler.init_mamba_backend() would set up is never initialized. Do it
+        # here (per tp_rank, i.e. per worker process) for mamba/linear-attn models.
+        if mambaish_config(model_runner.model_config) is not None:
+            from sglang.kernels.ops.mamba.triton_ops import (
+                initialize_mamba_selective_state_update_backend,
+            )
+
+            initialize_mamba_selective_state_update_backend(server_args)
         model_runner.init_cuda_graphs()
         if get_model().is_startup_weight_load_overlap:
             model_runner.finalize_startup_weight_load()

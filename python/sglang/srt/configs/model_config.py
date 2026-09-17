@@ -628,12 +628,17 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
+        has_dsv41_vision = (
+            self.hf_config.model_type == "deepseek_v41"
+            and self.hf_config.vision_n_layers > 0
+        )
         self.is_multimodal = (
             enable_multimodal
             and not self.is_lm_only
             and (
                 is_multimodal_model(self.hf_config.architectures)
                 or has_multimodal_subconfig
+                or has_dsv41_vision
             )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
@@ -652,6 +657,8 @@ class ModelConfig:
             self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
+        if self.is_multimodal and has_dsv41_vision:
+            self.is_image_understandable_model = True
 
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
@@ -681,6 +688,10 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.ngram_embedding_n = (
+            self.hf_config.ngram_embedding_n if self.use_ngram_embedding else 0
+        )
+        self.use_engram = bool(getattr(self.hf_config, "engram_layer_ids", ()))
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
