@@ -62,7 +62,6 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -89,6 +88,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -266,7 +266,8 @@ class PrefillBootstrapQueue:
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool
-            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            if transfer_draft_cache
+            and (not _is_npu or get_parallel().pp_group.is_last_rank)
             else None
         )
         num_draft_entries = 0
