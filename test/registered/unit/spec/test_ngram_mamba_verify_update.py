@@ -233,6 +233,19 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):
+    def test_flashinfer_gdn_positional_scratch_moves_to_request_rows(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            copy_verify_intermediate_rows,
+        )
+
+        destination = torch.zeros((8, 2, 3), dtype=torch.float32)
+        positional = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+        rows = torch.tensor([5, 2, 7], dtype=torch.int32)
+
+        copy_verify_intermediate_rows(destination, positional, rows)
+
+        torch.testing.assert_close(destination[rows.long()], positional)
+
     def test_ple_commit_reads_stable_request_rows(self):
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             HybridLinearAttnBackend,
