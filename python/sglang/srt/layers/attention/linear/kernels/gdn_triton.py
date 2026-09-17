@@ -5,6 +5,8 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
+_is_npu = is_npu()
+
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -153,7 +155,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if is_npu():
+        if _is_npu:
             # Decode-optimized NPU kernel: computes gating once per (token, value-head)
             # and reuses it across the value-dimension tiles.
             return fused_sigmoid_gating_delta_rule_update_decode_npu(
