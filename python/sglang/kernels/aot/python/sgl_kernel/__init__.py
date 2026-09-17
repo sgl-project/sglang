@@ -171,6 +171,7 @@ else:
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",
         "gemma_rmsnorm",
+        "get_cutlass_w4a8_moe_mm_data_with_permutation",
         "int8_scaled_mm",
         "merge_state_v2",
         "moe_align_block_size",
