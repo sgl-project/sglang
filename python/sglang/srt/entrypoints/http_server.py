@@ -293,7 +293,7 @@ async def lifespan(fast_api_app: FastAPI):
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         if get_disagg().disaggregation_mode == "prefill":
@@ -657,6 +657,13 @@ async def validate_json_request(raw_request: Request):
 
 
 ##### Native API endpoints #####
+
+
+@app.get("/ready")
+async def ready() -> Response:
+    """Report whether the server is ready to receive new requests."""
+    status_code = 200 if _global_state.tokenizer_manager.is_ready() else 503
+    return Response(status_code=status_code)
 
 
 @app.get("/health")
@@ -2457,6 +2464,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2514,6 +2522,10 @@ def _run_granian_server(
     server = Server(**granian_kwargs)
 
     if tokenizer_worker_num == 1:
+        if tokenizer_manager is not None:
+            # auto_create_handle_loop replaces the signal handler wired below,
+            # so shutdown can only reach this server through the hook.
+            tokenizer_manager.set_server_stop_hook(server.stop)
 
         async def serve():
             # The embedded server does not install its own signal handlers, so wire
@@ -2638,6 +2650,7 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=get_serving().ssl_ca_certs,
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
+                    tokenizer_manager=tokenizer_manager,
                 )
             elif get_serving().enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2660,6 +2673,9 @@ def _setup_and_run_http_server(
                 from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
 
                 server = uvicorn.Server(config)
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
 
                 async def _run_with_ssl_refresh():
                     refresher = SSLCertRefresher(
@@ -2678,23 +2694,31 @@ def _setup_and_run_http_server(
 
                 asyncio.run(_run_with_ssl_refresh())
             else:
-                # Default case, one tokenizer process
-                uvicorn.run(
-                    app,
-                    host=get_serving().host,
-                    port=get_serving().port,
-                    root_path=get_serving().fastapi_root_path,
-                    log_level=get_observability().log_level_http
-                    or get_observability().log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    loop="uvloop",
-                    ssl_keyfile=get_serving().ssl_keyfile,
-                    ssl_certfile=get_serving().ssl_certfile,
-                    ssl_ca_certs=get_serving().ssl_ca_certs,
-                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                # Default case, one tokenizer process.
+                # A Server rather than uvicorn.run(), so shutdown can ask it to stop.
+                server = uvicorn.Server(
+                    uvicorn.Config(
+                        app,
+                        host=get_serving().host,
+                        port=get_serving().port,
+                        root_path=get_serving().fastapi_root_path,
+                        log_level=get_observability().log_level_http
+                        or get_observability().log_level,
+                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                        loop="uvloop",
+                        ssl_keyfile=get_serving().ssl_keyfile,
+                        ssl_certfile=get_serving().ssl_certfile,
+                        ssl_ca_certs=get_serving().ssl_ca_certs,
+                        ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                    )
                 )
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
+                server.run()
         else:
-            # Multiple tokenizer and http processes
+            # Multiple tokenizer and http processes.
+            # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
