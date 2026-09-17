@@ -31,8 +31,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=287, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=789, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -76,11 +76,20 @@ class HiCacheStorageBaseMixin:
         return DEFAULT_MODEL_NAME_FOR_TEST
 
     @classmethod
+    def _get_storage_backend(cls):
+        return "file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {}
+
+    @classmethod
     def _get_base_server_args(cls):
         """Get base server arguments - can be extended in subclasses"""
         extra_config = {
             "hicache_storage_pass_prefix_keys": True,
         }
+        extra_config.update(cls._get_storage_backend_extra_config())
         return {
             "--enable-hierarchical-cache": True,
             "--mem-fraction-static": 0.6,
@@ -88,7 +97,7 @@ class HiCacheStorageBaseMixin:
             "--page-size": 64,
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
-            "--hicache-storage-backend": "file",
+            "--hicache-storage-backend": cls._get_storage_backend(),
             "--hicache-storage-backend-extra-config": json.dumps(extra_config),
         }
 
@@ -265,6 +274,46 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
             "--tp-size": 2,
         }
         return server_args, {}
+
+
+class TestHiCacheStorageFastFilePageFirstDirectIO(
+    HiCacheStorageBaseMixin, CustomTestCase
+):
+    """Page first direct tests for the fast_file storage backend (direct I/O path)."""
+
+    @classmethod
+    def _get_storage_backend(cls):
+        return "fast_file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {"storage_dir": cls.temp_dir, "read_workers": 2}
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {
+            "--hicache-mem-layout": "page_first_direct",
+            "--hicache-io-backend": "direct",
+            "--tp-size": 2,
+        }
+        return server_args, {}
+
+    def test_generation_is_identical_after_storage_reload(self):
+        """Pages read back through vectored I/O must be byte-identical to the
+        pages written, so deterministic generation cannot change after an L3
+        reload."""
+        prompt = self.gen_prompt(768)
+        initial = self.send_request(prompt, max_tokens=128)
+
+        self.trigger_offloading_and_flush()
+
+        cached = self.send_request(prompt, max_tokens=128)
+        self.assertEqual(initial["text"], cached["text"])
+        self.assertGreater(
+            self.get_cached_tokens(cached),
+            700,
+            "Expected the deterministic comparison to reload from L3 storage",
+        )
 
 
 class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):

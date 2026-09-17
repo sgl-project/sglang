@@ -127,6 +127,39 @@ python3 -m sglang.launch_server \
 ```
 
 
+### Deployment with Local Filesystem Backends
+
+`file` is the minimal reference backend: unbounded, staged, serial file I/O.
+For a local NVMe or filesystem tier use `fast_file`. It keeps the same on-disk
+page format and adds direct host-buffer I/O for page-first layouts, parallel
+reads, atomic page publication, and background LRU eviction:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-mem-layout page_first \
+  --hicache-io-backend kernel \
+  --hicache-write-policy write_through \
+  --hicache-storage-backend fast_file \
+  --hicache-storage-backend-extra-config \
+  '{"storage_dir":"/mnt/nvme/hicache","max_size":"3Ti","min_free_space":"4Ti","read_workers":8}'
+```
+
+Pages live below `storage_dir` in a namespace derived from the model name,
+parallel layout, and host pool layout, so one root can be shared by several
+deployments. Without `storage_dir`, `fast_file` uses the `file` backend's
+`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` and then `/tmp/hicache`; the
+namespace directory keeps its pages apart from `file` pages in the same root.
+`max_size` bounds one namespace as tracked by one process (MLA ranks share a
+namespace and rank 0 owns eviction); `min_free_space` is a floor for the whole
+filesystem. Both are optional. Eviction state and the optional
+`enable_metadata_cache` are process-local, and a completed write means close
+plus rename rather than `fsync`. The module docstring of
+`sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
+extra-config key.
+
 ### Deployment with HF3FS
 
 Here is an example of deploying DeepSeek-R1 with HiCache-HF3FS. For more details, see the [HF3FS Documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/README.md).

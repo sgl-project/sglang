@@ -160,6 +160,8 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name in ("file", "sim"):
             return backend_class(storage_config)
+        elif backend_name == "fast_file":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
@@ -199,6 +201,12 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "fast_file",
+    "sglang.srt.mem_cache.storage.fast_file.fast_file_store",
+    "HiCacheFastFile",
 )
 
 StorageBackendFactory.register_backend(
