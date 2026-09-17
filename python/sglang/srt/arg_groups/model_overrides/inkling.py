@@ -48,7 +48,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["mamba_full_memory_ratio"] = 0.1
     # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
     # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
-    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
+    # Inkling, so pin it here. Yields to an explicit --mamba-radix-cache-strategy.
     #
     # Compared against the unresolved token rather than the class default: the
     # default only answers "unset" while nothing has declared the field first,
@@ -58,6 +58,10 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # spec today, but giving it one would silently stop this pin from firing.
     if cfg.mamba_radix_cache_strategy == "auto":
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # The generic resolution never sets the arch-derived leaf for Inkling, and
+    # handle_mamba_radix_cache rejects extra_buffer on a model without it.
+    if not cfg.disable_radix_cache:
+        overrides["uses_mamba_radix_cache"] = True
     # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
     # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3

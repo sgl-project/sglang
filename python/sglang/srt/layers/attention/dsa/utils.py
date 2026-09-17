@@ -128,8 +128,12 @@ def is_dsa_enable_prefill_cp():
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
-def is_dsa_prefill_cp_round_robin_split():
+def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
+
+
+# Retain the name imported by the unchanged HIP radix attention backend.
+is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
@@ -145,13 +149,13 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
-def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
+def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return (
-        is_dsa_prefill_cp_round_robin_split()
+        is_dsa_prefill_cp_interleave()
         and seq_len > 0
         and seq_len >= cp_size
         and cp_size > 1
@@ -161,10 +165,10 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.layers.cp.utils import is_cp_active
 
     # CP-v2 already pads each rank-local shard to its physical size
-    if is_cp_v2_active(forward_batch):
+    if is_cp_active(forward_batch):
         return forward_batch.attn_cp_metadata.per_rank_actual_token[
             get_parallel().attn_cp_rank
         ]
@@ -185,16 +189,14 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
         tokens = global_num_tokens[0]
-    if can_dsa_prefill_cp_round_robin_split(forward_batch):
+    if can_dsa_prefill_cp_interleave(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     attn_cp_size = get_parallel().attn_cp_size
-    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
-        forward_batch
-    )
+    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens
