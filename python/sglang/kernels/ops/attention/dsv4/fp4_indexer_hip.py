@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_row
-from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )

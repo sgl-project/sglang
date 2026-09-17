@@ -18,7 +18,7 @@ register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
     """RoPE plus fake FP4 quantization, fused for CUDA BF16 inputs."""
     if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
-        from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
@@ -105,7 +105,7 @@ class TestCompressedKVQuant(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires a GPU")
     def test_triton_matches_torch_for_both_quantization_rules(self):
-        from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
