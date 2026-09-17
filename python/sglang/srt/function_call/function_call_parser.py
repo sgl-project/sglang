@@ -295,33 +295,11 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
         should_constrain_auto = tool_choice == "auto" and strict_requested
-        if (
-            tool_choice == "auto"
-            and not parallel_tool_calls
-            and getattr(
-                self.detector,
-                "reject_parallel_auto_without_constraints",
-                False,
-            )
-        ):
-            raise ValueError(
-                f"{type(self.detector).__name__} cannot enforce "
-                "parallel_tool_calls=False with automatic tool choice"
-            )
-        if (
-            strict_requested
-            and tool_choice == "auto"
-            and getattr(
-                self.detector,
-                "reject_strict_without_constraints",
-                False,
-            )
-            and not self.detector.supports_structural_tag()
-        ):
-            raise ValueError(
-                f"{type(self.detector).__name__} does not support strict tool "
-                "constraints"
-            )
+        self.detector.validate_structure_constraint_request(
+            tool_choice,
+            parallel_tool_calls,
+            strict_requested,
+        )
 
         try:
             if (

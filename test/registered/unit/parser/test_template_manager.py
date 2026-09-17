@@ -1009,27 +1009,20 @@ class TestResolveAutoParsers(CustomTestCase):
         )
         tokenizer = _DummyTokenizer([], chat_template="<|channel>content")
         tokenizer.response_template = {
-            "defaults": {"role": "assistant"},
-            "start_anchor": ["<|turn>model\n", "<tool_response|>"],
+            "start_anchor": "<assistant>",
             "fields": {
-                "content": {
-                    "close": ["<turn|>", "<|tool_response>", "<eos>"],
-                    "content": "text",
-                },
+                "content": {"content": "text"},
                 "thinking": {
-                    "open": "<|channel>thought\n",
-                    "close": "<channel|>",
-                    "content": "text",
+                    "open": "<think>",
+                    "close": "</think>",
                 },
                 "tool_calls": {
-                    "open_pattern": r"<\|tool_call>call:(?P<name>\w+)",
-                    "close": "<tool_call|>",
+                    "open": "<call>",
+                    "close": "</call>",
                     "content": "json",
-                    "repeats": True,
                     "transform": {
-                        "type": "function",
                         "function": {
-                            "name": "{name}",
+                            "name": "tool",
                             "arguments": "{content}",
                         },
                     },
@@ -1072,42 +1065,34 @@ class TestResolveAutoParsers(CustomTestCase):
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_invalid_response_template_uses_existing_detection(self):
-        args = self._make_server_args(
-            reasoning_parser="auto",
-            tool_call_parser="auto",
-        )
-        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
-        tokenizer.response_template = {"fields": {}}
-
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
-            resolve_auto_parsers(args)
-
-        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
-        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
-
-    def test_unsupported_response_template_fields_use_existing_detection(self):
-        args = self._make_server_args(
-            reasoning_parser="auto",
-            tool_call_parser="auto",
-        )
-        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
-        tokenizer.response_template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content": "text"},
-                "metadata": {
-                    "open": "<metadata>",
-                    "close": "</metadata>",
-                    "content": "json",
+        templates = {
+            "invalid": {"fields": {}},
+            "unsupported": {
+                "start_anchor": "<assistant>",
+                "fields": {
+                    "content": {"content": "text"},
+                    "metadata": {
+                        "open": "<metadata>",
+                        "close": "</metadata>",
+                        "content": "json",
+                    },
                 },
             },
         }
+        for name, template in templates.items():
+            with self.subTest(name=name):
+                args = self._make_server_args(
+                    reasoning_parser="auto",
+                    tool_call_parser="auto",
+                )
+                tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+                tokenizer.response_template = template
 
-        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
-            resolve_auto_parsers(args)
+                with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
 
-        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
-        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+                self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+                self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)

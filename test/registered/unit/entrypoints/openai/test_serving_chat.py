@@ -19,7 +19,6 @@ import unittest
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -38,7 +37,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _decode_response_parser_prefix,
-    _encode_reasoning_end_token_ids,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -171,36 +169,6 @@ class TestResponseParserPrefixDecoding(unittest.TestCase):
 
         self.assertEqual(decoded, "<first><second>")
         self.assertFalse(tokenizer.skip_special_tokens)
-
-    def test_encodes_response_template_reasoning_terminator(self):
-        tokenizer = Mock()
-        tokenizer.encode.return_value = [17, 18]
-        detector = SimpleNamespace(think_end_token="<end_thinking>")
-
-        token_ids = _encode_reasoning_end_token_ids(tokenizer, detector)
-
-        self.assertEqual(token_ids, [17, 18])
-        tokenizer.encode.assert_called_once_with(
-            "<end_thinking>",
-            add_special_tokens=False,
-        )
-
-    def test_missing_or_invalid_reasoning_terminator_is_ignored(self):
-        tokenizer = Mock()
-        tokenizer.encode.return_value = []
-
-        self.assertIsNone(
-            _encode_reasoning_end_token_ids(
-                tokenizer,
-                SimpleNamespace(think_end_token=""),
-            )
-        )
-        self.assertIsNone(
-            _encode_reasoning_end_token_ids(
-                tokenizer,
-                SimpleNamespace(think_end_token="<end_thinking>"),
-            )
-        )
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
@@ -711,6 +679,58 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+            self.tm.tokenizer.decode.assert_not_called()
+
+    def test_response_template_prefix_uses_prompt_token_ids(self):
+        processed_messages = MessageProcessingResult(
+            "prompt decoded with default spacing",
+            [1, 2, 3],
+            None,
+            None,
+            [],
+            [],
+            None,
+        )
+        self.chat.tool_call_parser = "response_template"
+        self.basic_req.input_ids = [1, 2, 3]
+        self.tm.tokenizer.decode.return_value = "<first><second>"
+
+        with patch.object(
+            self.chat,
+            "_process_messages",
+            return_value=processed_messages,
+        ):
+            _, request = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(request._response_parser_prefix, "<first><second>")
+        self.tm.tokenizer.decode.assert_called_once_with(
+            [1, 2, 3],
+            skip_special_tokens=False,
+            spaces_between_special_tokens=False,
+        )
+
+    def test_response_template_prefix_uses_engine_prompt_text(self):
+        processed_messages = MessageProcessingResult(
+            "exact engine prompt",
+            [],
+            None,
+            None,
+            [],
+            [],
+            None,
+        )
+        self.chat.reasoning_parser = "response_template"
+        self.tm.model_config.is_multimodal = True
+
+        with patch.object(
+            self.chat,
+            "_process_messages",
+            return_value=processed_messages,
+        ):
+            _, request = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(request._response_parser_prefix, "exact engine prompt")
+        self.tm.tokenizer.decode.assert_not_called()
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(

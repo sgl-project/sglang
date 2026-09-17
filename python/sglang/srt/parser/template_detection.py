@@ -866,7 +866,7 @@ def resolve_auto_parsers(server_args) -> None:
         response_template = resolve_detector_response_template(tokenizer, None)
         if response_template is not None:
             try:
-                fields = validate_response_template_for_serving(response_template)
+                template = validate_response_template_for_serving(response_template)
             except (TypeError, ValueError) as exc:
                 logger.warning(
                     "Ignoring invalid response_template from tokenizer configuration: %s",
@@ -878,7 +878,7 @@ def resolve_auto_parsers(server_args) -> None:
                     "tool_call_parser": "tool_calls",
                 }
                 for attr in needs:
-                    if parser_fields[attr] in fields:
+                    if parser_fields[attr] in template.fields:
                         detected[attr] = "response_template"
                 if detected:
                     logger.info(

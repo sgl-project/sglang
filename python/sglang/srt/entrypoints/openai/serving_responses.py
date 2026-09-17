@@ -581,9 +581,13 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
-            request._response_parser_prefix = self._response_parser_prefix(
-                adapted_request
-            )
+            if "response_template" in (
+                self.reasoning_parser,
+                self.tool_call_parser,
+            ):
+                request._response_parser_prefix = self._response_parser_prefix(
+                    adapted_request
+                )
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)

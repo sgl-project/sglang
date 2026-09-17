@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sglang.srt.parser.chat_parsing.response_templates import ResponseTemplate
 
 RESPONSE_TEMPLATE_CONFIG_KEY = "response_template"
 SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
@@ -27,7 +30,7 @@ SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
 )
 
 
-def validate_response_template_for_serving(template: dict) -> set[str]:
+def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
     """Validate the template and reject semantic fields serving cannot route."""
     from sglang.srt.parser.chat_parsing.response_templates import (
         load_response_template,
@@ -44,7 +47,7 @@ def validate_response_template_for_serving(template: dict) -> set[str]:
             f"{sorted(unsupported)}. Supported fields are: "
             f"{sorted(SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
         )
-    return fields
+    return loaded
 
 
 def resolve_detector_response_template(
@@ -55,14 +58,13 @@ def resolve_detector_response_template(
     if tokenizer is None:
         return fallback
 
-    cached = getattr(tokenizer, RESPONSE_TEMPLATE_CONFIG_KEY, None)
-    if isinstance(cached, dict):
-        return cached
+    template = getattr(tokenizer, RESPONSE_TEMPLATE_CONFIG_KEY, None)
+    if isinstance(template, dict):
+        return template
 
     init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
     template = init_kwargs.get(RESPONSE_TEMPLATE_CONFIG_KEY)
     if isinstance(template, dict):
-        setattr(tokenizer, RESPONSE_TEMPLATE_CONFIG_KEY, template)
         return template
 
     return fallback

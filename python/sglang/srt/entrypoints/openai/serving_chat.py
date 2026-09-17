@@ -142,22 +142,6 @@ def _decode_response_parser_prefix(tokenizer, token_ids: List[int]) -> str:
         return tokenizer.decode(token_ids, **kwargs)
 
 
-def _encode_reasoning_end_token_ids(tokenizer, detector) -> Optional[List[int]]:
-    terminator = getattr(detector, "think_end_token", "")
-    if not terminator:
-        return None
-    token_ids = tokenizer.encode(terminator, add_special_tokens=False)
-    if hasattr(token_ids, "tolist"):
-        token_ids = token_ids.tolist()
-    if (
-        not isinstance(token_ids, list)
-        or not token_ids
-        or any(type(token_id) is not int or token_id < 0 for token_id in token_ids)
-    ):
-        return None
-    return list(token_ids)
-
-
 def _has_incomplete_tool_call(parser, tool_index: Optional[int] = None) -> bool:
     detector = getattr(parser, "detector", parser)
     indices = getattr(detector, "incomplete_tool_call_indices", None)
@@ -1321,7 +1305,13 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
-        request._response_parser_prefix = self._response_parser_prefix(adapted_request)
+        if "response_template" in (
+            self.reasoning_parser,
+            self.tool_call_parser,
+        ):
+            request._response_parser_prefix = self._response_parser_prefix(
+                adapted_request
+            )
         return adapted_request, request
 
     def _response_parser_prefix(self, adapted_request: GenerateReqInput) -> str:
@@ -1467,19 +1457,31 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         result.skip_special_tokens = request.skip_special_tokens
-        if (
-            self.reasoning_parser in ("k2_horizon", "response_template")
-            and thinking_mode
-        ):
-            token_ids = _encode_reasoning_end_token_ids(
-                self.tokenizer_manager.tokenizer,
-                self._reasoning_detector,
+        if self.reasoning_parser == "k2_horizon" and thinking_mode:
+            parser = ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                force_reasoning=True,
+                request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
-            if token_ids is None and self.reasoning_parser == "k2_horizon":
+            token_ids = self.tokenizer_manager.tokenizer.encode(
+                parser.detector.think_end_token,
+                add_special_tokens=False,
+            )
+            if hasattr(token_ids, "tolist"):
+                token_ids = token_ids.tolist()
+            if (
+                not isinstance(token_ids, list)
+                or not token_ids
+                or any(
+                    type(token_id) is not int or token_id < 0 for token_id in token_ids
+                )
+            ):
                 raise ValueError(
                     "The selected K2 reasoning terminator could not be encoded"
                 )
-            result.reasoning_end_token_ids = token_ids
+            result.reasoning_end_token_ids = list(token_ids)
         return result
 
     def _apply_jinja_template(
