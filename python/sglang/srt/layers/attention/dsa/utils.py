@@ -115,7 +115,7 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu() or is_musa():
+    if is_npu() or is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -125,15 +125,13 @@ def is_dsa_enable_prefill_cp():
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
+    if is_hip():
+        return is_deepseek_v4(hf_config)
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
-
-
-# Retain the name imported by the unchanged HIP radix attention backend.
-is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the

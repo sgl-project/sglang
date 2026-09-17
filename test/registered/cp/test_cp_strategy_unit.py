@@ -98,7 +98,7 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_is_disabled(self):
+    def test_hip_dsa_cp_uses_generic_strategy(self):
         parallel = SimpleNamespace(
             attn_cp_size=2,
         )
@@ -116,7 +116,33 @@ class TestCPStrategyUnit(CustomTestCase):
             patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
             patch(
                 "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_v4",
                 return_value=True,
+            ),
+        ):
+            self.assertTrue(is_dsa_enable_prefill_cp())
+
+    def test_hip_non_v4_dsa_cp_remains_disabled(self):
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=2),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.process_model_config",
+                return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+            ),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_v4",
+                return_value=False,
             ),
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())

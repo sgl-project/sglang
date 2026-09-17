@@ -121,6 +121,11 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     backend = _RecordingBackend()
     forward_batch = SimpleNamespace(forward_mode=mode)
 
+    def materialize(payload, *_):
+        # Stand in for another CP rank while keeping the collective's packed
+        # byte-row contract visible to the assertions below.
+        return torch.cat((payload, payload[:1]), dim=0)
+
     with (
         envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
         envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.override(fused_verify),
@@ -136,7 +141,13 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             deepseek_v4, "get_parallel", return_value=SimpleNamespace(tp_size=8)
         ),
         patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
-        patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=cp),
+        patch.object(deepseek_v4, "is_cp_active", return_value=cp),
+        patch.object(
+            deepseek_v4,
+            "cp_materialize_global_token_order",
+            side_effect=materialize,
+        ) as materialize_mock,
+        patch.object(torch.cuda, "current_stream", return_value=object()),
         patch.object(deepseek_v4, "fused_rope_inplace", return_value=None),
         patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
         patch.object(deepseek_v4, "_is_gfx942_supported", False),
@@ -149,6 +160,7 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             forward_batch,
         )
 
+    layer.materialize_mock = materialize_mock
     return layer, backend.calls[0]
 
 
@@ -230,6 +242,15 @@ class TestUnifiedFp8QPair(unittest.TestCase):
         # unlike prefill the ring write happens before attention, but it is the
         # same flag and the same pair
         self.assertTrue(call["save_kv_cache"])
+        layer.materialize_mock.assert_not_called()
+
+    def test_fp8_draft_extend_keeps_its_local_packed_pair(self):
+        layer, call = _run(fp8=True, mode=ForwardMode.DRAFT_EXTEND_V2)
+
+        self.assertEqual(tuple(call["k"].shape), (TOKENS, NOPE_ROW_BYTES))
+        self.assertEqual(tuple(call["k_rope"].shape), (TOKENS, ROPE_DIM))
+        self.assertTrue(call["save_kv_cache"])
+        layer.materialize_mock.assert_not_called()
 
     def test_fp8_target_verify_needs_the_fused_store(self):
         """nothing else packs the pair, so the unfused arm would hand over bf16"""
@@ -246,14 +267,26 @@ class TestUnifiedFp8QPair(unittest.TestCase):
         self.assertNotIn("k_rope", call)
         self.assertIsNone(layer.prepare_kwargs["k_nope_out"])
 
-    def test_fp8_prefill_cp_is_refused_with_a_reason(self):
-        """the gather hands kv back in global token order after norm+RoPE, so
-        packing would have to move ahead of it -- refuse rather than guess"""
-        with self.assertRaisesRegex(NotImplementedError, "cp_size"):
-            _run(fp8=True, mode=ForwardMode.EXTEND, cp=True)
+    def test_fp8_prefill_cp_gathers_one_byte_packed_pair(self):
+        layer, call = _run(fp8=True, mode=ForwardMode.EXTEND, cp=True)
+
+        layer.materialize_mock.assert_called_once()
+        packed = layer.materialize_mock.call_args.args[0]
+        self.assertEqual(packed.dtype, torch.uint8)
+        self.assertEqual(
+            tuple(packed.shape),
+            (TOKENS, NOPE_ROW_BYTES + ROPE_DIM * torch.bfloat16.itemsize),
+        )
+        # The fake peer adds one globally ordered row. Both halves must grow
+        # together and stay contiguous for attention and the unified ring write.
+        self.assertEqual(tuple(call["k"].shape), (TOKENS + 1, NOPE_ROW_BYTES))
+        self.assertEqual(tuple(call["k_rope"].shape), (TOKENS + 1, ROPE_DIM))
+        self.assertTrue(call["k"].is_contiguous())
+        self.assertTrue(call["k_rope"].is_contiguous())
+        self.assertTrue(call["save_kv_cache"])
 
     def test_bf16_prefill_cp_is_left_alone(self):
-        """the refusal is fp8-only, CP prefill without it keeps working"""
+        """the byte-packed gather is fp8-only; bf16 CP keeps its existing path"""
         _, call = _run(fp8=False, mode=ForwardMode.EXTEND, cp=True)
 
         self.assertNotIn("q_rope", call)
@@ -261,9 +294,10 @@ class TestUnifiedFp8QPair(unittest.TestCase):
 
     def test_fp8_decode_under_cp_is_not_refused(self):
         """only prefill packs this chunk; decode reads rows the ring already has"""
-        _, call = _run(fp8=True, mode=ForwardMode.DECODE, cp=True)
+        layer, call = _run(fp8=True, mode=ForwardMode.DECODE, cp=True)
 
         self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
+        layer.materialize_mock.assert_not_called()
 
     def test_sink_is_sliced_to_this_rank(self):
         _, call = _run(fp8=True)
