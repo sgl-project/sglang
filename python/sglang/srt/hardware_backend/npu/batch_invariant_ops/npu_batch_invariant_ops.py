@@ -82,6 +82,9 @@ class NativeFIAGraphHandler(NpuGraphOpHandler):
         if func is out_op:
             return func, args, kwargs
         workspace = npu_fia_batch_invariant_get_max_workspace(*args, **kwargs)
+        # Match infer_output's keyword-only schema; omit absent kwargs to keep
+        # its defaults. Sequence lengths are not accepted by this helper;
+        # they remain in kwargs for FIA execution and graph updates.
         keys = [
             "input_layout",
             "quant_scale2",
@@ -91,6 +94,10 @@ class NativeFIAGraphHandler(NpuGraphOpHandler):
             "softmax_lse_flag",
             "query_rope",
         ]
+        # FIA positional args are (query, key, value): args[0] is Q, args[2] is V.
+        # This helper derives output shapes/dtypes from Q, V and the options
+        # above, then allocates (attention_output, softmax_lse) for .out.
+        # It does not compute attention; .out fills these buffers.
         output = ops._npu_fused_infer_attention_score_batch_invariant_infer_output(
             args[0], args[2], **{k: kwargs[k] for k in keys if k in kwargs}
         )
