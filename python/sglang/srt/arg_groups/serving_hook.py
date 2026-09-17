@@ -851,11 +851,6 @@ def handle_multimodal_feature_transport(server_args: Any):
             raise ValueError(
                 "--mm-feature-transport=cuda_vmm does not support pipeline parallelism."
             )
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--mm-feature-transport=cuda_vmm is not supported with "
-                "SGLANG_RUST_SERVER."
-            )
         pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
         handle_kind = "CUDA FABRIC" if cfg.nnodes > 1 else "POSIX FD"
         logger.info(
