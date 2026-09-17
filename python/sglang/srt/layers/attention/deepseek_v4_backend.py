@@ -180,11 +180,11 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     index_topk: int
+    # Sorted compress ratios present in this stage; absent ratios keep no
+    # buffers or schedules.
+    present_ratios: Tuple[int, ...]
     # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    # Sorted compress ratios present in this stage; absent ratios keep no
-    # buffers or schedules. The default (4, 128) serves metadata built by hand.
-    present_ratios: Tuple[int, ...] = (4, 128)
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None

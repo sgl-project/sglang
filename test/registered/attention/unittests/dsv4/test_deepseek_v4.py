@@ -342,6 +342,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
             index_topk=128,
+            present_ratios=(4, 128),
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
