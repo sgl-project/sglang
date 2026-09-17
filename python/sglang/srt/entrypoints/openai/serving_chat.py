@@ -1442,16 +1442,14 @@ class OpenAIServingChat(OpenAIServingBase):
             # dsv4/dsv41/dsv32 encoding path
             messages = copy.deepcopy(messages)
             is_dsv41 = self.chat_encoding_spec == "dsv41"
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
 
-            if is_dsv41:
-                # The V4.1 encoder consumes OpenAI parts lists itself (image
-                # parts become placeholders), so no flattening here.
-                for msg in messages:
-                    if msg.get("content") is None:
-                        msg["content"] = ""
-            else:
-                # dsv4/dsv32 are text-only and consume string content; flatten
-                # OpenAI parts-list content here so the encoder sees a plain string.
+            # The V4.1 encoder consumes OpenAI parts lists itself (image parts
+            # become placeholders). dsv4/dsv32 are text-only and consume string
+            # content; flatten parts-list content so the encoder sees a string.
+            if not is_dsv41:
                 for i, msg in enumerate(messages):
                     if isinstance(msg.get("content"), list):
                         messages[i] = process_content_for_template_format(
@@ -1459,8 +1457,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                 for msg in messages:
-                    if msg.get("content") is None:
-                        msg["content"] = ""
                     processed_msg = process_content_for_template_format(
                         msg,
                         template_content_format,

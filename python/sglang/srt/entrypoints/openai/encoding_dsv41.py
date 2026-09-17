@@ -530,25 +530,16 @@ def sort_tool_results_by_call_order(
 
 
 def _is_image_block(block: Dict[str, Any]) -> bool:
-    return isinstance(block, dict) and block.get("type") in ("image", "image_url")
+    return isinstance(block, dict) and block.get("type") == "image_url"
 
 
 def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a supported image block into an internal image record."""
-    record: Dict[str, Any] = {"type": "image"}
-    if block.get("type") == "image_url":
-        image_url = block.get("image_url")
-        if isinstance(image_url, str):
-            record["url"] = image_url
-        else:
-            record["url"] = (image_url or {}).get("url", "")
-    else:
-        for key in ("source", "url", "data"):
-            if key in block:
-                record[key] = block[key]
-    if not any(record.get(key) for key in ("source", "url", "data")):
+    """Normalize an ``image_url`` part into an internal image record."""
+    image_url = block.get("image_url")
+    url = image_url if isinstance(image_url, str) else (image_url or {}).get("url", "")
+    if not url:
         raise ValueError("Image block does not contain a valid source")
-    return record
+    return {"url": url}
 
 
 def _process_image_blocks(
