@@ -20,6 +20,9 @@ if ENABLE_JIT_DEEPGEMM:
     from deep_gemm.utils.layout import (
         get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
     )
+    from deep_gemm import (
+        transform_sf_into_required_layout as _transform_sf_into_required_layout,
+    )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
         """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
@@ -35,6 +38,27 @@ if ENABLE_JIT_DEEPGEMM:
         preserved.
         """
         out = _get_mn_major_tma_aligned_tensor(sf)
+        if out.data_ptr() == sf.data_ptr():
+            assert out.shape == sf.shape and out.stride() == sf.stride()
+            return sf
+        return out
+
+    def transform_sf_into_required_layout(
+        sf: torch.Tensor, *args, **kwargs
+    ) -> torch.Tensor:
+        """Transform ``sf`` into the layout DeepGEMM requires, preserving ownership.
+
+        Same hazard as ``get_mn_major_tma_aligned_tensor`` above: the
+        check-only fast paths (e.g. the FP32 128x128 recipe on SM90) return a
+        NON-OWNING ``torch::from_blob`` alias of ``sf`` across the TVM-FFI
+        boundary, and callers rebind the result over their only reference
+        (``param.data = transform_sf_into_required_layout(param.data, ...)``),
+        which frees the storage while the GEMM still reads through the alias
+        (sgl-project/sglang#39684). Hand back ``sf`` itself in that case so
+        ownership is preserved. Mirrors the guard above (#32188) until the
+        library-level fix (sgl-project/DeepGEMM#91) lands in a release.
+        """
+        out = _transform_sf_into_required_layout(sf, *args, **kwargs)
         if out.data_ptr() == sf.data_ptr():
             assert out.shape == sf.shape and out.stride() == sf.stride()
             return sf

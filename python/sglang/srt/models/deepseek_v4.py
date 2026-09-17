@@ -3526,7 +3526,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         from sglang.srt.layers import deep_gemm_wrapper
 
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            from deep_gemm import transform_sf_into_required_layout
+            from sglang.srt.layers.deep_gemm_wrapper import (
+                transform_sf_into_required_layout,
+            )
 
         if is_nextn:
             layers = [self.model.decoder]
