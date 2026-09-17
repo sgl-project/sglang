@@ -465,8 +465,10 @@ class DSV4RawDecodeMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    max_seq_len: Optional[int] = None
 
     def copy_(self, other: DSV4RawDecodeMetadata):
+        assert self.max_seq_len == other.max_seq_len
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
@@ -525,6 +527,9 @@ class DeepseekV4AttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.cuda_graph_seq_lens_enabled = (
+            model_runner.server_args.dsa_cuda_graph_seq_lens is not None
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -686,6 +691,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
+                max_seq_len=(max_seq_len if self.cuda_graph_seq_lens_enabled else None),
             )
 
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1041,7 +1047,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=raw_metadata.max_seq_len or self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -1226,13 +1232,17 @@ class DeepseekV4AttnBackend(
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        seq_len_bucket = getattr(forward_batch, "max_seq_len_override", None)
+        chosen_max_seq_len = seq_len_bucket or self.MAX_SEQ_LEN_FOR_CAPTURE
+        if seq_len_bucket is not None:
+            assert bucket == _GraphBucket.DECODE_OR_IDLE
+            assert 0 < seq_len_bucket <= self.MAX_SEQ_LEN_FOR_CAPTURE
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
             actual_max_seq_len = seq_lens_cpu.max().item()
             assert actual_max_seq_len <= chosen_max_seq_len
 
-        graph_key = bs
+        graph_key = (bs, seq_len_bucket) if seq_len_bucket is not None else bs
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
@@ -1510,7 +1520,7 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Union[int, tuple[int, int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -1542,7 +1552,7 @@ class DeepseekV4AttnBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs: Union[int, tuple[int, int]],
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,

@@ -72,6 +72,10 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.seq_len_buckets import (
+    normalize_seq_len_buckets,
+    select_seq_len_bucket,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -278,6 +282,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        self.capture_seq_lens = self._init_seq_len_buckets()
+        self._graph_seq_len = None
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -416,6 +422,53 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
 
+    def _init_seq_len_buckets(self):
+        args = self.model_runner.server_args
+        buckets = args.dsa_cuda_graph_seq_lens
+        if buckets is None:
+            return None
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        if (
+            not isinstance(self.attn_backend, DeepseekV4AttnBackend)
+            or self.capture_forward_mode != ForwardMode.DECODE
+            or not self.model_runner.spec_algorithm.is_none()
+            or args.tp_size != 1
+            or args.pp_size != 1
+            or args.dp_size != 1
+            or args.enable_dp_attention
+            or self.enable_two_batch_overlap
+            or self.enable_pdmux
+            or self.enable_torch_compile
+            or args.enable_lora
+            or args.enable_hisparse
+            or args.disaggregation_mode != "null"
+            or args.cuda_graph_config.decode.backend != "full"
+            or args.dsa_topk_backend not in ("flashinfer-gvr", "auto")
+        ):
+            raise ValueError(
+                "--dsa-cuda-graph-seq-lens currently requires DSv4 ordinary decode, "
+                "TP/PP/DP=1, full CUDA graphs and flashinfer-gvr/auto; "
+                "speculation, torch.compile, LoRA, HiSparse, disaggregation, "
+                "TBO and PDMux are unsupported"
+            )
+        result = normalize_seq_len_buckets(
+            buckets, self.attn_backend.MAX_SEQ_LEN_FOR_CAPTURE
+        )
+        logger.info("DSv4 decode graph sequence-length buckets: %s", result)
+        return result
+
+    def _select_graph_seq_len(self, forward_batch):
+        if self.capture_seq_lens is None:
+            return None
+        lengths = forward_batch.seq_lens_cpu
+        if lengths is None:
+            return None  # Never synchronize the GPU merely to choose a graph.
+        maximum = int(lengths.max().item()) if lengths.numel() else 1
+        return select_seq_len_bucket(self.capture_seq_lens, maximum)
+
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
         flashinfer-autotune dummy forward instead of allocating a throwaway set
@@ -444,6 +497,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            seq_len=self._graph_seq_len,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -501,6 +555,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        seq_len = self._select_graph_seq_len(forward_batch)
+        if self.capture_seq_lens is not None and seq_len is None:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -533,10 +590,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = self._make_graph_key(
-            cuda_graph_bs,
+        graph_key = ShapeKey(
+            size=cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            seq_len=seq_len,
         )
 
         is_bs_supported = (
@@ -909,7 +967,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens=bs * self.captured_req_width,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    for seq_len in reversed(self.capture_seq_lens or [None]):
+                        self._graph_seq_len = seq_len
+                        if seq_len is not None:
+                            logger.info(
+                                "Capturing DSv4 decode graph: bs=%d seq_len=%d",
+                                bs,
+                                seq_len,
+                            )
+                        self.capture_one_shape(bs, forward, stream_idx, variant_label)
+        self._graph_seq_len = None
 
     def capture_one_shape(
         self,
@@ -930,6 +997,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        forward_batch.max_seq_len_override = self._graph_seq_len
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1073,6 +1141,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
+            if self.capture_seq_lens is not None:
+                assert self._graph_seq_len == self._select_graph_seq_len(
+                    forward_batch
+                ), "Pre-planned decode metadata belongs to a different length bucket"
             graph_size_key = (
                 self._ragged_graph_size
                 if is_ragged
@@ -1105,6 +1177,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
+        self._graph_seq_len = self._select_graph_seq_len(forward_batch)
+        if self.capture_seq_lens is not None and self._graph_seq_len is None:
+            raise ValueError("Decode batch has no supported sequence-length graph")
 
         raw_bs = forward_batch.batch_size
 
@@ -1186,6 +1261,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        fb_view.max_seq_len_override = self._graph_seq_len
         attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
@@ -1235,12 +1311,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d seq_len=%s%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
+                    self._replay_graph_key.seq_len,
                     (
                         f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode

@@ -30,8 +30,10 @@ class ShapeKey:
     variant_label: optional execution variant (for example, "lora",
         "nolora", or "chunked_prefix"), or None for runners that don't
         record per-variant graphs.
+    seq_len: optional token-length capacity for DSv4 decode graphs.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    seq_len: Optional[int] = None

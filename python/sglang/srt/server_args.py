@@ -1822,6 +1822,13 @@ class ServerArgs:
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
         NS("exec.graph"),
     ] = None
+    dsa_cuda_graph_seq_lens: A[
+        Optional[List[int]],
+        "Opt-in DSv4 ordinary decode CUDA graph sequence-length buckets (token units). "
+        "Requires TP1, full graphs, and a FlashInfer DSA top-k backend. "
+        "The full request-table capacity is always included as a fallback.",
+        NS("exec.graph"),
+    ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
