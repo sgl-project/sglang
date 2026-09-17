@@ -178,6 +178,8 @@ class NgramEmbeddingManager:
             history = self.engram_hasher.history
             rows = []
             for req in batch.reqs:
+                # full_untruncated_fill_ids is only refreshed on the extend and
+                # decode paths, which a PD decode request has not run yet.
                 fill_ids = req.origin_input_ids + req.output_ids
                 end = len(fill_ids) - 1
                 ids = fill_ids[max(0, end - n1) : end]
