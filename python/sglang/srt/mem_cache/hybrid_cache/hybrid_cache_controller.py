@@ -1061,7 +1061,6 @@ class HybridCacheController(BaseHiCacheController):
             extra_info=self._storage_trace_extra(operation, include_request_id=True)
             | ({"pp_rank": pp_rank} if pp_rank is not None else {})
             or None,
-
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(

@@ -140,7 +140,7 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         self.assertEqual(pg_extra.extra_info, {"request_id": "r-1"})
         self.assertIsNone(pg_extra.prefix_keys)
         # KV-derived sidecar batch_get_v2 receives the same extra_info.
-        gv_extra = ctrl.storage_backend.batch_get_v2.call_args[0][1]
+        gv_extra = ctrl.storage_backend.batch_get_v2.call_args.kwargs["extra_info"]
         self.assertEqual(gv_extra.extra_info, {"request_id": "r-1"})
         # The PrefetchAck carries the request id.
         ack = ctrl.prefetch_sync_queue.put.call_args[0][0]
@@ -345,13 +345,14 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             is_terminated=lambda: False,
             hash_value=["h0", "h1"],
             request_id="r-1",
+            prefix_keys=None,
             sidecar_hash_values=None,
             sidecar_hit_pages=0,
         )
         ctrl._page_transfer_sidecar(op, kv_completed_pages=2)
 
-        # batch_get_v2 carries a request_id-only extra_info (no prefix_keys).
-        gv_extra = ctrl.storage_backend.batch_get_v2.call_args[0][1]
+        # batch_get_v2 carries a request_id-only extra_info; op forwards no prefix_keys (None).
+        gv_extra = ctrl.storage_backend.batch_get_v2.call_args.kwargs["extra_info"]
         self.assertEqual(gv_extra.extra_info, {"request_id": "r-1"})
         self.assertIsNone(gv_extra.prefix_keys)
         # The non-KV sidecar plumbing was driven.
