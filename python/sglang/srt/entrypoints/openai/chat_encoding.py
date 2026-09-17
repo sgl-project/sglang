@@ -105,7 +105,7 @@ def resolve_dsv4_reasoning_effort_profile(
     )
 
 
-def is_deepseek_v41_config(*, arch: str, model_type: str) -> bool:
+def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
     """Check model_type before matching the DeepseekV4 architecture substring;
     V4.1 configs can also use the V4 architecture name.
     """
@@ -135,7 +135,7 @@ def resolve_chat_encoding_spec(
     architectures = hf_config.architectures
     arch = architectures[0] if architectures else ""
 
-    if is_deepseek_v41_config(arch=arch, model_type=hf_config.model_type):
+    if is_deepseek_v41_arch(arch=arch, model_type=hf_config.model_type):
         return "dsv41"
     if "DeepseekV4" in arch:
         return "dsv4"
@@ -154,19 +154,18 @@ def resolve_chat_encoding_spec(
     return None
 
 
-def resolve_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
+def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
     """Map an API ``reasoning_effort`` onto what the V4.1 encoder accepts.
 
-    Tiers pass through; an OpenAI float in [0, 0.99] becomes a 1-100 budget;
-    an int budget (only reachable via ``chat_template_kwargs``) passes through
-    when in range. None means unsupported and the caller applies its default.
+    An int budget only reaches here through ``chat_template_kwargs``; None
+    means unsupported, and the caller applies its default.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value if 1 <= value <= 100 else None
     if isinstance(value, float):
-        return min(100, max(1, round(value * 100)))
+        return max(1, round(value * 100)) if 0.0 <= value <= 0.99 else None
     if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
         return value
     return None
@@ -191,10 +190,12 @@ def dsv41_tool_payload(tool: Any) -> Dict[str, Any]:
     return payload
 
 
-def default_dsv41_reasoning_effort_from_env(raw: str) -> Union[str, int]:
+def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, int]:
     """Parse ``SGLANG_DSV41_REASONING_EFFORT``; raises so a bad value fails at boot."""
+    if raw is None or not raw.strip():
+        return encoding_dsv41.DEFAULT_REASONING_EFFORT
     value: Any = int(raw) if raw.strip().isdigit() else raw.strip()
-    effort = resolve_dsv41_reasoning_effort(value)
+    effort = parse_dsv41_reasoning_effort(value)
     if effort is None:
         raise ValueError(
             f"Invalid SGLANG_DSV41_REASONING_EFFORT={raw!r}; expected one of "
