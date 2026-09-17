@@ -496,10 +496,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
-        # Inkling requires extra_buffer (models/inkling.py asserts
-        # get_exec().mamba.enable_mamba_extra_buffer); _inkling_overrides pins
-        # the strategy and the uses_mamba_radix_cache leaf, so
-        # validate_mamba_extra_buffer must accept these archs.
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
     }
