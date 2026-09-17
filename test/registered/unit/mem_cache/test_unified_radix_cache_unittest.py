@@ -3272,9 +3272,7 @@ class UnifiedRadixCacheSuite:
         cache_salt=None,
         last_node=None,
     ):
-        """Request stand-in for consuming a staged prefetch. A real Req, not a
-        mock: the Mamba handoff reads and writes its state-slot fields, and a
-        Mock's auto-attributes would silently pass for a device slot."""
+        """Use a real Req so mock auto-attributes cannot masquerade as slots."""
         req = Req(
             rid=req_id.rid,
             origin_input_text="",
@@ -3790,10 +3788,7 @@ class UnifiedRadixCacheSuite:
     # ================================================================
 
     def test_buffer_only_accepts_mamba(self):
-        """MAMBA is in the supported component set, and the assembled stack
-        clears the buffer-only fences: a host state pool with room for one
-        staging slot plus one in the loads reserve, and no int8 checkpoint
-        pool (a load-back restores a raw state slot, not a checkpoint slot)."""
+        """FULL+MAMBA initializes with raw checkpoints and two staging slots."""
         if (
             self.cfg.components
             != (

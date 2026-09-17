@@ -101,23 +101,11 @@ PAGE_SIZE = 128
 # handover from prompt tokens to generated ones.
 MAX_NEW_TOKENS = 1024
 
-# flush_cache waits for a fully idle scheduler, which under buffer_only means
-# every staged storage write has drained. The file backend writes each page
-# through its generic (non zero-copy) path at a few MB/s, so a seeding pass
-# outlasts the 30s default the helpers use by a wide margin.
+# flush_cache drains staged file-backend writes, which can exceed 30 seconds.
 _FLUSH_TIMEOUT_S = 600
 
-# The seeded prefix has to end strictly inside the measured prompt, not at its
-# end: storage keys one recurrent state per checkpoint node, the hit query only
-# accepts a prefix that ends on one, and a request can never ask for its own
-# last token back (max_prefix_len is input_len - 1). Seeding and measuring the
-# same prompt therefore reads as a total miss however much KV is stored.
-#
-# Sample count and generation length are sized against the file backend's write
-# throughput rather than against the KL statistics: every cached token here is
-# also a page it has to write before the next flush can return. The generation
-# still runs past the 512-token sliding window, so decode carries the window
-# through the prompt-to-generated handover.
+# Seed a checkpoint strictly inside the prompt: prefix reuse excludes its last
+# token. Keep file-backend writes bounded while decoding past the 512-token SWA.
 BUFFER_ONLY_SAMPLES = 8
 BUFFER_ONLY_SEED_TOKENS = 512
 BUFFER_ONLY_PROMPT_TOKENS = 768
@@ -448,46 +436,24 @@ class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
 
 
 class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
-    """Same exactness bar with host memory as a pure GPU<->L3 staging buffer.
+    """Restore FULL/SWA/Mamba from L3 and compare against recomputed logprobs.
 
-    `buffer_only` retains nothing on the host tier, so after a flush the only
-    thing a request can reuse is what L3 holds, spliced in at prefill
-    admission. All three components have to come back off one host bounce and
-    reproduce what a fresh prefill computes: the FULL KV, the trailing SWA
-    window, and the recurrent Mamba state. The state is the part with no
-    second chance -- it is a single slot restored into both the published tree
-    node and the consuming request, and a restore into the wrong slot still
-    generates fluent text.
-
-    The flush between seeding and measurement is what makes this a storage
-    test rather than a device-tree test: it drops the radix tree while leaving
-    L3 intact, so every nonzero `cached_tokens` below came back through the
-    buffer-mode read path.
+    Flushing the device tree after seeding ensures hits come from storage.
     """
-
-    @classmethod
-    def _seed_ids(cls) -> list[list[int]]:
-        return [ids[:BUFFER_ONLY_SEED_TOKENS] for ids in cls.input_ids]
 
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.storage_dir = tempfile.mkdtemp(prefix="sgl-buffer-only-kl-")
-        # A span is only readable back from storage if its trailing SWA window
-        # was still resident when the backup staged: the hit query folds the
-        # window's boundary into the KV hit, so an SWA-evicted span reads as a
-        # total miss. At the 0.1 the other classes run, the seeding set's own
-        # windows evict each other and the earliest samples go cold.
+        # Keep all seed SWA windows resident until their backups are staged.
         other_args = _base_args(swa_full_tokens_ratio="0.5") + [
             "--enable-hierarchical-cache",
             "--hicache-host-memory-mode",
             "buffer_only",
             "--hicache-storage-backend",
             "file",
-            # Without it the backend answers every existence query with a
-            # scandir over the whole storage directory, which grows with the
-            # pages this class writes.
+            # Avoid scanning the storage directory for each existence query.
             "--hicache-storage-backend-extra-config",
             '{"enable_metadata_cache": true}',
             "--hicache-write-policy",
@@ -497,14 +463,10 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             # The mamba host pool only supports page_first and page_first_direct.
             "--hicache-mem-layout",
             "page_first_direct",
-            # Fetch to completion: a partial fetch is a legitimate outcome the
-            # scheduler degrades on, and it would turn the cache-hit assertions
-            # below into flakes rather than a signal.
+            # Partial fetches would make the hit assertions timing-dependent.
             "--hicache-storage-prefetch-policy",
             "wait_complete",
-            # Same tight full-KV budget as the cache-mode class above, so
-            # eviction and checkpoint rotation actually run instead of
-            # everything staying resident on device.
+            # Match the cache-mode class's eviction/rotation budget.
             "--chunked-prefill-size",
             "2048",
             "--max-total-tokens",
@@ -543,16 +505,10 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
 
     def test_prefill_cache_hit_from_storage(self):
-        """Seed a prefix into L3, drop the device tree, then measure a longer
-        prompt over it: the restored span and the recurrent state that ends it
-        must score the generation exactly as a recomputed prefix does."""
-        seed_ids = self._seed_ids()
         full_ids = self.input_ids
+        seed_ids = [ids[:BUFFER_ONLY_SEED_TOKENS] for ids in full_ids]
 
-        # flush_cache only proceeds once the scheduler is fully idle, which in
-        # buffer mode includes the in-flight storage writes, so the second
-        # flush cannot race the seeding pass to L3. Those writes are what the
-        # helpers' 30s default is too short for.
+        # The second flush also waits for seed writes to reach L3.
         _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
         _generate(self.base_url, seed_ids, max_new_tokens=0)
         _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
@@ -574,9 +530,6 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
                 f"buffer_only[{i}] took no storage hit: the device tree was "
                 "flushed, so this run never exercised the buffer-mode read path",
             )
-            # Storage holds one recurrent state per checkpoint node, so a hit
-            # can only end where a checkpoint does, and never past the span
-            # that was seeded.
             self.assertEqual(
                 hit % TRACK_INTERVAL,
                 0,
@@ -595,9 +548,7 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             [full_ids[i] + results[i]["output_ids"] for i in range(len(results))],
             [_extract_output_logprobs(r) for r in results],
             label="buffer_only_prefill_cache_hit",
-            # One replay batch, one flush: the helper flushes per batch, and a
-            # per-sample flush would have to drain that sample's own storage
-            # writes inside its 30s default.
+            # One batch avoids repeated 30s flushes while replay writes drain.
             batch_size=BUFFER_ONLY_SAMPLES,
             sampling_temperature=0,
         )

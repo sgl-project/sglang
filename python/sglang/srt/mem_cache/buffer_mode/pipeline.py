@@ -134,9 +134,9 @@ class _OngoingBufferLoadBack(msgspec.Struct):
 
 
 class _MambaHandoff(msgspec.Struct):
-    """The two device destinations one staged recurrent state has to reach,
-    both reading the same host bounce. ``slot_allocated`` records that this
-    load-back owns the request slot, so a called-off load-back returns it.
+    """Two H2D destinations sharing a host slot.
+
+    slot_allocated marks a new request slot to release on rollback.
     """
 
     node_copy: PoolTransfer
@@ -227,9 +227,6 @@ def validate_buffer_only_stack(
     mamba = mamba_component
     if mamba is not None:
         host = mamba._mamba_pool_host
-        # Below two slots _backup_oversize rejects every checkpoint-carrying
-        # intent, so the whole node -- KV included -- silently never reaches
-        # storage.
         if host is None or host.size < 2:
             raise ValueError(
                 "--hicache-host-memory-mode buffer_only on Mamba models "
@@ -515,10 +512,7 @@ class BufferModePipeline:
         return False
 
     def _aux_loads_margin(self, pool_name: PoolName, host_pool) -> int:
-        """Aux-pool tokens reserved for loads: at least one prefetch alloc
-        (prepare_prefetch allocates the trailing window / the single Mamba
-        state slot here and a failed alloc forfeits the whole prefetch), plus
-        a 10% burst absorber mirroring live_cap."""
+        """Reserve at least one prefetch allocation or 10% of the aux pool."""
         one_prefetch_alloc = (
             self._swa_window_pages * host_pool.page_size
             if pool_name == PoolName.SWA
@@ -1105,13 +1099,10 @@ class BufferModePipeline:
     def _prepare_mamba_handoff(
         self, f: _StagedPrefetch, req: Req
     ) -> Optional[_MambaHandoff]:
-        """Bind the staged recurrent state to its two device destinations, or
-        None after deferring or dropping the load-back. The caller must end
-        this admission attempt so the next round rebuilds the joint prefix.
+        """Bind node and request H2D destinations to the staged checkpoint.
 
-        The request gets its own H2D rather than the deferred D2D copy the
-        match path uses: that copy is not ordered against this transfer, while
-        the H2D is layer-gated like the rest of the load."""
+        None ends this admission attempt; the next round rebuilds the joint prefix.
+        """
         mamba = self._cache.components[ComponentType.MAMBA]
         node_copy = next(
             (

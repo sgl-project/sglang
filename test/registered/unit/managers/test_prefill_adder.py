@@ -149,185 +149,119 @@ class TestPrefillAdder(CustomTestCase):
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
 
-    def test_staged_mamba_slot_gate_drops_then_recomputes_next_round(self):
-        cache = self.mock_tree_cache
-        cache.supports_mamba.return_value = False
-        self.mock_token_allocator.available_size.return_value = 10000
+    def _staged_mamba_admission(self, *, checkpoint_present):
+        cache = self.create_tree_cache()
+        cache.supports_mamba.return_value = True
+        cache.supports_swa.return_value = False
+        cache.page_size = 1
+        allocator = self.create_token_allocator(available_size=10000)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.tree_core.empty_match_result.device_indices = torch.empty(
+            0, dtype=torch.int64
+        )
+        mamba = MambaComponent.__new__(MambaComponent)
+        mamba.cache = cache
+        cache.components = {ComponentType.MAMBA: mamba}
+        cache.req_to_token_pool.mamba_allocator.alloc.return_value = None
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = cache
         pipeline.reset()
         pipeline.max_staged_admission_defers = 2
         cache.buffer_pipeline = pipeline
+        cache.init_load_back.side_effect = pipeline.init_load_back
+
         req = self.create_mock_req("staged-mamba", 0, 1)
+        req.extra_key = req.cache_salt = None
         req.sampling_params.ignore_eos = False
-        req.kv = SimpleNamespace(holds_mamba=False, cache_protected_len=4)
+        req.kv = SimpleNamespace(
+            holds_mamba=False, mamba_pool_idx=None, cache_protected_len=4
+        )
+        # Staging exposed FULL tokens beyond the empty joint match.
         req.prefix_indices = torch.arange(4)
         req.last_node = 1
+        req.best_match_node = 0
         req.full_untruncated_fill_ids = list(range(8))
-        req.host_hit_length = 2
-        req.swa_host_hit_length = 2
-        req.mamba_host_hit_length = 1
-        req.storage_hit_length = 2
+        req.host_hit_length = req.storage_hit_length = 2
+        req.mamba_host_hit_length = int(checkpoint_present)
         req.storage_hit_start = 4
         req.host_hit_is_storage = True
+        req.needs_host_load_back.return_value = True
         key = RadixKey(array("q", range(6)))
-        req.staged_prefetch_plan = StagedPrefetchPlan(1, key, 4, 2, 2, 1)
+        req.staged_prefetch_plan = StagedPrefetchPlan(
+            1, key, 4, 2, 0, int(checkpoint_present)
+        )
         request = req.cache_request_handle
-        host_state = torch.tensor([10])
+        aux = (
+            [PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([10]))]
+            if checkpoint_present
+            else []
+        )
         pipeline.staged_prefetches[request] = SimpleNamespace(
             request=request,
-            num_tokens=2,
-            occupied_tokens=2,
-            host_indices=torch.tensor([11, 12]),
-            aux_xfers=[PoolTransfer(name=PoolName.MAMBA, host_indices=host_state)],
+            operation_id=1,
+            extra_key=None,
+            cache_salt=None,
+            matched_len=0,
+            num_tokens=6,
+            occupied_tokens=6,
+            host_indices=torch.arange(6),
+            aux_xfers=aux,
         )
         pipeline.anchor_locks[request] = _AnchorLock(node_id=1, tokens=4)
         pipeline.anchor_locked_tokens_ = 4
-        cache.cache_controller.prefetch_tokens_occupied = 2
+        cc = cache.cache_controller
+        cc.prefetch_tokens_occupied = 6
         entry = MagicMock()
-        cache.cache_controller.mem_pool_host.entry_map = {PoolName.MAMBA: entry}
-        adder = self.create_adder(self.create_running_batch())
-        adder._mamba_slot_cost = 1
-        adder.rem_mamba_slots = 1
-        original_prefix = req.prefix_indices
-        with patch.object(
-            adder, "_check_prefill_budget", wraps=adder._check_prefill_budget
-        ) as check:
-            for attempt in range(2):
-                result = adder.add_one_req(req, False, None)
-                self.assertEqual(result, AddReqResult.NO_TOKEN)
-                self.assertEqual(adder.can_run_list, [])
-                self.assertIs(req.prefix_indices, original_prefix)
-                req.init_next_round_input.assert_not_called()
-                cache.init_load_back.assert_not_called()
-                if attempt == 0:
-                    self.assertIn(request, pipeline.staged_prefetches)
-                    entry.host_pool.free.assert_not_called()
-
-        self.assertNotIn(request, pipeline.staged_prefetches)
-        check.assert_not_called()
-        self.assertNotIn(request, pipeline.anchor_locks)
-        self.assertNotIn(request, pipeline._staged_admission_defers)
-        self.assertEqual(pipeline.anchor_locked_tokens_, 0)
-        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
-        entry.host_pool.free.assert_called_once()
-        cache.tree_core.dec_full_pin.assert_called_once_with(1)
-        self.assertIsNone(req.staged_prefetch_plan)
-        self.assertEqual(
-            (req.host_hit_length, req.swa_host_hit_length, req.mamba_host_hit_length),
-            (0, 0, 0),
+        cc.mem_pool_host.entry_map = {PoolName.MAMBA: entry}
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
         )
-        self.assertEqual(req.storage_hit_length, 0)
-        self.assertIsNone(req.storage_hit_start)
-        self.assertFalse(req.host_hit_is_storage)
+        return cache, pipeline, req, adder, entry
 
-        # The scheduler starts the next round by rebuilding the joint prefix;
-        # the previous FULL-only prefix must not be used for recomputation.
-        def rematch(tree_cache):
-            self.assertIs(tree_cache, cache)
-            req.prefix_indices = torch.empty(0, dtype=torch.int64)
-            req.kv.cache_protected_len = 0
-            req.last_node = 0
-
-        req.init_next_round_input.side_effect = rematch
-        req.init_next_round_input(cache)
-        next_adder = self.create_adder(self.create_running_batch())
-        next_adder._mamba_slot_cost = 1
-        next_adder.rem_mamba_slots = 1
-        next_adder.add_one_req(req, False, None)
-        self.assertEqual(next_adder.can_run_list, [req])
-        req.set_extend_range.assert_called_once_with(0, 8)
-        self.assertEqual(next_adder.rem_mamba_slots, 0)
-        cache.init_load_back.assert_not_called()
-
-    def test_staged_mamba_handoff_failure_ends_fixed_pool_admission(self):
-        for checkpoint_present in (True, False):
-            with self.subTest(checkpoint_present=checkpoint_present):
-                cache = self.create_tree_cache()
-                cache.supports_mamba.return_value = True
-                cache.supports_swa.return_value = False
-                cache.page_size = 1
-                allocator = self.create_token_allocator(available_size=10000)
-                cache.token_to_kv_pool_allocator = allocator
-                cache.tree_core.empty_match_result.device_indices = torch.empty(
-                    0, dtype=torch.int64
+    def test_staged_mamba_failures_retry_then_rematch(self):
+        for failure in ("slot_gate", "allocation", "missing_checkpoint"):
+            with self.subTest(failure=failure):
+                checkpoint_present = failure != "missing_checkpoint"
+                cache, pipeline, req, adder, entry = self._staged_mamba_admission(
+                    checkpoint_present=checkpoint_present
                 )
-                mamba = MambaComponent.__new__(MambaComponent)
-                mamba.cache = cache
-                cache.components = {ComponentType.MAMBA: mamba}
-                cache.req_to_token_pool.mamba_allocator.alloc.return_value = None
-                pipeline = BufferModePipeline.__new__(BufferModePipeline)
-                pipeline._cache = cache
-                pipeline.reset()
-                pipeline.max_staged_admission_defers = 2
-                cache.buffer_pipeline = pipeline
-                cache.init_load_back.side_effect = pipeline.init_load_back
-
-                req = self.create_mock_req("fixed-pool-handoff", 0, 1)
-                req.extra_key = None
-                req.cache_salt = None
-                req.sampling_params.ignore_eos = False
-                req.kv = SimpleNamespace(
-                    holds_mamba=False, mamba_pool_idx=None, cache_protected_len=4
-                )
-                # Joint match was empty; staging exposed four resident FULL
-                # tokens that require the fetched checkpoint before use.
-                req.prefix_indices = torch.arange(4)
-                req.last_node = 1
-                req.best_match_node = 0
-                req.full_untruncated_fill_ids = list(range(8))
-                req.host_hit_length = 2
-                req.mamba_host_hit_length = int(checkpoint_present)
-                req.storage_hit_length = 2
-                req.storage_hit_start = 4
-                req.host_hit_is_storage = True
-                req.needs_host_load_back.return_value = True
-                key = RadixKey(array("q", range(6)))
-                req.staged_prefetch_plan = StagedPrefetchPlan(
-                    1, key, 4, 2, 0, int(checkpoint_present)
-                )
+                if failure == "slot_gate":
+                    adder._mamba_slot_cost = 1
+                    adder.rem_mamba_slots = 1
+                    verdict = AddReqResult.NO_TOKEN
+                else:
+                    self.assertEqual(adder._mamba_slot_cost, 0)
+                    self.assertIsNone(adder.rem_mamba_slots)
+                    verdict = AddReqResult.OTHER
                 request = req.cache_request_handle
-                aux = (
-                    [PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([10]))]
-                    if checkpoint_present
-                    else []
-                )
-                pipeline.staged_prefetches[request] = SimpleNamespace(
-                    request=request,
-                    operation_id=1,
-                    extra_key=req.extra_key,
-                    cache_salt=req.cache_salt,
-                    matched_len=0,
-                    num_tokens=6,
-                    occupied_tokens=6,
-                    host_indices=torch.arange(6),
-                    aux_xfers=aux,
-                )
-                pipeline.anchor_locks[request] = _AnchorLock(node_id=1, tokens=4)
-                pipeline.anchor_locked_tokens_ = 4
                 cc = cache.cache_controller
-                cc.prefetch_tokens_occupied = 6
-                entry = MagicMock()
-                cc.mem_pool_host.entry_map = {PoolName.MAMBA: entry}
-
-                adder = self.create_adder(
-                    self.create_running_batch(),
-                    tree_cache=cache,
-                    token_to_kv_pool_allocator=allocator,
-                )
-                self.assertEqual(adder._mamba_slot_cost, 0)
-                self.assertIsNone(adder.rem_mamba_slots)
-                for attempt in range(2 if checkpoint_present else 1):
+                original_prefix = req.prefix_indices
+                with patch.object(
+                    adder, "_check_prefill_budget", wraps=adder._check_prefill_budget
+                ) as check:
+                    for attempt in range(2 if checkpoint_present else 1):
+                        self.assertEqual(adder.add_one_req(req, False, None), verdict)
+                        self.assertEqual(adder.can_run_list, [])
+                        self.assertIs(req.prefix_indices, original_prefix)
+                        req.init_next_round_input.assert_not_called()
+                        req.set_extend_range.assert_not_called()
+                        cc.load.assert_not_called()
+                        if checkpoint_present and attempt == 0:
+                            self.assertIn(request, pipeline.staged_prefetches)
+                            entry.host_pool.free.assert_not_called()
+                            self.assertEqual(cc.prefetch_tokens_occupied, 6)
+                if failure == "slot_gate":
+                    check.assert_not_called()
+                    cache.init_load_back.assert_not_called()
+                elif failure == "allocation":
                     self.assertEqual(
-                        adder.add_one_req(req, False, None), AddReqResult.OTHER
+                        cache.req_to_token_pool.mamba_allocator.alloc.call_count, 4
                     )
-                    self.assertEqual(adder.can_run_list, [])
-                    req.set_extend_range.assert_not_called()
-                    cc.load.assert_not_called()
-                    if checkpoint_present and attempt == 0:
-                        self.assertIn(request, pipeline.staged_prefetches)
-                        entry.host_pool.free.assert_not_called()
-                        self.assertEqual(cc.prefetch_tokens_occupied, 6)
+                    self.assertEqual(cache.evict.call_count, 2)
+                else:
+                    cache.req_to_token_pool.mamba_allocator.alloc.assert_not_called()
 
                 self.assertNotIn(request, pipeline.staged_prefetches)
                 self.assertNotIn(request, pipeline.anchor_locks)
@@ -335,35 +269,31 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(pipeline.anchor_locked_tokens_, 0)
                 self.assertEqual(cc.prefetch_tokens_occupied, 0)
                 self.assertIsNone(req.staged_prefetch_plan)
-                self.assertEqual(req.host_hit_length, 0)
-                self.assertEqual(req.mamba_host_hit_length, 0)
+                self.assertEqual(
+                    (
+                        req.host_hit_length,
+                        req.swa_host_hit_length,
+                        req.mamba_host_hit_length,
+                    ),
+                    (0, 0, 0),
+                )
                 self.assertEqual(req.storage_hit_length, 0)
                 self.assertIsNone(req.storage_hit_start)
                 self.assertFalse(req.host_hit_is_storage)
                 if checkpoint_present:
-                    self.assertEqual(
-                        cache.req_to_token_pool.mamba_allocator.alloc.call_count, 4
-                    )
-                    self.assertEqual(cache.evict.call_count, 2)
                     entry.host_pool.free.assert_called_once()
-                else:
-                    cache.req_to_token_pool.mamba_allocator.alloc.assert_not_called()
                 cache.tree_core.dec_full_pin.assert_called_once_with(1)
 
-                # As in the scheduler, the next attempt first rebuilds the
-                # joint match. Recompute all tokens, not the FULL-only tail.
-                def rematch(tree_cache):
-                    self.assertIs(tree_cache, cache)
-                    req.prefix_indices = torch.empty(0, dtype=torch.int64)
-                    req.kv.cache_protected_len = 0
-                    req.last_node = 0
-
-                req.init_next_round_input.side_effect = rematch
-                req.init_next_round_input(cache)
+                # The scheduler rematches before retrying after a drop.
+                req.prefix_indices = torch.empty(0, dtype=torch.int64)
+                req.kv.cache_protected_len = 0
+                req.last_node = 0
                 req.needs_host_load_back.return_value = False
                 adder.add_one_req(req, False, None)
                 self.assertEqual(adder.can_run_list, [req])
                 req.set_extend_range.assert_called_once_with(0, 8)
+                if failure == "slot_gate":
+                    self.assertEqual(adder.rem_mamba_slots, 0)
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False

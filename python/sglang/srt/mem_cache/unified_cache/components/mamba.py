@@ -690,8 +690,7 @@ class MambaComponent(TreeComponent):
     # ---- Buffer-mode load-back handoff ----
 
     def ensure_request_state_slot(self, req: Req) -> bool:
-        """Give the request a device Mamba slot to receive the staged state.
-        False when the pool has nothing to give even after an eviction pass."""
+        """Ensure a request slot, returning False if eviction cannot free one."""
         if req.kv.mamba_pool_idx is not None:
             return True
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -704,17 +703,14 @@ class MambaComponent(TreeComponent):
         return True
 
     def release_request_state_slot(self, req: Req) -> None:
-        """Return a slot ensure_request_state_slot allocated for a load-back
-        that was then called off."""
+        """Roll back a request slot allocated for a cancelled load-back."""
         self.cache.req_to_token_pool.mamba_allocator.free(
             req.kv.mamba_pool_idx.unsqueeze(-1)
         )
         req.kv.mamba_pool_idx = None
 
     def supersede_pending_state_copy(self, req: Req) -> None:
-        """Drop the deferred CoW/clear staged by the match: the load-back
-        writes the request's slot directly with a deeper state, and the
-        deferred D2D copy is not ordered against that H2D."""
+        """Reset the replay cursor and discard CoW/clear superseded by H2D."""
         write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
         if write_pos is not None and req.kv.mamba_pool_idx is not None:
             slot = self.cache.req_to_token_pool.translate_mamba_indices(
