@@ -12,7 +12,6 @@ non-NPU hosts.
 
 from __future__ import annotations
 
-import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -23,6 +22,9 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_submission import (
+    npu_graph_submission,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -150,8 +152,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa.
+        """Submit replay and parameter updates with an explicit stream dependency.
 
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
@@ -166,14 +167,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
-        def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+        from torch_npu.npu.graphs import _GraphDispatchMode
 
-        thread = threading.Thread(target=_update)
-        thread.start()
-        graph.replay()
-        thread.join()
+        self._device_module.set_device(self._device_id)
+        update_stream = _GraphDispatchMode.update_stream
+        if update_stream is None:
+            raise RuntimeError("NPU graph capture did not initialize the update stream")
+        with npu_graph_submission(self._device_module, update_stream, source="decoder"):
+            graph.replay()
+            graph.update(cpu_update_input=cpu_update_input)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
