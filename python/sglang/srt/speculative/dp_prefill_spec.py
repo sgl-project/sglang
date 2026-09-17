@@ -1,8 +1,4 @@
-"""Experimental cross-rank prefill/verify execution (local batches stay unmixed).
-
-The phase planner is deliberately independent of torch so its communication
-geometry can be checked on a CPU without importing the serving runtime.
-"""
+"""Plan token counts for prefill and speculative decoding across DP ranks."""
 
 import os
 from dataclasses import dataclass
@@ -56,8 +52,7 @@ class DPPrefillSpecPlan:
 
     def apply(self, batch, phase, rank):
         tokens, logprobs = self.phase_counts(phase)
-        # EP-only execution can retain just the local metadata entry. Preserve
-        # that representation instead of changing the model's gather contract.
+        # EP-only batches retain only their local counts.
         if len(batch.global_num_tokens) == 1:
             tokens, logprobs = (tokens[rank],), (logprobs[rank],)
         elif len(batch.global_num_tokens) != len(tokens):

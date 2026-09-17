@@ -240,9 +240,7 @@ def _update_gather_batch(
     from sglang.srt.speculative.dp_prefill_spec import ENABLED
 
     if ENABLED:
-        # ScheduleBatch is reused between iterations. Gathered counts are raw
-        # again, so a previous heterogeneous phase must not suppress normal
-        # speculative count scaling or pure-decode graph padding this step.
+        # Reset phase scaling when a reused batch receives fresh counts.
         batch.dp_prefill_spec_phase = None
         info = mlp_sync_info.tp0_info_cpu
         if info is None:

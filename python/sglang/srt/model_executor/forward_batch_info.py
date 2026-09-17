@@ -1459,9 +1459,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         if self.dp_prefill_spec_phase is not None:
-            # Different local forward modes must not be rewritten into a
-            # one-token EXTEND view by MAX_LEN padding. This experimental
-            # path is restricted to MegaMoE / attn-TP1 at startup.
+            # Preserve each rank's forward mode on heterogeneous steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,

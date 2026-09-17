@@ -1302,7 +1302,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        self.dp_prefill_spec_steps = 0
         if DP_PREFILL_SPEC_ENABLED:
             supported = (
                 server_args.enable_dp_attention
@@ -1585,12 +1584,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _forward_dp_prefill_spec(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
     ):
-        """All ranks run draft -> target -> draft-extend, with rank-local modes.
-
-        A prefill rank contributes an empty draft batch during proposal, then
-        performs its real prefill alongside other ranks' target verification.
-        Existing verify code owns acceptance, bonus tokens and KV cleanup.
-        """
+        """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
         is_prefill = batch.forward_mode.is_extend()
         if is_prefill and batch.decoding_reqs:
@@ -1631,18 +1625,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             verify_input = self.draft_worker.draft(draft_batch)
 
-        self.dp_prefill_spec_steps += 1
-        if self.dp_prefill_spec_steps & (self.dp_prefill_spec_steps - 1) == 0:
-            logger.info(
-                "DP_PREFILL_SPEC steps=%d rank=%d prefill=%d local_requests=%d "
-                "prefill_ranks=%d decode_ranks=%d",
-                self.dp_prefill_spec_steps,
-                rank,
-                is_prefill,
-                batch.batch_size(),
-                sum(p and n > 0 for p, n in zip(plan.prefills, plan.counts)),
-                sum(not p and n > 0 for p, n in zip(plan.prefills, plan.counts)),
-            )
         plan.apply(batch, "target", rank)
         if is_prefill:
             result = self._forward_prefill_batch(
