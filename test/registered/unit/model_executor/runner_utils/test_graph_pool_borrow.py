@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -231,6 +232,146 @@ class TestGraphPoolBorrow(CustomTestCase):
         self.assertTrue(torch.equal(predict, torch.full_like(predict, 3)))
         self.assertTrue(torch.equal(accept_lens, torch.full_like(accept_lens, 2)))
         self.assertTrue(torch.equal(accept_index, torch.zeros_like(accept_index)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_borrow_resizes_only_chunk_invariant_heads(self):
+        """Safe heads shrink to graph capacity; other heads retain their shapes."""
+        rows, vocab = 8192, 4096
+        # Integer fixtures make this test head invariant to GEMM row counts.
+        states = torch.randint(-2, 3, (rows, 64), device="cuda").to(torch.bfloat16)
+        weight = torch.randint(-2, 3, (vocab, 64), device="cuda").to(torch.bfloat16)
+        logits = torch.mm(states, weight.T).float()
+        token_ids = torch.randint(0, vocab, (rows,), device="cuda")
+        expected = torch.log_softmax(logits, dim=-1)[
+            torch.arange(rows, device="cuda"), token_ids
+        ]
+        metadata = SimpleNamespace(
+            extend_return_top_logprob=False,
+            extend_token_ids_logprob=False,
+            top_logprobs_nums=None,
+            extend_logprob_pruned_lens_cpu=[rows],
+            extend_input_logprob_token_ids_gpu=token_ids,
+            token_ids_logprobs=None,
+        )
+        processor = InputLogprobProcessor(vocab_size=vocab)
+        processor.enable_fast_input_logprobs = False
+        processor.enable_logprobs_chunk = True
+        processor.logprobs_chunk_size = rows
+
+        def run_with_pool_run_of(
+            nbytes, disabled, *, allow_chunk_resize=False, lm_head=None
+        ):
+            handle = torch.cuda.graph_pool_handle()
+            graph = torch.cuda.CUDAGraph()
+            seed = torch.zeros(8, device="cuda")
+            stream = torch.cuda.Stream()
+            with (
+                torch.cuda.stream(stream),
+                torch.cuda.graph(graph, pool=handle, stream=stream),
+            ):
+                transient = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+                transient.fill_(7)
+                keep = seed + 1
+                del transient
+            torch.cuda.synchronize()
+            allocations_borrowed = []
+            chunk_rows = []
+            runs = pool.find_free_graph_pool_runs(handle)
+
+            def get_logits(chunk, *_args, **_kwargs):
+                chunk_rows.append(chunk.shape[0])
+                projected = torch.mm(chunk, weight.T)
+                converted = projected.float()
+                allocations_borrowed.extend(
+                    any(
+                        lo <= tensor.data_ptr()
+                        and tensor.data_ptr() + tensor.nbytes <= lo + size
+                        for lo, size in runs
+                    )
+                    for tensor in (projected, converted)
+                )
+                return converted
+
+            with (
+                envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+                patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
+                patch.object(
+                    self.state, "disabled_reason", "test fallback" if disabled else None
+                ),
+                patch.object(
+                    torch.cuda,
+                    "mem_get_info",
+                    side_effect=AssertionError(
+                        "Chunk sizing must not query heap headroom"
+                    ),
+                ),
+            ):
+                with pool.borrow_graph_pool(user="warmup"):
+                    pass
+                result, sampled = processor.forward(
+                    pruned_states=states,
+                    sample_indices=torch.tensor([rows - 1], device="cuda"),
+                    input_logprob_indices=torch.arange(rows, device="cuda"),
+                    token_to_seq_idx=[0] * rows,
+                    lm_head=lm_head,
+                    get_logits_fn=get_logits,
+                    logits_metadata=metadata,
+                    allow_chunk_resize=allow_chunk_resize,
+                )
+                with pool.graph_pool_replay_scope():
+                    graph.replay()
+                torch.cuda.synchronize()
+                pool._teardown_borrow_pool()
+            del graph, keep
+            return result, sampled, allocations_borrowed, chunk_rows
+
+        for chunk_size, nbytes, disabled, allow_resize, borrowing, resized in (
+            (rows, 512 << 20, False, False, True, False),
+            (rows, 96 << 20, False, False, False, False),
+            (rows, 96 << 20, False, True, True, True),
+            (rows, 16 << 20, False, True, False, False),
+            (rows, 512 << 20, True, True, False, False),
+            (32, 66 << 20, False, True, True, False),
+            (32, 66 << 20, True, True, False, False),
+        ):
+            with self.subTest(
+                chunk_size=chunk_size,
+                nbytes=nbytes,
+                disabled=disabled,
+                allow_resize=allow_resize,
+            ):
+                processor.logprobs_chunk_size = chunk_size
+                result, sampled, borrowed, chunk_rows = run_with_pool_run_of(
+                    nbytes, disabled, allow_chunk_resize=allow_resize
+                )
+                self.assertEqual(max(chunk_rows) < chunk_size, resized)
+                effective_chunk_size = max(chunk_rows)
+                self.assertEqual(
+                    chunk_rows,
+                    [
+                        min(effective_chunk_size, rows - i)
+                        for i in range(0, rows, effective_chunk_size)
+                    ],
+                )
+                self.assertTrue(all(value == borrowing for value in borrowed))
+                self.assertTrue(torch.equal(result.token_logprobs, expected))
+                self.assertTrue(torch.equal(sampled, logits[-1:]))
+
+        processor.enable_logprobs_chunk = False
+        _, _, borrowed, chunk_rows = run_with_pool_run_of(
+            96 << 20, False, allow_chunk_resize=True
+        )
+        self.assertEqual(chunk_rows, [rows])
+        self.assertFalse(any(borrowed))
+
+        # LoRA has already prepared adapter metadata for each configured pass.
+        processor.enable_logprobs_chunk = True
+        processor.logprobs_chunk_size = rows // 2
+        lm_head = Mock(spec=["set_lm_head_pass", "reset_lm_head_pass"])
+        _, _, _, chunk_rows = run_with_pool_run_of(
+            96 << 20, False, allow_chunk_resize=True, lm_head=lm_head
+        )
+        self.assertEqual(chunk_rows, [rows // 2, rows // 2])
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_borrowed_allocations_land_on_free_graph_pool_runs(self):

@@ -560,6 +560,7 @@ class LogitsProcessor(nn.Module):
             get_logits_fn=self._get_logits,
             logits_metadata=logits_metadata,
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
+            allow_chunk_resize=self.supports_logprob_chunk_resize(lm_head),
         )
 
         logits_output = LogitsProcessorOutput(
@@ -842,7 +843,12 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits("pre_lm_head_sync_returned")
 
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        compute_lm_head = (
+            self._compute_input_logprob_lm_head
+            if logits_metadata.extend_return_logprob
+            else self._compute_lm_head
+        )
+        logits = compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -894,6 +900,18 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def supports_logprob_chunk_resize(self, lm_head: VocabParallelEmbedding) -> bool:
+        """Whether the input-logprob head preserves numerics across row counts."""
+        return False
+
+    def _compute_input_logprob_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
     def _compute_lm_head(
         self,

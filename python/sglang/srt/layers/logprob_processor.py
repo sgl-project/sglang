@@ -485,6 +485,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
+        allow_chunk_resize: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
@@ -499,7 +500,14 @@ class InputLogprobProcessor:
 
         borrow_logits_memory = False
         if pruned_states.is_cuda and not skip_chunking_for_dp_attn:
-            borrow_logits_memory = self._can_borrow_logits_memory(chunk_size)
+            chunk_size, borrow_logits_memory = self._fit_chunk_to_graph_pool(
+                chunk_size=chunk_size,
+                can_resize=(
+                    allow_chunk_resize
+                    and self.enable_logprobs_chunk
+                    and not hasattr(lm_head, "set_lm_head_pass")
+                ),
+            )
 
         return self._forward_by_chunk(
             pruned_states,
@@ -513,13 +521,10 @@ class InputLogprobProcessor:
             borrow_logits_memory=borrow_logits_memory,
         )
 
-    def _can_borrow_logits_memory(self, chunk_size: int) -> bool:
-        """Borrow only when the planned chunk fits on every TP rank.
-
-        Resizing chunks to graph-pool capacity changes LM-head GEMM shapes
-        and their rounding. Keep chunk boundaries independent of the graph
-        memory layout, including when borrowing is disabled on another runner.
-        """
+    def _fit_chunk_to_graph_pool(
+        self, chunk_size: int, can_resize: bool
+    ) -> Tuple[int, bool]:
+        """Resize only heads that preserve numerics across GEMM row counts."""
         # TP gathering can hold the local projection, gathered tensor, and
         # contiguous reshape together; FP32 bounds their possible dtypes.
         bytes_per_row = 3 * self.vocab_size * 4
@@ -537,9 +542,13 @@ class InputLogprobProcessor:
                 group=self.chunking_group,
             )
             fit_rows = int(capacity.item())
-        # Fall back to the existing reserved workspace if borrowing cannot
-        # hold the whole chunk; do not change LoRA or logprob chunk boundaries.
-        return fit_rows >= chunk_size
+        if fit_rows >= chunk_size:
+            return chunk_size, True
+        if can_resize and fit_rows > 0:
+            return fit_rows, True
+        # Unsupported heads and fixed collective/LoRA schedules retain their
+        # planned chunks and require their existing workspace reservation.
+        return chunk_size, False
 
     def _forward_by_chunk(
         self,
