@@ -631,7 +631,7 @@ async def benchmark(args):
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
                 logger.info(
-                    f"Warmup {i+1}/{args.warmup_requests}: "
+                    f"Warmup {i + 1}/{args.warmup_requests}: "
                     f"latency={warm_out.latency:.2f}s, success={warm_out.success}"
                 )
 

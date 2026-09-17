@@ -59,7 +59,6 @@ def resolve_consumer_rank(
         return 0
     if consumer_rank is None:
         try:
-
             # Use the global TP rank. An attention/DCP subgroup rank can alias
             # another consumer's acknowledgement slot.
             rank = int(get_parallel().tp_rank)

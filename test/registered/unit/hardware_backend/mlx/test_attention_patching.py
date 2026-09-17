@@ -8,9 +8,8 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
@@ -1155,8 +1154,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             raise _StopLoop
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
-        scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
-        scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler.ingest_requests = lambda: []
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.forward_ct = 0
@@ -1181,10 +1179,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = (
-            lambda running_batch, last_batch: SimpleNamespace(
-                batch_to_run=batch, running_batch=running_batch
-            )
+        scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
+            SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
         )
 
         with self.assertRaises(_StopLoop):
@@ -1522,6 +1518,7 @@ if _HAS_MLX:
             self.kv = ReqKvInfo()
             self.mamba_branching_seqlen = None
             self.inflight_middle_chunks = 0
+            self.mamba_branching_seqlen = None
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

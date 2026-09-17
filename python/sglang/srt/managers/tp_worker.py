@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -88,6 +89,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def last_shared_read_runner(self):
@@ -389,8 +396,26 @@ class TpModelWorker(BaseTpWorker):
         # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
             self.random_seed = random_seed
-        elif server_args.is_ep_joiner:
+        elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
+        elif (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and get_parallel().pp_size > 1
+        ):
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead — that is exactly
+            # the set of ranks holding a draft worker. The draft worker is
+            # constructed with pp_rank=0, so derive the caller's global rank
+            # from the TP group rather than tp_size * pp_rank + tp_rank.
+            tp_group = self.model_runner.tp_group
+            self.random_seed = broadcast_pyobj(
+                [get_device().random_seed],
+                tp_group.ranks[self.ps.tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
@@ -614,9 +639,9 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+            assert capture_hidden_mode is None, (
+                "capture_hidden_mode override requires a ScheduleBatch input"
+            )
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)

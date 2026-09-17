@@ -30,7 +30,12 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
 
@@ -262,14 +267,80 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
         return result
 
+    def c128_num_pages_needed(
+        self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> int:
+        """Return the number of new C128 physical pages needed by this step."""
+        if prefix_lens_cpu is None or seq_lens_cpu is None:
+            return 0
+        ratio = 128
+        page_size = self.c128_attn_allocator.page_size
+        prefix_pages = (prefix_lens_cpu // ratio + page_size - 1) // page_size
+        seq_pages = (seq_lens_cpu // ratio + page_size - 1) // page_size
+        return int((seq_pages - prefix_pages).clamp(min=0).sum().item())
+
+    def ensure_c128_capacity(
+        self, tree_cache: Optional[BasePrefixCache], num_pages: int
+    ) -> bool:
+        """Reclaim C128 pages through FULL leaf eviction.
+
+        Evicting FULL also reclaims its C128 payload without interior holes."""
+        if num_pages <= 0:
+            return True
+
+        page_size = self.c128_attn_allocator.page_size
+
+        def available_pages() -> int:
+            return self.c128_attn_allocator.available_size() // page_size
+
+        if available_pages() >= num_pages:
+            return True
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return False
+
+        while available_pages() < num_pages:
+            result = tree_cache.evict(EvictParams(num_tokens=self.page_size))
+            if result.num_tokens_evicted == 0:
+                break
+        return available_pages() >= num_pages
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        """Check FULL/SWA and exact per-request C128 demand for one decode."""
+        if requests is None:
+            return super().check_decode_capacity(
+                num_tokens=num_tokens, tree_cache=tree_cache
+            )
+
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        if spec_algorithm is not None and spec_algorithm.is_some():
+            prefix_lens, seq_lens, _ = page_aligned_decode_alloc_lens(
+                requests,
+                reserve=get_alloc_reserve_per_decode(),
+                page_size=self.page_size,
+            )
+        else:
+            prefix_lens = [req.kv.kv_allocated_len for req in requests]
+            seq_lens = [length + 1 for length in prefix_lens]
+
+        prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        c128_num_pages = self.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
+        c128_ok = self.ensure_c128_capacity(tree_cache, c128_num_pages)
+        full_swa_ok = self.full_swa_available_size() >= num_tokens
+        return full_swa_ok and c128_ok
+
     def _has_c128_sidecar_capacity(
         self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
     ) -> bool:
-        ratio = 128
+        need = self.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
         page_size = self.c128_attn_allocator.page_size
-        prefix_groups = (prefix_lens_cpu // ratio + page_size - 1) // page_size
-        seq_groups = (seq_lens_cpu // ratio + page_size - 1) // page_size
-        need = int((seq_groups - prefix_groups).clamp(min=0).sum().item())
         return need <= self.c128_attn_allocator.available_size() // page_size
 
     def _alloc_compressed_kv(
@@ -480,6 +551,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             super().available_size(),
             self.c128_attn_allocator.available_size() * 128,
         )
+
+    def full_swa_available_size(self):
+        return super().available_size()
 
     def resize(self, config) -> None:
         self.c128_attn_allocator.size = int(config.c128_max_total_num_tokens)

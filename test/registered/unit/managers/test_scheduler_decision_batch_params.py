@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 FORBIDDEN_TOKENS = ("self.running_batch", "self.last_batch", "self.cur_batch")
 
@@ -20,7 +20,6 @@ DECISION_METHODS = (
     Scheduler.get_next_batch_to_run,
     Scheduler.get_new_batch_prefill,
     Scheduler._get_new_batch_prefill_raw,
-    Scheduler._abort_on_running_timeout,
     Scheduler.is_disable_overlap_for_batch,
     SchedulerDisaggregationPrefillMixin.get_next_disagg_prefill_batch_to_run,
     SchedulerDisaggregationPrefillMixin.process_prefill_chunk,

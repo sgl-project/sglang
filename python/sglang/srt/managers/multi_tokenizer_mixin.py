@@ -598,9 +598,9 @@ class MultiDetokenizerRouter:
 
             # Single request: route by its own http_worker_ipc.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                assert recv_obj.http_worker_ipc is not None, (
+                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                )
                 self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 

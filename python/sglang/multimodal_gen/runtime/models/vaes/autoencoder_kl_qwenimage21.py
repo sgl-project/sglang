@@ -32,7 +32,6 @@ def get_activation(name):
 
 
 class QwenImage21AvgDown3D(nn.Module):
-
     def __init__(self, in_channels, out_channels, factor_t, factor_s=1):
         super().__init__()
         self.in_channels = in_channels
@@ -79,7 +78,6 @@ class QwenImage21AvgDown3D(nn.Module):
 
 
 class QwenImage21DupUp3D(nn.Module):
-
     def __init__(self, in_channels: int, out_channels: int, factor_t, factor_s=1):
         super().__init__()
         self.in_channels = in_channels
@@ -116,7 +114,6 @@ class QwenImage21DupUp3D(nn.Module):
 
 
 class QwenImage21CausalConv3d(nn.Conv2d):
-
     def __init__(
         self,
         in_channels: int,
@@ -151,7 +148,6 @@ class QwenImage21CausalConv3d(nn.Conv2d):
 
 
 class QwenImage21RMS_norm(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -177,13 +173,11 @@ class QwenImage21RMS_norm(nn.Module):
 
 
 class QwenImage21Upsample(nn.Upsample):
-
     def forward(self, x):
         return super().forward(x.float()).type_as(x)
 
 
 class QwenImage21Resample(nn.Module):
-
     def __init__(self, dim: int, mode: str, upsample_out_dim: int = None) -> None:
         super().__init__()
         self.dim = dim
@@ -227,7 +221,6 @@ class QwenImage21Resample(nn.Module):
 
 
 class QwenImage21ResidualBlock(nn.Module):
-
     def __init__(
         self,
         in_dim: int,
@@ -263,7 +256,6 @@ class QwenImage21ResidualBlock(nn.Module):
 
 
 class QwenImage21AttentionBlock(nn.Module):
-
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -297,7 +289,6 @@ class QwenImage21AttentionBlock(nn.Module):
 
 
 class QwenImage21MidBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -326,7 +317,6 @@ class QwenImage21MidBlock(nn.Module):
 
 
 class QwenImage21ResidualDownBlock(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -364,7 +354,6 @@ class QwenImage21ResidualDownBlock(nn.Module):
 
 
 class QwenImage21Encoder3d(nn.Module):
-
     def __init__(
         self,
         in_channels: int = 3,
@@ -435,7 +424,6 @@ class QwenImage21Encoder3d(nn.Module):
 
 
 class QwenImage21ResidualUpBlock(nn.Module):
-
     def __init__(
         self,
         in_dim: int,
@@ -484,7 +472,6 @@ class QwenImage21ResidualUpBlock(nn.Module):
 
 
 class QwenImage21UpBlock(nn.Module):
-
     def __init__(
         self,
         in_dim: int,
@@ -521,7 +508,6 @@ class QwenImage21UpBlock(nn.Module):
 
 
 class QwenImage21Decoder3d(nn.Module):
-
     def __init__(
         self,
         dim=128,

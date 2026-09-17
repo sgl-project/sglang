@@ -165,9 +165,7 @@ class QwenImage21EncodingStage(PipelineStage):
             if conditions
             else None
         )
-        for negative in (
-            [False, True] if batch.do_classifier_free_guidance else [False]
-        ):
+        for negative in [False, True] if batch.do_classifier_free_guidance else [False]:
             embeds, masks, layouts = [], [], []
             for prompt in negatives if negative else prompts:
                 with set_forward_context(
