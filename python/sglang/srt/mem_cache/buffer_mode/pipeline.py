@@ -1106,7 +1106,8 @@ class BufferModePipeline:
         self, f: _StagedPrefetch, req: Req
     ) -> Optional[_MambaHandoff]:
         """Bind the staged recurrent state to its two device destinations, or
-        None when the load-back has to be called off.
+        None after deferring or dropping the load-back. The caller must end
+        this admission attempt so the next round rebuilds the joint prefix.
 
         The request gets its own H2D rather than the deferred D2D copy the
         match path uses: that copy is not ordered against this transfer, while
@@ -1131,9 +1132,16 @@ class BufferModePipeline:
                 req.rid,
                 f.num_tokens,
             )
+            self.release_staged_hold(req.cache_request_handle, reason="no_mamba_state")
+            req.staged_prefetch_plan = None
+            req.host_hit_length = 0
+            req.swa_host_hit_length = 0
+            req.mamba_host_hit_length = 0
+            self._clear_storage_hit(req)
             return None
         slot_allocated = req.kv.mamba_pool_idx is None
         if not mamba.ensure_request_state_slot(req):
+            self.defer_staged_admission(req, pool="mamba")
             return None
         return _MambaHandoff(
             node_copy=node_copy,
@@ -1269,12 +1277,7 @@ class BufferModePipeline:
         if mamba is not None:
             handoff = self._prepare_mamba_handoff(f, req)
             if handoff is None:
-                self.release_staged_hold(request, reason="no_mamba_state")
-                req.staged_prefetch_plan = None
-                req.host_hit_length = 0
-                req.swa_host_hit_length = 0
-                req.mamba_host_hit_length = 0
-                return unchanged
+                return None
             # Not staging (its host slots are the node copy's), so it stays
             # out of the aux_xfers the ack frees.
             load_xfers.append(handoff.request_copy)
