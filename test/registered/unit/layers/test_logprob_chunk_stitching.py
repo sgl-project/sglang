@@ -96,7 +96,7 @@ def _run(proc, batch, chunked, chunk_size):
 class TestLogprobChunkStitching(CustomTestCase):
     def _sweep(self, with_token_ids):
         torch.manual_seed(0)
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         combos = list(coverage_cases(SEQ_SPEC_MENU, max_seqs=4))
         self.assertEqual(len(combos), EXPECTED_CASES)
         tried = 0
