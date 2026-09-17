@@ -19,7 +19,8 @@ register_npu_ci(est_time=400, suite="full-4-npu-a3", nightly=True)
 
 
 class TestNpuImageProcessorBackend(CustomTestCase):
-    """Testcase：验证 --image-processor-backend 参数在 NPU 上生效，auto/torchvision/pil 三种后端均可正常完成 VLM 图片推理。
+    """Testcase: verify --image-processor-backend takes effect on NPU, and that
+    auto/torchvision/pil backends all complete VLM image inference correctly.
 
     [Test Category] Parameter
     [Test Target] --image-processor-backend
@@ -71,7 +72,8 @@ class TestNpuImageProcessorBackend(CustomTestCase):
             body = response.json()
             self.assertTrue(body["choices"][0]["message"]["content"])
 
-            # image_tokens 来自 prefill 的多模态 item offsets，非零说明图片到达了 vision tower。
+            # image_tokens comes from the multimodal item offsets in prefill;
+            # a non-zero value means the image reached the vision tower.
             usage_details = body["usage"].get("prompt_tokens_details")
             self.assertIsNotNone(usage_details, "prompt carried no multimodal tokens")
             self.assertGreater(usage_details.get("image_tokens", 0), 0)
