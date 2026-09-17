@@ -1594,8 +1594,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
 
     def _track_write_through_node(
@@ -3136,7 +3137,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if write_back:
-            # Blocking: wait for all pending write-backs
+            # Blocking: submit what is still queued, then wait for every ack.
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -3312,6 +3314,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        # Backups queued outside process_batch_result: the chunked-prefill stash
+        # in get_next_batch_to_run, abort_request, and the PD prefill release.
+        self.flush_pending_backups()
 
         (
             write_finish_count,
@@ -3345,6 +3350,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def flush_pending_backups(self) -> None:
+        """Submit pending D2H backups as a merged operation."""
+        if self.linker is not None or self.cache_controller is None:
+            return
+        self.cache_controller.start_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
