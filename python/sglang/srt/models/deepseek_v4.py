@@ -555,6 +555,40 @@ def _apply_gguf_grouped_wo_a(
     return torch.stack(group_outputs, dim=1)
 
 
+def _materialize_cp_unified_fp8_kv(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    stream: Optional[Any],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather a two-pool unified-KV pair in global logical-token order."""
+    assert k_nope.ndim == k_rope.ndim == 2
+    assert k_nope.shape[0] == k_rope.shape[0]
+    assert k_nope.is_contiguous() and k_rope.is_contiguous()
+    assert k_nope.element_size() == 1, (
+        f"packed noPE rows must be byte-sized, got {k_nope.dtype}"
+    )
+
+    nope_dtype, rope_dtype = k_nope.dtype, k_rope.dtype
+    nope_bytes = k_nope.view(torch.uint8)
+    rope_bytes = k_rope.view(torch.uint8)
+    nope_row_bytes = nope_bytes.shape[-1]
+    rope_row_bytes = rope_bytes.shape[-1]
+
+    # E8M0 scales live inline in the noPE bytes. Gather both halves as one row
+    # so the CP permutation cannot separate scales, noPE, and RoPE.
+    packed = torch.cat((nope_bytes, rope_bytes), dim=-1).contiguous()
+    packed = cp_materialize_global_token_order(packed, forward_batch, stream)
+    assert packed.dtype == torch.uint8 and packed.ndim == 2
+    assert packed.shape[-1] == nope_row_bytes + rope_row_bytes
+
+    nope_bytes, rope_bytes = packed.split((nope_row_bytes, rope_row_bytes), dim=-1)
+    return (
+        nope_bytes.contiguous().view(nope_dtype),
+        rope_bytes.contiguous().view(rope_dtype),
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -1780,20 +1814,6 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY=1, or run with "
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
-        if (
-            unified
-            and is_unified_kv_fp8()
-            and is_cp_active(forward_batch)
-            and not forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            # The gather hands back bf16 kv in global token order *after*
-            # norm+RoPE, so packing would have to move ahead of it and re-derive
-            # RoPE from global-order positions. Whether the CP path has those
-            # ready is unverified, so refuse instead of packing the wrong order.
-            raise NotImplementedError(
-                "fp8 two-pool unified_kv does not support DSA prefill CP "
-                "(SGLANG_DSV4_UNIFIED_KV_FP8=1 with cp_size > 1)."
-            )
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
@@ -1872,6 +1892,15 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+            )
+
+        if unified_fp8_prefill and is_cp_active(forward_batch):
+            assert kv is not None and k_rope is not None
+            kv, k_rope = _materialize_cp_unified_fp8_kv(
+                kv,
+                k_rope,
+                forward_batch,
+                torch.cuda.current_stream(),
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is

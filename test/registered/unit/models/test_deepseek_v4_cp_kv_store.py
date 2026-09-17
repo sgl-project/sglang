@@ -12,6 +12,67 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4CPKVStore(unittest.TestCase):
+    def test_unified_fp8_pair_gathers_one_raw_byte_row(self):
+        local_nope_bytes = torch.tensor(
+            [
+                [1, 2, 3, 4, 125, 125, 130, 130],
+                [5, 6, 7, 8, 126, 126, 131, 131],
+            ],
+            dtype=torch.uint8,
+        )
+        local_nope = local_nope_bytes.view(torch.float8_e4m3fn)
+        local_rope = torch.tensor([[10.0, 11.0], [12.0, 13.0]], dtype=torch.bfloat16)
+
+        global_nope_bytes = torch.tensor(
+            [
+                [1, 2, 3, 4, 125, 125, 130, 130],
+                [20, 21, 22, 23, 127, 127, 132, 132],
+                [5, 6, 7, 8, 126, 126, 131, 131],
+            ],
+            dtype=torch.uint8,
+        )
+        global_rope = torch.tensor(
+            [[10.0, 11.0], [30.0, 31.0], [12.0, 13.0]], dtype=torch.bfloat16
+        )
+        gathered_bytes = torch.cat(
+            (
+                global_nope_bytes,
+                global_rope.contiguous().view(torch.uint8),
+            ),
+            dim=-1,
+        )
+        forward_batch, stream = object(), object()
+
+        with mock.patch.object(
+            deepseek_v4,
+            "cp_materialize_global_token_order",
+            return_value=gathered_bytes,
+        ) as materialize:
+            full_nope, full_rope = deepseek_v4._materialize_cp_unified_fp8_kv(
+                local_nope,
+                local_rope,
+                forward_batch,
+                stream,
+            )
+
+        materialize.assert_called_once()
+        packed_local, gathered_batch, gathered_stream = materialize.call_args.args
+        self.assertEqual(packed_local.dtype, torch.uint8)
+        self.assertTrue(
+            torch.equal(
+                packed_local,
+                torch.cat((local_nope_bytes, local_rope.view(torch.uint8)), dim=-1),
+            )
+        )
+        self.assertIs(gathered_batch, forward_batch)
+        self.assertIs(gathered_stream, stream)
+        self.assertEqual(full_nope.dtype, local_nope.dtype)
+        self.assertEqual(full_rope.dtype, local_rope.dtype)
+        self.assertTrue(full_nope.is_contiguous())
+        self.assertTrue(full_rope.is_contiguous())
+        self.assertTrue(torch.equal(full_nope.view(torch.uint8), global_nope_bytes))
+        self.assertTrue(torch.equal(full_rope, global_rope))
+
     def test_unified_cp_gathers_current_chunk_for_two_source_attention(self):
         layer = MQALayer.__new__(MQALayer)
         layer.fuse_wqa_wkv = False

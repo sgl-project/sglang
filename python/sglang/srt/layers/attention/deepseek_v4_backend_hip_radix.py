@@ -110,6 +110,8 @@ class UnifiedKvMetadata:
     pf_chunk_start: Optional[torch.Tensor] = None
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
+    # Global padded order, retained when CP reindexes positions_casual locally.
+    pf_positions: Optional[torch.Tensor] = None
 
     # Per-token req-slot map used by the SWA ring store, precomputed once per
     # step so the forward store does not recompute a repeat_interleave per layer.
@@ -138,6 +140,7 @@ class UnifiedKvMetadata:
                 "pf_chunk_start",
                 "pf_cu_q",
                 "pf_final_pos",
+                "pf_positions",
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
@@ -167,6 +170,7 @@ class UnifiedKvMetadata:
                 "pf_chunk_start",
                 "pf_cu_q",
                 "pf_final_pos",
+                "pf_positions",
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
@@ -742,6 +746,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens,
             num_tokens,
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
+            retain_global_positions=cp_active,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
@@ -1548,6 +1553,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         exact_num_tokens: bool = True,
+        retain_global_positions: bool = False,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1596,6 +1602,10 @@ class DeepseekV4HipRadixBackend(
         core.unified.pf_chunk_start = chunk_start
         core.unified.pf_cu_q = cu_q
         core.unified.pf_final_pos = final_pos
+        if retain_global_positions:
+            # positions_casual is still global here. CP reindexing below
+            # replaces that field, while this alias retains the global ring order.
+            core.unified.pf_positions = core.positions_casual
 
     def _forward_unified_kv(
         self,
@@ -1749,9 +1759,8 @@ class DeepseekV4HipRadixBackend(
             # padding rows the inert position produced by metadata expansion.
             positions = core_attn_metadata.positions_casual.to(torch.int64)
             assert positions.shape[0] == T
-            positions_full = forward_batch.positions.to(torch.int64)[
-                : state_slot_full.shape[0]
-            ].contiguous()
+            positions_full = core_attn_metadata.unified.pf_positions
+            assert positions_full is not None
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
