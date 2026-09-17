@@ -45,7 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 # gfx950 full-GPU. Passed in rather than read from the device so this stays a CPU test.
 CORE_COUNT = 256
