@@ -6,14 +6,14 @@ smaller registrations succeed. _register_chunk_with_retry halves the chunk
 until the driver accepts it instead of crashing the scheduler at startup.
 """
 
+import pytest
+import torch
+
 from sglang.srt.mem_cache.pool_host import common
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _register_chunk_with_retry,
 )
-
-import pytest
-import torch
 
 MiB = 1024**2
 
