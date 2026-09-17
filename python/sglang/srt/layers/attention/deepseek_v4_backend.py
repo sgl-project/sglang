@@ -546,9 +546,8 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
-    # Per-ratio extra-cache metadata stays as flat fields (copy_metadata and the
-    # CUDA-graph refresh enumerate fields by name); these accessors unify the
-    # read and write paths over the ratio.
+    # Per-ratio extra-cache metadata is stored as flat fields; these accessors
+    # unify the read and write paths over the ratio.
 
     def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
         """Slots into the ratio's extra cache, -1 padded: the indexer's top-k for
@@ -594,7 +593,7 @@ class DSV4AttnMetadata:
         topk_lengths: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        """Writer counterpart of the accessors above (test fixtures seed through it)."""
+        """Writer counterpart of the accessors above."""
         if compress_ratio == 1:
             self.c1_sparse_page_indices = page_indices
             self.c1_sparse_topk_lengths = topk_lengths

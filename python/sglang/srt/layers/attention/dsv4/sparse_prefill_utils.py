@@ -266,7 +266,7 @@ def build_swa_token_ids(
 
 @dataclass
 class CompressedGather:
-    """Positional layout of one top-k compressed cache inside the workspace."""
+    """Positional layout of one compressed cache inside the workspace."""
 
     flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
     compressed_base: torch.Tensor  # (num_reqs,) int32
@@ -281,8 +281,9 @@ class CompressedGather:
 class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
-    Fields depend on request/token mappings and compressed page tables,
-    not per-layer k_cache; layer-specific top-k combinations are not cached.
+    Fields depend on request/token mappings and compressed page tables, not
+    per-layer k_cache; per-layer top-k combinations are recomputed into reused
+    buffers.
     """
 
     # Geometry computed once per chunk.
@@ -447,7 +448,7 @@ class SparsePrefillChunkCache:
             f"live c128 extent {c128_max} exceeds metadata capacity "
             f"{c128_page_indices.shape[-1]}"
         )
-        # a request without rows on this rank gathers into a region nothing reads
+        # A request without rows on this rank gathers into a region nothing reads.
         last_q_per_req = (self.query_start_loc[1:] - 1).clamp_min(0).long()
         per_req_c128 = c128_page_indices.narrow(1, 0, c128_max).index_select(
             0, last_q_per_req
