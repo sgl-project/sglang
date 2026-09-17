@@ -443,7 +443,7 @@ def embed_mm_inputs(
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
             pad_values = [item.pad_value for item in items]
-            if input_ids.is_cuda:
+            if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
                     pad_values, dtype=torch.int64, device="cpu", pin_memory=True
