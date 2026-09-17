@@ -15,8 +15,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 
 
 def _rms_norm(dim: int) -> RMSNorm:
-    # fp32 statistics, fp32 weight multiply, cast at the end; the fused CUDA
-    # kernels do not take an fp32 weight with a bf16 input.
+    # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
     return RMSNorm(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
 
 
@@ -125,8 +124,7 @@ class ViT(nn.Module):
         x = self.patch_embed(patches)
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
         cos, sin = cos.to(x.device), sin.to(x.device)
-        # One image is one full, bidirectional sequence. Supplying its known
-        # length avoids device-to-host length discovery in every encoder layer.
+        # Passing the known length avoids device-to-host length discovery per layer.
         metadata = prepare_vision_attention_metadata(
             torch.tensor([0, x.shape[0]], dtype=torch.int32),
             x.device,

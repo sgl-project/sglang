@@ -98,7 +98,6 @@ def to_rgb(image: Image.Image) -> Image.Image:
 
 
 def patchify_image(image, args):
-    """Transform one decoded image into ViT patches."""
     p = args.vision_patch_size
     image = to_rgb(image)
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
@@ -123,7 +122,6 @@ def patchify_image(image, args):
 
 
 def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
-    """Default layout: the aligner grid in reading order, one IMAGE_NEW_LINE per row."""
     types = [IMAGE_START]
     types += ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h
     types.append(IMAGE_END)
@@ -179,9 +177,8 @@ def materialize_image_gpu(pixels: torch.Tensor, plan: dict) -> torch.Tensor:
     """Resize, pad, normalize and patchify on the input tensor's device."""
     x = pixels.unsqueeze(0).float()
     target = (plan["resize_h"], plan["resize_w"])
-    # PIL uses separable passes, with uint8 rounding/clamping after each pass.
-    # Keep those boundaries; a single 2D float resize preserves overshoots
-    # between passes and can diverge substantially on high-contrast images.
+    # PIL resizes separably, rounding and clamping to uint8 after each pass;
+    # fusing the two passes into one float resize diverges on high-contrast images.
     for size in ((x.shape[-2], target[1]), target):
         if x.shape[-2:] != size:
             x = (

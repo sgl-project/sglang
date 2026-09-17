@@ -45,9 +45,8 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
             self.preprocess_backend = "gpu"
         elif backend == "auto":
-            # Resolve the optional extension once, before the base class builds
-            # the preprocessing cache fingerprint. Image-processing errors are
-            # not caught here or retried with a different backend.
+            # Resolved before super().__init__(), which fingerprints the backend;
+            # a load failure falls back to PIL, later image errors do not.
             try:
                 extension = load_rust_extension(
                     "sglang.srt.rust_extensions._multimodal"
