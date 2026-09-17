@@ -264,3 +264,19 @@ Pending update — a sample transcript will be added here once the weights are p
 ```
 
 </Accordion>
+
+### 2.3 HiCache (Hierarchical KV Caching)
+
+HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
+
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**: the Playground emits `--enable-hierarchical-cache` on top of the recipe's flags, and cold KV pages spill to CPU pinned memory (L2, GPU + CPU) instead of being dropped from the GPU pool.
+
+The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
+
+Size the host pool by ratio (`--hicache-ratio 2`); the server rejects `--hicache-size` on this model. Alongside K/V the host tier carries the Gated DeltaNet conv/temporal state, the QSA compressed index-K (one row per `indexer_compress_ratio` tokens, per full-attention layer) and the per-request PLE short-conv window. Those last two are addressed through the KV and GDN slot spaces rather than allocated independently, so a fixed byte budget cannot be divided across them. Expect a higher per-token host cost than a plain attention model of the same size.
+
+HiCache cannot be combined with MTP: the MTP head is a full-attention layer, so the draft runner keeps its own QSA compressed index-K that no draft host path carries. `--speculative-algorithm NEXTN` alongside `--enable-hierarchical-cache` fails at startup, as does `--pp-size > 1`.
+
+The card is not offered on MI350X/MI355X, where the path is unvalidated.
+
+Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).

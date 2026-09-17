@@ -262,6 +262,24 @@ export const config = {
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
       ],
     },
+
+    // ----- Card: "HiCache" -----
+    // GPU -> CPU KV offload (L2 only; no storage tier here). Besides K/V the
+    // host tier mirrors the GDN conv/temporal state, the QSA compressed
+    // index-K and the per-request PLE short-conv window, so it costs more per
+    // token than a plain attention model of the same size. Sizing is by ratio:
+    // the engine emits `--hicache-size 0` and the server rejects any other
+    // value here. Cannot be combined with the Speculative Decoding card. Left
+    // out on AMD, where the path is unvalidated.
+    hicache: {
+      excludesHw: ["mi350x", "mi355x"],
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
+      ],
+    },
   },
 
   // Every cell below is a verified recipe. Ordering: the first cell seeds the
