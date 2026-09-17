@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Immutable compatibility and execution descriptions; no live process groups."""
+"""Immutable compatibility and descriptive load plans; no live process groups.
+
+PipelineExecutionPlan describes resolved loading, not an executable scheduler.
+Actual cache import is selected by the cache-only pipeline entry point.
+"""
 
 import json
 
@@ -27,7 +31,6 @@ class ComponentPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     source_path: str
     residency: str
     attention: str | None
-    cached: bool
     loader_id: str
 
 

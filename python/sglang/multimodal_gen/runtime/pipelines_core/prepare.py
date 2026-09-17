@@ -207,7 +207,6 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
                     if backend
                     else ("fa" if spec.module_name == "transformer" else None)
                 ),
-                required and spec.module_name == "transformer",
                 (
                     "TransformerLoader.customized"
                     if spec.module_name == "transformer"
