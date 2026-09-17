@@ -238,6 +238,55 @@ def test_flydsl_multi_iteration_dim():
     torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
 
 
+@pytest.mark.parametrize("dim,waves", [(1024, 2), (3072, 6), (4096, 8), (5120, 10)])
+def test_flydsl_norm_scale_shift_wave_count_dims(dim, waves):
+    """Each hidden size a model actually uses picks a wave count and stays correct.
+
+    The tile is ``BLOCK * VEC``; ``_pick_num_waves`` takes the largest block
+    whose tile divides D, so these four dims exercise every entry of
+    ``_BLOCK_CHOICES``.  The wave counts here are the wave64 ones -- a wave32
+    part runs the same block in twice as many waves.  Before the per-dim
+    selection only D=5120 (and its multiples) reached the kernel at all.
+    """
+    _, nss_op = _flydsl_ops()
+    from sglang.kernels.ops.diffusion import flydsl_norm_supports
+
+    assert flydsl_norm_supports(dim, FLYDSL_EPS), f"D={dim} should be eligible"
+
+    B, L = 1, 8
+    x = _mk((B, L, dim))
+    weight = _mk((dim,), torch.float32)
+    scale, shift = _mk((B, 1, dim)), _mk((B, 1, dim))
+
+    y = nss_op(x, weight, None, scale, shift, "rms", FLYDSL_EPS)
+    y_ref = _ref_norm_ss(x, weight, None, scale, shift, "rms", FLYDSL_EPS)
+    torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
+
+
+def test_flydsl_norm_supports_gates_dim_and_eps():
+    """The dispatch predicate: eligible dims, and the epsilon it cannot honour.
+
+    The kernels bake in ``_EPS`` rather than reading the caller's value, so a
+    norm configured with anything else must stay on the reference path -- it
+    would otherwise be normalized with the wrong epsilon.  Dims that no tile in
+    ``_BLOCK_CHOICES`` divides are rejected for the same reason:
+    a partial inner-loop iteration is not something the kernel can express.
+    """
+    _require_rocm()
+    try:
+        from sglang.kernels.ops.diffusion import flydsl_norm_supports
+    except ImportError as exc:  # pragma: no cover - old FlyDSL runner image
+        pytest.skip(f"FlyDSL unavailable: {exc}")
+
+    for dim in (1024, 3072, 4096, 5120, 10240):
+        assert flydsl_norm_supports(dim, FLYDSL_EPS), f"D={dim} should be eligible"
+    for dim in (1536, 2560, 512, 100):
+        assert not flydsl_norm_supports(dim, FLYDSL_EPS), f"D={dim} should be rejected"
+
+    assert not flydsl_norm_supports(3072, 1e-5)
+    assert not flydsl_norm_supports(5120, 1e-5)
+
+
 def test_flydsl_compile_cache_reuse_across_row_counts_and_layouts():
     """Guard for the compile-cache/shape-specialization hazard.
 
@@ -279,13 +328,13 @@ def test_flydsl_imports_without_flydsl_source_tree():
         "import importlib, sys;"
         f"m = importlib.import_module('{FLYDSL_MODULE}');"
         "assert 'kernels' not in sys.modules, 'leaked FlyDSL source-tree kernels package';"
-        "print('OK', m.FLYDSL_NORM_MIN_ALIGNED_DIM)"
+        "print('OK', m._NUM_WAVES_CHOICES)"
     )
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
     assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
-    assert f"OK {FLYDSL_D}" in r.stdout, r.stdout
+    assert "OK (10, 8, 6, 2)" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":
