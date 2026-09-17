@@ -64,7 +64,7 @@ class TestBasicSanity(
             num_examples=200,
             num_threads=64,
             thinking=False,
-            max_tokens=256,
+            max_tokens=1024,
             temperature=0,
         )
 
