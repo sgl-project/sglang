@@ -350,6 +350,9 @@ pub struct ModelConfig {
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
+    /// Disable router-generated input IDs for this model; keep routing tokenization.
+    /// Use when workers have rendering defaults or template stops the router cannot see.
+    pub disable_input_ids_forwarding: bool,
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
