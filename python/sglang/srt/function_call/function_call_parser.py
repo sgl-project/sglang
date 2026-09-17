@@ -359,3 +359,11 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+
+# Keep the dependency-free CLI choices list in sync with the real registry.
+from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES  # noqa: E402
+
+assert set(TOOL_CALL_PARSER_NAMES) == set(FunctionCallParser.ToolCallParserEnum), (
+    "function_call/parser_names.py is out of sync with FunctionCallParser.ToolCallParserEnum"
+)
