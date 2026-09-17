@@ -256,6 +256,8 @@ StructuralTagResponseFormat: TypeAlias = Union[
 ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+    Tuple[Literal["ebnf"], str],
+    Tuple[Literal["full_assistant_ebnf"], str],
 ]
 
 
@@ -1174,8 +1176,9 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if self.tool_choice == "required" or isinstance(
-                self.tool_choice, ToolChoice
+            if tool_call_constraint[0] != "full_assistant_ebnf" and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
             ):
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
@@ -1193,6 +1196,9 @@ class ChatCompletionRequest(BaseModel):
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value  # type: ignore
                 )
+            elif constraint_type == "full_assistant_ebnf":
+                sampling_params["ebnf"] = constraint_value
+                sampling_params["ebnf_full_assistant"] = True
             else:
                 sampling_params[constraint_type] = constraint_value
 
@@ -1883,6 +1889,12 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
+            if tool_call_constraint[0] == "full_assistant_ebnf":
+                # Explicit output constraints take precedence over the default EBNF.
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+                return params
             # Refuse rather than silently drop the tool-call grammar.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
@@ -1897,6 +1909,9 @@ class ResponsesRequest(BaseModel):
                     if hasattr(constraint_value, "model_dump")
                     else constraint_value
                 )
+            elif constraint_type == "full_assistant_ebnf":
+                params["ebnf"] = constraint_value
+                params["ebnf_full_assistant"] = True
             else:
                 params[constraint_type] = constraint_value
 
