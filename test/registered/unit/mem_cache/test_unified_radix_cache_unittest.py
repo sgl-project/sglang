@@ -1015,10 +1015,13 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     def test_buffer_backup_snapshot_preserves_raw_bigram_key_and_namespace(self):
         """The raw N+1 bigram tokens, the bigram flag and the (extra_key,
         cache_salt) namespace all feed the storage hash, so a snapshot that
-        drops any of them backs the node up under a key no prefetch will find."""
+        drops any of them backs the node up under a key no prefetch will find.
+        The snapshot also owns its copy of the key: the backup runs detached
+        from the tree, so a caller mutating it must not reach a later one."""
         cache, allocator, _ = build_fixture(self.cfg)
         cache.enable_storage = True
         tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        expected_tokens = tuple(tokens)
         key = RadixKey(tokens, extra_key="adapter-a", cache_salt="tenant-a")
         value = allocator.alloc(len(tokens) - 1)
         self.assertIsNotNone(value)
@@ -1034,6 +1037,12 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertEqual(snapshot.key.extra_key, "adapter-a")
         self.assertEqual(snapshot.key.cache_salt, "tenant-a")
         self.assertEqual(snapshot.prefix_keys, [])
+
+        snapshot.key.token_ids[0] = -1
+        fresh_snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertEqual(tuple(fresh_snapshot.key.token_ids), expected_tokens)
 
     def test_sanity_check_reads_buffer_backup_node_id_from_snapshot(self):
         """A buffer-mode backup entry keeps its node id inside the detached
