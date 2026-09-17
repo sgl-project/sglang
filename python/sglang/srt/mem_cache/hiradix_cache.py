@@ -27,7 +27,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-    take_kv_age_hit_observation,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1331,10 +1332,12 @@ class HiRadixCache(RadixCache):
         freed_device = 0
         for n in nodes:
             if n.host_value is not None:
+                self._observe_kv_eviction(n, len(n.host_value), "host", "dropped")
                 self.kv_events.record_remove(n, medium=StorageMedium.CPU)
                 self.cache_controller.evict_host(n.host_value)
                 n.host_value = None
             if n.value is not None:
+                self._observe_kv_eviction(n, len(n.value), "device", "dropped")
                 self.kv_events.record_remove(n, medium=StorageMedium.GPU)
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
@@ -1752,12 +1755,14 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        observe_kv_age = (
-            self.metrics_collector is not None and take_kv_age_hit_observation(params)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
         )
         value, last_node = self._match_prefix_helper(
             self.root_node, key, observe_kv_age=observe_kv_age
         )
+        if observe_kv_age and value:
+            mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
         else:
@@ -1920,6 +1925,9 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        # A split re-shapes the tree; it does not create KV. The retained prefix
+        # keeps the residency start its lifetime metric is measured from.
+        new_node.creation_time = child.creation_time
 
         # split value and host value if exists
         if child.evicted:

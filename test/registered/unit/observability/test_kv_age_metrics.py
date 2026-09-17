@@ -328,6 +328,47 @@ class TestRadixCacheEmitsKvAge(unittest.TestCase):
         ]
         self.assertEqual(evict_tokens, [len(tokens)])
 
+    def test_cold_request_reports_its_first_real_hit(self):
+        """A zero-token match must not consume the request's one observation:
+        a request that queued against a cold cache still reports the hit when
+        a sibling fills its prefix before a later scheduling round."""
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        tokens = array("q", [1, 2, 3, 4])
+        req = _req("cold", tokens)
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
+        self.assertEqual(collector.kv_age_seconds.observations, [])
+
+        indices = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
+        hits = [
+            v
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        ]
+        self.assertEqual(len(hits), 1)
+
+    def test_split_keeps_the_prefix_creation_time(self):
+        """A partial match splits a node; the retained prefix is the same KV and
+        keeps its residency start, so its lifetime at eviction is not reset."""
+        cache, allocator = self._build_cache()
+        tokens = array("q", [1, 2, 3, 4])
+        indices = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
+        (node,) = cache.root_node.children.values()
+        created = node.creation_time
+        node.creation_time = created - 3600.0  # pretend it has lived an hour
+
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2])))
+        )
+        (prefix,) = cache.root_node.children.values()
+        self.assertEqual(len(prefix.key), 2)
+        self.assertEqual(prefix.creation_time, created - 3600.0)
+
 
 class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
     """Same sequence on the default UnifiedRadixCache (Python tree core): the

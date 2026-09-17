@@ -44,7 +44,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-    take_kv_age_hit_observation,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
@@ -443,12 +444,14 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        observe_kv_age = (
-            self.metrics_collector is not None and take_kv_age_hit_observation(params)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
         )
         value, last_node = self._match_prefix_helper(
             self.root_node, key, observe_kv_age=observe_kv_age
         )
+        if observe_kv_age and value:
+            mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
         else:
@@ -792,6 +795,9 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        # A split re-shapes the tree; it does not create KV. The retained prefix
+        # keeps the residency start its lifetime metric is measured from.
+        new_node.creation_time = child.creation_time
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref

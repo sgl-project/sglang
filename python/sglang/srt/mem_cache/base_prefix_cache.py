@@ -72,19 +72,24 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
-def take_kv_age_hit_observation(params: MatchPrefixParams) -> bool:
-    """Return True for the first match_prefix a request performs, False after.
+def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
+    """True until the request's first *non-empty* match has been observed.
 
-    Only that first match measures real reuse: the scheduler re-matches waiting
-    requests every round and the cache re-matches after each insert, and those
-    would all land in the sub-second age bucket. Matches without a request
-    (tests, probes) never observe.
+    Only a request's first real hit measures reuse: the scheduler re-matches
+    waiting requests every round and the cache re-matches after each insert,
+    and those would all land in the sub-second age bucket. A zero-token match
+    does not count as observed, so a request that queued against a cold cache
+    still reports the hit when a sibling fills its prefix in a later round.
+    Matches without a request (tests, probes) never observe.
     """
     req = params.req
-    if req is None or getattr(req, "kv_age_hit_observed", False):
-        return False
-    req.kv_age_hit_observed = True
-    return True
+    return req is not None and not getattr(req, "kv_age_hit_observed", False)
+
+
+def mark_kv_age_hit_observed(params: MatchPrefixParams) -> None:
+    """Consume the request's one hit observation (call after a non-empty match)."""
+    if params.req is not None:
+        params.req.kv_age_hit_observed = True
 
 
 @dataclasses.dataclass

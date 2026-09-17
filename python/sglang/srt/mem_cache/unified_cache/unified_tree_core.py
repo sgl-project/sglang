@@ -38,7 +38,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     _dfs_weight_order,
-    take_kv_age_hit_observation,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
@@ -939,9 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         cur_time = get_and_increase_time_counter()
         now_wall = time.monotonic()
-        observe_kv_age = (
-            self.kv_age_observer is not None and take_kv_age_hit_observation(params)
-        )
+        observe_kv_age = self.kv_age_observer is not None and kv_age_hit_pending(params)
+        # Only a non-empty match consumes the request's one hit observation.
+        if observe_kv_age and best_match_node.parent is not None:
+            mark_kv_age_hit_observed(params)
         while node_update:
             if observe_kv_age:
                 self._emit_kv_age(
