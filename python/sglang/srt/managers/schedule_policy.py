@@ -1387,8 +1387,7 @@ class PrefillAdder:
                 has_chunked_req
                 and get_schedule().schedule_policy == "shortest-prefill-first"
             ):
-                # Reserved space may admit complete short prefills, but there is
-                # still only one slot for an unfinished chunked request.
+                # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
