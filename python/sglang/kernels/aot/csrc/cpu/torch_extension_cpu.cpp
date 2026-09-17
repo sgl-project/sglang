@@ -623,10 +623,6 @@ void store_cache_cpu(
 void copy_all_layer_kv_cache_cpu(
     const at::Tensor& data_ptrs, const at::Tensor& strides, const at::Tensor& tgt_loc, const at::Tensor& src_loc);
 
-// fused inplace qknorm
-void fused_inplace_qknorm_cpu(
-    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps, int64_t head_dim);
-
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -1028,16 +1024,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
   m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
 
-  // fused inplace qknorm
-  m.def(
-      "fused_inplace_qknorm_cpu(Tensor(a!) q, Tensor(a!) k, Tensor q_weight, Tensor k_weight, float eps, int head_dim) "
-      "-> ()");
-  m.impl("fused_inplace_qknorm_cpu", torch::kCPU, &fused_inplace_qknorm_cpu);
-}
+  TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+    m.impl("init_cpu_threads_env", init_cpu_threads_env);
+    m.impl("initialize", &initialize);
+  }
 
-TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
-  m.impl("init_cpu_threads_env", init_cpu_threads_env);
-  m.impl("initialize", &initialize);
-}
-
-REGISTER_EXTENSION(common_ops)
+  REGISTER_EXTENSION(common_ops)
