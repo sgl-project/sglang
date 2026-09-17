@@ -539,9 +539,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
-        # A 32-wide-K ue8m0 block weight is an MXFP8 operand; serve it through the
-        # FlashInfer MXFP8 GEMMs when an explicit FlashInfer backend is selected on
-        # Blackwell. Triton stays the fallback per layer (see _prepare_block_fp8_as_mxfp8).
+        # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
+        # block kernel (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
             self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
         )
@@ -852,8 +851,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale_inv.set_(scale_reordered)
 
     def _prepare_block_fp8_as_mxfp8(self, layer: Module) -> None:
-        """Derive the MXFP8 scale layout of a 32-wide-K ue8m0 block weight. The block
-        scales stay in place for the Triton fallback and for consumers that read them."""
         layer.block_fp8_mxfp8_ready = False
         if getattr(layer, "keep_plain_weight_layout", False):
             # The model reads .weight / .weight_scale_inv directly.
@@ -868,6 +865,8 @@ class Fp8LinearMethod(LinearMethodBase):
         except ValueError as e:
             logger.warning("Block-fp8 layer stays on the Triton kernel: %s", e)
             return
+        # weight_scale_inv stays in place for the Triton fallback and raw readers;
+        # the swizzled copy is stored separately.
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
         layer.block_fp8_mxfp8_ready = True
 
