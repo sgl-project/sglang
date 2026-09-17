@@ -1516,6 +1516,17 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
+        # The cached prefix is evictable once the KV is released; its length,
+        # capped at what a retry can match, seeds the retry's storage baseline
+        # so an evicted prefix gets one L3 lookup before it is recomputed.
+        yielded_prefix_len = (
+            0
+            if req.skip_radix_cache_insert
+            else min(
+                req.kv.cache_protected_len,
+                req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+            )
+        )
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1530,6 +1541,9 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         req.advance_cache_request_handle()
+        # A fresh lookup budget for the new attempt, as after a retraction.
+        req.storage_prefetch_retry_attempts = 0
+        req.storage_prefetch_last_match_len = yielded_prefix_len or None
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
