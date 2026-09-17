@@ -776,6 +776,7 @@ def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
     assert out_width % 32 == 0
     assert out_height % 32 == 0
     assert abs((out_width / out_height) - 2.0) < 0.05
+    assert (batch.width, batch.height) == (out_width, out_height)
 
 
 def test_sensenova_u1_it2i_preserves_explicit_output_size():
@@ -805,6 +806,7 @@ def test_sensenova_u1_it2i_preserves_explicit_output_size():
     )
 
     assert model.it2i_calls[0]["image_size"] == (1024, 1024)
+    assert (batch.width, batch.height) == (1024, 1024)
 
 
 def test_sensenova_u1_generation_stage_rejects_cfg_zero_star_for_it2i():

@@ -28,7 +28,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
 
 DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048
 MIN_INPUT_MAX_PIXELS = 512 * 512
@@ -210,6 +213,17 @@ class SenseNovaU1GenerationStage(PipelineStage):
             if edit_images
             else (int(batch.width), int(batch.height))
         )
+        if edit_images:
+            original_size = (int(batch.width), int(batch.height))
+            batch.width, batch.height = image_size
+            if image_size != original_size:
+                logger.info(
+                    "Resolved SenseNova-U1 edit output size from %sx%s to %sx%s",
+                    original_size[0],
+                    original_size[1],
+                    image_size[0],
+                    image_size[1],
+                )
 
         common_kwargs = dict(
             image_size=image_size,
