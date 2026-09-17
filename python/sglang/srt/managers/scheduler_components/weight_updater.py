@@ -241,9 +241,7 @@ class SchedulerWeightUpdaterManager:
                 )
             )
             success = False
-            message = (
-                "NCCL M2N Phase 2 does not support a draft/speculative model " "runner."
-            )
+            message = "NCCL M2N does not support a draft/speculative model runner."
             if not cleanup_success:
                 message += f" Cleanup also failed: {cleanup_message}"
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
@@ -298,7 +296,7 @@ class SchedulerWeightUpdaterManager:
                         raise ValueError("M2N requires a sync_base=True session")
                     if recv_req.selector not in ("target", "all"):
                         raise ValueError(
-                            "NCCL M2N Phase 2 can update only the target model runner"
+                            "NCCL M2N can update only the target model runner"
                         )
                     if recv_req.m2n_group_names is None:
                         self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n(
