@@ -66,16 +66,22 @@ inline void build_tree_kernel_efficient(
   const int64_t bs = batch_size.unwrap();
   TensorMatcher({bs * draft_token_num}).with_dtype<int64_t>().with_device(device).verify(positions);
   SymbolicDType mask_dtype;
-  int64_t mask_size = bs * draft_token_num;
+  // Cells this batch writes, which is a LOWER BOUND on the mask, not its size:
+  // the caller may hand in a buffer preallocated for the captured max batch and
+  // only fill the leading bs requests. FULL_MASK spans each request's context
+  // length, so it has no host-side bound at all.
+  int64_t min_mask_numel = bs * draft_token_num;
   if (tree_mask_mode == speculative::QLEN_ONLY_BITPACKING) {
     CHECK_HOST(draft_token_num <= 32);
     const uint8_t bits = draft_token_num > 16 ? 32 : (draft_token_num > 8 ? 16 : 8);
     mask_dtype.set_value(DLDataType{kDLUInt, bits, 1});
   } else {
     mask_dtype.set_value(DLDataType{kDLBool, 8, 1});
-    mask_size = tree_mask_mode == speculative::QLEN_ONLY ? mask_size * draft_token_num : -1;
+    min_mask_numel = tree_mask_mode == speculative::QLEN_ONLY ? min_mask_numel * draft_token_num : 0;
   }
-  TensorMatcher({mask_size}).with_dtype(mask_dtype).with_device(device).verify(tree_mask);
+  // -1 leaves the extent unconstrained; the bound below is the real guard.
+  TensorMatcher({-1}).with_dtype(mask_dtype).with_device(device).verify(tree_mask);
+  CHECK_HOST(tree_mask.numel() >= min_mask_numel);
   if (bs == 0) return;
 
   auto launch = LaunchKernel(static_cast<uint32_t>(bs), static_cast<uint32_t>(draft_token_num), device.unwrap());
