@@ -14,9 +14,7 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
     def _check(self, protocol, custom_mem_pool=None, allocator_env=None):
         allocator_env = allocator_env or {}
         with (
-            patch.object(
-                envs.MOONCAKE_PROTOCOL, "get", return_value=protocol
-            ),
+            patch.object(envs.MOONCAKE_PROTOCOL, "get", return_value=protocol),
             patch.object(
                 envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
                 "get",
@@ -56,17 +54,13 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
         self.assertEqual(
             self._check(
                 "EFA",
-                allocator_env={
-                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"
-                },
+                allocator_env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"},
             ),
             (False, None),
         )
 
     def test_non_efa_keeps_custom_memory_pool_behavior(self):
-        self.assertEqual(
-            self._check("rdma", custom_mem_pool="true"), (True, "NVLINK")
-        )
+        self.assertEqual(self._check("rdma", custom_mem_pool="true"), (True, "NVLINK"))
 
 
 if __name__ == "__main__":

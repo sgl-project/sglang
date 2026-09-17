@@ -40,7 +40,7 @@ def _cuda_expandable_segments_enabled() -> Optional[str]:
 def _validate_efa_allocator_compatibility(
     enable_custom_mem_pool: bool, custom_mem_pool_type: Optional[str]
 ) -> None:
-    """Reject CUDA VMM allocators that libfabric EFA cannot transfer."""
+    """Reject CUDA VMM allocators unsupported by the current libfabric EFA path."""
     if envs.MOONCAKE_PROTOCOL.get().lower() != "efa":
         return
 
@@ -48,16 +48,17 @@ def _validate_efa_allocator_compatibility(
         raise ValueError(
             f"SGLANG_MOONCAKE_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
             "incompatible with MOONCAKE_PROTOCOL=efa. Mooncake custom memory "
-            "pools use CUDA VMM allocations, but EFA requires cudaMalloc-backed "
-            "transfer buffers. Unset SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+            "pools use CUDA VMM allocations, which the current libfabric EFA "
+            "provider cannot transfer. Unset SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
         )
 
     expandable_segments_var = _cuda_expandable_segments_enabled()
     if expandable_segments_var is not None:
         raise ValueError(
             f"{expandable_segments_var} enables expandable_segments, which is "
-            "incompatible with MOONCAKE_PROTOCOL=efa. EFA requires "
-            "cudaMalloc-backed transfer buffers. Disable expandable_segments."
+            "incompatible with MOONCAKE_PROTOCOL=efa because the current "
+            "libfabric EFA provider cannot transfer CUDA VMM allocations. "
+            "Disable expandable_segments."
         )
 
 
