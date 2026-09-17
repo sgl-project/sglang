@@ -19,15 +19,18 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    GenerationResult,
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    GenerationResult,
     expand_request_outputs,
     format_lora_message,
+    map_request_outputs,
     prepare_request,
     save_outputs,
 )
@@ -63,6 +66,39 @@ try:
 except RuntimeError:
     # The start method can only be set once per program execution.
     pass
+
+
+def _replace_sampling_params_for_prompt(
+    sampling_params_orig: SamplingParams,
+    prompt: str,
+    output_file_name: str | None,
+    image_path: str | list[str] | None,
+) -> SamplingParams:
+    """Clone per-prompt parameters without losing model-internal state."""
+    sampling_params = dataclasses.replace(
+        sampling_params_orig,
+        prompt=prompt,
+        output_file_name=output_file_name,
+        image_path=image_path,
+    )
+
+    # dataclasses.replace() resets fields declared with init=False. Preserve
+    # model-internal output geometry so GLM-Image can crop the aligned canvas
+    # back to the user's requested size.
+    for field_name in ("requested_width", "requested_height"):
+        if hasattr(sampling_params_orig, field_name):
+            setattr(
+                sampling_params,
+                field_name,
+                getattr(sampling_params_orig, field_name),
+            )
+
+    # dataclasses.replace() also drops non-field attributes. Keep the explicit
+    # user fields so InputValidationStage honors values such as width/height.
+    sampling_params._explicit_fields = getattr(
+        sampling_params_orig, "_explicit_fields", set()
+    ) | {"prompt", "output_file_name", "image_path"}
+    return sampling_params
 
 
 class DiffGenerator:
@@ -199,8 +235,9 @@ class DiffGenerator:
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
-        Returns a single GenerationResult for a single prompt, a list for
-        multiple prompts, or None when every request failed.
+        Returns one GenerationResult per final sample, including each layer
+        of a layered image. Returns a single result without a list wrapper,
+        or None when every request failed.
         """
         # 1. prepare requests
         prompts = self._resolve_prompts(
@@ -228,18 +265,12 @@ class DiffGenerator:
         )
 
         for i, p in enumerate(prompts):
-            sampling_params = dataclasses.replace(
+            sampling_params = _replace_sampling_params_for_prompt(
                 sampling_params_orig,
                 prompt=p,
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
-            # `dataclasses.replace` drops non-field attrs; restore
-            # `_explicit_fields` so InputValidationStage honors user-supplied
-            # width/height, and mark the keys overridden above as explicit.
-            sampling_params._explicit_fields = getattr(
-                sampling_params_orig, "_explicit_fields", set()
-            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
@@ -278,7 +309,9 @@ class DiffGenerator:
         global_output_index = 0
 
         for requests in request_groups:
+            output_requests = []
             try:
+                output_requests = map_request_outputs(requests)
                 timer_prompt = [req.prompt for req in requests]
                 logger.info("Processing %d grouped request(s)", len(requests))
                 with ExitStack() as stack:
@@ -303,10 +336,11 @@ class DiffGenerator:
                     if requests[0].save_output and requests[0].return_file_paths_only:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
-                            len(output_file_paths), len(requests)
+                            len(output_file_paths), len(output_requests)
                         )
                         for idx, path in enumerate(output_file_paths):
-                            req = requests[idx]
+                            output_request = output_requests[idx]
+                            req = output_request.request
                             if req.data_type == DataType.VIDEO:
                                 req.sampling_params.validate_video_final_outputs(
                                     [path], req
@@ -314,7 +348,10 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=path,
@@ -323,14 +360,18 @@ class DiffGenerator:
                     elif requests[0].data_type == DataType.MESH:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
-                            len(output_file_paths), len(requests)
+                            len(output_file_paths), len(output_requests)
                         )
                         for idx, sample in enumerate(output_file_paths):
-                            req = requests[idx]
+                            output_request = output_requests[idx]
+                            req = output_request.request
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=sample,
@@ -338,7 +379,7 @@ class DiffGenerator:
                             )
                     else:
                         self._validate_output_count(
-                            len(output_batch.output), len(requests)
+                            len(output_batch.output), len(output_requests)
                         )
                         samples_out: list[Any] = []
                         audios_out: list[Any] = []
@@ -348,7 +389,7 @@ class DiffGenerator:
                             requests[0].data_type,
                             requests[0].fps,
                             requests[0].save_output,
-                            lambda idx: requests[idx].output_file_path(1, 0),
+                            lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,
                             audio_sample_rate=output_batch.audio_sample_rate,
                             samples_out=samples_out,
@@ -371,8 +412,9 @@ class DiffGenerator:
                         )
 
                         for idx in range(len(samples_out)):
-                            req = requests[idx]
-                            output_file_path = req.output_file_path(1, 0)
+                            output_request = output_requests[idx]
+                            req = output_request.request
+                            output_file_path = output_request.output_file_path()
                             if req.data_type == DataType.VIDEO and req.save_output:
                                 req.sampling_params.validate_video_final_outputs(
                                     [output_file_path], req
@@ -380,7 +422,10 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     samples=samples_out[idx],
                                     frames=frames_out[idx],
@@ -403,7 +448,7 @@ class DiffGenerator:
                             "Failed to clean up model-owned video request resources",
                             exc_info=True,
                         )
-                global_output_index += len(requests)
+                global_output_index += len(output_requests)
 
         total_gen_time = time.perf_counter() - total_start_time
         if self.server_args.batching_max_size > 1:

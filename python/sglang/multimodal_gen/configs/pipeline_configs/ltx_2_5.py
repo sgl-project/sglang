@@ -43,7 +43,7 @@ class LTX25PipelineConfig(LTX2PipelineConfig):
     # One checkpoint drives both T2V and image-conditioned generation, so this
     # must stay TI2V -- T2V rejects `--image-path` outright.
     task_type: ModelTaskType = ModelTaskType.TI2V
-    native_only_components = ("diffusion_decoder",)
+    native_only_components: tuple[str, ...] = ("diffusion_decoder",)
 
     dit_config: LTX25Config = field(default_factory=LTX25Config)
     vae_config: LTX25VideoVAEConfig = field(default_factory=LTX25VideoVAEConfig)

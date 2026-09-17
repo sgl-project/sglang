@@ -8,7 +8,6 @@
 
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator
-from itertools import chain
 from types import MethodType
 from typing import Any
 
@@ -39,21 +38,26 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     split_bitsandbytes_4bit_state,
 )
 from sglang.multimodal_gen.runtime.loader import rank_local_checkpoint
+from sglang.multimodal_gen.runtime.loader.host_spill import HostSpill
 from sglang.multimodal_gen.runtime.loader.utils import (
+    finalize_loaded_model,
     get_param_names_mapping,
     hf_to_custom_state_dict,
-    set_default_torch_dtype,
+    initialize_model,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    host_copies_are_redundant,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
+from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    process_model_weights_after_loading,
+)
 
 logger = init_logger(__name__)
 
@@ -63,8 +67,7 @@ _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
     if quant_config is None:
         return False
-    quant_name_getter = getattr(type(quant_config), "get_name", None)
-    return bool(callable(quant_name_getter) and quant_name_getter() == "bitsandbytes")
+    return quant_config.get_name() == "bitsandbytes"
 
 
 def _format_dtype_mismatch_summary(
@@ -99,14 +102,12 @@ def _make_param_like(
     return new_param
 
 
-def _can_assign_cpu_tensor_without_copy(
+def _can_assign_tensor_without_copy(
     actual_param: torch.nn.Parameter,
     full_tensor: torch.Tensor,
     target_param: torch.Tensor,
 ) -> bool:
-    """Return whether a TP=1 linear loader would only copy this CPU tensor."""
-    if full_tensor.device.type != "cpu":
-        return False
+    """Return whether a TP=1 linear loader would only copy this tensor."""
     weight_loader = actual_param.__dict__.get("weight_loader")
     if not isinstance(weight_loader, MethodType):
         return False
@@ -135,6 +136,8 @@ def _can_assign_cpu_tensor_without_copy(
     return (
         full_tensor.shape == target_param.shape
         and full_tensor.dtype == target_param.dtype
+        and full_tensor.layout == target_param.layout
+        and full_tensor.stride() == target_param.stride()
     )
 
 
@@ -207,6 +210,13 @@ def _maybe_dequantize_fp8(
     return full_tensor
 
 
+def _move_to_device_preserving_meta(model: nn.Module, device: torch.device) -> None:
+    # Buffers absent from the checkpoint (e.g. cosmos3's RoPE inv_freq) are
+    # still on the meta device here and .to() cannot copy out of meta; leave
+    # them for the model's post_load_weights() to rebuild on the real device.
+    model._apply(lambda t: t if t.is_meta else t.to(device))
+
+
 def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
     """Let FSDP2 unshard around forward passes that bypass ``__call__``.
 
@@ -238,6 +248,7 @@ def maybe_load_fsdp_model(
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
     checkpoint_key_filter: Callable[[str], bool] | None = None,
+    weights_iterator: Generator[tuple[str, torch.Tensor], None, None] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -255,6 +266,9 @@ def maybe_load_fsdp_model(
             Runtime residency strategies move it to the compute device before use.
         strict: If True, enforce strict state dict loading (all keys must match).
         weight_load_plan: Optional checkpoint/postprocess device plan for this load.
+        weights_iterator: Optional pre-built ``(name, tensor)`` source, used
+            instead of reading ``weight_dir_list`` as safetensors. Set by callers
+            whose checkpoint is not safetensors at all, such as GGUF.
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -283,8 +297,9 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+    model = initialize_model(
+        model_cls, init_params, default_torch_dtype, torch.device("meta")
+    )
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
@@ -295,15 +310,27 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
-    mps_zero_copy_weight_loading = bool(
+    keep_checkpoint_mapping = bool(
         current_platform.is_mps()
         and weight_load_plan.mps_layerwise_cpu_staging
         and weight_load_plan.checkpoint_load_device.type == "cpu"
     )
-    if mps_zero_copy_weight_loading:
-        # layerwise offload replaces block parameters with mps placeholders after
+    if keep_checkpoint_mapping:
+        # layerwise offload replaces block parameters with placeholders after
         # load, so compatible checkpoint tensors stay file-backed on CPU
-        model._mps_zero_copy_weight_loading = True
+        model._keep_checkpoint_mapping = True
+    host_spill = None
+    if (
+        weight_dir_list
+        and weights_iterator is None
+        and weight_load_plan.checkpoint_load_device.type == "cpu"
+        and host_copies_are_redundant()
+    ):
+        # Compatible tensors stay on the checkpoint mapping; the fused and
+        # reordered ones are materialized. On a shared pool their anonymous
+        # copies are never reclaimable (10.4 GiB for the H3 DiT's fused
+        # q/k/v), so they are materialized into file mappings instead.
+        host_spill = HostSpill.for_checkpoint(weight_dir_list)
     defer_cpu_placement = bool(
         component_starts_on_cpu
         and weight_load_plan.defer_cpu_placement
@@ -343,7 +370,9 @@ def maybe_load_fsdp_model(
         )
         register_fsdp_entrypoints(model)
 
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    param_names_mapping_fn = get_param_names_mapping(
+        model.param_names_mapping, valid_target_names=set(model.state_dict())
+    )
 
     # 2. load model from disk
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
@@ -354,6 +383,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -369,6 +399,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and not use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -382,7 +413,9 @@ def maybe_load_fsdp_model(
         )
 
     if preconverted_state_dict is None:
-        if weight_load_plan.load_full_state_dict_on_device:
+        if weights_iterator is not None:
+            weight_iterator = weights_iterator
+        elif weight_load_plan.load_full_state_dict_on_device:
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
                 key_filter=checkpoint_key_filter,
@@ -417,9 +450,15 @@ def maybe_load_fsdp_model(
         strict=strict,
         cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
-        mps_zero_copy_weight_loading=mps_zero_copy_weight_loading,
+        keep_checkpoint_mapping=keep_checkpoint_mapping,
+        allow_device_tensor_assignment=(
+            weight_load_plan.load_full_state_dict_on_device
+        ),
         preconverted_state_dict=preconverted_state_dict,
+        host_spill=host_spill,
     )
+    if host_spill is not None:
+        host_spill.log_summary(type(model).__name__)
     if bnb_quant_states:
         attach_bitsandbytes_4bit_quant_states(
             dict(model.named_parameters()), bnb_quant_states
@@ -428,28 +467,12 @@ def maybe_load_fsdp_model(
     # 3. postprocessing
     if weight_postprocess_device is not None:
         # move to device to perform postprocessing
-        model.to(weight_postprocess_device)
+        _move_to_device_preserving_meta(model, weight_postprocess_device)
 
-    for _, module in model.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None and hasattr(
-            quant_method, "process_weights_after_loading"
-        ):
-            if _is_npu and not isinstance(quant_method, UnquantizedLinearMethod):
-                # Activate the NZ format for storing weights,
-                # which is a specific optimization for Ascend NPU
-                torch.npu.config.allow_internal_format = True
-            quant_method.process_weights_after_loading(module)
-            if _is_npu:
-                torch.npu.empty_cache()
+    process_model_weights_after_loading(model)
     model.post_load_weights()
 
-    for n, p in chain(model.named_parameters(), model.named_buffers()):
-        if p.is_meta:
-            raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
-        # Avoid unintended computation graph accumulation during inference
-        if isinstance(p, torch.nn.Parameter):
-            p.requires_grad = False
+    finalize_loaded_model(model)
 
     # 4. deferred cpu offload
     if defer_cpu_placement:
@@ -541,7 +564,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
-    mps_zero_copy_weight_loading: bool = False,
+    keep_checkpoint_mapping: bool = False,
     preconverted_state_dict: (
         tuple[
             dict[
@@ -554,6 +577,8 @@ def load_model_from_full_model_state_dict(
         ]
         | None
     ) = None,
+    allow_device_tensor_assignment: bool = False,
+    host_spill: HostSpill | None = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -566,7 +591,11 @@ def load_model_from_full_model_state_dict(
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
-        mps_zero_copy_weight_loading (bool): retain compatible CPU checkpoint tensors for MPS layerwise offload
+        keep_checkpoint_mapping (bool): retain compatible CPU checkpoint tensors instead of copying them
+        allow_device_tensor_assignment (bool): adopt compatible checkpoint tensors
+            already materialized on the target device. This is reserved for an
+            explicit full-state direct-device load; ordinary loading keeps its
+            established parameter materialization path.
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -582,7 +611,12 @@ def load_model_from_full_model_state_dict(
             full_sd_iterator,
             param_names_mapping,
             valid_target_names=set(meta_sd.keys()),
+            fused_tensor_factory=(None if host_spill is None else host_spill.tensor),
         )  # type: ignore
+        if host_spill is not None:
+            for name, tensor in custom_param_sd.items():
+                if isinstance(tensor, torch.Tensor):
+                    host_spill.seal(name, tensor.shape, tensor.dtype)
     else:
         custom_param_sd, reverse_param_names_mapping = preconverted_state_dict
 
@@ -709,9 +743,9 @@ def load_model_from_full_model_state_dict(
                 else None
             )
             use_checkpoint_tensor_directly = bool(
-                mps_zero_copy_weight_loading
+                keep_checkpoint_mapping
                 and actual_param is not None
-                and not getattr(actual_param, "mps_zero_copy_unsafe", False)
+                and not getattr(actual_param, "checkpoint_mapping_unsafe", False)
                 and tuple(meta_sharded_param.shape) == tuple(full_tensor.shape)
                 and full_tensor.device.type == "cpu"
                 and full_tensor.dtype == target_dtype
@@ -720,18 +754,28 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = full_tensor
             elif weight_loader is not None:
                 assert actual_param is not None
-                if _can_assign_cpu_tensor_without_copy(
-                    actual_param,
-                    full_tensor,
-                    meta_sharded_param,
+                if (
+                    full_tensor.device.type == "cpu" or allow_device_tensor_assignment
+                ) and _can_assign_tensor_without_copy(
+                    actual_param, full_tensor, meta_sharded_param
                 ):
                     sharded_tensor = full_tensor
                 else:
-                    sharded_tensor = torch.empty_like(
-                        meta_sharded_param,
-                        device=checkpoint_load_device,
-                        dtype=target_dtype,
+                    spilled = (
+                        None
+                        if host_spill is None or checkpoint_load_device.type != "cpu"
+                        else host_spill.tensor(
+                            target_param_name, meta_sharded_param.shape, target_dtype
+                        )
                     )
+                    if spilled is not None:
+                        sharded_tensor = spilled[0]
+                    else:
+                        sharded_tensor = torch.empty_like(
+                            meta_sharded_param,
+                            device=checkpoint_load_device,
+                            dtype=target_dtype,
+                        )
                     # Preserve requires_grad flag to avoid errors with non-floating dtypes
                     requires_grad = meta_sharded_param.requires_grad
                     temp_param = _make_param_like(actual_param, sharded_tensor)
@@ -752,6 +796,10 @@ def load_model_from_full_model_state_dict(
                             f"param_cls={type(actual_param).__name__}"
                         ) from exc
                     sharded_tensor = temp_param.data
+                    if host_spill is not None and spilled is not None:
+                        host_spill.seal(
+                            target_param_name, meta_sharded_param.shape, target_dtype
+                        )
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
                 sharded_tensor = full_tensor

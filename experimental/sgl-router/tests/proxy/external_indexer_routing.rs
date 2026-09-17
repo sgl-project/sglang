@@ -16,6 +16,7 @@ use sgl_kv_indexer::pb::{
 use sgl_kv_indexer::{
     server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
 };
+use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
@@ -35,7 +36,20 @@ use crate::common::mock_worker::MockWorker;
 async fn external_indexer_routes_to_the_cached_worker() {
     let cached = MockWorker::start(vec![]).await;
     let uncached = MockWorker::start(vec![]).await;
-    let cfg = config();
+    let mut cfg = config();
+    cfg.model.policy = PolicyKind::CacheAware;
+    cfg.model
+        .cache_aware
+        .as_mut()
+        .expect("fixture includes cache-aware configuration")
+        .prefix_provider = CachePrefixProvider::Indexer;
+    cfg.model.affinity = Some(AffinityConfig {
+        cache_affinity_min_matched_tokens: Some(0),
+        cache_candidate_min_workers: 1,
+        cache_candidate_ratio: 1.0,
+        cache_candidate_max_workers: 1,
+        ..Default::default()
+    });
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let body = json!({
         "model": MODEL,
@@ -67,6 +81,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
                 hashes: hashes.clone(),
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
+                parent_block_hash: None,
             }],
             worker_address: cached.url.clone(),
             cache_spec: None,
@@ -88,15 +103,8 @@ async fn external_indexer_routes_to_the_cached_worker() {
     }
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            Arc::clone(&oracle),
-        )
-        .unwrap(),
-    );
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), Arc::clone(&oracle)).unwrap());
     let mut ctx = AppContext::new(
         cfg,
         tokenizers,

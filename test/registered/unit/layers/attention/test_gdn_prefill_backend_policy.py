@@ -11,17 +11,23 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
+    _validate_gdn_linear_attn_backends,
     flashinfer_gdn_prefill_default,
+    validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnKernelBackend,
+    resolve_linear_attn_backends,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _publish(testcase, **fields):
@@ -54,6 +60,7 @@ def make_runner(
         mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
+        enable_mis=False,
     )
     fields.update(arg_overrides)
     args = _publish(testcase, **fields)
@@ -73,7 +80,23 @@ def make_runner(
     )
 
 
-class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
+class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_mis_requires_triton_prefill_backend(self):
+        runner = make_runner(self, enable_mis=True)
+        with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
+            validate_gdn_mis_backend(LinearAttnKernelBackend.FLASHINFER)
+
+    def test_mis_rejects_page_major_layout(self):
+        make_runner(self, enable_mis=True, enable_page_major_kv_layout=True)
+        with self.assertRaisesRegex(ValueError, "page-major"):
+            validate_gdn_mis_backend(LinearAttnKernelBackend.TRITON)
+
+    def test_non_gdn_linear_backend_rejects_mis(self):
+        with self.assertRaisesRegex(ValueError, "does not support multi-item scoring"):
+            MambaAttnBackendBase.validate_mis_support(SimpleNamespace(enable_mis=True))
+
+        GDNAttnBackend.validate_mis_support(SimpleNamespace(enable_mis=True))
+
     def apply_policy(
         self,
         runner,
@@ -118,6 +141,44 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             with self.subTest(backend=backend):
                 runner = make_runner(self, linear_attn_prefill_backend=backend)
                 self.assertIsNone(self.apply_policy(runner))
+
+    def test_declines_when_deterministic_inference_is_enabled(self):
+        """Batch-sensitive GDN prefill must not bypass deterministic inference."""
+        runner = make_runner(
+            self,
+            state_dtype=torch.float32,
+            enable_deterministic_inference=True,
+        )
+
+        self.assertIsNone(
+            self.apply_policy(
+                runner,
+                capability=(9, 0),
+                cuda_version="12.9",
+            )
+        )
+
+    def test_rejects_explicit_flashinfer_prefill_in_deterministic_mode(self):
+        """Explicit backend precedence must not bypass deterministic GDN startup."""
+        cases = (
+            {"linear_attn_prefill_backend": "flashinfer"},
+            {"linear_attn_backend": "flashinfer"},
+        )
+        for fields in cases:
+            with self.subTest(fields=fields):
+                make_runner(
+                    self,
+                    enable_deterministic_inference=True,
+                    **fields,
+                )
+                backends = resolve_linear_attn_backends()
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "FlashInfer GDN prefill is not supported with "
+                    "--enable-deterministic-inference",
+                ):
+                    _validate_gdn_linear_attn_backends(backends)
 
     def test_rejects_unsupported_capability(self):
         cases = (
@@ -189,6 +250,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
+            multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
         )

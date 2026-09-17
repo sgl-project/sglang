@@ -6,7 +6,7 @@
 //! skips re-tokenizing the same prompt). Asserts the gating contract through
 //! the real chat handler + a MockWorker backend:
 //!
-//! * A plain text chat request on the engine-equivalent chat-encoder path →
+//! * A plain text chat request on the engine-equivalent chat-formatter path →
 //!   the forwarded body carries `input_ids` AND retains `messages`.
 //! * A request carrying `tools` → `input_ids` omitted (the router's encoder
 //!   doesn't render tool schemas, so its ids would diverge from the engine).
@@ -35,8 +35,8 @@ fn build_ctx(url: String) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+        tokenizers.has_chat_formatter(MODEL),
+        "deepseek-v4 model id must auto-attach the built-in chat formatter"
     );
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
@@ -46,17 +46,9 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the real loaded tokenizers (not the empty-registry test default) so
-    // the cache-aware policy can tokenize at ingress.
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            BlockSizeOracle::new(),
-        )
-        .unwrap(),
-    );
+    // Use the configured tokenizer so the chat path can emit input_ids.
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), BlockSizeOracle::new()).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }

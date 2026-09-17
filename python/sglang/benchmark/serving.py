@@ -101,6 +101,7 @@ class RequestFuncOutput:
     success: bool = False
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
+    tpot: Optional[float] = None  # Time per output token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
@@ -260,9 +261,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     prompt = request_func_input.prompt
 
@@ -391,9 +392,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -1295,9 +1296,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert (
-        backend in MULTI_TURN_BACKENDS
-    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    assert backend in MULTI_TURN_BACKENDS, (
+        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    )
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1340,7 +1341,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[DatasetRow],
+    input_requests: List[Union[DatasetRow, Dict[str, Any]]],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1364,14 +1365,20 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    is_mooncake = args.dataset_name == "mooncake"
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = input_requests[0].prompt
-    is_multi_turn = (
-        isinstance(first_prompt, list)
-        and bool(first_prompt)
-        and _normalize_round_messages(first_prompt[0]) is not None
-    )
+    if is_mooncake:
+        # Mooncake dataset rows are raw trace dictionaries. They are converted
+        # into DatasetRow objects by get_mooncake_request_over_time below.
+        is_multi_turn = False
+    else:
+        first_prompt = input_requests[0].prompt
+        is_multi_turn = (
+            isinstance(first_prompt, list)
+            and bool(first_prompt)
+            and _normalize_round_messages(first_prompt[0]) is not None
+        )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
@@ -1389,7 +1396,7 @@ async def benchmark(
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
+    if is_mooncake:
         # For mooncake, input_requests is a list of dicts.
         # We need to build a temporary DatasetRow for the warmup phase.
         warmup_record = input_requests[0]
@@ -1493,7 +1500,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
-        backend == "sglang" and args.dataset_name == "mooncake"
+        backend == "sglang" and is_mooncake
     ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
@@ -1517,7 +1524,9 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    benchmark_requests: List[DatasetRow] = []
     async for request in request_generator:
+        benchmark_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1525,9 +1534,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                assert lora_request_distribution == "skewed", (
+                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                )
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -1603,7 +1612,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1991,9 +2000,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert (
-            args.backend == "sglang"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert args.backend == "sglang", (
+            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        )
 
     # Set url
     if args.port is None:
@@ -2070,18 +2079,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert (
-            not args.tokenize_prompt
-        ), "`--tokenize-prompt` not compatible with image dataset"
+        assert not args.tokenize_prompt, (
+            "`--tokenize-prompt` not compatible with image dataset"
+        )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        assert args.lora_name is not None and len(args.lora_name) > 1, (
+            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        )
 
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert args.lora_zipf_alpha > 1, (
+        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    )
 
     print(f"{args}\n")
 
@@ -2355,13 +2364,13 @@ def cli_main():
         "--image-format",
         type=str,
         default="jpeg",
-        help=("Format of images for image dataset. " "Supports jpeg and png."),
+        help=("Format of images for image dataset. Supports jpeg and png."),
     )
     parser.add_argument(
         "--image-content",
         type=str,
         default="random",
-        help=("Content for images for image dataset. " "Supports random and blank."),
+        help=("Content for images for image dataset. Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",
