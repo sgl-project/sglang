@@ -1,4 +1,4 @@
-/// Index-K write of `fp4_rope.cuh` into the split FlyDSL layout: payload `[npages, 1, 4, kPageSize, 16]`
+/// Index-K write of `fp4_indexer_rope.cuh` into the split FlyDSL layout: payload `[npages, 1, 4, kPageSize, 16]`
 /// (chunk `c` holds elements `[32c, 32c + 32)`) and ue8m0 exponents `[npages, 1, 4, kPageSize]` with
 /// the slot axis transposed as a 16 x 4 tile -- the bytes `store_fp4_index_k_cache_split` writes.
 
@@ -8,7 +8,7 @@
 #error "fp4_rope_hip.cuh writes the FlyDSL index-K layout, which exists on ROCm only"
 #endif
 
-#include "fp4_rope.cuh"
+#include "fp4_indexer_rope.cuh"
 
 namespace sglang {
 
