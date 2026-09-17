@@ -64,9 +64,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
-    torch_w8a8_block_fp8_linear,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
 )
@@ -120,6 +120,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
@@ -528,7 +529,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self.quant_config.is_checkpoint_fp8_serialized
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
-        self.use_per_token_if_dynamic = False
+        self.use_per_token_if_dynamic = _is_xpu
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -800,26 +801,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
 
-        if (
-            is_xpu()
-            and self.w8a8_block_fp8_linear is torch_w8a8_block_fp8_linear
-            and self.weight_block_size in ([1, 128], [128, 128])
-            and layer.weight_scale_inv.ndim == 2
-        ):
-            # Keep the checkpoint's logical [N-blocks, K-blocks] shape, but use
-            # transpose-contiguous storage. For [1, 128], scaled_mm transposes
-            # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
-            # This avoids a per-forward contiguous/copy in either path.
-            scale = layer.weight_scale_inv.data
-            scale_b_is_contiguous = scale.t().is_contiguous()
-            if not scale_b_is_contiguous:
-                scale_reordered = torch.empty_strided(
-                    scale.shape,
-                    (1, scale.shape[0]),
-                    dtype=scale.dtype,
-                    device=scale.device,
-                )
-                scale_reordered.copy_(scale)
+        if _is_xpu:
+            scale_reordered = prepare_xpu_block_scale_for_scaled_mm(
+                layer.weight_scale_inv.data,
+                self.weight_block_size,
+                self.w8a8_block_fp8_linear,
+            )
+            if scale_reordered is not layer.weight_scale_inv.data:
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
 
@@ -1055,6 +1043,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
+
+            if (
+                _is_xpu
+                and layer.weight_scale.ndim == 2
+                and layer.weight_scale.shape[0] == 1
+            ):
+                with torch.no_grad():
+                    layer.weight_scale.set_(layer.weight_scale.data.t().contiguous())
 
             if _is_cpu:
                 assert _is_cpu_amx_available, (
@@ -2711,7 +2707,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if is_xpu() and not get_moe_runner_backend().is_triton():
+        if _is_xpu and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
