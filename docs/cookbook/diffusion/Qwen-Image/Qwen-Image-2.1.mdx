@@ -111,6 +111,21 @@ All corresponding output pixels were identical between revisions on each GPU.
 These measurements cover this fixed workload; other prompts and configurations
 can have different gains.
 
+### Lossless MLP and residual fusion
+
+The native DiT also uses the shared BF16 SiLU-multiply and gated-residual
+kernels, preserving the eager operations' intermediate rounding. SiLU-multiply
+checks its first eager call and falls back on mismatch. These optimizations
+are automatic on supported CUDA inputs.
+
+A second B200 comparison on 2026-09-17 used `f874eae18be` (already including
+the RoPE fusion) versus `a3d14531474`. With resident weights, FlashAttention,
+and the same four-startup protocol and workload above, generation decreased
+from **3.272 to 3.134 s** (4.23%) and editing from **3.886 to 3.762 s** (3.18%).
+All corresponding RGBA pixels were identical across the 10 generation and six
+editing samples per variant. These are additional gains over the RoPE baseline;
+this comparison does not establish the gain on other GPUs.
+
 ## 2. Model capabilities
 
 Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
