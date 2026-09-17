@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
     custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
