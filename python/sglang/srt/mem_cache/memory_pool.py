@@ -53,6 +53,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.layout import filter_dcp_local_kv_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -4263,6 +4264,9 @@ class MLATokenToKVPool(KVCache):
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
         kv_cache_cpu = []
+        # Latent KV is sharded under DCP. Keep the caller's logical indices
+        # unchanged for DSATokenToKVPool's replicated indexer cache.
+        indices = filter_dcp_local_kv_indices(indices)
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
@@ -4277,6 +4281,7 @@ class MLATokenToKVPool(KVCache):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         current_platform.synchronize()
+        indices = filter_dcp_local_kv_indices(indices)
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
