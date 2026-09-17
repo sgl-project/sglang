@@ -28,7 +28,7 @@ MIMO_V2_5_PRO_FP4_MODEL_PATH = (
 MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
 )
-MIMO_V2_5_PRO_FP4_8P_ENVS = {
+MIMO_V2_5_PRO_FP4_4P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "HCCL_BUFFSIZE": "300",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -48,7 +48,7 @@ MIMO_V2_5_PRO_FP4_8P_ENVS = {
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
 }
 
-MIMO_V2_5_PRO_FP4_8P_OTHER_ARGS = [
+MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS = [
     "--served-model-name",
     MIMO_V2_5_PRO_FP4_MODEL_PATH,
     "--trust-remote-code",
@@ -96,7 +96,7 @@ NUM_DRAFT_TOKENS = 8
 ACCEPT_RATE_THRESHOLD = 0.25
 
 
-class TestNPUMiMoV2_5_Pro_W4A8_8P_Acceptance(CustomTestCase):
+class TestNPUMiMoV2_5_Pro_W4A8_4P_Acceptance(CustomTestCase):
     """Test NPU acceptance rate and acceptance length for MiMo-V2.5-Pro-FP4 4p single node with DFLASH.
 
     Runs bench_serving with random dataset to measure speculative decoding acceptance rate.
@@ -111,8 +111,8 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_Acceptance(CustomTestCase):
             cls.model_path,
             cls.base_url,
             timeout=3600,
-            other_args=MIMO_V2_5_PRO_FP4_8P_OTHER_ARGS,
-            env=MIMO_V2_5_PRO_FP4_8P_ENVS,
+            other_args=MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS,
+            env=MIMO_V2_5_PRO_FP4_4P_ENVS,
         )
 
     @classmethod
