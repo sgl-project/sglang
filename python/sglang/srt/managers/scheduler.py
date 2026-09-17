@@ -4743,6 +4743,9 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        # Submit this batch's queued host backups before the next scheduler step.
+        self.tree_cache.flush_pending_backups()
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
