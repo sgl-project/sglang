@@ -410,7 +410,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/test_case_map.json" \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/test_case_map.json" \
             -o test_case_map.json
           test -s test_case_map.json
           echo "Downloaded test_case_map.json"
@@ -423,7 +423,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/outputs.tar.gz" \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/outputs.tar.gz" \
             -o outputs.tar.gz
           test -s outputs.tar.gz
           echo "Downloaded outputs.tar.gz"
@@ -631,19 +631,19 @@ jobs:
           from obs import ObsClient
 
           # Must match the download URLs in the recommend-tests-from-coverage job:
-          # https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/{outputs.tar.gz,test_case_map.json}
-          OBS_BUCKET = 'sglang-ascend'
+          # https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/{outputs.tar.gz,test_case_map.json}
+          OBS_BUCKET = 'sglang-npu'
           run_dir = os.environ['RUN_DIR']
 
           client = ObsClient(
               access_key_id=os.environ['OBS_ACCESS_KEY'],
               secret_access_key=os.environ['OBS_SECRET_KEY'],
-              server='https://obs.cn-east-3.myhuaweicloud.com'
+              server='https://obs.cn-southwest-2.myhuaweicloud.com'
           )
 
           uploads = [
-              (os.path.join(run_dir, 'outputs.tar.gz'), 'outputs.tar.gz'),
-              (os.path.join(run_dir, 'test_case_map.json'), 'test_case_map.json'),
+              (os.path.join(run_dir, 'outputs.tar.gz'), 'coverage/outputs.tar.gz'),
+              (os.path.join(run_dir, 'test_case_map.json'), 'coverage/test_case_map.json'),
           ]
           for local_path, obs_path in uploads:
               resp = client.putFile(OBS_BUCKET, obs_path, local_path)
