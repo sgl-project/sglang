@@ -1175,7 +1175,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     lora_param_names_mapping = Cosmos3VideoConfig().arch_config.lora_param_names_mapping
 
     # Variants swap the GEN layer / cross-attention implementation (e.g. the
-    # Multiview-AV sparse attention) without re-declaring the weight layout.
+    # Multiview-AV sparse attention) without redeclaring the weight layout.
     _gen_layer_cls: type[nn.Module] = Cosmos3GenDecoderLayer
     _cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention
 
