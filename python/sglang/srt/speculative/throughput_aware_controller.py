@@ -1,4 +1,4 @@
-"""Throughput-aware adaptive speculative decoding controller.
+"""Throughput-aware adaptive speculative decoding policy.
 
 Replaces the EMA-hysteresis decision logic with a throughput score:
 
@@ -11,26 +11,28 @@ where:
 
 Integration
 -----------
-This controller inherits all CUDA-graph / runtime-state switching machinery
-from :class:`AdaptiveController` and overrides only the decision logic:
+``AdaptiveController`` owns CUDA-graph capture, runtime-state switching, and
+profiling execution. This policy provides the decision and profiling inputs:
 
-  * ``init_states`` — build SpecRuntimeStates; profiling deferred to ``run_profiling``.
-  * ``activate_step_by_batch`` — sole decision point.  Every
+  * ``candidate_steps`` / ``cuda_graph_bs_for_step`` — runtime-state shape inputs.
+  * ``get_steps_for_batch`` — sole decision point. Every
     ``update_interval`` batches (and only when all active positions have
-    accumulated a full window), scores every candidate step and activates the
+    accumulated a full window), scores every candidate step and returns the
     winner.
   * ``on_verify_complete`` — data collection only.  Updates the per-position
     acceptance tracker and advances the batch counter.
 
 Config JSON format
 ------------------
-Optional.  When ``--speculative-adaptive-config`` is omitted, a built-in
-default is used (``candidate_steps=[1,3,5,7]`` at BS ``>=1``).
+Set ``"strategy": "throughput_aware"`` in the
+``--speculative-adaptive-config`` JSON to select this controller. The same file
+contains the candidate steps and throughput-specific tuning knobs.
 
 Integer-string keys are batch-size lower bounds (same as the standard
 adaptive config); non-integer keys are throughput-specific settings::
 
     {
+        "strategy": "throughput_aware",
         "window_size": 20,
         "update_interval": 5,
         "profile_run_batch_sizes": null,
@@ -64,16 +66,17 @@ the new score must exceed 110% of the current step's score.
 
 from __future__ import annotations
 
-import bisect
 import json
 import logging
 import math
 from typing import Optional
 
-import torch
-import torch.distributed as dist
-
-from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveSpecWorker,
+    SpecProfilePlan,
+    SpecProfilePoint,
+)
+from sglang.srt.speculative.adaptive_step_router import AdaptiveStepRouter
 from sglang.srt.speculative.throughput_aware_spec_params import (
     BatchSizeCostTable,
     PositionAcceptanceTracker,
@@ -86,22 +89,6 @@ from sglang.srt.speculative.throughput_aware_spec_params import (
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
-
-
-def _broadcast_float_from_rank0(value: float) -> float:
-    """Broadcast a float from TP rank 0 to all ranks; no-op when TP=1 or dist not active."""
-    if not dist.is_initialized():
-        return value
-    from sglang.srt.distributed import (
-        get_tensor_model_parallel_world_size,
-        get_tp_group,
-    )
-
-    if get_tensor_model_parallel_world_size() <= 1:
-        return value
-    t = torch.tensor([value], dtype=torch.float64, device=get_tp_group().device)
-    dist.broadcast(t, src=0, group=get_tp_group().device_group)
-    return float(t.item())
 
 
 # ---------------------------------------------------------------------------
@@ -242,19 +229,15 @@ def resolve_throughput_aware_candidate_steps(
 # ---------------------------------------------------------------------------
 
 
-class ThroughputAwareAdaptiveController(AdaptiveController):
-    """Throughput score = E[tokens] / cost_ms; decision in activate_step_by_batch."""
+class ThroughputAwarePolicy:
+    """Choose adaptive steps by scoring expected output tokens per decode cost."""
 
-    def __init__(self, worker, config_path: Optional[str] = None):
+    def __init__(self, initial_steps: int, config_path: Optional[str] = None):
         cfg = load_throughput_aware_config(config_path)
-        self._bs_list, self._bs_candidates = _parse_bs_candidates(cfg)
-
-        self._cuda_graph_bs: list[int] | None = None
-
-        all_candidate_steps = sorted(
-            {s for steps in self._bs_candidates.values() for s in steps}
-        )
-        self._all_candidate_steps: list[int] = all_candidate_steps
+        _, bs_candidates = _parse_bs_candidates(cfg)
+        self._router = AdaptiveStepRouter(bs_candidates)
+        all_candidate_steps = self._router.candidate_steps
+        self._all_candidate_steps = all_candidate_steps
 
         window_size = _config_int(cfg, "window_size", 20, minimum=1)
         self._update_interval = _config_int(cfg, "update_interval", 5, minimum=1)
@@ -288,21 +271,16 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
             )
         self._switch_hysteresis = float(switch_hysteresis)
 
-        first_candidates = self._bs_candidates[self._bs_list[0]]
-        self._current_steps: int = worker.speculative_num_steps
+        first_candidates = self._router.candidates_for_batch(0)
+        self._current_steps = initial_steps
         if self._current_steps not in all_candidate_steps:
             self._current_steps = first_candidates[len(first_candidates) // 2]
         self._batch_count: int = 0
 
-        # Mainline's controller accepts a policy object. This class supplies
-        # that policy interface itself while retaining the public controller
-        # type used by the throughput-aware integration.
-        super().__init__(worker, self)
-
         log_info_on_rank0(
             logger,
-            f"ThroughputAwareAdaptiveController initialized: "
-            f"bs_list={self._bs_list}, "
+            f"ThroughputAwarePolicy initialized: "
+            f"bs_list={self._router.batch_size_keys}, "
             f"all_candidate_steps={self._all_candidate_steps}, "
             f"initial_steps={self._current_steps}, "
             f"window_size={window_size}, "
@@ -313,35 +291,18 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
 
     @property
     def candidate_steps(self) -> list[int]:
-        return self._all_candidate_steps
-
-    def _find_closest_bs_key(self, target: int) -> int:
-        idx = bisect.bisect_right(self._bs_list, target) - 1
-        return self._bs_list[max(0, idx)]
-
-    def _candidates_for_batch(self, batch_size: int) -> list[int]:
-        if self._cuda_graph_bs is not None:
-            idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
-            if idx < len(self._cuda_graph_bs):
-                batch_size = self._cuda_graph_bs[idx]
-        return self._bs_candidates[self._find_closest_bs_key(batch_size)]
+        return self._router.candidate_steps
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
         """cuda_graph_bs values where step is a valid candidate (prunes graph captures)."""
-        if self._cuda_graph_bs is None:
-            return None
-        return [
-            bs
-            for bs in self._cuda_graph_bs
-            if step in self._bs_candidates[self._find_closest_bs_key(bs)]
-        ]
+        return self._router.cuda_graph_bs_for_step(step)
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
-        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+        self._router.set_cuda_graph_bs(cuda_graph_bs)
 
-    def _resolve_profile_seq_len(self) -> int:
+    def _resolve_profile_seq_len(self, worker: AdaptiveSpecWorker) -> int:
         """Prefill context length for profiling (config or auto, clamped to context_length)."""
-        ctx = int(self.worker.model_config.context_len)
+        ctx = int(worker.model_config.context_len)
         max_step = max(self._all_candidate_steps) if self._all_candidate_steps else 1
         decode_growth = (self._profile_n_warmup + self._profile_n_measure) * (
             max_step + 1
@@ -356,92 +317,54 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         seq_len = self._profile_run_seq_len or default_len
         return int(max(1, min(seq_len, ctx - headroom)))
 
-    def run_profiling(self, tree_cache, *, max_running_requests: int) -> None:
-        """Fill cost table via SpecProfilingSession for each (steps, batch_size)."""
-        from sglang.srt.speculative.spec_profiling_session import SpecProfilingSession
-
-        steps_to_profile_bs = self._build_profile_grid(max_running_requests)
-        if not any(steps_to_profile_bs.values()):
-            log_info_on_rank0(
-                logger,
-                "[ThroughputAware] No batch sizes to profile; "
-                "cost table will be empty.",
-            )
-            return
-
-        seq_len = self._resolve_profile_seq_len()
-        original_steps = self._current_steps
-
-        all_points = [
-            (steps, bs)
-            for steps, bs_list in sorted(steps_to_profile_bs.items())
-            for bs in sorted(bs_list)
-        ]
-
-        log_info_on_rank0(
-            logger,
-            f"[ThroughputAware] Starting cost table profiling: "
-            f"{len(all_points)} points, seq_len={seq_len}, "
-            f"n_warmup={self._profile_n_warmup}, n_measure={self._profile_n_measure}",
+    def profile_plan(
+        self, worker: AdaptiveSpecWorker, *, max_running_requests: int
+    ) -> SpecProfilePlan:
+        points = self._build_profile_points(max_running_requests)
+        return SpecProfilePlan(
+            points=points,
+            seq_len=self._resolve_profile_seq_len(worker) if points else 1,
+            n_warmup=self._profile_n_warmup,
+            n_measure=self._profile_n_measure,
         )
 
-        for steps, bs in all_points:
-            self._current_steps = steps  # pin step during profiling
-            self._activate(steps)
-
-            avg_ms = SpecProfilingSession(
-                worker=self.worker,
-                tree_cache=tree_cache,
-                batch_size=bs,
-                num_steps=steps,
-                seq_len=seq_len,
-                n_warmup=self._profile_n_warmup,
-                n_measure=self._profile_n_measure,
-            ).measure()
-
-            # Sync cost across TP ranks so all ranks make identical step decisions.
-            avg_ms = _broadcast_float_from_rank0(avg_ms)
-
-            self._cost_table.set(bs, steps, avg_ms)
-            log_info_on_rank0(
-                logger,
-                f"[ThroughputAware] steps={steps:2d}  bs={bs:4d}  "
-                f"seq_len={seq_len}  decode_avg={avg_ms:.3f}ms",
-            )
-
-        self._current_steps = original_steps
-        self._activate(original_steps)
-
+    def record_profile(self, batch_size: int, steps: int, avg_ms: float) -> None:
+        self._cost_table.set(batch_size, steps, avg_ms)
         log_info_on_rank0(
             logger,
-            f"[ThroughputAware] Cost table ready: {self._cost_table.summary()}",
+            f"[ThroughputAware] steps={steps:2d}  bs={batch_size:4d}  "
+            f"decode_avg={avg_ms:.3f}ms",
         )
 
-    def _build_profile_grid(self, max_running_requests: int) -> dict[int, list[int]]:
-        """Map num_steps -> batch sizes to profile."""
-        if self._cuda_graph_bs is None:
-            return {}
+    def profile_summary(self) -> str:
+        return self._cost_table.summary()
+
+    def _build_profile_points(
+        self, max_running_requests: int
+    ) -> tuple[SpecProfilePoint, ...]:
+        """Return the valid (steps, batch-size) measurements to run."""
+        cuda_graph_bs = self._router.cuda_graph_bs
+        if cuda_graph_bs is None:
+            return ()
         pool = (
-            sorted(set(self._profile_batch_sizes) & set(self._cuda_graph_bs))
+            sorted(set(self._profile_batch_sizes) & set(cuda_graph_bs))
             if self._profile_batch_sizes is not None
-            else list(self._cuda_graph_bs)
+            else list(cuda_graph_bs)
         )
         if self._max_profile_bs is not None:
             pool = [b for b in pool if b <= self._max_profile_bs]
         pool = [b for b in pool if b <= max_running_requests]
-        return {
-            steps: profiled
+        return tuple(
+            SpecProfilePoint(steps, batch_size)
             for steps in self._all_candidate_steps
-            if (
-                profiled := sorted(
-                    set(pool) & set(self.cuda_graph_bs_for_step(steps) or [])
-                )
+            for batch_size in sorted(
+                set(pool) & set(self.cuda_graph_bs_for_step(steps) or [])
             )
-        }
+        )
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def get_steps_for_batch(self, batch_size: int) -> int:
         """Pick best step every update_interval when positions are warmed."""
-        candidates = self._candidates_for_batch(batch_size)
+        candidates = self._router.candidates_for_batch(batch_size)
         if self._current_steps not in candidates:
             # Batch-size routing constrains which graphs were captured. Honor
             # it even at cold start or between periodic score updates.
@@ -456,22 +379,24 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         if self._should_reevaluate():
             self._reevaluate_and_switch(batch_size)
 
-        # Apply current step (no-op if already active).
-        if self._current_steps != self.worker.speculative_num_steps:
-            self._activate(self._current_steps)
+        return self._current_steps
 
     def on_verify_complete(
         self,
         num_correct_drafts_per_req: list[int],
         batch_size: int = 0,
         num_steps: int | None = None,
-    ) -> None:
+    ) -> int | None:
         """Update acceptance tracker only (no step switch here)."""
         if not num_correct_drafts_per_req:
-            return
+            return None
         observed_steps = self._current_steps if num_steps is None else num_steps
         self._tracker.update(num_correct_drafts_per_req, observed_steps)
         self._batch_count += 1
+        return None
+
+    def on_state_activated(self, steps: int) -> None:
+        self._current_steps = steps
 
     # ------------------------------------------------------------------
     # Decision logic
@@ -488,7 +413,7 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
 
     def _reevaluate_and_switch(self, batch_size: int) -> None:
         """Score all candidates for the given batch size and switch if beneficial."""
-        candidates = self._candidates_for_batch(batch_size)
+        candidates = self._router.candidates_for_batch(batch_size)
         rows = score_candidates(self._tracker, self._cost_table, candidates, batch_size)
         raw_best = pick_best_step(rows, fallback=self._current_steps)
         best_steps = pick_best_step_with_hysteresis(
