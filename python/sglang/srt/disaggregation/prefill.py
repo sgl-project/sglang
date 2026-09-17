@@ -31,6 +31,12 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.checksum import (
+    KvChecksumComputer,
+    is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
@@ -205,6 +211,17 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        if get_disagg().disaggregation_enable_kv_checksum:
+            kv_args = self.kv_manager.kv_args
+            self.scheduler.kv_checksum_computer = KvChecksumComputer(
+                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                kv_data_ptrs=kv_args.kv_data_ptrs,
+                kv_item_lens=kv_args.kv_item_lens,
+                state_data_ptrs=kv_args.state_data_ptrs,
+                state_item_lens=kv_args.state_item_lens,
+            )
+        else:
+            self.scheduler.kv_checksum_computer = None
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -1273,6 +1290,25 @@ class SchedulerDisaggregationPrefillMixin:
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
+        self,
+        req: Req,
+        last_chunk: bool = False,
+        end_idx: Optional[int] = None,
+    ) -> None:
+        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        if last_chunk and computer is not None:
+            if is_health_check_req(req):
+                value = 0
+            else:
+                if end_idx is None:
+                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                page_indices_gpu = page_indices_for_request(self, req, end_idx)
+                state_indices = state_indices_for_request(self, req, end_idx)
+                value = computer.compute(page_indices_gpu, state_indices)
+            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+
+    def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,

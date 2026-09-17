@@ -18,8 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _import_kernel_backend():
-    # Imported here rather than at module scope: the CuTe DSL backend drags in
-    # CUDA-only dependencies that CPU-side importers of this module never need.
+    # Deferred: the backend drags in CUDA-only deps CPU importers never need.
     from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
     from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
     from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
@@ -32,15 +31,12 @@ def _import_kernel_backend():
     )
 
 
-# Mirrors the constants the FlashInfer HT device kernel derives its shard split
-# from: warp size, and bf16 elements per 16-byte vector.
+# Mirrors the FlashInfer HT device kernel: warp size, bf16 elements per 16B vector.
 _WARP_SIZE = 32
 _VEC_BF16 = 8
 
-# The HT kernel spends two warps beside its reduction warps on non-consumer
-# roles: block_threads = consumer_threads + (2 + reduction_warps) * WARP_SIZE,
-# capped at the CUDA block limit. The two halves are coupled, so the consumer
-# budget is derived per candidate reduction-warp count rather than fixed.
+# Kernel bound, with two non-consumer warps beside the reduction warps:
+# consumer_threads + (2 + reduction_warps) * WARP_SIZE <= _CUDA_BLOCK_THREADS.
 _CUDA_BLOCK_THREADS = 1024
 _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
@@ -52,15 +48,11 @@ SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 def _ht_shard_split(
     hidden_size: int, max_consumer_threads: int
 ) -> tuple[int, int] | None:
-    """``(consumer_threads, vectors_per_thread)`` for the HT persistent kernel.
-
-    The kernel shards a token into consumer_threads * 8 * vectors_per_thread
-    elements, and consumer_threads must divide its 16-byte vector count.
-    """
+    # The kernel shards a token into consumer_threads * 8 * vectors_per_thread
+    # elements, and consumer_threads must divide its 16-byte vector count.
     packs = hidden_size // _VEC_BF16
-    # packs // 2 forces vectors_per_thread >= 2. The kernel only requires it to
-    # be positive; the floor of 2 is inherited from the shipped GB300 presets
-    # and is not otherwise justified, so it is safe to relax if measured.
+    # packs // 2 forces vectors_per_thread >= 2, inherited from the shipped
+    # GB300 presets; the kernel only requires it positive, so this can relax.
     limit = min(max_consumer_threads, packs // 2)
     for consumer_threads in range(
         limit - limit % _WARP_SIZE, _WARP_SIZE - 1, -_WARP_SIZE
@@ -71,9 +63,8 @@ def _ht_shard_split(
 
 
 def _ht_reduction_warp_order(preferred: int) -> tuple[int, ...]:
-    """Legal reduction-warp counts, the preset's own value first, then the
-    nearest alternatives -- stepping down before stepping up, because every
-    extra reduction warp is taken out of the consumers' block budget."""
+    # Preset's own value first, then nearest; steps down before up, because an
+    # extra reduction warp costs consumer block budget.
     return tuple(
         sorted(
             _HT_REDUCTION_WARP_CHOICES,
@@ -85,7 +76,7 @@ def _ht_reduction_warp_order(preferred: int) -> tuple[int, ...]:
 def _ht_shard_major_is_legal(
     consumer_threads: int, rms_token_groups: int, tp_size: int
 ) -> bool:
-    """Shard-major RMS needs an integer number of reduction shards per RMS warp."""
+    # Shard-major RMS needs an integer number of reduction shards per RMS warp.
     rms_warps_per_token = (consumer_threads // rms_token_groups) // _WARP_SIZE
     return (
         rms_warps_per_token > 0
@@ -97,9 +88,8 @@ def _ht_shard_major_is_legal(
 def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
     """``preset`` re-aimed at this shape, or None when no legal split exists.
 
-    Only the shape-dependent fields move; the preset's pipeline depth and RMS
-    schedule survive, except ``rms_shard_major``, which the kernel rejects
-    unless tp is a multiple of the RMS warps per token.
+    Only shape-dependent fields move, except ``rms_shard_major``, which the
+    kernel rejects unless tp is a multiple of the RMS warps per token.
     """
     packs = hidden_size // _VEC_BF16
     if packs % tp_size:
@@ -131,11 +121,8 @@ def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
 
 
 def _routes(bounds, ll_target, bt_targets, ht_target):
-    """The M-range dispatch for one operation, HT dropped when unroutable.
-
-    Without HT the widest BT range takes the unbounded slot, so the profile
-    still covers the whole workspace capacity instead of being rejected.
-    """
+    # Without HT the widest BT range takes the unbounded slot, so the profile
+    # still covers the whole workspace capacity.
     from flashinfer.comm.mnnvl_cutedsl import MRangeDispatch
 
     if ht_target is not None:
@@ -152,11 +139,8 @@ def _routes(bounds, ll_target, bt_targets, ht_target):
 def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     """A single-profile routing config for a shape FlashInfer does not ship.
 
-    Reuses the shipped GB300 presets and their crossovers, re-aiming only the
-    shape-dependent kernel parameters; the crossovers were measured at tp=8/16
-    hidden=8192 top_k=10 and are unmeasured elsewhere. A shape that admits no
-    legal HT split keeps the LL and BT routes and drops HT rather than losing
-    the whole profile.
+    Reuses the shipped GB300 crossovers, which were measured at tp=8/16
+    hidden=8192 top_k=10 and are unmeasured elsewhere.
     """
     from flashinfer.comm.mnnvl_cutedsl import (
         KernelTarget,
@@ -264,11 +248,8 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
 
 
 def _config_for_shape(default_config, *, tp_size: int, hidden_size: int, top_k: int):
-    """The shipped config when it covers this shape, else one rebuilt for it.
-
-    MNNVLCuteDSLConfig.resolve matches (tp, hidden, top_k, dtype) exactly and
-    DEFAULT_CONFIG ships GB300 H=8192/K=10 only, so every other shape needs one.
-    """
+    # MNNVLCuteDSLConfig.resolve matches (tp, hidden, top_k, dtype) exactly and
+    # DEFAULT_CONFIG ships GB300 H=8192/K=10 only, so other shapes need one.
     for profile in default_config.profiles:
         if profile.matches(
             tp_size=tp_size,
@@ -387,9 +368,6 @@ class FlashInferMNNVLCuteDSLARFusion:
                 hidden_size=self.hidden_size,
                 top_k=self.top_k,
             )
-            # Only fused finalize launches have a completed shared-expert handoff;
-            # standalone AllReduce kernels retain the safe load ordering.
-
             if get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(shaped_config)
             else:
@@ -455,8 +433,7 @@ class FlashInferMNNVLCuteDSLARFusion:
             input=routed_output,
             workspace=self.workspace,
             pattern=pattern,
-            # The public API carries the caller's PDL intent. The backend's
-            # routing profile owns the compiled choice and validates it.
+            # Caller intent only; the routing profile owns the compiled choice.
             launch_with_pdl=True,
             residual_in=residual,
             residual_out=residual_output,
@@ -511,8 +488,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
-    # Checked before CUDA: a workspace already existing is a statement about
-    # process state, and reporting "requires CUDA" for it would misdirect.
+    # Before the CUDA check: "requires CUDA" would misdirect for a second one.
     global _WORKSPACE
     if _WORKSPACE is not None:
         raise RuntimeError(

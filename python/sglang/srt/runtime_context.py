@@ -671,8 +671,7 @@ class ForwardFlags:
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
-        # defer_moe_finalize: hand the already-deferred MoE finalize to the next
-        #   layer's fused collective instead of materializing it in the MoE.
+        # defer_moe_finalize: next layer's fused collective absorbs the finalize.
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,

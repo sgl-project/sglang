@@ -435,6 +435,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -476,6 +477,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
@@ -486,6 +488,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 

@@ -733,11 +733,7 @@ def should_skip_mlp_all_reduce() -> bool:
 
 @lru_cache(maxsize=1)
 def moe_deferred_finalize_max_tokens() -> int:
-    """Largest M at which deferring the MoE finalize is still profitable.
-
-    Above it the [M*top_k, hidden] HBM round trip the deferral forces costs
-    more than the finalize kernel it saves. 0 means no bound.
-    """
+    """Largest M at which deferring the finalize still pays; 0 means no bound."""
     return envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
 
 

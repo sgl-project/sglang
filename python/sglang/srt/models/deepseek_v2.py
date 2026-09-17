@@ -1024,8 +1024,8 @@ class DeepseekV2MoE(nn.Module):
         current_stream.wait_stream(self.alt_stream)
 
         if deferred_finalize and get_forward().defer_moe_finalize:
-            # deferred_finalize already excluded the replicated
-            # _shared_expert_tp1 output, so the shared add folds in safely.
+            # deferred_finalize excluded the replicated _shared_expert_tp1
+            # output, so the shared add folds in safely.
             assert shared_output is not None
             from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
@@ -2507,8 +2507,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # Deferring implies fusing, and both are published by the one scoped()
-        # block below, so the deferral has to be decided before it.
+        # Deferring implies fusing, and one scoped() block below publishes both.
         may_defer_moe_finalize = self.layer_communicator.should_defer_moe_finalize(
             forward_batch
         )
@@ -2550,8 +2549,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                     gemm_output_zero_allocator,
                 )
 
-        # The flag only permits a handoff; the MoE still declines it per forward
-        # (non-bypassed topk, no deferring runner), so key off what came back.
+        # The flag only permits a handoff; the MoE declines it per forward, so
+        # key off what came back.
         if not isinstance(hidden_states, torch.Tensor):
             return hidden_states, residual, topk_indices
 
@@ -2777,15 +2776,13 @@ class DeepseekV2Model(nn.Module):
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
             rms_epsilon=config.rms_norm_eps,
-            # A TP1-replicated shared expert is added after the all-reduce, so
-            # folding it into the fused add would count it once per rank.
+            # A TP1-replicated shared expert is added after the all-reduce: it
+            # cannot fold into the fused add, nor move that reduction onward.
             can_defer_finalize=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE)
                 and layer.mlp.experts.supports_deferred_finalize
                 and not layer.mlp._shared_expert_tp1
             ),
-            # A TP1-replicated shared expert is added after the layer's own
-            # all-reduce, so that reduction cannot move to the next layer.
             requires_local_reduction=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp._shared_expert_tp1
             ),

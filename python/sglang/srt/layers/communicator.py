@@ -846,11 +846,7 @@ class LayerCommunicator:
         return self._finish_prepare_attn(hidden_states, residual, forward_batch)
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run. A subclass producing the
-        post-norm hidden states itself returns through here rather than
-        short-circuiting; skipping it leaves ``attn_inputs`` unset and
-        ``fetch_qkv_latent`` asserts.
-        """
+        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -937,8 +933,7 @@ class LayerCommunicator:
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
-        """Whether this layer's MoE may hand back an unfinalized output for the
-        next layer to absorb. ``m`` defaults to the forward's token count."""
+        """Whether the MoE may hand an unfinalized output to the next layer."""
         return False
 
     # NOTE: This function will cause torch recompilation

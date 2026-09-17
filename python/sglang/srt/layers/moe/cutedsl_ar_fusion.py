@@ -35,18 +35,13 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-# A predicate over one decoder layer, evaluated once per layer at install time.
 LayerPredicate = Callable[[torch.nn.Module], bool]
 
 logger = logging.getLogger(__name__)
 
 
 def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
-    """The gamma the fused RMSNorm reads, or None for a norm it cannot serve.
-
-    The kernel wants the multiplier as applied, so GemmaRMSNorm hands over its
-    pre-folded w + 1. None is how the eligibility predicates decline a layer.
-    """
+    """The multiplier as applied -- GemmaRMSNorm's pre-folded w + 1. None declines."""
     if isinstance(layernorm, GemmaRMSNorm):
         return layernorm.gemma_weight
     if isinstance(layernorm, RMSNorm) and layernorm.has_weight:
@@ -63,7 +58,6 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
 
 
 def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) -> int:
-    """Use framework token bounds as the workspace-capacity source of truth."""
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     candidates = [
@@ -82,10 +76,8 @@ def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) 
     return max(positive)
 
 
-# Stays a dataclass against .claude/rules/no-dataclasses.md: Dynamo can trace a
-# frozen dataclass constructor but cannot construct a msgspec.Struct (a
-# C-extension type), and both producers build this inside a fullgraph=True
-# region -- qwen2_moe's MoE forward, and DeepSeek's capture-mode dual stream.
+# Stays a dataclass against .claude/rules/no-dataclasses.md: both producers build
+# this under fullgraph=True, and Dynamo cannot construct a msgspec.Struct.
 @dataclass(frozen=True)
 class MoeFinalizeHandoff:
     """Unfinalized routed output plus the separately gated shared contribution."""
@@ -119,8 +111,6 @@ class MoeFinalizeHandoff:
 
 
 class CuteDSLFusionService:
-    """A lightweight model handle for the process-local FlashInfer workspace."""
-
     def __init__(
         self,
         *,
@@ -193,20 +183,17 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
-    """The only communicator that runs the CuTe DSL fused patterns."""
-
     fusion_service: CuteDSLFusionService | None = None
 
-    # Recorded by install_cutedsl_fusion(): this layer's runner can defer AND
-    # something downstream consumes the handoff.
+    # This layer's runner can defer AND something downstream consumes it.
     may_defer_moe_finalize: bool = False
 
-    # Whether the NEXT layer absorbs a plain all-reduce; unlike the flag above
-    # this excludes the last layer, whose final norm performs no all-reduce.
+    # Unlike the flag above, excludes the last layer: its final norm all-reduces
+    # nothing.
     successor_absorbs_all_reduce: bool = False
 
-    # This layer's MoE adds a replicated contribution after its own reduction,
-    # so moving that reduction to the next layer would scale it by tp_size.
+    # Its MoE adds a replicated contribution after its own reduction, which
+    # moving that reduction onward would scale by tp_size.
     owes_local_reduction: bool = False
 
     def prepare_attn(
@@ -311,8 +298,6 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         )
 
     def _should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
-        """Consuming a handoff is a property of the fused kernel and the
-        topology, not of the MoE runner that produced it."""
         return (
             self._common_eligible(forward_batch, m) and get_parallel().moe_ep_size == 1
         )
@@ -320,8 +305,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def _can_consume_post_moe_all_reduce(
         self, forward_batch: ForwardBatch, m: int
     ) -> bool:
-        """Incoming: may this layer's input norm absorb the all-reduce its
-        predecessor skipped. Independent of this layer's own successor."""
+        """Incoming, and independent of this layer's own successor."""
         return (
             self._common_eligible(forward_batch, m)
             and fused_norm_gamma(self.input_layernorm) is not None
@@ -331,8 +315,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def _can_absorb_post_moe_all_reduce(
         self, forward_batch: ForwardBatch, m: int
     ) -> bool:
-        """Outgoing: may this layer skip its own all-reduce because the next
-        one absorbs it. Refused when it owes a local reduction."""
+        """Outgoing: skip our own all-reduce because the next layer absorbs it."""
         return (
             self.successor_absorbs_all_reduce
             and not self.owes_local_reduction
@@ -342,8 +325,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
-        """Deferring skips the post-experts all-reduce on the promise of a
-        handoff, so a layer with no consumer must not defer."""
+        """Deferring skips the post-experts all-reduce on the promise of a handoff."""
         if not self.may_defer_moe_finalize:
             return False
         if m is None:
@@ -362,10 +344,8 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and get_moe_a2a_backend().is_none()
             and self._context.tp_size > 1
             # Both branches of should_fuse_mlp_allreduce_with_next_layer() answer
-            # before delegating to the base, so the base guards it would have run
-            # -- moe-cp allgather, MOE_FULL and SCATTERED -- are restated here.
-            # For a sparse layer _compute_mlp_mode() returns exactly one of those
-            # three or FULL, so requiring FULL covers all of them.
+            # before delegating to the base, so its guards -- moe-cp allgather,
+            # MOE_FULL and SCATTERED -- are restated by requiring FULL here.
             and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
             # Skipping the post-experts reduction drops both the EP and the TP
             # leg; one fused collective cannot restore both.
@@ -378,19 +358,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         m = int(forward_batch.input_ids.shape[0])
         if self.should_defer_moe_finalize(forward_batch, m):
             return True
-        # A runner that returns a plain tensor can still hand its all-reduce
-        # to the next layer's input norm.
         if self._can_absorb_post_moe_all_reduce(forward_batch, m):
             return True
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
 
 def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
-    """Whether any layer of ``model`` carries a CuTe DSL fusion communicator.
-
-    Most modules carry no ``layer_communicator`` at all, so ``__dict__.get``
-    stands in for a defensive ``getattr`` over a heterogeneous module tree.
-    """
+    # Most modules carry no ``layer_communicator``, so ``__dict__.get`` stands
+    # in for a defensive ``getattr`` over a heterogeneous module tree.
     return any(
         isinstance(
             module.__dict__.get("layer_communicator"),
@@ -411,20 +386,13 @@ def install_cutedsl_fusion(
     final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
-    """Give every fusion-enabled layer one shared workspace handle, or None.
+    """One shared workspace handle per fusion-enabled layer, or None.
 
-    The workspace compiles per (hidden_size, top_k, rms_epsilon), which every MoE
-    layer of a model shares. Every entry of ``layers`` must carry a
-    ``layer_communicator``, so a PP-padded list is sliced to the local range
-    first. Set ``final_norm_consumes_handoff`` only when the model's final norm
-    closes out the last layer's handoff, and ``requires_local_reduction`` for a
-    layer whose MoE adds a replicated output after its own all-reduce.
+    Every entry of ``layers`` must carry a ``layer_communicator``.
     """
     if get_flags().moe.in_speculative_scope:
-        # A draft model is built inside the target's process, and each workspace
+        # A draft is built in the target's process, and each workspace
         # rendezvouses its own NVLS region, so a second one is refused outright.
-        # A draft has nothing to install anyway: its layers have no successor to
-        # absorb a deferred finalize.
         return None
 
     fusion_layers = [
@@ -435,8 +403,8 @@ def install_cutedsl_fusion(
     if not fusion_layers:
         return None
 
-    # One workspace is compiled for one epsilon; a family with a per-layer value
-    # would otherwise be normalized with the wrong one, silently.
+    # The kernel validates only the epsilon the service passes, so a family
+    # with a per-layer value would silently normalize with the wrong one.
     for layer in fusion_layers:
         for norm in (
             layer.layer_communicator.input_layernorm,
@@ -495,7 +463,6 @@ def prepare_cutedsl_fusion(
     max_running_requests: int | None,
     label: str,
 ) -> None:
-    """Compile the workspace before graph capture; a no-op without a handle."""
     if service is None:
         return
     if get_disagg().enable_pdmux:
