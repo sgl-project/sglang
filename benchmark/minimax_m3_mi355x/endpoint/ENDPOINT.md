@@ -67,7 +67,7 @@ below — slower, but the only one measured to pass every vendor gate (aime25 no
 | `SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1` | `False` | aiter long-prefix extend |
 | `SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5` | `0.0` | decode fairness against chunked prefill |
 | `SGLANG_TIMEOUT_KEEP_ALIVE=3600` | `5` | long generations must not be reaped |
-| `NCCL_MIN_NCHANNELS=112` | unset | RCCL channel count measured on gfx950 |
+| `NCCL_MIN_NCHANNELS=112` | unset | RCCL channel floor, inherited from the benchmark env (`../reproduce.sh`). **Not measured in isolation** -- unlike every other collective knob it has no row in `../OPTIMIZATIONS.md` section 3, and this config routes the hot all-reduces around RCCL anyway (custom AR at decode sizes, quick-reduce INT4 at >= 64 MB). Kept only because every measured run had it set. |
 
 Dropped from the old `serve_endpoint.sh`, verified individually against `python/sglang/srt/environ.py`:
 `SGLANG_USE_AITER` / `HIP_FORCE_DEV_KERNARG` (already `ENV` in the image);
