@@ -33,8 +33,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.bootstrap import (
     bootstrap_diffusion_runtime,
-    configure_persistent_torch_compile_cache,
-    worker_cpu_intra_op_threads,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
@@ -118,18 +116,6 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
-
-
-def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
-    """CPU intra-op thread budget for one of `num_gpus` co-located workers.
-
-    torch defaults the intra-op pool to every host core in every worker, so
-    co-located workers oversubscribe the host num_gpus-fold and any CPU op
-    past the ~32k-element parallel grain pays pool wakeup contention instead
-    of microseconds (measured 500x on request-static packed layouts). An
-    explicit OMP_NUM_THREADS keeps deployer intent (returns None).
-    """
-    return worker_cpu_intra_op_threads(num_gpus)
 
 
 OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
@@ -258,10 +244,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
-
-    def _configure_persistent_torch_compile_cache(self) -> None:
-        """Persist torch.compile's Inductor/Triton cache across restarts"""
-        configure_persistent_torch_compile_cache()
 
     def is_sleeping(self) -> bool:
         return self.memory_occupation.is_sleeping() if self.memory_occupation else False
