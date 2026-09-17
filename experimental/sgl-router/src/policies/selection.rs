@@ -22,6 +22,7 @@
 //! The module owns the decision and reports why; it does not own the HTTP
 //! response. Mapping a failed selection onto a status code stays in the route.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use crate::config::{DecodePolicyKind, PolicyKind, SessionAffinityMode};
@@ -38,7 +39,7 @@ use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
-use crate::server::metrics::{MetricsRegistry, PolicySelectionFailureReason};
+use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
 use crate::workers::Worker;
 
 /// Everything one prefill selection reads. Collaborators first, then the
@@ -67,6 +68,58 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     /// The configured mode. Without Bucket partitioning all modes reduce to
     /// the single global domain, and the ladder applies that reduction itself.
     pub session_affinity_mode: SessionAffinityMode,
+    /// `--worker-queue-limit`. `None` disables the queue gate entirely.
+    pub worker_queue_limit: Option<u64>,
+    /// `--saturation-queue-floor`. `None` disables the saturation pin.
+    pub saturation_queue_floor: Option<u64>,
+}
+
+/// The queue-gate blind warn is sampled: it fires on a per-request path, and
+/// the condition (gate configured, zero fresh engine load samples fleet-wide)
+/// is steady-state, so 1-in-64 is plenty to surface it without log flooding.
+const QUEUE_GATE_BLIND_LOG_SAMPLE: u64 = 64;
+static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The saturation-pin info log is sampled for the same reason as the
+/// queue-gate blind warn: it fires on a per-request path and the condition
+/// (a saturated fleet) persists for many requests, so 1-in-64 surfaces it
+/// without log flooding.
+const SATURATION_PIN_LOG_SAMPLE: u64 = 64;
+static SATURATION_PIN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Maps the queue-gate audit of a Cache-Aware selection that produced no
+/// winner onto its decision label. Pure so every boundary is pinned by unit
+/// tests rather than inferred from the ladder that calls it:
+///
+/// - `queue_gate_rejected == 0` means the gate took nothing out, so whatever
+///   emptied the candidate set was not the gate.
+/// - `fleet_all_queued` is asked BEFORE the capacity question, because
+///   `all_queued` is keyed on the fleet being saturated and not on where the
+///   request landed. Asking capacity first drops the saturation signal in the
+///   worst case there is: a queueing fleet whose owners are also out of KV
+///   books a plain `cache_miss`, and a fully saturated fleet reads as a
+///   healthy one — the exact blind spot the label exists to remove.
+/// - `admission_evaluated == 0` is then what makes the GATE, rather than KV
+///   capacity, the reason an unsaturated fleet's candidate set came back
+///   empty. Without it a capacity exhaustion books as a gate diversion
+///   whenever one owner happens to be queueing.
+fn cache_aware_fallback_decision(
+    queue_gate_rejected: u64,
+    admission_evaluated: u64,
+    fleet_all_queued: bool,
+) -> CacheAwareDecision {
+    if queue_gate_rejected == 0 {
+        return CacheAwareDecision::CacheMiss;
+    }
+    if fleet_all_queued {
+        return CacheAwareDecision::AllQueued;
+    }
+    if admission_evaluated > 0 {
+        // Capacity, not the gate: owners survived the gate and then failed
+        // capacity admission.
+        return CacheAwareDecision::CacheMiss;
+    }
+    CacheAwareDecision::CacheWorkerQueued
 }
 
 /// Runs the prefill selection ladder. `Err` carries the reason the last rung
@@ -85,6 +138,7 @@ pub(crate) fn select_prefill_worker(
             tps_slo: inputs.tps_slo,
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
+        cache_gate_audit: None,
     };
     let selected = selector.run();
     selected.ok_or(selector.failure_reason)
@@ -98,6 +152,12 @@ struct Selector<'a> {
     inputs: &'a PrefillSelectionInputs<'a>,
     bucket_request: BucketRequest,
     failure_reason: PolicySelectionFailureReason,
+    /// Queue-gate audit of a Cache-Aware resolution that produced no winner:
+    /// (gate-rejected candidates, candidates that reached capacity admission,
+    /// fleet saturation, deepest rejected prefix). `None` when there was no
+    /// resolution at all — no load snapshot, or no candidate proposal — which
+    /// reads as a plain miss because nothing was gated out.
+    cache_gate_audit: Option<(u64, u64, bool, u32)>,
 }
 
 impl<'a> Selector<'a> {
@@ -117,6 +177,7 @@ impl<'a> Selector<'a> {
 
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
         let cache_winner = self.cache_winner();
+        let cache_winner_hit = cache_winner.is_some();
 
         let global_affinity_probe = use_global_affinity_probe
             .then(|| {
@@ -147,7 +208,7 @@ impl<'a> Selector<'a> {
             // Rebuild the backup inside the primary's own Bucket.
             .and_then(|domain| self.select_in_domain(&domain, true, false, false));
 
-        cache_winner.or_else(|| {
+        let selected = cache_winner.or_else(|| {
             // Materializing the normal domains clones the member list of every
             // Bucket, so build them only on the rung that actually reads them.
             let prefill_domains = || {
@@ -173,7 +234,32 @@ impl<'a> Selector<'a> {
                     self.select_domains(&prefill_domains(), true, true)
                 }
             }
-        })
+        });
+        // Only a selection that resolved a worker books a decision. A ladder
+        // that ran out of rungs is a 503, already counted by
+        // `sgl_router_policy_selection_failures_total`; booking it here too
+        // would break the documented sum and, worse, let a request that
+        // reached nothing book `cache_worker_queued` and contribute to
+        // `sgl_router_diverted_overlap_blocks` — a diversion that never
+        // arrived is not evidence about what the gate traded away.
+        if inputs.policy_kind == PolicyKind::CacheAware && !cache_winner_hit && selected.is_some() {
+            let (rejected, evaluated, fleet_all_queued, blocks) =
+                self.cache_gate_audit.unwrap_or((0, 0, false, 0));
+            let decision = cache_aware_fallback_decision(rejected, evaluated, fleet_all_queued);
+            if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
+                // A real diversion: an unqueued destination existed and the
+                // gate gave up `blocks` of matched prefix to reach it. The
+                // histogram is the evidence for whether the gate is trading
+                // large cached prefixes for short waits.
+                inputs
+                    .metrics
+                    .observe_diverted_overlap_blocks(&inputs.model_id.0, u64::from(blocks));
+            }
+            inputs
+                .metrics
+                .record_cache_aware_decision(&inputs.model_id.0, decision);
+        }
+        selected
     }
 
     /// The per-request `SelectionContext` every rung starts from.
@@ -206,8 +292,42 @@ impl<'a> Selector<'a> {
             return None;
         };
         let bounded_candidate_count = proposal.candidates.len();
-        let cache_decision =
-            resolve_cache_candidates(&proposal, inputs.request_input_tokens, snapshot);
+        // The queue gate reads the engine-published load sample and fails open
+        // per worker. When NO worker has a fresh sample the gate is inert
+        // fleet-wide and nothing would say so: `cache_worker_queued` sitting at
+        // 0 is indistinguishable from a healthy fleet. Warn (sampled) — a fleet
+        // that never advertised a load port must not silently disable the gate.
+        if inputs.worker_queue_limit.is_some()
+            && !inputs.workers.is_empty()
+            && inputs
+                .workers
+                .iter()
+                .all(|worker| snapshot.fresh_load_for_url(&worker.url).is_none())
+            && QUEUE_GATE_BLIND_LOG_COUNTER
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .is_multiple_of(QUEUE_GATE_BLIND_LOG_SAMPLE)
+        {
+            tracing::warn!(
+                model = %inputs.model_id,
+                worker_queue_limit = inputs.worker_queue_limit,
+                workers = inputs.workers.len(),
+                "--worker-queue-limit is set but no worker has a fresh engine load \
+                 sample, so the queue gate is inert. Check that engines advertise a \
+                 load port and publish LoadStat",
+            );
+        }
+        let cache_decision = resolve_cache_candidates(
+            &proposal,
+            inputs.request_input_tokens,
+            snapshot,
+            inputs.workers,
+        );
+        self.cache_gate_audit = Some((
+            cache_decision.queue_gate_rejected_candidates,
+            cache_decision.admission_evaluated_candidates,
+            cache_decision.fleet_all_queued,
+            cache_decision.queue_gate_best_rejected_blocks,
+        ));
         inputs
             .metrics
             .record_cache_admission_evaluations(cache_decision.admission_evaluated_candidates);
@@ -243,9 +363,52 @@ impl<'a> Selector<'a> {
             prefill_pressure_source = cache_decision.prefill_pressure_source,
             "cache candidate winner",
         );
-        inputs
-            .metrics
-            .record_policy_decision("cache_aware", "cache_candidate");
+        inputs.metrics.record_policy_decision(
+            "cache_aware",
+            prefill_policy_reason(
+                PolicyKind::CacheAware,
+                ProposalKind::CacheAffinity,
+                decision.reason,
+                inputs.session_id.is_some_and(|value| !value.is_empty()),
+                true,
+            ),
+        );
+        if decision.reason == DecisionReason::SaturationPin {
+            // The pin books the saturation label because it always means
+            // affinity was kept under a queueing fleet. It does not retire
+            // the off-owner draw in `run`: when every gate-rejected owner
+            // also fails capacity admission the pin yields no decision, and
+            // the fallback records the same label from an off-owner landing.
+            inputs
+                .metrics
+                .record_cache_aware_decision(&inputs.model_id.0, CacheAwareDecision::AllQueued);
+            if SATURATION_PIN_LOG_COUNTER
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .is_multiple_of(SATURATION_PIN_LOG_SAMPLE)
+            {
+                tracing::info!(
+                    model = %&inputs.model_id.0,
+                    worker = %decision.selected.url,
+                    saturation_queue_floor = inputs.saturation_queue_floor,
+                    worker_queue_limit = inputs.worker_queue_limit,
+                    "fleet saturated, keeping affinity with a queueing prefix owner \
+                     instead of diverting",
+                );
+            }
+        } else {
+            inputs.metrics.record_cache_aware_decision(
+                &inputs.model_id.0,
+                if cache_decision.queue_gate_fell_back {
+                    // The gate removed every owner and nowhere in the fleet is
+                    // unqueued, so the prefix was kept rather than traded for a
+                    // wait that cannot be dodged. Booked as saturation, never
+                    // as a plain hit.
+                    CacheAwareDecision::AllQueued
+                } else {
+                    CacheAwareDecision::CacheHit
+                },
+            );
+        }
         Some(decision.selected)
     }
 
@@ -317,6 +480,7 @@ impl<'a> Selector<'a> {
                     &proposal,
                     inputs.request_input_tokens,
                     snapshot,
+                    inputs.worker_queue_limit,
                 )
             } else {
                 resolve_prefill_admitted(
@@ -324,6 +488,7 @@ impl<'a> Selector<'a> {
                     &proposal,
                     inputs.request_input_tokens,
                     snapshot,
+                    inputs.worker_queue_limit,
                 )
             };
             let Some(decision) = decision else {
@@ -400,6 +565,7 @@ fn prefill_policy_reason(
         PolicyKind::CacheAware => match (proposal, decision) {
             (_, DecisionReason::CacheCandidate)
             | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
+            (_, DecisionReason::SaturationPin) => "saturation_pin",
             (_, DecisionReason::Primary) => "no_cache_candidate",
             (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
             (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
@@ -415,6 +581,7 @@ fn prefill_policy_reason(
             DecisionReason::BackupPressureGuard => "pressure_backup",
             DecisionReason::RangeFallback => "range_fallback",
             DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
+            DecisionReason::SaturationPin => "saturation_pin",
         },
     }
 }
@@ -521,17 +688,20 @@ fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>)
 #[cfg(test)]
 mod tests {
     use super::{
-        prefill_policy_reason, projected_decode_kv_tokens, select_decode_peer,
-        select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
+        cache_aware_fallback_decision, prefill_policy_reason, projected_decode_kv_tokens,
+        select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
     };
-    use crate::config::{DecodePolicyKind, PolicyKind, SessionAffinityMode};
+    use crate::config::{AffinityConfig, DecodePolicyKind, PolicyKind, SessionAffinityMode};
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
     use crate::policies::buckets::BucketSelector;
+    use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::{Policy, ProposalKind, SelectionProposal};
-    use crate::server::metrics::{MetricsRegistry, PolicySelectionFailureReason};
+    use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
+    use crate::server::metrics::{
+        CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
+    };
     use crate::workers::Worker;
     use std::sync::Arc;
     use std::time::Instant;
@@ -573,6 +743,62 @@ mod tests {
         )
     }
 
+    /// `(worker, waiting requests, tokens already held, published KV
+    /// capacity)`. The queue gate reads `num_waiting_reqs`, which the plain
+    /// [`snapshot`] fixture pins at zero.
+    fn queued_snapshot(entries: &[(&Arc<Worker>, u64, u64, u64)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_native_cache_workers(
+            7,
+            entries
+                .iter()
+                .map(|(worker, waiting, used, capacity)| {
+                    (
+                        worker.url.clone(),
+                        NativeCacheWorkerLoad {
+                            num_running_reqs: 1,
+                            num_waiting_reqs: *waiting,
+                            num_waiting_uncached_tokens: *waiting,
+                            num_used_tokens: *used,
+                            num_total_tokens: *used,
+                            max_total_num_tokens: *capacity,
+                            max_running_requests: 64,
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
+                            captured_at: Instant::now(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// An indexer hit placing `matched_prefix_blocks` on each named worker.
+    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> ExternalPrefixSignal {
+        ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: matches
+                    .iter()
+                    .map(|(worker, blocks)| sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: *blocks,
+                        worker_id: worker.id.0.clone(),
+                        address: worker.url.clone(),
+                    })
+                    .collect(),
+                best_prefix_blocks: matches.iter().map(|(_, blocks)| *blocks).max().unwrap_or(0),
+            },
+            query_blocks,
+        }
+    }
+
+    fn booked_decisions(metrics: &MetricsRegistry) -> Vec<String> {
+        metrics
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("sgl_router_cache_aware_decisions_total{"))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Power-of-two prefill, Bucket partitioning off, no session affinity —
     /// the single global domain, which is what isolates the ladder's rungs.
     #[allow(clippy::too_many_arguments)]
@@ -599,6 +825,8 @@ mod tests {
             external_prefix: None,
             load_snapshot,
             workers,
+            worker_queue_limit: None,
+            saturation_queue_floor: None,
             ttft_slo_ms: None,
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
@@ -652,6 +880,150 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_cache_aware_selection_books_no_decision() {
+        // The documented invariant on `sgl_router_cache_aware_decisions_total`
+        // is one decision per selection that RESOLVES a worker, so the labels
+        // sum to the cache-aware rate less the 503s. A ladder that ran out of
+        // rungs is already counted by the failure counter; booking it here too
+        // would break that sum and let a request that reached nothing feed
+        // `sgl_router_diverted_overlap_blocks`.
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let workers: Vec<Arc<Worker>> = Vec::new();
+        let loads = snapshot(&[]);
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            64,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+
+        assert!(select_prefill_worker(&inputs).is_err());
+
+        let rendered = metrics.render();
+        let booked: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("sgl_router_cache_aware_decisions_total{"))
+            .collect();
+        assert!(
+            booked.is_empty(),
+            "a 503 selection must book no cache-aware decision, got {booked:?}"
+        );
+    }
+
+    /// The wiring between `resolve_cache_candidates`' audit and the decision
+    /// label, which the resolver test and the pure-mapper test each cover only
+    /// one side of. This is the end the `selected.is_some()` guard could
+    /// silently kill.
+    #[test]
+    fn a_saturated_capacity_exhausted_fleet_books_all_queued_through_the_ladder() {
+        let owner = worker("owner");
+        let shallow_owner = worker("shallow-owner");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&shallow_owner)];
+        // Both owners are over the limit (saturation) AND out of KV, so the
+        // re-admitted set yields no winner and the ladder falls through to the
+        // capacity fallback. Before the ordering fix this booked `cache_miss`.
+        let loads = queued_snapshot(&[
+            (&owner, 9, 10_000, 10_000),
+            (&shallow_owner, 5, 10_000, 10_000),
+        ]);
+        let signal = prefix_signal(&[(&owner, 9), (&shallow_owner, 4)], 10);
+        let config = AffinityConfig {
+            worker_queue_limit: Some(4),
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::new(config);
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        inputs.worker_queue_limit = Some(4);
+        inputs.external_prefix = Some(&signal);
+
+        assert!(
+            select_prefill_worker(&inputs).is_ok(),
+            "a saturated fleet must still route"
+        );
+
+        assert_eq!(
+            booked_decisions(&metrics),
+            vec![
+                r#"sgl_router_cache_aware_decisions_total{model_id="model",decision="all_queued"} 1"#
+            ],
+            "saturation must survive a capacity-exhausted re-admission"
+        );
+    }
+
+    /// The other side of the same wiring: an unsaturated fleet where the gate
+    /// really did divert, which must book the diversion AND the prefix depth
+    /// it gave up.
+    #[test]
+    fn a_real_diversion_books_cache_worker_queued_and_its_overlap_depth() {
+        let owner = worker("owner");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&idle)];
+        // The only prefix owner is queueing; a non-owner is idle, so a
+        // diversion can dodge the wait and the fleet is NOT saturated.
+        // `cache_affinity_min_matched_tokens` defaults to 1024, so the request
+        // has to be large enough for a 7/10-block match to clear it, or the
+        // candidate never reaches the gate at all and this books a plain miss.
+        let loads = queued_snapshot(&[(&owner, 9, 10, 10_000_000), (&idle, 0, 10, 10_000_000)]);
+        let signal = prefix_signal(&[(&owner, 7)], 10);
+        let config = AffinityConfig {
+            worker_queue_limit: Some(4),
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::new(config);
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        inputs.worker_queue_limit = Some(4);
+        inputs.external_prefix = Some(&signal);
+
+        let selected = select_prefill_worker(&inputs).expect("an idle worker exists");
+
+        assert_eq!(selected.id, idle.id, "the gate must divert off the prefix");
+        assert_eq!(
+            booked_decisions(&metrics),
+            vec![
+                r#"sgl_router_cache_aware_decisions_total{model_id="model",decision="cache_worker_queued"} 1"#
+            ]
+        );
+        // The depth given up is the evidence the histogram exists for, and a
+        // diversion that never arrived must never reach it.
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_diverted_overlap_blocks_count{model_id="model"} 1"#),
+            "a real diversion must observe its overlap depth, got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn a_saturated_fleet_still_routes_through_the_capacity_fallback() {
         let full = worker("full");
         let also_full = worker("also-full");
@@ -667,6 +1039,7 @@ mod tests {
                 &SelectionProposal::with_backup(Arc::clone(&full), Arc::clone(&also_full)),
                 64,
                 &loads,
+                None,
             )
             .is_none(),
             "fixture must saturate every worker so the strict rung admits none",
@@ -841,5 +1214,50 @@ mod tests {
             ),
             "cache_candidate"
         );
+    }
+
+    #[test]
+    fn cache_aware_fallback_decision_needs_the_gate_to_have_emptied_the_set() {
+        // The trap this pins: on an UNSATURATED fleet, one owner queueing
+        // while the others exhaust KV capacity is a CAPACITY problem, not a
+        // gate diversion. Only a gate that removed every owner leaves zero
+        // candidates evaluated.
+        assert!(matches!(
+            cache_aware_fallback_decision(1, 3, false),
+            CacheAwareDecision::CacheMiss
+        ));
+        // Nothing gated out at all: a plain miss, saturated or not.
+        assert!(matches!(
+            cache_aware_fallback_decision(0, 0, false),
+            CacheAwareDecision::CacheMiss
+        ));
+        assert!(matches!(
+            cache_aware_fallback_decision(0, 4, true),
+            CacheAwareDecision::CacheMiss
+        ));
+    }
+
+    #[test]
+    fn cache_aware_fallback_decision_separates_diversion_from_saturation() {
+        // Gate removed every owner and somewhere unqueued exists: a real
+        // diversion off the prefix. `resolve_cache_candidates` leaves
+        // `evaluated` at zero here because its second tier does not fire on
+        // an unsaturated fleet.
+        assert!(matches!(
+            cache_aware_fallback_decision(2, 0, false),
+            CacheAwareDecision::CacheWorkerQueued
+        ));
+        // Saturation, in the shape the resolver actually produces: the
+        // second tier re-admitted the gated-out owners, so `evaluated` is
+        // NON-zero, and they then failed hard admission. Booking the
+        // capacity outcome here would drop the saturation signal exactly
+        // where it matters — hence saturation is asked first. Pinning
+        // `(2, 0, true)` instead would assert a state the resolver cannot
+        // reach: re-admission and the `AllQueued` precondition are the same
+        // condition, so an empty `evaluated` never survives it.
+        assert!(matches!(
+            cache_aware_fallback_decision(2, 2, true),
+            CacheAwareDecision::AllQueued
+        ));
     }
 }
