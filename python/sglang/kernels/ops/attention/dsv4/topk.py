@@ -51,17 +51,20 @@ def _jit_topk_v2_module():
             if occ_16_1 > 0:
                 extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
     kernel = f"TopKKernel<{args}>"
+    wrappers = [
+        ("topk_transform_paged", f"{kernel}::transform_paged"),
+        ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_plan", f"{kernel}::plan"),
+    ]
+    if is_hip_runtime():
+        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
+        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
-        cuda_wrappers=[
-            ("topk_transform_paged", f"{kernel}::transform_paged"),
-            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
-            ("topk_transform_packed", f"{kernel}::transform_packed"),
-            ("topk_plan", f"{kernel}::plan"),
-        ],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -284,7 +287,12 @@ def topk_transform_packed_v2(
     invalid for that row and the buffer must have no other consumer, so do not
     pass a view with overlapping rows.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
+
+    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
+    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
+    produces this layout today.
     """
+    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
     module = _jit_topk_v2_module()
     module.topk_transform_packed(
         scores,
