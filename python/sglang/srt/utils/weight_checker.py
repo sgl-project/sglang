@@ -50,10 +50,13 @@ class CheckEntry(NamedTuple):
 class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
+    is_shuffled: bool = False
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
+    "cos_cache",
+    "sin_cache",
     "inv_freq",
     "freqs_cis",
     "expert_mask_gpu",
@@ -313,12 +316,14 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
-        own = {name for name, _ in module.named_parameters(recurse=False)}
-        for name in own:
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls, prefix + scale
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
                 )
     return quantized_set
 
@@ -342,7 +347,9 @@ def _build_check_entries(
             yield CheckEntry(
                 name,
                 name not in skip_compare_names,
-                qw.comparable_cls(tensor, raw[qw.scale_name]),
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
             )
         else:
             should_compare = name not in skip_compare_names and (
