@@ -1307,6 +1307,10 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (non-overlap schedule, no DP attention).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1481,6 +1485,15 @@ class Envs:
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
 
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
@@ -1499,25 +1512,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
-    # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
-    # rows from the GPU instead of sharding them over HBM.
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
-    # Pin and map the host table with cudaHostRegister. False leaves the plain
-    # mapping to the platform (Grace-Blackwell ATS reaches it directly).
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
-    # How the host table is laid out: "shared" is one memfd copy for the TP group
-    # with no all-reduce; "private" is one anonymous mapping per rank holding its
-    # row range, gathered with the all-reduce. "auto" picks shared when shmem THP
-    # (transparent_hugepage/shmem_enabled) is on, else private when anonymous THP
-    # is on, else shared without huge pages.
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("auto")
-    # With the host table on, drop the checkpoint's page cache (posix_fadvise
-    # DONTNEED on the safetensors) before pre-faulting the table and again after
-    # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
-    # huge-page faults. Costs the next restart its warm page cache.
-    SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
