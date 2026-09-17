@@ -15,7 +15,9 @@ tie-break choice) does not matter.
 
 from __future__ import annotations
 
+import importlib
 import sys
+from types import SimpleNamespace
 from typing import Tuple
 
 import pytest
@@ -572,6 +574,67 @@ def test_moe_fused_gate_accepts_non_fp32_bias(
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("rows", [1, 6, 8])
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
+def test_small_target_router_pdl_graph(rows, bias_dtype, monkeypatch):
+    """Changing producers and consumers agree bitwise with the PDL path."""
+    gate = importlib.import_module("sglang.kernels.ops.moe.moe_fused_gate")
+    if not gate.is_arch_support_pdl():
+        pytest.skip("PDL comparison requires Hopper or newer")
+
+    scores, _ = _make_inputs(rows, 384, seed=42)
+    bias_input = torch.randn(384, device=DEVICE, dtype=bias_dtype)
+    live = torch.tensor([rows], device=DEVICE, dtype=torch.int32)
+
+    def pipeline():
+        # Keep producers and consumers inside capture to exercise dependencies.
+        produced_scores = scores * 2.0
+        produced_bias = bias_input.float()
+        packed = torch.empty((rows, 6), device=DEVICE, dtype=torch.int32)
+        weights, indices = gate.moe_fused_gate(
+            produced_scores,
+            produced_bias,
+            topk=6,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.5,
+            apply_routed_scaling_factor_on_output=True,
+            num_token_non_padded=live,
+            renormalize_epsilon=1e-20,
+            packed_out=packed,
+        )
+        return weights.clone(), indices.clone(), packed.clone()
+
+    graphs = []
+    outputs = []
+    # Mock only the dispatch architecture so the comparison also runs on H100
+    # CI. The Triton kernels still compile for the actual device.
+    for major, minor in [(9, 0), (10, 3)]:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                gate,
+                "get_jit_cuda_arch",
+                lambda: SimpleNamespace(major=major, minor=minor),
+            )
+            for _ in range(3):
+                pipeline()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs.append(pipeline())
+            graphs.append(graph)
+
+    for replay in range(8):
+        scores.normal_()
+        bias_input.normal_()
+        if replay == 0:  # Equal scores exercise the expert-ID tie break.
+            scores.zero_()
+            bias_input.zero_()
+        live.fill_(rows if replay == 0 else replay % (rows + 1))
+        for graph in graphs:
+            graph.replay()
+        for reference, actual in zip(*outputs):
+            assert torch.equal(reference, actual)
 
 
 if __name__ == "__main__":
