@@ -22,7 +22,7 @@ MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
 # TODO: Update HLE dataset path for CI environment
 HLE_DATASET_PATH = "/root/.cache/modelscope/hub/datasets/AI-ModelScope/hle"
 
-MIMO_V2_5_PRO_FP4_4P_ENVS = {
+MIMO_V2_5_PRO_FP4_8P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "HCCL_BUFFSIZE": "300",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -42,7 +42,7 @@ MIMO_V2_5_PRO_FP4_4P_ENVS = {
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
 }
 
-MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS = [
+MIMO_V2_5_PRO_FP4_8P_OTHER_ARGS = [
     "--served-model-name",
     MIMO_V2_5_PRO_FP4_MODEL_PATH,
     "--trust-remote-code",
@@ -82,12 +82,12 @@ MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS = [
 ]
 
 
-class TestNPUMiMoV2_5_Pro_W4A8_4P_HLE(TestNpuAccuracyTestCaseBase):
+class TestNPUMiMoV2_5_Pro_W4A8_8P_HLE(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for MiMo-V2.5-Pro-FP4 4p single node on HLE"""
 
     model = MIMO_V2_5_PRO_FP4_MODEL_PATH
-    other_args = MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS
-    envs = MIMO_V2_5_PRO_FP4_4P_ENVS
+    other_args = MIMO_V2_5_PRO_FP4_8P_OTHER_ARGS
+    envs = MIMO_V2_5_PRO_FP4_8P_ENVS
     accuracy = 0.33
     datasets = ["hle"]
     dataset_args = {
