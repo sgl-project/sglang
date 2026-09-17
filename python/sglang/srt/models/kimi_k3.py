@@ -2911,6 +2911,18 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+        ):
+            if "dspark_hidden_states" in pp_proxy_tensors.tensors:
+                aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
+            if self.start_layer - 1 in self.dspark_layers_to_capture:
+                aux_hidden_states.append(
+                    self._dspark_capture_stream(
+                        self.start_layer - 1, hidden_states, residual, attn_res
+                    )
+                )
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2929,6 +2941,7 @@ class KimiK3LinearModel(nn.Module):
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
+                and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, residual, attn_res)
@@ -2942,9 +2955,12 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux_hidden_states:
+                proxy_tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return PPProxyTensors(proxy_tensors)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -3053,12 +3069,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
