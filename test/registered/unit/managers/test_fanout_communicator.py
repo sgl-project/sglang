@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,6 +44,38 @@ class TestQueueingCall(CustomTestCase):
             # All callers complete without error, in strict FIFO order.
             await asyncio.gather(*tasks)
             self.assertEqual(sent, ["A", "B", "C"])
+
+        asyncio.run(scenario())
+
+    def test_cancelled_call_drops_late_correlated_response(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=1,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+
+            abandoned = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-1"))
+            )
+            await asyncio.sleep(0)
+            abandoned.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await abandoned
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"))
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-1"))
+            await asyncio.sleep(0)
+            self.assertFalse(retry.done())
+
+            response = SimpleNamespace(submission_id="submission-2")
+            comm.handle_recv(response)
+            self.assertEqual(await retry, [response])
 
         asyncio.run(scenario())
 
