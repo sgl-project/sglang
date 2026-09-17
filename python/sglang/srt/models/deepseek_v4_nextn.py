@@ -8,6 +8,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import (
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     get_global_dp_buffer_len,
@@ -24,6 +30,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
@@ -160,6 +167,20 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        if use_prefill_cp and is_cp_active(forward_batch):
+            attn_backend = get_attn_backend()
+            if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                local_positions = getattr(
+                    forward_batch, "dsv4_cp_local_positions", None
+                )
+                if (
+                    local_positions is not None
+                    and positions.shape[0] == local_positions.shape[0]
+                ):
+                    forward_batch.positions = positions
+
         if _is_npu:
             # Same per-forward rope prime as DeepseekV4Model.forward: the
             # decoder layer reads the memoized gather instead of re-gathering.
@@ -220,7 +241,6 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,
