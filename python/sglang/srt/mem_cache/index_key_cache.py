@@ -63,9 +63,9 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
+        return self._view_as_kernel_pages(self.buffer[layer_id - self.pool.start_layer])
 
-    def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
+    def _view_as_kernel_pages(self, buffer: torch.Tensor) -> torch.Tensor:
         # NOTE(kpham-sgl): A pool page groups packed [K64, scales64] blocks;
         # reshaping must preserve those blocks rather than pack all scales last.
         return buffer.view(-1, self.kernel_page_bytes)
@@ -112,7 +112,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
+        buf = self._view_as_kernel_pages(self.buffer[layer_id - self.pool.start_layer])
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,

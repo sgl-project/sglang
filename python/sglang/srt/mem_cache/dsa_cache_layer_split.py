@@ -142,7 +142,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 src_tensor=src_tensor,
             )
             self.remote_layer_id = layer_id
-        return self._kernel_view(self.remote_buffer)
+        return self._view_as_kernel_pages(self.remote_buffer)
 
     def state_buf_infos(self):
         owned_layer_ids = [
