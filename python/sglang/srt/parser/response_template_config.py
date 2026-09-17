@@ -47,6 +47,20 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
             f"{sorted(unsupported)}. Supported fields are: "
             f"{sorted(SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
         )
+    for name in ("thinking", "content"):
+        field = template.get("fields", {}).get(name)
+        if not isinstance(field, dict):
+            continue
+        if (
+            field.get("content", "text") != "text"
+            or field.get("transform") is not None
+            or field.get("join") is not None
+            or field.get("content_args", {}).get("strip") is True
+        ):
+            raise ValueError(
+                f"response_template field {name!r} uses semantics that cannot "
+                "be streamed by the OpenAI serving adapter"
+            )
     return loaded
 
 

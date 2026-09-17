@@ -1,5 +1,6 @@
 """Tests for checkpoint-driven response-template adapters."""
 
+import copy
 import json
 import unittest
 from types import SimpleNamespace
@@ -163,6 +164,17 @@ class TestResponseTemplateLoading(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported semantic fields"):
             ResponseTemplateReasoningDetector(response_template=template)
 
+        for field_name, update in (
+            ("content", {"content": "json"}),
+            ("content", {"content_args": {"strip": True}}),
+            ("thinking", {"transform": "{content}"}),
+        ):
+            with self.subTest(field=field_name, update=update):
+                template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+                template["fields"][field_name].update(update)
+                with self.assertRaisesRegex(ValueError, "cannot be streamed"):
+                    validate_response_template_for_serving(template)
+
         template = {
             "defaults": {"role": "assistant", "metadata": {}},
             "start_anchor": "<assistant>",
@@ -259,14 +271,14 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
         self.assertEqual(parsed.reasoning_text, "I should check the weather.")
         self.assertEqual(parsed.normal_text, malformed)
 
-    def test_structured_thinking_is_routed_as_opaque_text(self):
+    def test_required_tool_field_does_not_expose_reasoning(self):
         template = {
             "start_anchor": "<assistant>",
             "fields": {
                 "thinking": {
                     "open": "<think>",
                     "close": "</think>",
-                    "content": "json",
+                    "content": "text",
                 },
                 "content": {"content": "text"},
                 "tool_calls": {
@@ -281,9 +293,9 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
         parsed = ResponseTemplateReasoningDetector(
             response_template=template,
             prefix="<assistant>",
-        ).detect_and_parse('<think>{"unfinished"</think>answer')
+        ).detect_and_parse("<think>reason</think>answer")
 
-        self.assertEqual(parsed.reasoning_text, '{"unfinished"')
+        self.assertEqual(parsed.reasoning_text, "reason")
         self.assertEqual(parsed.normal_text, "answer")
 
     def test_thinking_only_template_preserves_plain_content(self):
