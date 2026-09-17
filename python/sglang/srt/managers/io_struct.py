@@ -2104,6 +2104,9 @@ class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     # Filled by TokenizerManager before scheduler fan-out. It is not accepted
     # from the public API as the runtime is authoritative for its own identity.
     runtime_instance_id: Optional[str] = None
+    # Correlates one tokenizer-to-scheduler fan-out attempt. Retries keep the
+    # operation ID but receive a new submission ID.
+    submission_id: Optional[str] = None
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
@@ -2111,6 +2114,7 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     message: str
     conflict: bool = False
     operation_id: Optional[str] = None
+    submission_id: Optional[str] = None
     instance_id: Optional[str] = None
     old_ep_size: int = 0
     new_ep_size: int = 0
