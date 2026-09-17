@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -760,7 +761,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIs(transport.pool, pool)
 
 
-class TestSchedulerMmTransportBoundary(unittest.TestCase):
+class TestSchedulerMmTransportBoundary(CustomTestCase):
     def _publish(self, **fields):
         from sglang.srt.runtime_context import get_context
 
@@ -829,6 +830,88 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
             errors = scheduler._materialize_cuda_vmm_inputs(request)
 
         return request, errors
+
+    def test_text_only_inputs_skip_vmm_error_agreement(self):
+        """Text-only requests must not wait for multimodal error agreement."""
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        for batch_type in (
+            None,
+            scheduler_module.BatchTokenizedGenerateReqInput,
+            scheduler_module.BatchTokenizedEmbeddingReqInput,
+        ):
+            with self.subTest(batch_type=batch_type):
+                requests = [SimpleNamespace(mm_inputs=None) for _ in range(2)]
+                request = (
+                    requests[0] if batch_type is None else batch_type(batch=requests)
+                )
+                with (
+                    patch.object(
+                        scheduler_module, "TokenizedGenerateReqInput", SimpleNamespace
+                    ),
+                    patch.object(
+                        scheduler_module.MultimodalInputs, "from_processor_output"
+                    ) as materialize,
+                    patch.object(
+                        scheduler,
+                        "_gather_vmm_materialization_errors",
+                        return_value=[None, None],
+                    ) as gather_errors,
+                ):
+                    errors = scheduler._materialize_cuda_vmm_inputs(request)
+
+                self.assertEqual(errors, [None] * (1 if batch_type is None else 2))
+                materialize.assert_not_called()
+                gather_errors.assert_not_called()
+
+    def test_mixed_vmm_batch_preserves_error_alignment(self):
+        """A remote reconstruction failure must abort the matching multimodal input."""
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
+        raw_inputs = object()
+        materialized = scheduler_module.MultimodalInputs(mm_items=[])
+        requests = [
+            SimpleNamespace(mm_inputs=value)
+            for value in (None, raw_inputs, None, materialized, None)
+        ]
+        request = scheduler_module.BatchTokenizedGenerateReqInput(batch=requests)
+        remote_error = "RuntimeError: remote failure"
+
+        with (
+            patch.object(
+                scheduler_module.MultimodalInputs,
+                "from_processor_output",
+                return_value=materialized,
+            ) as materialize,
+            patch.object(
+                scheduler,
+                "_gather_vmm_materialization_errors",
+                side_effect=[[None, None], [None, remote_error]],
+            ) as gather_errors,
+        ):
+            errors = scheduler._materialize_cuda_vmm_inputs(request)
+
+        self.assertEqual(
+            errors,
+            [
+                None,
+                None,
+                None,
+                f"Multimodal feature reconstruction failed (rank 1: {remote_error})",
+                None,
+            ],
+        )
+        self.assertEqual(gather_errors.call_args_list, [call(None), call(None)])
+        materialize.assert_called_once_with(
+            raw_inputs, requires_mm_token_modalities=False
+        )
+        self.assertEqual(
+            [request.mm_inputs for request in requests],
+            [None, materialized, None, None, None],
+        )
 
     def test_materializes_inputs_directly_before_base_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
