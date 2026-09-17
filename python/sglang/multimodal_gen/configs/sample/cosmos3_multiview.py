@@ -284,8 +284,9 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
 def validate_lidar_request(lidar: Any) -> dict[str, Any]:
     """Validate the joint camera/LiDAR ``lidar`` object: one prepared control clip.
 
-    ``decode`` (default true) controls whether the denoised LiDAR latents are
-    decoded to range maps and written next to the camera video.
+    ``decode`` (default false) asks for the LiDAR output as well: the denoised
+    LiDAR latents are decoded to range maps and written next to the camera
+    video. By default a joint request returns only the camera video.
     """
     if not isinstance(lidar, dict):
         raise ValueError(f"lidar must be a JSON object, got {type(lidar).__name__}.")
@@ -301,7 +302,7 @@ def validate_lidar_request(lidar: Any) -> dict[str, Any]:
             "Cosmos3 lidar.control_path must be a prepared range-map tensor "
             f"({sorted(COSMOS3_LIDAR_CONTROL_SUFFIXES)}), got {path!r}."
         )
-    decode = lidar.get("decode", True)
+    decode = lidar.get("decode", False)
     if isinstance(decode, bool) is False:
         raise ValueError(f"Cosmos3 lidar.decode must be a boolean, got {decode!r}.")
     return {"control_path": path, "decode": decode}

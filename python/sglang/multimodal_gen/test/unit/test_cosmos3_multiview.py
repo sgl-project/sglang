@@ -1251,7 +1251,7 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
             validate_lidar_request({"control_path": "sweeps.tar"})
         self.assertEqual(
             validate_lidar_request({"control_path": "sweeps.safetensors"}),
-            {"control_path": "sweeps.safetensors", "decode": True},
+            {"control_path": "sweeps.safetensors", "decode": False},
         )
         with self.assertRaisesRegex(ValueError, "control_path"):
             validate_multiview_request({"views": [{"camera_key": "front"}]})
@@ -1731,12 +1731,14 @@ class TestLidarDecoder(unittest.TestCase):
         self.assertEqual(pooled[0, 0, 0, 1].item(), 0.0)  # columns 2,3: no return
 
     def test_lidar_request_decode_flag(self):
+        """LiDAR output is opt-in: a joint request returns only the camera video
+        unless it sets decode true."""
         params = validate_lidar_request({"control_path": "/x/hdmap.safetensors"})
-        self.assertTrue(params["decode"])
-        params = validate_lidar_request(
-            {"control_path": "/x/hdmap.safetensors", "decode": False}
-        )
         self.assertFalse(params["decode"])
+        params = validate_lidar_request(
+            {"control_path": "/x/hdmap.safetensors", "decode": True}
+        )
+        self.assertTrue(params["decode"])
         with self.assertRaises(ValueError):
             validate_lidar_request(
                 {"control_path": "/x/hdmap.safetensors", "decode": "no"}

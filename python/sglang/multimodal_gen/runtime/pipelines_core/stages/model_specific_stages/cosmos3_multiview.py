@@ -1221,9 +1221,10 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
 
     The output is one ``[1, 3, V*F, H, W]`` video: all frames of camera 0, then
     camera 1, and so on in request camera order. Split it by
-    ``frames_per_view`` on the client to get per-camera clips. Denoised LiDAR
-    latents are decoded to metric range maps and reported in the output's
-    ``lidar`` block (files next to the video, arrays when frames are returned).
+    ``frames_per_view`` on the client to get per-camera clips. When the request
+    sets ``lidar.decode``, the denoised LiDAR latents are decoded to metric range
+    maps and reported in the output's ``lidar`` block (files next to the video,
+    arrays when frames are returned); otherwise a joint request returns only video.
     """
 
     def __init__(
@@ -1238,12 +1239,11 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
 
     def _decode_lidar(self, batch: Req, latents: torch.Tensor) -> dict[str, Any] | None:
         lidar_request = batch.sampling_params.resolved_lidar() or {}
-        if not lidar_request.get("decode", True):
+        if not lidar_request.get("decode", False):
             return None
         if self.lidar_decoder is None:
             raise ValueError(
-                "Joint camera/LiDAR requests need the LiDAR decoder; pass lidar.decode=false "
-                "to skip decoding."
+                "lidar.decode=true needs the LiDAR decoder, which this server did not load."
             )
         projection = self.lidar_decoder.projection
         min_range_m = float(projection["min_range_m"])
