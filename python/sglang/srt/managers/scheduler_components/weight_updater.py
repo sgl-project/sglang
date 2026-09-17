@@ -78,7 +78,7 @@ def _split_lora_named_tensors(named_tensors):
 
 def _sha256_tensor(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
-        tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
+        tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy()
     ).hexdigest()
 
 
@@ -141,6 +141,8 @@ class SchedulerWeightUpdaterManager:
     # Version reported by the buckets of the open session; recorded only when
     # end_weight_update commits, so a version never names a half-applied update.
     _weight_update_pending_version: Optional[str] = None
+    _received_update_id: Optional[str] = None
+    _received_checksums: Optional[Dict[str, str]] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -401,6 +403,8 @@ class SchedulerWeightUpdaterManager:
             not self._weight_update_in_progress
         ), "begin_weight_update called while a weight-update session is already open"
         self._weight_update_selector = recv_req.selector
+        self._received_update_id = None
+        self._received_checksums = None
         self._weight_update_sync_base = recv_req.sync_base
         self._lora_stash = {}
         self._weight_update_pending_version = None
@@ -419,6 +423,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
+        self._observe_received_weights(update_id=recv_req.observation_update_id)
         if self._weight_update_sync_base:
             run_post_load = not self._weight_update_loaded
             for _, runner in self.get_model_runners(self._weight_update_selector):
@@ -430,6 +435,19 @@ class SchedulerWeightUpdaterManager:
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
+
+    def _observe_received_weights(self, *, update_id: Optional[str]) -> None:
+        if update_id is None or not self._weight_update_sync_base:
+            return
+        try:
+            checksums = {
+                name: _sha256_tensor(tensor)
+                for name, tensor in self.tp_worker.model_runner.model.named_parameters()
+            }
+            self._received_checksums = checksums
+            self._received_update_id = update_id
+        except Exception:
+            logger.exception("Could not observe received weight buffers")
 
     def forget_lora_adapter(self, lora_name: str) -> None:
         """Drop the partial-stream guard entry: a re-registered or unloaded name
@@ -591,6 +609,9 @@ class SchedulerWeightUpdaterManager:
                 if p is not None:
                     role_payloads.append((role, p))
             payload = _merge_checksum_payloads(role_payloads) if role_payloads else None
+            if payload is not None:
+                payload["received_update_id"] = self._received_update_id
+                payload["received_checksums"] = self._received_checksums
 
             tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
             if tp_size > 1 and payload is not None:

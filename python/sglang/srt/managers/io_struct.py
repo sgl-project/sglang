@@ -2021,6 +2021,7 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    observation_update_id: Optional[str] = None
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2058,6 +2059,8 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
+    received_update_id: Optional[str] = None
+    received_checksums: Optional[Dict[str, str]] = None
     # One entry per role the checksum covers: the target model plus, under
     # speculative decoding, each draft runner. All roles on a rank share the GPU
     # rank; consumers key off it to merge the shards.
