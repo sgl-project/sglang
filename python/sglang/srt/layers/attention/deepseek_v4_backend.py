@@ -524,6 +524,14 @@ class DSV4AttnMetadata:
     def positions(self) -> torch.Tensor:
         return self.positions_casual
 
+    @property
+    def has_c4(self) -> bool:
+        return 4 in self.present_ratios
+
+    @property
+    def has_c128(self) -> bool:
+        return 128 in self.present_ratios
+
     def get_flashmla_metadata(self, compress_ratio: Literal[0, 1, 2, 4, 128]):
         if compress_ratio == 0:
             return self.c0_flashmla_metadata
@@ -790,9 +798,7 @@ class DSV4AttnMetadata:
             f"{self.raw_out_loc.shape=}, {num_tokens=}"
         )
 
-        has_c4 = 4 in self.present_ratios
-        has_c128 = 128 in self.present_ratios
-        if has_c4 or has_c128:
+        if self.has_c4 or self.has_c128:
             # One kernel produces both ratios; compute_page_indices=False only
             # drops the [T, max_c128_len] table, which is c128-only.
             (
@@ -811,13 +817,13 @@ class DSV4AttnMetadata:
                 self.raw_out_loc,
                 self.page_table,
                 self.page_size,
-                compute_page_indices=has_c128,
+                compute_page_indices=self.has_c128,
             )
-            if has_c4:
+            if self.has_c4:
                 self.c4_out_loc = c4_out_loc
                 self.c4_topk_lengths_raw = c4_topk_lengths_raw
                 self.c4_topk_lengths_clamp1 = c4_topk_lengths_clamp1
-            if has_c128:
+            if self.has_c128:
                 self.c128_out_loc = c128_out_loc
                 self.c128_topk_lengths_clamp1 = c128_topk_lengths_clamp1
                 self.c128_page_indices = _pad_last_dim(c128_page_indices)
@@ -888,21 +894,18 @@ class DSV4AttnMetadata:
             expected_local_len = pre_global_len // cp_size
         if num_tokens is None:
             num_tokens = pre_global_len
-        for field_name in self._CP_REINDEX_FIELDS:
+        for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name, None)
+            if val is None:
+                assert field_name in self._CP_REINDEX_OPTIONAL_FIELDS, (
+                    f"CP reindex: {field_name} is None"
+                )
+                continue
             assert isinstance(val, torch.Tensor), (
                 f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             )
-            setattr(self, field_name, val[idx].contiguous())
-        for field_name in self._CP_REINDEX_OPTIONAL_FIELDS:
-            val = getattr(self, field_name)
-            if val is not None:
-                setattr(self, field_name, val[idx].contiguous())
-
-        for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
-            val = getattr(self, field_name)
-            if val is None:
-                continue
+            val = val[idx].contiguous()
+            setattr(self, field_name, val)
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
                 f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
@@ -921,9 +924,7 @@ class DSV4AttnMetadata:
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
-        has_c4 = 4 in self.present_ratios
-        has_c128 = 128 in self.present_ratios
-        if has_c4:
+        if self.has_c4:
             assert self.c4_topk_lengths_clamp1 is not None
             self.c4_sparse_topk_lengths = torch.clamp(
                 self.c4_topk_lengths_clamp1, max=self.index_topk
@@ -944,8 +945,10 @@ class DSV4AttnMetadata:
             self.c4_sparse_page_indices = None
             self.c4_sparse_raw_indices = None
         self.c0_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata() if has_c4 else None
-        self.c128_flashmla_metadata = _create_flashmla_metadata() if has_c128 else None
+        self.c4_flashmla_metadata = _create_flashmla_metadata() if self.has_c4 else None
+        self.c128_flashmla_metadata = (
+            _create_flashmla_metadata() if self.has_c128 else None
+        )
         if low_ratio_buffers is not None:
             assert not is_prefill and self.low_ratios == (1, 2)
             self.c1_sparse_topk_lengths, self.c1_sparse_page_indices = (
@@ -2823,9 +2826,9 @@ class DeepseekV4AttnBackend(
         ):
             core = metadata.core_attn_metadata
             core.c0_flashmla_metadata = _create_flashmla_metadata()
-            if 4 in core.present_ratios:
+            if core.has_c4:
                 core.c4_flashmla_metadata = _create_flashmla_metadata()
-            if 128 in core.present_ratios:
+            if core.has_c128:
                 core.c128_flashmla_metadata = _create_flashmla_metadata()
             if 1 in core.low_ratios:
                 core.c1_flashmla_metadata = _create_flashmla_metadata()
