@@ -995,7 +995,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=capture_hidden_mode,
             )
-            if self._is_context_only_pp_prefill_rank:
+            if self.ps.pp_rank < self.ps.pp_size - 1:
                 return batch_output
         return self._decode_idle_result(on_publish=on_publish)
 
