@@ -107,8 +107,3 @@ def bootstrap_diffusion_runtime(
         publish(
             SrtServerArgs(model_path="dummy", tp_size=server_args.tp_size), role=role
         )
-
-    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-
-    if current_platform.is_cuda():
-        monkey_patch_torch_reductions()

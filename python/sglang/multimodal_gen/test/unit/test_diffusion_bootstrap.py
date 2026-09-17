@@ -90,7 +90,10 @@ class TestDiffusionBootstrap(unittest.TestCase):
                     )
                     self.assertEqual(groups.call_args.kwargs["tp_size"], 2)
                     self.assertEqual(publish.call_args.kwargs["role"], role)
-                    reductions.assert_called_once_with()
+                    # Ordinary multi-GPU IPC-A2A rebuilds on the local ordinal;
+                    # the UUID reduction patch breaks that contract. Cache
+                    # transport applies its patch lazily, outside bootstrap.
+                    reductions.assert_not_called()
 
 
 if __name__ == "__main__":
