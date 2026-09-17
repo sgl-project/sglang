@@ -40,6 +40,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark.cache_protocol import resolve_benchmark_cache_protocol
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
@@ -1471,9 +1472,12 @@ async def benchmark(
     # Flush cache after warmup so the measured run does not benefit from
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
-    should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
-    ) or flush_cache
+    cache_protocol = resolve_benchmark_cache_protocol(
+        backend,
+        flush_cache,
+        ci_env=os.getenv("SGLANG_IS_IN_CI"),
+    )
+    should_flush_cache = cache_protocol["flushed_cache"]
     if should_flush_cache:
         flush_server_cache(base_url, backend, flush_cache_timeout)
 
@@ -1853,6 +1857,10 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            **cache_protocol,
+            "total_cached_tokens": sum(
+                o.cached_tokens for o in outputs if o.success
+            ),
         }
 
         if args.cache_report:
