@@ -5,7 +5,7 @@
 
 use crate::kv_events::{BlockSizeOracle, HashTree};
 use crate::policies::admission::{apply_filters, EligibilityFilter};
-use crate::policies::{Policy, PrefillProposal, SelectionContext, SelectionProposal};
+use crate::policies::{Policy, PrefillEvaluation, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -118,34 +118,38 @@ impl Pipeline {
     }
 
     /// Apply eligibility without rewriting an existing Session assignment.
-    fn propose_prefill_filtered(
+    fn evaluate_prefill_filtered(
         &self,
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
-    ) -> Option<PrefillProposal> {
+    ) -> Option<PrefillEvaluation> {
+        let fleet_ctx = ctx
+            .clone()
+            .with_routable_fleet(ctx.routable_fleet().unwrap_or(workers));
+        let ctx = &fleet_ctx;
         let eligible = apply_filters(self.views(), workers, ctx)?;
-        if self.inner.is_bucket_affinity_policy() && ctx.affinity_lookup_enabled() {
+        if self.inner.resolves_affinity_in_range() && ctx.affinity_lookup_enabled() {
             let probe_ctx = (*ctx).clone().without_affinity_assignment();
             if let Some(
-                proposal @ PrefillProposal::Pair(SelectionProposal {
+                proposal @ PrefillEvaluation::Pair(SelectionProposal {
                     kind: crate::policies::ProposalKind::SessionAffinity,
                     ..
                 }),
-            ) = self.inner.propose_prefill(workers, &probe_ctx)
+            ) = self.inner.evaluate_prefill(workers, &probe_ctx)
             {
                 return Some(proposal.with_eligible_workers(eligible));
             }
         }
         self.inner
-            .propose_prefill(&eligible, ctx)
+            .evaluate_prefill(&eligible, ctx)
             .map(|proposal| proposal.with_eligible_workers(eligible))
     }
 }
 
 impl Policy for Pipeline {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        let (proposal_kind, selected) = match self.propose_prefill_filtered(workers, ctx)? {
-            PrefillProposal::Pair(proposal) => {
+        let (proposal_kind, selected) = match self.evaluate_prefill_filtered(workers, ctx)? {
+            PrefillEvaluation::Pair(proposal) => {
                 let eligible = proposal.eligible_workers.as_deref().unwrap_or(workers);
                 if eligible
                     .iter()
@@ -160,7 +164,7 @@ impl Policy for Pipeline {
                     (proposal.kind, selected)
                 }
             }
-            PrefillProposal::CacheCandidates(proposal) => {
+            PrefillEvaluation::Cache(proposal) => {
                 let selected = proposal.candidates.into_iter().next()?.worker;
                 (crate::policies::ProposalKind::CacheAffinity, selected)
             }
@@ -176,9 +180,9 @@ impl Policy for Pipeline {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
-        match self.propose_prefill_filtered(workers, ctx)? {
-            PrefillProposal::Pair(proposal) => Some(proposal),
-            PrefillProposal::CacheCandidates(proposal) => {
+        match self.evaluate_prefill_filtered(workers, ctx)? {
+            PrefillEvaluation::Pair(proposal) => Some(proposal),
+            PrefillEvaluation::Cache(proposal) => {
                 let candidate = proposal.candidates.into_iter().next()?;
                 Some(
                     SelectionProposal::primary(candidate.worker)
@@ -188,12 +192,12 @@ impl Policy for Pipeline {
         }
     }
 
-    fn propose_prefill(
+    fn evaluate_prefill(
         &self,
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
-    ) -> Option<PrefillProposal> {
-        self.propose_prefill_filtered(workers, ctx)
+    ) -> Option<PrefillEvaluation> {
+        self.evaluate_prefill_filtered(workers, ctx)
     }
 
     fn uses_shared_prefill_admission(&self) -> bool {
@@ -223,8 +227,8 @@ impl Policy for Pipeline {
     }
 
     /// Preserves the inner policy's Bucket-affinity semantics.
-    fn is_bucket_affinity_policy(&self) -> bool {
-        self.inner.is_bucket_affinity_policy()
+    fn resolves_affinity_in_range(&self) -> bool {
+        self.inner.resolves_affinity_in_range()
     }
 
     fn needs_request_tokens(&self) -> bool {
@@ -341,7 +345,7 @@ pub struct Argmax {
 }
 
 /// The default selector, shared by every scoring policy that does not override
-/// [`super::ScoringPolicy::selector`].
+/// [`ScoringPolicy::selector`].
 pub static ARGMAX: Argmax = Argmax {
     rotor: AtomicUsize::new(0),
 };
@@ -489,6 +493,50 @@ mod scoring_tests {
     use crate::workers::engine_reports::{EngineSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn pipeline_preserves_fleet_scope_for_cache_saturation() {
+        use crate::kv_events::PrefixSignal;
+        use crate::policies::cache_aware::CacheAwarePolicy;
+        let owner = worker("owner");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&idle)];
+        let loads = snapshot(&[(&owner, 1, 4, 0, 10_000), (&idle, 0, 0, 0, 10_000)]);
+        let model = ModelId("tiny".into());
+        let signal = PrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![sgl_kv_indexer::PrefixMatch {
+                    worker_id: owner.id.0.clone(),
+                    address: owner.url.clone(),
+                    matched_prefix_blocks: 1,
+                }],
+                best_prefix_blocks: 1,
+            },
+            query_blocks: 1,
+        };
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(100)
+            .with_external_prefix(Some(&signal))
+            .with_load_snapshot(&loads);
+        let cache = Arc::new(CacheAwarePolicy::new(AffinityConfig {
+            worker_queue_limit: Some(4),
+            saturation_queue_floor: Some(1),
+            cache_affinity_min_matched_tokens: None,
+            cache_affinity_min_match_ratio: None,
+            ..Default::default()
+        }));
+        let pipeline =
+            Pipeline::new(vec![Arc::new(Keep(vec!["owner"], OnEmpty::Hold))], cache).unwrap();
+        let PrefillEvaluation::Cache(selection) =
+            pipeline.evaluate_prefill(&workers, &ctx).unwrap()
+        else {
+            panic!("the owner must produce a cache evaluation");
+        };
+        assert_eq!(selection.candidates.len(), 1);
+        assert_eq!(selection.resolution.queue_gate_rejected_candidates, 1);
+        assert!(!selection.resolution.fleet_all_queued);
+        assert!(selection.resolution.decision.is_none(), "the idle fleet worker prevents a saturation pin even when a filter excluded it from the cache candidate set");
+    }
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -788,7 +836,7 @@ mod scoring_tests {
         )
         .expect("valid filter and inner session policy");
         assert!(
-            session_pipeline.is_bucket_affinity_policy(),
+            session_pipeline.resolves_affinity_in_range(),
             "Pipeline must forward the inner Session affinity range capability"
         );
     }
@@ -812,9 +860,15 @@ mod scoring_tests {
             (&ws[2], 0, 0, 0, 4_096),
         ]);
 
-        let decision =
-            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
-                .expect("capacity exhaustion must degrade inside the filtered domain");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            crate::policies::admission::CapacityFallback::Allowed,
+        )
+        .expect("capacity exhaustion must degrade inside the filtered domain");
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
     }
 
@@ -836,8 +890,8 @@ mod scoring_tests {
             session.clone(),
         )
         .expect("valid filter and session policy");
-        let PrefillProposal::Pair(proposal) = pipeline
-            .propose_prefill(&ws, &ctx)
+        let PrefillEvaluation::Pair(proposal) = pipeline
+            .evaluate_prefill(&ws, &ctx)
             .expect("filtered session proposal")
         else {
             panic!("Session-Aware must retain pair semantics");
@@ -849,9 +903,15 @@ mod scoring_tests {
         assert_eq!(proposal.primary.id, ws[2].id);
 
         let snapshot = EngineSnapshot::default();
-        let decision =
-            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
-                .expect("an eligible escape worker exists");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            crate::policies::admission::CapacityFallback::Allowed,
+        )
+        .expect("an eligible escape worker exists");
         assert_ne!(decision.selected.id, ws[2].id);
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
 
@@ -874,8 +934,8 @@ mod scoring_tests {
         )
         .expect("valid filter and session policy");
 
-        let PrefillProposal::Pair(proposal) = pipeline
-            .propose_prefill(&ws, &ctx)
+        let PrefillEvaluation::Pair(proposal) = pipeline
+            .evaluate_prefill(&ws, &ctx)
             .expect("eligible workers establish the session")
         else {
             panic!("Session-Aware must retain pair semantics");

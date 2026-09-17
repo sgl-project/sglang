@@ -5,7 +5,7 @@
 
 use crate::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use crate::policies::admission::CandidateDomain;
-use crate::policies::CacheCandidate;
+use crate::policies::cache_aware::CacheCandidate;
 use crate::workers::Worker;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

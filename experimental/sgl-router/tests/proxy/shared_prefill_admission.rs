@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use sgl_router::policies::cache_aware::{CacheAwarePolicy, CacheCandidate, CacheCandidateProposal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,8 +13,7 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::{
-    CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
-    SelectionContext, SelectionProposal,
+    Policy, PolicyRegistry, PrefillEvaluation, ProposalKind, SelectionContext, SelectionProposal,
 };
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
@@ -114,12 +114,12 @@ impl Policy for CacheCandidatesPolicy {
         panic!("chat routing must use the cache-candidate proposal")
     }
 
-    fn propose_prefill(
+    fn evaluate_prefill(
         &self,
-        _: &[Arc<Worker>],
-        _: &SelectionContext<'_>,
-    ) -> Option<PrefillProposal> {
-        Some(PrefillProposal::CacheCandidates(CacheCandidateProposal {
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillEvaluation> {
+        let proposal = CacheCandidateProposal {
             candidates: vec![CacheCandidate {
                 worker: Arc::clone(&self.worker),
                 matched_prefix_tokens: 1,
@@ -128,9 +128,15 @@ impl Policy for CacheCandidatesPolicy {
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
-            cache_switch_margin_tokens: 0,
-            ..Default::default()
-        }))
+        };
+        Some(PrefillEvaluation::Cache(
+            CacheAwarePolicy::new(Default::default()).evaluate_candidates(
+                proposal,
+                ctx.input_tokens().unwrap(),
+                ctx.load_snapshot().unwrap(),
+                workers,
+            ),
+        ))
     }
 
     fn needs_load_snapshot(&self) -> bool {

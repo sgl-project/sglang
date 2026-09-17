@@ -7,7 +7,7 @@
 use sgl_router::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::buckets::{BucketRequest, BucketSelector};
-use sgl_router::policies::CacheCandidate;
+use sgl_router::policies::cache_aware::CacheCandidate;
 use sgl_router::workers::Worker;
 use std::sync::Arc;
 

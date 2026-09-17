@@ -353,7 +353,7 @@ impl Policy for SessionAwarePolicy {
         true
     }
 
-    fn is_bucket_affinity_policy(&self) -> bool {
+    fn resolves_affinity_in_range(&self) -> bool {
         true
     }
 }
@@ -836,6 +836,7 @@ mod proposal_tests {
             32,
             &loads,
             None,
+            admission::CapacityFallback::Allowed,
         )
         .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
