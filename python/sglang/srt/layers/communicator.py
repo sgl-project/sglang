@@ -605,14 +605,20 @@ class LayerCommunicator:
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
+        pre_normalized: bool = False,
     ):
-        hidden_states, residual = self.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=quant_format,
-            post_residual_addition=post_residual_addition,
-        )
+        if pre_normalized:
+            hidden_states, residual = self.prepare_attn_after_fused_moe_allreduce(
+                hidden_states, residual, forward_batch
+            )
+        else:
+            hidden_states, residual = self.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=quant_format,
+                post_residual_addition=post_residual_addition,
+            )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
                 hidden_states=residual,
@@ -627,6 +633,30 @@ class LayerCommunicator:
             ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
+        return hidden_states, residual
+
+    def prepare_attn_after_fused_moe_allreduce(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Run the layer-input communication tail after fused normalization."""
+
+        if get_attn_tp_context().input_scattered:
+            raise RuntimeError(
+                "pure MoE all-reduce fusion does not support scattered attention inputs"
+            )
+        hidden_states = self._communicate_simple_fn(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            context=self._context,
+        )
+        if self.qkv_latent_func is not None:
+            attn_inputs = AttentionInputs(
+                hidden_states, forward_batch, self.qkv_latent_func
+            )
+            get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
 
     def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
