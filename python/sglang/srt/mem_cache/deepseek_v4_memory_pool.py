@@ -1722,32 +1722,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             state[state_locs, half:] = float("-inf")
 
     def request_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
-        """PD transfer indices of the request-scoped state component: one c128
-        page per item (or the single online row) of the c128 ring, or the
-        request's whole ratio-2 pair ring, which only an odd prefix ships (an
-        even prefix leaves no pending half-pair for decode to read).
-        """
-        import numpy as np
-
-        from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
-
+        """PD transfer indices of the request-state component for one request."""
         pools = [
             p for p in self.compress_state_pools if p is not None and p.request_scoped
         ]
+        # One index list addresses every request-state buffer, so the
+        # request-scoped pools must share a ring layout; today there is one.
         assert len(pools) == 1, (
             f"expected one request-scoped state pool, got {len(pools)}"
         )
-        pool = pools[0]
-        if pool.ratio == 2:
-            if seq_len % 2 == 0:
-                return np.empty((0,), dtype=np.int32)
-            return np.array([int(req_pool_idx)], dtype=np.int32)
-        return get_dsv4_c128_state_indices(
-            req_pool_idx,
-            seq_len,
-            online=pool.online,
-            ring_size=1 if pool.online else pool.ring_size,
-        )
+        return pools[0].transfer_indices(req_pool_idx, seq_len)
 
     def clear_request_scoped_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped state for one req slot: the C128 ring and the
@@ -1857,6 +1841,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return compress_kv_pool.kv_cache_total_dim
 
     def get_swa_key_layout(self) -> KVLayout:
+        # The aggregate's layout: swa_kv_pool is None under the request window
+        # and unified_kv, where the SWA rows live elsewhere.
         return self.kv_layout
 
     def get_swa_key_bytes_per_token(self) -> int:

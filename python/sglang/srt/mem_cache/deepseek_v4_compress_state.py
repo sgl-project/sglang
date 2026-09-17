@@ -4,6 +4,7 @@ import dataclasses
 from contextlib import nullcontext
 from math import gcd
 
+import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -80,6 +81,51 @@ class KVAndScore:
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
 
+def c4_state_transfer_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ring_size: int,
+) -> np.ndarray:
+    """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
+    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
+    # pair the overlap compressor's live rows by logical token position.
+    if ring_size < 8 or ring_size % 4 != 0:
+        raise ValueError(
+            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
+        )
+
+    seq_len = max(0, int(seq_len))
+    state_len = seq_len % 4 + 4
+    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
+    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    return rows.astype(np.int32)
+
+
+def request_scoped_state_transfer_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ratio: int,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """PD transfer indices of a request-scoped compress state: the one pending
+    partial block of ``ratio`` tokens, as the request's single online row or the
+    ring page that holds it. Nothing pends at a block boundary."""
+    if seq_len == 0 or seq_len % ratio == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % ratio == 0, (
+        f"ring_size must be a multiple of {ratio}, got {ring_size}"
+    )
+    pages_per_req = ring_size // ratio
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // ratio
+    return np.array([page], dtype=np.int32)
+
+
 class CompressStatePool:
     def __init__(
         self,
@@ -143,6 +189,23 @@ class CompressStatePool:
                 self.kv_score_buffer.clear()
             else:
                 self.kv_score_buffer[-1].clear()
+
+    def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        """PD transfer indices of this pool's state for one request."""
+        assert self.request_scoped, "page-scoped state travels with the SWA pages"
+        if self.ratio == 2:
+            # The pair ring is one row per request; only an odd prefix leaves a
+            # pending half-pair for decode to read.
+            if seq_len % 2 == 0:
+                return np.empty((0,), dtype=np.int32)
+            return np.array([int(req_pool_idx)], dtype=np.int32)
+        return request_scoped_state_transfer_indices(
+            req_pool_idx,
+            seq_len,
+            ratio=self.ratio,
+            online=self.online,
+            ring_size=self.ring_size,
+        )
 
     def _alloc_kv_score_buffer(
         self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool

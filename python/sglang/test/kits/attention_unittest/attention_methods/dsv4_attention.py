@@ -1266,14 +1266,10 @@ def _extra_metadata_indices(
     the upgraded `DSV4AttnMetadata`. Mirrors the dispatch in
     `DeepseekV4AttnBackend.forward(compress_ratio=...)`.
     """
-    if compress_ratio in (1, 2, 4):
-        return (
-            core_metadata.sparse_page_indices(compress_ratio),
-            core_metadata.sparse_topk_lengths(compress_ratio),
-        )
-    if compress_ratio == 128:
-        return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
-    raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+    return (
+        core_metadata.sparse_page_indices(compress_ratio),
+        core_metadata.sparse_topk_lengths(compress_ratio),
+    )
 
 
 def _pure_torch_dsv4_combined_reference(
@@ -1424,11 +1420,12 @@ def _seed_c4_sparse_indices(
         num_entries, dtype=sparse_indices.dtype, device=sparse_indices.device
     )
     lengths = md.sparse_topk_lengths(ratio)
-    setattr(md, f"c{ratio}_sparse_page_indices", seed)
-    setattr(
-        md,
-        f"c{ratio}_sparse_topk_lengths",
-        torch.full((num_q,), num_entries, dtype=lengths.dtype, device=lengths.device),
+    md.set_sparse_topk(
+        ratio,
+        page_indices=seed,
+        topk_lengths=torch.full(
+            (num_q,), num_entries, dtype=lengths.dtype, device=lengths.device
+        ),
     )
 
 
@@ -1470,9 +1467,12 @@ def _seed_c4_sparse_prefill_indices(
     )
     seeded = torch.where(seq < lens.unsqueeze(1), seq, seq.new_full((), -1))
     lengths = md.sparse_topk_lengths(ratio)
-    setattr(md, f"c{ratio}_sparse_raw_indices", seeded)
-    setattr(md, f"c{ratio}_sparse_page_indices", seeded.clone())
-    setattr(md, f"c{ratio}_sparse_topk_lengths", lens.to(lengths.dtype))
+    md.set_sparse_topk(
+        ratio,
+        page_indices=seeded.clone(),
+        topk_lengths=lens.to(lengths.dtype),
+        raw_indices=seeded,
+    )
 
 
 def run_dsv4_target_verify_attention_case(
