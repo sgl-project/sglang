@@ -64,21 +64,33 @@ def requant_npu_arch35_block_fp8_to_mxfp8(
         weight = weight.to(device)
     scale = layer.weight_scale_inv.data.to(device)
 
-    bf16 = torch.empty(n_dim, k_dim, dtype=torch.bfloat16, device=weight.device)
+    # Chunked over rows to cap peak memory: the BF16 intermediate is
+    # chunk-sized, and only the new fp8 payload (the final weight itself) is
+    # materialized in full. Row chunking never crosses the 32-element quant
+    # groups (they run along K), so per-chunk results equal whole-tensor ones.
     rows_per_chunk = block_n * max(1, 1024 // block_n)
+    qw = torch.empty(n_dim, k_dim, dtype=torch.float8_e4m3fn, device=weight.device)
+    w_scale = None
     for r0 in range(0, n_dim, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, n_dim)
         s = scale[r0 // block_n : (r1 + block_n - 1) // block_n]
         s = s.repeat_interleave(block_n, dim=0)[: r1 - r0].repeat_interleave(
             block_k, dim=1
         )[:, :k_dim]
-        bf16[r0:r1] = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(
-            torch.bfloat16
+        bf16 = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(torch.bfloat16)
+        qw_c, ws_c = torch.ops.npu.npu_dynamic_mx_quant(
+            bf16, dst_type=torch.float8_e4m3fn
         )
+        qw[r0:r1] = qw_c
+        if w_scale is None:
+            w_scale = torch.empty(
+                n_dim, *ws_c.shape[1:], dtype=ws_c.dtype, device=weight.device
+            )
+        w_scale[r0:r1] = ws_c
 
-    qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
-        bf16, dst_type=torch.float8_e4m3fn
-    )
+    if w_scale.dim() == 2:
+        # Older torch_npu builds return [out, in//32]; reshape to 3D.
+        w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
 
     # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
     # scale [in//64, out, 2] as strided transpose views — DO NOT call

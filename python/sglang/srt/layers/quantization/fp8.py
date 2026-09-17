@@ -734,9 +734,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Plain block-FP8 checkpoint (fp32 block scales): requantize to
                 # the MXFP8 layout once at load time so the native A5 quantized
                 # GEMM (npu_w8a8_mxfp8_linear) can run the layer.
-                requant_npu_arch35_block_fp8_to_mxfp8(
-                    layer, self.weight_block_size
-                )
+                requant_npu_arch35_block_fp8_to_mxfp8(layer, self.weight_block_size)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
