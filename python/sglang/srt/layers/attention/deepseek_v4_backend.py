@@ -1484,8 +1484,6 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        # Pass the model window and physical KV page size explicitly. They can
-        # differ on SM120, where direct FlashInfer storage uses 64-token pages.
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),

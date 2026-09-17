@@ -71,9 +71,8 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 def _num_dsv4_physical_kv_pages(
     size: int, physical_page_size: int, logical_page_size: int
 ) -> int:
-    """Include the allocator's reserved logical page in physical storage."""
-    if physical_page_size <= 0 or logical_page_size <= 0:
-        raise ValueError("DeepSeek-V4 KV page sizes must be positive")
+    # The paged allocator reserves one page at the logical page size, so the
+    # highest token index is size + logical_page_size - 1.
     return ceil_div(size + logical_page_size, physical_page_size)
 
 
@@ -789,23 +788,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.swa_size = swa_size
         self.swa_page_size = swa_page_size
-        # The allocator and compressor state keep 256-token logical pages, but
-        # FlashInfer's SM120 DSV4 kernel consumes a 64-token physical SWA page.
-        # Storing in that layout directly removes the per-layer 256 -> 64 page
-        # split while preserving the flat token indices produced by the
-        # allocator.
-        self.swa_kv_page_size = (
+        # The allocator and compress state keep 256-token logical pages, while
+        # FlashInfer's SM120 DSV4 kernel consumes 64-token physical pages. Storing
+        # SWA KV in that layout removes the per-layer 256 -> 64 page split; the
+        # allocator's flat token indices stay valid.
+        swa_kv_page_size = (
             64
             if get_platform().is_sm120 and envs.SGLANG_OPT_SM120_DIRECT_SWA_KV.get()
             else swa_page_size
         )
-        assert swa_page_size % self.swa_kv_page_size == 0
-        if self.swa_kv_page_size != swa_page_size:
+        assert swa_page_size % swa_kv_page_size == 0
+        if swa_kv_page_size != swa_page_size:
             logger.info(
                 "DeepSeek-V4 SM120 direct SWA KV layout enabled: "
                 "logical_page_size=%d physical_page_size=%d",
                 swa_page_size,
-                self.swa_kv_page_size,
+                swa_kv_page_size,
             )
 
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -848,7 +846,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
-                page_size=self.swa_kv_page_size,
+                page_size=swa_kv_page_size,
                 dtype=dtype,
                 layer_num=stage_layer_num,
                 device=device,

@@ -422,9 +422,8 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # Keep FP8 wo_a opt-in on SM120. Recent DeepGEMM builds provide
-            # dedicated SM120 kernels, while older installations do not; the
-            # Centralized DeepGEMM capability validation handles explicit opt-in.
+            # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
+            # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             # The default top-k v2 path still requires unsupported resources.
