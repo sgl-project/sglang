@@ -122,8 +122,8 @@ def test_delayed_socket_with_recycled_peer_identity_is_rejected_before_export():
     peer = ProcessIdentity.read(os.getpid())
     request = {
         **PROTOCOL,
-        "type": "fetch_component",
-        "component": "transformer",
+        "type": "fetch_bundle",
+        "components": ["transformer", "text_encoder"],
         "compatibility": owner.plan.to_dict(),
         "generation": msgspec.to_builtins(owner.exporter.generation),
         "consumer": {"pid": peer.pid, "start_ticks": peer.start_ticks - 1},

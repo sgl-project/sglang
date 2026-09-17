@@ -12,14 +12,24 @@ import uuid
 import msgspec
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.weight_cache.bundle import (
+    build_bundle,
+    component_storage_bytes,
+    retain_importer,
+    validate_manifest_components,
+)
 from sglang.multimodal_gen.runtime.weight_cache.identity import (
     compatibility_plan,
     locate,
 )
-from sglang.multimodal_gen.runtime.weight_cache.plan import plan_diff
+from sglang.multimodal_gen.runtime.weight_cache.plan import (
+    DIFFUSION_PROTOCOL_VERSION,
+    plan_diff,
+)
 from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 from sglang.weight_cache_common.descriptors import CACHE_ABI, StateManifest
 from sglang.weight_cache_common.liveness import ProcessIdentity
+from sglang.weight_cache_common.mapping import validate_meta_schema
 from sglang.weight_cache_common.transport import (
     CudaIpcImporter,
     ExportGeneration,
@@ -28,7 +38,11 @@ from sglang.weight_cache_common.transport import (
 )
 
 logger = init_logger(__name__)
-PROTOCOL = {"family": "diffusion", "protocol_version": 1, "cache_abi": CACHE_ABI}
+PROTOCOL = {
+    "family": "diffusion",
+    "protocol_version": DIFFUSION_PROTOCOL_VERSION,
+    "cache_abi": CACHE_ABI,
+}
 
 
 def peer_identity(sock):
@@ -122,6 +136,7 @@ class WeightCacheClient:
         manifest = StateManifest.from_dict(response["manifest"])
         if manifest.digest != generation.manifest_digest:
             raise ValueError("Weight-cache state manifest digest mismatch")
+        validate_manifest_components(manifest, self.plan.to_dict()["requested"])
         return generation, manifest
 
 
@@ -138,17 +153,15 @@ def materialize_from_cache(prepared, args):
         # Watchdog is live before even requesting any counted send references.
         importer = CudaIpcImporter(generation, manifest)
         guarded = time.perf_counter()
-        # Protocol v1 serves one component. The following bundle migration
-        # replaces this restriction without changing component capabilities.
-        if len(prepared.cached_components) != 1:
-            raise ValueError("Protocol v1 requires one cached component")
-        component = prepared.cached_components[0]
-        model = component.build_meta()
+        bundle = build_bundle(prepared.cached_components, meta=True)
+        retain_importer(bundle, importer)
+        # Reject incompatible schemas before consuming a counted-send budget.
+        validate_meta_schema(bundle, manifest)
         constructed = time.perf_counter()
         request_id = uuid.uuid4().hex
         response = client.request(
-            "fetch_component",
-            component=component.name,
+            "fetch_bundle",
+            components=list(prepared.cached_component_names),
             generation=msgspec.to_builtins(generation),
             request_id=request_id,
         )
@@ -160,18 +173,22 @@ def materialize_from_cache(prepared, args):
         if delivery.request_id != request_id:
             raise ValueError("Weight-cache delivery request ID mismatch")
         fetched = time.perf_counter()
-        importer.receive(delivery, model, request_id=request_id)
+        importer.receive(delivery, bundle, request_id=request_id)
         mapped = time.perf_counter()
-        model = component.finalize_after_import(model)
+        for component in prepared.cached_components:
+            component.finalize_after_import(bundle[component.name])
     finalized = time.perf_counter()
     elapsed = finalized - start
+    label = ",".join(prepared.cached_component_names)
     logger.info(
-        "[WeightCache] transformer imported in %.3fs (%d shared bytes)",
+        "[WeightCache] %s imported in %.3fs (%d unique shared bytes)",
+        label,
         elapsed,
         manifest.unique_storage_bytes,
     )
     logger.info(
-        "[WeightCache] transformer import stages: %s",
+        "[WeightCache] %s import stages: %s",
+        label,
         json.dumps(
             {
                 "compatibility": planned - start,
@@ -186,8 +203,14 @@ def materialize_from_cache(prepared, args):
             sort_keys=True,
         ),
     )
-    pipeline = prepared.materialize(args, loaded_modules={component.name: model})
-    pipeline.memory_usages[component.name] = manifest.unique_storage_bytes / (1024**3)
+    pipeline = prepared.materialize(args, loaded_modules=dict(bundle.items()))
+    for name, size in component_storage_bytes(
+        manifest, prepared.cached_component_names
+    ).items():
+        pipeline.memory_usages[name] = size / (1024**3)
+    pipeline._weight_cache_bundle = bundle
+    pipeline._weight_cache_importer = importer
+    pipeline._weight_cache_shared_bytes = manifest.unique_storage_bytes
     pipeline._weight_cache_import_seconds = elapsed
     importer.check_alive()
     return pipeline

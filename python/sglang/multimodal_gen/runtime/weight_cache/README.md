@@ -109,6 +109,28 @@ Uncached components still use the ordinary pipeline load loop. Checkpoint
 identity covers the deduplicated union of all cached components' consumed files;
 the current publication contract still requires one model root.
 
+The coordinator operates on one `ModuleDict` bundle per GPU owner/generation.
+Diffusion protocol **v2** fetches the exact complete bundle in one delivery;
+v1 owners/clients are rejected and must be restarted together. Common manifests
+and SRT's protocol are unchanged. Snapshot/import runs across all components,
+so cross-component storage aliases and object ties are preserved and unique
+storages are counted once against the non-refundable export budget. Status
+reports the bundle's component names and union storage count/bytes.
+
+The producer watchdog starts before constructing any component. All meta
+schemas are checked before fetch, all components are mapped/finalized before
+the pipeline can become ready, and each imported component retains the shared
+guard. A partial failure does not stop monitoring or refund a delivery.
+`pipeline._weight_cache_shared_bytes` is the bundle's union size; per-component
+`memory_usages` describes reachable storage and may double-count cross-component
+aliases when summed. These are not CUDA allocator/physical-VRAM measurements.
+
+The extensible bundle is not broader model admission: current public selectors
+still allow **DiT only** for the three audited pipelines. A future encoder/VAE
+requires an audited loader capability/state contract, an explicit pipeline
+binding and selector/residency admission, plus real multi-component parity and
+lifecycle tests. There is no dynamic cross-pipeline pool or partial replacement.
+
 All three DiTs reuse the same ordinary loader and meta constructor.
 Qwen's packed text QKV is imported in its
 ordinary finalized layout. RoPE frequencies, modulation caches and the small
@@ -192,12 +214,14 @@ from fresh interpreter startup, including launcher and spawned worker, with a
 positive rejection control. It allows header/stat/config and uncached-component
 reads, runs two simultaneous Wan consumers, checks output/weight parity, and
 checks real owner status through budget exhaustion and client exit. It is not a
-generic syscall/security sandbox. The lifecycle test uses a tiny CUDA component
+generic syscall/security sandbox. The lifecycle test uses a tiny two-component bundle
 with real diffusion socket/IPC orchestration and injects generation replacement
 and producer death before fetch, during finalize, and during slow uncached load.
 It also blocks two fresh workers in meta construction simultaneously, checks
 status while both connections remain open, then imports concurrently and drains
-both real consumers. The large Wan test's starts are sequential; its inference
+both real consumers. Cross-component object/storage ties, union budgets and a
+second-component finalize failure are exercised through real IPC. The large
+Wan test's starts are sequential; its inference
 requests are concurrent.
 The automatic-placement test injects only free-memory observations in separate
 processes and verifies stable cached identity despite uncached placement changes.

@@ -140,6 +140,7 @@ class DiffusionWeightCacheDaemon:
                 "generation": msgspec.to_builtins(generation),
                 "cache_status": {
                     **stats,
+                    "components": self.plan.to_dict()["requested"],
                     "active_consumers": len(self._live_consumers()),
                     "accepting_fetches": not stats["admission_stopped"]
                     and not stats["budget_exhausted"],
@@ -155,8 +156,13 @@ class DiffusionWeightCacheDaemon:
                 "generation": msgspec.to_builtins(generation),
                 "manifest": self.exporter.manifest.to_dict(),
             }
-        if kind != "fetch_component" or request.get("component") != "transformer":
-            raise ValueError("Unsupported diffusion weight-cache request/component")
+        if (
+            kind != "fetch_bundle"
+            or request.get("components") != self.plan.to_dict()["requested"]
+        ):
+            raise ValueError(
+                "Unsupported diffusion weight-cache request/component bundle"
+            )
         if decode_generation(request["generation"]) != generation:
             raise ValueError("Weight-cache fetch generation mismatch")
         if (
@@ -345,9 +351,9 @@ class DiffusionWeightCacheDaemon:
                 rendezvous=NetworkAddress("127.0.0.1", get_free_port()),
                 role="diffusion_weight_cache_daemon",
             )
-            if len(self.prepared.cached_components) != 1:
-                raise ValueError("Protocol v1 requires one cached component")
-            model, _ = self.prepared.cached_components[0].load_ordinary()
+            from sglang.multimodal_gen.runtime.weight_cache.bundle import build_bundle
+
+            model = build_bundle(self.prepared.cached_components)
             self.exporter = CudaIpcExporter(
                 model, max_deliveries=self.args.weight_cache_max_deliveries
             )

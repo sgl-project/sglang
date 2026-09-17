@@ -27,7 +27,7 @@ class PreparedComponent(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     architecture: str
     loader_cls: type
     recipe: Any
-    contract: Any  # ComponentStateContract; trusted local object, not wire data.
+    contract: ComponentStateContract  # Trusted local object, not wire data.
     attention_backend: Any
 
     def loader(self):

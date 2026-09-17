@@ -41,7 +41,9 @@ def owner_fixture():
     )
     owner = object.__new__(DiffusionWeightCacheDaemon)
     owner._initialize_control()
-    owner.plan = CacheCompatibilityPlan.from_fields(component={})
+    owner.plan = CacheCompatibilityPlan.from_fields(
+        components={}, requested=["transformer", "text_encoder"]
+    )
     owner.exporter = exporter
     return owner
 
@@ -78,8 +80,8 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
         with pytest.raises(RuntimeError, match="partial export"):
             request(
                 owner,
-                "fetch_component",
-                component="transformer",
+                "fetch_bundle",
+                components=["transformer", "text_encoder"],
                 generation=msgspec.to_builtins(owner.exporter.generation),
                 request_id=uuid.uuid4().hex,
             )
@@ -96,8 +98,8 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
     with pytest.raises(ExportBudgetExceeded):
         request(
             owner,
-            "fetch_component",
-            component="transformer",
+            "fetch_bundle",
+            components=["transformer", "text_encoder"],
             generation=msgspec.to_builtins(owner.exporter.generation),
             request_id=uuid.uuid4().hex,
         )

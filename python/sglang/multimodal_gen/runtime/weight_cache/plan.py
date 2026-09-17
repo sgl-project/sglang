@@ -11,6 +11,8 @@ import msgspec
 
 from sglang.weight_cache_common.descriptors import CACHE_ABI, canonical_digest
 
+DIFFUSION_PROTOCOL_VERSION = 2
+
 
 def canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -61,7 +63,7 @@ class CacheCompatibilityPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=
                 dict(
                     cache_abi=CACHE_ABI,
                     family="diffusion",
-                    protocol_version=1,
+                    protocol_version=DIFFUSION_PROTOCOL_VERSION,
                     **fields,
                 )
             )

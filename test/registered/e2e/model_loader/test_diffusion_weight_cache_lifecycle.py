@@ -31,9 +31,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC"
 
 
 class TinyComponent:
-    name = "transformer"
-
-    def __init__(self, connection=None, pause=None):
+    def __init__(self, name, shared, connection=None, pause=None):
+        self.name = name
+        self.shared = shared
         self.connection = connection
         self.pause = pause
 
@@ -44,31 +44,61 @@ class TinyComponent:
             # real watchdog must remain live. Parent never releases this wait.
             assert self.connection.recv() == "continue"
 
+    def _model(self, device):
+        model = torch.nn.Linear(4, 4, bias=False, device=device).requires_grad_(False)
+        if self.name == "transformer":
+            with torch.no_grad():
+                model.weight.fill_(2)
+            self.shared["weight"] = model.weight
+        else:
+            # Exact cross-component object tie plus a strided storage alias.
+            model.weight = self.shared["weight"]
+            model.register_buffer("slice", model.weight.detach()[::2, 1:])
+            model.register_buffer("local", torch.full((4,), 3.0, device=device))
+        return model.eval()
+
     def load_ordinary(self):
-        model = torch.nn.Linear(4, 4, bias=False, device="cuda:0")
-        with torch.no_grad():
-            model.weight.fill_(2)
-        return model.eval(), 0
+        return self._model("cuda:0"), 0
 
     def build_meta(self):
-        self._pause("before_fetch")
-        return torch.nn.Linear(4, 4, bias=False, device="meta").eval()
+        if self.name == "text_encoder":
+            self._pause("before_fetch")
+        return self._model("meta")
 
     def finalize_after_import(self, model):
-        self._pause("finalize")
+        if self.name == "text_encoder":
+            self._pause("finalize")
+            if self.pause == "finalize_error":
+                raise ValueError("test-only second component finalization failed")
         return model
 
 
 class TinyPrepared:
     def __init__(self, connection=None, pause=None):
-        self.cached_components = (TinyComponent(connection, pause),)
+        shared = {}
+        self.cached_components = tuple(
+            TinyComponent(name, shared, connection, pause)
+            for name in ("transformer", "text_encoder")
+        )
+
+    @property
+    def cached_component_names(self):
+        return tuple(component.name for component in self.cached_components)
 
     def materialize(self, args, *, loaded_modules):
         self.cached_components[0]._pause("uncached_load")
         torch.testing.assert_close(
             loaded_modules["transformer"].weight.cpu(), torch.full((4, 4), 2.0)
         )
-        return SimpleNamespace(memory_usages={}, model=loaded_modules["transformer"])
+        first, second = loaded_modules["transformer"], loaded_modules["text_encoder"]
+        assert first.weight is second.weight
+        assert (
+            first.weight.untyped_storage().data_ptr()
+            == second.slice.untyped_storage().data_ptr()
+        )
+        torch.testing.assert_close(second.local.cpu(), torch.full((4,), 3.0))
+        assert first._weight_cache_importer is second._weight_cache_importer
+        return SimpleNamespace(memory_usages={}, modules=loaded_modules)
 
 
 def _args(root):
@@ -110,9 +140,19 @@ def _worker(root, plan, generation, connection, pause):
     args._weight_cache_admission = (plan, generation)
     with patch.object(client, "compatibility_plan", return_value=plan):
         try:
-            materialize_from_cache(TinyPrepared(connection, pause), args)
+            pipeline = materialize_from_cache(TinyPrepared(connection, pause), args)
+            assert pipeline._weight_cache_shared_bytes == 80
+            assert pipeline.memory_usages == {
+                "transformer": 64 / 1024**3,
+                "text_encoder": 80 / 1024**3,
+            }
         except ValueError as error:
             connection.send(("rejected", str(error)))
+            if pause == "finalize_error":
+                # Catch the error in a live process. A mapped component / error
+                # traceback must still have a live guard and cannot become ready.
+                connection.recv()
+                return
             raise
     connection.send("pipeline_ready")
     connection.recv()
@@ -127,6 +167,7 @@ def service():
         plan = CacheCompatibilityPlan.from_fields(
             rank={"device_uuid": str(torch.cuda.get_device_properties(0).uuid)},
             test="tiny-diffusion-service",
+            requested=["transformer", "text_encoder"],
         )
 
         def start_owner():
@@ -208,8 +249,8 @@ def test_owner_replacement_between_manifest_and_worker_rejects_generation(servic
 
         with pytest.raises(RuntimeError, match="fetch generation mismatch"):
             client.request(
-                "fetch_component",
-                component="transformer",
+                "fetch_bundle",
+                components=["transformer", "text_encoder"],
                 generation=msgspec.to_builtins(generation),
                 request_id=uuid.uuid4().hex,
             )
@@ -226,6 +267,27 @@ def test_owner_replacement_between_manifest_and_worker_rejects_generation(servic
         assert status["deliveries_reserved"] == 0
         assert status["active_consumers"] == 0
     assert second.is_alive()
+
+
+def test_partial_component_finalization_failure_keeps_guard_and_budget(service):
+    owner = service.start_owner()
+    with WeightCacheClient(service.plan, service.args) as client:
+        generation, _ = client.manifest()
+    worker, connection = service.start_worker(generation, "finalize_error")
+    assert connection.poll(60)
+    assert connection.recv() == (
+        "rejected",
+        "test-only second component finalization failed",
+    )
+    with WeightCacheClient(service.plan, service.args) as client:
+        status = client.status()
+        assert status["deliveries_reserved"] == 1
+        assert status["storage_exports_reserved"] == 2
+        assert status["active_consumers"] == 1
+    owner.kill()
+    owner.join(10)
+    worker.join(10)
+    assert worker.exitcode == -signal.SIGKILL
 
 
 def test_concurrent_worker_admission_and_status_during_meta_construction(service):
@@ -247,6 +309,8 @@ def test_concurrent_worker_admission_and_status_during_meta_construction(service
         status = client.status()
         assert status["active_consumers"] == 2
         assert status["deliveries_reserved"] == 2
+        assert status["storage_count"] == 2
+        assert status["storage_exports_reserved"] == 4
         assert status["fetches_remaining"] == 6
     owner.terminate()
     owner.join(10)
