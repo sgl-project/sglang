@@ -381,6 +381,10 @@ class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):
         self.kernel = CompressedTensorsWNA16XPULinearKernel(
             group_size=self.group_size)
 
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 20
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 

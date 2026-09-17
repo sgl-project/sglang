@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -403,14 +404,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         if _is_xpu:
-            if error:
-                raise RuntimeError(
-                    f"Quantization scheme requiring compute capability "
-                    f"{min_capability} is not supported on XPU."
-                )
-            return False
+            # TODO: torch.xpu.get_device_capability
+            device = torch.xpu.current_device()
+            device_capability = torch.ops.sgl_kernel.query_device.default(device)
+        else:
+            device_capability = torch.cuda.get_device_capability()
 
-        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
+        capability_tuple = DeviceCapability(*device_capability)
 
         if capability_tuple is not None:
             capability = capability_tuple.to_int()
@@ -508,6 +508,30 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+
+    def _is_mxfp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+        is_floating_point = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_group = (
+            weight_quant.strategy == QuantizationStrategy.GROUP
+            and input_quant.strategy == QuantizationStrategy.GROUP
+        )
+        is_block32 = weight_quant.group_size == 32 and input_quant.group_size == 32
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        is_weight_static = not weight_quant.dynamic
+        return (
+            is_floating_point
+            and is_group
+            and is_block32
+            and is_symmetric
+            and is_weight_static
+        )
 
     def _is_fp8_w8a8(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
@@ -727,13 +751,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                         "Current platform does not support w4a4 nvfp4 quantization."
                     )
 
-            if self._is_fp8_w8a8(weight_quant, input_quant):
-                if _is_xpu:
-                    is_fp8_w8a8_supported = True
-                else:
-                    is_fp8_w8a8_supported = self._check_scheme_supported(
-                        CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+            if self._is_mxfp8_w8a8(weight_quant, input_quant):
+                _is_mxfp8_w8a8_supported = self._check_scheme_supported(
+                    CompressedTensorsW8A8MXFp8.get_min_capability(), error=False
+                )
+                if _is_mxfp8_w8a8_supported:
+                    return CompressedTensorsW8A8MXFp8(
+                        weight_quant=weight_quant,
+                        input_quant=input_quant,
                     )
+                else:
+                    raise NotImplementedError(
+                        "Current platform does not support w8a8 mxfp8 quantization."
+                    )
+
+            if self._is_fp8_w8a8(weight_quant, input_quant):
+                is_fp8_w8a8_supported = self._check_scheme_supported(
+                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
@@ -991,15 +1026,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if _is_xpu:
-            if not isinstance(
-                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
-            ):
-                raise RuntimeError(
-                    f"{scheme.__class__.__name__} is not supported on XPU "
-                    "(no XPU kernel implementation)."
-                )
-        elif not _is_npu:
+        if not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
