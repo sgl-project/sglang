@@ -1,3 +1,5 @@
+import os
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -79,11 +81,11 @@ def _make_source_embedding(
     )
 
 
-def _load_rows(offloaded, rows):
+def _load_rows(offloaded, rows, *, pinned=True):
     pointer = offloaded.weight.data_ptr()
     offloaded.weight_loader(offloaded.weight, rows)
     assert offloaded.weight.data_ptr() == pointer
-    assert offloaded.weight.is_pinned()
+    assert offloaded.weight.is_pinned() == pinned
     assert offloaded.weight.weight_loader.__self__ is offloaded
     assert offloaded.quant_method is None
 
@@ -187,6 +189,78 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
     assert graph_five.data_ptr() != graph_three.data_ptr()
     assert set(layer._graph_prefetch_buffers) == {3, 5}
+
+
+def _file_backend_supported() -> bool:
+    from sglang.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
+
+    return (
+        torch.cuda.is_available()
+        and device_uses_host_page_tables(torch.cuda.current_device()) is True
+    )
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs pageable host memory reachable through host page tables",
+)
+@pytest.mark.parametrize("embedding_dim", [7, 160])
+def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
+    with tempfile.TemporaryDirectory() as table_dir:
+        pinned = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(embedding_dim=embedding_dim)
+        )
+        filed = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(embedding_dim=embedding_dim),
+            backend="file",
+            table_dir=table_dir,
+        )
+        assert pinned._file_prefetcher is None and filed._file_prefetcher is not None
+        (name,) = os.listdir(table_dir)
+        assert "rows0-8" in name  # this rank's vocabulary shard
+        rows = torch.arange(
+            8 * embedding_dim, dtype=torch.bfloat16, device="cuda"
+        ).reshape(8, embedding_dim)
+        _load_rows(pinned, rows)
+        _load_rows(filed, rows, pinned=False)
+        ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=torch.int64, device="cuda")
+        torch.testing.assert_close(filed(ids), pinned(ids), rtol=0, atol=0)
+        # A prefill-sized gather goes through the page-cache hint path.
+        big = torch.randint(0, 8, (4096,), device="cuda")
+        torch.testing.assert_close(
+            filed(big), rows.index_select(0, big), rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs pageable host memory reachable through host page tables",
+)
+def test_qwen4_ple_file_backend_fp8_table():
+    embedding_dim = 160
+    with tempfile.TemporaryDirectory() as table_dir:
+        filed = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(
+                embedding_dim=embedding_dim, dtype=torch.float8_e4m3fn
+            ),
+            backend="file",
+            table_dir=table_dir,
+        )
+        assert filed.weight.dtype == torch.float8_e4m3fn
+        rows = (
+            torch.arange(8 * embedding_dim, dtype=torch.float32, device="cuda").reshape(
+                8, embedding_dim
+            )
+            / 64
+        ).to(torch.float8_e4m3fn)
+        _load_rows(filed, rows, pinned=False)
+        ids = torch.tensor([[0, 7, 3]], dtype=torch.int64, device="cuda")
+        expected = (
+            rows.index_select(0, ids.flatten())
+            .to(torch.bfloat16)
+            .reshape(1, 3, embedding_dim)
+        )
+        torch.testing.assert_close(filed(ids), expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
