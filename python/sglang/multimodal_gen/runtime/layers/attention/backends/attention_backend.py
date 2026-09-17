@@ -57,13 +57,6 @@ class AttentionBackend(ABC):
 
     @classmethod
     def supports_packed_varlen(cls) -> bool:
-        """Whether the backend serves packed varlen at all, native or emulated.
-
-        Selection-time admission only. Callers choosing between a depad/repack
-        fast path and a masked fallback want ``AttentionImpl
-        .has_native_varlen_kernel`` instead; several impls satisfy this check
-        with a per-segment Python loop.
-        """
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
 
     @classmethod
@@ -236,15 +229,6 @@ class AttentionImpl(ABC, Generic[T]):
         cu_seqlens_k: torch.Tensor | None = None,
         max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
-        """Attend packed ``[T, H, D]`` queries against packed keys/values.
-
-        ``cu_seqlens`` and ``max_seqlen`` describe both sides unless
-        ``cu_seqlens_k`` / ``max_seqlen_k`` are given, which let queries and
-        keys carry different segment lengths (cross-attention over a gathered
-        K/V). Overrides that cannot honor the asymmetric form must reject it
-        rather than fall back to the query bounds, which would silently attend
-        over the wrong ranges.
-        """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"
         )
