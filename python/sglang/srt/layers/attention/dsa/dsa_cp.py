@@ -38,6 +38,32 @@ if TYPE_CHECKING:
 # disagreeing with the forward.
 _enable_dsa_cp = envs.SGLANG_NPU_ENABLE_DSA_CP.get()
 
+if _enable_dsa_cp and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get():
+    # Loud at startup, because quiet it would be a 16x accuracy cliff rather
+    # than a crash. Both flags slice the indexer's queries across attention-TP;
+    # with DSA-CP the slice has already happened by the time the indexer runs,
+    # so the older flag would slice it a second time and each rank would score
+    # 1/256 of the queries while the top-k gather reassembled the wrong rows.
+    raise ValueError(
+        "SGLANG_NPU_ENABLE_DSA_CP supersedes "
+        "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING and the two cannot both "
+        "be set: DSA-CP shards the whole attention block's tokens, which "
+        "includes the indexer's. Unset the indexer-only flag."
+    )
+
+if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
+    # vLLM-Ascend refuses the same pair ("Fused preprocessing does not support
+    # DSA-CP", sfa_cp.py:309). Their fused preprocess writes the KV cache from
+    # inside the operator, at the batch's own slot mapping, which under DSA-CP
+    # is the sliced one -- so the rows the slice does not own never get
+    # written. Untested here either way; refuse rather than find out in an
+    # accuracy run.
+    raise ValueError(
+        "SGLANG_NPU_ENABLE_DSA_CP does not compose with SGLANG_NPU_USE_MLAPO. "
+        "The fused MLA preprocess writes the KV cache itself, at a slot mapping "
+        "DSA-CP has already sliced."
+    )
+
 
 class _Missing:
     """Distinguishes "no plan cached yet" from "cached, and it is None"."""

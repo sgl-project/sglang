@@ -63,6 +63,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.dsa.dsa_cp import dsa_cp_enabled
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -1763,7 +1764,26 @@ class DeepseekV2AttentionMLA(
         self.use_dsa = is_deepseek_dsa(config)
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        # DSA-CP shards the batch's TOKENS across attention-TP instead of its
+        # heads, so every rank computes every head for its own slice and needs
+        # the whole q_b_proj / kv_b_proj weight. Building them at tp_size 1 lets
+        # the checkpoint loader hand each rank the full tensor, which is what
+        # vLLM-Ascend does (ShardedCPColumnParallelOp's fake world_size-1
+        # group). The alternative -- gather the shards at startup, as
+        # --dcp-replicate-q-proj does -- cannot run on this checkpoint at all,
+        # because that path is bf16/fp16 only and these weights are W4A8.
+        #
+        # Costs about 1.9 GiB per rank at tp16 and 78 layers. o_proj is NOT
+        # affected: it stays row-parallel over `self.num_heads * v_head_dim`, and
+        # the DSA-CP forward hands it this rank's heads for every token after an
+        # all-to-all, which is exactly the shape it already expects.
+        self.use_dsa_cp = dsa_cp_enabled()
+        qkv_tp_rank, qkv_tp_size = (
+            (0, 1) if self.use_dsa_cp else (attn_tp_rank, attn_tp_size)
+        )
+        self.num_local_heads = (
+            num_heads if self.use_dsa_cp else num_heads // attn_tp_size
+        )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1789,8 +1809,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=qkv_tp_rank,
+                tp_size=qkv_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1799,8 +1819,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=qkv_tp_rank,
+                tp_size=qkv_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1858,8 +1878,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=qkv_tp_rank,
+            tp_size=qkv_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -1903,9 +1923,19 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
+        #
+        # ...unless DSA-CP is on, in which case num_local_heads is ALREADY the
+        # full head set: q_b_proj is unsharded, so a rank computes every head
+        # locally and there is nothing for the decode Q all-gather to add. This
+        # is the same end state as --dcp-replicate-q-proj, reached by loading
+        # the weight whole instead of gathering it -- which is why it works here
+        # on a W4A8 checkpoint, where that flag prepares zero layers. The
+        # forward must skip all_gather_q_for_mla_decode to match; see
+        # forward_dsa_core_npu.
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads
+                * (1 if self.use_dsa_cp else get_parallel().attn_dcp_size),
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
