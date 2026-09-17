@@ -205,6 +205,33 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
 
 
+def plan_dcp_owner_write(
+    loc: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rows of ``loc`` this rank owns, and the physical rows they land on.
+
+    The owner rule is CUDA's, from the Triton kernel at
+    ``kernels/ops/kvcache/mla_buffer.py:42``::
+
+        is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+        loc      = loc // DCP_WORLD_SIZE
+
+    Returns ``(owned_idx, dest)``: positions into ``loc`` that this rank owns,
+    and their destinations in its own pool. Together across the group the
+    ``owned_idx`` partition every row of ``loc`` exactly once, so a write
+    filtered through this covers the same rows as an unfiltered one.
+
+    ``torch.nonzero`` makes the output shape data-dependent, which costs a
+    stream synchronisation and **cannot run inside a captured stream**. That is
+    why the NPU decode path does not use this and aims its non-owned rows at a
+    padding row instead (``_resolve_dcp_write``). Extend is not captured, and
+    one forward's write location is shared by every layer, so there the filter
+    is computed once and reused 78 times.
+    """
+    owned_idx = torch.nonzero((loc % dcp_size) == dcp_rank).squeeze(1)
+    return owned_idx, loc[owned_idx] // dcp_size
+
+
 # Reusable device buffers for the extend gather, keyed by purpose, dtype, device
 # and row shape. See dcp_extend_gather_buffer.
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}

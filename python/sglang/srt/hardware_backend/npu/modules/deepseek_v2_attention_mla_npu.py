@@ -678,6 +678,15 @@ def _dcp_gather_extend_kv_npu(
             ]
         )
         forward_batch.npu_dcp_extend_gather = plan
+        # Same branch, same once-per-forward guarantee: tell the pool it may
+        # drop the rows this rank does not own from this forward's KV write,
+        # instead of writing all of them and aiming 15/16 at a padding row.
+        # getattr because a wrapper pool (SWA, hybrid) may forward
+        # get_mla_kv_buffer without knowing about this; declining is correct
+        # there, and silent because it is the pre-existing behaviour.
+        plan_write = getattr(get_token_to_kv_pool(), "plan_dcp_extend_write", None)
+        if plan_write is not None:
+            plan_write(forward_batch.out_cache_loc)
         if _debug_dcp_extend_memory:
             _log_dcp_extend_memory(
                 sum(forward_batch.extend_prefix_lens_cpu),
