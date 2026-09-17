@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
+
 import pytest
 import torch
 
@@ -66,3 +68,7 @@ def test_compile_and_graph_replay():
     weight.normal_()
     graph.replay()
     torch.testing.assert_close(out, reference(x, weight, 1e-6), atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

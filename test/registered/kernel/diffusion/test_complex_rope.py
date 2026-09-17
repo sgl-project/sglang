@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
+
 import pytest
 import torch
 
@@ -83,3 +85,7 @@ def test_qwen21_rope_first_sight_verification(monkeypatch):
         qwen_image21.apply_rope(x, rope), reference(x, rope), atol=0, rtol=0
     )
     assert gate.disabled and not gate.verified
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
