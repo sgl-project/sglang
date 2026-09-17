@@ -14,7 +14,10 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        self.kernel_page_bytes = pool.index_kernel_page_size * (
+            pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4
+        )
+        num_pages = (index_buf_size + pool.index_page_size + 1) // pool.index_page_size
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
@@ -33,7 +36,7 @@ class IndexKeyCache:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size
+            pool.index_page_size
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
 
@@ -60,7 +63,12 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[layer_id - self.pool.start_layer]
+        return self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
+
+    def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
+        # NOTE(kpham-sgl): A pool page groups packed [K64, scales64] blocks;
+        # reshaping must preserve those blocks rather than pack all scales last.
+        return buffer.view(-1, self.kernel_page_bytes)
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -104,7 +112,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -115,11 +123,13 @@ class IndexKeyCache:
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        page_indices = (
+            indices[:: self.pool.index_page_size] // self.pool.index_page_size
+        )
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // self.pool.index_page_size)
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -134,10 +144,12 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        page_indices = (
+            indices[:: self.pool.index_page_size] // self.pool.index_page_size
+        )
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // self.pool.index_page_size)
         for layer_id in range(self.pool.layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue
@@ -152,7 +164,8 @@ class IndexKeyCache:
     def _item_len(self, layer_idx: int) -> int:
         # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
         buf = self.buffer[layer_idx]
-        return 0 if buf.shape[0] == 0 else buf[0].nbytes
+        # NOTE(kpham-sgl): PD peers can have different DCP widths; export kernel blocks.
+        return 0 if buf.shape[0] == 0 else self.kernel_page_bytes * buf.element_size()
 
     def state_buf_infos(self):
         layer_num = self.pool.layer_num

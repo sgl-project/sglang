@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 class LayerSplitIndexKeyCache(IndexKeyCache):
     def __init__(self, pool: LayerSplitDSATokenToKVPool, index_buf_size: int):
         super().__init__(pool, index_buf_size)
-        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        num_pages = (index_buf_size + pool.index_page_size + 1) // pool.index_page_size
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
@@ -142,7 +142,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 src_tensor=src_tensor,
             )
             self.remote_layer_id = layer_id
-        return self.remote_buffer
+        return self._kernel_view(self.remote_buffer)
 
     def state_buf_infos(self):
         owned_layer_ids = [
@@ -154,41 +154,6 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         data_lens = [self.buffer[i].nbytes for i in owned_layer_ids]
         item_lens = [self._item_len(i) for i in owned_layer_ids]
         return data_ptrs, data_lens, item_lens
-
-    def cpu_copy(self, indices):
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
-        index_k_cpu = []
-        chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
-            index_k_cpu.append([])
-            if self.buffer[layer_id].shape[0] == 0:
-                continue
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.buffer[layer_id][chunk_page_indices].to(
-                    "cpu", non_blocking=True
-                )
-                index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
-        return index_k_cpu
-
-    def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
-        chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
-            if self.buffer[layer_id].shape[0] == 0:
-                continue
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
-                assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
-                self.buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
 
 
 class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
