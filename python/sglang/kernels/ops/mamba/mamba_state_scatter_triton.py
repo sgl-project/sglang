@@ -12,7 +12,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 
-_TRITON_DEVICE_TYPES = ("cuda", "xpu")
+TRITON_DEVICE_TYPES = ("cuda", "xpu")
 
 
 def _require_triton_device(dst: torch.Tensor, src: torch.Tensor, fn_name: str) -> None:
@@ -22,7 +22,7 @@ def _require_triton_device(dst: torch.Tensor, src: torch.Tensor, fn_name: str) -
             f"{fn_name}: dst and src must be on the same device. "
             f"{dst.device=} {src.device=}"
         )
-    if dst.device.type not in _TRITON_DEVICE_TYPES:
+    if dst.device.type not in TRITON_DEVICE_TYPES:
         raise ValueError(f"{fn_name}: unsupported device {dst.device.type}.")
 
 

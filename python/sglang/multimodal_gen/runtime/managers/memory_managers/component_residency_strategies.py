@@ -198,8 +198,8 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # of the weights next to the device copy still being read from
             # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
             # and exhausted a GB10. Take the synchronous, pageable path there.
-            # XPU: an async pageable-host D2H can reach a null-argument backend
-            # memcpy; the prefetch stream above is CUDA-only, so nothing overlaps.
+            # XPU takes the sync path too: this strategy only builds a prefetch
+            # stream under is_cuda, so nothing overlaps an async copy here.
             module.to(
                 "cpu",
                 non_blocking=not (

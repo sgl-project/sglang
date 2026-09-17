@@ -109,7 +109,8 @@ def test_comfyui_flux_pipeline_direct() -> None:
         req.negative_prompt_embeds = None
 
     req.pooled_embeds = [pooled_projections]
-    # Flux time_text_embed needs a pooled projection on every CFG branch.
+    # Flux time_text_embed needs a pooled projection on every CFG branch. Zeros are
+    # not real negative conditioning, so only dtype and device are asserted below.
     req.neg_pooled_embeds = (
         [torch.zeros_like(pooled_projections)]
         if req.negative_prompt_embeds is not None

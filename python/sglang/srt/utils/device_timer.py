@@ -3,7 +3,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Optional
 
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.common import device_timing_event, get_device_module
 
 
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
@@ -20,6 +20,8 @@ def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
 class DeviceTimer:
     def __init__(self, reporter: Callable):
         self._device_module = get_device_module()
+        # CPU has no timing event; degrade to a no-op rather than raise from every wrap.
+        self.timing_supported = device_timing_event(self._device_module) is not None
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [reporter]
         self._in_wrap = False
@@ -29,6 +31,10 @@ class DeviceTimer:
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not self.timing_supported:
+            yield
+            return
+
         # Not re-entrant: a nested wrap would end the wrong interval and leave
         # an un-ended one at the head of the queue for _report() to trip over.
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
@@ -68,6 +74,10 @@ class GapTimer(DeviceTimer):
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not self.timing_supported:
+            yield
+            return
+
         if self._pending is not None:
             self._pending.end(device_module=self._device_module, metadata=metadata)
             self._intervals.append(self._pending)
@@ -91,12 +101,13 @@ class _TimingInterval:
 
     @staticmethod
     def create(device_module):
-        start_event = device_module.Event(enable_timing=True)
+        # Only reached past wrap()'s timing_supported gate, so the event exists.
+        start_event = device_timing_event(device_module)
         start_event.record()
         return _TimingInterval(start_event=start_event)
 
     def end(self, device_module, metadata: Dict):
-        end_event = device_module.Event(enable_timing=True)
+        end_event = device_timing_event(device_module)
         end_event.record()
 
         assert self.end_event is None

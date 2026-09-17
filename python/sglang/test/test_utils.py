@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device,
+    is_amx_tile_supported,
     is_blackwell,
     is_cuda,
     is_xpu,
@@ -2495,9 +2496,12 @@ def requires_intel_amx():
     # Evaluated at decoration time, so keep this a factory rather than a
     # module-level constant: every test_utils importer would otherwise probe
     # the device on import.
+    if auto_config_device() != "cpu" or not is_amx_tile_supported:
+        return unittest.skip("Requires a CPU run on AMX hardware.")
+    # The kernel build is a CI precondition, not a capability: a missing
+    # convert_weight_packed stays red instead of silently skipping the suite.
     return unittest.skipUnless(
-        auto_config_device() == "cpu" and cpu_has_amx_support(),
-        "Requires a CPU run with AMX kernels.",
+        is_in_ci() or cpu_has_amx_support(), "Requires AMX kernels."
     )
 
 

@@ -21,6 +21,9 @@ def _run_until_prefix_locked(r):
     for _ in range(8):
         if r.lock_refs >= 1:
             return
+        # Without this the loop can leave prefill and abort a decoding req instead,
+        # passing the chunked-abort assertions for the wrong reason.
+        assert r.is_chunking, "prefix lock never appeared while the req was chunking"
         yield
     raise AssertionError(f"radix lock_ref must be held mid-chunk; got {r.lock_refs}")
 
@@ -506,7 +509,6 @@ class TestRegressionGptOss(ScriptedTestCase):
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         model_path="openai/gpt-oss-20b",
         mem_fraction_static=0.70,
-        cuda_graph_backend_prefill="disabled",
     )
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):
