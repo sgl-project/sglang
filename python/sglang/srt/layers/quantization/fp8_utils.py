@@ -484,6 +484,8 @@ class Mxfp8DenseGemmBackend(Enum):
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
     # gfx950 aiter MXFP8 GEMM: plain fp8 weight + compact 32x32 ue8m0 block scale bytes
     GFX95_MXFP8_AITER = "gfx95_mxfp8_aiter"
+    # Intel XPU: torch scaled_mm BlockWise1x32 on plain fp8 weight + [N, K // 32] ue8m0 bytes
+    XPU_SCALED_MM = "xpu_scaled_mm"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -516,6 +518,9 @@ class Mxfp8DenseGemmBackend(Enum):
             Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
             Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER,
         )
+
+    def is_xpu_scaled_mm(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.XPU_SCALED_MM
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -878,6 +883,9 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
+    if _is_xpu:
+        return Mxfp8DenseGemmBackend.XPU_SCALED_MM
+
     if get_platform().is_blackwell and is_flashinfer_available():
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
@@ -893,7 +901,7 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
     raise RuntimeError(
         "No MXFP8 dense GEMM kernel is available on this device. MXFP8 dense linear "
         "requires Blackwell (SM100/SM103/SM110/SM120) with FlashInfer, Hopper (SM90) "
-        "with DeepGEMM, or ROCm gfx95."
+        "with DeepGEMM, ROCm gfx95, or Intel XPU."
     )
 
 
@@ -1015,6 +1023,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    elif backend.is_xpu_scaled_mm():
+        return xpu_mxfp8_scaled_mm_linear
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -1023,6 +1033,65 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     )
 
     return dot_scaled_mxfp8_blockscaled_linear
+
+
+def xpu_mxfp8_scaled_mm_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear on Intel XPU via torch scaled_mm BlockWise1x32: weight is
+    [N, K] e4m3, weight_scale is row-major [N, K // 32] ue8m0 bytes."""
+    group_size = 32
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    m, k = input_2d.shape
+    if k % group_size != 0:
+        raise ValueError(f"K={k} must be divisible by {group_size} for MXFP8.")
+
+    if input_scale is None:
+        output_dtype = input.dtype
+        if input_2d.dtype not in (torch.bfloat16, torch.float16):
+            input_2d = input_2d.to(torch.bfloat16)
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        q_input = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=input.device)
+        # Row-major [M, K // 32] e8m0, the layout the BlockWise1x32 probe expects; needs
+        # sgl-kernel-xpu row-major ue8m0 output (port of sgl-project/sgl-kernel-xpu#357).
+        x_scale = torch.empty(
+            m, k // group_size, dtype=torch.float8_e8m0fnu, device=input.device
+        )
+        sgl_per_token_group_quant_8bit(
+            input=input_2d,
+            output_q=q_input,
+            output_s=x_scale,
+            group_size=group_size,
+            eps=1e-10,
+            fp8_min=fp8_info.min,
+            fp8_max=fp8_info.max,
+            scale_ue8m0=True,
+            enable_v2=True,
+        )
+    else:
+        output_dtype = torch.bfloat16
+        q_input = input_2d
+        x_scale = input_scale.view(torch.float8_e8m0fnu)
+
+    # A reinterpreting view: the bytes are already e8m0 exponents.
+    weight_scale_e8m0 = weight_scale.contiguous().view(torch.float8_e8m0fnu)
+    output = torch.nn.functional.scaled_mm(
+        q_input,
+        weight.t(),
+        x_scale,
+        torch.nn.functional.ScalingType.BlockWise1x32,
+        weight_scale_e8m0,
+        torch.nn.functional.ScalingType.BlockWise1x32,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
 
 
 def deepgemm_w8a8_mxfp8_linear_with_fallback(
