@@ -168,6 +168,15 @@ Model paths that require one backend for correctness declare it as required;
 those layers keep that backend even when the surrounding component is
 overridden.
 
+For an automatic, measurement-based choice, pass
+`--enable-attention-backend-autotune true`. On each layer's first sufficiently
+large input, the native runtime times compatible candidates and switches only
+when the output remains within its numerical guard and the measured gain exceeds
+the noise margin. The tuner is disabled by default and currently validated on
+SM90 and SM12x. It does not replace a backend selected explicitly through
+`--attention-backend` or `--component-attention-backends`, or a backend required
+by the model for correctness.
+
 ## Configuration
 
 Some backends require additional configuration. You can pass these parameters via `--attention-backend-config`. This argument accepts:
