@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -944,6 +945,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 "intermediate_size_per_partition="
                 f"{layer.intermediate_size_per_partition} is not 128-aligned"
             )
+
+        if not is_gfx95_supported():
+            return None
 
         cfg = layer.moe_runner_config
         wants_swiglu_oai = (
