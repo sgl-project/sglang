@@ -484,21 +484,45 @@ def _fused_k128_split_kernel(
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(intermediate_state_indices + pid_batch).to(tl.int64)
 
+    # [opt] hoist ring_slot load outside the loop — it is constant across steps
+    ring_slot_val = -1
+    if CACHE_RING:
+        ring_slot_val = tl.load(h0_indices + pid_batch).to(tl.int64)
+
+    # [opt] pre-compute base pointers once; increment by stride each step to
+    # eliminate the token * stride multiplication in every iteration
     p_o = o + (bos * HV + pid_hv) * V + o_v
+    p_q = q + bos * stride_q + k_head * K
+    p_k = k + bos * stride_k + k_head * K
+    p_v = v + bos * stride_v + pid_hv * V + o_v
+    p_b = b + bos * stride_b + pid_hv
+    if IS_KDA:
+        p_a = a + bos * stride_a + pid_hv * K
+    else:
+        p_a = a + bos * stride_a + pid_hv
+
+    # [opt] pre-compute ring write base offsets (step_idx folded in later)
+    # g_base layout differs: per-K vector for KDA, per-head scalar for GDN
+    ring_rawv_base = replayssm_rawv + ring_slot_val * stride_rawv_slot + pid_hv * MAX_CACHE_LEN * V if CACHE_RING else replayssm_rawv
+    ring_rawk_base = replayssm_rawk + ring_slot_val * stride_rawk_slot + k_head * MAX_CACHE_LEN * K if CACHE_RING else replayssm_rawk
+    if IS_KDA:
+        ring_g_base = replayssm_g + ring_slot_val * stride_g_slot + pid_hv * MAX_CACHE_LEN * K if CACHE_RING else replayssm_g
+    else:
+        ring_g_base = replayssm_g + ring_slot_val * stride_g_slot + pid_hv * MAX_CACHE_LEN if CACHE_RING else replayssm_g
+    ring_beta_base = replayssm_beta + ring_slot_val * stride_beta_slot + pid_hv * MAX_CACHE_LEN if CACHE_RING else replayssm_beta
 
     step_idx = 0
     for _ in range(0, T_loop):
-        token = bos + step_idx
-
-        q0 = tl.load(q + token * stride_q + k_head * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
-        q1 = tl.load(q + token * stride_q + k_head * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
-        k0_raw = tl.load(k + token * stride_k + k_head * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
-        k1_raw = tl.load(k + token * stride_k + k_head * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
-        v_raw = tl.load(v + token * stride_v + pid_hv * V + o_v, mask=mask_v, other=0.0).to(tl.float32)
-        b_val = tl.load(b + token * stride_b + pid_hv).to(tl.float32)
+        # [opt] incremental pointers — no token * stride multiply
+        q0 = tl.load(p_q + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+        q1 = tl.load(p_q + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+        k0_raw = tl.load(p_k + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+        k1_raw = tl.load(p_k + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+        v_raw = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+        b_val = tl.load(p_b).to(tl.float32)
         if IS_KDA:
-            a0 = tl.load(a + token * stride_a + pid_hv * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
-            a1 = tl.load(a + token * stride_a + pid_hv * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+            a0 = tl.load(p_a + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+            a1 = tl.load(p_a + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
 
             if USE_LOWER_BOUND:
                 raw_gate0 = lower_bound * tl.sigmoid(exp_A * (a0 + dt_bias0))
@@ -511,7 +535,7 @@ def _fused_k128_split_kernel(
                 raw_gate0 = -exp_A * sp0
                 raw_gate1 = -exp_A * sp1
         else:
-            a_val = tl.load(a + token * stride_a + pid_hv).to(tl.float32)
+            a_val = tl.load(p_a).to(tl.float32)
             x = a_val + dt_bias_val
             if USE_LOWER_BOUND:
                 raw_gate = lower_bound * tl.sigmoid(exp_A * x)
@@ -522,37 +546,36 @@ def _fused_k128_split_kernel(
         beta = 1.0 / (1.0 + tl.exp(-b_val))
 
         if CACHE_RING:
-            ring_slot = tl.load(h0_indices + pid_batch).to(tl.int64)
-            if step_idx < MAX_CACHE_LEN and ring_slot >= 0:
+            if step_idx < MAX_CACHE_LEN and ring_slot_val >= 0:
                 tl.store(
-                    replayssm_rawv + ring_slot * stride_rawv_slot + pid_hv * MAX_CACHE_LEN * V + step_idx * V + o_v,
+                    ring_rawv_base + step_idx * V + o_v,
                     v_raw.to(replayssm_rawv.dtype.element_ty), mask=mask_v,
                 )
                 if pid_v == 0:
                     tl.store(
-                        replayssm_rawk + ring_slot * stride_rawk_slot + k_head * MAX_CACHE_LEN * K + step_idx * K + o_k0,
+                        ring_rawk_base + step_idx * K + o_k0,
                         k0_raw.to(replayssm_rawk.dtype.element_ty), mask=mask_k0,
                     )
                     tl.store(
-                        replayssm_rawk + ring_slot * stride_rawk_slot + k_head * MAX_CACHE_LEN * K + step_idx * K + o_k1,
+                        ring_rawk_base + step_idx * K + o_k1,
                         k1_raw.to(replayssm_rawk.dtype.element_ty), mask=mask_k1,
                     )
                     if IS_KDA:
                         tl.store(
-                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN * K + step_idx * K + o_k0,
+                            ring_g_base + step_idx * K + o_k0,
                             raw_gate0, mask=mask_k0,
                         )
                         tl.store(
-                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN * K + step_idx * K + o_k1,
+                            ring_g_base + step_idx * K + o_k1,
                             raw_gate1, mask=mask_k1,
                         )
                     else:
                         tl.store(
-                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN + step_idx,
+                            ring_g_base + step_idx,
                             raw_gate,
                         )
                     tl.store(
-                        replayssm_beta + ring_slot * stride_beta_slot + pid_hv * MAX_CACHE_LEN + step_idx,
+                        ring_beta_base + step_idx,
                         beta,
                     )
 
@@ -569,12 +592,17 @@ def _fused_k128_split_kernel(
             k0 = k0_raw
             k1 = k1_raw
 
+        # [opt] fuse exp(gate) — compute decay = exp(raw_gate) once, reuse for
+        # both state *= decay and avoiding a second exp in the state update
         if IS_KDA:
-            state0 *= tl.exp(raw_gate0[None, :])
-            state1 *= tl.exp(raw_gate1[None, :])
+            decay0 = tl.exp(raw_gate0)
+            decay1 = tl.exp(raw_gate1)
+            state0 *= decay0[None, :]
+            state1 *= decay1[None, :]
         else:
-            state0 *= tl.exp(raw_gate)
-            state1 *= tl.exp(raw_gate)
+            decay = tl.exp(raw_gate)
+            state0 *= decay
+            state1 *= decay
 
         value = v_raw - tl.sum(state0 * k0[None, :] + state1 * k1[None, :], axis=1)
         value *= beta
@@ -600,6 +628,11 @@ def _fused_k128_split_kernel(
 
         step_idx += 1
         p_o += HV * V
+        p_q += stride_q
+        p_k += stride_k
+        p_v += stride_v
+        p_b += stride_b
+        p_a += stride_a
 
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:

@@ -103,6 +103,14 @@ def _kda_replayssm_fold_kernel_v2(
             hv64 = tl.cast(hv, tl.int64)
             h = hv // (HV // H)
 
+            # [opt] pre-compute per-slot ring base pointers (loop-invariant
+            # across v-tiles and steps). The t-loop below uses incremental
+            # += stride to avoid t64 * dim multiplications each step.
+            ring_rawk_base = rawk_l + pid * stride_rawk_slot + h * MAX_CACHE_LEN * K
+            ring_rawv_base = rawv_l + pid * stride_rawv_slot + hv * MAX_CACHE_LEN * V
+            ring_gk_base = gk_l + pid * stride_gk_slot + hv * MAX_CACHE_LEN * K
+            ring_beta_base = beta_l + pid * stride_beta_slot + hv * MAX_CACHE_LEN
+
             for v_start in range(0, V, BLOCK_V):
                 v_offsets = v_start + tl.arange(0, BLOCK_V)
                 v_mask = v_offsets < V
@@ -119,48 +127,38 @@ def _kda_replayssm_fold_kernel_v2(
                     p_h0, mask=mask_state, other=0.0
                 ).to(tl.float32)
 
-                for t in range(n_commit):
-                    t64 = tl.cast(t, tl.int64)
+                # [opt] pre-compute track store address (constant across steps).
+                # Always computed when HAS_TRACK; store is guarded by the
+                # runtime condition in the loop body.
+                if HAS_TRACK:
+                    p_track_l = (
+                        h0_l
+                        + track_idx * stride_state_slot
+                        + hv64 * stride_state_hv
+                        + v_offsets[:, None] * stride_state_v
+                        + k_offsets[None, :] * stride_state_k
+                    )
 
-                    b_k = tl.load(
-                        rawk_l
-                        + pid * stride_rawk_slot
-                        + h * MAX_CACHE_LEN * K
-                        + t64 * K
-                        + k_offsets,
-                        mask=k_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    b_v = tl.load(
-                        rawv_l
-                        + pid * stride_rawv_slot
-                        + hv * MAX_CACHE_LEN * V
-                        + t64 * V
-                        + v_offsets,
-                        mask=v_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    b_gk = tl.load(
-                        gk_l
-                        + pid * stride_gk_slot
-                        + hv * MAX_CACHE_LEN * K
-                        + t64 * K
-                        + k_offsets,
-                        mask=k_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    b_beta = tl.load(
-                        beta_l
-                        + pid * stride_beta_slot
-                        + hv * MAX_CACHE_LEN
-                        + t64,
-                    ).to(tl.float32)
+                # [opt] initialize step pointers from pre-computed bases
+                p_rawk = ring_rawk_base + k_offsets
+                p_rawv = ring_rawv_base + v_offsets
+                p_gk = ring_gk_base + k_offsets
+                p_beta = ring_beta_base
+
+                for t in range(n_commit):
+                    # [opt] incremental pointers — no t64 * dim multiply
+                    b_k = tl.load(p_rawk, mask=k_mask, other=0.0).to(tl.float32)
+                    b_v = tl.load(p_rawv, mask=v_mask, other=0.0).to(tl.float32)
+                    b_gk = tl.load(p_gk, mask=k_mask, other=0.0).to(tl.float32)
+                    b_beta = tl.load(p_beta).to(tl.float32)
 
                     if USE_QK_L2NORM_IN_KERNEL:
                         b_k = b_k / (
                             tl.sqrt(tl.sum(b_k * b_k)) + 1e-6
                         )
-                    state *= tl.exp(b_gk[None, :])
+                    # [opt] bind decay = exp(b_gk) once; reuse in broadcast
+                    decay = tl.exp(b_gk)
+                    state *= decay[None, :]
                     b_v -= tl.sum(state * b_k[None, :], axis=1)
                     b_v *= b_beta
                     state += b_v[:, None] * b_k[None, :]
@@ -169,18 +167,17 @@ def _kda_replayssm_fold_kernel_v2(
                         if (t == track_step_val) and (
                             track_idx > NULL_BLOCK_ID
                         ):
-                            p_track = (
-                                h0_l
-                                + track_idx * stride_state_slot
-                                + hv64 * stride_state_hv
-                                + v_offsets[:, None] * stride_state_v
-                                + k_offsets[None, :] * stride_state_k
-                            )
                             tl.store(
-                                p_track,
+                                p_track_l,
                                 state.to(h0_ptr.dtype.element_ty),
                                 mask=mask_state,
                             )
+
+                    # [opt] advance pointers by one step
+                    p_rawk += K
+                    p_rawv += V
+                    p_gk += K
+                    p_beta += 1
 
                 tl.store(
                     p_h0,
@@ -275,40 +272,58 @@ def kda_replayssm_exact_fold_kernel(
     )
     b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
+    # [opt] pre-compute per-slot base pointers once; the loop below uses
+    # incremental += stride to avoid phys * dim multiplications each step.
+    p_rawk = (
+        rawk_cache
+        + i_n * stride_rawk_slot
+        + i_h * MAX_CACHE_LEN * K
+        + o_k
+    )
+    p_rawv = (
+        rawv_cache
+        + i_n * stride_rawv_slot
+        + i_hv * MAX_CACHE_LEN * V
+        + o_v
+    )
+    p_gk = (
+        gk_cache
+        + i_n * stride_gk_slot
+        + i_hv * MAX_CACHE_LEN * K
+        + o_k
+    )
+    p_beta = (
+        beta_cache
+        + i_n * stride_beta_slot
+        + i_hv * MAX_CACHE_LEN
+    )
+
+    # [opt] pre-compute track store address (constant across steps).
+    # The address is always computed when HAS_TRACK; the actual store is
+    # guarded by the same runtime condition (track_idx > NULL_BLOCK_ID)
+    # as the original, so an invalid track_idx never triggers a store.
+    if HAS_TRACK:
+        p_track = (
+            h0
+            + track_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+
     for t in range(0, n_commit):
-        phys = t.to(tl.int64)
-        b_k = tl.load(
-            rawk_cache
-            + i_n * stride_rawk_slot
-            + (i_h * MAX_CACHE_LEN + phys) * K
-            + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_v = tl.load(
-            rawv_cache
-            + i_n * stride_rawv_slot
-            + (i_hv * MAX_CACHE_LEN + phys) * V
-            + o_v,
-            mask=mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        b_gk = tl.load(
-            gk_cache
-            + i_n * stride_gk_slot
-            + (i_hv * MAX_CACHE_LEN + phys) * K
-            + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_beta = tl.load(
-            beta_cache + i_n * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
-        ).to(tl.float32)
+        # [opt] incremental pointers — no phys * dim multiply
+        b_k = tl.load(p_rawk, mask=mask_k, other=0.0).to(tl.float32)
+        b_v = tl.load(p_rawv, mask=mask_v, other=0.0).to(tl.float32)
+        b_gk = tl.load(p_gk, mask=mask_k, other=0.0).to(tl.float32)
+        b_beta = tl.load(p_beta).to(tl.float32)
 
         # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
         if USE_QK_L2NORM_IN_KERNEL:
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-        b_h *= tl.exp(b_gk[:, None])  # per-K gate decay, broadcast over V
+        # [opt] bind decay = exp(b_gk) once; reuse in broadcast multiply
+        decay = tl.exp(b_gk)
+        b_h *= decay[:, None]  # per-K gate decay, broadcast over V
         b_v -= tl.sum(b_h * b_k[:, None], 0)
         b_v *= b_beta
         b_h += b_k[:, None] * b_v[None, :]
@@ -317,14 +332,16 @@ def kda_replayssm_exact_fold_kernel(
         if HAS_TRACK:
             if (t == track_step) and (track_idx > NULL_BLOCK_ID):
                 tl.store(
-                    h0
-                    + track_idx * stride_state_slot
-                    + i_hv * V * K
-                    + o_v[None, :] * K
-                    + o_k[:, None],
+                    p_track,
                     b_h.to(h0.dtype.element_ty),
                     mask=mask_h,
                 )
+
+        # [opt] advance pointers by one step
+        p_rawk += K
+        p_rawv += V
+        p_gk += K
+        p_beta += 1
 
     tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
