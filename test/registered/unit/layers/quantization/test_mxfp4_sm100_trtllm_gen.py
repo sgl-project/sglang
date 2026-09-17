@@ -20,6 +20,14 @@ from flashinfer import trtllm_fp4_block_scale_moe
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
+
+def _parallel_state_module():
+    """Stub `parallel_state`: the context reads the getters from there."""
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
 
 if not is_sm100_supported():
@@ -301,7 +309,7 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
         fi_trtllm_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_trtllm_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_trtllm_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
 
     fixtures = _make_random_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1

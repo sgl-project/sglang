@@ -30,6 +30,14 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
+
+def _parallel_state_module():
+    """Stub `parallel_state`: the context reads the getters from there."""
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 dev = "cuda"
@@ -266,7 +274,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     # This kernel test runs outside a model-parallel process. Bypass only the
     # symmetric-allocation context; all pre-permute, DeepGEMM, activation,
     # quantization, down-GEMM, and post-permute kernels remain real.
-    monkeypatch.setattr(deep_gemm_runner, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
     monkeypatch.setattr(
         deep_gemm_runner,
         "use_symmetric_memory",

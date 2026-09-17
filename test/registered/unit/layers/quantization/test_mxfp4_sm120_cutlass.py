@@ -14,6 +14,14 @@ import torch
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
+
+def _parallel_state_module():
+    """Stub `parallel_state`: the context reads the getters from there."""
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
@@ -134,7 +142,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 256, 256
     w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
@@ -277,7 +285,7 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 160, 160
     padded_hidden = padded_intermediate = 256

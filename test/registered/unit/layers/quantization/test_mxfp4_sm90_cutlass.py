@@ -60,6 +60,14 @@ from flashinfer.fused_moe.core import ActivationType
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
+
+def _parallel_state_module():
+    """Stub `parallel_state`: the context reads the getters from there."""
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 GROUP_SIZE = 32  # MXFP4 block size
 
 
@@ -352,7 +360,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
     monkeypatch.setattr(
         fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
         "get",
@@ -602,7 +610,7 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
     monkeypatch.setattr(
         fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
         "get",
@@ -741,7 +749,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(_parallel_state_module(), "get_tp_group", lambda: None)
 
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
     w1, w3 = w13.chunk(2, dim=1)
