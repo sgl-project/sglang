@@ -700,6 +700,17 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.cur_batch_for_debug = batch
 
+            # Process transfers before submitting the next forward's graphs,
+            # which can otherwise block the scheduler's GPU work.
+            process_before_forward = (
+                envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+            )
+            if process_before_forward:
+                if self.last_batch:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                self.process_disagg_prefill_inflight_queue()
+
             # Launch the current batch
             if batch:
                 if self.enable_staging:
@@ -712,13 +723,15 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not process_before_forward:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            if not process_before_forward:
+                self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -898,9 +911,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
 
-                # Still chunking iff its next chunk was launched: either it is
+                # Still chunking iff its next chunk was admitted: either it is
                 # still self.chunked_req, or its final chunk (extend_range
-                # reaching the end of the input) is in flight. A yielded req
+                # reaching the end of the input) was prepared. A yielded req
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
                     req.extend_range is not None
