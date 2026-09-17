@@ -153,19 +153,27 @@ class DSATopKBackend(Enum):
 
         # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
         # fusion from RAGGED above. Unsupported shapes fall back, not raise.
+        # The row -> request map is `token_to_batch_idx` for a whole-forward call
+        # and the chunk's own `batch_idx_list` when the indexer split the logits.
+        if batch_idx_list is None:
+            row_to_batch = attn_metadata.token_to_batch_idx
+        elif isinstance(batch_idx_list, torch.Tensor):
+            row_to_batch = batch_idx_list
+        else:
+            # The prefill-CP list selects requests, not rows: leave it on legacy.
+            row_to_batch = None
         if (
             _is_hip
             and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
-            and batch_idx_list is None
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0]
             and logits.dtype == torch.float32
             and logits.stride(1) == 1
             and logits.stride(0) % 4 == 0
             and row_starts is not None
-            and attn_metadata.token_to_batch_idx is not None
-            and attn_metadata.token_to_batch_idx.shape[0] == logits.shape[0]
+            and row_to_batch is not None
+            and row_to_batch.shape[0] == logits.shape[0]
         ):
             return _topk_transform_v2_packed(
                 logits,
@@ -173,7 +181,7 @@ class DSATopKBackend(Enum):
                 topk,
                 attn_metadata,
                 row_starts=row_starts,
-                row_to_batch=attn_metadata.token_to_batch_idx,
+                row_to_batch=row_to_batch,
             )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
