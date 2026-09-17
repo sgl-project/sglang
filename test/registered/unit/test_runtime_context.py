@@ -263,6 +263,87 @@ class TestSpawnIdentities(_IsolatedOverrides):
         self.assertIn("initialize_dp_attention", str(caught.exception))
 
 
+class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
+    """With a spawn bundle, a rank read works before any group exists.
+
+    This is what `ParallelState` provided by being a plain frozen record, and
+    what the topology init could not: it needs the groups. Deriving at publish
+    is what lets a reader ask the context in a process that never initialises
+    distributed -- every unit test that builds a scheduler component, for one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_derived_widths(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_it_matches_the_topology_init_for_every_shape(self):
+        """Cross-checked against the function the groups use, not restated.
+
+        Same inputs, two callers: one has them from the configuration and the
+        spawn, the other from the groups it just built.
+        """
+        from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+
+        shapes = [
+            (8, 1, 1, False),
+            (8, 2, 1, True),
+            (8, 4, 1, True),
+            (8, 2, 2, True),
+            (16, 4, 2, True),
+        ]
+        for tp_size, dp_size, attn_cp_size, dp_attn in shapes:
+            for tp_rank in range(tp_size):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        tp_size=tp_size,
+                        dp_size=dp_size,
+                        attn_cp_size=attn_cp_size,
+                        enable_dp_attention=dp_attn,
+                    ),
+                    role="test",
+                    ranks=SpawnRanks(gpu_id=0, tp_rank=tp_rank, pp_rank=0),
+                )
+                want_tp, _, want_dp, _ = compute_dp_attention_world_info(
+                    dp_attn, tp_rank, tp_size, dp_size, attn_cp_size
+                )
+                msg = f"tp={tp_size} dp={dp_size} cp={attn_cp_size} rank={tp_rank}"
+                self.assertEqual(get_parallel().attn_tp_rank, want_tp, msg)
+                self.assertEqual(get_parallel().attn_dp_rank, want_dp, msg)
+
+    def test_the_rank_reads_without_a_process_group(self):
+        """No distributed init, no patching of any getter."""
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=5, pp_rank=0),
+        )
+        with patch(
+            f"{_PS}.get_attn_tensor_model_parallel_rank",
+            side_effect=AssertionError("no group must be consulted"),
+        ):
+            self.assertEqual(get_parallel().attn_tp_rank, 1)
+            self.assertEqual(get_parallel().attn_dp_rank, 1)
+
+    def test_without_a_bundle_it_still_asks_the_group(self):
+        """Unchanged for every process that publishes without a placement."""
+        publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
+        with patch(f"{_PS}.get_attn_tensor_model_parallel_rank", return_value=3):
+            self.assertEqual(get_parallel().attn_tp_rank, 3)
+
+
 class TestStampedRanks(_IsolatedOverrides):
     """`attn_dp_rank` comes from the stamp, and says so when there is none.
 
@@ -2168,6 +2249,126 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
         for name, value in vars(Parallel).items():
             if isinstance(value, Derived):
                 self.assertNotIn(name, fields)
+
+
+class TestTheRecordAndTheGroupsMustAgree(_IsolatedOverrides):
+    """Two accounts of one placement: what `publish` recorded from the
+    configuration, and what the groups say once they have been built.
+
+    The point of deriving at publish is that they agree, so the checks that
+    say so have to fire when they do not -- and, just as much, stay quiet
+    when they do. A rank is a plausible small integer whichever way it is
+    wrong, so neither direction shows up on its own.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_derived_widths(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _dp_attention_args(self):
+        """`tp_rank=2` of a 4-wide TP with two attention-DP replicas places
+        this process at `attn_dp_rank=1`; the stub carries only what the
+        topology init reads off a model config."""
+        from types import SimpleNamespace
+
+        import torch
+
+        # `device` is stated because `model_path="dummy"` short-circuits the
+        # resolution that would otherwise detect one, and the topology init
+        # ends by handing it to `torch.device`.
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            tp_size=4,
+            dp_size=2,
+            enable_dp_attention=True,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(), hidden_size=8, dtype=torch.float16
+        )
+        return server_args, model_config
+
+    def test_the_topology_init_accepts_a_record_that_describes_its_groups(self):
+        from sglang.srt.layers import dp_attention
+
+        server_args, model_config = self._dp_attention_args()
+        publish(
+            server_args,
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=2, pp_rank=0, dp_rank=1),
+        )
+        with (
+            patch(f"{_DP}.get_tensor_model_parallel_world_size", return_value=4),
+            patch(f"{_PS}.get_tensor_model_parallel_rank", return_value=2),
+        ):
+            dp_attention.initialize_dp_attention(server_args, model_config)
+        self.assertEqual(get_parallel().attn_dp_rank, 1)
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+
+    def test_the_topology_init_refuses_a_record_that_does_not(self):
+        """A caller that published one topology and built another gets told,
+        rather than served whichever of the two the reader happens to ask."""
+        from sglang.srt.layers import dp_attention
+
+        server_args, model_config = self._dp_attention_args()
+        publish(
+            server_args,
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=2, pp_rank=0, dp_rank=1),
+        )
+        get_parallel().override_permanently(attn_dp_rank=0)
+        with (
+            patch(f"{_DP}.get_tensor_model_parallel_world_size", return_value=4),
+            patch(f"{_PS}.get_tensor_model_parallel_rank", return_value=2),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"attention-DP rank disagrees"):
+                dp_attention.initialize_dp_attention(server_args, model_config)
+
+    def test_an_elastic_joiner_is_not_told_its_own_rewrite_disagrees(self):
+        """The elastic identity is a second, deliberate placement of the same
+        name -- `tp_rank + ep_join_rank_offset` rather than the (dp, cp, tp)
+        layout. Comparing the record against it would fail every scale-joiner,
+        which asserts a non-zero offset."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.layers import dp_attention
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            tp_size=4,
+            dp_size=2,
+            enable_dp_attention=True,
+            elastic_ep_backend="mooncake",
+            max_ep_size=8,
+            ep_join_rank_offset=4,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(), hidden_size=8, dtype=torch.float16
+        )
+        publish(
+            server_args,
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=2, pp_rank=0, dp_rank=1),
+        )
+        with (
+            patch(f"{_DP}.get_tensor_model_parallel_world_size", return_value=4),
+            patch(f"{_PS}.get_tensor_model_parallel_rank", return_value=2),
+        ):
+            dp_attention.initialize_dp_attention(server_args, model_config)
+        # The rewrite wins, and it is what the readers see afterwards.
+        self.assertEqual(get_parallel().attn_dp_rank, 6)
 
 
 if __name__ == "__main__":

@@ -274,6 +274,28 @@ def derive_attention_widths(
     return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
 
 
+def derive_attention_ranks(
+    *, tp_rank: int, attn_tp_size: int, attn_cp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_tp_rank, attn_dp_rank) for a process at `tp_rank`.
+
+    The rank layout is (dp, cp, tp) with tp the fastest-changing dimension::
+
+        tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size
+                  + attn_tp_rank
+
+    Split out beside `derive_attention_widths` because two places need it from
+    different inputs: `publish` has this process's `tp_rank` from the spawn and
+    the widths from the configuration, while `initialize_dp_attention` has them
+    from the groups it just built. They must not carry separate copies of the
+    arithmetic -- the point of computing it at publish is that the two agree.
+    """
+    attn_tp_rank = tp_rank % attn_tp_size
+    if not enable_dp_attention:
+        return attn_tp_rank, 0
+    return attn_tp_rank, tp_rank // (attn_tp_size * attn_cp_size)
+
+
 def derive_parallel_widths(
     *,
     tp_size: int,
@@ -1720,6 +1742,7 @@ def publish(
         _CONTEXT.parallel.override_permanently(
             dp_rank=ranks.dp_rank, gpu_id=ranks.gpu_id
         )
+        _stamp_attention_ranks(_CONTEXT.parallel, ranks.tp_rank)
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
@@ -1732,6 +1755,27 @@ def publish(
             flush=True,
         )
     return _CONTEXT
+
+
+def _stamp_attention_ranks(parallel, tp_rank: int) -> None:
+    """Place this process in the attention topology, from the configuration.
+
+    The widths are already on the bag -- `publish` computed them a moment ago --
+    and the rank comes from the spawn, so the position is known here, before any
+    process group exists. That is the point: a rank read then works in a process
+    that never initialises distributed, which is what `ParallelState` provided
+    by being a plain frozen record.
+
+    It is a stamp rather than a bag leaf because it is a per-process fact, and
+    nothing about the configuration distinguishes one rank from another.
+    """
+    attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+        tp_rank=tp_rank,
+        attn_tp_size=parallel.attn_tp_size,
+        attn_cp_size=parallel.attn_cp_size,
+        enable_dp_attention=parallel.enable_dp_attention,
+    )
+    parallel.override_permanently(attn_tp_rank=attn_tp_rank, attn_dp_rank=attn_dp_rank)
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:

@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    derive_attention_ranks,
     derive_attention_widths,
     get_device,
     get_exec,
@@ -349,15 +350,12 @@ def compute_dp_attention_world_info(
         dp_size=dp_size,
         enable_dp_attention=enable_dp_attention,
     )
-    attn_tp_rank = tp_rank % attn_tp_size
-
-    if not enable_dp_attention:
-        attn_dp_rank = 0
-    else:
-        # Rank layout is (dp, cp, tp) where tp is the fastest-changing dim:
-        # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
-        attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
-
+    attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+        tp_rank=tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=attn_cp_size,
+        enable_dp_attention=enable_dp_attention,
+    )
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
@@ -381,6 +379,18 @@ def initialize_dp_attention(
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
+
+    # Checked here, against the layout the groups were built from, because the
+    # elastic rewrite below deliberately replaces that layout with the scale
+    # identity. Only the first of the two is what `publish` recorded.
+    stamped = get_parallel()._stamp.get("attn_dp_rank")
+    if stamped is not None and stamped != attn_dp_rank:
+        raise RuntimeError(
+            "attention-DP rank disagrees with the published configuration: "
+            f"publish placed this process at {stamped}, the groups built since "
+            f"put it at {attn_dp_rank}. The record that was published does not "
+            "describe the groups this process built."
+        )
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
