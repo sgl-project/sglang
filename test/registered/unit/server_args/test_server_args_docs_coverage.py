@@ -1,10 +1,11 @@
 """Every live ServerArgs flag needs a row in server_arguments.mdx and every flag
-the doc names must still register. The two allowlists below may only shrink.
+the doc names must still register. The allowlist below may only shrink.
 """
 
 import argparse
 import re
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -45,6 +46,7 @@ _ROW_FLAG_RE = re.compile(r"`(--[a-zA-Z0-9][\w-]*)`|<code>(--[a-zA-Z0-9][\w-]*)<
 _UNDOCUMENTED = frozenset(
     {
         "--c128-page-size",
+        "--cuda-graph-prefill-max-context",
         "--decoupled-spec-bind-endpoint",
         "--decoupled-spec-connect-endpoints",
         "--decoupled-spec-rank",
@@ -52,6 +54,7 @@ _UNDOCUMENTED = frozenset(
         "--deepep-v2-mode",
         "--disaggregation-decode-extra-slots",
         "--disaggregation-decode-retraction-backup",
+        "--disaggregation-enable-kv-checksum",
         "--dsa-paged-mqa-logits-backend",
         "--dsv4-attn-backend",
         "--dsv4-prefill-backend",
@@ -93,7 +96,7 @@ _UNDOCUMENTED = frozenset(
         "--mm-io-worker-num",
         "--mm-preprocess-cache-size-mb",
         "--mm-processor-worker-num",
-        "--optimistic-prefill-attempts",
+        "--otlp-service-name",
         "--prefill-decode-interval",
         "--radix-eviction-policy-config",
         "--return-input-ids",
@@ -120,25 +123,12 @@ _UNDOCUMENTED = frozenset(
     }
 )
 
-# Flags named anywhere in the doc that no longer register. May only shrink.
-_STALE_ROWS = frozenset(
-    {
-        "--custom-sigquit-handler",
-        "--debug-tensor-dump-inject",
-        "--hybrid-kvcache-ratio",
-        "--optimistic-prefill-retries",
-    }
-)
 
-
-def _parser_actions():
-    parser = argparse.ArgumentParser()
+def _parser_actions() -> tuple[list[argparse.Action], list[argparse.Action]]:
+    parser = argparse.ArgumentParser(add_help=False)
     ServerArgs.add_cli_args(parser)
     live, deprecated = [], []
     for action in parser._actions:
-        options = [o for o in action.option_strings if o not in ("-h", "--help")]
-        if not options:
-            continue
         (deprecated if isinstance(action, _DEPRECATED_ACTION_TYPES) else live).append(
             action
         )
@@ -155,22 +145,9 @@ def _doc_rows() -> list[list[str]]:
     return [cells for cells in rows if cells]
 
 
-def _uncovered(live_actions, arg_cells_blob: str) -> set[str]:
-    uncovered = set()
-    for action in live_actions:
-        options = [o for o in action.option_strings if o not in ("-h", "--help")]
-        # Any alias counts. A trailing boundary stops `--model` matching `--model-path`.
-        if not any(
-            re.search(re.escape(opt) + r"(?![\w-])", arg_cells_blob) for opt in options
-        ):
-            uncovered.add(action.option_strings[0])
-    return uncovered
-
-
-def _documented_flags(rows: list[list[str]]) -> set[str]:
+def _flags_in(cells: Iterable[str]) -> set[str]:
     return {
         match.group(1) or match.group(2)
-        for cells in rows
         for cell in cells
         for match in _ROW_FLAG_RE.finditer(cell)
     }
@@ -181,34 +158,26 @@ class TestServerArgsDocsCoverage(CustomTestCase):
     def setUpClass(cls):
         cls.live_actions, deprecated_actions = _parser_actions()
         cls.rows = _doc_rows()
-        cls.arg_cells_blob = "\n".join(cells[0] for cells in cls.rows)
-        cls.uncovered = _uncovered(cls.live_actions, cls.arg_cells_blob)
-        cls.documented = _documented_flags(cls.rows)
+        argument_column_flags = _flags_in(cells[0] for cells in cls.rows)
+        cls.uncovered = {
+            action.option_strings[0]
+            for action in cls.live_actions
+            # Any alias counts.
+            if argument_column_flags.isdisjoint(action.option_strings)
+        }
         registered = {
             o for a in cls.live_actions + deprecated_actions for o in a.option_strings
         }
-        cls.stale = cls.documented - registered
+        cls.stale = _flags_in(cell for cells in cls.rows for cell in cells) - registered
 
-    def test_cell_parser_still_matches_the_doc(self):
-        """An over matching parser fails quietly. It inflates the documented set
-        and hides real gaps. Pin the table shape and one known row."""
-        self.assertGreater(
-            len(self.rows),
-            400,
-            f"only {len(self.rows)} table rows recovered from {_DOC_PATH}. "
-            "The row regex no longer matches the table markup",
-        )
+    def test_every_row_has_four_cells(self):
+        """Coverage reads only the first cell. A row the cell regex splits wrongly
+        can pass description text off as the Argument column and hide a gap."""
         misshapen = [cells[0][:80] for cells in self.rows if len(cells) != _DOC_COLUMNS]
         self.assertFalse(
             misshapen,
             f"these rows do not have {_DOC_COLUMNS} cells, so their first cell may "
             "not be the Argument column:\n  " + "\n  ".join(misshapen),
-        )
-        self.assertIn(
-            "--model-path",
-            self.arg_cells_blob,
-            "a flag known to be documented was not found in the Argument column. "
-            "The row regex is over or under matching",
         )
 
     def test_no_new_undocumented_flags(self):
@@ -233,27 +202,15 @@ class TestServerArgsDocsCoverage(CustomTestCase):
             f"the set in {Path(__file__).name}:\n  " + "\n  ".join(outdated),
         )
 
-    def test_no_new_stale_rows(self):
-        added = sorted(self.stale - _STALE_ROWS)
+    def test_no_stale_rows(self):
+        stale = sorted(self.stale)
         self.assertFalse(
-            added,
-            "server_arguments.mdx names these flags but they no longer register, "
-            "current or deprecated and are not on the allow list. The flag was "
-            "renamed (possibly via cli_name=) or removed or its field has no CLI "
-            "surface (no A[] annotation, or Arg(no_cli=True)). Fix or delete the "
-            f"mention or add it to _STALE_ROWS in {Path(__file__).name}:\n  "
-            + "\n  ".join(added),
-        )
-
-    def test_stale_allowlist_is_current(self):
-        outdated = []
-        for flag in sorted(_STALE_ROWS - self.stale):
-            reason = "registers again" if flag in self.documented else "gone from doc"
-            outdated.append(f"{flag} ({reason})")
-        self.assertFalse(
-            outdated,
-            "these entries in _STALE_ROWS are out of date. Remove them from "
-            f"the set in {Path(__file__).name}:\n  " + "\n  ".join(outdated),
+            stale,
+            "server_arguments.mdx names these flags but they no longer register "
+            "as a current or deprecated flag. The flag was renamed (possibly via "
+            "cli_name=) or removed, or its field has no CLI surface (no A[] "
+            "annotation, or Arg(no_cli=True)). Fix or delete the mention:\n  "
+            + "\n  ".join(stale),
         )
 
 

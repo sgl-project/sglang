@@ -102,6 +102,9 @@ jobs:
               - "rust/*"
               - "rust/!(sglang-renderer|sglang-processor)/**"
               - "proto/**"
+              # test_server_args_docs_coverage.py diffs this doc against the CLI,
+              # so a docs-only edit can break that test.
+              - "docs/docs/advanced_features/server_arguments.mdx"
             renderer:
               - "rust/sglang-renderer/**"
               - "rust/sglang-processor/**"
