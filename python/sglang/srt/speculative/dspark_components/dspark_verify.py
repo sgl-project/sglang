@@ -286,7 +286,7 @@ class TargetVerifyExecutor:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        if sampling_info is not None and result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -419,7 +419,7 @@ class TargetVerifyExecutor:
         sampling_info,
         inject_gate: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> tuple[TargetVerifyResult, torch.Tensor]:
+    ) -> tuple[TargetVerifyResult, Optional[torch.Tensor]]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
             layout=layout,
@@ -440,6 +440,8 @@ class TargetVerifyExecutor:
             pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = target_verify.logits_output
+        if logits_output is None:
+            return target_verify, None
 
         stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
