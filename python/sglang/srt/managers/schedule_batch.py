@@ -1977,6 +1977,18 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+            # Generation restarts from scratch here, so every output cursor
+            # must restart with it: the streamer slices new output_ids with
+            # send_token_offset, and the incremental detokenizer rebuilds its
+            # state from surr/read_offset sentinels. Keep these resets after
+            # the truncation above, which must still read the pre-restart
+            # send_token_offset for the already-streamed prefix.
+            self.send_token_offset = 0
+            self.send_decode_id_offset = 0
+            self.send_output_token_logprobs_offset = 0
+            self.send_output_sampling_mask_offset = 0
+            self.surr_offset = None
+            self.read_offset = None
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.get_kvcache().cpu_copy_carries_mamba:
