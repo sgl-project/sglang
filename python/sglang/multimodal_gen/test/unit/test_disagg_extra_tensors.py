@@ -3,6 +3,10 @@
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import (
+    RoleType,
+    filter_modules_for_role,
+)
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
     extract_transfer_fields,
@@ -12,7 +16,20 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+
+
+def test_qwen21_disagg_encoder_loads_condition_vae():
+    pipeline = object.__new__(QwenImage21Pipeline)
+    modules = filter_modules_for_role(
+        pipeline._required_config_modules,
+        RoleType.ENCODER,
+        extra_allowed_modules=pipeline._get_extra_allowed_modules_for_role(
+            RoleType.ENCODER, "ti2i"
+        ),
+    )
+    assert set(modules) == {"processor", "text_encoder", "vae", "scheduler"}
 
 
 @pytest.mark.parametrize("edit", [False, True])

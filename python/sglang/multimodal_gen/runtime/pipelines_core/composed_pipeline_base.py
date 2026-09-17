@@ -260,6 +260,7 @@ class ComposedPipelineBase(ABC):
                 "Flux2KleinPipeline": {"vae"},
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImage21Pipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
                 "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
