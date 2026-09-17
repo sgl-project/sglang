@@ -246,6 +246,7 @@ class TestSwapABAttention(CustomTestCase):
                 actual.float(), gold.float(), atol=0.003, rtol=0.01
             )
 
+    @unittest.skipUnless(is_gfx95_supported(), "HIP fused inverse RoPE")
     def test_fused_inverse_rope(self):
         from sglang.srt.layers.attention.hip_flash_mla import _apply_inverse_rope
 
