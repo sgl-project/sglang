@@ -70,6 +70,12 @@ class Disagg(msgspec.Struct):
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
         ),
     ] = "mooncake"
+    disaggregation_enable_kv_checksum: A[
+        bool,
+        "Compute an Adler-32 checksum over each request's KV pages on prefill "
+        "and verify it on decode. Enable on both prefill and decode engines. "
+        "A mismatch aborts the request, or raises in CI. Disabled by default.",
+    ] = False
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998

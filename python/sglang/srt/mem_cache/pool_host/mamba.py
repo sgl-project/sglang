@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -23,6 +24,8 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+transfer_state_per_layer_direct_pf_lf = None
+transfer_state_all_layer_direct_lf_pf = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -42,8 +45,29 @@ if _is_npu:
         from sgl_kernel_npu.kvcacheio import transfer_mamba_state
     except ImportError:
         transfer_mamba_state = None
+    try:
+        from sgl_kernel_npu.kvcacheio import (
+            transfer_state_all_layer_direct_lf_pf,
+            transfer_state_per_layer_direct_pf_lf,
+        )
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
+
+
+_NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
+_NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
+
+
+def _npu_hicache_mamba_io_mode() -> str:
+    mode = os.getenv(_NPU_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
+    if mode not in _NPU_HICACHE_MAMBA_IO_MODES:
+        raise ValueError(
+            f"{_NPU_HICACHE_MAMBA_IO_ENV} must be one of "
+            f"{sorted(_NPU_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
+        )
+    return mode
 
 
 class MambaPoolHost(HostKVCache):
@@ -136,9 +160,35 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
+        self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _configure_npu_mamba_io(self) -> None:
+        mode = _npu_hicache_mamba_io_mode()
+        if mode == "sync":
+            logger.info("NPU HiCache Mamba state transfer mode: sync torch fallback.")
+            return
+
+        required_ops = (
+            transfer_state_per_layer_direct_pf_lf,
+            transfer_state_all_layer_direct_lf_pf,
+        )
+        required_torch_ops = (
+            "transfer_state_per_layer_direct_pf_lf",
+            "transfer_state_all_layer_direct_lf_pf",
+        )
+        if any(op is None for op in required_ops) or any(
+            not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
+        ):
+            raise RuntimeError(
+                "NPU HiCache Mamba async state transfer requires "
+                "the per-layer PF->LF and all-layer LF->PF direct operators "
+                "from sgl-kernel-npu."
+            )
+
+        logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -377,12 +427,21 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            # NPU fallback: page-first host buffer -> per-layer device buffer.
-            # host buffer layout is (size, num_layers, 1, *shape); the trailing 1
-            # is the page placeholder dim, so index it out explicitly.
-            dst[dst_indices.to(dst.device)] = src[
-                src_indices.to(src.device), layer_id, 0
-            ].to(dst.device)
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_per_layer_direct_pf_lf(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    layer_id=layer_id,
+                )
+            else:
+                host_indices = src_indices.to(dtype=torch.int64, device=src.device)
+                device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                values = (
+                    src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
+                )
+                dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -427,10 +486,17 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            # NPU: mirror the load path — the dedicated kernel transfers all
-            # layers at once via a single 2D strided copy
-            # (device layer-first -> host page-first).
-            if transfer_mamba_state is not None:
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_all_layer_direct_lf_pf(
+                    device_states=[src_layers],
+                    host_states=[dst],
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                )
+            elif transfer_mamba_state is not None:
+                # NPU: mirror the load path — the dedicated kernel transfers all
+                # layers at once via a single 2D strided copy
+                # (device layer-first -> host page-first).
                 transfer_mamba_state(
                     device_buf=src_layers,
                     host_buf=dst,
@@ -440,10 +506,18 @@ class MambaPoolHost(HostKVCache):
                 )
             else:
                 # Per-layer fallback when the dedicated kernel is unavailable.
-                for lid in range(num_layers):
-                    dst[dst_indices.to(dst.device), lid, 0] = src_layers[lid][
-                        src_indices.to(dst.device)
-                    ].to(dst.device)
+                device_indices = src_indices.to(
+                    dtype=torch.int64, device=src_layers.device
+                )
+                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                values = (
+                    src_layers.index_select(1, device_indices)
+                    .movedim(0, 1)
+                    .unsqueeze(2)
+                    .contiguous()
+                    .to(device=dst.device)
+                )
+                dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
