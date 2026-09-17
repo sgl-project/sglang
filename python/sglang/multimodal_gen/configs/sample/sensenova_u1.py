@@ -6,17 +6,23 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.configs.sensenova_u1 import (
-    DEFAULT_CFG_INTERVAL,
-    DEFAULT_CFG_NORM,
-    DEFAULT_ENABLE_TIMESTEP_SHIFT,
-    DEFAULT_T_EPS,
-    DEFAULT_THINK_MODE,
-    DEFAULT_TIMESTEP_SHIFT,
-    SENSENOVA_U1_CFG_NORM_CHOICES,
-    SENSENOVA_U1_REQUEST_EXTRA_KEY,
-    SENSENOVA_U1_RESOLUTION_ALIGNMENT,
+
+SENSENOVA_U1_REQUEST_EXTRA_KEY = "sensenova_u1"
+
+SENSENOVA_U1_CFG_NORM_CHOICES = (
+    "none",
+    "global",
+    "channel",
+    "cfg_zero_star",
 )
+SENSENOVA_U1_RESOLUTION_ALIGNMENT = 32
+
+DEFAULT_CFG_NORM = "none"
+DEFAULT_TIMESTEP_SHIFT = 3.0
+DEFAULT_ENABLE_TIMESTEP_SHIFT = True
+DEFAULT_CFG_INTERVAL = (0.0, 1.0)
+DEFAULT_T_EPS = 0.02
+DEFAULT_THINK_MODE = False
 
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",
