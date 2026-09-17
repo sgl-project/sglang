@@ -111,8 +111,11 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
     pipeline = object.__new__(QwenImage21Pipeline)
     pipeline.server_args = get_global_server_args()
-    actual_model = deepcopy(model)
-    reference = deepcopy(model)
+    config = pipeline.server_args.pipeline_config.dit_config
+    actual_model = QwenImage21Transformer2DModel(config, {}).cuda().eval()
+    reference = QwenImage21Transformer2DModel(config, {}).cuda().eval()
+    for loaded in (actual_model, reference):
+        loaded.load_state_dict(model.state_dict())
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
     weights = {}
