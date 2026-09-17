@@ -1260,6 +1260,11 @@ class HiRadixCache(RadixCache):
                 return
             self.writing_check(write_back=True)
             for node, device_indices in staged:
+                # The device copy leaves here, after the backup has landed:
+                # same device-tier exit as _evict_backuped, same sample.
+                self._observe_kv_eviction(
+                    node, len(device_indices), "device", "demoted"
+                )
                 self.cache_controller.evict_device(device_indices)
                 node.release_host()
             staged.clear()
@@ -1271,9 +1276,6 @@ class HiRadixCache(RadixCache):
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
-                # Fresh backup then demotion: same device-tier exit as
-                # _evict_backuped, so it gets the same sample.
-                self._observe_kv_eviction(x, len(x.value), "device", "demoted")
                 x.protect_host()
                 staged.append((x, x.value))
                 num_evicted += self._detach_backuped(x)
