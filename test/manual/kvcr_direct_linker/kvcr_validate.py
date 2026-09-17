@@ -386,8 +386,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--report", required=True)
-    parser.add_argument("extra", nargs="*", help="extra sglang.launch_server args")
-    args = parser.parse_args()
+    # Unknown flags are forwarded to sglang.launch_server verbatim.
+    args, args.extra = parser.parse_known_args()
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     report = (scenario_roundtrip if args.scenario == "roundtrip" else scenario_peer)(
