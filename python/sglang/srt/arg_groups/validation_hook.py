@@ -108,6 +108,22 @@ def validate_cache_salt_ttl(server_args: Any) -> None:
             "is not implemented for the Rust tree core."
         )
 
+    if cfg.cache_salt_ttl_zeroize:
+        if cfg.cache_salt_ttl_zeroize_max_bytes_per_iteration <= 0:
+            raise ValueError(
+                "--cache-salt-ttl-zeroize-max-bytes-per-iteration must be positive."
+            )
+        # The wipe is issued on the scheduler's current stream, which orders it
+        # after the attention kernels already queued there. A second forward
+        # stream would run its reads concurrently with those writes.
+        if cfg.enable_two_batch_overlap:
+            raise ValueError(
+                "--cache-salt-ttl-zeroize does not support "
+                "--enable-two-batch-overlap: the wipe is ordered against the "
+                "current stream only, so the other microbatch's attention "
+                "reads would race it."
+            )
+
 
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args

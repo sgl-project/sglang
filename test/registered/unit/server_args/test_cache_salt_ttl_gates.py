@@ -84,6 +84,12 @@ class TestCacheSaltTtlGates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be >="):
             _validate(cache_salt_ttl_max_seconds=5.0)
 
+    def test_zeroize_is_refused_where_it_cannot_order_against_the_reads(self):
+        with self.assertRaisesRegex(ValueError, "two-batch-overlap"):
+            _validate(cache_salt_ttl_zeroize=True, enable_two_batch_overlap=True)
+        # ...but the flag alone is fine.
+        _validate(cache_salt_ttl_zeroize=True)
+
 
 if __name__ == "__main__":
     unittest.main()

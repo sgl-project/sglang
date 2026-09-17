@@ -290,6 +290,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.kv_zeroize import build_kv_zeroizer, warmup_zero_kv_rows
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -624,6 +625,7 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        self.init_cache_salt_ttl_zeroize()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -2760,6 +2762,29 @@ class Scheduler(
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
+
+    def init_cache_salt_ttl_zeroize(self) -> None:
+        """Wire up --cache-salt-ttl-zeroize, or fail startup if it cannot run.
+
+        Built here rather than inside the cache because the plan has to read
+        the live KV pool's buffers, and a pool family whose bytes it cannot
+        enumerate must stop the server: a partial wipe reads as a guarantee.
+        """
+        if not (self.cache_salt_ttl_enabled and get_memory().cache_salt_ttl_zeroize):
+            return
+        zeroizer = build_kv_zeroizer(
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            self.tree_cache.components.keys(),
+        )
+        self.tree_cache.enable_cache_salt_ttl_zeroize(
+            zeroizer,
+            get_memory().cache_salt_ttl_zeroize_max_bytes_per_iteration,
+        )
+        # Compile the kernel now: the first expiry would otherwise JIT inside a
+        # scheduler iteration, and SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY
+        # treats a post-readiness Triton load as a fault.
+        warmup_zero_kv_rows(self.token_to_kv_pool_allocator.device)
 
     def handle_expire_cache_salts(self, recv_req: ExpireCacheSaltsReq):
         """Drop the radix KV of cache salts whose TTL elapsed.

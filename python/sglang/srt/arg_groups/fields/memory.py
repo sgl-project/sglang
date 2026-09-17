@@ -122,6 +122,14 @@ class Memory(msgspec.Struct):
         int,
         "Cap on simultaneously tracked cache salts. Nothing bounds how many distinct salts a client can mint, so past this cap the salts closest to their deadline are expired early.",
     ] = 16384
+    cache_salt_ttl_zeroize: A[
+        bool,
+        "Overwrite the KV bytes of slots freed by a cache-salt TTL expiry before returning them to the allocator. Freeing is index bookkeeping only, so without this a departed salt's KV stays readable in HBM until some later forward happens to overwrite it.",
+    ] = False
+    cache_salt_ttl_zeroize_max_bytes_per_iteration: A[
+        int,
+        "Cap on the KV bytes zeroized per scheduler iteration. A TTL teardown is bursty -- one departing tenant can release a whole cached prefix at once -- so the wipe is spread over iterations. Slots not yet cleared stay withheld from the allocator, so none is ever handed out dirty.",
+    ] = 256 * 1024 * 1024
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
