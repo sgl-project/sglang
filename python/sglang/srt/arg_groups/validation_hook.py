@@ -77,10 +77,56 @@ def check_server_args(server_args: Any):
                     "NPU PP + speculative decoding (MTP) is only supported "
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
+        elif envs.SGLANG_ENABLE_PP_SPEC.get():
+            assert cfg.disable_overlap_schedule, (
+                "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+            )
+            # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
+            # tail-drafts; every other algorithm would be mis-rebuilt.
+            assert (
+                cfg.speculative_algorithm == "EAGLE"
+                and not cfg.enable_multi_layer_eagle
+            ), (
+                "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only, "
+                f"got {cfg.speculative_algorithm}"
+            )
+            # PD prefill relays topk_p / topk_index / hidden states through
+            # RelayPayload; the gated flow replaces that relay with its own
+            # and does not carry those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The PP relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every stage rebuilds the same verify input from the relayed
+            # per-request state, so all stages must see the same batch.
+            # DP attention partitions it per DP rank.
+            assert not cfg.enable_dp_attention, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
         else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            pp_dspark_prefill = (
+                cfg.speculative_algorithm or ""
+            ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            pp_dspark_decode = (
+                (cfg.speculative_algorithm or "").upper() == "DSPARK"
+                and cfg.disaggregation_mode == "decode"
+                and cfg.speculative_dspark_pp_replicated_draft
+            )
+            assert (
+                cfg.speculative_algorithm is None
+                or pp_dspark_prefill
+                or pp_dspark_decode
+            ), (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for DSPARK on a PD prefill server, or on a PD decode server with "
+                "--speculative-dspark-pp-replicated-draft"
             )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
@@ -113,6 +159,14 @@ def check_server_args(server_args: Any):
     check_lora_server_args(server_args)
 
     # Check speculative decoding
+    if cfg.speculative_draft_scheduling_policy == "bubble":
+        assert (
+            cfg.speculative_algorithm or ""
+        ).upper() == "DSPARK" and cfg.speculative_dspark_pp_replicated_draft, (
+            "--speculative-draft-scheduling-policy=bubble requires DSPARK "
+            "with --speculative-dspark-pp-replicated-draft"
+        )
+
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 

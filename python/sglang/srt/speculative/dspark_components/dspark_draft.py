@@ -211,6 +211,7 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
+        force_draft_embedding: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -222,6 +223,7 @@ class DraftBlockProposer:
         self._tp_sync = tp_sync
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._force_draft_embedding = force_draft_embedding
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -252,7 +254,7 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if not self.sample_from_anchor or self._force_draft_embedding
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
