@@ -1419,6 +1419,8 @@ FILE_SUITES = {
     ],
     "1-gpu-b200": [
         "test_server_b200.py",
+        # Native H3 resident weights need a large-memory diffusion runner.
+        "../single_test_file/test_weight_cache_minimax_h3_1_gpu.py",
     ],
     "4-gpu-h100": [
         "test_server_4_gpu_h100.py",
@@ -1449,6 +1451,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_weight_cache_1_gpu.py",
         "../single_test_file/test_weight_cache_qwen_image_1_gpu.py",
+        "../single_test_file/test_weight_cache_startup_guard_1_gpu.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1489,6 +1492,7 @@ STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
         "../single_test_file/test_weight_cache_1_gpu.py": 1200.0,
         "../single_test_file/test_weight_cache_qwen_image_1_gpu.py": 600.0,
+        "../single_test_file/test_weight_cache_startup_guard_1_gpu.py": 300.0,
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
     "2-gpu": {

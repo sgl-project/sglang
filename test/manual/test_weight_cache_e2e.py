@@ -121,13 +121,12 @@ def run_single_daemon(
                     elif req.get("type") == "fetch_state":
                         engine_config = CacheConfig.from_dict(req["config"])
                         if daemon.config.matches(engine_config):
-                            send_msg(
+                            daemon.transport_backend.send_fetch_state_response(
                                 conn,
-                                {
-                                    "status": "ok",
-                                    "config": daemon.config.to_dict(),
-                                    "entries": daemon.state_entries,
-                                },
+                                config=daemon.config.to_dict(),
+                                entries=daemon.state_entries,
+                                pid=os.getpid(),
+                                preloaded_weights_bytes=daemon.preloaded_weights_bytes,
                             )
                         else:
                             send_msg(
@@ -282,7 +281,6 @@ def main():
     )
 
     # Query config from daemon (pp_rank=0, tp_rank=0)
-    from sglang.srt.utils import MultiprocessingSerializer
     from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
     socket_path_0 = _temp_path(tp_size, 0, 0, ".sock")
@@ -321,7 +319,11 @@ def main():
         sample_names = list(entries.keys())[:5]
         for name in sample_names:
             entry = entries[name]
-            imported = MultiprocessingSerializer.deserialize(entry["handle"])
+            from sglang.srt.weight_cache.transport import get_client_transport_backend
+
+            imported = get_client_transport_backend(
+                result.get("transport_backend")
+            ).import_tensor(entry)
             print(
                 f"  {name}: shape={tuple(imported.shape)}, "
                 f"dtype={imported.dtype}, device={imported.device}"

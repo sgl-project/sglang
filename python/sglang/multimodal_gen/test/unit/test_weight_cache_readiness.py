@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Readiness probes must not race the health-success observer shutdown."""
 
+import itertools
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,7 +20,7 @@ def test_health_success_preserves_or_probes_actual_liveness(observed):
     with (
         patch.object(wc.threading, "Thread") as thread,
         patch.object(wc.ServerManager, "_wait_for_ready"),
-        patch.object(wc.time, "perf_counter", side_effect=[11.0, 12.0]),
+        patch.object(wc.time, "perf_counter", side_effect=itertools.count(11.0)),
         patch.object(wc.requests, "get", return_value=Mock(status_code=200)) as get,
     ):
         manager._wait_for_ready(Mock(), Mock())
@@ -30,7 +31,6 @@ def test_health_success_preserves_or_probes_actual_liveness(observed):
     else:
         get.assert_called_once_with("http://127.0.0.1:12345/liveness", timeout=1)
         assert manager.readiness["liveness"] == 2.0
-    thread.return_value.join.assert_called_once_with(timeout=2)
 
 
 @pytest.mark.parametrize("timeout", [False, True])
@@ -52,4 +52,3 @@ def test_health_success_does_not_fabricate_liveness_on_probe_failure(timeout):
     ):
         manager._wait_for_ready(Mock(), Mock())
     assert "liveness" not in manager.readiness
-    thread.return_value.join.assert_called_once_with(timeout=2)

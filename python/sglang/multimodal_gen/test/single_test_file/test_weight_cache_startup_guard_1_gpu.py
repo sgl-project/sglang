@@ -80,7 +80,7 @@ def test_complete_warm_start_has_no_cached_tensor_reads_and_two_consumers_are_im
     with tempfile.TemporaryDirectory(prefix="wc-guard-") as runtime:
         socket_path = Path(runtime) / "owner.sock"
         env = {"SGLANG_DIFFUSION_WEIGHT_CACHE_DIR": runtime}
-        flags = "--num-gpus 1 --warmup-mode off --performance-mode manual"
+        flags = "--num-gpus 1 --warmup-mode off --performance-mode manual --attention-backend fa"
         with (tmp_path / "owner.log").open("w") as log:
             try:
                 ordinary = TimedServerManager(

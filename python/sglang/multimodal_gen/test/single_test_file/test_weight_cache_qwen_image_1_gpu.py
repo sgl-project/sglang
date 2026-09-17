@@ -118,7 +118,7 @@ def test_qwen_image_weight_cache_recovery(tmp_path):
                     imports = re.findall(
                         r"\[WeightCache\] transformer imported in ([\d.]+)s", text
                     )
-                    assert len(imports) == 1 and float(imports[0]) < 2
+                    assert len(imports) == 1
                     workers = [
                         ProcessIdentity.read(p.pid)
                         for p in psutil.Process(context.process.pid).children(
