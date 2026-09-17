@@ -1351,7 +1351,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1360,11 +1359,25 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if req_pool_indices is not None:
+            # A relayed PP accept result is committed after its verify forward
+            # context has exited.  At that point forward_metadata belongs to the
+            # most recently launched micro-batch, not necessarily the batch whose
+            # accept result just arrived.  Rebuild the destination slots from the
+            # matched forward snapshot supplied by the commit caller.
+            state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
+                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
+                    req_pool_indices[:request_number]
+                )
+            )
+        else:
+            # Direct worker commits happen in the active verify context and some
+            # legacy callers do not carry request-pool indices.
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -229,6 +230,58 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                 torch.tensor([2, -1], dtype=torch.int32),
             )
         )
+
+
+class TestDelayedMambaCommitBatchPairing(CustomTestCase):
+    def test_request_slots_override_stale_forward_metadata(self):
+        """A delayed PP relay must commit the batch that produced the accept result."""
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        backend = object.__new__(HybridLinearAttnBackend)
+        req_pool = MagicMock()
+        req_pool.mamba_pool = SimpleNamespace(replayssm_is_kda=False)
+        mamba_caches = MagicMock()
+        req_pool.get_speculative_mamba2_params_all_layers.return_value = mamba_caches
+        req_pool.get_mamba_indices.return_value = torch.tensor(
+            [41, 42, 43], dtype=torch.int32
+        )
+
+        linear_backend = MagicMock()
+        linear_backend.req_to_token_pool = req_pool
+        linear_backend.forward_metadata.mamba_cache_indices = torch.tensor(
+            [99], dtype=torch.int32
+        )
+        linear_backend._translate_mamba_indices.side_effect = lambda value: value + 100
+        linear_backend.accept_lens_pool = None
+        backend.linear_attn_backend = linear_backend
+        backend._update_ple_state_after_mtp_verify = MagicMock()
+
+        last_steps = torch.tensor([2, 0, 3], dtype=torch.int32)
+        req_pool_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
+        with patch(
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+            "scatter_mamba_states_after_mtp_verify"
+        ) as scatter:
+            backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_steps,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+                req_pool_indices=req_pool_indices,
+            )
+
+        req_pool.get_mamba_indices.assert_called_once()
+        torch.testing.assert_close(
+            req_pool.get_mamba_indices.call_args.args[0], req_pool_indices
+        )
+        scatter.assert_called_once()
+        torch.testing.assert_close(
+            scatter.call_args.args[1],
+            torch.tensor([141, 142, 143], dtype=torch.int32),
+        )
+        torch.testing.assert_close(scatter.call_args.args[2], last_steps)
 
 
 class TestConvWindowDedupLayout(CustomTestCase):
