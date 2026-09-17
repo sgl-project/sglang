@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
+  pull_request:
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -388,7 +389,7 @@ jobs:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode == true }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
     env:
@@ -408,22 +409,6 @@ jobs:
           OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
         run: |
           set -euo pipefail
-
-          # Print lengths only (never the values) to verify secrets injection.
-          # GitHub auto-masks non-empty secret values in logs; printing
-          # lengths additionally surfaces the "secret not configured" case,
-          # which shows as 0 here instead of an opaque 403 below.
-          echo "OBS_ACCESS_KEY length: ${#OBS_ACCESS_KEY}"
-          echo "OBS_SECRET_KEY length: ${#OBS_SECRET_KEY}"
-
-          # Empty credentials make the request anonymous; a private bucket then
-          # answers 403 Access Denied (fork PRs and repos without these secrets
-          # configured end up here). Fail fast with a clear cause instead of
-          # three opaque 403 retries.
-          if [ -z "${OBS_ACCESS_KEY:-}" ] || [ -z "${OBS_SECRET_KEY:-}" ]; then
-            echo "::error::OBS credentials are empty; secrets OBS_ACCESS_KEY_PRECISION/OBS_SECRET_ACCESS_KEY_PRECISION are unavailable in this run (fork PR or repo secrets not configured)"
-            exit 1
-          fi
 
           if ! python3 -c "import obs" >/dev/null 2>&1; then
             echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
@@ -470,22 +455,6 @@ jobs:
           OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
         run: |
           set -euo pipefail
-
-          # Print lengths only (never the values) to verify secrets injection.
-          # GitHub auto-masks non-empty secret values in logs; printing
-          # lengths additionally surfaces the "secret not configured" case,
-          # which shows as 0 here instead of an opaque 403 below.
-          echo "OBS_ACCESS_KEY length: ${#OBS_ACCESS_KEY}"
-          echo "OBS_SECRET_KEY length: ${#OBS_SECRET_KEY}"
-
-          # Empty credentials make the request anonymous; a private bucket then
-          # answers 403 Access Denied (fork PRs and repos without these secrets
-          # configured end up here). Fail fast with a clear cause instead of
-          # three opaque 403 retries.
-          if [ -z "${OBS_ACCESS_KEY:-}" ] || [ -z "${OBS_SECRET_KEY:-}" ]; then
-            echo "::error::OBS credentials are empty; secrets OBS_ACCESS_KEY_PRECISION/OBS_SECRET_ACCESS_KEY_PRECISION are unavailable in this run (fork PR or repo secrets not configured)"
-            exit 1
-          fi
 
           if ! python3 -c "import obs" >/dev/null 2>&1; then
             echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
@@ -595,7 +564,7 @@ jobs:
 
         recommend-tests-from-coverage,
       ]
-    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode == true }}
+    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode != true }}
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
