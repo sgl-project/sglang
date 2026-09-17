@@ -95,4 +95,4 @@ def test_verify_tree_greedy():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+    sys.exit(pytest.main([__file__, "-v"]))

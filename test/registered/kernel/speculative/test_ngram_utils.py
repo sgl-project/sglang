@@ -81,4 +81,4 @@ def test_reconstruct_indices_from_tree_mask():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+    sys.exit(pytest.main([__file__, "-v"]))
