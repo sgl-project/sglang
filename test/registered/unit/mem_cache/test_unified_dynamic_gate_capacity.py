@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from unified_allocator_fixtures import (
+from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
     reset_context,
