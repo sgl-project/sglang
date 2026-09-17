@@ -428,7 +428,7 @@ def _do_bench_internal_graph(
     tic = torch.cuda.Event(enable_timing=True)
     toc = torch.cuda.Event(enable_timing=True)
     for _ in range(max(replay_iters // loop_count, 10)):
-        empty_tensor.zero_()  # cold the L2 cache
+        empty_tensor.max()
         sync_multigpu_fn()  # sync GPU before each iteration for precise timing
         tic.record(stream)
         graph.replay()
@@ -532,7 +532,7 @@ def do_bench(
             toc = torch.cuda.Event(enable_timing=True)
             empty_tensor = _get_flush_l2_buffer()
             for _ in range(max(replay_iters, 10)):
-                empty_tensor.zero_()  # cold the L2 cache
+                empty_tensor.max()
                 sync_multigpu_fn()
                 tic.record(stream)
                 fn(*input_args, **input_kwargs)

@@ -30,7 +30,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
+from sglang.kernels.ops.attention.dsv4.wo_a import (
+    fused_rope_wo_a_bf16,
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
@@ -443,6 +445,11 @@ if _is_hip:
             and is_wo_a_fp8_fused_invrope_supported()
         ):
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+
+
+@functools.lru_cache(maxsize=1)
+def _fused_wo_a_arch_supported() -> bool:
+    return _is_cuda and torch.cuda.get_device_capability()[0] == 10
 
 
 def _apply_wo_a_bf16_matmul(
@@ -944,6 +951,18 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+    @functools.cached_property
+    def use_flashinfer_mxfp8_wo_b(self) -> bool:
+        """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
+        quantization into its epilogue. Not known until wo_b's weights load."""
+        quant_method = getattr(self.wo_b, "quant_method", None)
+        return getattr(
+            quant_method, "mxfp8_dense_backend", None
+        ) == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL and (
+            getattr(quant_method, "use_mxfp8", False)
+            or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+        )
+
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
@@ -1161,6 +1180,18 @@ class MQALayer(MqaAttentionBase):
 
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+        )
+        # Everything the megakernel needs except the token count and the mxfp8
+        # wo_b epilogue, which only reports ready after its weights are loaded.
+        self.use_fused_wo_a = (
+            self.is_dsv41
+            and envs.SGLANG_DSV41_FUSED_WO_A.get()
+            and _fused_wo_a_arch_supported()
+            and not self.wo_a_fp8
+            and not self.use_npu_arch35_mxfp8_wo_a
+            and self.wo_a.weight.dtype == torch.bfloat16
+            and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
+            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
         )
 
         # KV cache write is always fused into the K kernel
@@ -2361,6 +2392,13 @@ class MQALayer(MqaAttentionBase):
                 self.wo_a.weight_scale_inv.data,
             )
         else:
+            fuse_mxfp8_quant = (
+                self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
+            )
+            fuse_rope_wo_a = (
+                self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+            )
+
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
                     forward_batch, positions, o.dtype, inverse=True
@@ -2372,7 +2410,8 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            else:
+            elif not fuse_rope_wo_a:
+                # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,
@@ -2383,7 +2422,17 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if self.use_npu_arch35_mxfp8_wo_a:
+            if fuse_rope_wo_a:
+                wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                out = fused_rope_wo_a_bf16(
+                    o,
+                    wo_a,
+                    torch.view_as_real(self.freqs_cis).flatten(1),
+                    positions,
+                    out_mxfp8=fuse_mxfp8_quant,
+                )
+                o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
+            elif self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
                     o, dst_type=torch.float8_e4m3fn
                 )
@@ -2466,25 +2515,7 @@ class MQALayer(MqaAttentionBase):
                             is_target_verify=forward_batch.forward_mode.is_target_verify(),
                             is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                             fast_path=self.is_dsv41,
-                            fuse_mxfp8_quant=(
-                                not get_forward().sp_active
-                                and getattr(
-                                    getattr(self.wo_b, "quant_method", None),
-                                    "mxfp8_dense_backend",
-                                    None,
-                                )
-                                == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-                                and (
-                                    getattr(
-                                        getattr(self.wo_b, "quant_method", None),
-                                        "use_mxfp8",
-                                        False,
-                                    )
-                                    or getattr(
-                                        self.wo_b, "block_fp8_mxfp8_ready", False
-                                    )
-                                )
-                            ),
+                            fuse_mxfp8_quant=fuse_mxfp8_quant,
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(
