@@ -921,6 +921,13 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
     if not view.uses_mamba_radix_cache:
+        # auto is arch-gated, so only an explicit strategy reaches a non-mamba
+        # arch here, where it would arm the mamba paths and crash at prefill.
+        if mamba_extra_buffer_of(view):
+            raise ValueError(
+                f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
+                f"needs mamba state, got {model_arch}."
+            )
         return
 
     if mamba_extra_buffer_of(view):
