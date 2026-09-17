@@ -1,16 +1,60 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: HIP RoPE stores use a different cache layout and kernel.
+register_amd_ci(est_time=40, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 class TestQRopeStore(CustomTestCase):
+    def setUp(self):
+        if is_hip():
+            from sglang.kernels.ops.attention import deepseek_v4_rope
+
+            previous = deepseek_v4_rope._USE_BATCHED_ROPE
+            deepseek_v4_rope.set_batched_rope(True)
+            self.addCleanup(deepseek_v4_rope.set_batched_rope, previous)
+
+    @unittest.skipUnless(is_hip(), "AMD model dispatch")
+    def test_model_writes_output_without_mutating_gemm_result(self):
+        from sglang.srt.models.deepseek_v4 import MQALayer
+
+        for rows in (6, 4097):
+            with self.subTest(rows=rows):
+                q = torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+                original = q.clone()
+                output = torch.empty(rows, 64, 512, device="cuda", dtype=q.dtype)[
+                    :, :16
+                ]
+                freqs = torch.polar(
+                    torch.ones(8192, 32, device="cuda"),
+                    torch.randn(8192, 32, device="cuda"),
+                )
+                positions = torch.arange(rows, device="cuda")
+                attention = SimpleNamespace(
+                    wq_b=lambda x: (q, None),
+                    n_local_heads=16,
+                    head_dim=512,
+                    qk_rope_head_dim=64,
+                    q_head_norm=False,
+                    is_dsv41=True,
+                    freqs_cis=freqs,
+                )
+                actual = MQALayer._compute_q_b(attention, q, positions, output)
+                expected = original.clone()
+                fused_rope_inplace(expected[..., 448:], None, freqs, positions)
+                self.assertIs(actual, output)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(q, original, rtol=0, atol=0)
+
     def test_exact_output_and_padding(self):
         torch.manual_seed(911)
         freqs = torch.polar(

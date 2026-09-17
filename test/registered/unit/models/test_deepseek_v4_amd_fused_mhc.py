@@ -77,10 +77,10 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
                     )
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_gfx95_enables_cross_layer_fusion(self, _mock_aiter, _mock_gfx95):
+    def test_aiter_gfx95_enables_cross_layer_fusion(self, _mock_gfx95):
         with (
+            envs.SGLANG_USE_AITER.override(True),
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
@@ -88,10 +88,10 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
             self.assertTrue(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=False)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_cross_layer_disabled_without_gfx95(self, _mock_aiter, _mock_gfx95):
+    def test_aiter_cross_layer_disabled_without_gfx95(self, _mock_gfx95):
         with (
+            envs.SGLANG_USE_AITER.override(True),
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
@@ -99,24 +99,24 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
             self.assertFalse(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=False)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_path_skips_without_sglang_use_aiter(self, _mock_aiter, _mock_gfx95):
-        result = deepseek_v4_fused_mhc.try_aiter_fused_mhc_post_pre(
-            layer_input=mock.Mock(shape=(32, 7168), dim=2, device="cpu"),
-            residual=mock.Mock(dim=3),
-            post=mock.Mock(),
-            comb=mock.Mock(),
-            hc_fn=mock.Mock(),
-            hc_scale=mock.Mock(),
-            hc_base=mock.Mock(),
-            rms_eps=1e-6,
-            hc_eps=1e-6,
-            hc_post_mult=2.0,
-            sinkhorn_iters=20,
-            norm_weight=mock.Mock(),
-            norm_eps=1e-6,
-        )
+    def test_aiter_path_skips_without_sglang_use_aiter(self, _mock_gfx95):
+        with envs.SGLANG_USE_AITER.override(False):
+            result = deepseek_v4_fused_mhc.try_aiter_fused_mhc_post_pre(
+                layer_input=mock.Mock(shape=(32, 7168), dim=2, device="cpu"),
+                residual=mock.Mock(dim=3),
+                post=mock.Mock(),
+                comb=mock.Mock(),
+                hc_fn=mock.Mock(),
+                hc_scale=mock.Mock(),
+                hc_base=mock.Mock(),
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                hc_post_mult=2.0,
+                sinkhorn_iters=20,
+                norm_weight=mock.Mock(),
+                norm_eps=1e-6,
+            )
         self.assertIsNone(result)
 
     @mock.patch.object(
@@ -287,6 +287,10 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # (norm_fused=False) -- the Triton fused post+pre contract.
         normed = object()
         layer.input_layernorm.return_value = normed
+        layer._input_norm.side_effect = lambda hs, allow_aiter_quant=True: (
+            layer.input_layernorm(hs),
+            None,
+        )
         layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
 
         # Force the non-aiter (torch layernorm) branch deterministically so the
@@ -359,7 +363,11 @@ class TestAmdFusedMhcNumerical(unittest.TestCase):
         res = (torch.randn(m, hc_mult, hidden, device=dev) * 0.02).bfloat16()
         post = torch.randn(m, hc_mult, device=dev) * 0.02
         comb = torch.randn(m, hc_mult, hc_mult, device=dev) * 0.02
-        fn = (torch.randn(hc_mult3, hc_mult * hidden, device=dev) * 0.02).bfloat16()
+        # AITER reads fn as FP32; a BF16 allocation would be read out of bounds.
+        fn = (
+            torch.randn(hc_mult3, hc_mult * hidden, device=dev, dtype=torch.float32)
+            * 0.02
+        )
         scl = torch.ones(hc_mult3, device=dev)
         base = torch.zeros(hc_mult3, device=dev)
         nw = torch.ones(hidden, device=dev).bfloat16()

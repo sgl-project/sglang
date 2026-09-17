@@ -538,6 +538,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    # Longest sequence across the attention-DP group (from the scheduler's DP
+    # sync); None without DP attention.
+    dp_max_seq_len: Optional[int] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -698,6 +701,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+    encoder_swa_replay: bool = False
+
+    # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
+    # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
+    ngram_history: Optional[torch.Tensor] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -900,6 +908,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
+            ngram_history=batch.ne_history,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -918,6 +927,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
+            dp_max_seq_len=batch.dp_max_seq_len,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,

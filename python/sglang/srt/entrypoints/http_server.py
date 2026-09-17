@@ -2248,6 +2248,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         bool(model_info.get("has_image_understanding", False))
         and not get_disagg().language_only
         and not get_disagg().language_model_only
+        and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
     )
     if model_info["is_generation"]:

@@ -38,7 +38,7 @@ import torch
 from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(is_hip(), "wo_a batched_gemm_bf16 routing requires ROCm")
@@ -47,12 +47,20 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
     def setUpClass(cls):
         # Import the heavy model module only on a GPU runner (see module docstring).
         from sglang.srt.models import deepseek_v4 as dsv4
+        from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense
 
         cls.dsv4 = dsv4
+        cls.gfx95_dense = deepseek_v4_gfx95_dense
         cls.device = "cuda"  # torch maps "cuda" onto the ROCm HIP device
 
     def setUp(self):
         torch.manual_seed(0)
+        # the gfx950 wo_a route reads the exec bag (deterministic gate): publish one
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         # The one-shot runtime-disable flag is process-global; reset it so a
         # failure case in one test cannot leak into another.
         self.dsv4._wo_a_aiter_batched_gemm_disabled = False
@@ -113,6 +121,8 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                     mock.patch.object(
                         self.dsv4, "_wo_a_aiter_batched_gemm_enabled", enabled
                     ),
+                    # the gfx950 fp8-grid fork would run before the aiter kernel
+                    mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
                     mock.patch.object(
                         self.dsv4, "_wo_a_batched_gemm_bf16", fake_kernel
                     ),
@@ -143,6 +153,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
 
         with (
             mock.patch.object(self.dsv4, "_wo_a_aiter_batched_gemm_enabled", True),
+            mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
             mock.patch.object(self.dsv4, "_wo_a_batched_gemm_bf16", _boom),
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)

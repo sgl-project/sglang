@@ -120,7 +120,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -2382,6 +2381,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Mask marking chunked (not-yet-finished) prefill requests whose sampled
     # pseudo next-token must NOT be written into the ngram token table.
     ne_skip_token_table_update: torch.Tensor = None
+    # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
+    # of each request's first extend token (NgramEmbeddingManager).
+    ne_history: Optional[torch.Tensor] = None
+    encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2483,6 +2486,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Longest sequence across the attention-DP group this step (decode graph
+    # variants keyed by context length must agree on every rank).
+    dp_max_seq_len: Optional[int] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
@@ -2719,6 +2725,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            for req in reqs:
+                if (
+                    req.multimodal_inputs is not None
+                    or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    raise ValueError(
+                        "encoder SWA replay currently supports token-only text requests"
+                    )
+                if req.return_logprob and req.logprob_start_len not in (
+                    -1,
+                    len(req.origin_input_ids),
+                ):
+                    raise ValueError(
+                        "encoder SWA replay cannot return cached prompt logprobs"
+                    )
+            self.encoder_swa_reset = [
+                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
+            ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self

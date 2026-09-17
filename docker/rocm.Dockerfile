@@ -569,12 +569,20 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
+# Drop this synchronization patch after the AITER pin includes ROCm/aiter#5561.
+COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
+# gfx950 BF16 SiLU dispatch and clamp fix; drop once included in its AITER pin.
+COPY docker/patches/rocm/aiter_moe_bf16_silu.patch /tmp/aiter_patches/
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
  && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && git apply --verbose /tmp/aiter_patches/aiter_flydsl_moe_stage1_lds_dma_drain.patch \
+ && if [ "${GPU_ARCH_LIST}" = "gfx950" ]; then \
+      git apply --verbose /tmp/aiter_patches/aiter_moe_bf16_silu.patch; \
+    fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -1175,6 +1183,8 @@ ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
+# Drop after the AITER pin includes ROCm/aiter#5562; model_configs preserves other models' rows.
+COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
