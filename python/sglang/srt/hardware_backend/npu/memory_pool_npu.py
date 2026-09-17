@@ -1124,6 +1124,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
 
         loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+        if loc.numel() == 0:
+            # Reachable only on the filtered extend path, where a rank can
+            # legitimately own none of a short chunk's rows -- at dcp16 any
+            # extend under 16 tokens leaves most ranks with nothing. The row-0
+            # path never gets here because it keeps every row. Upstream's
+            # sharded pool returns on the same condition
+            # (page_interleave_pool.py, `if owned_idx.numel() == 0: return`);
+            # a zero-row scatter is not worth trusting to a vendor operator.
+            return
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
