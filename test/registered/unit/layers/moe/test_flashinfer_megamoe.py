@@ -124,6 +124,55 @@ def test_make_supported_config_passes_persistent_reduce(monkeypatch):
     assert config.topk_reduce_persistent is True
 
 
+def test_make_supported_moe_ep_tensors_passes_runtime_num_tokens(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class NewMoEEpTensors:
+        def __init__(
+            self,
+            *,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            num_tokens=None,
+        ):
+            self.hidden_states = hidden_states
+            self.topk_ids = topk_ids
+            self.topk_weights = topk_weights
+            self.num_tokens = num_tokens
+
+    tensors = module._make_supported_moe_ep_tensors(
+        NewMoEEpTensors,
+        hidden_states="x",
+        topk_ids="ids",
+        topk_weights="weights",
+        num_tokens=7,
+        fc1_alpha="ignored",
+    )
+    assert tensors.num_tokens == 7
+    assert not hasattr(tensors, "fc1_alpha")
+
+
+def test_make_supported_moe_ep_tensors_filters_runtime_num_tokens(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class OldMoEEpTensors:
+        def __init__(self, *, hidden_states, topk_ids, topk_weights):
+            self.hidden_states = hidden_states
+            self.topk_ids = topk_ids
+            self.topk_weights = topk_weights
+
+    tensors = module._make_supported_moe_ep_tensors(
+        OldMoEEpTensors,
+        hidden_states="x",
+        topk_ids="ids",
+        topk_weights="weights",
+        num_tokens=7,
+    )
+    assert tensors.hidden_states == "x"
+    assert not hasattr(tensors, "num_tokens")
+
+
 def test_adapter_keeps_router_ids_int32(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
@@ -169,6 +218,7 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
 
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
+    assert mega.tensors.num_tokens == hidden_states.shape[0]
     assert result.hidden_states is output
 
 

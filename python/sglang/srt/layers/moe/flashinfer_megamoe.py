@@ -233,6 +233,20 @@ def _make_supported_config(config_cls: Any, **kwargs: Any) -> Any:
     return config_cls(**supported)
 
 
+def _make_supported_moe_ep_tensors(tensors_cls: Any, **kwargs: Any) -> Any:
+    signature = inspect.signature(tensors_cls)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return tensors_cls(**kwargs)
+
+    supported = {
+        name: value for name, value in kwargs.items() if name in signature.parameters
+    }
+    return tensors_cls(**supported)
+
+
 def _topk_reduce_persistent_enabled() -> bool:
     return bool(envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get())
 
@@ -648,12 +662,14 @@ def run_flashinfer_megamoe(
     mega = quant_info.mega
     _ensure_shared_workspace(mega)
 
-    t = MoEEpTensors(
+    t = _make_supported_moe_ep_tensors(
+        MoEEpTensors,
         hidden_states=x.to(torch.bfloat16),
         # FlashInfer's fused staging accepts the int32 router output and widens
         # directly into its final int64 workspace buffer. Keep this path copy-free.
         topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
+        num_tokens=x.shape[0],
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
