@@ -62,7 +62,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    broadcast_pyobj,
+    deserialize_tensor_payload,
+    set_random_seed,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -214,13 +218,16 @@ class BaseTpWorker(ABC):
         deserializing another rank's copy would break producer-side CUDA-IPC
         refcounting."""
         monkey_patch_torch_reductions()
-        return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.ps.tp_rank]
-        )
+        return deserialize_tensor_payload(serialized_named_tensors[self.ps.tp_rank])
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        named_tensors = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        # safetensors payloads deserialize to a dict; the weight updater expects
+        # an iterable of (name, tensor) pairs.
+        if isinstance(named_tensors, dict):
+            named_tensors = list(named_tensors.items())
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
+            named_tensors=named_tensors,
             load_format=recv_req.load_format,
         )
         return success, message
