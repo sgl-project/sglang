@@ -131,6 +131,43 @@ class TestProtocolFraming(CustomTestCase):
 
 
 class TestTransportBackend(CustomTestCase):
+    def test_daemon_budget_status_and_exhaustion_have_wire_responses(self):
+        from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+
+        owner = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        owner.config = _make_cache_config()
+        owner.gpu_id = 0
+        owner.preloaded_weights_bytes = 4
+        owner.transport_backend = TorchIpcTransportBackend(max_deliveries=2)
+        owner.state_entries = owner.transport_backend.prepare_export(
+            {"w": (torch.ones(1), True)}
+        )
+        a, b = socket.socketpair()
+        b.settimeout(1)
+
+        def exchange(kind):
+            send_msg(b, {"type": kind, "config": owner.config.to_dict()})
+            owner._handle_connection(a)
+            return recv_msg(b)
+
+        try:
+            self.assertEqual(exchange("query_status")["fetches_remaining"], 2)
+            with patch(
+                "sglang.srt.weight_cache.transport.MultiprocessingSerializer.serialize",
+                return_value="handle",
+            ) as serialize:
+                for _ in range(2):
+                    self.assertEqual(exchange("fetch_state")["status"], "ok")
+                exhausted = exchange("fetch_state")
+                self.assertEqual(exhausted["status"], "budget_exhausted")
+                self.assertEqual(exhausted["deliveries_reserved"], 2)
+                self.assertEqual(exhausted["fetches_remaining"], 0)
+                self.assertEqual(serialize.call_count, 2)
+            self.assertEqual(exchange("query_status")["fetches_remaining"], 0)
+        finally:
+            a.close()
+            b.close()
+
     def test_prepare_is_static_and_every_fetch_serializes_afresh(self):
         backend = TorchIpcTransportBackend(max_deliveries=2)
         with patch(

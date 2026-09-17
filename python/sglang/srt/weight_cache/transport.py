@@ -26,6 +26,10 @@ VMM_FD_BACKEND = "vmm_fd"
 _FD_INDEX_STRUCT = struct.Struct("<Q")
 
 
+class DeliveryBudgetExceeded(RuntimeError):
+    """Non-refundable producer generation budget is exhausted."""
+
+
 def _send_fd(sock: socket.socket, fd: int, index: int) -> None:
     payload = _FD_INDEX_STRUCT.pack(index)
     fds = array.array("i", [int(fd)])
@@ -131,7 +135,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
             raise RuntimeError("An IPC backend cannot export after fork")
         with self._export_lock:
             if self.deliveries_reserved >= self.max_deliveries:
-                raise RuntimeError(
+                raise DeliveryBudgetExceeded(
                     "Weight-cache IPC delivery budget exhausted; drain consumers "
                     "and restart the producer"
                 )
@@ -161,12 +165,13 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:
+        exported = self.export_entries(entries)
         send_msg(
             conn,
             {
                 "status": "ok",
                 "config": config,
-                "entries": self.export_entries(entries),
+                "entries": exported,
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
@@ -177,6 +182,16 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         self, sock: socket.socket, result: Dict[str, Any]
     ) -> Dict[str, Any]:
         return result
+
+    def stats(self) -> dict:
+        with self._export_lock:
+            remaining = self.max_deliveries - self.deliveries_reserved
+            return {
+                "max_deliveries": self.max_deliveries,
+                "deliveries_reserved": self.deliveries_reserved,
+                "fetches_remaining": remaining,
+                "budget_exhausted": remaining == 0,
+            }
 
     def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
         if entry.get("device_type") == "cuda":
@@ -239,12 +254,14 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
+    *,
+    max_deliveries: int = 128,
 ) -> WeightCacheTransportBackend:
     if VmmFdTransportBackend.can_export_state(state_tensors):
         logger.info("[weight_cache] Using transport backend: %s", VMM_FD_BACKEND)
         return VmmFdTransportBackend()
     logger.info("[weight_cache] Using transport backend: %s", TORCH_IPC_BACKEND)
-    return TorchIpcTransportBackend()
+    return TorchIpcTransportBackend(max_deliveries=max_deliveries)
 
 
 def get_client_transport_backend(name: Optional[str]) -> WeightCacheTransportBackend:

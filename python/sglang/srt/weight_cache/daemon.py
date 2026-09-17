@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import dataclasses
+import json
 import logging
 import multiprocessing
 import os
@@ -71,7 +72,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import choose_daemon_transport_backend
+from .transport import DeliveryBudgetExceeded, choose_daemon_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class WeightCacheDaemonArgs:
     dist_init_method: Optional[str] = None
     timeout: int = 1800
     force: bool = False
+    status: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -119,6 +121,11 @@ class WeightCacheDaemonArgs:
         )
         parser.add_argument("--timeout", type=int, default=1800)
         parser.add_argument("--force", action="store_true")
+        parser.add_argument(
+            "--status",
+            action="store_true",
+            help="Query one owner's recovery budget without loading weights (use --gpu-id or --weight-cache-socket).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -129,6 +136,7 @@ class WeightCacheDaemonArgs:
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            status=args.status,
         )
 
 
@@ -446,7 +454,10 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
-        self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        self.transport_backend = choose_daemon_transport_backend(
+            state_tensors,
+            max_deliveries=resolving_view(self.server_args).weight_cache_max_deliveries,
+        )
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
         for name, kind, persistent, _ in state_metadata:
             if name in self.state_entries:
@@ -575,15 +586,36 @@ class WeightCacheDaemon:
                 f"Serving {len(self.state_entries)} tensors via "
                 f"{self.transport_backend.name} transport"
             )
-            self.transport_backend.send_fetch_state_response(
+            try:
+                self.transport_backend.send_fetch_state_response(
+                    conn,
+                    config=self.config.to_dict(),
+                    entries=self.state_entries,
+                    # PID so the client can watch daemon liveness: if this
+                    # process dies while clients hold IPC mappings, their
+                    # param.data (and any CUDA-graph-captured addresses) dangle.
+                    pid=os.getpid(),
+                    preloaded_weights_bytes=self.preloaded_weights_bytes,
+                )
+            except DeliveryBudgetExceeded as error:
+                send_msg(
+                    conn,
+                    {
+                        "status": "budget_exhausted",
+                        "message": str(error),
+                        **self.transport_backend.stats(),
+                    },
+                )
+
+        elif req.get("type") == "query_status":
+            send_msg(
                 conn,
-                config=self.config.to_dict(),
-                entries=self.state_entries,
-                # PID so the client can watch daemon liveness: if this
-                # process dies while clients hold IPC mappings, their
-                # param.data (and any CUDA-graph-captured addresses) dangle.
-                pid=os.getpid(),
-                preloaded_weights_bytes=self.preloaded_weights_bytes,
+                {
+                    "status": "ok",
+                    "pid": os.getpid(),
+                    "config": self.config.to_dict(),
+                    **self.transport_backend.stats(),
+                },
             )
 
         elif req.get("type") == "ping":
@@ -860,7 +892,23 @@ if __name__ == "__main__":
 
     server_args = prepare_server_args(server_argv)
     daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
-    if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
+    if daemon_args.status:
+        cfg = resolving_view(server_args)
+        gpu_id = (
+            daemon_args.gpu_id if daemon_args.gpu_id is not None else cfg.base_gpu_id
+        )
+        path = cfg.weight_cache_socket or get_socket_path(
+            current_platform.get_device_uuid(gpu_id)
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(30)
+            conn.connect(path)
+            send_msg(conn, {"type": "query_status"})
+            response = recv_msg(conn)
+            if response.get("status") != "ok":
+                raise RuntimeError(f"Weight-cache status rejected: {response}")
+            print(json.dumps(response, sort_keys=True))
+    elif daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
         gpu_id = (
             daemon_args.gpu_id
             if daemon_args.gpu_id is not None

@@ -521,7 +521,12 @@ class IpcModelLoader(BaseModelLoader):
             send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
             result = recv_msg(sock)
 
-            if result.get("status") != "ok":
+            if result.get("status") not in ("ok", "mismatch"):
+                raise RuntimeError(
+                    f"[IpcModelLoader] Weight-cache request rejected at {self.socket_path}: "
+                    f"{result.get('status')}: {result.get('message', result)}"
+                )
+            if result.get("status") == "mismatch":
                 daemon_config = result.get("daemon_config", {})
                 raise RuntimeError(
                     f"[IpcModelLoader] Daemon config mismatch!\n"
