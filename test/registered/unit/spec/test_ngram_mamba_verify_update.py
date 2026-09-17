@@ -233,6 +233,25 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):
+    def test_ple_commit_reads_stable_request_rows(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        dst = torch.zeros((1, 8, 2), dtype=torch.float32)
+        src = torch.zeros((1, 16, 4, 2), dtype=torch.float32)
+        src[0, 11, 2] = torch.tensor([3.0, 7.0])
+
+        HybridLinearAttnBackend._scatter_speculative_state_with_mask(
+            dst,
+            src,
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([11], dtype=torch.int64),
+        )
+
+        torch.testing.assert_close(dst[0, 5], torch.tensor([3.0, 7.0]))
+
     def test_pp_verify_scratch_uses_stable_request_rows_for_all_backends(self):
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             MambaAttnBackendBase,

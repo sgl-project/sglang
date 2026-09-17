@@ -1558,8 +1558,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ) -> None:
         self.ngram_pool.set_context(ngram_indices, context)
 
-    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
-        self.ngram_pool.set_intermediate_context(context)
+    def set_ngram_intermediate_context(
+        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
+    ) -> None:
+        self.ngram_pool.set_intermediate_context(context, indices)
 
     def copy_mamba_state(
         self, src_index: torch.Tensor, dst_index: torch.Tensor

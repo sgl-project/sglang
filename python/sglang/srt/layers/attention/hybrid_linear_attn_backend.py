@@ -1477,6 +1477,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            source_indices_tensor,
         )
 
     @staticmethod
@@ -1485,19 +1486,28 @@ class HybridLinearAttnBackend(AttentionBackend):
         src: torch.Tensor,
         dst_indices_raw: torch.Tensor,
         step_indices_raw: torch.Tensor,
+        source_indices_raw: Optional[torch.Tensor] = None,
     ):
         if dst is None or src is None or step_indices_raw.numel() == 0:
             return
         if dst.is_cuda and src.is_cuda:
             fused_mamba_state_scatter_with_mask(
-                dst, src, dst_indices_raw, step_indices_raw
+                dst,
+                src,
+                dst_indices_raw,
+                step_indices_raw,
+                source_indices_raw,
             )
             return
 
         device = dst.device
         dst_indices = dst_indices_raw.to(device=device, dtype=torch.long)
         steps = step_indices_raw.to(device=device, dtype=torch.long)
-        src_indices = torch.arange(steps.shape[0], device=device, dtype=torch.long)
+        src_indices = (
+            torch.arange(steps.shape[0], device=device, dtype=torch.long)
+            if source_indices_raw is None
+            else source_indices_raw.to(device=device, dtype=torch.long)
+        )
         valid = (
             (steps >= 0)
             & (steps < src.shape[2])
@@ -1518,6 +1528,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
+        source_indices_tensor: Optional[torch.Tensor] = None,
     ):
         """Roll the accepted per-step PLE side states into their main slots."""
         req_to_token_pool = self.linear_attn_backend.req_to_token_pool
@@ -1555,6 +1566,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_state,
                 state_indices_tensor,
                 last_correct_step_indices,
+                source_indices_tensor,
             )
             if mamba_track_indices is not None:
                 self._scatter_speculative_state_with_mask(
@@ -1562,6 +1574,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                     intermediate_state,
                     mamba_track_indices,
                     mamba_steps_to_track,
+                    source_indices_tensor,
                 )
 
 
