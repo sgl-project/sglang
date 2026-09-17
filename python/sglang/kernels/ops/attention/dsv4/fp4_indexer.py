@@ -464,3 +464,154 @@ def fp4_index_logits_decode(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _fp4_index_logits_paged_kernel(
+    q_ptr,  # [B, H, D] bf16, fp4 queries (already RoPE'd)
+    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
+    rtt_ptr,  # [num_req_slots, max_context_len] int32 req_to_token
+    req_ptr,  # [B] int64 request-pool indices
+    lens_ptr,  # [B] int64 visible compressed positions per request
+    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
+    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
+    L,
+    ratio,
+    page_size,
+    row_stride,
+    rtt_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    """The same math as ``_fp4_index_logits_kernel`` with paged slot lookup.
+
+    Each tile resolves ``req_to_token[req, logical_pos * ratio] // ratio`` when
+    it needs the slot, rather than receiving a caller-materialized ``[B, L]``
+    int64 slot map.
+    """
+    b = tl.program_id(0)
+    lb = tl.program_id(1)
+    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_h = tl.arange(0, H)
+    offs_i = tl.arange(0, HALF_D)
+
+    n_vis = tl.load(lens_ptr + b)
+    valid = offs_l < tl.minimum(n_vis, L)
+    request = tl.load(req_ptr + b).to(tl.int64)
+    token = tl.load(
+        rtt_ptr + request * rtt_stride + (offs_l * ratio).to(tl.int64),
+        mask=offs_l < L,
+        other=0,
+    )
+    slot = (token // ratio).to(tl.int64)
+    # Match the reference path's masked_fill(~valid, 0).
+    slot = tl.where(valid, slot, 0)
+    page = slot // page_size
+    off = slot % page_size
+    row_base = page * row_stride
+
+    pay = tl.load(
+        table_ptr
+        + row_base[:, None]
+        + off[:, None] * INDEX_K_PAYLOAD_BYTES
+        + offs_i[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    low = _e2m1_decode(pay & 0x0F)
+    high = _e2m1_decode((pay >> 4) & 0x0F)
+    sc_idx = offs_i // 16
+    exps = tl.load(
+        table_ptr
+        + row_base[:, None]
+        + page_size * INDEX_K_PAYLOAD_BYTES
+        + off[:, None] * INDEX_K_SCALE_BYTES
+        + sc_idx[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    k_low = (low * scale).to(tl.bfloat16)
+    k_high = (high * scale).to(tl.bfloat16)
+
+    q_even = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
+    )
+    q_odd = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
+    )
+
+    acc = tl.dot(q_even, tl.trans(k_low))
+    acc += tl.dot(q_odd, tl.trans(k_high))
+    s = acc.to(tl.bfloat16).to(tl.float32)
+    s = tl.maximum(s, 0.0)
+    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
+    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
+    logit = tl.where(valid, logit, float("-inf"))
+    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
+
+
+def fp4_index_logits_decode_paged(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req: torch.Tensor,
+    ratio: int,
+    lmax: int,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Score the FP4 indexer without materializing a full ``[B, lmax]`` slot map.
+
+    ``req_to_token`` is an int32 ``[num_req_slots, max_context_len]`` mapping.
+    Its inner dimension must have unit stride because the Triton address
+    calculation receives only its row stride. The result is ``[B, lmax]`` fp32
+    logits with ``-inf`` at positions beyond each row's visible length.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert isinstance(ratio, int) and ratio > 0
+    assert isinstance(lmax, int) and lmax >= 0
+    assert req_to_token.dtype == torch.int32 and req_to_token.dim() == 2
+    assert req_to_token.stride(1) == 1
+    assert lmax * ratio <= req_to_token.shape[1]
+    assert req.dim() == 1 and lens.dim() == 1 and req.shape == lens.shape
+    assert req.shape[0] == q.shape[0]
+    assert table.dtype == torch.uint8 and table.dim() == 2
+    assert q.device == req_to_token.device == req.device == lens.device == table.device
+
+    B, H, _ = q.shape
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    out = torch.empty((B, lmax), dtype=torch.float32, device=q.device)
+    if lmax == 0 or B == 0:
+        return out
+    BLOCK_L = 64
+    grid = (B, triton.cdiv(lmax, BLOCK_L))
+    _fp4_index_logits_paged_kernel[grid](
+        q,
+        weights,
+        req_to_token,
+        req.to(torch.int64).contiguous(),
+        lens.to(torch.int64).contiguous(),
+        table,
+        out,
+        lmax,
+        ratio,
+        page_size,
+        table.stride(0),
+        req_to_token.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=H,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        BLOCK_L=BLOCK_L,
+        num_warps=4,
+    )
+    return out
