@@ -1691,6 +1691,25 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
             return None
         return remapped_name
 
+    # llm-compressor saves fp8 kv scales under the fused projection name
+    # (e.g. ...self_attn.qkv_proj.k_scale). Match this before the
+    # .k_scale/.v_scale branch below, which would otherwise remap the fused
+    # name to the nonexistent ...qkv_proj.attn.k_scale. The optional "qk"
+    # also catches names pre-mangled by name.replace("v_proj", "qkv_proj"),
+    # the same regex family as vllm's Fp8Config.get_cache_scale_mapper.
+    fused = re.match(r"^(.*\.self_attn)\.qk(?:qk)?v_proj\.([kv])_scale$", name)
+    if fused is not None:
+        remapped_name = f"{fused.group(1)}.attn.{fused.group(2)}_scale"
+        if remapped_name not in params_dict:
+            print_warning_once(
+                f"Found {fused.group(2)}_scale in the checkpoint (e.g. {name}), "
+                "but not found the expected name in the model "
+                f"(e.g. {remapped_name}). {fused.group(2)}_scale is "
+                "not loaded."
+            )
+            return None
+        return remapped_name
+
     possible_scale_names = [".k_scale", ".v_scale"]
     # Patterns where modelopt stores scales under k_proj/v_proj
     # but the model expects them under attn (RadixAttention)
