@@ -485,7 +485,6 @@ class ModelRunner:
 
         # For weight updates
         self.init_weight_updater()
-        self._m2n_fp8_storage = None
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
@@ -1961,15 +1960,6 @@ class ModelRunner:
     def begin_weight_update(self) -> None:
         """Begin a weight-update session: restore in-place-packed weights to a
         loadable state (no-op for schemes that don't repack)."""
-        receivers = self.weight_updater._m2n_receivers
-        if receivers and getattr(self, "_m2n_fp8_storage", None) is None:
-            from sglang.srt.weight_sync.nccl_m2n import M2NFP8Storage
-
-            # Snapshot all PP groups before any hook changes inference storage.
-            # Retain it across a failed transfer and communicator reconnection.
-            self._m2n_fp8_storage = M2NFP8Storage(
-                self.model, [receiver.manifest for receiver in receivers.values()]
-            )
         restore_weight(self.model, torch.device(self.device))
 
     def end_weight_update(self, run_post_load: bool) -> None:
@@ -1979,10 +1969,6 @@ class ModelRunner:
         if run_post_load:
             post_load_weights(self.model)
         postprocess_weight(self.model, torch.device(self.device))
-        storage = getattr(self, "_m2n_fp8_storage", None)
-        if storage is not None:
-            storage.restore(self.model)
-            self._m2n_fp8_storage = None
 
     def check_weights(
         self,
