@@ -692,9 +692,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     "combine_topk_swa_indices",
                     return_value=combined,
                 ) as combine:
-                    cache.ensure_c128(page_indices)
+                    gather = cache.ensure_c128(page_indices)
 
-                self.assertEqual(cache.c128_flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
                 self.assertEqual(combine.call_args.kwargs["topk"], expected_extent)
                 self.assertEqual(
                     combine.call_args.kwargs["topk_indices"].shape,

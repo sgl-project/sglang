@@ -4079,26 +4079,9 @@ class DeepseekV4AttnBackend(
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-            if compress_ratio == 128:
-                assert core_attn_metadata.c128_page_indices is not None
-                cache.ensure_c128(core_attn_metadata.c128_page_indices)
-                flat_token_ids = cache.c128_flat_token_ids
-                combined_indices = cache.c128_combined_indices
-                combined_lens = cache.c128_combined_lens
-            else:
-                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
-                assert raw_indices is not None, (
-                    f"sparse-prefill c{compress_ratio} path requires the raw "
-                    "top-k indices (allocated in init_flashmla_related when "
-                    "is_prefill=True)"
-                )
-                gather = cache.ensure_compressed(
-                    compress_ratio, core_attn_metadata.page_table, extra_page_size
-                )
-                flat_token_ids = gather.flat_token_ids
-                combined_indices, combined_lens = cache.combine_compressed(
-                    compress_ratio, raw_indices[: cache.num_qo_tokens]
-                )
+            flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
+                compress_ratio, core_attn_metadata, extra_page_size
+            )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
                 n_compressed + cache.swa_token_ids.shape[0]
@@ -4260,27 +4243,9 @@ class DeepseekV4AttnBackend(
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-
-            if compress_ratio == 128:
-                assert core_attn_metadata.c128_page_indices is not None
-                cache.ensure_c128(core_attn_metadata.c128_page_indices)
-                flat_token_ids = cache.c128_flat_token_ids
-                combined_indices = cache.c128_combined_indices
-                combined_lens = cache.c128_combined_lens
-            else:
-                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
-                assert raw_indices is not None, (
-                    f"Q8KV8 sparse-prefill c{compress_ratio} path requires the raw "
-                    "top-k indices (allocated in init_flashmla_related when "
-                    "is_prefill=True)"
-                )
-                gather = cache.ensure_compressed(
-                    compress_ratio, core_attn_metadata.page_table, extra_page_size
-                )
-                flat_token_ids = gather.flat_token_ids
-                combined_indices, combined_lens = cache.combine_compressed(
-                    compress_ratio, raw_indices[: cache.num_qo_tokens]
-                )
+            flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
+                compress_ratio, core_attn_metadata, extra_page_size
+            )
 
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
