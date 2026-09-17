@@ -72,9 +72,8 @@ void tree_speculative_sampling_target_only(
       .verify(draft_probs);
   CHECK_HOST(draft_tokens.unwrap() > 0 && spec_tokens.unwrap() > 0 && vocab_size.unwrap() > 0);
   CHECK_HOST(std::gcd(int64_t{4}, vocab_size.unwrap()) == VecSize);
-  // The thresholds are deliberately unbounded here: they come straight from
-  // --speculative-accept-threshold-{single,acc}, which the arg layer does not
-  // range-check either, and the AOT launcher accepted any value.
+  CHECK_HOST(threshold_single >= 0 && threshold_single <= 1);
+  CHECK_HOST(threshold_acc >= 0 && threshold_acc <= 1);
   if (batch_size.unwrap() == 0) return;
 
   constexpr uint32_t block_threads = 1024;

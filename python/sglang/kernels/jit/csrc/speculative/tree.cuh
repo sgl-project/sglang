@@ -65,28 +65,32 @@ inline void build_tree_kernel_efficient(
       .verify(retrive_next_sibling);
   const int64_t bs = batch_size.unwrap();
   TensorMatcher({bs * draft_token_num}).with_dtype<int64_t>().with_device(device).verify(positions);
-  SymbolicDType mask_dtype;
-  // Cells this batch writes, which is a LOWER BOUND on the mask, not its size:
-  // the caller may hand in a buffer preallocated for the captured max batch and
-  // only fill the leading bs requests. FULL_MASK spans each request's context
-  // length, so it has no host-side bound at all.
-  int64_t min_mask_numel = bs * draft_token_num;
+  // The mask is raw bytes to these kernels, and callers disagree on how they
+  // spell that: bool for an inline allocation or the default preallocated
+  // buffer, uint8 for the triton backend's, uint{8,16,32} for a bit-packed one.
+  // So constrain its BYTES, never its element type. The bound is a lower one --
+  // a buffer preallocated for the captured max batch is larger than what this
+  // batch writes, and FULL_MASK spans each request's context length so it has
+  // no host-side bound at all.
+  size_t num_bytes_per_item = 1;
+  int64_t min_mask_bytes = 0;
   if (tree_mask_mode == speculative::QLEN_ONLY_BITPACKING) {
     CHECK_HOST(draft_token_num <= 32);
-    const uint8_t bits = draft_token_num > 16 ? 32 : (draft_token_num > 8 ? 16 : 8);
-    mask_dtype.set_value(DLDataType{kDLUInt, bits, 1});
-  } else {
-    mask_dtype.set_value(DLDataType{kDLBool, 8, 1});
-    min_mask_numel = tree_mask_mode == speculative::QLEN_ONLY ? min_mask_numel * draft_token_num : 0;
+    // Width comes from draft_token_num alone, exactly as the AOT launcher does.
+    num_bytes_per_item = draft_token_num > 16 ? 4 : (draft_token_num > 8 ? 2 : 1);
+    min_mask_bytes = bs * draft_token_num * static_cast<int64_t>(num_bytes_per_item);
+  } else if (tree_mask_mode == speculative::QLEN_ONLY) {
+    min_mask_bytes = bs * draft_token_num * draft_token_num;
   }
-  // -1 leaves the extent unconstrained; the bound below is the real guard.
-  TensorMatcher({-1}).with_dtype(mask_dtype).with_device(device).verify(tree_mask);
-  CHECK_HOST(tree_mask.numel() >= min_mask_numel);
+  // -1 leaves the extent unconstrained; the byte bound below is the real guard.
+  TensorMatcher({-1}).with_device(device).verify(tree_mask);
+  const int64_t mask_elem_bytes = tree_mask.dtype().bits / 8;
+  CHECK_HOST(tree_mask.dtype().bits % 8 == 0 && mask_elem_bytes > 0);
+  CHECK_HOST(tree_mask.numel() * mask_elem_bytes >= min_mask_bytes);
   if (bs == 0) return;
 
   auto launch = LaunchKernel(static_cast<uint32_t>(bs), static_cast<uint32_t>(draft_token_num), device.unwrap());
   if (tree_mask_mode == speculative::QLEN_ONLY_BITPACKING) {
-    const size_t num_bytes_per_item = tree_mask.dtype().bits / 8;
     launch(
         speculative::build_tree_efficient_partial_packed,
         static_cast<int64_t*>(parent_list.data_ptr()),
@@ -175,13 +179,13 @@ inline void reconstruct_indices_from_tree_mask(
     int64_t draft_token_num) {
   using namespace host;
   SymbolicDevice device;
-  SymbolicDType mask_dtype;
-  mask_dtype.set_value(DLDataType{kDLBool, 8, 1});
   CHECK_HOST(batch_size >= 0 && draft_token_num > 0 && draft_token_num <= 1024);
-  TensorMatcher({batch_size * draft_token_num * draft_token_num})
-      .with_dtype(mask_dtype)
-      .with_device<kDLCUDA>(device)
-      .verify(tree_mask);
+  // Bytes, not element type -- same reasoning as build_tree_kernel_efficient:
+  // the kernel casts straight to bool* and callers are free to spell a 1-byte
+  // mask as bool or uint8.
+  TensorMatcher({-1}).with_device<kDLCUDA>(device).verify(tree_mask);
+  CHECK_HOST(tree_mask.dtype().bits == 8);
+  CHECK_HOST(tree_mask.numel() >= batch_size * draft_token_num * draft_token_num);
   TensorMatcher({batch_size}).with_dtype<int64_t>().with_device(device).verify(verified_seq_len);
   TensorMatcher({batch_size * draft_token_num}).with_dtype<int64_t>().with_device(device).verify(positions);
   TensorMatcher({batch_size, draft_token_num})
