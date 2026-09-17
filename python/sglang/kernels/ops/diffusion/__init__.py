@@ -38,6 +38,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
@@ -241,7 +242,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
-        _CUDA_SM100_PLUS,
+        _CUDA_SM90_PLUS,
         "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
     ),
     (
@@ -511,7 +512,9 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",
     "triton_group_norm_silu": "norm.group_norm_silu_triton",

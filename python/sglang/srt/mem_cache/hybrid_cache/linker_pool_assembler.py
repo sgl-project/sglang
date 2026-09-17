@@ -26,7 +26,7 @@ class DevicePoolEntry:
         indices_from_pool: PoolName,
         device_pool: Any,
         components: Sequence[Sequence[torch.Tensor]],
-        layer_mapping: dict[int, int],
+        layer_mapping: dict[int, int | Sequence[int]],
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
@@ -127,14 +127,16 @@ class DevicePoolEntry:
         return self._rows(indices)
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        buffer_index = self.layer_mapping.get(layer)
-        if buffer_index is None:
+        mapped = self.layer_mapping.get(layer)
+        if mapped is None:
             return None
+        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
         items = []
         for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            base_ptr, row_stride, size = component[buffer_index]
-            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+            for buffer_index in buffer_indices:
+                base_ptr, row_stride, size = component[buffer_index]
+                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
@@ -234,8 +236,28 @@ def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
     return views
 
 
+def _with_packed_draft_mapping(
+    layer_mapping: dict[int, int],
+    *,
+    target_device_layer_num: int,
+    draft_layer_num: int,
+) -> dict[int, int | tuple[int, ...]]:
+    """Attach draft depth N to the same transfer layer as target layer N."""
+    if draft_layer_num > len(layer_mapping):
+        raise ValueError(
+            "Packed draft layers exceed the target transfer layer count: "
+            f"{draft_layer_num} > {len(layer_mapping)}."
+        )
+    result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
+    for depth in range(draft_layer_num):
+        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+    return result
+
+
 def _build_deepseek_v4_device_pool_group(
-    kvcache: Any, page_size: int
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -256,13 +278,23 @@ def _build_deepseek_v4_device_pool_group(
                 "DeepSeek V4 SWA page size must match the tree page size: "
                 f"{kvcache.swa_page_size} != {page_size}."
             )
+        draft_swa_buffers = [
+            buffer
+            for pool in mtp_draft_device_pools
+            for buffer in pool.swa_kv_pool.kv_buffer
+        ]
+        swa_mapping = _with_packed_draft_mapping(
+            mappings.swa,
+            target_device_layer_num=len(kvcache.swa_kv_pool.kv_buffer),
+            draft_layer_num=len(draft_swa_buffers),
+        )
         entries.append(
             DevicePoolEntry(
                 name=PoolName.SWA,
                 indices_from_pool=PoolName.SWA,
                 device_pool=kvcache.swa_kv_pool,
-                components=[kvcache.swa_kv_pool.kv_buffer],
-                layer_mapping=mappings.swa,
+                components=[[*kvcache.swa_kv_pool.kv_buffer, *draft_swa_buffers]],
+                layer_mapping=swa_mapping,
                 page_size=page_size,
                 rows_are_pages=True,
             )
@@ -336,21 +368,41 @@ def _build_deepseek_v4_device_pool_group(
     )
 
 
-def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
+def _build_dsa_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
     if kvcache.page_size != page_size:
         raise ValueError(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
     num_layers = kvcache.layer_num
-    identity = {layer: layer for layer in range(num_layers)}
+    if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
+        raise ValueError("DSA MTP page size must match the tree page size.")
+    draft_kv_buffers = [
+        buffer for pool in mtp_draft_device_pools for buffer in pool.kv_buffer
+    ]
+    draft_indexer_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in pool.index_k_with_scale_buffer
+    ]
+    if len(draft_kv_buffers) != len(draft_indexer_buffers):
+        raise ValueError("DSA MTP KV and indexer draft layer counts must match.")
+    layer_mapping = _with_packed_draft_mapping(
+        {layer: layer for layer in range(num_layers)},
+        target_device_layer_num=num_layers,
+        draft_layer_num=len(draft_kv_buffers),
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.kv_buffer],
-            layer_mapping=identity,
+            components=[[*kvcache.kv_buffer, *draft_kv_buffers]],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -358,8 +410,8 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
