@@ -239,7 +239,7 @@ class SamplingBatchInfo:
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
             ),
             vocab_size=vocab_size,
-            max_top_k=max(r.sampling_params.top_k for r in reqs),
+            max_top_k=max((r.sampling_params.top_k for r in reqs), default=1),
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,

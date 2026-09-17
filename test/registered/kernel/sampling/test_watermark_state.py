@@ -114,5 +114,29 @@ def test_retracted_request_restores_context_history():
     assert state.num_watermarked_contexts[1].item() == 2
 
 
+def test_speculative_record_stops_at_context_capacity():
+    state = WatermarkState(
+        max_num_reqs=1,
+        context_window=2,
+        max_contexts_per_req=2,
+        key="0123456789abcdef",
+        device="cuda",
+        default_enabled=True,
+    )
+    state.num_watermarked_contexts[0] = 1
+    state.watermarked_context_hashes[0, 0] = 10
+
+    state.record_speculative(
+        torch.tensor([0], dtype=torch.int32, device="cuda"),
+        torch.tensor([20, 30, 40], dtype=torch.int64, device="cuda"),
+        torch.ones(3, dtype=torch.bool, device="cuda"),
+        torch.tensor([[0, 1, 2]], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int32, device="cuda"),
+    )
+
+    assert state.num_watermarked_contexts[0].item() == 2
+    assert state.watermarked_context_hashes[0].tolist() == [10, 20]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

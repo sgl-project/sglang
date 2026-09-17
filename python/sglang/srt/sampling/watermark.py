@@ -49,6 +49,24 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             key="<redacted>" if value.key is not None else None,
             context_window=value.context_window,
         )
+    if isinstance(value, msgspec.Struct):
+        result = copy.copy(value)
+        replacements = {}
+        for field in msgspec.structs.fields(value):
+            item = getattr(value, field.name)
+            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
+                replacements[field.name] = "<redacted>" if item is not None else None
+            elif field.name in {
+                "watermark",
+                "sampling_params",
+                "preferred_sampling_params",
+            }:
+                replacements[field.name] = redact_watermark_secrets(
+                    item, in_watermark_config=field.name == "watermark"
+                )
+        for name, replacement in replacements.items():
+            msgspec.Struct.__setattr__(result, name, replacement)
+        return result if replacements else value
     if isinstance(value, dict):
         return {
             key: (
@@ -798,8 +816,16 @@ class WatermarkState:
         selected: torch.Tensor,
     ) -> None:
         rows = selected.nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            return
         pool_indices = req_pool_indices[rows].to(torch.int64)
         counts = self.num_watermarked_contexts[pool_indices]
+        within_capacity = counts < self.watermarked_context_hashes.shape[1]
+        rows = rows[within_capacity]
+        pool_indices = pool_indices[within_capacity]
+        counts = counts[within_capacity]
+        if rows.numel() == 0:
+            return
         self.watermarked_context_hashes[pool_indices, counts.to(torch.int64)] = (
             context_hashes[rows].to(torch.int32)
         )

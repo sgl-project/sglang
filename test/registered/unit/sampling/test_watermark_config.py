@@ -4,13 +4,14 @@ import os
 import pickle
 import sys
 import traceback
+from array import array
 from types import SimpleNamespace
 
 import pytest
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     _validate_watermark_request,
@@ -294,6 +295,23 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     dump_request = redact_watermark_secrets(request)
     assert secret not in repr(dump_request.sampling_params)
     assert request.sampling_params["watermark"]["key"] == secret
+
+    tokenized_request = TokenizedGenerateReqInput(
+        input_text="hello",
+        input_ids=array("q", [1]),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(watermark={"key": secret}),
+        return_logprob=False,
+        logprob_start_len=-1,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+    )
+    dump_request = redact_watermark_secrets(tokenized_request)
+    assert dump_request.sampling_params.watermark.key == "<redacted>"
+    assert tokenized_request.sampling_params.watermark.key == secret
 
     command = redact_watermark_command_line(
         [
