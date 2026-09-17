@@ -34,7 +34,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
     get_pp_indices,
     tensor_model_parallel_all_reduce,
 )
@@ -576,7 +575,7 @@ class TransformersBase(nn.Module):
         self.config = config
         self.text_config = get_hf_text_config(config)
         self.weight_mapper = self.hf_to_sglang_mapper
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Weight loading attrs
         self.skip_prefixes: list[str] = []

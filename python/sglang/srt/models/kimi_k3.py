@@ -21,9 +21,7 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
     get_shared_experts_tp_group,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -257,7 +255,7 @@ def _dp_local_buffer_group():
     CommunicateSummableTensorPairFn._scatter_hidden_states)."""
     parallel = get_parallel()
     if parallel.tp_size == parallel.attn_dp_size:
-        return get_tp_group()
+        return get_parallel().tp_group
     return parallel.attn_tp_group
 
 
@@ -361,7 +359,7 @@ class KimiK3MLP(nn.Module):
         )
         if use_dp:
             local_hidden_states = hidden_states
-            hidden_states = get_global_dp_buffer(get_tp_group())
+            hidden_states = get_global_dp_buffer(get_parallel().tp_group)
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
@@ -796,12 +794,12 @@ class KimiK3MoE(nn.Module):
         import deep_gemm
 
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
-        from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
         )
+        from sglang.srt.runtime_context import get_parallel
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -819,7 +817,7 @@ class KimiK3MoE(nn.Module):
             f"the env var to cover the per-rank rows"
         )
         buf = _get_mega_moe_symm_buffer(
-            get_moe_ep_group().device_group,
+            get_parallel().moe_ep_group.device_group,
             num_experts=self.experts.num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_topk=self._mega_top_k,
@@ -1389,7 +1387,7 @@ class KimiK3MoE(nn.Module):
             ).view(-1)
         else:
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
 
@@ -1505,7 +1503,7 @@ class KimiK3MoE(nn.Module):
         use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
         if use_dp:
             local_hidden_states = hidden_states
-            hidden_states = get_global_dp_buffer(get_tp_group())
+            hidden_states = get_global_dp_buffer(get_parallel().tp_group)
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
@@ -2919,7 +2917,7 @@ class KimiK3LinearModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
@@ -2990,7 +2988,7 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -3188,7 +3186,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
