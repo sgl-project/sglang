@@ -132,8 +132,13 @@ class XPUAttentionBackend(AttentionBackend):
                 "graph decode path cannot run the varlen KV gather."
             )
 
+        # Gemma-3 multimodal: per extend-token image-block id set by
+        # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
+        self.bidirectional_block_ids = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        self.bidirectional_block_ids = None
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -649,6 +654,23 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            # Gemma-3 multimodal: prepare_attn_masks set bidirectional_block_ids (per
+            # extend-token image id, -1 for text). Run non-causal + pass it so the
+            # sgl-kernel-xpu prefill re-imposes causal for text but keeps image
+            # tokens bidirectional. window_size is dropped because multimodal
+            # prefill is short (<= sliding window, so the window is a no-op) and a
+            # (window, 0) local mask would re-mask the bidirectional image block.
+            causal_arg = False if use_cascade_attn else causal
+            bidirectional_block_ids = None
+            if (
+                self.bidirectional_block_ids is not None
+                and not layer.is_cross_attention
+                and not use_cascade_attn
+            ):
+                bidirectional_block_ids = self.bidirectional_block_ids
+                causal_arg = False
+                window_size = (-1, -1)
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -659,9 +681,10 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
+                causal=causal_arg,
                 window_size=window_size,
                 softcap=layer.logit_cap,
+                bidirectional_block_ids=bidirectional_block_ids,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
