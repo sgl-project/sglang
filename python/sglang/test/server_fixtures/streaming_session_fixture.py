@@ -144,7 +144,7 @@ async def _abort_repro_run_all(base_url: str, tokenizer: Any) -> None:
         for _ in range(ABORT_REPRO_SESSIONS):
             async with http.post(
                 base_url + "/open_session",
-                json={"capacity_of_str_len": 50000, "streaming": True},
+                json={"streaming": True},
             ) as resp:
                 assert resp.status == 200, await resp.text()
                 session_ids.append(await resp.json())
@@ -304,7 +304,7 @@ async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -
             for _ in range(CONCURRENT_LOGPROB_SESSIONS):
                 async with http.post(
                     base_url + "/open_session",
-                    json={"capacity_of_str_len": 50000, "streaming": True},
+                    json={"streaming": True},
                 ) as resp:
                     assert resp.status == 200
                     sids.append(await resp.json())
@@ -348,7 +348,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
         for _ in range(STRESS_NUM_SESSIONS):
             async with http.post(
                 base_url + "/open_session",
-                json={"capacity_of_str_len": 50000, "streaming": True},
+                json={"streaming": True},
             ) as resp:
                 assert resp.status == 200
                 sids.append(await resp.json())

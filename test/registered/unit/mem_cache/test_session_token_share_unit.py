@@ -59,7 +59,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
 
 class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
-        self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
+        self.session = Session(session_id="s", streaming=True)
 
     def _create(self, rid, input_ids, max_new_tokens=8):
         return self.session.create_req(

@@ -153,14 +153,7 @@ def _run_one_session(
     mode = "streaming_session" if streaming else "regular_session"
     result = ModeResult(mode=mode)
 
-    default_gen = GEN_LEN
-    if per_turn_gen_lens is not None:
-        max_gen = max(per_turn_gen_lens)
-    else:
-        max_gen = default_gen
-    capacity = sum(len(c) for c in chunks) + len(chunks) * max_gen + 1024
-
-    open_payload: dict = {"capacity_of_str_len": capacity}
+    open_payload: dict = {}
     if streaming:
         open_payload["streaming"] = True
     session_id = requests.post(base_url + "/open_session", json=open_payload).json()

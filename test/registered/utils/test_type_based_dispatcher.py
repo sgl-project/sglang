@@ -180,7 +180,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         test_requests.append(FlushCacheReqInput())
         test_requests.append(ClearHiCacheReqInput())
         test_requests.append(AbortReq())
-        test_requests.append(OpenSessionReqInput(capacity_of_str_len=0))
+        test_requests.append(OpenSessionReqInput())
         test_requests.append(CloseSessionReqInput(session_id=""))
         test_requests.append(UpdateWeightFromDiskReqInput(model_path=""))
         test_requests.append(

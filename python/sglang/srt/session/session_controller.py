@@ -83,13 +83,11 @@ class SessionReqNode:
 class Session:
     def __init__(
         self,
-        capacity_of_str_len: int,
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
-        self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
         self.last_active_time: float = time.monotonic()
@@ -388,7 +386,6 @@ class SessionController:
             return OpenSessionReqOutput(session_id=session_id, success=False)
         else:
             self.sessions[session_id] = Session(
-                recv_req.capacity_of_str_len,
                 session_id,
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
