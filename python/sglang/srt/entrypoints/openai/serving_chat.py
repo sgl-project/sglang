@@ -354,9 +354,9 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
-        self._chat_template_cache: OrderedDict[
-            bytes, tuple[str, tuple[int, ...], str]
-        ] = OrderedDict()
+        self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
+            OrderedDict()
+        )
 
     def _probe_prompt_text_round_trip(self) -> bool:
         """Does rendering the chat template to text and re-encoding lose anything?
@@ -1585,14 +1585,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
-                rendered_prompt, prompt_ids, decoded_prompt = (
-                    self._render_and_encode_chat_template(
-                        openai_compatible_messages,
-                        tools=tools,
-                        template_kwargs=extra_template_kwargs,
-                        encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal,
-                    )
+                prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                    openai_compatible_messages,
+                    tools=tools,
+                    template_kwargs=extra_template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                    use_cache=is_multimodal,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1603,14 +1601,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    rendered_prompt, prompt_ids, decoded_prompt = (
-                        self._render_and_encode_chat_template(
-                            openai_compatible_messages,
-                            tools=tools,
-                            template_kwargs=extra_template_kwargs,
-                            encode_kwargs=encode_kwargs,
-                            use_cache=is_multimodal,
-                        )
+                    prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                        openai_compatible_messages,
+                        tools=tools,
+                        template_kwargs=extra_template_kwargs,
+                        encode_kwargs=encode_kwargs,
+                        use_cache=is_multimodal,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1656,7 +1652,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
-    ) -> tuple[str, List[int], Optional[str]]:
+    ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
             try:
@@ -1681,21 +1677,11 @@ class OpenAIServingChat(OpenAIServingBase):
             cached = self._chat_template_cache.get(cache_key)
             if cached is not None:
                 self._chat_template_cache.move_to_end(cache_key)
-                rendered_prompt, prompt_ids, decoded_prompt = cached
-                return rendered_prompt, list(prompt_ids), decoded_prompt
+                prompt_ids, decoded_prompt = cached
+                return list(prompt_ids), decoded_prompt
 
-        rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=tools,
-            return_dict=False,
-            **template_kwargs,
-        )
         if self._prompt_text_round_trip_is_lossy:
-            # rendered_prompt is still produced, for logging and the cache key,
-            # but it is not what the model gets: re-encoding it would drop the
-            # control tokens the template just emitted.
+            # Re-encoding rendered text would drop the template's control tokens.
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -1705,6 +1691,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 **template_kwargs,
             )
         else:
+            rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **template_kwargs,
+            )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(
                 rendered_prompt, **encode_kwargs
             )
@@ -1715,15 +1709,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if cache_key is not None:
-            self._chat_template_cache[cache_key] = (
-                rendered_prompt,
-                tuple(prompt_ids),
-                decoded_prompt,
-            )
+            self._chat_template_cache[cache_key] = (tuple(prompt_ids), decoded_prompt)
             if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
                 self._chat_template_cache.popitem(last=False)
 
-        return rendered_prompt, prompt_ids, decoded_prompt
+        return prompt_ids, decoded_prompt
 
     def _apply_conversation_template(
         self,

@@ -16,6 +16,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 probe = OpenAIServingChat._probe_prompt_text_round_trip
 engine_prompt = OpenAIServingChat._engine_prompt
+render_and_encode = OpenAIServingChat._render_and_encode_chat_template
 
 
 class FakeTokenizer:
@@ -25,11 +26,13 @@ class FakeTokenizer:
         self._text_ids = text_ids
         self._template_ids = template_ids
         self._raises = raises
+        self.template_calls = []
 
     def encode(self, text, **kwargs):
         return [] if text == "" else list(self._text_ids)
 
     def apply_chat_template(self, messages, tokenize=False, **kwargs):
+        self.template_calls.append(tokenize)
         if self._raises:
             raise ValueError("template needs kwargs this probe does not pass")
         return list(self._template_ids) if tokenize else "<s>[INST]x[/INST]"
@@ -64,6 +67,27 @@ class TestProbe(unittest.TestCase):
     def test_a_template_that_raises_keeps_the_text_path(self):
         tok = FakeTokenizer(text_ids=[1], template_ids=[1], raises=True)
         self.assertFalse(probe(_server(tok)))
+
+
+class TestRenderAndEncode(unittest.TestCase):
+    def test_lossy_tokenizer_encodes_straight_to_ids_without_a_text_render(self):
+        tok = FakeTokenizer(text_ids=[9, 9, 9, 9], template_ids=[1, 3, 4])
+        server = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(tokenizer=tok),
+            _prompt_text_round_trip_is_lossy=True,
+        )
+
+        prompt_ids, _ = render_and_encode(
+            server,
+            [{"role": "user", "content": "x"}],
+            tools=None,
+            template_kwargs={},
+            encode_kwargs={},
+            use_cache=False,
+        )
+
+        self.assertEqual(prompt_ids, [1, 3, 4])
+        self.assertEqual(tok.template_calls, [True])
 
 
 class TestEnginePrompt(unittest.TestCase):
