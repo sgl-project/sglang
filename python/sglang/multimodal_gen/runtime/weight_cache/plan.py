@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Immutable compatibility and execution descriptions; no live process groups."""
 
-import dataclasses
 import json
-from dataclasses import dataclass
+
+import msgspec
 
 from sglang.weight_cache_common.descriptors import CACHE_ABI, canonical_digest
 
@@ -12,8 +12,7 @@ def canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-@dataclass(frozen=True)
-class PlannedRankContext:
+class PlannedRankContext(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     rank: int
     local_device: int
     device_uuid: str
@@ -21,8 +20,7 @@ class PlannedRankContext:
     tp_rank: int = 0
 
 
-@dataclass(frozen=True)
-class ComponentPlan:
+class ComponentPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     name: str
     library: str
     architecture: str
@@ -33,18 +31,16 @@ class ComponentPlan:
     loader_id: str
 
 
-@dataclass(frozen=True)
-class PipelineExecutionPlan:
+class PipelineExecutionPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     pipeline: str
     components: tuple[ComponentPlan, ...]
 
     @property
     def digest(self):
-        return canonical_digest(dataclasses.asdict(self))
+        return canonical_digest(msgspec.to_builtins(self))
 
 
-@dataclass(frozen=True)
-class CacheCompatibilityPlan:
+class CacheCompatibilityPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     # JSON bytes (rather than a mutable nested dict) are the authoritative plan.
     document: str
 

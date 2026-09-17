@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Strict diffusion component admission on the existing SRT wire/IPC layers."""
 
-import dataclasses
 import json
 import os
 import socket
@@ -9,6 +8,8 @@ import stat
 import struct
 import time
 import uuid
+
+import msgspec
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weight_cache.identity import (
@@ -41,9 +42,7 @@ def peer_identity(sock):
 
 
 def decode_generation(value):
-    return ExportGeneration(
-        **{**value, "producer": ProcessIdentity(**value["producer"])}
-    )
+    return msgspec.convert(value, type=ExportGeneration, strict=True)
 
 
 def validate_response(response):
@@ -139,7 +138,7 @@ def materialize_from_cache(prepared, args):
         response = client.request(
             "fetch_component",
             component="transformer",
-            generation=dataclasses.asdict(generation),
+            generation=msgspec.to_builtins(generation),
             request_id=request_id,
         )
         delivery = IpcDelivery(

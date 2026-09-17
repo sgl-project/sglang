@@ -13,8 +13,8 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from dataclasses import dataclass
 
+import msgspec
 import torch
 from torch import nn
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -31,8 +31,7 @@ class ExportBudgetExceeded(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class ExportGeneration:
+class ExportGeneration(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     producer: ProcessIdentity
     nonce: str
     manifest_digest: str
@@ -40,8 +39,7 @@ class ExportGeneration:
     torch_version: str
 
 
-@dataclass(frozen=True)
-class StorageHandle:
+class StorageHandle(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     group: str
     nbytes: int
     entry: dict
@@ -58,8 +56,7 @@ class StorageHandle:
             raise ValueError(f"Invalid storage tensor entry: {self.group}")
 
 
-@dataclass(frozen=True)
-class IpcDelivery:
+class IpcDelivery(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     generation: ExportGeneration
     request_id: str
     storages: tuple[StorageHandle, ...]

@@ -7,14 +7,14 @@ import hashlib
 import os
 import re
 import stat
-from dataclasses import dataclass
 from pathlib import Path
+
+import msgspec
 
 from .descriptors import canonical_digest
 
 
-@dataclass(frozen=True)
-class FileStamp:
+class FileStamp(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     size: int
     mtime_ns: int
     ctime_ns: int

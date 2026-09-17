@@ -20,11 +20,11 @@ import time
 import traceback
 import unittest
 import uuid
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from msgspec.structs import replace
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cuda_ci

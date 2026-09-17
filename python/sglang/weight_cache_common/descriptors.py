@@ -10,8 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
 
+import msgspec
 import torch
 
 CACHE_ABI = 1
@@ -45,14 +45,12 @@ def _name(value: str, *, root: bool = False) -> None:
         raise ValueError(f"Invalid module/tensor path: {value!r}")
 
 
-@dataclass(frozen=True)
-class StorageDescriptor:
+class StorageDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     group: str
     nbytes: int
 
 
-@dataclass(frozen=True)
-class TensorDescriptor:
+class TensorDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     name: str
     kind: str  # parameter | buffer
     persistent: bool
@@ -78,8 +76,7 @@ class TensorDescriptor:
         )
 
 
-@dataclass(frozen=True)
-class StateManifest:
+class StateManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     storages: tuple[StorageDescriptor, ...]
     tensors: tuple[TensorDescriptor, ...]
     training: tuple[tuple[str, bool], ...]
@@ -154,27 +151,13 @@ class StateManifest:
         return sum(storage.nbytes for storage in self.storages)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return msgspec.to_builtins(self)
 
     @classmethod
     def from_dict(cls, value: dict) -> StateManifest:
         if set(value) != {"cache_abi", "storages", "tensors", "training"}:
             raise ValueError("Unexpected state manifest fields")
-        result = cls(
-            cache_abi=value["cache_abi"],
-            storages=tuple(StorageDescriptor(**item) for item in value["storages"]),
-            tensors=tuple(
-                TensorDescriptor(
-                    **{
-                        **item,
-                        "shape": tuple(item["shape"]),
-                        "stride": tuple(item["stride"]),
-                    }
-                )
-                for item in value["tensors"]
-            ),
-            training=tuple((name, mode) for name, mode in value["training"]),
-        )
+        result = msgspec.convert(value, type=cls, strict=True)
         result.validate()
         return result
 

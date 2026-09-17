@@ -16,8 +16,9 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
+
+import msgspec
 
 from .descriptors import canonical_digest
 from .identity import FileStamp, hash_file
@@ -46,15 +47,13 @@ def _paths(root: Path, relative_files: list[str]) -> list[tuple[str, Path]]:
     return sorted(result.items())
 
 
-@dataclass(frozen=True)
-class CheckpointFile:
+class CheckpointFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     path: str
     size: int
     sha256: str
 
 
-@dataclass(frozen=True)
-class CheckpointManifest:
+class CheckpointManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     files: tuple[CheckpointFile, ...]
     schema: int = 1
 
@@ -83,22 +82,19 @@ class CheckpointManifest:
     @property
     def digest(self) -> str:
         self.validate()
-        return canonical_digest(asdict(self))
+        return canonical_digest(msgspec.to_builtins(self))
 
     @classmethod
     def read(cls, path: Path) -> CheckpointManifest:
         value = json.loads(path.read_text())
         if set(value) != {"schema", "files"}:
             raise ValueError("Unexpected checkpoint manifest fields")
-        result = cls(
-            tuple(CheckpointFile(**item) for item in value["files"]), value["schema"]
-        )
+        result = msgspec.convert(value, type=cls, strict=True)
         result.validate()
         return result
 
 
-@dataclass(frozen=True)
-class VerifiedCheckpoint:
+class VerifiedCheckpoint(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     manifest_digest: str
     stamps: tuple[tuple[str, FileStamp], ...]
 
@@ -159,7 +155,7 @@ def write_manifest(root: Path, manifest: CheckpointManifest) -> Path:
             mode="w", dir=root, prefix=".weight-cache-", delete=False
         ) as stream:
             temporary = Path(stream.name)
-            json.dump(asdict(manifest), stream, sort_keys=True, indent=2)
+            json.dump(msgspec.to_builtins(manifest), stream, sort_keys=True, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())

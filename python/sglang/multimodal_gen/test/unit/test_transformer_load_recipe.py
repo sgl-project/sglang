@@ -3,7 +3,6 @@
 
 import unittest
 from contextlib import nullcontext
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -92,7 +91,7 @@ class TestTransformerLoadRecipe(unittest.TestCase):
         self.assertEqual(first.server_args.tp_size, 1)
         first.init_params["out_features"] = 888
         self.assertEqual(frozen.thaw().init_params["out_features"], 4)
-        with self.assertRaises(FrozenInstanceError):
+        with self.assertRaises(AttributeError):
             frozen._payload = b"mutated"
 
     def test_materialize_uses_frozen_class_config_and_files(self):

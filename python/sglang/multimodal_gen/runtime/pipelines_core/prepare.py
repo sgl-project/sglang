@@ -3,9 +3,9 @@
 
 import copy
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
@@ -32,8 +32,7 @@ from sglang.multimodal_gen.runtime.weight_cache.plan import (
 logger = init_logger(__name__)
 
 
-@dataclass(frozen=True)
-class PreparedPipeline:
+class PreparedPipeline(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     pipeline_cls: type
     model_path: str
     specs: tuple[ComponentLoadSpec, ...]

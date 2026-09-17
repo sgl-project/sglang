@@ -10,11 +10,11 @@ import socket
 import tempfile
 import threading
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from msgspec.structs import replace
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci

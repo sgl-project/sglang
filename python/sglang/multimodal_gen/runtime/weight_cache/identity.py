@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Strict published checkpoint/source identity, using shared cache utilities."""
 
-import dataclasses
 import hashlib
 import importlib.metadata
 import logging
@@ -9,6 +8,7 @@ import os
 import re
 from pathlib import Path
 
+import msgspec
 import torch
 
 import sglang
@@ -66,7 +66,7 @@ def checkpoint_identity(prepared, args, *, verify=False):
         ),
         None,
     )
-    stamps = {name: dataclasses.asdict(FileStamp.read(root / name)) for name in names}
+    stamps = {name: msgspec.to_builtins(FileStamp.read(root / name)) for name in names}
     manifest_path = root / MANIFEST_FILENAME
     if manifest_path.exists():
         manifest = CheckpointManifest.read(manifest_path)
@@ -188,7 +188,7 @@ def environment_identity(args):
 def compatibility_plan(prepared, args, *, verify_checkpoint=False):
     index = local_device_index(args)
     rank = PlannedRankContext(0, index, current_platform.get_device_uuid(index))
-    rank_fields = dataclasses.asdict(rank)
+    rank_fields = msgspec.to_builtins(rank)
     # A process-local CUDA ordinal is a locator, not an allocation identity.
     # CUDA_VISIBLE_DEVICES may renumber the same physical GPU in the consumer.
     rank_fields.pop("local_device")

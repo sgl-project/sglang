@@ -3,9 +3,9 @@ import logging
 import pickle
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen import envs
@@ -49,8 +49,7 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
-@dataclass
-class ResolvedTransformerLoad:
+class ResolvedTransformerLoad(msgspec.Struct):
     """The existing loader's resolved decisions, before any model is built."""
 
     model_cls: type[torch.nn.Module]
@@ -76,8 +75,7 @@ class ResolvedTransformerLoad:
         )
 
 
-@dataclass(frozen=True)
-class FrozenTransformerLoad:
+class FrozenTransformerLoad(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """Immutable local recipe; every consumer receives a fresh working copy.
 
     Constructed by this process's resolver (or inherited by its spawned worker),

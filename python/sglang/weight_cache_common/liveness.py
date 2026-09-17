@@ -11,14 +11,14 @@ import select
 import signal
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
+
+import msgspec
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class ProcessIdentity:
+class ProcessIdentity(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     pid: int
     start_ticks: int  # /proc/<pid>/stat field 22, not wall-clock time
 

@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 from torch import nn
 
@@ -24,8 +23,7 @@ def iter_modules(
             yield from iter_modules(child, path, ancestors)
 
 
-@dataclass(frozen=True)
-class StateSnapshot:
+class StateSnapshot(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     manifest: StateManifest
     tensors: dict[str, torch.Tensor]
     # Strong references to the ORIGINAL storages, not serialized IPC handles.

@@ -6,7 +6,6 @@ Run with ``python -m sglang.multimodal_gen.runtime.weight_cache.daemon
 """
 
 import argparse
-import dataclasses
 import fcntl
 import hashlib
 import json
@@ -18,6 +17,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+import msgspec
 
 from sglang.multimodal_gen.runtime.distributed.bootstrap import (
     bootstrap_diffusion_runtime,
@@ -105,7 +106,7 @@ class DiffusionWeightCacheDaemon:
             stats = self.exporter.stats()
             return {
                 "compatibility": self.plan.to_dict(),
-                "generation": dataclasses.asdict(generation),
+                "generation": msgspec.to_builtins(generation),
                 "cache_status": {
                     **stats,
                     "active_consumers": sum(p.is_alive() for p in self.consumers),
@@ -120,7 +121,7 @@ class DiffusionWeightCacheDaemon:
                 )
             return {
                 "compatibility": self.plan.to_dict(),
-                "generation": dataclasses.asdict(generation),
+                "generation": msgspec.to_builtins(generation),
                 "manifest": self.exporter.manifest.to_dict(),
             }
         if kind != "fetch_component" or request.get("component") != "transformer":
@@ -133,7 +134,7 @@ class DiffusionWeightCacheDaemon:
         # including clients which abandon a response or partially import it.
         self.consumers = {p for p in self.consumers if p.is_alive()}
         self.consumers.add(peer)
-        return dataclasses.asdict(
+        return msgspec.to_builtins(
             self.exporter.export(request["request_id"], generation=generation)
         )
 
@@ -221,7 +222,7 @@ class DiffusionWeightCacheDaemon:
                         json.dumps(
                             {
                                 "compatibility_digest": self.plan.digest,
-                                "generation": dataclasses.asdict(
+                                "generation": msgspec.to_builtins(
                                     self.exporter.generation
                                 ),
                             }

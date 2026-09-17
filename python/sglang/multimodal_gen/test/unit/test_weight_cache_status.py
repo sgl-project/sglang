@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import dataclasses
 import os
 import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 
 from sglang.multimodal_gen.runtime.weight_cache.client import (
@@ -70,7 +70,7 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
                 owner,
                 "fetch_component",
                 component="transformer",
-                generation=dataclasses.asdict(owner.exporter.generation),
+                generation=msgspec.to_builtins(owner.exporter.generation),
                 request_id=uuid.uuid4().hex,
             )
     after = request(owner, "query_status")["cache_status"]
@@ -88,7 +88,7 @@ def test_status_is_non_consuming_and_survives_nonrefundable_exhaustion():
             owner,
             "fetch_component",
             component="transformer",
-            generation=dataclasses.asdict(owner.exporter.generation),
+            generation=msgspec.to_builtins(owner.exporter.generation),
             request_id=uuid.uuid4().hex,
         )
     # Dead consumers disappear from observations, but never refund sends.

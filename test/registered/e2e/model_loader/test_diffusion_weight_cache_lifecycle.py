@@ -206,14 +206,15 @@ def test_owner_replacement_between_manifest_and_worker_rejects_generation(servic
         replacement, _ = client.manifest()
         assert replacement != generation
         # Replay old generation on a real authenticated connection: no exports.
-        import dataclasses
         import uuid
+
+        import msgspec
 
         with pytest.raises(RuntimeError, match="fetch generation mismatch"):
             client.request(
                 "fetch_component",
                 component="transformer",
-                generation=dataclasses.asdict(generation),
+                generation=msgspec.to_builtins(generation),
                 request_id=uuid.uuid4().hex,
             )
     worker, connection = service.start_worker(generation, None)
