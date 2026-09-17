@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_request_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
     is_aborted,
@@ -1406,11 +1405,10 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
-            def _c128_state_payload():
-                return get_dsv4_request_state_indices(
-                    self.token_to_kv_pool_allocator.get_kvcache(),
-                    int(req.kv.req_pool_idx),
-                    c128_seq_len,
+            def _request_state_payload():
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                return kvcache.request_state_transfer_indices(
+                    int(req.kv.req_pool_idx), c128_seq_len
                 )
 
             state_types = (
@@ -1425,7 +1423,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }

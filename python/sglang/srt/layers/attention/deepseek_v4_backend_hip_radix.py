@@ -58,7 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -573,7 +573,7 @@ class DeepseekV4HipRadixBackend(
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer

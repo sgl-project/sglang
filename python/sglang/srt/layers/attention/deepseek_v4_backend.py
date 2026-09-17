@@ -136,7 +136,7 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -1190,17 +1190,8 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        # The distinct ratios this stage has, sorted -- (4, 128) for V4, (1, 2)
-        # for V4.1 -- not the per-layer hf_config.compress_ratios list. Nothing
-        # is built for a ratio outside this set.
-        # Empty C4/C128 pools are kept for compatibility even when the model
-        # only uses V4.1 ratios 1/2. They have no metadata consumers.
-        model_ratios = set(self.token_to_kv_pool.compression_ratios)
-        self.present_ratios: Tuple[int, ...] = tuple(
-            ratio
-            for ratio in sorted(self.token_to_kv_pool.kv_pools)
-            if ratio in model_ratios
-        )
+        # Nothing is built for a compress ratio outside the pool's set.
+        self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
         self.low_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in (1, 2) if ratio in self.present_ratios
         )
@@ -1217,7 +1208,7 @@ class DeepseekV4AttnBackend(
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
 
         kernel = get_exec().kernel

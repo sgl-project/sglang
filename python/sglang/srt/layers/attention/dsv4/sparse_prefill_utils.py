@@ -269,7 +269,6 @@ class CompressedGather:
     """Positional layout of one top-k compressed cache inside the workspace."""
 
     flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
-    page_size: int
     compressed_base: torch.Tensor  # (num_reqs,) int32
     swa_base: torch.Tensor  # (num_reqs,) int32
     # Tail stays at the -1 sentinel because the valid prefix length is
@@ -495,7 +494,6 @@ class SparsePrefillChunkCache:
 
         gather = CompressedGather(
             flat_token_ids=flat_ids,
-            page_size=c_page_size,
             compressed_base=compressed_base,
             swa_base=swa_base,
         )

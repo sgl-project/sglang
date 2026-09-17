@@ -92,6 +92,7 @@ class CompressStatePool:
         enable_memory_saver: bool,
         ratio: int,
         online: bool = False,
+        request_scoped: bool = False,
         swa_page_size: int = 0,
         online_mtp_max_draft_tokens: int = 0,
         state_cache_page_size: int = 1,
@@ -99,8 +100,8 @@ class CompressStatePool:
         self.ratio = ratio
         # Request-scoped state is addressed by req_pool_idx (one ring per request
         # slot) and travels on the PD request-state component; page-scoped state
-        # follows the SWA pages.
-        self.request_scoped = ratio in (2, 128)
+        # follows the SWA pages. The pool factory decides which ratios are which.
+        self.request_scoped = request_scoped
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
         self.page_size = state_cache_page_size

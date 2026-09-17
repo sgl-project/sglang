@@ -1123,6 +1123,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_hisparse=enable_hisparse,
             kv_pool_cls=kv_pool_cls,
         )
+
+        # The distinct compress ratios this stage has, sorted. Registry pools kept
+        # for a ratio the model lacks (wire-layout alignment) do not count.
+        model_ratios = set(self.compression_ratios)
+        self.present_ratios: Tuple[int, ...] = tuple(
+            ratio for ratio in sorted(self.kv_pools) if ratio in model_ratios
+        )
+
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
@@ -1542,6 +1550,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             online=(ratio == 128 and ONLINE_C128),
+            request_scoped=ratio in (2, 128),
             swa_page_size=self.swa_page_size,
             online_mtp_max_draft_tokens=(
                 self.online_mtp_max_draft_tokens if ratio == 128 else 0
@@ -1562,6 +1571,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=2,
+            request_scoped=True,
             online=False,
         )
 
@@ -1711,7 +1721,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             state[state_locs, :half] = 0
             state[state_locs, half:] = float("-inf")
 
-    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+    def request_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
+        """PD transfer indices of the request-scoped state component: one c128
+        page per item (or the single online row) of the c128 ring, or the
+        request's whole ratio-2 pair ring, which only an odd prefix ships (an
+        even prefix leaves no pending half-pair for decode to read).
+        """
+        import numpy as np
+
+        from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
+
+        pools = [
+            p for p in self.compress_state_pools if p is not None and p.request_scoped
+        ]
+        assert len(pools) == 1, (
+            f"expected one request-scoped state pool, got {len(pools)}"
+        )
+        pool = pools[0]
+        if pool.ratio == 2:
+            if seq_len % 2 == 0:
+                return np.empty((0,), dtype=np.int32)
+            return np.array([int(req_pool_idx)], dtype=np.int32)
+        return get_dsv4_c128_state_indices(
+            req_pool_idx,
+            seq_len,
+            online=pool.online,
+            ring_size=1 if pool.online else pool.ring_size,
+        )
+
+    def clear_request_scoped_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped state for one req slot: the C128 ring and the
         ratio-2 pending-pair ring."""
         for pool in self.compress_state_pools:
@@ -1814,12 +1852,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the extra cache's format from."""
-        if self.uniform_fp8:
-            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
-            _, _, compress_kv_pool = self.layer_mapping[layer_id]
-            assert compress_kv_pool is not None
-            return compress_kv_pool.kv_cache_total_dim
-        return self.get_extra_key_layout(layer_id).bytes_per_token
+        _, _, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.kv_cache_total_dim
 
     def get_swa_key_layout(self) -> KVLayout:
         return self.kv_layout
