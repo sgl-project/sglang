@@ -111,6 +111,8 @@ def _hybrid_stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,  # short-circuits NgramEmbeddingManager
+        ngram_embedding_n=0,
+        use_engram=False,
     )
     return stub
 
