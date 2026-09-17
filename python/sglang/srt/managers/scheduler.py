@@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -438,6 +439,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     def __init__(
         self,
@@ -976,11 +978,10 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        config_to_check = self.model_config.hf_config
-        if hasattr(self.model_config.hf_config, "text_config"):
-            config_to_check = self.model_config.hf_config.text_config
-        elif hasattr(self.model_config, "hf_text_config"):
-            config_to_check = self.model_config.hf_text_config
+        # Use the language config already normalized by ModelConfig. Multimodal
+        # wrappers expose it under different attributes (for example,
+        # ``text_config`` or ``llm_config``).
+        config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -1522,6 +1523,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             # The decode requests polling kv cache
@@ -1569,6 +1571,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -2163,7 +2166,8 @@ class Scheduler(
                     tokenized_req.mm_inputs, MultimodalInputs
                 ):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
-                        tokenized_req.mm_inputs
+                        tokenized_req.mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
             except Exception as error:
                 local_error = f"{type(error).__name__}: {error}"
@@ -2598,7 +2602,10 @@ class Scheduler(
         if self.dp_tp_group.rank_in_group == 0:
             try:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
             except Exception as error:
                 result = _MultimodalInputBroadcast(
@@ -2629,7 +2636,10 @@ class Scheduler(
                 result = obj_list[0]
             else:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
 
         if result.error is not None:
@@ -2644,7 +2654,10 @@ class Scheduler(
 
         if get_mm().enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs)
-        return MultimodalInputs.from_processor_output(mm_inputs)
+        return MultimodalInputs.from_processor_output(
+            mm_inputs,
+            requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+        )
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
@@ -4754,7 +4767,7 @@ class Scheduler(
         # (queues parked under KV pressure / disagg transfer) has no
         # process_batch_result to publish the growing gauge, and gating here
         # froze /get_loads, DP balancing, and the LoadStat for the stall. This
-        # path spins without sleeping, so a wall-clock floor bounds the
+        # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
         fully_idle = self.is_fully_idle()
@@ -4767,6 +4780,10 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+            if self.enable_hicache_storage:
+                # Storage workers need the GIL between I/O calls. Yield while
+                # there is no GPU batch so polling cannot starve their acks.
+                time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5852,7 +5869,7 @@ def run_scheduler_process(
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"
