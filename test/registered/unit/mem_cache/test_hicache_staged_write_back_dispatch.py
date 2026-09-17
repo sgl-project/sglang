@@ -1,6 +1,7 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
 import unittest
+from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -264,15 +265,22 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
 
-    def test_short_staged_swa_tail_resolves_device_covered_head(self):
+    def _short_swa_tail_pipeline(self, swa_page_size: int) -> BufferModePipeline:
+        """Pipeline holding one staged span [2, 8) whose 4-slot trailing SWA
+        window outruns the splice left by a device prefix of 6."""
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.cache_controller.mem_pool_host.entry_map = {
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(page_size=swa_page_size)
+            )
+        }
         pipeline.release_staged_hold = mock.Mock(return_value=True)
         pipeline.staged_prefetches = {
             handle: SimpleNamespace(
                 request=handle,
-                key_tokens=list(range(8)),
+                key_tokens=array("q", range(8)),
                 extra_key=None,
                 cache_salt=None,
                 matched_len=2,
@@ -289,14 +297,42 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 operation_id=1,
             )
         }
+        return pipeline
 
-        self.assertEqual(
-            pipeline.plan_staged_splice(handle, device_prefix_len=6), (0, 0)
+    def test_short_staged_swa_tail_keeps_complete_window(self):
+        """FULL-prefix growth trims only FULL; SWA keeps its complete window."""
+        handle = CacheRequestHandle("r", 0)
+        pipeline = self._short_swa_tail_pipeline(swa_page_size=2)
+        pipeline._cache.tree_core.is_eagle = False
+        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
+        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
+            0, 6
         )
-        pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with(
-            handle, 4
+        req = SimpleNamespace(
+            rid="r",
+            cache_request_handle=handle,
+            prefix_indices=_indices(0, 0),
+            kv=SimpleNamespace(cache_protected_len=0),
         )
-        pipeline.release_staged_hold.assert_called_once_with(handle, reason="shrunk")
+        self.assertTrue(pipeline.prepare_staged_prefetch(req))
+        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
+        pipeline.release_staged_hold.assert_not_called()
+
+        pipeline = self._short_swa_tail_pipeline(swa_page_size=4)
+        pipeline._cache.tree_core.is_eagle = False
+        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
+        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
+            0, 6
+        )
+        req = SimpleNamespace(
+            rid="r",
+            cache_request_handle=handle,
+            prefix_indices=_indices(0, 0),
+            kv=SimpleNamespace(cache_protected_len=0),
+        )
+        self.assertTrue(pipeline.prepare_staged_prefetch(req))
+        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
+        pipeline.release_staged_hold.assert_not_called()
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()
@@ -549,6 +585,57 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
 
+    def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.kv_buffer = torch.empty(2, 2, 2, 2, 1, 1)
+
+        device_k = torch.empty(2, 3, 2, 1, 1)
+        device_v = torch.empty_like(device_k)
+        device_pool = SimpleNamespace(
+            # FIA exposes lists here; these must not be sent to the operator.
+            k_buffer=[device_k[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            v_buffer=[device_v[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            get_hicache_transfer_buffers=mock.Mock(return_value=(device_k, device_v)),
+        )
+        host_indices = _indices(0, 2)
+        device_indices = _indices(2, 4)
+        directions = SimpleNamespace(H2D="H2D", D2H="D2H")
+
+        with (
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
+                directions,
+                create=True,
+            ),
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                create=True,
+            ) as transfer,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="kernel_ascend",
+            )
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id=0,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertEqual(device_pool.get_hicache_transfer_buffers.call_count, 2)
+        self.assertEqual(transfer.call_count, 2)
+        for call in transfer.call_args_list:
+            self.assertIs(call.kwargs["device_k"], device_k)
+            self.assertIs(call.kwargs["device_v"], device_v)
+        self.assertEqual(transfer.call_args_list[0].kwargs["direction"], "D2H")
+        self.assertEqual(transfer.call_args_list[1].kwargs["direction"], "H2D")
+
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         kv_cache_dim = 5
@@ -711,6 +798,79 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+
+    def test_mamba_kernel_npu_backup_then_load_roundtrip(self):
+        num_layers = 2
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 5], dtype=torch.int64)
+        temporal = torch.arange(num_layers * 8 * 3, dtype=torch.float32).reshape(
+            num_layers, 8, 3
+        )
+        conv = (
+            torch.arange(num_layers * 8 * 2, dtype=torch.float32).reshape(
+                num_layers, 8, 2
+            )
+            / 8
+        ).to(torch.bfloat16)
+        device_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal.clone(), conv=[conv.clone()])
+        )
+        expected_temporal = device_pool.mamba_cache.temporal[:, device_indices].clone()
+        expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
+
+        host = MambaPoolHost.__new__(MambaPoolHost)
+        host.layout = "page_first_direct"
+        host.num_mamba_layers = num_layers
+        host.temporal_state_elem_size = 3
+        host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.float32)
+        host.conv_state_shapes = [(2,)]
+        host.conv_buffer = [torch.zeros(8, num_layers, 1, 2, dtype=torch.bfloat16)]
+        host.temporal_staging_buffer = None
+        host.conv_staging_buffers = [None]
+        host._temporal_can_use_jit = False
+        host._conv_can_use_jit = [False]
+        host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
+        host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
+
+        host.backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend="kernel_ascend",
+        )
+        device_pool.mamba_cache.temporal.zero_()
+        device_pool.mamba_cache.conv[0].zero_()
+        for layer_id in range(num_layers):
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.temporal[:, device_indices], expected_temporal
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.temporal_buffer[host_indices].squeeze(2).transpose(0, 1),
+                expected_temporal,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.conv_buffer[0][host_indices].squeeze(2).transpose(0, 1),
+                expected_conv,
             )
         )
 
