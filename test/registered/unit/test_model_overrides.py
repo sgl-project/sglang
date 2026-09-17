@@ -2290,34 +2290,93 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         },
                     )
 
+    def test_lora_moe_disables_shared_experts_fusion(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_fusion_disable,
+        )
+
+        for runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+            with self.subTest(runner=runner):
+                self.assertEqual(
+                    _moe_runner_fusion_disable(
+                        ResolvedView(SimpleNamespace(moe_runner_backend=runner))
+                    ),
+                    {"disable_shared_experts_fusion": True},
+                )
+        for runner in ("triton", "deep_gemm", "marlin"):
+            with self.subTest(runner=runner):
+                self.assertEqual(
+                    _moe_runner_fusion_disable(
+                        ResolvedView(SimpleNamespace(moe_runner_backend=runner))
+                    ),
+                    {},
+                )
+
+    def test_glm_lora_moe_keeps_shared_experts_separate(self):
+        for runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+            with self.subTest(runner=runner):
+                args = self._construct(
+                    "Glm4MoeForCausalLM",
+                    "glm4_moe",
+                    config_extra={
+                        "n_routed_experts": 16,
+                        "n_shared_experts": 1,
+                        "num_experts_per_tok": 2,
+                    },
+                    moe_runner_backend=runner,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    max_lora_rank=8,
+                    lora_target_modules=["gate_up_proj", "down_proj"],
+                    disable_shared_experts_fusion=False,
+                )
+                self.assertFalse(args.disable_shared_experts_fusion)
+                self.assertTrue(self._resolved(args, "disable_shared_experts_fusion"))
+                self.assertIn(
+                    (
+                        "_moe_runner_fusion_disable",
+                        {"disable_shared_experts_fusion": True},
+                    ),
+                    args._resolved_overrides,
+                )
+
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _speculative_moe_runner_default,
         )
 
-        self.assertEqual(
-            _speculative_moe_runner_default(
-                ResolvedView(
-                    SimpleNamespace(
-                        speculative_moe_runner_backend=None, moe_runner_backend="triton"
-                    )
+        for target in ("auto", "triton", "lora_triton", "lora_cutedsl", "lora_marlin"):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    _speculative_moe_runner_default(
+                        ResolvedView(
+                            SimpleNamespace(
+                                speculative_moe_runner_backend=None,
+                                moe_runner_backend=target,
+                            )
+                        )
+                    ),
+                    {
+                        "speculative_moe_runner_backend": (
+                            "auto" if target.startswith("lora_") else target
+                        )
+                    },
                 )
-            ),
-            {"speculative_moe_runner_backend": "triton"},
-        )
-        # user-set draft backend survives
-        self.assertEqual(
-            _speculative_moe_runner_default(
-                ResolvedView(
-                    SimpleNamespace(
-                        speculative_moe_runner_backend="deep_gemm",
-                        moe_runner_backend="auto",
-                    )
+        for draft in ("auto", "deep_gemm", "lora_cutedsl"):
+            with self.subTest(draft=draft):
+                self.assertEqual(
+                    _speculative_moe_runner_default(
+                        ResolvedView(
+                            SimpleNamespace(
+                                speculative_moe_runner_backend=draft,
+                                moe_runner_backend="lora_cutedsl",
+                            )
+                        )
+                    ),
+                    {},
                 )
-            ),
-            {},
-        )
 
     def test_dsa_split_backend_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (

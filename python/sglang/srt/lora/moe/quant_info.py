@@ -53,11 +53,11 @@ class MoeLoraFp8QuantInfo(msgspec.Struct, kw_only=True):
             intermediate_size=int(base_layer.w2_weight.shape[2]),
             hidden_size=int(base_layer.w2_weight.shape[1]),
         )
-        admit_fp8_block_weights(quant_info)
+        _admit_fp8_block_weights(quant_info)
         return quant_info
 
 
-def admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
+def _admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
     """Validate 128x128 weight blocks and scales once when binding weights."""
     if tuple(quant_info.block_shape) != (128, 128):
         raise NotImplementedError(
@@ -99,7 +99,7 @@ StandardLayoutQuantInfo = MoeLoraBf16QuantInfo | MoeLoraFp8QuantInfo
 
 
 class MoeLoraNvFp4MarlinQuantInfo(msgspec.Struct, kw_only=True):
-    """Marlin W4A16: INT32 packed weights, E4M3 group-16 and FP32 global scales."""
+    """Prepared Marlin W4A16: INT32 weights, E4M3 group-16 and FP16/BF16 globals."""
 
     w13_qweight: torch.Tensor
     w2_qweight: torch.Tensor
@@ -113,13 +113,11 @@ class MoeLoraNvFp4MarlinQuantInfo(msgspec.Struct, kw_only=True):
 
     @classmethod
     def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
-        # Load may already have repacked the weights; INT32 marks Marlin format.
-        if base_layer.w13_weight.dtype != torch.int32:
-            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-                prepare_moe_nvfp4_layer_for_marlin,
-            )
-
-            prepare_moe_nvfp4_layer_for_marlin(base_layer)
+        for name in ("w13_weight", "w2_weight"):
+            if getattr(base_layer, name).dtype != torch.int32:
+                raise ValueError(
+                    f"NVFP4 MoE LoRA requires already-prepared Marlin {name}."
+                )
         return cls(
             w13_qweight=base_layer.w13_weight,
             w2_qweight=base_layer.w2_weight,

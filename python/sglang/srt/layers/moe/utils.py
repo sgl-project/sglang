@@ -168,18 +168,11 @@ class _MoeRunnerBackendPredicates:
         return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value
 
     def is_lora(self):
-        # The LoRA MoE runner on one of its base-GEMM vendors.
         return self.value in (
             MoeRunnerBackend.LORA_CUTEDSL.value,
             MoeRunnerBackend.LORA_TRITON.value,
             MoeRunnerBackend.LORA_MARLIN.value,
         )
-
-    def is_lora_cutedsl(self):
-        return self.value == MoeRunnerBackend.LORA_CUTEDSL.value
-
-    def is_lora_triton(self):
-        return self.value == MoeRunnerBackend.LORA_TRITON.value
 
     def is_lora_marlin(self):
         return self.value == MoeRunnerBackend.LORA_MARLIN.value

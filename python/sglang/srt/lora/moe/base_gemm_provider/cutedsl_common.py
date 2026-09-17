@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -10,6 +11,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
     from sglang.srt.lora.workspace import LoraWorkspace
+
+logger = logging.getLogger(__name__)
 
 # Cache code only: caching bound arguments would retain layer weights.
 _COMPILE_CACHE: dict[tuple, object] = {}
@@ -45,17 +48,17 @@ class CuteDslTileMixin:
     ) -> None:
         import cuda.bindings.driver as cuda_driver
 
-        from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
-            cutedsl_version,
-            load_config_table,
-        )
-        from sglang.srt.lora.moe.kernels.cutedsl.api import (
+        from sglang.kernels.ops.lora.moe.cutedsl.api import (
             GroupedGemmConfig,
             as_dynamic_cute_tensor,
         )
-        from sglang.srt.lora.moe.kernels.cutedsl.schedule_builder import (
+        from sglang.kernels.ops.lora.moe.cutedsl.schedule_builder import (
             MAX_EXPERTS,
             MAX_TOKEN_CLUSTERS,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
+            cutedsl_version,
+            load_config_table,
         )
 
         self._as_dynamic_cute_tensor = as_dynamic_cute_tensor
@@ -69,7 +72,12 @@ class CuteDslTileMixin:
         self._bind_weights(quant_info)
 
         device = quant_info.w13_weight.device
-        # The 152-cluster choice was tuned on GB300.
+        # Keep the SM90 FP8 heuristic at 64-wide tiles; tables may override it.
+        self._xwide_by_heuristic = not (
+            self._DTYPE_TAG == "fp8"
+            and torch.cuda.get_device_capability(device) < (10, 0)
+        )
+        # Use one persistent cluster per SM on 152-SM Blackwell devices.
         xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
         if (
             torch.cuda.get_device_capability(device) >= (10, 0)
@@ -91,21 +99,9 @@ class CuteDslTileMixin:
             n_gemm1=self._gate_up_slices * quant_info.intermediate_size,
             n_gemm2=quant_info.hidden_size,
             k=quant_info.hidden_size,
-            expected_versions={"cutedsl": version} if version else None,
+            installed_versions={"cutedsl": version} if version else None,
         )
-        if self._config_table is not None:
-            for bucket_m, payload in self._config_table.buckets.items():
-                if "token_width" not in payload:
-                    raise ValueError(
-                        f"{self.contract.key} config bucket {bucket_m} lacks "
-                        "token_width"
-                    )
-            widths = dict(tile_set)
-            widths.update(
-                (tile.token_width, tile.persistent_clusters)
-                for tile in self._config_table.tiles
-            )
-            tile_set = tuple(sorted(widths.items()))
+        tile_set = self._merge_table_tiles(tile_set)
 
         self._compiled: dict[int, dict[str, CuteDslStageCall]] = {}
         self._tile_configs: dict[int, GroupedGemmConfig] = {}
@@ -124,6 +120,31 @@ class CuteDslTileMixin:
             self._compile_stage(token_width, "gemm1")
             self._compile_stage(token_width, "gemm2")
         torch.cuda.synchronize(device)
+
+    def _merge_table_tiles(
+        self, tile_set: tuple[tuple[int, int], ...]
+    ) -> tuple[tuple[int, int], ...]:
+        """Add the table's tiles; drop a table whose buckets pick uncompiled widths."""
+        if self._config_table is None:
+            return tile_set
+        widths = dict(tile_set)
+        widths.update(
+            (tile.token_width, tile.persistent_clusters)
+            for tile in self._config_table.tiles
+        )
+        undeclared = {
+            payload["token_width"] for payload in self._config_table.buckets.values()
+        } - set(widths)
+        if undeclared:
+            logger.warning(
+                "Ignoring the %s GEMM config: buckets select token widths %s that "
+                "no tile declares",
+                self.contract.key,
+                sorted(undeclared),
+            )
+            self._config_table = None
+            return tile_set
+        return tuple(sorted(widths.items()))
 
     def _bind_weights(self, quant_info: StandardLayoutQuantInfo) -> None:
         """Optional hook for dtype-specific weight preparation."""
@@ -170,11 +191,11 @@ class CuteDslTileMixin:
             sf_weights=self._stage_scale(stage),
         )
 
-    def _token_width_for(self, m_max: int, expected_m: int) -> int:
+    def _token_width_for(self, max_expert_rows: int, expected_m: int) -> int:
         """Widen the tuned choice if needed to fit the packed schedule."""
         if self._config_table is not None:
             performance_width = self._config_table.pick(expected_m)["token_width"]
-        elif expected_m >= self.XWIDE_EXPECTED_M_THRESHOLD:
+        elif expected_m >= self.XWIDE_EXPECTED_M_THRESHOLD and self._xwide_by_heuristic:
             performance_width = self.XWIDE_TOKEN_WIDTH
         elif (
             expected_m >= self.WIDE_EXPECTED_M_THRESHOLD
@@ -184,16 +205,54 @@ class CuteDslTileMixin:
         else:
             performance_width = self.NARROW_TOKEN_WIDTH
         for width in sorted(self._compiled):
-            if width >= performance_width and m_max <= width * self._max_token_clusters:
+            if (
+                width >= performance_width
+                and max_expert_rows <= width * self._max_token_clusters
+            ):
                 return width
         widest = max(self._compiled)
         raise ValueError(
-            f"m_max={m_max} exceeds the widest compiled tile's schedule "
-            f"packing ({widest * self._max_token_clusters})"
+            f"max_expert_rows={max_expert_rows} exceeds the widest compiled "
+            f"tile's schedule packing ({widest * self._max_token_clusters})"
         )
 
     def _stream(self, device: torch.device):
         return self._cu_stream(torch.cuda.current_stream(device).cuda_stream)
+
+    @staticmethod
+    def _output_clusters(n: int) -> int:
+        return (n + CuteDslTileMixin.OUTPUT_WIDTH - 1) // CuteDslTileMixin.OUTPUT_WIDTH
+
+    def _small_prepare_outputs(
+        self,
+        workspace: LoraWorkspace | None,
+        prefix: str,
+        capacities: tuple[int, int],
+        num_experts: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Schedule buffers plus the small prepare's stage-begin scratch."""
+        import triton
+
+        scratch_len = 2 * max(16, triton.next_power_of_2(num_experts))
+        if workspace is None:
+            capacity1, capacity2 = capacities
+            return {
+                "schedule1_out": torch.empty(
+                    capacity1, dtype=torch.int64, device=device
+                ),
+                "tiles1_out": torch.empty(1, dtype=torch.int32, device=device),
+                "schedule2_out": torch.empty(
+                    capacity2, dtype=torch.int64, device=device
+                ),
+                "tiles2_out": torch.empty(1, dtype=torch.int32, device=device),
+                "scratch": torch.empty(scratch_len, dtype=torch.int32, device=device),
+            }
+        outputs = self._schedule_buffers(workspace, prefix, capacities, device)
+        outputs["scratch"] = workspace.tensor(
+            f"{prefix}:small_scratch", (scratch_len,), dtype=torch.int32, device=device
+        )
+        return outputs
 
     @staticmethod
     def _schedule_buffers(

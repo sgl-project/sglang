@@ -12,8 +12,22 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _check_v2_lora_modes(cfg: Any, option: str):
+    for unsupported, mode in (
+        (cfg.attn_dp_size > 1, "DP-attention with --attn-dp-size > 1"),
+        (cfg.enable_pdmux, "PD-multiplexing"),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        # Both reach the legacy kv_b correction kernels with V2 batch metadata.
+        (envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get(), "SGLANG_EXPERIMENTAL_LORA_OPTI"),
+        (get_platform().is_hip, "ROCm"),
+    ):
+        if unsupported:
+            raise ValueError(f"{option} does not yet support {mode}")
 
 
 def check_lora_server_args(server_args: Any):
@@ -34,6 +48,11 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
+            "lora"
+        ):
+            _check_v2_lora_modes(cfg, "--lora-backend triton_v2")
+
         if cfg.enable_lora_overlap_loading is None:
             declare_resolution(
                 server_args, "check_lora_server_args", enable_lora_overlap_loading=False
@@ -162,9 +181,7 @@ def check_lora_server_args(server_args: Any):
 
 
 def check_lora_moe_runner_args(server_args: Any):
-    """The LoRA MoE runner serves adapter traffic on a LoRA-enabled engine
-    with Standard dispatch; these mirror its layer-attach admission checks so
-    the failure names the flag."""
+    """Reject unsupported LoRA MoE configurations before layer attachment."""
     cfg = resolving_view(server_args)
     if (
         cfg.speculative_algorithm is not None
@@ -180,15 +197,25 @@ def check_lora_moe_runner_args(server_args: Any):
     backend = cfg.moe_runner_backend
     if not backend.startswith("lora"):
         return
-    if not (cfg.enable_lora or cfg.lora_paths):
+    if not cfg.enable_lora:
         raise ValueError(
             f"--moe-runner-backend {backend} requires --enable-lora (or --lora-paths)"
         )
+    if cfg.lora_backend != "triton_v2":
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires --lora-backend triton_v2"
+        )
+    _check_v2_lora_modes(cfg, f"--moe-runner-backend {backend}")
     # Layer attachment checks the specific weight layout within each scheme.
     if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
         raise ValueError(
             f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
-            f"FP8, and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
+            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
+        )
+    if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
+        raise ValueError(
+            f"--moe-runner-backend {backend} cannot run ModelOpt NVFP4 MoE; "
+            "use --moe-runner-backend lora_marlin"
         )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(
@@ -199,10 +226,6 @@ def check_lora_moe_runner_args(server_args: Any):
         raise ValueError(
             f"--moe-runner-backend {backend} does not yet support elastic EP"
         )
-    if cfg.enable_dp_attention and cfg.dp_size > 1:
-        raise ValueError(
-            f"--moe-runner-backend {backend} does not yet support DP-attention with dp_size > 1"
-        )
     if (
         cfg.enable_eplb
         or cfg.init_expert_location != "trivial"
@@ -211,18 +234,6 @@ def check_lora_moe_runner_args(server_args: Any):
         raise ValueError(
             f"--moe-runner-backend {backend} currently requires trivial expert placement "
             "without EPLB or redundant experts"
-        )
-    if cfg.enable_pdmux:
-        raise ValueError(
-            f"--moe-runner-backend {backend} does not yet support PD-multiplexing: its "
-            "fused-align routing scratch is cached per (device, num_buckets) and is "
-            "not safe under concurrent prefill/decode streams"
-        )
-    if cfg.enable_two_batch_overlap:
-        raise ValueError(
-            f"--moe-runner-backend {backend} does not yet support two-batch overlap: its "
-            "batch metadata and graph-stable MoE workspace are shared across layers "
-            "and are not safe for concurrent child forwards"
         )
 
 

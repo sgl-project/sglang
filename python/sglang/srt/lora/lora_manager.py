@@ -149,16 +149,12 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_req: int
     ):
-        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
-
-        Called during CudaGraphRunner.__init__(), after init_memory_pool().
-        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
-        """
-        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        self.lora_backend.init_cuda_graph_batch_info(
+        """Initialize decode-runner metadata after model memory-pool setup."""
+        self.max_bs_in_decode_cuda_graph = max_bs_in_cuda_graph
+        self.lora_backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
@@ -255,19 +251,17 @@ class LoRAManager:
         max_loras: int,
         compute_dtype,
         moe_layer,
-        include_legacy_kernel_buffers: bool = True,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
         Called before init_memory_pool() so memory profiling accounts for them.
-        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        Phase 2 (dense batch metadata) uses init_decode_cuda_graph_batch_info().
         """
         self.lora_backend.init_cuda_graph_moe_buffers(
             max_bs=max_bs,
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
-            include_legacy_kernel_buffers=include_legacy_kernel_buffers,
         )
 
     def create_lora_update_result(
@@ -330,6 +324,15 @@ class LoRAManager:
             )
 
         return self.create_lora_update_result(success=True)
+
+    def _validate_replicated_q_targets(self, target_modules):
+        # q_proj adapter targets normalize to qkv_proj.
+        unsupported = set(target_modules) & {"q_b_proj", "qkv_proj", "kv_b_proj"}
+        if unsupported and get_parallel().dcp_replicate_q_proj:
+            raise ValueError(
+                f"Replicated-Q decode is incompatible with LoRA targets {sorted(unsupported)}; "
+                "pass --no-dcp-replicate-q-proj to use the local-head Q path."
+            )
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -488,6 +491,9 @@ class LoRAManager:
         metadata."""
         self.lora_backend.reset_batch_state()
 
+    def reset_routing_cache(self) -> None:
+        self.lora_backend.reset_routing_cache()
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
@@ -500,11 +506,11 @@ class LoRAManager:
             return
 
         # set up batch info shared by all lora modules
-        use_cuda_graph = self._use_cuda_graph_batch(forward_batch)
+        use_decode_cuda_graph = self._use_cuda_graph_batch(forward_batch)
         # Eligible extend batches refresh the static prefill batch info in
         # place so captured kernels read current values at replay.
-        use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
-            forward_batch
+        use_prefill_cuda_graph = (
+            not use_decode_cuda_graph and self.can_use_prefill_cuda_graph(forward_batch)
         )
 
         active_lora_ids = set(forward_batch.lora_ids)
@@ -543,11 +549,11 @@ class LoRAManager:
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
-            forward_batch=forward_batch,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
-            use_cuda_graph=use_cuda_graph,
+            forward_batch,
+            weight_indices,
+            lora_ranks,
+            scalings,
+            use_decode_cuda_graph,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
         self.lora_backend.batch_info.has_active_lora = any(
@@ -566,8 +572,8 @@ class LoRAManager:
 
     def _use_cuda_graph_batch(self, forward_batch: ForwardBatch) -> bool:
         return (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
+            hasattr(self, "max_bs_in_decode_cuda_graph")
+            and forward_batch.batch_size <= self.max_bs_in_decode_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
             and (not self.attn_dp_enabled or forward_batch.can_run_decode_cuda_graph)
         )
@@ -718,6 +724,7 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        self._validate_replicated_q_targets(self.target_modules)
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
@@ -871,18 +878,17 @@ class LoRAManager:
 
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
+        # Each Indexer decides fusion when it is built (CUDA, env, RoPE style).
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
-        if indexer_targets:
-            from sglang.srt.layers.attention.dsa.dsa_indexer import (
-                _use_dsa_indexer_fusion,
+        if indexer_targets and any(
+            getattr(module, "use_dsa_indexer_fusion", False)
+            for _, module in self.base_model.named_modules()
+        ):
+            raise ValueError(
+                f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
+                "incompatible with DSA indexer Q/K fusion. Set "
+                "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
             )
-
-            if _use_dsa_indexer_fusion:
-                raise ValueError(
-                    f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
-                    "incompatible with DSA indexer Q/K fusion. Set "
-                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
-                )
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
@@ -1150,10 +1156,22 @@ class LoRAManager:
                 if isinstance(module, InklingBatchDenseMLP):
                     from sglang.srt.models.inkling_common.lora import (
                         InklingBatchDenseMLPWithLoRA,
+                        InklingBatchDenseMLPWithLoRAV2,
                     )
 
-                    module.__class__ = InklingBatchDenseMLPWithLoRA
+                    # The dense engine's sink runs on the pool buffers directly;
+                    # other backends take the experimental path.
+                    module.__class__ = (
+                        InklingBatchDenseMLPWithLoRAV2
+                        if self.lora_backend.name == "triton_v2"
+                        else InklingBatchDenseMLPWithLoRA
+                    )
                     module.initialize_lora(self.lora_backend)
+                    logger.info_once(
+                        "Inkling shared-sink LoRA: %s on the %s backend",
+                        type(module).__name__,
+                        self.lora_backend.name,
+                    )
                     lora_module = module
                 else:
                     lora_module = self.set_lora_module(
@@ -1165,9 +1183,8 @@ class LoRAManager:
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
 
-        # The quant methods create no base runner under a lora_* backend, so an
-        # MoE layer the adapter did not wrap would fail at its first forward.
-        # (getattr: unit tests build partial managers without __init__.)
+        # lora_* quant methods leave execution to the LoRA wrapper; reject
+        # target sets that leave every MoE layer without one.
         backend = getattr(self, "moe_lora_runner_backend", None)
         modules = list(self.base_model.modules())
         if (
@@ -1189,18 +1206,14 @@ def init_lora_cuda_graph_moe_buffers(
     lora_manager: LoRAManager,
     dtype: torch.dtype,
 ):
-    """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+    """Allocate legacy MoE buffers before init_memory_pool() sizes the KV cache.
 
-    Must be called before init_memory_pool() so that memory profiling
-    sees the reduced available memory and sizes KV cache correctly.
-    All MoE LoRA layers share one set of buffers (managed by the
-    lora_backend) since they execute sequentially during forward.
-
-    Phase 2 (dense LoRA batch metadata) is handled later in
-    CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-    because it needs capture-time parameters (max_bs, num_tokens_per_req)
-    that are only available at that stage.
+    Sequential MoE layers reuse these buffers. Dense batch metadata is allocated
+    later by DecodeCudaGraphRunner, which owns the capture-time batch sizes.
     """
+    if lora_manager.lora_backend.name == "triton_v2":
+        logger.debug("V2 MoE scratch is allocated during warmup, not reserved here")
+        return
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
@@ -1219,18 +1232,14 @@ def init_lora_cuda_graph_moe_buffers(
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
-            # New engines share metadata but allocate their own kernel scratch.
-            include_legacy = not module._lora_runner_backend.is_lora()
             lora_manager.init_cuda_graph_moe_buffers(
                 max_tokens,
                 max_loras,
                 dtype,
                 module,
-                include_legacy_kernel_buffers=include_legacy,
             )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_tokens={max_tokens}, max_loras={max_loras}, "
-                f"legacy_kernel_buffers={include_legacy})"
+                f"(max_tokens={max_tokens}, max_loras={max_loras})"
             )
             break

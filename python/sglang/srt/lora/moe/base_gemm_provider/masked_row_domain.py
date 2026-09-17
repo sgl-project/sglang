@@ -17,13 +17,13 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (
 from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.route_view import RouteView
+    from sglang.kernels.ops.lora.common.route_view import RouteView
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
-def masked_m_max(num_tokens: int) -> int:
-    """Use the same slab bound as the upstream masked preprocess."""
-    return (num_tokens // 256 + 1) * 256
+def masked_m_max(num_tokens: int, alignment: int = 8) -> int:
+    """Fit all input rows in one expert, with a nonzero aligned slab extent."""
+    return max(alignment, (num_tokens + alignment - 1) // alignment * alignment)
 
 
 class MaskedRowState(msgspec.Struct, kw_only=True):
@@ -36,7 +36,7 @@ class MaskedRowState(msgspec.Struct, kw_only=True):
     expected_m: int
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32
     m_max: int
-    retained_inputs: bool
+    input_buffer_reuse: bool
 
 
 class MaskedRowDomainProvider(MoeBaseProvider):
@@ -44,17 +44,17 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self.quant_info = quant_info
         self._gate_up_slices = admit_weight_layout(quant_info)
 
-        from sglang.srt.lora.moe.kernels.activation_delta import (
+        from sglang.kernels.ops.lora.moe.activation_delta import (
             act_delta_masked,
         )
-        from sglang.srt.lora.moe.kernels.dispatch_masked import (
+        from sglang.kernels.ops.lora.moe.dispatch_masked import (
             dispatch_fill_masked_bf16,
         )
 
         self._preprocess = dispatch_fill_masked_bf16
         self._act_kernel = act_delta_masked
 
-        from sglang.srt.lora.moe.kernels.fused_act import (
+        from sglang.kernels.ops.lora.moe.fused_act import (
             fused_b_act_masked,
         )
 
@@ -106,12 +106,12 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             expected_m=expected_rows_per_expert(num_pairs, num_experts),
             pair_to_row=pair_to_row,
             m_max=m_max,
-            retained_inputs=workspace is not None,
+            input_buffer_reuse=workspace is not None,
         )
 
     def release_prepared_inputs(self, row_state: MaskedRowState) -> None:
         # Workspace buffers retain their addresses for graph replay.
-        if row_state.retained_inputs:
+        if row_state.input_buffer_reuse:
             return
         from sglang.srt.utils import dispose_tensor
 

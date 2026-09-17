@@ -25,7 +25,10 @@ import torch
 # test_modelopt_nvfp4_moe_scales.py for the circular-import reason).
 # isort: off
 from sglang.srt.layers.quantization import modelopt_quant
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp4MoeQuantInfo,
 )
@@ -125,6 +128,122 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
         )
     method.runner = _Runner()
     return method
+
+
+class TestNvFp4LoraAdmission(CustomTestCase):
+    def _method(self, backend, capability=(10, 0)):
+        with (
+            _live_backend(backend),
+            mock.patch.object(modelopt_quant, "is_cuda", return_value=True),
+            mock.patch.object(
+                modelopt_quant, "get_device_capability", return_value=capability
+            ),
+            mock.patch.object(
+                modelopt_quant,
+                "get_platform",
+                return_value=SimpleNamespace(is_blackwell=capability >= (10, 0)),
+            ),
+        ):
+            return ModelOptNvFp4FusedMoEMethod(SimpleNamespace())
+
+    def test_actual_quant_method_rejects_non_marlin_lora(self):
+        for backend in (MoeRunnerBackend.LORA_TRITON, MoeRunnerBackend.LORA_CUTEDSL):
+            with self.subTest(backend=backend), _live_backend(backend):
+                with mock.patch.object(modelopt_quant, "get_platform") as platform:
+                    with self.assertRaisesRegex(ValueError, "lora_marlin"):
+                        ModelOptNvFp4FusedMoEMethod(SimpleNamespace())
+                platform.assert_not_called()
+        for backend in (MoeRunnerBackend.LORA_MARLIN, MoeRunnerBackend.MARLIN):
+            for capability in ((9, 0), (10, 0)):
+                with self.subTest(backend=backend, capability=capability):
+                    self._method(backend, capability)
+
+    def test_checkpoint_detected_nvfp4_uses_the_same_guard(self):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        config = ModelOptFp4Config.from_config(
+            {"quant_algo": "NVFP4", "group_size": 16, "ignore": []}
+        )
+        layer = FusedMoE.__new__(FusedMoE)
+        for backend in (MoeRunnerBackend.LORA_TRITON, MoeRunnerBackend.LORA_CUTEDSL):
+            with self.subTest(backend=backend), _live_backend(backend):
+                with self.assertRaisesRegex(ValueError, "lora_marlin"):
+                    config.get_quant_method(layer, "experts")
+
+    def test_lora_rejects_nongated_before_weight_creation(self):
+        layer = SimpleNamespace(moe_runner_config=SimpleNamespace(is_gated=False))
+        for backend in (MoeRunnerBackend.LORA_MARLIN, MoeRunnerBackend.MARLIN):
+            method = self._method(backend)
+            with mock.patch.object(
+                method,
+                "prepare_weight_loader",
+                side_effect=RuntimeError("loader reached"),
+            ) as loader:
+                if backend.is_lora_marlin():
+                    with self.assertRaisesRegex(ValueError, "two W13 slices"):
+                        method.create_weights(layer, 2, 64, 32, torch.bfloat16)
+                    loader.assert_not_called()
+                    self.assertFalse(hasattr(layer, "params_dtype"))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "loader reached"):
+                        method.create_weights(layer, 2, 64, 32, torch.bfloat16)
+                    loader.assert_called_once()
+
+    def test_lora_uses_the_existing_marlin_scale_preparation(self):
+        cases = (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([[1.0], [2.0]]),
+            torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+            torch.tensor([[1.0, 1.000001], [2.0, 2.0]]),
+            torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+        )
+        for backend in (MoeRunnerBackend.LORA_MARLIN, MoeRunnerBackend.MARLIN):
+            for w13 in cases:
+                method = self._method(backend)
+                w2 = torch.ones(2)
+                expected = w13 if w13.ndim == 1 else w13[:, 0]
+                prepared = []
+                layer = SimpleNamespace(
+                    num_local_experts=2,
+                    moe_runner_config=SimpleNamespace(is_gated=True),
+                    w13_weight_scale_2=w13,
+                    w2_weight_scale_2=w2,
+                )
+                with (
+                    self.subTest(backend=backend, w13=w13),
+                    _live_backend(backend),
+                    mock.patch.object(
+                        modelopt_quant,
+                        "get_moe_a2a_backend",
+                        return_value=SimpleNamespace(is_megamoe=lambda: False),
+                    ),
+                    mock.patch.object(
+                        modelopt_quant, "_use_nvfp4_dispatch", return_value=False
+                    ),
+                    mock.patch.object(
+                        modelopt_quant,
+                        "copy_or_rebind_param",
+                        side_effect=lambda layer, name, value: setattr(
+                            layer, name, value
+                        ),
+                    ),
+                    mock.patch.object(
+                        modelopt_quant,
+                        "prepare_moe_nvfp4_layer_for_marlin",
+                        side_effect=lambda layer: prepared.append(
+                            (
+                                layer.w13_weight_scale_2.clone(),
+                                layer.w13_weight_scale_2.is_contiguous(),
+                            )
+                        ),
+                    ) as prepare,
+                ):
+                    method.process_weights_after_loading(layer)
+                    prepare.assert_called_once_with(layer)
+                    scales, contiguous = prepared[0]
+                    torch.testing.assert_close(scales, expected, rtol=0, atol=0)
+                    self.assertTrue(contiguous)
+                    self.assertIs(layer.w2_weight_scale_2, w2)
 
 
 class TestNvFp4MoeDispatch(CustomTestCase):

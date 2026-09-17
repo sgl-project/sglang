@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tune a separate ``*_down.json`` config for the fused MoE down GEMM.
+"""Screen down-GEMM configs with the gate/up config and route block size fixed.
 
-``tuning_fused_moe_triton.py`` times the fused pipeline under one config, so
-both GEMMs ship the gate/up winner even though their aspect ratios are
-opposite (gate/up: N = 2 x shard, K = hidden; down: N = hidden, K = shard).
-The runtime already prefers an ``E=...,N=..._down.json`` when one exists and
-only pins BLOCK_SIZE_M across the pair (one moe_align sort feeds both).
-
-This script pins the tuned gate/up config per batch size and sweeps down
-candidates that share its BLOCK_SIZE_M, timing the same fused call the main
-tuner times: the gate/up term is constant, so the argmin isolates the down
-kernel. Run it after the main tuner, pointing --gate-up-config at its output.
+Run after the main tuner, passing its output as --gate-up-config. This times
+the full fused call and writes ``*_down.json`` screening candidates, without
+numerical checks, held-out selection or model qualification. Validate numerics
+and the full pipeline before installing the output.
 """
 
 import argparse
@@ -19,39 +13,25 @@ import os
 import sys
 from contextlib import nullcontext
 
-import torch
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import tuning_fused_moe_triton as tuner  # noqa: E402
-from common_utils import (  # noqa: E402
-    get_configs_compute_bound,
-    get_default_batch_sizes,
-    get_model_config,
-    sort_config,
-)
-
-from sglang.srt.layers.moe.moe_runner.triton_utils import (  # noqa: E402
-    fused_moe as fused_moe_mod,
-)
-from sglang.srt.layers.moe.moe_runner.triton_utils import (  # noqa: E402
-    fused_moe_triton_config as cfg_mod,
-)
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (  # noqa: E402
-    get_config_file_name,
-)
-from sglang.srt.server_args import (  # noqa: E402
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
-
 _PIN = {"gate_up": None, "down": None}
 
 
 def _patched_try_get_optimal(*args, **kwargs):
-    if kwargs.get("return_down_config") or (len(args) >= 7 and args[6]):
+    if kwargs.get("return_down_config") or (len(args) >= 9 and args[8]):
         return dict(_PIN["gate_up"]), (dict(_PIN["down"]), _PIN["down"]["BLOCK_SIZE_M"])
     return dict(_PIN["gate_up"])
+
+
+def _benchmark_candidate(benchmark, *args, **kwargs):
+    try:
+        return benchmark(*args, **kwargs), None
+    except Exception as exc:
+        if any(
+            message in str(exc).lower()
+            for message in ("illegal memory access", "device-side assert")
+        ):
+            raise
+        return None, repr(exc)[:300]
 
 
 def main() -> None:
@@ -69,6 +49,29 @@ def main() -> None:
     parser.add_argument("--out-dir", default=".")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
+
+    import torch
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tuning_fused_moe_triton as tuner
+    from common_utils import (
+        get_configs_compute_bound,
+        get_default_batch_sizes,
+        get_model_config,
+        sort_config,
+    )
+
+    from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe as fused_moe_mod
+    from sglang.srt.layers.moe.moe_runner.triton_utils import (
+        fused_moe_triton_config as cfg_mod,
+    )
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+        get_config_file_name,
+    )
+    from sglang.srt.server_args import (
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
 
     server_args = ServerArgs(
         model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
@@ -117,26 +120,26 @@ def main() -> None:
         first_err = None
         for cand in cands:
             _PIN["down"] = cand
-            try:
-                t = tuner.benchmark_config(
-                    cand,
-                    M,
-                    E,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    False,
-                    False,
-                    False,
-                    False,
-                    block_shape,
-                    num_iters=10,
-                )
-            except Exception as e:
+            t, error = _benchmark_candidate(
+                tuner.benchmark_config,
+                cand,
+                M,
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                False,
+                False,
+                False,
+                False,
+                block_shape,
+                num_iters=10,
+            )
+            if error is not None:
                 if first_err is None:
-                    first_err = repr(e)[:300]
+                    first_err = error
                 continue
             if t < best_t:
                 best_t, best = t, cand
@@ -144,7 +147,7 @@ def main() -> None:
             f"no down candidate compiled at M={M}; first error: {first_err}"
         )
         results[M] = sort_config(best)
-        print(f"M={M}: best down {results[M]} ({best_t * 1e3:.1f}us)", flush=True)
+        print(f"M={M}: best down {results[M]} ({best_t:.1f}us)", flush=True)
 
     name = get_config_file_name(
         E,

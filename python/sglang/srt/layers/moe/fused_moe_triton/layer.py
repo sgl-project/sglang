@@ -565,9 +565,6 @@ class FusedMoE(torch.nn.Module):
         ):
             self.moe_runner_config.inplace = False
 
-        _nvfp4_backend = getattr(
-            self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
-        )
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )

@@ -18,12 +18,12 @@ _PACKAGE_CONFIG_DIR = os.path.join(
 )
 
 
-class GemmTile(msgspec.Struct, frozen=True, kw_only=True):
+class GemmTile(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     token_width: int
     persistent_clusters: int
 
 
-class GemmConfigTable(msgspec.Struct, kw_only=True):
+class GemmConfigTable(msgspec.Struct, kw_only=True, forbid_unknown_fields=True):
     buckets: dict[int, dict[str, int]]
     tiles: tuple[GemmTile, ...] = ()
     version: dict[str, str] = {}
@@ -38,14 +38,21 @@ def _validate(table: GemmConfigTable) -> None:
     for bucket_m, payload in table.buckets.items():
         if bucket_m <= 0:
             raise ValueError(f"bucket key {bucket_m} must be positive")
-        if not payload or any(value <= 0 for value in payload.values()):
-            raise ValueError(f"bucket {bucket_m} payload must be positive ints")
+        if set(payload) != {"token_width"}:
+            raise ValueError(f"bucket {bucket_m} must contain only token_width")
+        width = payload["token_width"]
+        if width <= 0 or width & (width - 1):
+            raise ValueError(
+                f"bucket {bucket_m} token_width must be a positive power of two"
+            )
     widths = [tile.token_width for tile in table.tiles]
     if len(set(widths)) != len(widths):
         raise ValueError("tiles must declare one persistent_clusters per token_width")
     for tile in table.tiles:
-        if tile.token_width <= 0 or tile.persistent_clusters <= 0:
-            raise ValueError("tile fields must be positive")
+        if tile.token_width <= 0 or tile.token_width & (tile.token_width - 1):
+            raise ValueError("tile token_width must be a positive power of two")
+        if tile.persistent_clusters <= 0:
+            raise ValueError("persistent_clusters must be positive")
 
 
 def config_file_name(
@@ -66,7 +73,7 @@ def config_file_name(
 
 @functools.lru_cache(maxsize=None)
 def _load(
-    path: str, expected_versions: tuple[tuple[str, str], ...]
+    path: str, installed_versions: tuple[tuple[str, str], ...]
 ) -> GemmConfigTable | None:
     if not os.path.exists(path):
         return None
@@ -77,18 +84,21 @@ def _load(
     except (msgspec.DecodeError, ValueError) as exc:
         logger.warning("Ignoring malformed MoE LoRA GEMM config %s: %s", path, exc)
         return None
-    for name, expected in expected_versions:
+    # The recorded version is tuning provenance. A table tuned with another
+    # release is still used: its tiles are compiled and checked before use,
+    # but their speed on this release has not been re-validated here.
+    for name, installed in installed_versions:
         recorded = table.version.get(name)
-        if recorded is not None and recorded != expected:
+        if recorded is not None and recorded != installed:
             logger.warning(
-                "Ignoring MoE LoRA GEMM config %s: %s version %s does not "
-                "match installed %s",
+                "MoE LoRA GEMM config %s was tuned with %s %s; installed %s. "
+                "The table is used, but its tile choices were not re-validated "
+                "on this release.",
                 path,
                 name,
                 recorded,
-                expected,
+                installed,
             )
-            return None
     logger.info("Using MoE LoRA GEMM config from %s.", path)
     return table
 
@@ -101,7 +111,7 @@ def load_config_table(
     n_gemm2: int,
     k: int,
     device_name: str | None = None,
-    expected_versions: Mapping[str, str] | None = None,
+    installed_versions: Mapping[str, str] | None = None,
 ) -> GemmConfigTable | None:
     if device_name is None:
         from sglang.srt.utils import get_device_name
@@ -115,7 +125,7 @@ def load_config_table(
         k=k,
         device_name=device_name,
     )
-    versions = tuple(sorted((expected_versions or {}).items()))
+    versions = tuple(sorted((installed_versions or {}).items()))
     roots = (envs.SGLANG_LORA_MOE_CONFIG_DIR.get(), _PACKAGE_CONFIG_DIR)
     for root in filter(None, roots):
         path = os.path.join(root, "base_gemm", name)

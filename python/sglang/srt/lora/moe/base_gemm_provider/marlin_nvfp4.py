@@ -66,7 +66,7 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
         workspace=None,
     ) -> MarlinNvFp4RowState:
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-        from sglang.srt.lora.moe.kernels.align_rows import align_rows, pair_to_row_map
+        from sglang.srt.lora.moe.base_gemm_provider.input_alignment import align_rows
 
         num_tokens = hidden_states.shape[0]
         num_experts = self.quant_info.num_local_experts
@@ -74,9 +74,6 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
         for block_size_m in (8, 16, 32, 48, 64):
             if num_tokens * top_k / num_experts / block_size_m < 0.9:
                 break
-        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
-            topk_ids, block_size_m, num_experts
-        )
         num_pairs = topk_ids.numel()
         device = hidden_states.device
         if workspace is not None:
@@ -85,9 +82,11 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
             )
         else:
             rows = torch.empty((num_pairs,), dtype=torch.int32, device=device)
-        # Pair-major rows: pair p is row p, and a pair without an expert reads as
-        # -1 (the finalize gates on the row map, not on topk_ids).
-        pair_to_row = pair_to_row_map(topk_ids, rows)
+        # Finalize uses pair_to_row, with -1 for pairs without an expert.
+        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
+            topk_ids, block_size_m, num_experts, pair_to_row_out=rows
+        )
+        pair_to_row = rows
         return MarlinNvFp4RowState(
             hidden_states=hidden_states,
             topk_ids=topk_ids,

@@ -43,7 +43,10 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
-from sglang.srt.arg_groups.lora_hook import check_lora_moe_runner_args
+from sglang.srt.arg_groups.lora_hook import (
+    check_lora_moe_runner_args,
+    check_lora_server_args,
+)
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -53,6 +56,7 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -1084,16 +1088,154 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_kv4_compatibility(args)
 
 
+class TestLoraDpAttentionArgs(unittest.TestCase):
+    def _args(self, **overrides):
+        kwargs = dict(
+            model_path="dummy",
+            tp_size=2,
+            enable_lora=True,
+            lora_backend="triton_v2",
+            max_lora_rank=8,
+            lora_target_modules=["down_proj"],
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_rejects_v2_attention_dp(self):
+        for runner in ("auto", "lora_cutedsl"):
+            with (
+                self.subTest(runner=runner),
+                self.assertRaisesRegex(ValueError, "DP-attention"),
+            ):
+                check_lora_server_args(
+                    self._args(attn_dp_size=2, moe_runner_backend=runner)
+                )
+
+    def test_rejects_v2_normalized_legacy_attention_dp(self):
+        args = self._args(enable_dp_attention=True, dp_size=2)
+        parallel_hook.handle_deprecated_dp_attention(args)
+        self.assertFalse(resolution_result(args, "enable_dp_attention"))
+        self.assertEqual(resolution_result(args, "attn_dp_size"), 2)
+        self.assertEqual(resolution_result(args, "dp_size"), 1)
+        with self.assertRaisesRegex(ValueError, "triton_v2.*DP-attention"):
+            check_lora_server_args(args)
+
+    def test_paths_enable_v2_attention_dp_guard(self):
+        args = self._args(
+            enable_lora=None, lora_paths=["adapter=/tmp/adapter"], attn_dp_size=2
+        )
+        with self.assertRaisesRegex(ValueError, "triton_v2.*DP-attention"):
+            check_lora_server_args(args)
+        self.assertTrue(resolution_result(args, "enable_lora"))
+
+    def test_allows_independent_dp_replicas(self):
+        for backend in ("auto", "lora_cutedsl"):
+            with self.subTest(backend=backend):
+                args = self._args(dp_size=2, moe_runner_backend=backend)
+                check_lora_server_args(args)
+                self.assertEqual(resolution_result(args, "attn_dp_size"), 1)
+
+    def test_preserves_legacy_and_disabled_lora(self):
+        for overrides in (
+            {"lora_backend": "csgmv"},
+            {"enable_lora": None},
+            {"enable_lora": False, "lora_paths": ["adapter=/tmp/adapter"]},
+        ):
+            with self.subTest(**overrides):
+                check_lora_server_args(self._args(attn_dp_size=2, **overrides))
+
+    def test_moe_rejects_effective_attention_dp(self):
+        for deprecated in (False, True):
+            with self.subTest(deprecated=deprecated):
+                args = self._args(moe_runner_backend="lora_cutedsl")
+                if deprecated:
+                    args.enable_dp_attention = True
+                    args.dp_size = 2
+                    parallel_hook.handle_deprecated_dp_attention(args)
+                else:
+                    args.attn_dp_size = 2
+                with self.assertRaisesRegex(ValueError, "lora_cutedsl.*DP-attention"):
+                    check_lora_moe_runner_args(args)
+
+
 class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
+    def _args(self, **overrides):
+        kwargs = dict(
+            model_path="dummy",
+            enable_lora=True,
+            lora_backend="triton_v2",
+            max_lora_rank=8,
+            lora_target_modules=["down_proj"],
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_v2_rejects_legacy_kv_b_correction_paths(self):
+        from sglang.srt.arg_groups import lora_hook
+
+        for runner in ("auto", "lora_cutedsl"):
+            with self.subTest(runner=runner, mode="experimental"):
+                with envs.SGLANG_EXPERIMENTAL_LORA_OPTI.override(True):
+                    with self.assertRaisesRegex(ValueError, "EXPERIMENTAL_LORA_OPTI"):
+                        check_lora_server_args(self._args(moe_runner_backend=runner))
+            with self.subTest(runner=runner, mode="rocm"):
+                with patch.object(
+                    lora_hook, "get_platform", return_value=SimpleNamespace(is_hip=True)
+                ):
+                    with self.assertRaisesRegex(ValueError, "ROCm"):
+                        check_lora_server_args(self._args(moe_runner_backend=runner))
+
+    def test_v2_rejects_concurrent_forwards(self):
+        for flag, error in (
+            ("enable_pdmux", "PD-multiplexing"),
+            ("enable_two_batch_overlap", "two-batch overlap"),
+        ):
+            for lora_args in (
+                {"enable_lora": True},
+                {"enable_lora": None, "lora_paths": ["adapter=/tmp/adapter"]},
+            ):
+                for runner in ("auto", "lora_cutedsl"):
+                    with self.subTest(flag=flag, lora_args=lora_args, runner=runner):
+                        args = self._args(
+                            moe_runner_backend=runner, **{flag: True}, **lora_args
+                        )
+                        with self.assertRaisesRegex(ValueError, error):
+                            check_lora_server_args(args)
+
+    def test_concurrency_guards_preserve_legacy_and_disabled_lora(self):
+        for flag in ("enable_pdmux", "enable_two_batch_overlap"):
+            for lora_args in (
+                {"lora_backend": "csgmv"},
+                {"enable_lora": None},
+                {"enable_lora": False, "lora_paths": ["adapter=/tmp/adapter"]},
+            ):
+                with self.subTest(flag=flag, lora_args=lora_args):
+                    check_lora_server_args(self._args(**{flag: True}, **lora_args))
+
+    def test_v2_allows_sequential_forwards(self):
+        check_lora_server_args(self._args())
+
+    def test_requires_v2_lora_backend(self):
+        for runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+            for backend in (None, "triton", "csgmv", "ascend", "torch_native"):
+                with self.subTest(runner=runner, backend=backend):
+                    kwargs = dict(
+                        model_path="dummy", enable_lora=True, moe_runner_backend=runner
+                    )
+                    if backend is not None:
+                        kwargs["lora_backend"] = backend
+                    with self.assertRaisesRegex(
+                        ValueError, "requires --lora-backend triton_v2"
+                    ):
+                        check_lora_moe_runner_args(ServerArgs(**kwargs))
+            check_lora_moe_runner_args(self._args(moe_runner_backend=runner))
+
     def test_rejects_pdmux(self):
-        # The MoE LoRA fused-align routing scratch is cached per
-        # (device, num_buckets); PDMux runs prefill and decode concurrently on
-        # separate streams, so the combination must fail at startup instead of
-        # silently corrupting routes.
         server_args = ServerArgs(
             model_path="dummy",
             moe_runner_backend="lora_cutedsl",
             enable_lora=True,
+            lora_backend="triton_v2",
             enable_pdmux=True,
         )
 
@@ -1120,6 +1262,7 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
             model_path="dummy",
             moe_runner_backend="lora_cutedsl",
             enable_lora=True,
+            lora_backend="triton_v2",
             enable_two_batch_overlap=True,
         )
 
@@ -4085,26 +4228,111 @@ class TestLazyReexports(CustomTestCase):
             server_args_module.NotAThing
 
 
+class TestLoraReplicatedQArgs(unittest.TestCase):
+    def test_replication_target_validation_is_deferred_to_the_model(self):
+        for lora_args in ({"enable_lora": True}, {"lora_paths": ["adapter=/unused"]}):
+            for target in ("q_b_proj", "kv_b_proj", "q_proj", "down_proj"):
+                with self.subTest(lora_args=lora_args, target=target):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        dcp_replicate_q_proj=True,
+                        max_lora_rank=16,
+                        lora_target_modules=[target],
+                        **lora_args,
+                    )
+                    check_lora_server_args(args)
+
+    def test_kimi_default_and_explicit_disable_preserved_until_target_validation(self):
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import _kimi_k3_overrides
+
+        for replicate_q in (None, False):
+            with self.subTest(replicate_q=replicate_q):
+                args = ServerArgs(
+                    model_path="dummy",
+                    tp_size=2,
+                    dcp_size=2,
+                    dcp_comm_backend="a2a",
+                    decode_attention_backend="tokenspeed_mla",
+                    dcp_replicate_q_proj=replicate_q,
+                    enable_lora=True,
+                    max_lora_rank=16,
+                    lora_target_modules=["q_b_proj"],
+                )
+                declare_resolution(
+                    args, "kimi_k3", **_kimi_k3_overrides(args, SimpleNamespace())
+                )
+                if replicate_q is None:
+                    self.assertTrue(resolution_result(args, "dcp_replicate_q_proj"))
+                else:
+                    self.assertFalse(resolution_result(args, "dcp_replicate_q_proj"))
+                check_lora_server_args(args)
+
+    def test_preserves_base_only_and_local_head_lora(self):
+        for kwargs in (
+            {"dcp_replicate_q_proj": True},
+            {
+                "enable_lora": False,
+                "lora_paths": ["adapter=/unused"],
+                "dcp_replicate_q_proj": True,
+            },
+            {"enable_lora": True, "dcp_replicate_q_proj": False},
+            {"enable_lora": True, "dcp_replicate_q_proj": None},
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    max_lora_rank=16,
+                    lora_target_modules=["q_b_proj"],
+                    **kwargs,
+                )
+                check_lora_server_args(args)
+
+
 class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
     """Startup guards for the lora_* MoE runner backends."""
 
     def test_rejects_speculative_selection(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            speculative_algorithm="EAGLE",
-            speculative_moe_runner_backend="lora_cutedsl",
+        for runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+            with self.subTest(runner=runner):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    speculative_moe_runner_backend=runner,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "speculative-moe-runner-backend"
+                ):
+                    check_lora_moe_runner_args(args)
+
+    def test_lora_target_defaults_to_ordinary_draft(self):
+        from sglang.srt.arg_groups.overrides import (
+            _speculative_moe_runner_default,
+            run_post_process_pass,
         )
-        with self.assertRaisesRegex(ValueError, "speculative-moe-runner-backend"):
-            check_lora_moe_runner_args(server_args)
+
+        for runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+            with self.subTest(runner=runner):
+                args = ServerArgs(
+                    model_path="dummy",
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    moe_runner_backend=runner,
+                    speculative_algorithm="EAGLE",
+                )
+                run_post_process_pass(args, _speculative_moe_runner_default)
+                check_lora_moe_runner_args(args)
+                self.assertEqual(
+                    resolution_result(args, "speculative_moe_runner_backend"), "auto"
+                )
+                self.assertIsNone(args.speculative_moe_runner_backend)
 
     def test_speculative_value_ignored_without_speculative_decoding(self):
-        # The field inherits the target runner when unset, so it reads the
-        # lora_* name on every LoRA server; only an actual draft model makes
-        # it meaningful.
+        # Without a draft model, an explicit draft-only field has no effect.
         server_args = ServerArgs(
             model_path="dummy",
             moe_runner_backend="lora_cutedsl",
             enable_lora=True,
+            lora_backend="triton_v2",
             max_lora_rank=16,
             lora_target_modules=["gate_up_proj", "down_proj"],
             speculative_moe_runner_backend="lora_cutedsl",
@@ -4116,27 +4344,58 @@ class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
             model_path="dummy",
             moe_runner_backend="lora_cutedsl",
             enable_lora=True,
+            lora_backend="triton_v2",
             quantization="awq",
         )
         with self.assertRaisesRegex(ValueError, "unquantized"):
             check_lora_moe_runner_args(server_args)
 
-        for quantization in (None, "fp8", "modelopt_fp4"):
+        for quantization, runner in (
+            (None, "lora_cutedsl"),
+            ("fp8", "lora_cutedsl"),
+            ("modelopt_fp4", "lora_marlin"),
+        ):
             server_args = ServerArgs(
                 model_path="dummy",
-                moe_runner_backend="lora_cutedsl",
+                moe_runner_backend=runner,
                 enable_lora=True,
+                lora_backend="triton_v2",
                 max_lora_rank=16,
                 lora_target_modules=["gate_up_proj", "down_proj"],
                 quantization=quantization,
             )
             check_lora_moe_runner_args(server_args)
 
+    def test_nvfp4_needs_the_marlin_provider(self):
+        for runner in ("lora_cutedsl", "lora_triton"):
+            with self.subTest(runner=runner):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    moe_runner_backend=runner,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    quantization="modelopt_fp4",
+                )
+                with self.assertRaisesRegex(ValueError, "lora_marlin"):
+                    check_lora_moe_runner_args(server_args)
+
+    def test_rejects_explicitly_disabled_lora(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_runner_backend="lora_cutedsl",
+            enable_lora=False,
+            lora_paths=["adapter=/tmp/adapter"],
+            lora_backend="triton_v2",
+        )
+        with self.assertRaisesRegex(ValueError, "requires --enable-lora"):
+            check_lora_server_args(server_args)
+
     def test_rejects_non_standard_dispatch(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_runner_backend="lora_cutedsl",
             enable_lora=True,
+            lora_backend="triton_v2",
             moe_a2a_backend="deepep",
         )
         with self.assertRaisesRegex(ValueError, "Standard dispatch"):

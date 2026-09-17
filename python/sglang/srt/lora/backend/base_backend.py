@@ -27,6 +27,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
     supports_lora_a_overlap = False
     skip_inactive_lora_batches = False
+    # Requires a separate "nolora" decode graph for batches without adapters.
+    skip_inactive_dense_lora = False
 
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
@@ -81,6 +83,11 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             "prepare_global_lora_batch() to support DP attention."
         )
 
+    def reset_routing_cache(self) -> None:
+        """Clear cached routes without changing batch metadata or storage."""
+        if self.lora_workspace is not None:
+            self.lora_workspace.routes.clear()
+
     def validate_lora_targets(
         self,
         base_model: torch.nn.Module,
@@ -88,6 +95,35 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     ) -> None:
         """Raise before wrapping when this backend cannot execute its targets."""
         pass
+
+    def forward_with_base(
+        self,
+        layer,
+        x: torch.Tensor,
+        base_fn,
+        lora_a,
+        lora_b,
+        output_offset,
+        offsets,
+        *,
+        all_reduce=None,
+        kind="linear",
+        pruned_batch_info=None,
+    ) -> torch.Tensor:
+        """Run base + LoRA, retaining separate base/A reductions for legacy backends."""
+        if all_reduce is None:
+            return layer.apply_lora(base_fn(), x)
+        output = base_fn()
+        lora_a_output = self.run_lora_a_sgemm(x, lora_a)
+        output = all_reduce(output)
+        lora_a_output = all_reduce(lora_a_output)
+        return self.run_lora_b_sgemm(
+            x=lora_a_output,
+            weights=lora_b,
+            output_offset=output_offset,
+            output_offset_cpu=layer.output_offset_cpu,
+            base_output=output,
+        )
 
     def run_lora_a_embedding(
         self,
@@ -210,19 +246,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
-    def init_cuda_graph_batch_info(
-        self,
-        max_bs_in_cuda_graph: int,
-        num_tokens_per_req: int,
+    def init_decode_cuda_graph_batch_info(
+        self, max_bs_in_cuda_graph: int, num_tokens_per_req: int
     ):
-        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
-
-        Called during CudaGraphRunner.__init__(), after init_memory_pool().
-
-        Args:
-            max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
-            num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
-        """
+        """Allocate decode-runner metadata, including target verification."""
         pass
 
     def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
@@ -233,7 +260,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         )
 
     def init_prefill_cuda_graph_batch_info(
-        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+        self,
+        max_num_tokens: int,
+        max_num_requests: Optional[int] = None,
     ):
         """Allocate static LoRA batch metadata for the prefill CUDA graph,
         sized for the largest captured token bucket. Called before capture."""
@@ -268,7 +297,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         base = moe_layer.base_layer
         top_k = base.top_k
-        device = moe_layer._quant_info.w13_weight.device
+        quant_info = moe_layer._quant_info
+        # Marlin quant info exposes packed weights as w13_qweight.
+        weight = getattr(quant_info, "w13_weight", None)
+        if weight is None:
+            weight = quant_info.w13_qweight
+        device = weight.device
         num_experts = base.num_experts
 
         block_size_m = 64
@@ -393,14 +427,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        use_cuda_graph: bool,
+        use_decode_cuda_graph: bool,
         use_prefill_cuda_graph: bool = False,
     ):
-        """Prepare the lora weights and batch info for current forward batch.
-
-        use_cuda_graph / use_prefill_cuda_graph select in-place updates of the
-        static decode / prefill CUDA graph batch info respectively.
-        """
+        """Bind eager metadata or update the selected graph family's static metadata."""
         pass
 
     def prepare_lora_token_segments(
@@ -425,11 +455,24 @@ def _compute_moe_lora_info_kernel(
     weight_indices_ptr,
     adapter_enabled_ptr,
     token_lora_mapping_ptr,
-    num_segments,
     max_len,
+    num_tokens,
+    bucket_len,
+    live_programs,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if pid >= live_programs:
+        # A tile of the static bucket past the live tokens: no adapter.
+        offs = (
+            num_tokens + (pid - live_programs) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        )
+        tl.store(
+            token_lora_mapping_ptr + offs,
+            tl.full((BLOCK_SIZE,), -1, tl.int32),
+            mask=offs < bucket_len,
+        )
+        return
     num_pid_m = tl.cdiv(max_len, BLOCK_SIZE)
 
     pid_seg = pid // num_pid_m
@@ -443,11 +486,12 @@ def _compute_moe_lora_info_kernel(
     lora_id = tl.load(weight_indices_ptr + pid_seg)
     lora_rank = tl.load(lora_ranks_ptr + lora_id)
     adapter_is_enabled = lora_rank > 0
-    tl.store(
-        adapter_enabled_ptr + lora_id,
-        adapter_is_enabled.to(tl.int32),
-        mask=pid_m == 0,
-    )
+    if adapter_enabled_ptr is not None:
+        tl.store(
+            adapter_enabled_ptr + lora_id,
+            adapter_is_enabled.to(tl.int32),
+            mask=pid_m == 0,
+        )
     tl.store(
         token_lora_mapping_ptr + seg_start + offs,
         tl.where(adapter_is_enabled, lora_id, -1),
@@ -463,30 +507,59 @@ def _compute_moe_lora_info(
     adapter_enabled: torch.Tensor | None,
     token_lora_mapping: torch.Tensor | None,
     max_len: int,
+    bucket_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build token slots and the active-adapter mask for legacy backends."""
+    if adapter_enabled is None:
+        adapter_enabled = torch.empty(
+            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+        )
+    else:
+        assert len(lora_ranks) <= adapter_enabled.shape[0], (
+            "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        )
+    adapter_enabled.zero_()
+    token_lora_mapping = _compute_token_lora_mapping(
+        num_tokens,
+        seg_indptr,
+        lora_ranks,
+        weight_indices,
+        token_lora_mapping,
+        max_len,
+        bucket_len=bucket_len,
+        adapter_enabled=adapter_enabled,
+    )
+    return adapter_enabled, token_lora_mapping
+
+
+def _compute_token_lora_mapping(
+    num_tokens: int,
+    seg_indptr: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    weight_indices: torch.Tensor,
+    token_lora_mapping: torch.Tensor | None,
+    max_len: int,
+    bucket_len: int | None = None,
+    adapter_enabled: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Expand request slots, clearing graph padding in the same CUDA launch."""
+    tail_tiles = 0
+    full_mapping = token_lora_mapping
     if token_lora_mapping is not None:
         assert num_tokens <= token_lora_mapping.shape[0], (
             "num_tokens must be less than or equal to the shape of token_lora_mapping"
         )
-        # Clear padded replay rows left by a larger batch.
+        # Clear graph padding here unless the CUDA kernel will clear it.
         if num_tokens < token_lora_mapping.shape[0]:
-            token_lora_mapping[num_tokens:].fill_(-1)
+            if bucket_len is not None and token_lora_mapping.device.type == "cuda":
+                tail_tiles = triton.cdiv(bucket_len - num_tokens, 256)
+            else:
+                token_lora_mapping[num_tokens:].fill_(-1)
         token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
             (num_tokens,), dtype=torch.int32, device=seg_indptr.device
         )
-
-    if adapter_enabled is not None:
-        assert len(lora_ranks) <= adapter_enabled.shape[0], (
-            "lora_ranks must be less than or equal to the shape of adapter_enabled"
-        )
-    else:
-        adapter_enabled = torch.empty(
-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-        )
-
-    adapter_enabled.zero_()
 
     has_segments = weight_indices.numel() != 0
     needs_launch = num_tokens != 0 and has_segments
@@ -502,28 +575,32 @@ def _compute_moe_lora_info(
     # Triton kernel on CUDA only; every other device (e.g. XPU) falls through to
     # the native torch path below, which yields the same mapping.
     if needs_launch and seg_indptr.device.type == "cuda":
-        _compute_moe_lora_info_kernel[(grid_size,)](
+        _compute_moe_lora_info_kernel[(grid_size + tail_tiles,)](
             seg_indptr,
             lora_ranks,
             weight_indices,
             adapter_enabled,
             token_lora_mapping,
-            weight_indices.numel(),
             max_len,
+            num_tokens,
+            bucket_len if tail_tiles else 0,
+            grid_size,
             BLOCK_SIZE=block_size,
         )
-        return adapter_enabled, token_lora_mapping
+        return token_lora_mapping
+    if tail_tiles:
+        full_mapping[num_tokens:bucket_len].fill_(-1)
 
-    if has_segments:
+    if has_segments and adapter_enabled is not None:
         active_ranks = lora_ranks[weight_indices.long()]
         adapter_enabled.scatter_(
             0, weight_indices.long(), (active_ranks > 0).to(torch.int32)
         )
     if num_tokens == 0:
-        return adapter_enabled, token_lora_mapping
+        return token_lora_mapping
     if not has_segments:
         token_lora_mapping.fill_(-1)
-        return adapter_enabled, token_lora_mapping
+        return token_lora_mapping
 
     token_positions = torch.arange(
         num_tokens, device=seg_indptr.device, dtype=torch.int32
@@ -543,4 +620,4 @@ def _compute_moe_lora_info(
     )
     token_lora_mapping.masked_fill_(token_lora_ranks <= 0, -1)
 
-    return adapter_enabled, token_lora_mapping
+    return token_lora_mapping

@@ -1465,6 +1465,9 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     Runs before the deprecated cutlass environment override.
     """
     runner = view.moe_runner_backend
+    if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+        logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
+        return {"disable_shared_experts_fusion": True}
     if runner == "flashinfer_cutedsl":
         logger.warning(
             "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1561,10 +1564,16 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
 @register_post_process
 def _speculative_moe_runner_default(view: Any) -> dict:
     """Default the speculative (draft) MoE runner backend to the resolved
-    target-model backend. Invoked at the head of the speculative-decoding
-    hook, after the MoE kernel chain has resolved."""
+    target-model backend; a target-only lora_* runner defaults it to auto.
+    Invoked at the head of the speculative-decoding hook, after the MoE kernel
+    chain has resolved."""
     if view.speculative_moe_runner_backend is None:
-        return {"speculative_moe_runner_backend": view.moe_runner_backend}
+        target = view.moe_runner_backend
+        return {
+            "speculative_moe_runner_backend": (
+                "auto" if target.startswith("lora_") else target
+            )
+        }
     return {}
 
 

@@ -78,7 +78,7 @@ class LoRABatchInfo:
     seg_lens: Optional[torch.Tensor]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
-    permutation: Optional[torch.Tensor]
+    permutation: Optional[torch.Tensor] = None
 
     # Total number of tokens this batch info expects (host-side int).
     # Used by lm_head LoRA to validate input shape without GPU sync.
@@ -107,6 +107,20 @@ class LoRABatchInfo:
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+class Phase(str, Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+def architecture_for_capability(major: int) -> str:
+    """Plan-table name for compute capability major: sm90, sm100 (>= 10) or default."""
+    if major == 9:
+        return "sm90"
+    if major >= 10:
+        return "sm100"
+    return "default"
 
 
 def copy_weight_into_buffer(
@@ -661,3 +675,26 @@ def build_lm_head_pass_segments(
         result.append((seg_wi, seg_lens))
 
     return result
+
+
+def capturing_lora_graph() -> bool:
+    """Whether capture is active, excluding the decode "nolora" variant."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_lora_variant,
+        get_is_capture_mode,
+    )
+
+    return get_is_capture_mode() and get_capture_lora_variant() != "nolora"
+
+
+def kv_b_lora_correction(attn_module) -> str | None:
+    """Select the absorbed-MLA correction: "v2", "legacy", or None.
+
+    The v2 path follows lora_active, including adapter-capable graph capture.
+    """
+    layer = getattr(attn_module, "kv_b_proj", None)
+    if not getattr(layer, "set_lora", False):
+        return None
+    if layer.lora_backend.name != "triton_v2":
+        return "legacy"
+    return "v2" if layer.lora_active else None
