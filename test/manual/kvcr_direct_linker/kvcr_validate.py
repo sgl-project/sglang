@@ -207,6 +207,8 @@ def _linker_config(args, *, control_port: int | None) -> dict:
         "local_dram_bytes_per_worker": args.dram_gib << 30,
         "preparation_deadline_ms": args.deadline_ms,
         "fetch_chunk_pages": 64,
+        # Scheduler processes may be killed before close() logs, so log often.
+        "stats_log_interval_s": 2.0,
     }
     if control_port is not None:
         config.update(
@@ -250,7 +252,7 @@ def scenario_roundtrip(args, workdir: Path) -> dict:
                 server.generate(filler, 1)
             time.sleep(args.settle_s)
             replay = server.generate(prompt, args.max_new_tokens)
-            time.sleep(1.0)
+            time.sleep(args.settle_s)
             report["runs"][label] = {
                 "first": _summary(first),
                 "replay": _summary(replay),
@@ -345,7 +347,7 @@ def scenario_peer(args, workdir: Path) -> dict:
             _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, args.page_size),
             False,
         )
-        time.sleep(1.0)
+        time.sleep(args.settle_s)
         report["runs"] = runs
         report["source_stats"] = source.stats()
         report["target_stats"] = target.stats()
