@@ -14,6 +14,7 @@
 """Mooncake-specific utilities for custom memory pool management."""
 
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -24,6 +25,40 @@ logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
 SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NODE_NVLINK"]
+
+
+def _cuda_expandable_segments_enabled() -> Optional[str]:
+    """Return the allocator env var that enables CUDA expandable segments."""
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        for field in os.environ.get(var, "").split(","):
+            key, _, value = field.partition(":")
+            if key.strip() == "expandable_segments" and value.strip().lower() == "true":
+                return var
+    return None
+
+
+def _validate_efa_allocator_compatibility(
+    enable_custom_mem_pool: bool, custom_mem_pool_type: Optional[str]
+) -> None:
+    """Reject CUDA VMM allocators that libfabric EFA cannot transfer."""
+    if envs.MOONCAKE_PROTOCOL.get().lower() != "efa":
+        return
+
+    if enable_custom_mem_pool:
+        raise ValueError(
+            f"SGLANG_MOONCAKE_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
+            "incompatible with MOONCAKE_PROTOCOL=efa. Mooncake custom memory "
+            "pools use CUDA VMM allocations, but EFA requires cudaMalloc-backed "
+            "transfer buffers. Unset SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+        )
+
+    expandable_segments_var = _cuda_expandable_segments_enabled()
+    if expandable_segments_var is not None:
+        raise ValueError(
+            f"{expandable_segments_var} enables expandable_segments, which is "
+            "incompatible with MOONCAKE_PROTOCOL=efa. EFA requires "
+            "cudaMalloc-backed transfer buffers. Disable expandable_segments."
+        )
 
 
 def init_mooncake_custom_mem_pool(
@@ -108,5 +143,7 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
     else:
         enable_custom_mem_pool = False
         custom_mem_pool_type = None
+
+    _validate_efa_allocator_compatibility(enable_custom_mem_pool, custom_mem_pool_type)
 
     return enable_custom_mem_pool, custom_mem_pool_type
