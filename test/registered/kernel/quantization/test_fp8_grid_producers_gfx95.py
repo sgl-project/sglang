@@ -1,7 +1,9 @@
 """The gfx950 fused fp8-grid producers (RMSNorm + fake-quant, clamp + silu * mul, wo_a GEMM epilogue) must match the unfused launches bitwise on the quant step."""
 
 import unittest
+
 import torch
+
 from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_triton,
 )
@@ -18,10 +20,6 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
-
-
-
-
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
@@ -287,7 +285,6 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
                 self.assertTrue(
                     torch.equal(self.gemm(x[:t], w, fp8_grid=False), full_plain[:t])
                 )
-
 
     def test_odd_r_takes_the_single_launch(self):
         """R that is not a 32 multiple never takes split-K (its partial kernel stores

@@ -14,10 +14,14 @@ logits kernel's ABI layout.
 """
 
 from __future__ import annotations
+
 import sys
+import unittest
+
 import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel (the AOT top-k transform)
 import torch
+
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -39,16 +43,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
-import unittest
-import torch
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
-
-
-
-
-
 
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -290,8 +285,8 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
-@pytest.mark.parametrize("num_tokens", [1, 16], ids=['1', '16'])
-@pytest.mark.parametrize("num_heads", [32], ids=['32'])
+@pytest.mark.parametrize("num_tokens", [1, 16], ids=["1", "16"])
+@pytest.mark.parametrize("num_heads", [32], ids=["32"])
 def test_index_q_pack_weights_matches_standalone(
     num_tokens: int, num_heads: int
 ) -> None:
@@ -900,7 +895,7 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
             )
 
 
-@pytest.mark.parametrize("seq_len", [1024], ids=['1024'])
+@pytest.mark.parametrize("seq_len", [1024], ids=["1024"])
 def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
     on the same scores differ; ordered by position they are identical, -1 padding last."""
@@ -934,16 +929,6 @@ def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     pos = raw_a.clamp_min(0)
     slots = page_table.gather(1, pos // PAGE_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
     assert torch.equal(page_a, torch.where(valid, slots, -1))
-
-
-
-
-
-
-
-
-
-
 
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
