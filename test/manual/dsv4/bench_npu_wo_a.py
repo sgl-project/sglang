@@ -99,6 +99,7 @@ def main():
         parser.error("dimensions and iteration counts must be positive")
 
     import torch_npu
+    
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_wo_a import (
         apply_npu_wo_a_bf16,
     )
