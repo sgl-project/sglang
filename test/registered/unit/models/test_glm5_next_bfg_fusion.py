@@ -53,13 +53,13 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
         )
         override.install()
         self.addCleanup(override.restore)
-        self.enterContext(
-            patch.object(
-                UnquantizedLinearMethod,
-                "apply",
-                MockQuantizedLinearMethod.apply,
-            )
+        patcher = patch.object(
+            UnquantizedLinearMethod,
+            "apply",
+            MockQuantizedLinearMethod.apply,
         )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @torch.no_grad()
     def test_projection_loading_matches_unfused_reference(self):
