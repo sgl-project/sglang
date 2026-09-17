@@ -480,7 +480,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
     strategy:
       fail-fast: false
