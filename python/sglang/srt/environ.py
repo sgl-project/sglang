@@ -926,6 +926,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Activation precision for MXFP4-weight dense linears, independent of the
+    # MoE: "fp4" is the checkpoint's own W4A4, "bf16" dequantizes the weights
+    # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
+    # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
+    SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
