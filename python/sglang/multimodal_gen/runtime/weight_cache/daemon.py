@@ -16,6 +16,7 @@ import stat
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import msgspec
@@ -42,7 +43,6 @@ from sglang.multimodal_gen.runtime.weight_cache.plan import plan_diff
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 from sglang.srt.weight_cache.protocol import (
     CLIENT_CONNECTION_TIMEOUT,
-    cleanup_stale_daemon_files,
     recv_msg,
     send_msg,
 )
@@ -63,6 +63,25 @@ def private_directory(path):
         raise PermissionError(
             f"Weight-cache runtime directory must be owned and private (0700): {path}"
         )
+
+
+@contextmanager
+def owner_lock(path):
+    """Never unlink lock files: every contender must flock the same inode."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Not an owned regular owner lock: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"Weight-cache owner already holds resource: {path}"
+            ) from error
+        yield
+    finally:
+        os.close(fd)
 
 
 class DiffusionWeightCacheDaemon:
@@ -161,7 +180,41 @@ class DiffusionWeightCacheDaemon:
                             pass
             time.sleep(0.05)
 
-    def run(self):
+    def _cleanup_stale_files(self):
+        # Both device and path locks are held. Never signal a PID from .ready:
+        # it may have been recycled since the previous owner's crash.
+        for path, kind in ((self.path, stat.S_ISSOCK), (self.ready_path, stat.S_ISREG)):
+            try:
+                st = path.lstat()
+            except FileNotFoundError:
+                continue
+            if st.st_uid != os.getuid() or not kind(st.st_mode):
+                raise PermissionError(
+                    f"Refusing to remove non-owned cache endpoint: {path}"
+                )
+            if path == self.path:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.2)
+                    try:
+                        probe.connect(str(path))
+                    except (ConnectionRefusedError, FileNotFoundError):
+                        pass
+                    else:
+                        raise RuntimeError(
+                            f"Live weight-cache socket already exists: {path}"
+                        )
+            path.unlink(missing_ok=True)
+
+    def _remove_endpoints(self):
+        for path in (self.ready_path, self.path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # An endpoint failure must not bypass consumer draining and
+                # release allocations that may still be imported elsewhere.
+                logger.exception("Cannot remove weight-cache endpoint %s", path)
+
+    def _owner_lock_paths(self):
         device_uuid = self.plan.to_dict()["rank"]["device_uuid"]
         lock_root = (
             default_runtime_dir()
@@ -170,25 +223,23 @@ class DiffusionWeightCacheDaemon:
         private_directory(default_runtime_dir())
         private_directory(lock_root)
         private_directory(self.path.parent)
-        lock_fd = os.open(
-            lock_root / "owner.lock",
-            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
+        return sorted(
+            {
+                lock_root / "owner.lock",
+                self.path.with_name(self.path.name + ".lock"),
+                self.ready_path.with_name(self.ready_path.name + ".lock"),
+            }
         )
-        lock_st = os.fstat(lock_fd)
-        if lock_st.st_uid != os.getuid() or not stat.S_ISREG(lock_st.st_mode):
-            os.close(lock_fd)
-            raise PermissionError(
-                "Weight-cache owner lock is not an owned regular file"
-            )
+
+    def run(self):
+        locks = ExitStack()
         listener = None
         published = False
         handlers = {}
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            cleanup_stale_daemon_files(
-                device_uuid, socket_path=str(self.path), ready_path=str(self.ready_path)
-            )
+            for path in self._owner_lock_paths():
+                locks.enter_context(owner_lock(path))
+            self._cleanup_stale_files()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 handlers[sig] = signal.signal(sig, self.stop)
             bootstrap_diffusion_runtime(
@@ -272,12 +323,11 @@ class DiffusionWeightCacheDaemon:
             if listener is not None:
                 listener.close()
             if published:
-                self.ready_path.unlink(missing_ok=True)
-                self.path.unlink(missing_ok=True)
+                self._remove_endpoints()
             self._drain()
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
-            os.close(lock_fd)
+            locks.close()
             # Keep self.exporter strongly owned even after run returns. The
             # standalone owner process lifetime defines the allocation lifetime.
 

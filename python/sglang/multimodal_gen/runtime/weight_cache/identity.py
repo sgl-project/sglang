@@ -201,10 +201,14 @@ def compatibility_plan(prepared, args, *, verify_checkpoint=False):
 def locate(plan, args):
     device_uuid = plan.to_dict()["rank"]["device_uuid"]
     if args.weight_cache_socket is not None:
-        path = Path(args.weight_cache_socket.format(device_uuid=device_uuid))
+        path = Path(args.weight_cache_socket.replace("{device_uuid}", device_uuid))
         if not path.is_absolute() or len(os.fsencode(path)) > 107:
             raise ValueError(
                 "weight_cache_socket must be an absolute Unix socket path of at most 107 bytes"
             )
+        # Resolve directory aliases, but never follow a socket-node symlink.
+        path = path.parent.resolve() / path.name
+        if len(os.fsencode(path)) > 107:
+            raise ValueError("Resolved weight-cache socket exceeds 107 bytes")
         return path
     return socket_path(device_uuid, plan.digest)

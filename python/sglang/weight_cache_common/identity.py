@@ -105,12 +105,17 @@ def source_digest(package_root: Path) -> str:
 
 def default_runtime_dir() -> Path:
     override = envs.SGLANG_DIFFUSION_WEIGHT_CACHE_DIR.get()
-    if override:
-        return Path(override)
-    return (
-        Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-        / "sglang_diffusion_weight_cache"
+    root = (
+        Path(override)
+        if override
+        else (
+            Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+            / "sglang_diffusion_weight_cache"
+        )
     )
+    if not root.is_absolute():
+        raise ValueError("Weight-cache runtime directory must be absolute")
+    return root
 
 
 def socket_path(
