@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.attention.dsa import triton_kernel
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
