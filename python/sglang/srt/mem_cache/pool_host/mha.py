@@ -28,7 +28,11 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKOnlyPool,
+    MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -37,6 +41,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -116,15 +121,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.v_data_ptrs = make_kernel_ptr_table(
+            self.v_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -775,10 +780,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         else:
             self.k_data_refs = []
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
 
     def get_size_per_token(self):
@@ -1414,9 +1419,22 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
-    Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
+    Returns ``MHATokenToKVPoolMXFP8Host`` for the block-scaled MXFP8 pool (its
+    UE8M0 scales must travel with the payload),
+    ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if isinstance(device_pool, MHATokenToKVPoolMXFP8):
+        if device_pool.head_dim != device_pool.v_head_dim:
+            raise NotImplementedError(
+                "MXFP8 HiCache does not support asymmetric K/V head dimensions yet."
+            )
+
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
+            MHATokenToKVPoolMXFP8Host,
+        )
+
+        return MHATokenToKVPoolMXFP8Host
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
