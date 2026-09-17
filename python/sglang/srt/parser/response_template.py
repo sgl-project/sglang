@@ -35,6 +35,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.parser.response_template_config import (
     resolve_detector_response_template,
+    validate_response_template_for_serving,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,23 @@ def derive_tool_extraction_template(
         field.setdefault("content_args", {})["strict"] = True
     fields[tool_field] = field
     return {"defaults": {}, **anchor, "fields": fields}
+
+
+def derive_reasoning_extraction_template(
+    full: dict[str, Any],
+    *,
+    tool_field: str = "tool_calls",
+) -> dict[str, Any]:
+    """Treat tool regions as opaque wire text while routing reasoning."""
+    template = copy.deepcopy(full)
+    field = template.get("fields", {}).get(tool_field)
+    if field is None:
+        return template
+    field["content"] = "text"
+    field["content_args"] = {"strip": False}
+    field["transform"] = "{content}"
+    field.pop("transform_each", None)
+    return template
 
 
 def _first_field_literal(field: dict[str, Any], key: str) -> str:
@@ -116,7 +134,10 @@ class ResponseTemplateStreamAdapter:
         self._passthrough_field = passthrough_field
         self._mode = mode
         if mode == AdapterMode.REASONING:
-            parser_template = template
+            parser_template = derive_reasoning_extraction_template(
+                template,
+                tool_field=tool_field,
+            )
         else:
             parser_template = derive_tool_extraction_template(
                 template,
@@ -130,8 +151,12 @@ class ResponseTemplateStreamAdapter:
         self._passthrough = False
         self._pending_reasoning = ""
         self._pending_tool_raw = ""
+        self._pending_tool_body = ""
         self._pending_tool_streamed = False
+        self._failed_streamed_tool = False
         self._finalized = False
+        self._prefix_opens_tool_region: bool | None = None
+        self._deferred_prefix_open_pending = True
 
     @property
     def passthrough(self) -> bool:
@@ -161,18 +186,46 @@ class ResponseTemplateStreamAdapter:
                 active_open = {**event, "from_prefix": True}
             elif event["type"] == "region_close":
                 active_open = None
+        if active_open is not None:
+            self._deferred_prefix_open_pending = False
         return [] if active_open is None else [active_open]
+
+    def _mark_deferred_prefix_open(self, events: list[dict]) -> list[dict]:
+        if not self._deferred_prefix_open_pending or not self._prefix:
+            return events
+        for index, event in enumerate(events):
+            raw = event.get("raw", "")
+            if (
+                event.get("field") == self._tool_field
+                and event["type"] == "region_open"
+                and raw
+                and self._prefix.endswith(raw)
+            ):
+                events[index] = {**event, "from_prefix": True}
+                self._deferred_prefix_open_pending = False
+                break
+        return events
 
     def _recover_failed_tool_input(self, current_text: str) -> str:
         if self._stream_parser is None:
             return current_text
         parser_input = self._stream_parser.input_text
-        if self._pending_tool_raw:
-            start = parser_input.rfind(self._pending_tool_raw)
-            if start != -1:
-                return parser_input[start:]
-            return self._pending_tool_raw + parser_input[self._committed_input_offset :]
         return parser_input[self._committed_input_offset :]
+
+    def prefix_opens_tool_region(self) -> bool:
+        if self._prefix_opens_tool_region is not None:
+            return self._prefix_opens_tool_region
+        try:
+            result = bool(self._initial_events(self._make_parser()))
+        except Exception:
+            result = False
+        self._prefix_opens_tool_region = result
+        return result
+
+    def prefix_ends_with_tool_open(self, pattern: re.Pattern[str]) -> bool:
+        return any(
+            match.end() == len(self._prefix) for match in pattern.finditer(self._prefix)
+        )
 
     def _raw_tool_events(self, events: Sequence[dict]) -> str:
         parts: List[str] = []
@@ -193,7 +246,7 @@ class ResponseTemplateStreamAdapter:
         try:
             parser = self._make_parser(tools)
             events = self._initial_events(parser)
-            events += parser.feed(text)
+            events += self._mark_deferred_prefix_open(parser.feed(text))
             _, final_events = parser.finalize()
             events += final_events
             return events, True
@@ -209,6 +262,16 @@ class ResponseTemplateStreamAdapter:
         text: str,
         tools: Sequence[Any] | None = None,
     ) -> tuple[list[dict], bool]:
+        if self._failed_streamed_tool:
+            if not text:
+                return [], True
+            return [
+                {
+                    "type": "region_malformed",
+                    "field": self._tool_field,
+                    "text": text,
+                }
+            ], True
         if self._passthrough or self._finalized:
             return [], False
         initial_events: list[dict] = []
@@ -217,19 +280,32 @@ class ResponseTemplateStreamAdapter:
                 self._stream_parser = self._make_parser(tools)
                 initial_events = self._initial_events(self._stream_parser)
                 self._committed_input_offset = len(self._stream_parser.input_text)
-            events = initial_events + self._stream_parser.feed(text)
+            events = initial_events + self._mark_deferred_prefix_open(
+                self._stream_parser.feed(text)
+            )
             self._committed_input_offset = self._stream_parser.consumed_offset
             return events, True
         except Exception as exc:
             logger.warning(
-                "response_template streaming parse failed; passing through: %s",
+                "response_template streaming parse failed; preserving wire bytes: %s",
                 exc,
             )
-            self._passthrough = True
             if self._mode == AdapterMode.TOOL:
                 if self._pending_tool_streamed:
+                    malformed = (
+                        self._pending_tool_body + self._recover_failed_tool_input(text)
+                    )
                     self._pending_tool_raw = ""
-                    return [], True
+                    self._pending_tool_body = ""
+                    self._failed_streamed_tool = True
+                    return [
+                        {
+                            "type": "region_malformed",
+                            "field": self._tool_field,
+                            "text": malformed,
+                        }
+                    ], True
+                self._passthrough = True
                 passthrough = self._raw_tool_events(
                     initial_events
                 ) + self._recover_failed_tool_input(text)
@@ -241,12 +317,16 @@ class ResponseTemplateStreamAdapter:
                         "text": passthrough,
                     }
                 ], True
+            self._passthrough = True
             return [], False
 
     def finalize(
         self,
         tools: Sequence[Any] | None = None,
     ) -> tuple[list[dict], bool]:
+        if self._failed_streamed_tool:
+            self._finalized = True
+            return [], True
         if self._passthrough or self._finalized:
             return [], not self._passthrough
         initial_events: list[dict] = []
@@ -261,14 +341,28 @@ class ResponseTemplateStreamAdapter:
             return initial_events + events, True
         except Exception as exc:
             logger.warning(
-                "response_template finalize failed; passing through: %s",
+                "response_template finalize failed; preserving wire bytes: %s",
                 exc,
             )
-            self._passthrough = True
             if self._mode == AdapterMode.TOOL:
                 if self._pending_tool_streamed:
+                    malformed = (
+                        self._pending_tool_body + self._recover_failed_tool_input("")
+                    )
                     self._pending_tool_raw = ""
-                    return [], True
+                    self._pending_tool_body = ""
+                    self._failed_streamed_tool = True
+                    self._finalized = True
+                    if not malformed:
+                        return [], True
+                    return [
+                        {
+                            "type": "region_malformed",
+                            "field": self._tool_field,
+                            "text": malformed,
+                        }
+                    ], True
+                self._passthrough = True
                 passthrough = self._raw_tool_events(
                     initial_events
                 ) + self._recover_failed_tool_input("")
@@ -282,6 +376,7 @@ class ResponseTemplateStreamAdapter:
                         "text": passthrough,
                     }
                 ], True
+            self._passthrough = True
             return [], False
 
     def route_reasoning_events(
@@ -306,7 +401,8 @@ class ResponseTemplateStreamAdapter:
                     normal_parts.append(event["text"])
             elif field == self._tool_field:
                 if etype == "region_open":
-                    normal_parts.append(event.get("raw", ""))
+                    if not event.get("from_prefix"):
+                        normal_parts.append(event.get("raw", ""))
                 elif etype == "region_close":
                     normal_parts.append(event.get("raw", ""))
                 elif etype == "region_chunk":
@@ -319,6 +415,7 @@ class ResponseTemplateStreamAdapter:
         *,
         on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
+        on_tool_malformed: Callable[[str], None] | None = None,
     ) -> str:
         normal_parts: List[str] = []
         for event in events:
@@ -332,10 +429,15 @@ class ResponseTemplateStreamAdapter:
                     self._pending_tool_raw = (
                         "" if event.get("from_prefix") else raw_open
                     )
+                    self._pending_tool_body = ""
                     if on_tool_open is not None:
                         self._pending_tool_streamed = on_tool_open(raw_open)
                 elif etype == "region_chunk":
                     self._pending_tool_raw += event["text"]
+                    self._pending_tool_body += event["text"]
+                elif etype == "region_malformed":
+                    if on_tool_malformed is not None:
+                        on_tool_malformed(event["text"])
                 elif etype == "region_close":
                     raw_close = event.get("raw", "")
                     if (
@@ -344,6 +446,7 @@ class ResponseTemplateStreamAdapter:
                     ):
                         normal_parts.append(self._pending_tool_raw + raw_close)
                     self._pending_tool_raw = ""
+                    self._pending_tool_body = ""
                     self._pending_tool_streamed = False
         return "".join(normal_parts)
 
@@ -354,6 +457,9 @@ class _ResponseTemplateParserInputMixin:
     @staticmethod
     def configure_request_for_parsing(request: Any) -> None:
         request.skip_special_tokens = False
+        template_kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
+        template_kwargs["spaces_between_special_tokens"] = False
+        request.chat_template_kwargs = template_kwargs
 
 
 class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
@@ -378,6 +484,7 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         template = resolve_detector_response_template(tokenizer, fallback)
         if template is None:
             raise ValueError("response_template is required")
+        validate_response_template_for_serving(template)
         self.response_template = template
         self.stream_reasoning = stream_reasoning
         thinking = template.get("fields", {}).get(self.thinking_field, {})
@@ -444,6 +551,7 @@ class ResponseTemplateToolDetector(
     tool_field: str = "tool_calls"
     passthrough_field: str = "normal"
     reject_strict_without_constraints = True
+    reject_parallel_auto_without_constraints = True
 
     def __init__(
         self,
@@ -458,6 +566,7 @@ class ResponseTemplateToolDetector(
         template = resolve_detector_response_template(tokenizer, fallback)
         if template is None:
             raise ValueError("response_template is required")
+        validate_response_template_for_serving(template)
         self.response_template = template
         self._adapter = ResponseTemplateStreamAdapter(
             template,
@@ -483,11 +592,20 @@ class ResponseTemplateToolDetector(
             self.eot_token = tool_spec["close"]
         elif isinstance(tool_spec.get("close"), list) and tool_spec["close"]:
             self.eot_token = tool_spec["close"][0]
+        self.incomplete_tool_call_indices: set[int] = set()
+        self.has_incomplete_tool_call = False
 
     def has_tool_call(self, text: str) -> bool:
-        if self._tool_open_re is None:
-            return False
-        return self._tool_open_re.search(text) is not None
+        return bool(
+            self._tool_open_re is not None
+            and self._tool_open_re.search(text) is not None
+        ) or (
+            self._tool_open_re is not None
+            and (
+                self._adapter.prefix_opens_tool_region()
+                or self._adapter.prefix_ends_with_tool_open(self._tool_open_re)
+            )
+        )
 
     def _tool_name_from_open(self, raw: str) -> str | None:
         if self._tool_open_re is None or self._tool_name_template is None:
@@ -572,8 +690,10 @@ class ResponseTemplateToolDetector(
         if name_was_streamed:
             item = item.model_copy(update={"name": None})
         pending_calls.append(item)
+        self.incomplete_tool_call_indices.discard(self.current_tool_id)
         self.current_tool_id += 1
         self.current_tool_name_sent = False
+        self.has_incomplete_tool_call = bool(self.incomplete_tool_call_indices)
 
     def _emit_tool_name(self, name: str, pending_calls: List[ToolCallItem]) -> None:
         if self.current_tool_id == -1:
@@ -591,7 +711,35 @@ class ResponseTemplateToolDetector(
                 parameters="",
             )
         )
+        self.prev_tool_call_arr[self.current_tool_id] = {
+            "name": name,
+            "arguments": "",
+        }
+        self.incomplete_tool_call_indices.add(self.current_tool_id)
         self.current_tool_name_sent = True
+        self.has_incomplete_tool_call = True
+
+    def _emit_malformed_tool_arguments(
+        self,
+        text: str,
+        pending_calls: List[ToolCallItem],
+    ) -> None:
+        if self.current_tool_id < 0 or not self.current_tool_name_sent:
+            return
+        previous = self.streamed_args_for_tool[self.current_tool_id]
+        arguments = previous + text
+        self.streamed_args_for_tool[self.current_tool_id] = arguments
+        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = arguments
+        if text:
+            pending_calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=text,
+                )
+            )
+        self.incomplete_tool_call_indices.add(self.current_tool_id)
+        self.has_incomplete_tool_call = True
 
     def _route_tool_events(
         self, events: List[dict], tool_indices: Dict[str, int]
@@ -679,6 +827,10 @@ class ResponseTemplateToolDetector(
             events,
             on_tool_open=on_open,
             on_tool_close=on_close,
+            on_tool_malformed=lambda text: self._emit_malformed_tool_arguments(
+                text,
+                pending_calls,
+            ),
         )
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
@@ -686,7 +838,7 @@ class ResponseTemplateToolDetector(
         return False
 
     def parses_required_natively(self) -> bool:
-        return True
+        return False
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(

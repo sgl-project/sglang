@@ -847,8 +847,11 @@ def resolve_auto_parsers(server_args) -> None:
     tokenizer = None
     try:
         tokenizer = get_tokenizer(
-            cfg.model_path,
+            cfg.tokenizer_path,
+            tokenizer_mode=cfg.tokenizer_mode,
             trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+            tokenizer_backend=cfg.tokenizer_backend,
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
@@ -857,16 +860,13 @@ def resolve_auto_parsers(server_args) -> None:
     if tokenizer is not None and chat_template_arg is None:
         from sglang.srt.parser.response_template_config import (
             resolve_detector_response_template,
+            validate_response_template_for_serving,
         )
 
         response_template = resolve_detector_response_template(tokenizer, None)
         if response_template is not None:
-            from sglang.srt.parser.chat_parsing.response_templates import (
-                load_response_template,
-            )
-
             try:
-                fields = load_response_template(response_template).fields
+                fields = validate_response_template_for_serving(response_template)
             except (TypeError, ValueError) as exc:
                 logger.warning(
                     "Ignoring invalid response_template from tokenizer configuration: %s",

@@ -296,7 +296,21 @@ class FunctionCallParser:
         )
         should_constrain_auto = tool_choice == "auto" and strict_requested
         if (
+            tool_choice == "auto"
+            and not parallel_tool_calls
+            and getattr(
+                self.detector,
+                "reject_parallel_auto_without_constraints",
+                False,
+            )
+        ):
+            raise ValueError(
+                f"{type(self.detector).__name__} cannot enforce "
+                "parallel_tool_calls=False with automatic tool choice"
+            )
+        if (
             strict_requested
+            and tool_choice == "auto"
             and getattr(
                 self.detector,
                 "reject_strict_without_constraints",

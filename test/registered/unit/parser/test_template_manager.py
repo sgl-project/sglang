@@ -977,6 +977,31 @@ class TestResolveAutoParsers(CustomTestCase):
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
+    def test_uses_runtime_tokenizer_configuration(self):
+        args = ServerArgs(
+            model_path="weights-path",
+            tokenizer_path="tokenizer-path",
+            tokenizer_mode="slow",
+            tokenizer_backend="fastokens",
+            revision="tokenizer-revision",
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+            trust_remote_code=True,
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        get_tokenizer = Mock(return_value=tokenizer)
+
+        with _patch_hf_transformers_utils(get_tokenizer):
+            resolve_auto_parsers(args)
+
+        get_tokenizer.assert_called_once_with(
+            "tokenizer-path",
+            tokenizer_mode="slow",
+            trust_remote_code=True,
+            revision="tokenizer-revision",
+            tokenizer_backend="fastokens",
+        )
+
     def test_gemma4_response_template_takes_precedence_over_legacy_detection(self):
         args = self._make_server_args(
             reasoning_parser="auto",
@@ -1053,6 +1078,30 @@ class TestResolveAutoParsers(CustomTestCase):
         )
         tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
         tokenizer.response_template = {"fields": {}}
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_unsupported_response_template_fields_use_existing_detection(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "metadata": {
+                    "open": "<metadata>",
+                    "close": "</metadata>",
+                    "content": "json",
+                },
+            },
+        }
 
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)

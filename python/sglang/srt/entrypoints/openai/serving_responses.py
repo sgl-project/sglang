@@ -78,7 +78,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     label_developer_content,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    _has_incomplete_tool_call,
+)
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -2252,13 +2255,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             else:
+                item_status = (
+                    "incomplete"
+                    if (
+                        self._status_from_finish_reason(finish_reason) != "completed"
+                        or (
+                            tool_parser is not None
+                            and _has_incomplete_tool_call(tool_parser, tool_index)
+                        )
+                    )
+                    else "completed"
+                )
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
                     name=state["name"] or "",
                     type="function_call",
                     id=state["item_id"],
-                    status="completed",
+                    status=item_status,
                 )
                 events.append(
                     _send_event(

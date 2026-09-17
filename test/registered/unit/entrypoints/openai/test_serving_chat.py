@@ -19,6 +19,7 @@ import unittest
 import uuid
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -36,6 +37,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    _decode_response_parser_prefix,
+    _encode_reasoning_end_token_ids,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -57,6 +60,26 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
 _ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
+
+_RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{content}",
+                },
+            },
+        },
+    },
+}
 
 
 def _spec_result(index):
@@ -107,6 +130,77 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
     {%- endfor -%}
 {%- endfor -%}
 """
+
+
+class TestResponseParserPrefixDecoding(unittest.TestCase):
+    def test_disables_spacing_between_special_tokens(self):
+        class SpecialTokenTokenizer:
+            def decode(
+                self,
+                token_ids,
+                *,
+                skip_special_tokens=True,
+                spaces_between_special_tokens=True,
+            ):
+                self.options = (
+                    skip_special_tokens,
+                    spaces_between_special_tokens,
+                )
+                return (
+                    "<first> <second>"
+                    if spaces_between_special_tokens
+                    else "<first><second>"
+                )
+
+        tokenizer = SpecialTokenTokenizer()
+
+        decoded = _decode_response_parser_prefix(tokenizer, [1, 2])
+
+        self.assertEqual(decoded, "<first><second>")
+        self.assertEqual(tokenizer.options, (False, False))
+
+    def test_falls_back_for_tokenizers_without_spacing_option(self):
+        class CompatibleTokenizer:
+            def decode(self, token_ids, *, skip_special_tokens=True):
+                self.skip_special_tokens = skip_special_tokens
+                return "<first><second>"
+
+        tokenizer = CompatibleTokenizer()
+
+        decoded = _decode_response_parser_prefix(tokenizer, [1, 2])
+
+        self.assertEqual(decoded, "<first><second>")
+        self.assertFalse(tokenizer.skip_special_tokens)
+
+    def test_encodes_response_template_reasoning_terminator(self):
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [17, 18]
+        detector = SimpleNamespace(think_end_token="<end_thinking>")
+
+        token_ids = _encode_reasoning_end_token_ids(tokenizer, detector)
+
+        self.assertEqual(token_ids, [17, 18])
+        tokenizer.encode.assert_called_once_with(
+            "<end_thinking>",
+            add_special_tokens=False,
+        )
+
+    def test_missing_or_invalid_reasoning_terminator_is_ignored(self):
+        tokenizer = Mock()
+        tokenizer.encode.return_value = []
+
+        self.assertIsNone(
+            _encode_reasoning_end_token_ids(
+                tokenizer,
+                SimpleNamespace(think_end_token=""),
+            )
+        )
+        self.assertIsNone(
+            _encode_reasoning_end_token_ids(
+                tokenizer,
+                SimpleNamespace(think_end_token="<end_thinking>"),
+            )
+        )
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
@@ -2915,6 +3009,65 @@ class ServingChatTestCase(unittest.TestCase):
             any(c.get("usage") is not None for c in after_error),
             "usage chunk dropped after error abort",
         )
+
+    def test_truncated_response_template_call_keeps_stop_and_raw_arguments(self):
+        self.chat.tool_call_parser = "response_template"
+        self.tm.tokenizer.response_template = _RESPONSE_TEMPLATE
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        request._response_parser_prefix = "<assistant>"
+
+        async def generate():
+            yield {
+                "text": '<call:get_weather>{"city":',
+                "meta_info": {
+                    "id": "chatcmpl-truncated-call",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": "CUSTOM_STOP"},
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request = Mock(return_value=generate())
+        adapted_request = GenerateReqInput(
+            text="<assistant>",
+            sampling_params={},
+            stream=True,
+        )
+
+        chunks = self._run_chat_stream(adapted_request, request)
+        parsed = self._parse_chunks(chunks)
+        arguments = "".join(
+            tool_call["function"]["arguments"]
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+            for tool_call in choice.get("delta", {}).get("tool_calls", [])
+        )
+        finish = next(
+            choice
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+            if choice.get("finish_reason") is not None
+        )
+
+        self.assertEqual(arguments, '{"city":')
+        self.assertEqual(finish["finish_reason"], "stop")
+        self.assertEqual(finish["matched_stop"], "CUSTOM_STOP")
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

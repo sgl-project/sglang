@@ -18,6 +18,33 @@ from __future__ import annotations
 from typing import Any
 
 RESPONSE_TEMPLATE_CONFIG_KEY = "response_template"
+SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
+    {
+        "thinking",
+        "content",
+        "tool_calls",
+    }
+)
+
+
+def validate_response_template_for_serving(template: dict) -> set[str]:
+    """Validate the template and reject semantic fields serving cannot route."""
+    from sglang.srt.parser.chat_parsing.response_templates import (
+        load_response_template,
+    )
+
+    loaded = load_response_template(template)
+    fields = set(loaded.fields)
+    unsupported = (fields - SUPPORTED_RESPONSE_TEMPLATE_FIELDS) | (
+        set(loaded.defaults) - {"role"}
+    )
+    if unsupported:
+        raise ValueError(
+            "response_template contains unsupported semantic fields: "
+            f"{sorted(unsupported)}. Supported fields are: "
+            f"{sorted(SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
+        )
+    return fields
 
 
 def resolve_detector_response_template(
