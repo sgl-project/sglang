@@ -13,9 +13,14 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    fused_scale_residual_norm_scale_shift_triton,
     triton_one_pass_rms_norm,
+)
+from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+    expand_scale_shift_cpu_param,
 )
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
@@ -377,20 +382,6 @@ class LayerNorm(CustomOp):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-            # Lazy cache for ones vector (not a registered buffer to avoid FSDP/meta issues)
-            self._weight_fallback_cache = None
-
-    def _get_weight_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        wf = getattr(self, "_weight_fallback_cache", None)
-        if (
-            wf is None
-            or wf.device != x.device
-            or wf.dtype != x.dtype
-            or wf.numel() != self.hidden_size
-        ):
-            wf = torch.ones(self.hidden_size, device=x.device, dtype=x.dtype)
-            self._weight_fallback_cache = wf
-        return wf
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
@@ -531,6 +522,22 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             impl_mode=0,
         )
         return output.to(origin_dtype)
+
+    def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
+        def matches_input(param: torch.Tensor | None) -> bool:
+            return param is None or (
+                param.dtype == inputs.dtype and param.device == inputs.device
+            )
+
+        if not (matches_input(self.weight) and matches_input(self.bias)):
+            return self.forward_native(inputs)
+        return F.layer_norm(
+            inputs,
+            self.normalized_shape,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
 
 
 ################################################################################
@@ -678,10 +685,37 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.norm_type == "layer":
+            weight = self.norm.weight
+            bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_triton(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_triton(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
+        return self.forward_native(residual, x, gate, shift, scale)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
@@ -745,6 +779,42 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if modulated is None:
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
+
+    def forward_cpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        if isinstance(gate, torch.Tensor):
+            gate_tensor = gate
+        elif gate == 1:
+            gate_tensor = None
+        else:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        if gate_tensor is not None:
+            gate_tensor = expand_scale_shift_cpu_param(gate_tensor, x)
+
+        return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
+            residual,
+            x,
+            gate_tensor,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
 
 
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
@@ -866,6 +936,28 @@ class _NormScaleShift(CustomOp):
             return modulated.to(x.dtype)
 
         return (normalized * (1 + scale) + shift).to(x.dtype)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
+            x,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
 
 
 class LayerNormScaleShift(_NormScaleShift):
