@@ -489,7 +489,7 @@ def get_available_gpu_memory(
             # Memory-capped container (e.g. one socket-pinned CI container):
             # size against this cgroup's own limit and usage, so a sibling
             # container's memory on the same host is not counted here.
-            total_free_memory = cgroup_limit - get_used_cpu_memory()
+            total_free_memory = max(0, cgroup_limit - get_used_cpu_memory())
         else:
             # No cgroup limit (bare metal / full-machine container): keep the
             # original host-wide estimate.
