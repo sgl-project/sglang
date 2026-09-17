@@ -884,7 +884,6 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: dict[int, int],
         reasoning_tokens: dict[int, int],
         completion_tokens: dict[int, int],
-        response_parser_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -908,7 +907,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 content,
                 request,
                 finish_reason_type,
-                response_parser_prefix,
             )
             if reasoning_text:
                 usage = None
@@ -942,7 +940,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
-                response_parser_prefix=response_parser_prefix,
             ):
                 if chunk:
                     yield chunk
@@ -1286,6 +1283,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        request._response_parser_prefix = self._response_parser_prefix(adapted_request)
         return adapted_request, request
 
     def _response_parser_prefix(self, adapted_request: GenerateReqInput) -> str:
@@ -1913,7 +1911,6 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
-        response_parser_prefix = self._response_parser_prefix(adapted_request)
 
         # State tracking for streaming
         is_firsts = {}
@@ -2070,7 +2067,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
-                    response_parser_prefix=response_parser_prefix,
                 ):
                     yield chunk
 
@@ -2257,7 +2253,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request,
             ret,
             int(time.time()),
-            response_parser_prefix=self._response_parser_prefix(adapted_request),
         )
 
         return response
@@ -2267,7 +2262,6 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         ret: list[dict[str, Any]],
         created: int,
-        response_parser_prefix: str = "",
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
         if self.chat_encoding_spec == "kimi_k3":
@@ -2360,7 +2354,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
-                        prefix=response_parser_prefix,
+                        prefix=request._response_parser_prefix,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -2382,7 +2376,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
-                    response_parser_prefix,
+                    request._response_parser_prefix,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2720,7 +2714,6 @@ class OpenAIServingChat(OpenAIServingBase):
         content: dict[str, Any],
         request: ChatCompletionRequest,
         finish_reason_type: str | None = None,
-        response_parser_prefix: str = "",
     ) -> tuple[str | None, str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
@@ -2735,7 +2728,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=self._tool_call_parsing_active(request),
-                prefix=response_parser_prefix,
+                prefix=request._response_parser_prefix,
             )
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
@@ -3006,7 +2999,6 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
-        response_parser_prefix: str = "",
     ):
         """Process tool calls in streaming response.
 
@@ -3030,7 +3022,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
-                        prefix=response_parser_prefix,
+                        prefix=request._response_parser_prefix,
                     )
                     use_native_parser = (
                         probe.detector.supports_structural_tag()
@@ -3045,7 +3037,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
-                    prefix=response_parser_prefix,
+                    prefix=request._response_parser_prefix,
                 )
 
         parser = parser_dict[index]

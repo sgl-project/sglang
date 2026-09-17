@@ -4,7 +4,12 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    Function,
+    ResponsesRequest,
+    Tool,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector as Gemma4ToolDetector,
@@ -288,6 +293,23 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
 
 
 class TestResponseTemplateAdapters(unittest.TestCase):
+    def test_parser_prefix_request_state_is_private(self):
+        requests = (
+            ChatCompletionRequest(messages=[]),
+            ResponsesRequest(input="hello"),
+        )
+
+        for request in requests:
+            with self.subTest(request=type(request).__name__):
+                request._response_parser_prefix = PREFIX
+
+                self.assertEqual(request._response_parser_prefix, PREFIX)
+                self.assertNotIn("response_parser_prefix", request.model_dump())
+                self.assertEqual(
+                    request.model_copy()._response_parser_prefix,
+                    PREFIX,
+                )
+
     def test_response_template_backend_is_internal(self):
         self.assertNotIn("response_template", ReasoningParser.DetectorMap)
         self.assertNotIn(

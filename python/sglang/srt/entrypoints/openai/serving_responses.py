@@ -583,7 +583,9 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
-            response_parser_prefix = self._response_parser_prefix(adapted_request)
+            request._response_parser_prefix = self._response_parser_prefix(
+                adapted_request
+            )
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
@@ -620,7 +622,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         created_time,
                         require_reasoning=require_reasoning,
-                        response_parser_prefix=response_parser_prefix,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -652,7 +653,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
-                    response_parser_prefix=response_parser_prefix,
                 )
             try:
                 result: Union[
@@ -666,7 +666,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
-                    response_parser_prefix=response_parser_prefix,
                 )
                 return result
             except Exception as e:
@@ -761,7 +760,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         output_items: Optional[list] = None,
-        response_parser_prefix: str = "",
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -815,7 +813,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
-                response_parser_prefix=response_parser_prefix,
             )
 
             if meta_info is not None:
@@ -1039,7 +1036,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         output_logprobs: Optional[list] = None,
         *,
         require_reasoning: bool,
-        response_parser_prefix: str = "",
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
         if self.reasoning_parser:
@@ -1058,7 +1054,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and self.tool_call_parser
                     and request.tool_choice != "none"
                 ),
-                prefix=response_parser_prefix,
+                prefix=request._response_parser_prefix,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -1094,7 +1090,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
-                prefix=response_parser_prefix,
+                prefix=request._response_parser_prefix,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -1564,7 +1560,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-        response_parser_prefix: str = "",
     ):
         try:
             # Update the status to "in_progress"
@@ -1583,7 +1578,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_metadata,
                 created_time,
                 require_reasoning=require_reasoning,
-                response_parser_prefix=response_parser_prefix,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1906,7 +1900,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-        response_parser_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         pending: list[dict] = []
         can_call_tools = (
@@ -1922,7 +1915,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time,
             require_reasoning=require_reasoning,
-            response_parser_prefix=response_parser_prefix,
         ):
             if not can_call_tools:
                 yield event
@@ -1963,7 +1955,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-        response_parser_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -2030,7 +2021,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
-                    prefix=response_parser_prefix,
+                    prefix=request._response_parser_prefix,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2040,7 +2031,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
-                    prefix=response_parser_prefix,
+                    prefix=request._response_parser_prefix,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
@@ -2055,7 +2046,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=isinstance(tool_parser, FunctionCallParser),
-                prefix=response_parser_prefix,
+                prefix=request._response_parser_prefix,
             )
 
         current_output_index = -1
