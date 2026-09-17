@@ -7,372 +7,607 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
+# @triton.jit(do_not_specialize=["T"])
+# def _gate_and_ring_write_kernel(
+#     A_log,
+#     a,
+#     dt_bias,
+#     b,
+#     g_buffer,
+#     beta_buffer,
+#     softplus_beta,
+#     softplus_threshold,
+#     lower_bound,
+#     cu_seqlens,
+#     stride_a,
+#     stride_b,
+#     T,
+#     B: tl.constexpr,
+#     H: tl.constexpr,
+#     HV: tl.constexpr,
+#     K: tl.constexpr,
+#     BK: tl.constexpr,
+#     IS_VARLEN: tl.constexpr,
+#     IS_KDA: tl.constexpr,
+#     USE_LOWER_BOUND: tl.constexpr,
+# ):
+#     i_nh = tl.program_id(0)
+#     i_n, i_hv = i_nh // HV, i_nh % HV
+
+#     if IS_VARLEN:
+#         bos, eos = (
+#             tl.load(cu_seqlens + i_n).to(tl.int64),
+#             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+#         )
+#         T_seq = eos - bos
+#     else:
+#         bos = i_n * T
+#         T_seq = T
+
+#     o_k = tl.arange(0, BK)
+#     mask_k = o_k < K
+
+#     p_b = b + bos * stride_b + i_hv
+#     p_A_log = A_log + i_hv
+#     if IS_KDA:
+#         p_a = a + bos * stride_a + i_hv * K + o_k
+#         p_dt_bias = dt_bias + i_hv * K + o_k
+#     else:
+#         p_a = a + bos * stride_a + i_hv
+#         p_dt_bias = dt_bias + i_hv
+
+#     for step_idx in range(0, T_seq):
+#         b_A_log = tl.load(p_A_log).to(tl.float32)
+#         if IS_KDA:
+#             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+#             b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+#         else:
+#             b_a = tl.load(p_a).to(tl.float32)
+#             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+#         x = b_a + b_dt_bias
+#         if USE_LOWER_BOUND:
+#             b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+#         else:
+#             beta_x = softplus_beta * x
+#             softplus_x = tl.where(
+#                 beta_x <= softplus_threshold,
+#                 (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+#                 x,
+#             )
+#             b_g = -tl.exp(b_A_log) * softplus_x
+
+#         b_b = tl.load(p_b).to(tl.float32)
+#         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+#         if IS_KDA:
+#             tl.store(
+#                 g_buffer + (bos + step_idx) * HV * K + i_hv * K + o_k,
+#                 b_g,
+#                 mask=mask_k,
+#             )
+#         else:
+#             tl.store(g_buffer + (bos + step_idx) * HV + i_hv, b_g)
+#         tl.store(beta_buffer + (bos + step_idx) * HV + i_hv, b_beta)
+
+#         p_b += stride_b
+#         p_a += stride_a
+
+
+# @triton.jit(do_not_specialize=["T"])
+# def _recurrent_delta_rule_preactivated_kernel(
+#     q,
+#     k,
+#     v,
+#     o,
+#     g_preact,
+#     beta_preact,
+#     h0_source,
+#     h0_indices,
+#     stride_h0_source,
+#     cu_seqlens,
+#     scale,
+#     T,
+#     stride_q,
+#     stride_k,
+#     stride_v,
+#     B: tl.constexpr,
+#     H: tl.constexpr,
+#     HV: tl.constexpr,
+#     K: tl.constexpr,
+#     V: tl.constexpr,
+#     BK: tl.constexpr,
+#     BV: tl.constexpr,
+#     USE_INITIAL_STATE: tl.constexpr,
+#     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+#     IS_VARLEN: tl.constexpr,
+#     IS_KDA: tl.constexpr,
+# ):
+#     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+#     i_n, i_hv = i_nh // HV, i_nh % HV
+#     i_h = i_hv // (HV // H)
+
+#     if IS_VARLEN:
+#         bos, eos = (
+#             tl.load(cu_seqlens + i_n).to(tl.int64),
+#             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+#         )
+#         all_tokens = T
+#         T = eos - bos
+#     else:
+#         bos, eos = i_n * T, i_n * T + T
+#         all_tokens = B * T
+
+#     o_k = i_k * BK + tl.arange(0, BK)
+#     o_v = i_v * BV + tl.arange(0, BV)
+
+#     p_q = q + bos * stride_q + i_h * K + o_k
+#     p_k = k + bos * stride_k + i_h * K + o_k
+#     p_v = v + bos * stride_v + i_hv * V + o_v
+#     p_o = o + ((i_k * all_tokens + bos) * HV + i_hv) * V + o_v
+
+#     if IS_KDA:
+#         p_g = g_preact + bos * HV * K + i_hv * K + o_k
+#     else:
+#         p_g = g_preact + bos * HV + i_hv
+#     p_beta = beta_preact + bos * HV + i_hv
+
+#     mask_k = o_k < K
+#     mask_v = o_v < V
+#     mask_h = mask_v[:, None] & mask_k[None, :]
+
+#     b_h = tl.zeros([BV, BK], dtype=tl.float32)
+#     if USE_INITIAL_STATE:
+#         idx = tl.load(h0_indices + i_n).to(tl.int64)
+#         if idx >= 0:
+#             p_h0 = (
+#                 h0_source
+#                 + idx * stride_h0_source
+#                 + i_hv * K * V
+#                 + o_v[:, None] * K
+#                 + o_k[None, :]
+#             )
+#             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+#     for _ in range(0, T):
+#         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+#         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+#         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
+#         if USE_QK_L2NORM_IN_KERNEL:
+#             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+#             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+#         b_q = b_q * scale
+
+#         if IS_KDA:
+#             b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
+#             b_h *= tl.exp(b_g[None, :])
+#         else:
+#             b_g = tl.load(p_g).to(tl.float32)
+#             b_h *= tl.exp(b_g)
+
+#         b_v -= tl.sum(b_h * b_k[None, :], 1)
+#         b_beta = tl.load(p_beta).to(tl.float32)
+#         b_v *= b_beta
+#         b_h += b_v[:, None] * b_k[None, :]
+#         b_o = tl.sum(b_h * b_q[None, :], 1)
+#         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+#         p_q += stride_q
+#         p_k += stride_k
+#         p_v += stride_v
+#         p_o += HV * V
+#         if IS_KDA:
+#             p_g += HV * K
+#         else:
+#             p_g += HV
+#         p_beta += HV
+
+
+# @triton.jit
+# def _replayssm_verify_recurrent_kernel(
+#     q_ptr,
+#     k_ptr,
+#     v_ptr,
+#     out_ptr,
+#     g_preact_ptr,
+#     beta_preact_ptr,
+#     initial_state_ptr,
+#     initial_indices_ptr,
+#     replayssm_rawv,
+#     replayssm_rawk,
+#     replayssm_g,
+#     replayssm_beta,
+#     stride_initial_0,
+#     scale,
+#     stride_q,
+#     stride_k,
+#     stride_v,
+#     stride_rawv_slot: tl.constexpr,
+#     stride_rawk_slot: tl.constexpr,
+#     stride_g_slot: tl.constexpr,
+#     stride_beta_slot: tl.constexpr,
+#     cu_seqlens,
+#     H: tl.constexpr,
+#     HV: tl.constexpr,
+#     K: tl.constexpr,
+#     V: tl.constexpr,
+#     STEPS: tl.constexpr,
+#     BK: tl.constexpr,
+#     BV: tl.constexpr,
+#     MAX_CACHE_LEN: tl.constexpr,
+#     CACHE_RING: tl.constexpr,
+#     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+#     IS_KDA: tl.constexpr,
+#     USE_INITIAL_STATE: tl.constexpr,
+#     IS_VARLEN: tl.constexpr,
+# ):
+#     pid_batch = tl.program_id(0)
+#     pid_hv = tl.program_id(1)
+#     pid_v = tl.program_id(2)
+
+#     offset_k = tl.arange(0, BK)
+#     offset_v = pid_v * BV + tl.arange(0, BV)
+#     mask_k = offset_k < K
+#     mask_v = offset_v < V
+#     mask_state = mask_v[:, None] & mask_k[None, :]
+
+#     k_head = pid_hv // (HV // H)
+
+#     if IS_VARLEN:
+#         bos = tl.load(cu_seqlens + pid_batch).to(tl.int64)
+#     else:
+#         bos = pid_batch * STEPS
+
+#     state = tl.zeros([BV, BK], dtype=tl.float32)
+#     if USE_INITIAL_STATE:
+#         initial_idx = tl.load(initial_indices_ptr + pid_batch).to(tl.int64)
+#         if initial_idx >= 0:
+#             p_h0 = (
+#                 initial_state_ptr
+#                 + initial_idx * stride_initial_0
+#                 + pid_hv * V * K
+#                 + offset_v[:, None] * K
+#                 + offset_k[None, :]
+#             )
+#             state = tl.load(p_h0, mask=mask_state, other=0.0).to(tl.float32)
+
+#     for step in tl.static_range(0, STEPS):
+#         token = bos + step
+
+#         k_raw = tl.load(
+#             k_ptr + token * stride_k + k_head * K + offset_k,
+#             mask=mask_k,
+#             other=0.0,
+#         )
+#         v_raw = tl.load(
+#             v_ptr + token * stride_v + pid_hv * V + offset_v,
+#             mask=mask_v,
+#             other=0.0,
+#         )
+
+#         if CACHE_RING:
+#             if step < MAX_CACHE_LEN:
+#                 tl.store(
+#                     replayssm_rawv
+#                     + pid_batch * stride_rawv_slot
+#                     + pid_hv * MAX_CACHE_LEN * V
+#                     + step * V
+#                     + offset_v,
+#                     v_raw.to(replayssm_rawv.dtype.element_ty),
+#                     mask=mask_v,
+#                 )
+#                 if pid_v == 0:
+#                     tl.store(
+#                         replayssm_rawk
+#                         + pid_batch * stride_rawk_slot
+#                         + k_head * MAX_CACHE_LEN * K
+#                         + step * K
+#                         + offset_k,
+#                         k_raw.to(replayssm_rawk.dtype.element_ty),
+#                         mask=mask_k,
+#                     )
+#                     if IS_KDA:
+#                         tl.store(
+#                             replayssm_g
+#                             + pid_batch * stride_g_slot
+#                             + pid_hv * MAX_CACHE_LEN * K
+#                             + step * K
+#                             + offset_k,
+#                             tl.load(
+#                                 g_preact_ptr
+#                                 + (token * HV + pid_hv) * K
+#                                 + offset_k,
+#                                 mask=mask_k,
+#                                 other=0.0,
+#                             ),
+#                             mask=mask_k,
+#                         )
+#                     else:
+#                         tl.store(
+#                             replayssm_g
+#                             + pid_batch * stride_g_slot
+#                             + pid_hv * MAX_CACHE_LEN
+#                             + step,
+#                             tl.load(
+#                                 g_preact_ptr + token * HV + pid_hv
+#                             ),
+#                         )
+#                     tl.store(
+#                         replayssm_beta
+#                         + pid_batch * stride_beta_slot
+#                         + pid_hv * MAX_CACHE_LEN
+#                         + step,
+#                         tl.load(
+#                             beta_preact_ptr + token * HV + pid_hv
+#                         ),
+#                     )
+
+#         q = tl.load(
+#             q_ptr + token * stride_q + k_head * K + offset_k,
+#             mask=mask_k,
+#             other=0.0,
+#         ).to(tl.float32)
+#         k = k_raw.to(tl.float32)
+#         value = v_raw.to(tl.float32)
+
+#         if USE_QK_L2NORM_IN_KERNEL:
+#             q = q / (tl.sqrt(tl.sum(q * q, axis=0)) + 1e-6)
+#             k = k / (tl.sqrt(tl.sum(k * k, axis=0)) + 1e-6)
+#         q *= scale
+
+#         if IS_KDA:
+#             gate = tl.load(
+#                 g_preact_ptr + (token * HV + pid_hv) * K + offset_k,
+#                 mask=mask_k,
+#                 other=0.0,
+#             ).to(tl.float32)
+#             state *= tl.exp(gate[None, :])
+#         else:
+#             gate = tl.load(
+#                 g_preact_ptr + token * HV + pid_hv
+#             ).to(tl.float32)
+#             state *= tl.exp(gate)
+
+#         value -= tl.sum(state * k[None, :], axis=1)
+#         beta = tl.load(beta_preact_ptr + token * HV + pid_hv).to(tl.float32)
+#         value *= beta
+#         state += value[:, None] * k[None, :]
+#         output = tl.sum(state * q[None, :], axis=1)
+
+#         tl.store(
+#             out_ptr + (token * HV + pid_hv) * V + offset_v,
+#             output,
+#             mask=mask_v,
+#         )
+
+
 @triton.jit(do_not_specialize=["T"])
-def _gate_and_ring_write_kernel(
+def _fused_k128_split_kernel(
     A_log,
     a,
     dt_bias,
-    b,
-    g_buffer,
-    beta_buffer,
     softplus_beta,
     softplus_threshold,
     lower_bound,
-    cu_seqlens,
-    stride_a,
-    stride_b,
-    T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    IS_KDA: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
-):
-    i_nh = tl.program_id(0)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-
-    if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int64),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
-        )
-        T_seq = eos - bos
-    else:
-        bos = i_n * T
-        T_seq = T
-
-    o_k = tl.arange(0, BK)
-    mask_k = o_k < K
-
-    p_b = b + bos * stride_b + i_hv
-    p_A_log = A_log + i_hv
-    if IS_KDA:
-        p_a = a + bos * stride_a + i_hv * K + o_k
-        p_dt_bias = dt_bias + i_hv * K + o_k
-    else:
-        p_a = a + bos * stride_a + i_hv
-        p_dt_bias = dt_bias + i_hv
-
-    for step_idx in range(0, T_seq):
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        if IS_KDA:
-            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
-        else:
-            b_a = tl.load(p_a).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
-
-        x = b_a + b_dt_bias
-        if USE_LOWER_BOUND:
-            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
-        else:
-            beta_x = softplus_beta * x
-            softplus_x = tl.where(
-                beta_x <= softplus_threshold,
-                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-                x,
-            )
-            b_g = -tl.exp(b_A_log) * softplus_x
-
-        b_b = tl.load(p_b).to(tl.float32)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-        if IS_KDA:
-            tl.store(
-                g_buffer + (bos + step_idx) * HV * K + i_hv * K + o_k,
-                b_g,
-                mask=mask_k,
-            )
-        else:
-            tl.store(g_buffer + (bos + step_idx) * HV + i_hv, b_g)
-        tl.store(beta_buffer + (bos + step_idx) * HV + i_hv, b_beta)
-
-        p_b += stride_b
-        p_a += stride_a
-
-
-@triton.jit(do_not_specialize=["T"])
-def _recurrent_delta_rule_preactivated_kernel(
     q,
     k,
     v,
+    b,
     o,
-    g_preact,
-    beta_preact,
     h0_source,
     h0_indices,
     stride_h0_source,
     cu_seqlens,
+    intermediate_states_buffer,
+    intermediate_state_indices,
+    cache_steps,
     scale,
     T,
+    stride_a,
     stride_q,
     stride_k,
     stride_v,
+    stride_b,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BK: tl.constexpr,
     BV: tl.constexpr,
+    HK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
-):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-
-    if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int64),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
-        )
-        all_tokens = T
-        T = eos - bos
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        all_tokens = B * T
-
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    p_q = q + bos * stride_q + i_h * K + o_k
-    p_k = k + bos * stride_k + i_h * K + o_k
-    p_v = v + bos * stride_v + i_hv * V + o_v
-    p_o = o + ((i_k * all_tokens + bos) * HV + i_hv) * V + o_v
-
-    if IS_KDA:
-        p_g = g_preact + bos * HV * K + i_hv * K + o_k
-    else:
-        p_g = g_preact + bos * HV + i_hv
-    p_beta = beta_preact + bos * HV + i_hv
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_v[:, None] & mask_k[None, :]
-
-    b_h = tl.zeros([BV, BK], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n).to(tl.int64)
-        if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * stride_h0_source
-                + i_hv * K * V
-                + o_v[:, None] * K
-                + o_k[None, :]
-            )
-            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-
-    for _ in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-        b_q = b_q * scale
-
-        if IS_KDA:
-            b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
-            b_h *= tl.exp(b_g[None, :])
-        else:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= tl.exp(b_g)
-
-        b_v -= tl.sum(b_h * b_k[None, :], 1)
-        b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        p_q += stride_q
-        p_k += stride_k
-        p_v += stride_v
-        p_o += HV * V
-        if IS_KDA:
-            p_g += HV * K
-        else:
-            p_g += HV
-        p_beta += HV
-
-
-@triton.jit
-def _replayssm_verify_recurrent_kernel(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    out_ptr,
-    g_preact_ptr,
-    beta_preact_ptr,
-    initial_state_ptr,
-    initial_indices_ptr,
+    USE_LOWER_BOUND: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    CACHE_RING: tl.constexpr,
     replayssm_rawv,
     replayssm_rawk,
     replayssm_g,
     replayssm_beta,
-    stride_initial_0,
-    scale,
-    stride_q,
-    stride_k,
-    stride_v,
     stride_rawv_slot: tl.constexpr,
     stride_rawk_slot: tl.constexpr,
     stride_g_slot: tl.constexpr,
     stride_beta_slot: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    STEPS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
-    CACHE_RING: tl.constexpr,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_KDA: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
 ):
     pid_batch = tl.program_id(0)
     pid_hv = tl.program_id(1)
     pid_v = tl.program_id(2)
 
-    offset_k = tl.arange(0, BK)
-    offset_v = pid_v * BV + tl.arange(0, BV)
-    mask_k = offset_k < K
-    mask_v = offset_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
+    o_k0 = tl.arange(0, HK)
+    o_k1 = o_k0 + HK
+    o_v = pid_v * BV + tl.arange(0, BV)
+    mask_k0 = o_k0 < K
+    mask_k1 = o_k1 < K
+    mask_v = o_v < V
+    mask_state0 = mask_v[:, None] & mask_k0[None, :]
+    mask_state1 = mask_v[:, None] & mask_k1[None, :]
 
     k_head = pid_hv // (HV // H)
 
-    state = tl.zeros([BV, BK], dtype=tl.float32)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + pid_batch).to(tl.int64)
+        eos = tl.load(cu_seqlens + pid_batch + 1).to(tl.int64)
+        T_loop = eos - bos
+    else:
+        bos = pid_batch * T
+        T_loop = T
+
+    state0 = tl.zeros([BV, HK], dtype=tl.float32)
+    state1 = tl.zeros([BV, HK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        initial_idx = tl.load(initial_indices_ptr + pid_batch).to(tl.int64)
-        if initial_idx >= 0:
-            p_h0 = (
-                initial_state_ptr
-                + initial_idx * stride_initial_0
-                + pid_hv * V * K
-                + offset_v[:, None] * K
-                + offset_k[None, :]
-            )
-            state = tl.load(p_h0, mask=mask_state, other=0.0).to(tl.float32)
+        idx = tl.load(h0_indices + pid_batch).to(tl.int64)
+        if idx >= 0:
+            base = h0_source + idx * stride_h0_source + pid_hv * V * K
+            state0 = tl.load(
+                base + o_v[:, None] * K + o_k0[None, :],
+                mask=mask_state0, other=0.0,
+            ).to(tl.float32)
+            state1 = tl.load(
+                base + o_v[:, None] * K + o_k1[None, :],
+                mask=mask_state1, other=0.0,
+            ).to(tl.float32)
 
-    for step in tl.static_range(0, STEPS):
-        token = pid_batch * STEPS + step
+    A_log_val = tl.load(A_log + pid_hv).to(tl.float32)
+    exp_A = tl.exp(A_log_val)
+    if IS_KDA:
+        dt_bias0 = tl.load(dt_bias + pid_hv * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+        dt_bias1 = tl.load(dt_bias + pid_hv * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+    else:
+        dt_bias_val = tl.load(dt_bias + pid_hv).to(tl.float32)
 
-        k_raw = tl.load(
-            k_ptr + token * stride_k + k_head * K + offset_k,
-            mask=mask_k,
-            other=0.0,
-        )
-        v_raw = tl.load(
-            v_ptr + token * stride_v + pid_hv * V + offset_v,
-            mask=mask_v,
-            other=0.0,
-        )
+    cache_idx = -1
+    if CACHE_INTERMEDIATE_STATES:
+        cache_idx = tl.load(intermediate_state_indices + pid_batch).to(tl.int64)
+
+    p_o = o + (bos * HV + pid_hv) * V + o_v
+
+    step_idx = 0
+    for _ in range(0, T_loop):
+        token = bos + step_idx
+
+        q0 = tl.load(q + token * stride_q + k_head * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+        q1 = tl.load(q + token * stride_q + k_head * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+        k0_raw = tl.load(k + token * stride_k + k_head * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+        k1_raw = tl.load(k + token * stride_k + k_head * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+        v_raw = tl.load(v + token * stride_v + pid_hv * V + o_v, mask=mask_v, other=0.0).to(tl.float32)
+        b_val = tl.load(b + token * stride_b + pid_hv).to(tl.float32)
+        if IS_KDA:
+            a0 = tl.load(a + token * stride_a + pid_hv * K + o_k0, mask=mask_k0, other=0.0).to(tl.float32)
+            a1 = tl.load(a + token * stride_a + pid_hv * K + o_k1, mask=mask_k1, other=0.0).to(tl.float32)
+
+            if USE_LOWER_BOUND:
+                raw_gate0 = lower_bound * tl.sigmoid(exp_A * (a0 + dt_bias0))
+                raw_gate1 = lower_bound * tl.sigmoid(exp_A * (a1 + dt_bias1))
+            else:
+                x0 = softplus_beta * (a0 + dt_bias0)
+                x1 = softplus_beta * (a1 + dt_bias1)
+                sp0 = tl.where(x0 <= softplus_threshold, tl.log(1.0 + tl.exp(x0)) / softplus_beta, a0 + dt_bias0)
+                sp1 = tl.where(x1 <= softplus_threshold, tl.log(1.0 + tl.exp(x1)) / softplus_beta, a1 + dt_bias1)
+                raw_gate0 = -exp_A * sp0
+                raw_gate1 = -exp_A * sp1
+        else:
+            a_val = tl.load(a + token * stride_a + pid_hv).to(tl.float32)
+            x = a_val + dt_bias_val
+            if USE_LOWER_BOUND:
+                raw_gate = lower_bound * tl.sigmoid(exp_A * x)
+            else:
+                beta_x = softplus_beta * x
+                softplus_x = tl.where(beta_x <= softplus_threshold, tl.log(1.0 + tl.exp(beta_x)) / softplus_beta, x)
+                raw_gate = -exp_A * softplus_x
+        beta = 1.0 / (1.0 + tl.exp(-b_val))
 
         if CACHE_RING:
-            if step < MAX_CACHE_LEN:
+            ring_slot = tl.load(h0_indices + pid_batch).to(tl.int64)
+            if step_idx < MAX_CACHE_LEN and ring_slot >= 0:
                 tl.store(
-                    replayssm_rawv
-                    + pid_batch * stride_rawv_slot
-                    + pid_hv * MAX_CACHE_LEN * V
-                    + step * V
-                    + offset_v,
-                    v_raw.to(replayssm_rawv.dtype.element_ty),
-                    mask=mask_v,
+                    replayssm_rawv + ring_slot * stride_rawv_slot + pid_hv * MAX_CACHE_LEN * V + step_idx * V + o_v,
+                    v_raw.to(replayssm_rawv.dtype.element_ty), mask=mask_v,
                 )
                 if pid_v == 0:
                     tl.store(
-                        replayssm_rawk
-                        + pid_batch * stride_rawk_slot
-                        + k_head * MAX_CACHE_LEN * K
-                        + step * K
-                        + offset_k,
-                        k_raw.to(replayssm_rawk.dtype.element_ty),
-                        mask=mask_k,
+                        replayssm_rawk + ring_slot * stride_rawk_slot + k_head * MAX_CACHE_LEN * K + step_idx * K + o_k0,
+                        k0_raw.to(replayssm_rawk.dtype.element_ty), mask=mask_k0,
+                    )
+                    tl.store(
+                        replayssm_rawk + ring_slot * stride_rawk_slot + k_head * MAX_CACHE_LEN * K + step_idx * K + o_k1,
+                        k1_raw.to(replayssm_rawk.dtype.element_ty), mask=mask_k1,
                     )
                     if IS_KDA:
                         tl.store(
-                            replayssm_g
-                            + pid_batch * stride_g_slot
-                            + pid_hv * MAX_CACHE_LEN * K
-                            + step * K
-                            + offset_k,
-                            tl.load(
-                                g_preact_ptr
-                                + (token * HV + pid_hv) * K
-                                + offset_k,
-                                mask=mask_k,
-                                other=0.0,
-                            ),
-                            mask=mask_k,
+                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN * K + step_idx * K + o_k0,
+                            raw_gate0, mask=mask_k0,
+                        )
+                        tl.store(
+                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN * K + step_idx * K + o_k1,
+                            raw_gate1, mask=mask_k1,
                         )
                     else:
                         tl.store(
-                            replayssm_g
-                            + pid_batch * stride_g_slot
-                            + pid_hv * MAX_CACHE_LEN
-                            + step,
-                            tl.load(
-                                g_preact_ptr + token * HV + pid_hv
-                            ),
+                            replayssm_g + ring_slot * stride_g_slot + pid_hv * MAX_CACHE_LEN + step_idx,
+                            raw_gate,
                         )
                     tl.store(
-                        replayssm_beta
-                        + pid_batch * stride_beta_slot
-                        + pid_hv * MAX_CACHE_LEN
-                        + step,
-                        tl.load(
-                            beta_preact_ptr + token * HV + pid_hv
-                        ),
+                        replayssm_beta + ring_slot * stride_beta_slot + pid_hv * MAX_CACHE_LEN + step_idx,
+                        beta,
                     )
 
-        q = tl.load(
-            q_ptr + token * stride_q + k_head * K + offset_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        k = k_raw.to(tl.float32)
-        value = v_raw.to(tl.float32)
-
         if USE_QK_L2NORM_IN_KERNEL:
-            q = q / (tl.sqrt(tl.sum(q * q, axis=0)) + 1e-6)
-            k = k / (tl.sqrt(tl.sum(k * k, axis=0)) + 1e-6)
-        q *= scale
+            q_scale = scale * tl.rsqrt(tl.sum(q0 * q0 + q1 * q1) + 1e-12)
+            k_scale = tl.rsqrt(tl.sum(k0_raw * k0_raw + k1_raw * k1_raw) + 1e-12)
+            q0 *= q_scale
+            q1 *= q_scale
+            k0 = k0_raw * k_scale
+            k1 = k1_raw * k_scale
+        else:
+            q0 *= scale
+            q1 *= scale
+            k0 = k0_raw
+            k1 = k1_raw
 
         if IS_KDA:
-            gate = tl.load(
-                g_preact_ptr + (token * HV + pid_hv) * K + offset_k,
-                mask=mask_k,
-                other=0.0,
-            ).to(tl.float32)
-            state *= tl.exp(gate[None, :])
+            state0 *= tl.exp(raw_gate0[None, :])
+            state1 *= tl.exp(raw_gate1[None, :])
         else:
-            gate = tl.load(
-                g_preact_ptr + token * HV + pid_hv
-            ).to(tl.float32)
-            state *= tl.exp(gate)
+            state0 *= tl.exp(raw_gate)
+            state1 *= tl.exp(raw_gate)
 
-        value -= tl.sum(state * k[None, :], axis=1)
-        beta = tl.load(beta_preact_ptr + token * HV + pid_hv).to(tl.float32)
+        value = v_raw - tl.sum(state0 * k0[None, :] + state1 * k1[None, :], axis=1)
         value *= beta
-        state += value[:, None] * k[None, :]
-        output = tl.sum(state * q[None, :], axis=1)
 
-        tl.store(
-            out_ptr + (token * HV + pid_hv) * V + offset_v,
-            output,
-            mask=mask_v,
-        )
+        state0 += value[:, None] * k0[None, :]
+        state1 += value[:, None] * k1[None, :]
+        output = tl.sum(state0 * q0[None, :] + state1 * q1[None, :], axis=1)
+
+        tl.store(p_o, output.to(p_o.dtype.element_ty), mask=mask_v)
+
+        if CACHE_INTERMEDIATE_STATES:
+            if cache_idx >= 0:
+                snap_base = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + step_idx * HV * K * V
+                    + pid_hv * V * K
+                )
+                snap_ptr0 = snap_base + o_v[:, None] * K + o_k0[None, :]
+                snap_ptr1 = snap_base + o_v[:, None] * K + o_k1[None, :]
+                tl.store(snap_ptr0, state0.to(snap_ptr0.dtype.element_ty), mask=mask_state0)
+                tl.store(snap_ptr1, state1.to(snap_ptr1.dtype.element_ty), mask=mask_state1)
+
+        step_idx += 1
+        p_o += HV * V
+
+    if not DISABLE_STATE_UPDATE:
+        if USE_INITIAL_STATE:
+            idx = tl.load(h0_indices + pid_batch).to(tl.int64)
+            if idx >= 0:
+                base = h0_source + idx * stride_h0_source + pid_hv * V * K
+                tl.store(base + o_v[:, None] * K + o_k0[None, :], state0.to(h0_source.dtype.element_ty), mask=mask_state0)
+                tl.store(base + o_v[:, None] * K + o_k1[None, :], state1.to(h0_source.dtype.element_ty), mask=mask_state1)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -588,8 +823,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # ring; the overflow steps are past the committable prefix, so drop them
         # (writing them would smash the next slot's ring).
         if CACHE_RING:
-            ring_slot = i_n
-            if step_idx < MAX_CACHE_LEN:
+            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if step_idx < MAX_CACHE_LEN and ring_slot >= 0:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -820,126 +1055,30 @@ def fused_sigmoid_gating_delta_rule_update(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    if cache_ring:
-        # Split path (NPU-optimized): gate computation is fully parallel
-        # (no ring writes — just g/beta → temp buffers); ring writes are
-        # folded into the recurrent kernel's compute-heavy loop where they
-        # are hidden by the VEC pipeline.
-        total_tokens = B * T
-
-        if is_kda:
-            g_buffer = torch.empty(
-                total_tokens, HV * K, dtype=torch.float32, device=q.device
-            )
-        else:
-            g_buffer = torch.empty(
-                total_tokens, HV, dtype=torch.float32, device=q.device
-            )
-        beta_buffer = torch.empty(
-            total_tokens, HV, dtype=torch.float32, device=q.device
-        )
-
-        grid_gate = (N * HV,)
-        _gate_and_ring_write_kernel[grid_gate](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-            g_buffer=g_buffer,
-            beta_buffer=beta_buffer,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            lower_bound=lower_bound if lower_bound is not None else 0.0,
-            cu_seqlens=cu_seqlens,
-            stride_a=stride_a,
-            stride_b=stride_b,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            BK=BK,
-            IS_VARLEN=cu_seqlens is not None,
-            IS_KDA=is_kda,
-            USE_LOWER_BOUND=lower_bound is not None,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-
-        STEPS = T // N
-        BV_RECURRENT = min(triton.next_power_of_2(V), 64)
-        grid_recurrent = (N, HV, triton.cdiv(V, BV_RECURRENT))
-        _replayssm_verify_recurrent_kernel[grid_recurrent](
-            q,
-            k,
-            v,
-            o,
-            g_buffer,
-            beta_buffer,
-            initial_state_source if initial_state_source is not None else q,
-            initial_state_indices if initial_state_indices is not None else q,
-            replayssm_rawv if replayssm_rawv is not None else q,
-            replayssm_rawk if replayssm_rawk is not None else q,
-            replayssm_g if replayssm_g is not None else q,
-            replayssm_beta if replayssm_beta is not None else q,
-            initial_state_source.stride(0) if initial_state_source is not None else 0,
-            scale,
-            stride_q,
-            stride_k,
-            stride_v,
-            stride_rawv_slot,
-            stride_rawk_slot,
-            stride_g_slot,
-            stride_beta_slot,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            STEPS=STEPS,
-            BK=BK,
-            BV=BV_RECURRENT,
-            MAX_CACHE_LEN=max_cache_len,
-            CACHE_RING=True,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            IS_KDA=is_kda,
-            USE_INITIAL_STATE=initial_state_source is not None,
-            num_warps=1,
-            num_stages=3,
-        )
-    else:
-        # PDL (sm90+): chain this kernel behind its producer conv1d_update,
-        # which already launches dependents. Bit-exact (scheduling only) —
-        # benefits both KDA and GDN recurrent paths.
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
-
-        fused_sigmoid_gating_delta_rule_update_kernel[grid](
+    # K=128 optimized path: split K into K64+K64 halves, BV=V (no V-tiling).
+    # Eliminates 4x redundant K loads and gate computation from V-tiling.
+    # Early load firing + combined reductions improve pipeline overlap.
+    if K == 128 and retrieve_parent_token is None:
+        BV_K128 = min(triton.next_power_of_2(V), 128)
+        grid_k128 = (N, HV, triton.cdiv(V, BV_K128))
+        _fused_k128_split_kernel[grid_k128](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
             softplus_beta=softplus_beta,
             softplus_threshold=softplus_threshold,
             lower_bound=lower_bound if lower_bound is not None else 0.0,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            o=o,
+            q=q, k=k, v=v, b=b, o=o,
             h0_source=initial_state_source,
             h0_indices=initial_state_indices,
             stride_h0_source=(
                 initial_state_source.stride(0)
-                if initial_state_source is not None
-                else 0
+                if initial_state_source is not None else 0
             ),
             cu_seqlens=cu_seqlens,
             intermediate_states_buffer=intermediate_states_buffer,
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_stride_steps,
-            retrieve_parent_token_ptr=retrieve_parent_token,
-            stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
-            stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
             scale=scale,
             T=T,
             stride_a=stride_a,
@@ -947,14 +1086,7 @@ def fused_sigmoid_gating_delta_rule_update(
             stride_k=stride_k,
             stride_v=stride_v,
             stride_b=stride_b,
-            NP2_T=NP2_T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
+            B=B, H=H, HV=HV, K=K, V=V, BV=BV_K128, HK=K // 2,
             USE_INITIAL_STATE=initial_state_source is not None,
             USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
             IS_VARLEN=cu_seqlens is not None,
@@ -962,7 +1094,7 @@ def fused_sigmoid_gating_delta_rule_update(
             USE_LOWER_BOUND=lower_bound is not None,
             DISABLE_STATE_UPDATE=disable_state_update,
             CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
-            HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+            CACHE_RING=cache_ring,
             replayssm_rawv=replayssm_rawv,
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
@@ -972,10 +1104,81 @@ def fused_sigmoid_gating_delta_rule_update(
             stride_g_slot=stride_g_slot,
             stride_beta_slot=stride_beta_slot,
             MAX_CACHE_LEN=max_cache_len,
-            CACHE_RING=cache_ring,
             num_warps=num_warps,
             num_stages=num_stages,
-            **pdl_kwargs,
         )
+        o = o.squeeze(0)
+        return o
+
+    # PDL (sm90+): chain this kernel behind its producer conv1d_update,
+    # which already launches dependents. Bit-exact (scheduling only) —
+    # benefits both KDA and GDN recurrent paths.
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    )
+
+    fused_sigmoid_gating_delta_rule_update_kernel[grid](
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        o=o,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        stride_h0_source=(
+            initial_state_source.stride(0)
+            if initial_state_source is not None
+            else 0
+        ),
+        cu_seqlens=cu_seqlens,
+        intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
+        cache_steps=cache_stride_steps,
+        retrieve_parent_token_ptr=retrieve_parent_token,
+        stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
+        stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+        scale=scale,
+        T=T,
+        stride_a=stride_a,
+        stride_q=stride_q,
+        stride_k=stride_k,
+        stride_v=stride_v,
+        stride_b=stride_b,
+        NP2_T=NP2_T,
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        USE_INITIAL_STATE=initial_state_source is not None,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
+        IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
+        DISABLE_STATE_UPDATE=disable_state_update,
+        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        MAX_CACHE_LEN=max_cache_len,
+        CACHE_RING=cache_ring,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        **pdl_kwargs,
+    )
     o = o.squeeze(0)
     return o
