@@ -47,6 +47,13 @@ def distributed():
     )
     set_global_server_args(args)
     maybe_init_distributed_environment_and_model_parallel(tp_size=2, sp_size=1)
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    yield
+    torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+    torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
 
 @pytest.mark.parametrize("edit", [False, True])
@@ -91,7 +98,8 @@ def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
         for param in reference.parameters():
             torch.nn.init.normal_(param, std=0.02)
     reference.bind_encoder_tp_group(get_sp_group())
-    model = Qwen3VLForConditionalGeneration(config).cuda().eval()
+    with use_tensor_parallel_group(get_tp_group()):
+        model = Qwen3VLForConditionalGeneration(config).cuda().eval()
     model.bind_encoder_tp_group(get_tp_group())
     model.load_weights(reference.state_dict().items())
     for layer in model.model.language_model.layers:
