@@ -751,7 +751,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         use_double_buffer_dp_memory = _is_npu and batch.forward_mode.is_decode()
         pin_memory = is_pin_memory_available(device)
         if use_double_buffer_dp_memory:
-            cpu_buf, gpu_view, n = self._copy_list_to_pinned_buf(
+            cpu_buf, gpu_view, n, h2d_event = self._copy_list_to_pinned_buf(
                 model_runner,
                 device,
                 global_num_tokens,
@@ -759,6 +759,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "global_num_tokens",
             )
             gpu_view.copy_(cpu_buf, non_blocking=True)
+            h2d_event.record()
             self.global_num_tokens_gpu = gpu_view
         else:
             self.global_num_tokens_gpu = torch.tensor(
@@ -766,7 +767,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         if use_double_buffer_dp_memory:
-            cpu_buf, gpu_view, n = self._copy_list_to_pinned_buf(
+            cpu_buf, gpu_view, n, h2d_event = self._copy_list_to_pinned_buf(
                 model_runner,
                 device,
                 global_num_tokens_for_logprob,
@@ -774,6 +775,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "global_num_tokens_for_logprob",
             )
             gpu_view.copy_(cpu_buf, non_blocking=True)
+            h2d_event.record()
             self.global_num_tokens_for_logprob_gpu = gpu_view
         else:
             self.global_num_tokens_for_logprob_gpu = torch.tensor(
@@ -789,6 +791,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cpu_attr = f"_init_new_pinned_{attr_name}"
         gpu_attr = f"_init_new_gpu_{attr_name}"
         toggle_attr = f"_init_new_toggle_{attr_name}"
+        event_attr = f"_init_new_h2d_event_{attr_name}"
         if not hasattr(model_runner, cpu_attr):
             setattr(
                 model_runner,
@@ -801,25 +804,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 torch.empty((2, 1), dtype=dtype, device=device),
             )
             setattr(model_runner, toggle_attr, 0)
+            setattr(model_runner, event_attr, [None, None])
         toggle = getattr(model_runner, toggle_attr)
         cpu_buf = getattr(model_runner, cpu_attr)[toggle]
         gpu_buf = getattr(model_runner, gpu_attr)[toggle]
         setattr(model_runner, toggle_attr, 1 - toggle)
-        return cpu_buf, gpu_buf
+        events = getattr(model_runner, event_attr)
+        event = events[toggle]
+        if event is not None:
+            # The pinned row may still be read by the H2D enqueued two calls
+            # ago; wait for it before overwriting.
+            event.synchronize()
+        else:
+            event = torch.get_device_module(device).Event()
+            events[toggle] = event
+        return cpu_buf, gpu_buf, event
 
     @staticmethod
     def _copy_list_to_pinned_buf(model_runner, device, values, dtype, attr_name):
         """Lazily create a double-buffered pinned CPU + device list buffer.
 
         The selected CPU buffer row is filled with ``values`` and a contiguous
-        device buffer of the same length is returned.  Caller must enqueue the
-        async H2D.  Double buffering prevents the CPU from overwriting a pinned
-        source that the device may still be reading.
+        device buffer of the same length is returned, along with the slot's
+        H2D completion event.  Caller must enqueue the async H2D and record
+        the event.  Double buffering plus per-slot events prevent the CPU
+        from overwriting a pinned source that the device may still be reading.
         """
         n = len(values)
         cpu_attr = f"_init_new_pinned_{attr_name}"
         gpu_attr = f"_init_new_gpu_{attr_name}"
         toggle_attr = f"_init_new_toggle_{attr_name}"
+        event_attr = f"_init_new_h2d_event_{attr_name}"
         if (
             not hasattr(model_runner, cpu_attr)
             or getattr(model_runner, cpu_attr).shape[1] < n
@@ -831,6 +846,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 delattr(model_runner, cpu_attr)
                 delattr(model_runner, gpu_attr)
                 delattr(model_runner, toggle_attr)
+                delattr(model_runner, event_attr)
             setattr(
                 model_runner,
                 cpu_attr,
@@ -840,12 +856,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner, gpu_attr, torch.empty((2, n), dtype=dtype, device=device)
             )
             setattr(model_runner, toggle_attr, 0)
+            setattr(model_runner, event_attr, [None, None])
         toggle = getattr(model_runner, toggle_attr)
         cpu_buf = getattr(model_runner, cpu_attr)[toggle]
         gpu_buf = getattr(model_runner, gpu_attr)[toggle]
         setattr(model_runner, toggle_attr, 1 - toggle)
+        events = getattr(model_runner, event_attr)
+        event = events[toggle]
+        if event is not None:
+            event.synchronize()
+        else:
+            event = torch.get_device_module(device).Event()
+            events[toggle] = event
         cpu_buf[:n].copy_(torch.tensor(values, dtype=dtype))
-        return cpu_buf[:n], gpu_buf[:n], n
+        return cpu_buf[:n], gpu_buf[:n], n, event
 
     @classmethod
     def init_new(
@@ -985,11 +1009,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
             if _is_npu and batch.forward_mode.is_decode():
-                cpu_buf, gpu_buf = cls._get_pinned_scalar_buf(
+                cpu_buf, gpu_buf, h2d_event = cls._get_pinned_scalar_buf(
                     model_runner, device, torch.int32, "global_num_token_non_padded"
                 )
                 cpu_buf.fill_(num_tokens)
                 gpu_buf.copy_(cpu_buf, non_blocking=True)
+                h2d_event.record()
                 ret.global_num_token_non_padded = gpu_buf
             else:
                 ret.global_num_token_non_padded = torch.tensor(
