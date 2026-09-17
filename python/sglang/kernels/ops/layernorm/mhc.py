@@ -2368,6 +2368,194 @@ def hc_mix_stats_sinkhorn(
     return pre, post, comb
 
 
+# Compensated projections: the fp32 mixing weight is split into components the
+# tensor cores take exactly (three bf16 parts, or a tf32 high part and its fp32
+# residual) and accumulated over a fixed number of K slices, so the fp32
+# accumulation error stays bounded like the DeepGEMM path's.
+_HC_MIX_COMPENSATED_SLICES = 16
+_HC_MIX_BF16X3_BLOCK_M = 128
+
+
+def split_bf16_hc_weight(weight: torch.Tensor):
+    assert weight.dtype == torch.float32 and weight.is_contiguous()
+    high = weight.bfloat16()
+    residual = weight - high.float()
+    middle = residual.bfloat16()
+    low = (residual - middle.float()).bfloat16()
+    return high, middle, low
+
+
+def split_tf32_hc_weight(weight: torch.Tensor):
+    assert weight.dtype == torch.float32 and weight.is_contiguous()
+    high = (weight.view(torch.int32) & -8192).view(torch.float32)
+    return high, weight - high
+
+
+@triton.jit
+def _hc_mix_stats_bf16x3_kernel(
+    X,
+    W_HI,
+    W_MID,
+    W_LO,
+    MIX,
+    SQ,
+    M,
+    K: tl.constexpr,
+    K_PER_SLICE: tl.constexpr,
+    MIX_COLS: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # M stays runtime-valued so variable prefill lengths reuse the same binary.
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, MIX_PAD)
+    start = tl.program_id(1) * K_PER_SLICE
+    ks = start + tl.arange(0, BLOCK_K)
+    hi = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    mid = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    lo = tl.zeros((BLOCK_M, MIX_PAD), tl.float32)
+    sq = tl.zeros((BLOCK_M,), tl.float32)
+    for block in range(K_PER_SLICE // BLOCK_K):
+        k = ks + block * BLOCK_K
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * K + k[None, :],
+            rows[:, None] < M,
+            0,
+        )
+        offsets = cols[None, :] * K + k[:, None]
+        w_hi = tl.load(W_HI + offsets, cols[None, :] < MIX_COLS, 0)
+        w_mid = tl.load(W_MID + offsets, cols[None, :] < MIX_COLS, 0)
+        w_lo = tl.load(W_LO + offsets, cols[None, :] < MIX_COLS, 0)
+        hi = tl.dot(x, w_hi, hi)
+        mid = tl.dot(x, w_mid, mid)
+        lo = tl.dot(x, w_lo, lo)
+        xf = x.to(tl.float32)
+        sq += tl.sum(xf * xf, 1)
+    offsets = (tl.program_id(1) * M + rows[:, None]) * MIX_COLS + cols[None, :]
+    tl.store(
+        MIX + offsets, (hi + mid) + lo, (rows[:, None] < M) & (cols[None, :] < MIX_COLS)
+    )
+    tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
+
+
+def hc_mix_stats_sinkhorn_bf16x3(
+    x: torch.Tensor,
+    weight_parts,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    m, k = x.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _HC_MIX_COMPENSATED_SLICES
+    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert len(weight_parts) == 3
+    assert all(
+        w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
+        for w in weight_parts
+    )
+    part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
+    sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
+    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
+        x,
+        *weight_parts,
+        part_mix,
+        sq,
+        m,
+        K=k,
+        K_PER_SLICE=k // slices,
+        MIX_COLS=mix,
+        MIX_PAD=triton.next_power_of_2(mix),
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_M=_HC_MIX_BF16X3_BLOCK_M,
+        num_warps=4,
+        num_stages=3,
+    )
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part_mix,
+        sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
+def hc_mix_stats_sinkhorn_deepgemm(
+    x_flat: torch.Tensor,
+    weight_parts,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
+    m, k = x_flat.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _HC_MIX_COMPENSATED_SLICES
+    high, low = weight_parts
+    assert high.shape == low.shape == (mix, k)
+    dev = x_flat.device
+    pre = torch.empty((m, hc_mult), dtype=torch.float32, device=dev)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), dtype=torch.float32, device=dev)
+    if m == 0:
+        return pre, post, comb
+
+    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_lo = torch.empty_like(mix_hi)
+    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
+    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+    # The row sum of squares depends only on x_flat, so the second projection
+    # recomputes exactly the same values; let it overwrite sq instead of
+    # allocating a (slices, m) fp32 scratch that is thrown away
+    # (4 MiB at m = 65536).
+    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        mix_hi,
+        sq,
+        hc_scale,
+        hc_base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        part_mix_residual_ptr=mix_lo,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
