@@ -163,13 +163,9 @@ def dependency_identity(args):
 
 
 def environment_identity(args):
-    try:
-        source = source_digest(Path(sglang.__file__).parent)
-    except (OSError, ValueError):
-        if not args.weight_cache_allow_unverified_build:
-            raise
-        source = "UNVERIFIED-DEVELOPMENT-BUILD"
-        logging.getLogger(__name__).warning("Weight cache uses %s", source)
+    # Even development providers without RECORD require a complete, stable
+    # Python source identity. A shared placeholder could admit different code.
+    source = source_digest(Path(sglang.__file__).parent)
     # RECORD is the installer's content manifest, including native binaries.
     # As with checkpoints, this assumes trusted published installations; manual
     # binary edits without republishing their RECORD are outside that contract.

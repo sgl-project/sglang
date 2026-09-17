@@ -206,6 +206,16 @@ class TestStateMapping(unittest.TestCase):
 
 
 class TestIdentity(unittest.TestCase):
+    def test_source_directory_symlinks_cannot_hide_importable_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "__init__.py").write_text("")
+            (root / "real").mkdir()
+            (root / "real" / "hidden.py").write_text("VALUE = 1")
+            (root / "linked").symlink_to(root / "real", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "directory symlinks"):
+                source_digest(root)
+
     def test_socket_path_binds_and_full_identity_is_not_the_locator(self):
         with tempfile.TemporaryDirectory(prefix="wc-") as directory:
             root = Path(directory)

@@ -112,3 +112,13 @@ def test_environment_includes_provider_receipt(publications):
         before = identity.environment_identity(args)
         publications["sglang-kernel"] = ("1.0", "changed RECORD")
         assert identity.environment_identity(args) != before
+
+
+def test_source_hash_failure_cannot_collapse_different_development_builds():
+    with patch.object(
+        identity, "source_digest", side_effect=ValueError("source changed")
+    ):
+        with pytest.raises(ValueError, match="source changed"):
+            identity.environment_identity(
+                SimpleNamespace(weight_cache_allow_unverified_build=True)
+            )

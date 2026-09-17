@@ -53,6 +53,10 @@ def _source_files(root: str) -> list[str]:
     # Like Path.rglob, do not recurse through directory symlinks. Include
     # directories named *.py as well, so hash_file rejects them as before.
     for parent, directories, names in os.walk(root, onerror=on_error):
+        if any(os.path.islink(os.path.join(parent, name)) for name in directories):
+            raise ValueError(
+                "Source directory symlinks are not supported for weight-cache identity"
+            )
         files.extend(
             os.path.join(parent, name)
             for name in (*directories, *names)

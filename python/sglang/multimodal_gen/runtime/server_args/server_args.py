@@ -2062,10 +2062,14 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
         parser.add_argument(
-            "--weight-cache-allow-weak-checkpoint-identity", action="store_true"
+            "--weight-cache-allow-weak-checkpoint-identity",
+            action="store_true",
+            help="Development only: allow stat-only local checkpoint identity without a content manifest; not a production integrity guarantee.",
         )
         parser.add_argument(
-            "--weight-cache-allow-unverified-build", action="store_true"
+            "--weight-cache-allow-unverified-build",
+            action="store_true",
+            help="Development only: allow installed providers without RECORD (unverified native build). Complete stable Python source identity remains mandatory.",
         )
         # Model and path configuration
         parser.add_argument(
