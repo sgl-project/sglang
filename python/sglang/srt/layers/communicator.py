@@ -988,7 +988,7 @@ class LayerCommunicator:
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
-                    and get_exec().comm.enable_aiter_allreduce_fusion
+                    and aiter_all_reduce_fusion_enabled_for(forward_batch.forward_mode)
                 )
             )
             and (not self.is_last_layer)
