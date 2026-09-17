@@ -77,20 +77,43 @@ def test_sdpa_mask_broadcast_and_fully_masked_rows(mask_kind, layout):
     assert torch.count_nonzero(actual[..., 0, :]) == 0
 
 
-@pytest.mark.parametrize("mask_kind", ["boolean", "additive"])
-def test_sdpa_exported_executor_matches_torch(mask_kind):
+@pytest.mark.parametrize("query_len,key_len", [(1, 4), (2, 5), (5, 2), (3, 3)])
+def test_sdpa_rectangular_causal_is_upper_left(query_len, key_len):
+    query = torch.zeros(1, 1, query_len, 4)
+    key = torch.zeros(1, 1, key_len, 4)
+    value = torch.arange(1, key_len + 1, dtype=torch.float32)
+    value = value.reshape(1, 1, key_len, 1).expand(1, 1, key_len, 4)
+    _check_lowering((query, key, value), is_causal=True)
+
+
+@pytest.mark.parametrize(
+    "query_len,key_len,mask_kind,causal",
+    [
+        (3, 3, "boolean", False),
+        (3, 3, "additive", False),
+        (2, 5, None, True),
+        (5, 2, None, True),
+    ],
+)
+def test_sdpa_exported_executor_matches_torch(mask_kind, query_len, key_len, causal):
     class Attention(torch.nn.Module):
         def forward(self, query, key, value, mask):
-            return F.scaled_dot_product_attention(query, key, value, attn_mask=mask)
+            return F.scaled_dot_product_attention(
+                query, key, value, attn_mask=mask, is_causal=causal
+            )
 
-    inputs = _inputs()
-    mask = torch.tensor(
-        [[True, False, True], [False, False, False], [True, True, False]]
-    )
-    if mask_kind == "additive":
-        mask = torch.where(mask, 0.5, -float("inf"))
+    inputs = _inputs(query_len, key_len)
+    mask = None
+    if mask_kind is not None:
+        mask = torch.ones(query_len, key_len, dtype=torch.bool)
+        mask[:, -1] = False
+        mask[1] = False
+        if mask_kind == "additive":
+            mask = torch.where(mask, 0.5, -float("inf"))
     expected = Attention()(*inputs, mask)
-    args = tuple(t.to("mps") for t in (*inputs, mask))
+    args = tuple(
+        t.to("mps") if isinstance(t, torch.Tensor) else t for t in (*inputs, mask)
+    )
     graph = torch.export.export(Attention(), args, strict=False).module()
     # Match the serving consumer's removal of the side-effect-only export guard.
     for node in tuple(graph.graph.nodes):

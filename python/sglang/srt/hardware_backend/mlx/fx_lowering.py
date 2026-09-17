@@ -308,10 +308,11 @@ def _lower_sdpa(mx, args, kwargs):
     scores = (query @ mx.swapaxes(key, -1, -2)) * scale
     if causal:
         rows, columns = scores.shape[-2:]
-        offset = columns - rows
+        # ATen SDPA uses upper-left causal alignment even when L != S.
+        # Cached decode's lower-right convention belongs to its own op.
         causal_mask = mx.triu(
             mx.full((rows, columns), -float("inf"), dtype=scores.dtype),
-            k=1 + offset,
+            k=1,
         )
         scores = scores + causal_mask
     if attention_mask is not None:
