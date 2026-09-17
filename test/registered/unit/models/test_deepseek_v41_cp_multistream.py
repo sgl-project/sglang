@@ -76,7 +76,7 @@ class _FakeLowRatioBackend:
 
 
 class TestDeepseekV41CPMultiStream(CustomTestCase):
-    def test_eager_cp_prefill_selects_multistream_for_large_chunks(self):
+    def test_eager_cp_prefill_selects_prepare_by_ratio(self):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 
         class Selected(Exception):
@@ -91,7 +91,7 @@ class TestDeepseekV41CPMultiStream(CustomTestCase):
         batch = SimpleNamespace(forward_mode=mode)
         x = torch.zeros((1024, 4))  # Larger than the capture-time BS limit.
         for ratio, method_name in (
-            (4, "_forward_prepare_multi_stream"),
+            (0, "_forward_prepare"),
             (1, "_forward_prepare_low_ratio_multi_stream"),
         ):
             with self.subTest(ratio=ratio):
@@ -102,7 +102,7 @@ class TestDeepseekV41CPMultiStream(CustomTestCase):
                     alt_streams=[object(), object(), object()],
                     _multi_stream_bs_limit=128,
                     compress_ratio=ratio,
-                    compressor=object(),
+                    compressor=object() if ratio == 1 else None,
                     _kernel_num_heads=lambda _: 1,
                     n_local_heads=1,
                     head_dim=128,

@@ -2173,32 +2173,15 @@ class MQALayer(MqaAttentionBase):
         use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
             forward_batch
         )
-        capture_mode = get_is_capture_mode()
-        # CP prefill runs eager (its prefill CUDA graph is disabled). Keep the
-        # explicit multi-stream optimization available there, including for
-        # chunks larger than the capture-time small-batch limit.
-        cp_eager_multi_stream = (
-            _is_cuda
-            and self.is_dsv41
-            and use_prefill_cp
-            and forward_batch.forward_mode.is_extend()
-            and not capture_mode
-            and not unified
-        )
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
+            and get_is_capture_mode()
             and (
-                cp_eager_multi_stream
-                or (
-                    capture_mode
-                    and (
-                        is_in_breakable_cuda_graph()
-                        or x.shape[0] <= self._multi_stream_bs_limit
-                    )
-                )
+                is_in_breakable_cuda_graph()
+                or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and (not use_prefill_cp or (not _is_hip and not unified))
+            and not use_prefill_cp
             and not (_is_hip and self.compressor is None)
             and self.compress_ratio not in (1, 2)
         ) or (
@@ -2217,7 +2200,7 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and not unified
             and (
-                not capture_mode
+                not get_is_capture_mode()
                 or (
                     (
                         is_in_breakable_cuda_graph()
@@ -2349,8 +2332,7 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if enable_multi_stream:
-            # Regular multi-stream fuses the KV cache write. Prefill CP instead
-            # materializes raw KV on the parent stream before forking.
+            # Regular multi-stream fuses the KV cache write.
             if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
