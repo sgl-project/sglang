@@ -813,6 +813,7 @@ class Envs:
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     # ===================================================================
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================

@@ -135,8 +135,9 @@ class Mm(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for the multimodal global embedding cache. "
-            "Used when --enable-mm-global-cache is set.",
-            choices=["mooncake"],
+            "Used when --enable-mm-global-cache is set. mooncake uses the "
+            "Mooncake distributed store (RDMA); npu_memcache uses Ascend MemCache.",
+            choices=["mooncake", "npu_memcache"],
         ),
     ] = "mooncake"
     disable_fast_image_processor: A[

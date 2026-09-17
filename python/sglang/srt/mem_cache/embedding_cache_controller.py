@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import math
 import threading
@@ -28,6 +29,34 @@ if transfer_embedding_ranges_direct is not None and not hasattr(
 
 TARGET_PAGE_BYTES = 256 * 1024
 VISION_POOL_RATIO = 0.8
+
+
+def _is_npu(device) -> bool:
+    return str(device.type if hasattr(device, "type") else device).startswith("npu")
+
+
+def _make_event(device) -> Optional[torch.Event]:
+    """Create a stream event for the device backend (CUDA or NPU)."""
+    if _is_npu(device):
+        return torch.npu.Event()
+    return torch.cuda.Event()
+
+
+@contextlib.contextmanager
+def _device_stream(device, stream):
+    """Context manager running inside the given stream on the device backend."""
+    if _is_npu(device):
+        with torch.npu.stream(stream):
+            yield
+    else:
+        with torch.cuda.stream(stream):
+            yield
+
+
+def _current_stream(device):
+    if _is_npu(device):
+        return torch.npu.current_stream(device)
+    return torch.cuda.current_stream(device)
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
@@ -788,8 +817,8 @@ class EmbeddingCacheController:
         try:
             device = dst_tensor.device
             copy_stream = self._get_copy_stream(device)
-            event = torch.cuda.Event()
-            with torch.cuda.stream(copy_stream):
+            event = _make_event(device)
+            with _device_stream(device, copy_stream):
                 self._copy_embedding_page_runs(
                     src=pool.tensor,
                     dst=dst_tensor,
@@ -854,11 +883,14 @@ class EmbeddingCacheController:
                 if entry is not None:
                     self._unpin_read(entry)
 
-    def _get_copy_stream(self, device: torch.device) -> "torch.cuda.Stream":
+    def _get_copy_stream(self, device: torch.device):
         key = str(device)
         stream = self._copy_streams.get(key)
         if stream is None:
-            stream = torch.cuda.Stream(device=device)
+            if _is_npu(device):
+                stream = torch.npu.Stream(device=device)
+            else:
+                stream = torch.cuda.Stream(device=device)
             self._copy_streams[key] = stream
         return stream
 
@@ -1017,12 +1049,12 @@ class EmbeddingCacheController:
             src = src.contiguous()
 
         device = src.device
-        producer_stream = torch.cuda.current_stream(device)
+        producer_stream = _current_stream(device)
         copy_stream = self._get_copy_stream(device)
         copy_stream.wait_stream(producer_stream)
         src.record_stream(copy_stream)
-        event = torch.cuda.Event()
-        with torch.cuda.stream(copy_stream):
+        event = _make_event(device)
+        with _device_stream(device, copy_stream):
             self._copy_embedding_page_runs(
                 src=src,
                 dst=pool.tensor,
