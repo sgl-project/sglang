@@ -11,7 +11,6 @@ Usage:
 """
 
 import logging
-import os
 import pkgutil
 from importlib.metadata import entry_points
 
@@ -40,7 +39,7 @@ def _is_rocm_available() -> bool:
 
 
 def _is_cpu_available() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
+    return envs.SGLANG_USE_CPU_ENGINE.get() and not _is_xpu_available()
 
 
 def _is_npu_available() -> bool:
@@ -69,7 +68,8 @@ def _resolve_platform() -> SRTPlatform:
          - Import and activate all discovered plugins
          - 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
            (checked first; an explicit opt-in wins over CUDA/ROCm availability,
-           so developers on GPU hosts can intentionally exercise the CPU path)
+           so developers on GPU hosts can intentionally exercise the CPU path,
+           except on a host with an XPU, where the opt-in is ignored)
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform

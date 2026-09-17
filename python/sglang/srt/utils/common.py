@@ -216,8 +216,15 @@ def is_host_cpu_arm64() -> bool:
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    if not envs.SGLANG_USE_CPU_ENGINE.get():
+        return False
+    if is_xpu():
+        logger.warning(
+            "Ignoring SGLANG_USE_CPU_ENGINE: an XPU device is present and the XPU "
+            "build provides no CPU engine kernels. Using the XPU engine."
+        )
+        return False
+    return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
 @lru_cache(maxsize=1)
