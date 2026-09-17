@@ -2187,8 +2187,6 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if _is_ppu:
                 return self._forward_flashmla_sparse(
                     q_all=q_all,
