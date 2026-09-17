@@ -1433,6 +1433,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
+                source_indices_raw=source_indices_tensor,
                 null_block_id=-1,
             )
             return
