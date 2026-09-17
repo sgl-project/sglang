@@ -10,7 +10,6 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
-    kimi_linear_config,
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
@@ -239,6 +238,14 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+
+    def _uses_kda_cache(self) -> bool:
+        # KDA models such as GLM can share Kimi's cache layout without being
+        # classified as a Kimi model by hybrid_arch.
+        return (
+            self.mambaish_config is not None
+            and self.mambaish_config.mamba2_cache_params.is_kda
+        )
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -827,10 +834,7 @@ class KVCacheConfigurator:
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
-                )
+                and (self.hybrid_gdn_config is not None or self._uses_kda_cache())
             ),
         )
         return req_to_token_pool
@@ -870,11 +874,11 @@ class KVCacheConfigurator:
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
+            and not self._uses_kda_cache()
         ):
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+                "cache layout; got a non-KDA model."
             )
         from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 
@@ -928,10 +932,7 @@ class KVCacheConfigurator:
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
-                )
+                and (self.hybrid_gdn_config is not None or self._uses_kda_cache())
             ),
         )
         return req_to_token_pool
@@ -2100,14 +2101,13 @@ class KVCacheConfigurator:
         # The ring is allocated per slot but is not part of mamba_cache_per_req;
         # the solve must charge it too or num_slots is over-provisioned.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+            self.hybrid_gdn_config is not None or self._uses_kda_cache()
         )
         if replayssm_active:
             # GDN sizes the fold window to the draft maximum; the KDA ring
             # stays --linear-replayssm-cache-len long (mirrors MambaPool).
             max_draft_tokens = max_speculative_num_draft_tokens()
-            if kimi_linear_config(self.model_config) is not None:
+            if self._uses_kda_cache():
                 record_len = get_exec().mamba.linear_replayssm_cache_len
             elif max_draft_tokens is not None:
                 record_len = max_draft_tokens

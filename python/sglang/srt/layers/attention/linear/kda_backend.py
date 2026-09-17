@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -15,7 +16,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_ppu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_ppu, logger
 from sglang.srt.utils.common import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -917,13 +918,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token: Optional[torch.Tensor],
         replayssm_rawv: Optional[torch.Tensor],
     ) -> bool:
-        """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
-        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
-            return False
-        if importlib.util.find_spec("cutlass") is None:
-            return False
-        if torch.cuda.get_device_capability()[0] != 10:
-            return False
+        """Check the fused dense KDA verify contract for PLA or CuTe DSL."""
+        use_pla = is_ppu() and envs.SGLANG_SAIL_PLA_CUDA.get()
+        if not use_pla:
+            if (
+                not self.kernel_dispatcher.verify_backend.is_nv_cutedsl()
+                or not is_cuda()
+            ):
+                return False
+            if importlib.util.find_spec("cutlass") is None:
+                return False
+            if torch.cuda.get_device_capability()[0] != 10:
+                return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
         # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
@@ -972,6 +978,57 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
             return False
+        if use_pla:
+            # PLA verify writes raw-input rings, not per-token SSM snapshots.
+            # Unsupported serving layouts keep the existing Triton path.
+            if intermediate_state_cache is not None or replayssm_rawv is None:
+                return False
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            rings = (
+                replayssm_rawv,
+                cache.replayssm_rawk,
+                cache.replayssm_g,
+                cache.replayssm_beta,
+            )
+            dtypes = (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
+            if any(t is None or t.dtype != dtype for t, dtype in zip(rings, dtypes)):
+                return False
+            if (
+                layer.A_log.dtype != torch.float32
+                or layer.dt_bias.dtype != torch.float32
+            ):
+                return False
+            if (
+                conv_states.dtype != torch.bfloat16
+                or intermediate_conv_window_cache.dtype != torch.bfloat16
+            ):
+                return False
+            seq_len, dim = mixed_qkv.shape[0], layer.num_v_heads * 128
+            if (
+                mixed_qkv.shape[1] != 3 * dim
+                or mixed_qkv.stride(-1) != 1
+                or a.shape
+                not in (
+                    (seq_len, dim),
+                    (1, seq_len, dim),
+                    (1, seq_len, layer.num_v_heads, 128),
+                )
+                or b.shape
+                not in ((seq_len, layer.num_v_heads), (1, seq_len, layer.num_v_heads))
+                or a.stride(-1) != 1
+                or b.stride(-1) != 1
+                or (a.ndim == 4 and a.stride(-2) != 128)
+            ):
+                return False
+            return all(
+                t.is_contiguous()
+                for t in (
+                    ssm_states,
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    *rings,
+                )
+            )
         if intermediate_state_cache is None:
             # ReplaySSM: the ring replaces the per-step snapshots. The kernel
             # wrapper validates ring layout/dtypes and raises loudly (there is
@@ -1006,9 +1063,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
-            fused_kda_decode_mtp_dspark,
-        )
+        use_pla = is_ppu() and envs.SGLANG_SAIL_PLA_CUDA.get()
+        if use_pla:
+            from pla.decode import kda_mtp_sglang
+
+            fused_kda_decode_mtp_dspark = kda_mtp_sglang.fused_kda_decode_mtp_dspark
+        else:
+            from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+                fused_kda_decode_mtp_dspark,
+            )
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads
@@ -1035,7 +1098,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # into the recurrence.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
-        apply_onorm = onorm_gate is not None and fused_static is not None
+        apply_onorm = (
+            not use_pla and onorm_gate is not None and fused_static is not None
+        )
         if apply_onorm:
             onorm_weight = fused_static[5]
             onorm_eps = fused_static[6]
@@ -1055,8 +1120,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cs_q=cs_q,
             cs_k=cs_k,
             cs_v=cs_v,
-            g=a,
-            beta=b,
+            g=a.view(1, seq_len, h, 128) if use_pla else a,
+            beta=b.view(1, seq_len, h) if use_pla else b,
             A_log=layer.A_log.reshape(-1),
             dt_bias=layer.dt_bias.reshape(-1),
             recurrent_state=ssm_states,
@@ -1077,6 +1142,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
         )
+        if use_pla:
+            logger.info_once(
+                "USE PPU SAIL CUDA PLA kernel: fused_kda_decode_mtp_dspark (direct layout)"
+            )
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out
