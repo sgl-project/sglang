@@ -9,8 +9,13 @@ set -uo pipefail
 export HIP_VISIBLE_DEVICES=$GPUS CUDA_VISIBLE_DEVICES=$GPUS
 # kernels and collectives (measured on gfx950; see ../OPTIMIZATIONS.md section 3)
 export SGLANG_USE_AITER=1 NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1
-export SGLANG_M3_ALLOW_CUSTOM_AR=1 ROCM_QUICK_REDUCE_QUANTIZATION=INT4 SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144
-export SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL=1 SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=${INDEX_TOPK_FREQ:-4}
+export SGLANG_M3_ALLOW_CUSTOM_AR=1 SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144
+# numerics knobs (defaults = the measured config; override for A/B): QR_QUANT=INT4|INT8|FP|NONE, KV_DTYPE=fp8_e4m3|auto,
+# FP8_INDEX_CACHE=1|0, GLUON_PREFILL=1|0, INDEX_TOPK_FREQ=4
+: "${QR_QUANT:=INT4}" "${KV_DTYPE:=fp8_e4m3}" "${FP8_INDEX_CACHE:=1}" "${GLUON_PREFILL:=1}"
+[ "$QR_QUANT" = NONE ] || export ROCM_QUICK_REDUCE_QUANTIZATION=$QR_QUANT
+export SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL=$GLUON_PREFILL SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=$GLUON_PREFILL SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=${INDEX_TOPK_FREQ:-4}
+export SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE=$FP8_INDEX_CACHE
 export SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1
 export SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5 SGLANG_TIMEOUT_KEEP_ALIVE=3600
 # MiniMax provider-check behaviour: parse tool calls with no/unknown inventory, 404 unknown model names, 429 on a full queue
@@ -28,7 +33,7 @@ case $SPEC in
 esac
 exec python3 -m sglang.launch_server --model-path "$MODEL" --served-model-name MiniMax-M3 --trust-remote-code \
   --tp 4 --host 0.0.0.0 --port "$PORT" ${SGLANG_API_KEY:+--api-key "$SGLANG_API_KEY"} \
-  --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 8192 --mem-fraction-static "$MEMFRAC" \
+  --kv-cache-dtype "$KV_DTYPE" --chunked-prefill-size 8192 --mem-fraction-static "$MEMFRAC" \
   $SPECARGS --triton-attention-num-kv-splits 64 --cuda-graph-backend-prefill breakable \
   --reasoning-parser minimax-m3 --tool-call-parser minimax-m3 --enable-metrics --enable-cache-report \
   --max-running-requests "$MAXRUN" --max-queued-requests "$MAXQUEUE" --watchdog-timeout 3600 $EXTRA
