@@ -723,8 +723,8 @@ class HybridCacheController(BaseHiCacheController):
             return True
 
         # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
-        # pool is replicated.
-        if transfer.name == PoolName.MAMBA:
+        # pool is replicated. Qwen4-Exp PLE state rides the same MambaPool slots.
+        if transfer.name in (PoolName.MAMBA, PoolName.PLE_STATE):
             return True
 
         # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.

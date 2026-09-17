@@ -212,7 +212,34 @@ class QSATokenToKVPool(HybridLinearKVPool):
     def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
         return self.qsa_rope_position_buffer[loc.long()]
 
+    def get_qsa_compressed_page_buffers(self) -> tuple[List[torch.Tensor], int]:
+        """Per-layer compressed-K views as ``[pages, page_bytes]`` rows.
+
+        Rows line up with full-KV pages: a token's compressed slot is
+        ``full_slot // ratio`` and the constructor rejects a ``page_size`` that
+        is not a multiple of the ratio, so full page ``p`` owns exactly the
+        compressed range ``[p * page/ratio, (p+1) * page/ratio)``.
+        """
+        row_elems = (
+            self.qsa_compressed_page_size
+            * self.qsa_index_kv_heads
+            * self.qsa_index_head_dim
+        )
+        num_pages = self.qsa_compressed_capacity // self.qsa_compressed_page_size
+        buffers = [
+            self.qsa_compressed_flat[layer_offset][: num_pages * row_elems].view(
+                num_pages, row_elems
+            )
+            for layer_offset in range(len(self.qsa_compressed_k_buffer_pool))
+        ]
+        return buffers, row_elems * self.index_state_dtype.itemsize
+
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        # Under HiCache this layer's compressed rows may still be in flight
+        # from host; a stale index-K read does not fault, it scores the wrong
+        # blocks. The pending-ring getters need no wait -- that state is
+        # per-request and never leaves the device.
+        self._wait_for_layer(layer_id)
         return self.qsa_compressed_k_buffer_pool[
             self._transfer_full_attention_id(layer_id)
         ]

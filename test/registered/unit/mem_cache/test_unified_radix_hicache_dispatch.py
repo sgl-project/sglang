@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MiniMaxSparseStrategy,
     _PlainKvStrategy,
+    _QsaMambaStrategy,
     _select_strategy,
     _SwaStrategy,
     register_stack_strategy,
@@ -20,7 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _mock_kvcache(cls):
@@ -40,6 +41,9 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertLess(
             order.index(_MiniMaxSparseStrategy), order.index(_PlainKvStrategy)
         )
+        # QSATokenToKVPool inherits from HybridLinearKVPool, so it must resolve
+        # before _MambaStrategy.
+        self.assertLess(order.index(_QsaMambaStrategy), order.index(_MambaStrategy))
         self.assertEqual(order[-1], _PlainKvStrategy)
 
     def test_deepseek_v4_full_swa(self):
@@ -57,6 +61,31 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(HybridLinearKVPool)
         strategy = _select_strategy(kvcache, {FULL, MAMBA})
         self.assertIsInstance(strategy, _MambaStrategy)
+
+    def test_qsa_mamba(self):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        kvcache = _mock_kvcache(QSATokenToKVPool)
+        strategy = _select_strategy(kvcache, {FULL, MAMBA})
+        self.assertIsInstance(strategy, _QsaMambaStrategy)
+
+    def test_mamba_strategy_does_not_claim_a_qsa_pool(self):
+        """A QSA pool on _MambaStrategy builds a KV+MAMBA stack that drops the
+        compressed index-K and the PLE state, and nothing else notices."""
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        kvcache = _mock_kvcache(QSATokenToKVPool)
+        self.assertFalse(_MambaStrategy().matches(kvcache, {FULL, MAMBA}))
+
+    def test_qsa_pool_without_a_strategy_raises(self):
+        """A QSA component set no strategy handles must raise rather than fall
+        back to the generic hybrid-linear stack."""
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        kvcache = _mock_kvcache(QSATokenToKVPool)
+        with self.assertRaises(AssertionError) as cm:
+            _select_strategy(kvcache, {FULL})
+        self.assertIn("No matching HiCache strategy", str(cm.exception))
 
     def test_swa(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -144,6 +173,40 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
             with self.assertRaises(AssertionError) as cm:
                 _select_strategy(kvcache, {FULL})
             self.assertIn("No matching HiCache strategy", str(cm.exception))
+
+    def test_qsa_stack_rejects_unsupported_combinations(self):
+        """Each of these leaves part of the QSA/PLE state unmirrored, which
+        shows up as wrong output rather than a crash."""
+        cases = [
+            # (kwargs, exception, message fragment)
+            (dict(hicache_size=1), ValueError, "--hicache-size"),
+            (dict(pp_size=2), NotImplementedError, "pipeline parallelism"),
+            (
+                dict(mtp_draft_device_pools=(object(),)),
+                NotImplementedError,
+                "speculative decoding",
+            ),
+        ]
+        for kwargs, exc_type, fragment in cases:
+            with self.subTest(**kwargs):
+                params = MagicMock()
+                params.pp_size = kwargs.get("pp_size", 1)
+                params.mtp_draft_device_pools = kwargs.get("mtp_draft_device_pools", ())
+                memory = MagicMock(hicache_size=kwargs.get("hicache_size", 0))
+                with patch.object(
+                    hybrid_pool_assembler, "get_memory", return_value=memory
+                ):
+                    with self.assertRaises(exc_type) as cm:
+                        hybrid_pool_assembler.build_qsa_mamba_stack(
+                            params=params,
+                            kvcache=MagicMock(),
+                            mamba_pool=MagicMock(),
+                            full_layer_mapping={},
+                            mamba_layer_mapping={},
+                            load_cache_event=object(),
+                            storage_backend=None,
+                        )
+                self.assertIn(fragment, str(cm.exception))
 
     def test_register_custom_strategy_takes_precedence(self):
         class _CustomStrategy(StackStrategy):

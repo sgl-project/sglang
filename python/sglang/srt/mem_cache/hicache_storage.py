@@ -74,6 +74,11 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
+    # Qwen4-Exp sidecars: QSA compressed index-K (KV-derived) and the
+    # per-request PLE side states (MAMBA-derived).
+    QSA_COMPRESSED = "qsa_compressed"
+    PLE_STATE = "ple_state"
+
     # Draft KV pool
     DRAFT = "draft"
     DRAFT_INDEXER = "draft_indexer"

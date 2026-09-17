@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.ple import PleStatePoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
@@ -928,6 +929,164 @@ def build_hybrid_mamba_stack(
     return host_pool_group, cache_controller
 
 
+def build_qsa_mamba_stack(
+    *,
+    params: CacheInitParams,
+    kvcache: Any,
+    mamba_pool: Any,
+    full_layer_mapping: dict[int, int],
+    mamba_layer_mapping: dict[int, int],
+    load_cache_event,
+    storage_backend: Optional[str],
+    host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    """KV + MAMBA + QSA compressed index-K + PLE side state, for Qwen4-Exp.
+
+    The two extra pools are derived rather than independently allocated: QSA
+    rides the KV indices (its rows are `full_slot // compress_ratio`) and PLE
+    rides the MAMBA slot indices. Neither can be sized on its own.
+    """
+    if get_memory().hicache_size > 0:
+        raise ValueError(
+            "Qwen3.8-Flash-Next HiCache does not support --hicache-size; "
+            "use --hicache-ratio instead."
+        )
+    if params.pp_size > 1:
+        # The layer mappings are keyed by unrebased model layer ids while the
+        # transfer loop counts from 0, so the PLE anchor layer below is only
+        # well defined on a single stage.
+        raise NotImplementedError(
+            "Qwen3.8-Flash-Next HiCache does not support pipeline parallelism "
+            "(--pp-size > 1) yet."
+        )
+    if params.mtp_draft_device_pools:
+        raise NotImplementedError(
+            "Qwen3.8-Flash-Next HiCache does not support speculative decoding "
+            "yet: the draft runner owns its own QSA compressed index-K, which "
+            "no draft host path carries. Drop --speculative-algorithm or "
+            "--enable-hierarchical-cache."
+        )
+
+    transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    layout = get_memory().hicache_mem_layout
+
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=kvcache.full_kv_pool,
+        page_size=params.page_size,
+        use_mla=False,
+    )
+    mamba_host_pool = MambaPoolHost(
+        mamba_pool,
+        get_memory().hicache_ratio,
+        0,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+    compressed_buffers, compressed_item_bytes = (
+        kvcache.get_qsa_compressed_page_buffers()
+    )
+    qsa_host_pool = DeepSeekV4PagedHostPool(
+        pool_name=str(PoolName.QSA_COMPRESSED),
+        device_buffers=compressed_buffers,
+        item_bytes=compressed_item_bytes,
+        # The sidecar is handed the KV pool's host indices, so its rows have to
+        # span the KV host pool's page space.
+        num_host_pages=kv_host_pool.page_num,
+        slot_page_size=params.page_size,
+        layout=layout,
+        allocator_type=_get_allocator_type(),
+        # A compressed row is one page's worth of pooled keys, not a flat token
+        # array, so the token-granular fallback does not apply.
+        page_aligned_only=True,
+    )
+
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host_pool,
+            device_pool=kvcache.full_kv_pool,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.MAMBA,
+            host_pool=mamba_host_pool,
+            device_pool=mamba_pool,
+            layer_mapping=mamba_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            host_evict_fn=host_mamba_evict_fn,
+            device_evict_fn=device_mamba_evict_fn,
+            device_alloc_fn=mamba_allocator.alloc,
+            device_free_fn=mamba_allocator.free,
+        ),
+        build_pool_entry(
+            name=PoolName.QSA_COMPRESSED,
+            host_pool=qsa_host_pool,
+            device_pool=kvcache,
+            # One compressed buffer per full-attention layer, in the local order
+            # the pool's own _transfer_full_attention_id uses.
+            layer_mapping=full_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+        ),
+    ]
+
+    if mamba_pool._slot_siblings:
+        ple_host_pool = PleStatePoolHost(
+            mamba_pool,
+            mamba_host_pool,
+            layout=layout,
+            allocator_type=_get_allocator_type(),
+        )
+        model_layer_ids = ple_host_pool.model_layer_ids
+        if not model_layer_ids:
+            raise ValueError(
+                "The PLE state pool carries no model-layer state, so its "
+                "transfer has no layer to anchor to."
+            )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.PLE_STATE,
+                host_pool=ple_host_pool,
+                device_pool=mamba_pool,
+                # Loaded at the first layer that owns PLE state, so the
+                # request-wide N-gram context is resident before any PLE layer
+                # reads it.
+                layer_mapping={min(model_layer_ids): 0},
+                transfer_layer_num=transfer_layer_num,
+            )
+        )
+
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
+    )
+    return host_pool_group, cache_controller
+
+
 def build_hybrid_mamba_swa_stack(
     *,
     params: CacheInitParams,
@@ -1458,11 +1617,20 @@ class _DeepSeekV4Strategy(StackStrategy):
 class _MambaStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-        return isinstance(kvcache, HybridLinearKVPool) and components == {
-            ComponentType.FULL,
-            ComponentType.MAMBA,
-        }
+        # A QSATokenToKVPool is a HybridLinearKVPool, but this stack carries
+        # neither its compressed index-K nor its PLE state; let _select_strategy
+        # raise rather than restore KV without the matching index-K.
+        return (
+            isinstance(kvcache, HybridLinearKVPool)
+            and not isinstance(kvcache, QSATokenToKVPool)
+            and components
+            == {
+                ComponentType.FULL,
+                ComponentType.MAMBA,
+            }
+        )
 
     def build(
         self,
@@ -1506,6 +1674,79 @@ class _MambaStrategy(StackStrategy):
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
             pools_desc="KV + MAMBA",
+        )
+
+
+class _QsaMambaStrategy(StackStrategy):
+    """Qwen4-Exp: hybrid GDN + QSA sparse full attention, plus PLE side state."""
+
+    def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        return isinstance(kvcache, QSATokenToKVPool) and components == {
+            ComponentType.FULL,
+            ComponentType.MAMBA,
+        }
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        host_pool_group, cache_controller = build_qsa_mamba_stack(
+            params=params,
+            kvcache=kvcache,
+            mamba_pool=params.req_to_token_pool.mamba_pool,
+            full_layer_mapping=full_layer_mapping,
+            mamba_layer_mapping=mamba_layer_mapping,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        sidecars = [
+            SidecarPoolSpec(
+                pool_name=PoolName.QSA_COMPRESSED,
+                indices_from_pool=PoolName.KV,
+                # A page whose compressed rows are missing scores against stale
+                # index-K rather than degrading gracefully.
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+        ]
+        if PoolName.PLE_STATE in host_pool_group.entry_map:
+            sidecars.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.PLE_STATE,
+                    indices_from_pool=PoolName.MAMBA,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+            },
+            sidecars=sidecars,
+            register_req_to_token_counter=True,
+            transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+            pools_desc="KV + MAMBA + QSA" + (" + PLE" if len(sidecars) > 1 else ""),
         )
 
 
@@ -1836,6 +2077,7 @@ class _PlainKvStrategy(StackStrategy):
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
+    _QsaMambaStrategy(),
     _MambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
