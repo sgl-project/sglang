@@ -221,9 +221,7 @@ class CacheAwarePolicy(Enum):
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
-    SHORTEST_PREFILL_FIRST = (
-        "shortest-prefill-first"  # experimental shortest uncached prefill first
-    )
+    SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -431,8 +429,6 @@ class SchedulePolicy:
 
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:
-        # Include output tokens when a retracted request must replay them.
-        # Host hits avoid compute but their transfer cost is not modeled here.
         return max(
             1,
             len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
