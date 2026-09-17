@@ -354,7 +354,7 @@ class ZmqEventPublisher(EventPublisher):
     ----------
     endpoint:
         PUB address. Use ``tcp://*:5557`` to bind or ``tcp://host:5557`` to
-        connect.
+        connect, unless overridden by ``bind``.
     replay_endpoint:
         Optional ROUTER address for replay requests. When given, subscribers can
         request missed batches by sending the starting sequence number as an
@@ -367,6 +367,9 @@ class ZmqEventPublisher(EventPublisher):
         Maximum number of events to buffer in memory.
     topic:
         Topic to publish events to.
+    bind:
+        Whether to bind the PUB socket. When unset, preserve the endpoint-based
+        heuristic: bind wildcard, IPC and inproc addresses; connect otherwise.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -381,6 +384,7 @@ class ZmqEventPublisher(EventPublisher):
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
         topic: str = "",
+        bind: Optional[bool] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -394,6 +398,7 @@ class ZmqEventPublisher(EventPublisher):
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
+        self._bind = bind
         self._replay_endpoint = self.offset_endpoint_port(
             replay_endpoint, self._dp_rank
         )
@@ -497,19 +502,22 @@ class ZmqEventPublisher(EventPublisher):
         if self._pub is None:
             self._pub = self._ctx.socket(zmq.PUB)
             self._pub.set_hwm(self._hwm)
-            # Heuristic: bind if wildcard / * present, else connect.
+            # Default heuristic: bind if wildcard / * present, else connect.
             # bind stable, connect volatile convention.
             # ``0.0.0.0`` is the IPv4 bind-all wildcard alongside ``*``
             # and ``::``; ``/server_info`` advertises it as a wildcard,
             # so the publisher must bind it for the advertised endpoint
             # to actually be listening.
-            if (
-                "*" in self._endpoint
-                or "::" in self._endpoint
-                or "0.0.0.0" in self._endpoint
-                or self._endpoint.startswith("ipc://")
-                or self._endpoint.startswith("inproc://")
-            ):
+            should_bind = self._bind
+            if should_bind is None:
+                should_bind = (
+                    "*" in self._endpoint
+                    or "::" in self._endpoint
+                    or "0.0.0.0" in self._endpoint
+                    or self._endpoint.startswith("ipc://")
+                    or self._endpoint.startswith("inproc://")
+                )
+            if should_bind:
                 logger.debug(
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
@@ -637,6 +645,11 @@ class KVEventsConfig(BaseModel):
 
     endpoint: str = "tcp://*:5557"
     """The zmq endpoint to use for publishing kv events.
+    """
+
+    bind: Optional[bool] = None
+    """Bind (true) or connect (false) the PUB socket. When unset, infer from
+    the endpoint as before. Use true to bind a concrete address such as loopback.
     """
 
     replay_endpoint: Optional[str] = None

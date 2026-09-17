@@ -8,6 +8,7 @@ the router can subscribe per replica (the `dp_size` it reads from
 """
 
 import atexit
+import json
 import tempfile
 import time
 import unittest
@@ -20,6 +21,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    EventPublisherFactory,
     KVEventBatch,
     NullEventPublisher,
     StorageMedium,
@@ -57,6 +59,9 @@ class TestLocalKvEventSource(CustomTestCase):
                 "block_size": 64,
             },
         )
+        self._assert_event_received(publisher, source)
+
+    def _assert_event_received(self, publisher, source):
         with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
             subscriber.setsockopt_string(zmq.SUBSCRIBE, source["topic"])
             subscriber.connect(source["endpoint"])
@@ -65,13 +70,55 @@ class TestLocalKvEventSource(CustomTestCase):
                 publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
                 if subscriber.poll(100):
                     topic, _, payload = subscriber.recv_multipart()
-                    self.assertEqual(topic, b"kv")
+                    self.assertEqual(topic, source["topic"].encode())
                     batch = msgspec.msgpack.decode(payload, type=KVEventBatch)
-                    self.assertEqual(batch.attn_dp_rank, 4)
+                    self.assertEqual(batch.attn_dp_rank, source["dp_rank"])
                     self.assertEqual(batch.events, [AllBlocksCleared()])
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+    def test_explicit_loopback_bind_from_cli_is_subscribable(self):
+        for rank in (0, 4):
+            with self.subTest(rank=rank):
+                with zmq.Context.instance().socket(zmq.PUB) as probe:
+                    port = probe.bind_to_random_port("tcp://127.0.0.1")
+                publisher = EventPublisherFactory.create(
+                    json.dumps(
+                        {
+                            "publisher": "zmq",
+                            "endpoint": f"tcp://127.0.0.1:{port - rank}",
+                            "bind": True,
+                            "topic": "",
+                        }
+                    ),
+                    attn_dp_rank=rank,
+                )
+                atexit.unregister(publisher.shutdown)
+                self.addCleanup(publisher.shutdown)
+                endpoint = f"tcp://127.0.0.1:{port}"
+                self.assertEqual(
+                    publisher._pub.getsockopt_string(zmq.LAST_ENDPOINT), endpoint
+                )
+                source = publisher.describe_local_source(64)
+                self.assertEqual(
+                    source,
+                    {
+                        "dp_rank": rank,
+                        "endpoint": endpoint,
+                        "topic": "",
+                        "block_size": 64,
+                    },
+                )
+                self._assert_event_received(publisher, source)
+
+    def test_explicit_connect_overrides_ipc_bind_heuristic(self):
+        directory = tempfile.TemporaryDirectory(prefix="kv-", dir="/tmp")
+        self.addCleanup(directory.cleanup)
+        publisher = self._publisher(
+            attn_dp_rank=0, endpoint=f"ipc://{directory.name}/events", bind=False
+        )
+        self.assertIsNone(publisher.describe_local_source(64))
 
     def test_ephemeral_bind_and_replay_report_resolved_ports(self):
         publisher = self._publisher(
