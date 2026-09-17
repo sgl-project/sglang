@@ -6,18 +6,16 @@ use crate::config::{
 };
 use crate::discovery::ModelId;
 use crate::kv_events::{BlockSizeOracle, HashTree};
+use crate::policies::admission::Overloaded;
 use crate::policies::{
+    affinity::SessionAwarePolicy,
+    affinity::StickyPolicy,
+    balancing::LoadBasedPolicy,
+    balancing::PowerOfTwoChoicesPolicy,
+    balancing::RandomPolicy,
+    balancing::RoundRobinPolicy,
     cache_aware::CacheAwarePolicy,
-    load_based::LoadBasedPolicy,
-    power_of_two::PowerOfTwoChoicesPolicy,
-    random::RandomPolicy,
-    round_robin::RoundRobinPolicy,
-    scoring::{
-        admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
-        Pipeline, ScorePolicy,
-    },
-    session_aware::SessionAwarePolicy,
-    sticky::StickyPolicy,
+    scoring::{FusedScorePolicy, Pipeline, PrefixCachePolicy, ScorePolicy, DEFAULT_WEIGHT},
     Policy, PolicyRegistry,
 };
 use anyhow::{anyhow, Result};
@@ -131,7 +129,7 @@ fn build_filter(
                 PrefixCachePolicy::new(
                     Arc::clone(tree),
                     Arc::clone(block_size_oracle),
-                    prefix_cache::DEFAULT_WEIGHT,
+                    DEFAULT_WEIGHT,
                 )
                 .with_min_share(share),
             )
@@ -151,7 +149,7 @@ fn build_score(
         ScoreTermKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
             Arc::clone(tree),
             Arc::clone(block_size_oracle),
-            prefix_cache::DEFAULT_WEIGHT,
+            DEFAULT_WEIGHT,
         )),
     }
 }
@@ -184,34 +182,6 @@ fn build_score_policy(
     Ok(Arc::new(ScorePolicy::new(build_fused(
         model, tree, oracle,
     )?)))
-}
-
-/// Builds a policy with test defaults.
-#[cfg(test)]
-pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
-    Ok(match kind {
-        PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-        PolicyKind::Random => Arc::new(RandomPolicy::new()),
-        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
-        )),
-        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
-        )),
-        PolicyKind::Sticky => {
-            let s = crate::config::StickyConfig::default();
-            Arc::new(StickyPolicy::new(
-                Duration::from_secs(s.idle_secs),
-                Duration::from_secs(s.eviction_interval_secs),
-                build_sticky_fallback(s.fallback_policy),
-            ))
-        }
-        PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
-            return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
-        }
-    })
 }
 
 pub fn build_registry(
@@ -356,8 +326,17 @@ mod tests {
         }
     }
 
+    fn build_with_defaults(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
+        let config = cfg_with_model("modelA", kind);
+        build_policy(
+            &config.model,
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
+        )
+    }
+
     #[test]
-    fn build_policy_kind_only_covers_all_variants() {
+    fn build_with_defaults_covers_all_variants() {
         for (kind, needs_load_snapshot, needs_dispatch_timestamps) in [
             (PolicyKind::RoundRobin, false, false),
             (PolicyKind::Random, false, false),
@@ -367,7 +346,7 @@ mod tests {
             (PolicyKind::CacheAware, true, false),
             (PolicyKind::Sticky, false, false),
         ] {
-            let policy = build_policy_kind_only(kind).unwrap();
+            let policy = build_with_defaults(kind).unwrap();
             assert_eq!(
                 policy.needs_load_snapshot(),
                 needs_load_snapshot,
@@ -379,8 +358,8 @@ mod tests {
                 "{kind:?}"
             );
         }
-        assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
-        assert!(build_policy_kind_only(PolicyKind::ScorePolicy).is_err());
+        assert!(build_with_defaults(PolicyKind::FusedScore).is_err());
+        assert!(build_with_defaults(PolicyKind::ScorePolicy).is_err());
     }
 
     #[test]

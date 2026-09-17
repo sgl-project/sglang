@@ -27,17 +27,16 @@ use std::sync::Arc;
 
 use crate::config::{DecodePolicyKind, PolicyKind, SessionAffinityMode};
 use crate::discovery::ModelId;
+use crate::kv_events::PrefixSignal;
 use crate::policies::admission::{
     resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
     CandidateDomain, CandidateRange, DecisionReason,
 };
-use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::decode::{
+use crate::policies::balancing::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
-use crate::policies::{
-    ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
-};
+use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::{Policy, PrefillProposal, ProposalKind, SelectionContext};
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
 use crate::workers::engine_reports::EngineSnapshot;
 use crate::workers::Worker;
@@ -56,7 +55,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub session_id: Option<&'a str>,
     pub request_input_tokens: u64,
     pub request_tokens: Option<&'a [u32]>,
-    pub external_prefix: Option<&'a ExternalPrefixSignal>,
+    pub external_prefix: Option<&'a PrefixSignal>,
     /// Required whenever `policy.uses_shared_prefill_admission()`; the
     /// per-domain rung panics without it. `Policy::needs_load_snapshot`
     /// defaults to `uses_shared_prefill_admission`, which is what keeps the
@@ -693,11 +692,12 @@ mod tests {
     };
     use crate::config::{AffinityConfig, DecodePolicyKind, PolicyKind, SessionAffinityMode};
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::kv_events::PrefixSignal;
     use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
+    use crate::policies::balancing::PowerOfTwoChoicesPolicy;
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
+    use crate::policies::{Policy, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
     };
@@ -773,8 +773,8 @@ mod tests {
     }
 
     /// An indexer hit placing `matched_prefix_blocks` on each named worker.
-    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> ExternalPrefixSignal {
-        ExternalPrefixSignal {
+    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> PrefixSignal {
+        PrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: matches
                     .iter()

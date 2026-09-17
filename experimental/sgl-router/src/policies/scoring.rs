@@ -1,41 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Candidate eligibility and scoring policies.
+//! Scoring, selection, and composition over eligible candidates.
 
-pub mod admission;
-pub mod argmax;
-pub mod prefix_cache;
-
+use crate::kv_events::{BlockSizeOracle, HashTree};
+use crate::policies::admission::{apply_filters, EligibilityFilter};
 use crate::policies::{Policy, PrefillProposal, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
-use argmax::{Selector, ARGMAX};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// What a filter means when it has rejected every worker it was shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnEmpty {
-    /// Ignore this filter when it rejects every candidate.
-    Abstain,
-    /// Keep the rejection: no worker is admissible.
-    Hold,
-}
-
-/// A hard constraint applied before scoring.
-pub trait EligibilityFilter: Send + Sync + std::fmt::Debug {
-    /// Returns one admission flag per worker; `true` keeps the candidate.
-    fn keep(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<bool>;
-
-    /// Whether this constraint reads `ctx.request_tokens()`.
-    fn needs_tokens(&self) -> bool {
-        false
-    }
-
-    /// Controls the result when this filter rejects every candidate.
-    fn on_empty(&self) -> OnEmpty {
-        OnEmpty::Abstain
-    }
-}
 
 /// A soft preference for eligible candidates.
 pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
@@ -71,65 +44,6 @@ pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
     fn selector(&self) -> &dyn Selector {
         &ARGMAX
     }
-}
-
-/// Applies ordered filters. `None` means a holding filter rejected all candidates.
-pub fn admit<'f>(
-    filters: impl IntoIterator<Item = &'f dyn EligibilityFilter>,
-    workers: &[Arc<Worker>],
-    ctx: &SelectionContext<'_>,
-) -> Option<Vec<Arc<Worker>>> {
-    let mut alive: Vec<Arc<Worker>> = workers.to_vec();
-
-    for filter in filters {
-        if alive.is_empty() {
-            break;
-        }
-        let flags = filter.keep(&alive, ctx);
-        let on_empty = filter.on_empty();
-        if flags.len() != alive.len() {
-            tracing::debug!(
-                filter = ?filter,
-                n_workers = alive.len(),
-                n_flags = flags.len(),
-                "eligibility filter returned the wrong arity",
-            );
-            if on_empty == OnEmpty::Hold {
-                return None;
-            }
-        }
-        let untouched = alive.len() == workers.len();
-
-        let next: Vec<Arc<Worker>> = (alive.iter().enumerate())
-            .filter(|(i, _)| flags.get(*i).copied().unwrap_or(true))
-            .map(|(_, w)| Arc::clone(w))
-            .collect();
-
-        if next.is_empty() {
-            match on_empty {
-                OnEmpty::Hold => return None,
-                OnEmpty::Abstain if untouched => {
-                    tracing::debug!(
-                        filter = ?filter,
-                        n_workers = workers.len(),
-                        "eligibility filter has no eligible workers; falling back to the full candidate set",
-                    );
-                    continue;
-                }
-                OnEmpty::Abstain => {
-                    tracing::debug!(
-                        filter = ?filter,
-                        n_alive = alive.len(),
-                        "eligibility filter conflicts with a higher-priority one; yielding",
-                    );
-                    continue;
-                }
-            }
-        }
-        alive = next;
-    }
-
-    Some(alive)
 }
 
 /// Selects the best-scoring worker.
@@ -209,7 +123,7 @@ impl Pipeline {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<PrefillProposal> {
-        let eligible = admit(self.views(), workers, ctx)?;
+        let eligible = apply_filters(self.views(), workers, ctx)?;
         if self.inner.is_bucket_affinity_policy() && ctx.affinity_lookup_enabled() {
             let probe_ctx = (*ctx).clone().without_affinity_assignment();
             if let Some(
@@ -411,16 +325,167 @@ pub(crate) fn refs(
     fs.iter().map(|f| &**f)
 }
 
+/// Scores within this distance of the best are tied.
+pub const TIE_EPSILON: f32 = 1e-6;
+
+pub trait Selector: Send + Sync + std::fmt::Debug {
+    /// Index into `workers` of the chosen candidate, or `None` when there is
+    /// nothing to choose from. `scores[i]` belongs to `workers[i]`.
+    fn pick(&self, workers: &[Arc<Worker>], scores: &[f32]) -> Option<usize>;
+}
+
+/// Highest score wins; ties choose the least-loaded candidate and rotate.
+#[derive(Debug, Default)]
+pub struct Argmax {
+    rotor: AtomicUsize,
+}
+
+/// The default selector, shared by every scoring policy that does not override
+/// [`super::ScoringPolicy::selector`].
+pub static ARGMAX: Argmax = Argmax {
+    rotor: AtomicUsize::new(0),
+};
+
+impl Selector for Argmax {
+    fn pick(&self, workers: &[Arc<Worker>], scores: &[f32]) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+        let n = workers.len().min(scores.len());
+        let best = (0..n)
+            .map(|i| scores[i])
+            .filter(|s| !s.is_nan())
+            .fold(None::<f32>, |acc, s| Some(acc.map_or(s, |b| b.max(s))));
+        let mut band: Vec<usize> = match best {
+            Some(b) => (0..n)
+                .filter(|&i| !scores[i].is_nan() && scores[i] >= b - TIE_EPSILON)
+                .collect(),
+            None => Vec::new(),
+        };
+        if band.is_empty() {
+            tracing::debug!(
+                n_workers = workers.len(),
+                n_scores = scores.len(),
+                "no usable score; falling back to load + rotation",
+            );
+            band = (0..workers.len()).collect();
+        }
+        let min_load = band.iter().map(|&i| workers[i].active_load()).min()?;
+        let tied: Vec<usize> = band
+            .into_iter()
+            .filter(|&i| workers[i].active_load() == min_load)
+            .collect();
+        let k = self.rotor.fetch_add(1, Ordering::Relaxed) % tied.len();
+        Some(tied[k])
+    }
+}
+
+/// Score for a miss or unavailable prefix signal.
+const NO_HOLDING: f32 = 0.0;
+
+/// Default fused-term weight.
+pub const DEFAULT_WEIGHT: f32 = 1.0;
+
+pub struct PrefixCachePolicy {
+    tree: Arc<HashTree>,
+    block_size_oracle: Arc<BlockSizeOracle>,
+    weight: f32,
+    /// Minimum cached share for eligibility; zero disables filtering.
+    min_share: f32,
+}
+
+impl std::fmt::Debug for PrefixCachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixCachePolicy")
+            .field("weight", &self.weight)
+            .field("min_share", &self.min_share)
+            .field("tree_nodes", &self.tree.node_count())
+            .finish()
+    }
+}
+
+impl PrefixCachePolicy {
+    pub fn new(tree: Arc<HashTree>, block_size_oracle: Arc<BlockSizeOracle>, weight: f32) -> Self {
+        Self {
+            tree,
+            block_size_oracle,
+            weight,
+            min_share: 0.0,
+        }
+    }
+
+    /// Require a cached share for eligibility.
+    pub fn with_min_share(mut self, share: f32) -> Self {
+        self.min_share = share;
+        self
+    }
+}
+
+impl PrefixCachePolicy {
+    /// Returns each worker's cached prompt share.
+    fn shares(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        let flat = || vec![NO_HOLDING; workers.len()];
+
+        let Some(tokens) = ctx.request_tokens().filter(|t| !t.is_empty()) else {
+            return flat();
+        };
+        let Some((query_blocks, depths)) =
+            crate::kv_events::prefix_depths_by_url(&self.tree, &self.block_size_oracle, tokens)
+        else {
+            return flat();
+        };
+        workers
+            .iter()
+            .map(|worker| {
+                depths
+                    .get(&worker.url)
+                    .map_or(NO_HOLDING, |depth| *depth as f32 / query_blocks as f32)
+            })
+            .collect()
+    }
+}
+
+impl ScoringPolicy for PrefixCachePolicy {
+    fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        self.shares(workers, ctx)
+    }
+
+    fn weight(&self) -> f32 {
+        self.weight
+    }
+
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        (self.min_share > 0.0).then_some(self as &dyn EligibilityFilter)
+    }
+
+    fn needs_tokens(&self) -> bool {
+        true
+    }
+}
+
+impl EligibilityFilter for PrefixCachePolicy {
+    fn keep(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<bool> {
+        (self.shares(workers, ctx).into_iter())
+            .map(|share| share >= self.min_share)
+            .collect()
+    }
+
+    fn needs_tokens(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod scoring_tests {
     use super::*;
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::admission::OnEmpty;
     use crate::policies::admission::{resolve_prefill, CandidateRange};
-    use crate::policies::load_based::LoadBasedPolicy;
-    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::round_robin::RoundRobinPolicy;
-    use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::policies::affinity::SessionAwarePolicy;
+    use crate::policies::balancing::LoadBasedPolicy;
+    use crate::policies::balancing::PowerOfTwoChoicesPolicy;
+    use crate::policies::balancing::RoundRobinPolicy;
     use crate::workers::engine_reports::{EngineSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -839,7 +904,7 @@ mod tests {
             keep(&["a", "b"], OnEmpty::Abstain),
             keep(&["c"], OnEmpty::Abstain),
         ];
-        let out = admit(refs(&chain), &ws, &ctx).expect("Abstain never holds");
+        let out = apply_filters(refs(&chain), &ws, &ctx).expect("Abstain never holds");
         assert_eq!(
             urls(&out),
             urls(&ws[..2]),
@@ -850,7 +915,10 @@ mod tests {
             keep(&["c"], OnEmpty::Abstain),
             keep(&["a", "b"], OnEmpty::Abstain),
         ];
-        assert_eq!(urls(&admit(refs(&rev), &ws, &ctx).unwrap()), urls(&ws[2..]));
+        assert_eq!(
+            urls(&apply_filters(refs(&rev), &ws, &ctx).unwrap()),
+            urls(&ws[2..])
+        );
     }
 
     #[test]
@@ -865,7 +933,7 @@ mod tests {
             keep(&["b", "c"], OnEmpty::Abstain),
         ];
         assert_eq!(
-            urls(&admit(refs(&chain), &ws, &ctx).unwrap()),
+            urls(&apply_filters(refs(&chain), &ws, &ctx).unwrap()),
             vec![ws[1].url.clone()]
         );
     }
@@ -881,7 +949,7 @@ mod tests {
             keep(&["c"], OnEmpty::Hold),
         ];
         assert!(
-            admit(refs(&held), &ws, &ctx).is_none(),
+            apply_filters(refs(&held), &ws, &ctx).is_none(),
             "no eligible worker, and the filter said Hold",
         );
 
@@ -890,7 +958,7 @@ mod tests {
             keep(&["b"], OnEmpty::Hold),
         ];
         assert_eq!(
-            urls(&admit(refs(&ok), &ws, &ctx).unwrap()),
+            urls(&apply_filters(refs(&ok), &ws, &ctx).unwrap()),
             vec![ws[1].url.clone()]
         );
 
@@ -917,7 +985,7 @@ mod tests {
         let ws = fleet();
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None);
-        let out = admit(refs(&[boxed(Short)]), &ws, &ctx).expect("the tail was admitted");
+        let out = apply_filters(refs(&[boxed(Short)]), &ws, &ctx).expect("the tail was admitted");
         assert_eq!(urls(&out), urls(&ws[1..]), "only index 0 rejected");
     }
 
@@ -938,7 +1006,7 @@ mod tests {
         let ws = fleet();
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None);
-        assert!(admit(refs(&[boxed(ShortHold)]), &ws, &ctx).is_none());
+        assert!(apply_filters(refs(&[boxed(ShortHold)]), &ws, &ctx).is_none());
     }
 
     #[test]
@@ -973,5 +1041,201 @@ mod tests {
             p.needs_request_tokens(),
             "hunger comes from the filter half"
         );
+    }
+}
+
+#[cfg(test)]
+mod argmax_tests {
+    use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use std::collections::HashSet;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    #[test]
+    fn score_wins_unless_the_gap_is_inside_the_tie_band() {
+        let ws = vec![worker("a"), worker("b")];
+        let sel = Argmax::default();
+        let _loaded = ws[1].load_guard();
+
+        assert_eq!(sel.pick(&ws, &[1.0, 1.0 - 1e-3]), Some(0), "clear winner");
+        let tie = [1.0 - 5e-7, 1.0];
+        assert_eq!(sel.pick(&ws, &tie), Some(0), "tie -> less load");
+        assert_eq!(sel.pick(&[], &[]), None, "nothing to choose from");
+    }
+
+    #[test]
+    fn nan_never_wins_from_either_position() {
+        let ws = vec![worker("a"), worker("b")];
+        let sel = Argmax::default();
+        assert_eq!(sel.pick(&ws, &[f32::NAN, 0.0]), Some(1));
+        assert_eq!(sel.pick(&ws, &[0.0, f32::NAN]), Some(0));
+        assert!(sel.pick(&ws, &[f32::NAN, f32::NAN]).is_some());
+    }
+
+    #[test]
+    fn a_total_tie_rotates_over_every_candidate() {
+        let ws = vec![worker("a"), worker("b"), worker("c")];
+        let sel = Argmax::default();
+        let picks: HashSet<usize> = (0..3).filter_map(|_| sel.pick(&ws, &[1.0; 3])).collect();
+        assert_eq!(
+            picks.len(),
+            3,
+            "three tied picks must cover all three: {picks:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::kv_events::KvWorkerId;
+    use crate::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+
+    const BLOCK: usize = 4;
+
+    fn worker(url: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(url.into()),
+            url: url.into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    fn tokens() -> Vec<u32> {
+        (0..(BLOCK as u32 * 4)).collect()
+    }
+
+    fn insert(tree: &HashTree, url: &str, rank: u32, from: usize, blocks: usize) {
+        let all = compute_block_hashes(&tokens(), BLOCK);
+        let parent = if from == 0 { None } else { Some(all[from - 1]) };
+        tree.insert(
+            &KvWorkerId::new(url.into(), rank),
+            parent,
+            &all[from..from + blocks],
+        );
+    }
+
+    fn policy(tree: Arc<HashTree>) -> PrefixCachePolicy {
+        let oracle = BlockSizeOracle::new();
+        oracle
+            .try_set(BLOCK as u32)
+            .expect("a fresh oracle accepts the first block size");
+        PrefixCachePolicy::new(tree, oracle, 1.0)
+    }
+
+    fn shares(p: &PrefixCachePolicy, ws: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        assert!(
+            ScoringPolicy::as_filter(p).is_none(),
+            "no floor configured, so this term must not be a filter at all",
+        );
+        p.scores(ws, ctx)
+    }
+
+    #[test]
+    fn depth_is_a_fraction_and_a_tail_without_block_zero_misses() {
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "deep", 0, 0, 3);
+        insert(&tree, "tail", 0, 2, 2);
+        let ws = vec![worker("deep"), worker("tail"), worker("cold")];
+
+        let model = ModelId("tiny".into());
+        let ids = tokens();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let scores = shares(&policy(tree), &ws, &ctx);
+        assert_eq!(scores[0], 0.75, "3 of 4 blocks held, not a neutral 1.0");
+        assert_eq!(scores[1], 0.0, "tail without block 0 holds nothing");
+        assert_eq!(scores[2], 0.0, "never seen");
+    }
+
+    #[test]
+    fn several_dp_ranks_of_one_worker_collapse_to_the_deepest() {
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "dp", 0, 0, 1);
+        insert(&tree, "dp", 1, 0, 3);
+        let ws = vec![worker("dp")];
+
+        let model = ModelId("tiny".into());
+        let ids = tokens();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        assert_eq!(
+            shares(&policy(tree), &ws, &ctx),
+            vec![0.75],
+            "3 of 4, not 1"
+        );
+    }
+
+    #[test]
+    fn without_tokens_every_worker_scores_the_same() {
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "deep", 0, 0, 3);
+        let ws = vec![worker("deep"), worker("cold")];
+        let model = ModelId("tiny".into());
+        let policy = policy(tree);
+
+        let ids = tokens();
+        let with = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        assert_eq!(
+            shares(&policy, &ws, &with),
+            vec![0.75, 0.0],
+            "signal is live"
+        );
+
+        let without = SelectionContext::new(&model, None);
+        assert_eq!(
+            shares(&policy, &ws, &without),
+            vec![0.0, 0.0],
+            "and inert here"
+        );
+    }
+
+    #[test]
+    fn without_a_block_size_no_worker_looks_like_a_hit() {
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "deep", 0, 0, 3);
+        let ws = vec![worker("deep"), worker("cold")];
+
+        let model = ModelId("tiny".into());
+        let ids = tokens();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let cold = PrefixCachePolicy::new(tree, BlockSizeOracle::new(), 1.0);
+        assert_eq!(shares(&cold, &ws, &ctx), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_bigram_branch_queries_a_different_chain() {
+        let ids = tokens();
+        let unigram = compute_block_hashes(&ids, BLOCK);
+        let bigram = compute_block_hashes_bigram(&ids, BLOCK);
+        assert_ne!(unigram, bigram, "the two hashers must disagree, else this");
+
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "deep", 0, 0, 4);
+        let ws = vec![worker("deep")];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(BLOCK as u32).unwrap();
+        oracle.set_bigram(true);
+        let p = PrefixCachePolicy::new(Arc::clone(&tree), oracle, 1.0);
+        assert_eq!(
+            shares(&p, &ws, &ctx),
+            vec![0.0],
+            "bigram query, unigram tree"
+        );
+        assert_eq!(shares(&policy(tree), &ws, &ctx), vec![1.0]);
     }
 }

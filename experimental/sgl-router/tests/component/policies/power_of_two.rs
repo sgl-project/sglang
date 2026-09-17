@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
+use sgl_router::policies::balancing::PowerOfTwoChoicesPolicy;
 use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::workers::Worker;
 use std::sync::atomic::Ordering;

@@ -9,9 +9,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use sgl_router::policies::random::RandomPolicy;
-use sgl_router::policies::round_robin::RoundRobinPolicy;
+use sgl_router::policies::balancing::PowerOfTwoChoicesPolicy;
+use sgl_router::policies::balancing::RandomPolicy;
+use sgl_router::policies::balancing::RoundRobinPolicy;
 use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;

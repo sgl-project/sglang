@@ -5,10 +5,10 @@
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
-use crate::policies::{request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::MetricsRegistry;
+use crate::tokenizer::{request_tokens_for, RequestTokens};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
