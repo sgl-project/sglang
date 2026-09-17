@@ -470,5 +470,118 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
 
+class TestPlainKvDevicePoolAssembler(CustomTestCase):
+    """Dense MHA/MLA pools reach the direct linker through the plain strategy."""
+
+    @staticmethod
+    def _mha_pool(*, layers, size, page_size, rows_are_pages, quantized=False):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UnquantizedKVCacheMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        pool.page_size = page_size
+        pool.size = size
+        pool.layer_num = layers
+        # is_quantized_kv_cache derives from the quant method type.
+        pool.quant_method = object() if quantized else UnquantizedKVCacheMethod()
+        rows = (size + page_size) // page_size if rows_are_pages else size + page_size
+        width = 3 * page_size if rows_are_pages else 3
+        pool.k_buffer = [
+            torch.zeros((rows, width), dtype=torch.uint8) for _ in range(layers)
+        ]
+        pool.v_buffer = [
+            torch.zeros((rows, width), dtype=torch.uint8) for _ in range(layers)
+        ]
+        return pool
+
+    def test_mha_target_and_packed_draft_share_one_pool(self):
+        target = self._mha_pool(layers=2, size=6, page_size=2, rows_are_pages=False)
+        draft = self._mha_pool(layers=1, size=6, page_size=2, rows_are_pages=False)
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=target,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
+            components={ComponentType.FULL},
+        )
+
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+        self.assertFalse(group.rank_replicated)
+        entry = group.entry_map[PoolName.KV]
+        # K and V components, each target layers then draft layers.
+        self.assertEqual([len(c) for c in entry.components], [3, 3])
+        self.assertEqual(
+            entry.components[0][2].data_ptr(), draft.k_buffer[0].data_ptr()
+        )
+        # Draft depth 0 rides on transfer layer 0 next to target layer 0.
+        self.assertEqual(entry.layer_mapping, {0: (0, 2), 1: 1})
+        pointers, sizes = entry.get_page_buffer_meta(torch.tensor([2, 3]))
+        self.assertEqual(sizes, [6] * 6)
+        self.assertEqual(pointers[0], target.k_buffer[0][2].data_ptr())
+
+    def test_mla_is_rank_replicated_and_hnd_rows_are_pages(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        pool.page_size = 2
+        pool.size = 6
+        pool.layer_num = 2
+        pool.kv_buffer = [torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
+        group = resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=()),
+            components={ComponentType.FULL},
+        )
+        self.assertTrue(group.rank_replicated)
+        entry = group.entry_map[PoolName.KV]
+        _, sizes = entry.get_page_buffer_meta(torch.tensor([0, 1]))
+        self.assertEqual(sizes, [10, 10])
+
+        hnd = self._mha_pool(layers=1, size=6, page_size=2, rows_are_pages=True)
+        group = resolve_hybrid_device_pool_group(
+            kvcache=hnd,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=()),
+            components={ComponentType.FULL},
+        )
+        entry = group.entry_map[PoolName.KV]
+        # A page-major layout addresses one row per page.
+        self.assertEqual(entry.prepare_locations(torch.tensor([2, 3])), [1])
+
+    def test_rejects_quantized_scales_and_mismatched_draft_layouts(self):
+        quantized = self._mha_pool(
+            layers=1, size=6, page_size=2, rows_are_pages=False, quantized=True
+        )
+        with self.assertRaisesRegex(ValueError, "quantized MHA pools"):
+            resolve_hybrid_device_pool_group(
+                kvcache=quantized,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=()),
+                components={ComponentType.FULL},
+            )
+        target = self._mha_pool(layers=1, size=6, page_size=2, rows_are_pages=False)
+        draft = self._mha_pool(layers=1, size=6, page_size=2, rows_are_pages=True)
+        with self.assertRaisesRegex(ValueError, "share one row layout"):
+            resolve_hybrid_device_pool_group(
+                kvcache=target,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
+                components={ComponentType.FULL},
+            )
+        mismatched_page = self._mha_pool(
+            layers=1, size=8, page_size=4, rows_are_pages=False
+        )
+        with self.assertRaisesRegex(ValueError, "must match the tree page size"):
+            resolve_hybrid_device_pool_group(
+                kvcache=mismatched_page,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=()),
+                components={ComponentType.FULL},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

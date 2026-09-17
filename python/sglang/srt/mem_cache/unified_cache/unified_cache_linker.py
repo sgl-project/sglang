@@ -21,12 +21,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
+import msgspec
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, StorageMedium
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     InsertParams,
     MatchResult,
@@ -58,10 +61,50 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
 )
 
 
+class LinkerRequestContext(msgspec.Struct, frozen=True, kw_only=True):
+    """What a backend may use to prepare residency for one request attempt."""
+
+    request: CacheRequestHandle
+    # Orchestrator KV-hint envelope from the request, or None. Advisory only.
+    router_hint: Optional[Any] = None
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    # A backend that confirms residency asynchronously before admission sets
+    # this; the tree then calls prepare_request at enqueue and gates admission
+    # on preparation_ready. Backends that look up synchronously leave it False
+    # and inherit the no-op hooks, so their scheduling is unchanged.
+    prepares_requests: bool = False
+    # Whether offload commits publish EXTERNAL-tier KV events and evictions
+    # withdraw them; only a backend that reports evictions may set this.
+    publishes_external_events: bool = False
+
+    def prepare_request(
+        self, context: LinkerRequestContext, transfers: list[PoolTransfer]
+    ) -> None:
+        """Start confirming residency for the device-uncached tail.
+
+        ``transfers`` are the LOOKUP transfers the tree would pass to
+        ``lookup``. Preparation must not report a hit; ``lookup`` does that
+        once residency is held.
+        """
+
+    def preparation_ready(self, request: CacheRequestHandle) -> bool:
+        """Whether admission may proceed (as a hit or an ordinary miss)."""
+        return True
+
+    def release_request(self, rid: str) -> None:
+        """Drop prepared residency the request will never consume."""
+
+    def finish_request(self, rid: str) -> None:
+        """A request finished normally; drop any residency it still holds."""
+
+    def take_removed_page_hashes(self) -> list[int]:
+        """Event hashes of externally stored pages the backend has evicted."""
+        return []
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -176,6 +219,13 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # While set, match() hands the lookup transfers to prepare_request
+        # instead of looking up, so enqueue-time preparation never recurses
+        # into the backend's lookup.
+        self._preparing = False
+        # Page hash -> node that was published as externally stored, so a
+        # backend eviction can clear the mark and let write-through re-offload.
+        self._stored_page_nodes: dict[str, NodeId] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -184,8 +234,45 @@ class UnifiedCacheLinkerWrapper:
     def layer_done_counter(self) -> object:
         return self.cache_linker.layer_done_counter
 
+    @property
+    def prepares_requests(self) -> bool:
+        return self.cache_linker.prepares_requests
+
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    # ---- preparation: confirm residency before admission ----
+
+    def prepare_request(self, req: Req) -> None:
+        """Run the device-only match and hand the uncached tail to the backend.
+
+        Uses the request's ordinary prefix match so the tail is exactly what a
+        later lookup would ask about; the backend sees no lookup here.
+        """
+        if not self.prepares_requests:
+            return
+        self._preparing = True
+        try:
+            req.init_next_round_input(self.cache, cow_mamba=False)
+        finally:
+            self._preparing = False
+
+    def sync_preparation(self, reqs: Sequence[Req]) -> set[str]:
+        """Request IDs every attention rank agrees are ready for admission.
+
+        Readiness is decided per rank, so it is reduced with MIN across the
+        attention group in queue order; a request one rank still prepares is
+        skipped by all of them, keeping admission consensus intact.
+        """
+        ready = [
+            int(self.cache_linker.preparation_ready(req.cache_request_handle))
+            for req in reqs
+        ]
+        if not ready:
+            return set()
+        mask = torch.tensor(ready, dtype=torch.int, device="cpu")
+        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        return {req.rid for req, flag in zip(reqs, mask.tolist()) if flag}
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -209,6 +296,14 @@ class UnifiedCacheLinkerWrapper:
             if transfer is None:
                 return result
             lookup_transfers.append(transfer)
+        if self._preparing:
+            self.cache_linker.prepare_request(
+                LinkerRequestContext(
+                    request=req.cache_request_handle, router_hint=req.kv_hints
+                ),
+                lookup_transfers,
+            )
+            return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
@@ -564,12 +659,59 @@ class UnifiedCacheLinkerWrapper:
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
+        tree_core = self.cache.tree_core
         for success in successes:
             pending = self.pending_offloads.pop(0)
-            self.cache.tree_core.finish_external_linker_offload(
+            tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
+            if success and self.cache_linker.publishes_external_events:
+                for node_id in pending.publish_node_ids:
+                    node = tree_core.node_by_id(node_id)
+                    tree_core.kv_events.record_store(
+                        node, medium=StorageMedium.EXTERNAL
+                    )
+                    for page_hash in node.hash_value or ():
+                        self._stored_page_nodes[page_hash] = node_id
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+
+    def drain_external_inventory(self) -> None:
+        """Withdraw pages the backend evicted: emit removals, allow re-offload.
+
+        L1 presence does not imply external residency, so the mark is cleared
+        on the node that was published if it still names the page; a node that
+        has since split keeps its mark and simply misses until it is evicted.
+        """
+        if not self.cache_linker.publishes_external_events:
+            return
+        removed = self.cache_linker.take_removed_page_hashes()
+        if not removed:
+            return
+        tree_core = self.cache.tree_core
+        tree_core.kv_events.enqueue(
+            BlockRemoved(block_hashes=list(removed), medium=StorageMedium.EXTERNAL)
+        )
+        from sglang.srt.mem_cache.storage.kvcr.router_hint import page_hash_to_int64
+
+        if not self._stored_page_nodes:
+            return
+        removed_set = set(removed)
+        for page_hash in [
+            page
+            for page in self._stored_page_nodes
+            if page_hash_to_int64(page) in removed_set
+        ]:
+            node_id = self._stored_page_nodes.pop(page_hash)
+            try:
+                node = tree_core.node_by_id(node_id)
+            except (KeyError, IndexError):
+                continue
+            if (
+                node.hash_value
+                and page_hash in node.hash_value
+                and node.write_through_pending_id is None
+            ):
+                node.external_cache_stored = False
 
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
@@ -579,6 +721,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self._stored_page_nodes.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -594,11 +737,16 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.release_request(rid)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+
+    def finish_request(self, rid: str) -> None:
+        self.hit_markers.pop(rid, None)
+        self.cache_linker.finish_request(rid)
 
     def close(self) -> None:
         self.cache_linker.close()

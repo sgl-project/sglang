@@ -210,6 +210,12 @@ def _create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "kvcr":
+            from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+                KVCRDirectLinker,
+            )
+
+            linker_cls = KVCRDirectLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"

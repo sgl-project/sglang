@@ -1008,6 +1008,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        drain_external_inventory=lambda: None,
     )
 
     reduce_calls = 0

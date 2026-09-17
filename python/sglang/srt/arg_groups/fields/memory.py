@@ -208,8 +208,8 @@ class Memory(msgspec.Struct):
     unified_cache_external_linker_backend: A[
         str,
         Arg(
-            help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            help="Storage backend for --enable-unified-cache-external-linker. kvcr offloads GPU pages into KVCR-owned DRAM over NIXL and supports router-hinted peer reuse; configure it with --hicache-storage-backend-extra-config.",
+            choices=["mooncake", "mori", "kvcr"],
         ),
     ] = "mooncake"
 
