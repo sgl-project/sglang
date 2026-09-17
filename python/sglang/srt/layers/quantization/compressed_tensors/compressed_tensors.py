@@ -60,7 +60,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
     find_matched_target,
+    find_matched_target_by_name,
     is_activation_quantization_format,
+    is_mtp_layer_name,
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -683,6 +685,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         weight_quant: BaseModel,
         input_quant: BaseModel,
         format: Optional[str] = None,
+        layer_name: Optional[str] = None,
     ) -> CompressedTensorsLinearScheme:
         # The format of the config_group this layer matched, when it declares
         # one. Falls back to the top-level format, which is "mixed-precision"
@@ -777,7 +780,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                         input_symmetric=input_quant.symmetric,
                     )
 
-        raise NotImplementedError("No compressed-tensors compatible scheme was found.")
+        layer_info = f" for layer '{layer_name}'" if layer_name else ""
+        raise NotImplementedError(
+            f"No compressed-tensors compatible scheme was found{layer_info}. "
+            "If this layer is unquantized in the checkpoint (such as an MTP/NEXTN draft head), "
+            r"add its module name or regex pattern (e.g. 're:mtp\..*') to quantization_config.ignore."
+        )
 
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
@@ -973,6 +981,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_quant=weight_quant,
                 input_quant=input_quant,
                 format=scheme_format,
+                layer_name=layer_name,
             )
 
         # Raise error if device does not support the scheme
@@ -1067,12 +1076,26 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                if is_mtp_layer_name(layer_name):
+                    # MTP/NEXTN draft heads are outside the HF model graph traced by
+                    # llm-compressor and are typically stored unquantized without being
+                    # listed in ignore. Only quantize an MTP layer when a target
+                    # explicitly matches its layer name or unfused shard names; do not
+                    # fall back to generic module-type targets like Linear or FusedMoE.
+                    matched_target = find_matched_target_by_name(
+                        layer_name=layer_name,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                    if matched_target is None:
+                        return None
+                else:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
 
             return self.target_scheme_map[matched_target]
 

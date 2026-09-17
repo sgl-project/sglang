@@ -232,3 +232,28 @@ def _match_fused_layer(
             unfused_matches.append(None)
 
     return unfused_matches[0] if all(unfused_matches) else None
+
+
+def is_mtp_layer_name(layer_name: Optional[str]) -> bool:
+    """Return True if layer_name belongs to an MTP/NEXTN speculative draft head."""
+    if not layer_name:
+        return False
+    return (
+        layer_name.startswith(("mtp.", "model.mtp.", "mtp_layers.", "mtp_block."))
+        or ".mtp." in layer_name
+        or ".mtp_layers." in layer_name
+        or ".mtp_block." in layer_name
+    )
+
+
+def find_matched_target_by_name(
+    layer_name: Optional[str],
+    targets: Iterable[str],
+    fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+) -> Optional[str]:
+    """Match a layer against targets strictly by layer name or unfused shard names."""
+    if not layer_name:
+        return None
+    return _find_first_match(layer_name, targets) or _match_fused_layer(
+        layer_name, targets, fused_mapping
+    )
