@@ -379,6 +379,36 @@ def _build_dsa_device_pool_group(
             f"{kvcache.page_size} != {page_size}."
         )
     num_layers = kvcache.layer_num
+    indexer_buffers = kvcache.index_k_with_scale_buffer
+
+    # Some DSA layers reuse another layer's top-k result and therefore do not
+    # own an Index-K buffer. Map the active model layers to the compact buffer
+    # list instead of assuming one Index-K buffer per model layer.
+    indexer_layer_ids = getattr(kvcache, "indexer_layer_ids", None)
+    if indexer_layer_ids is None:
+        indexer_mapping = {layer: layer for layer in range(num_layers)}
+        expected_indexer_buffers = num_layers
+    else:
+        start_layer = getattr(kvcache, "start_layer", 0)
+        indexer_mapping = {
+            layer_id - start_layer: buffer_index
+            for buffer_index, layer_id in enumerate(indexer_layer_ids)
+        }
+        invalid_layers = [
+            layer for layer in indexer_mapping if not 0 <= layer < num_layers
+        ]
+        if invalid_layers:
+            raise ValueError(
+                "DSA Index-K layers are outside the local layer range: "
+                f"{invalid_layers}, num_layers={num_layers}, start_layer={start_layer}."
+            )
+        expected_indexer_buffers = len(indexer_layer_ids)
+    if len(indexer_buffers) != expected_indexer_buffers:
+        raise ValueError(
+            "DSA Index-K buffer count does not match its layer mapping: "
+            f"buffers={len(indexer_buffers)}, "
+            f"mapped_layers={expected_indexer_buffers}."
+        )
     if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
         raise ValueError("DSA MTP page size must match the tree page size.")
     draft_kv_buffers = [
@@ -391,18 +421,24 @@ def _build_dsa_device_pool_group(
     ]
     if len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("DSA MTP KV and indexer draft layer counts must match.")
-    layer_mapping = _with_packed_draft_mapping(
+    kv_layer_mapping = _with_packed_draft_mapping(
         {layer: layer for layer in range(num_layers)},
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
+    for depth, _ in enumerate(draft_indexer_buffers):
+        mapped = indexer_mapping.get(depth)
+        draft_buffer_index = len(indexer_buffers) + depth
+        indexer_mapping[depth] = (
+            (draft_buffer_index,) if mapped is None else (mapped, draft_buffer_index)
+        )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
             components=[[*kvcache.kv_buffer, *draft_kv_buffers]],
-            layer_mapping=layer_mapping,
+            layer_mapping=kv_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -410,8 +446,8 @@ def _build_dsa_device_pool_group(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
-            layer_mapping=layer_mapping,
+            components=[[*indexer_buffers, *draft_indexer_buffers]],
+            layer_mapping=indexer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
