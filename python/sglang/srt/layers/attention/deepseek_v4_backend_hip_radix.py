@@ -913,6 +913,7 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
+            req_pool_indices_repeated,
             seq_lens,
             extend_seq_lens,
             num_draft_tokens * bs,
