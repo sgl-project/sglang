@@ -124,6 +124,7 @@ class BenchArgs:
     base_url: str = ""
     local_tokenizer_path: str = ""
     skip_warmup: bool = False
+    skip_token_capacity_check: bool = False
     show_report: bool = False
     profile: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
@@ -207,6 +208,11 @@ class BenchArgs:
             ),
         )
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--skip-token-capacity-check",
+            action="store_true",
+            help="Skip the raw-token capacity check; keep max-running-requests checks.",
+        )
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument(
@@ -254,6 +260,7 @@ class BenchArgs:
                 "generated-shared-prefix",
                 "sharegpt",
                 "custom",
+                "longbench_v2",
             ],
             help="Name of the dataset to benchmark on. sharegpt/custom replay "
             "recorded text prompts (custom reads --dataset-path JSONL); their "
@@ -638,6 +645,7 @@ def run_one_case(
             "random-ids",
             "mmmu",
             "generated-shared-prefix",
+            "longbench_v2",
         ) + REPLAY_TEXT_DATASETS
         if dataset_name not in supported_datasets:
             raise ValueError(
@@ -684,6 +692,21 @@ def run_one_case(
         elif dataset_name == "mmmu":
             input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
             image_data = [req.image_data for req in input_requests]
+        elif dataset_name == "longbench_v2":
+            # Real long documents, so the requested ISL is a TRUNCATION rather
+            # than one short message tiled up to length. Truncate to exactly
+            # input_len (instead of averaging, as the replay datasets do) so the
+            # shape under test matches the tiled `random` arm token for token
+            # and the only variable left is how the prompts route.
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            input_ids = [ids[:input_len] for ids in input_ids if len(ids) >= input_len]
+            if len(input_ids) < batch_size:
+                raise ValueError(
+                    f"longbench_v2 yielded only {len(input_ids)} prompts of >= "
+                    f"{input_len} tokens for batch size {batch_size}"
+                )
+            input_ids = input_ids[:batch_size]
+            image_data = None
         elif dataset_name in REPLAY_TEXT_DATASETS:
             if len(input_requests) < batch_size:
                 raise ValueError(
@@ -1229,6 +1252,9 @@ def run_benchmark_internal(
             skip_token_capacity_threshold += state.get("memory_usage", {}).get(
                 "token_capacity", 1000000000
             )
+
+        if bench_args.skip_token_capacity_check:
+            skip_token_capacity_threshold = float("inf")
 
         # Router /get_server_info responses carry "router_manager"; worker
         # responses never do, so its presence confirms a router by design.

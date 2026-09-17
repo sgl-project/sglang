@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -328,6 +329,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             qkv_weight[:, self.q_lora_rank :].contiguous()
         )
 
+        if get_disagg().disaggregation_mode != "null":
+            qkv_weight.data.untyped_storage().resize_(0)
+
     def get_sin_cos(self, positions):
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
@@ -590,6 +594,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dequant_q_norm,
         )
 
+    def uses_mlaprolog(self) -> bool:
+        _is_arch35_dsa = (
+            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
+        )
+        return _is_arch35_dsa or (
+            hasattr(self.quant_config, "ignore")
+            and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
+        )
+
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
@@ -602,10 +615,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
         )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
-        _is_mlaprolog = _is_arch35_dsa or (
-            hasattr(self.quant_config, "ignore")
-            and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
-        )
+        _is_mlaprolog = self.uses_mlaprolog()
         if _is_w8a8 and not _is_arch35_dsa:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
