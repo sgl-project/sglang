@@ -52,6 +52,50 @@ class MinimaxM3Detector(BaseFormatDetector):
     def _normalize_tag_spacing(cls, text: str) -> str:
         return cls.TAG_SPACING_RE.sub(MINIMAX_NS_TOKEN, text)
 
+    INVOKE_OPEN = MINIMAX_NS_TOKEN + "<invoke"
+    _INVOKE_NAME_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+
+    @classmethod
+    def _find_tag_close(cls, text: str, start: int) -> int:
+        """Index of the first ``>`` at or after ``start`` that is not part of a
+        namespace token (the token itself contains ``>``); -1 if none."""
+        pos = start
+        while True:
+            gt = text.find(">", pos)
+            if gt == -1:
+                return -1
+            ns = text.rfind(MINIMAX_NS_TOKEN, 0, gt + len(MINIMAX_NS_TOKEN))
+            if ns != -1 and ns <= gt < ns + len(MINIMAX_NS_TOKEN):
+                pos = ns + len(MINIMAX_NS_TOKEN)
+                continue
+            return gt
+
+    @classmethod
+    def _invoke_name_from_open_tag(
+        cls, span: str, tools: List[Tool]
+    ) -> Optional[str]:
+        """Tool name from the text between ``<invoke`` and ``>``.
+
+        The canonical form is `` name="Read"``; long-context generations also
+        drop or double the ``name=`` glue (`` name Read"``, `` nameRead"``,
+        `` name name="Read"``, or a namespace token spliced in). Strip the
+        markup, take the last identifier, and prefer a declared tool name when
+        one matches case-insensitively.
+        """
+        cleaned = span.replace(MINIMAX_NS_TOKEN, " ").replace("<", " ")
+        tokens = [t for t in cls._INVOKE_NAME_TOKEN_RE.findall(cleaned) if t != "name"]
+        if not tokens:
+            return None
+        raw = tokens[-1]
+        candidates = [raw]
+        if raw.startswith("name") and len(raw) > 4:
+            candidates.append(raw[4:])
+        declared = {tool.function.name.lower(): tool.function.name for tool in tools}
+        for candidate in candidates:
+            if candidate.lower() in declared:
+                return declared[candidate.lower()]
+        return candidates[-1] if raw.startswith("name") and len(tokens) == 1 else raw
+
     @classmethod
     def _flushable_prefix_length(cls, text: str, token: str) -> int:
         for length in range(min(len(token) - 1, len(text)), 0, -1):
@@ -117,7 +161,7 @@ class MinimaxM3Detector(BaseFormatDetector):
         results: List[ToolCallItem] = []
         cursor = 0
         while True:
-            start = block.find(self.INVOKE_PREFIX, cursor)
+            start = block.find(self.INVOKE_OPEN, cursor)
             end = block.find(self.INVOKE_SUFFIX, start)
             if start == -1 or end == -1:
                 break
@@ -125,12 +169,16 @@ class MinimaxM3Detector(BaseFormatDetector):
             invoke_str = block[start:end]
             cursor = end + len(self.INVOKE_SUFFIX)
 
-            name_end = invoke_str.find('">', len(self.INVOKE_PREFIX))
+            name_end = self._find_tag_close(invoke_str, len(self.INVOKE_OPEN))
             if name_end == -1:
                 continue
 
-            func_name = invoke_str[len(self.INVOKE_PREFIX) : name_end]
-            body = invoke_str[name_end + len('">') :]
+            func_name = self._invoke_name_from_open_tag(
+                invoke_str[len(self.INVOKE_OPEN) : name_end], tools
+            )
+            if not func_name:
+                continue
+            body = invoke_str[name_end + 1 :]
             params = self._parse_parameter(
                 body, self._get_function_parameters_schema(func_name, tools)
             )
@@ -211,7 +259,7 @@ class MinimaxM3Detector(BaseFormatDetector):
 
     def _consume_tool_call_end(self) -> bool:
         start = self._buffer.find(self.TOOL_CALL_END)
-        invoke_start = self._buffer.find(self.INVOKE_PREFIX)
+        invoke_start = self._buffer.find(self.INVOKE_OPEN)
         if start == -1 or (invoke_start != -1 and invoke_start < start):
             return False
 
@@ -222,17 +270,23 @@ class MinimaxM3Detector(BaseFormatDetector):
     def _consume_invoke_start(
         self, tools: List[Tool], calls: List[ToolCallItem]
     ) -> bool:
-        start = self._buffer.find(self.INVOKE_PREFIX)
+        start = self._buffer.find(self.INVOKE_OPEN)
         if start == -1:
             return False
 
-        name_start = start + len(self.INVOKE_PREFIX)
-        name_end = self._buffer.find('">', name_start)
+        name_start = start + len(self.INVOKE_OPEN)
+        name_end = self._find_tag_close(self._buffer, name_start)
         if name_end == -1:
             return False
 
-        function_name = self._buffer[name_start:name_end]
-        self._buffer = self._buffer[name_end + len('">') :]
+        function_name = self._invoke_name_from_open_tag(
+            self._buffer[name_start:name_end], tools
+        )
+        if not function_name:
+            # unreadable open tag: skip it and keep scanning
+            self._buffer = self._buffer[name_end + 1 :]
+            return True
+        self._buffer = self._buffer[name_end + 1 :]
         self._current_function_name = function_name
         self._current_function_schema = self._get_function_parameters_schema(
             function_name, tools

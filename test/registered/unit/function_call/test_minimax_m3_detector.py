@@ -565,6 +565,50 @@ class TestMinimaxM3LenientClosingTags(CustomTestCase):
         self.assertEqual(calls[0]["args"]["location"]["city"], "Beijing")
 
 
+class TestMinimaxM3LenientInvokeOpen(CustomTestCase):
+    """Long-context generations drop or double the ``name=`` glue of the
+    invoke tag (observed on MiniMax's provider check: ``<invoke name Read">``,
+    ``<invoke nameRead">``, ``<invoke name name="Read">``, a namespace token
+    spliced into the tag). The call must still be surfaced, non-streaming and
+    streaming alike."""
+
+    def setUp(self):
+        self.tools = _make_tools()
+
+    def _forms(self):
+        return [
+            '<invoke name="get_weather">',
+            '<invoke name get_weather">',
+            '<invoke nameget_weather">',
+            '<invoke name name="get_weather">',
+            "<invoke name" + _wire("<get_weather\">").lstrip(),
+            '<invoke name="Get_Weather">',
+        ]
+
+    def test_non_streaming(self):
+        for open_tag in self._forms():
+            with self.subTest(open_tag=open_tag):
+                calls, _ = _parse_segments(
+                    ("<tool_call>", open_tag, "<city>Beijing", "</city>", "</invoke>", "</tool_call>"),
+                    self.tools,
+                )
+                self.assertEqual(calls, [{"name": "get_weather", "args": {"city": "Beijing"}}])
+
+    def test_streaming(self):
+        for open_tag in self._forms():
+            with self.subTest(open_tag=open_tag):
+                text = _wire("<tool_call>", open_tag, "<city>Beijing", "</city>", "</invoke>", "</tool_call>")
+                detector = MinimaxM3Detector()
+                calls = []
+                for i in range(0, len(text), 5):
+                    calls += detector.parse_streaming_increment(text[i : i + 5], self.tools).calls
+                calls += detector.finish(self.tools).calls
+                names = [c.name for c in calls if c.name]
+                args = "".join(c.parameters for c in calls if c.name is None)
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(args), {"city": "Beijing"})
+
+
 class TestMinimaxM3ComposedSchema(CustomTestCase):
     """A top-level oneOf has no `properties`, so child tags used to resolve to no
     schema at all and every value came back as a bare string (report case
