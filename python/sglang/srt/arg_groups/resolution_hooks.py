@@ -96,6 +96,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_data_parallelism",
         "handle_load_balance_method",
         "handle_context_parallelism",
+        "handle_kv_cache_sharding",
         "handle_moe_kernel_config",
         "handle_a2a_moe",
         "handle_eplb_and_dispatch",

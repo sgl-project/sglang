@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_swa_ring_size,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.page_interleave import compute_page_shard_scratch_bytes
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -199,7 +200,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
-    bias = 0
+    bias = double-buffered scratch bytes for KV sharding, otherwise zero
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -227,6 +228,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if has_kv_on_another_pp_stage
             else get_schedule().max_total_tokens or kvc.model_config.context_len
         )
+
+        # Logical-page KV sharding reserves a fixed double-buffered assembly
+        # scratch next to the pool; charge it before token sizing.
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -534,7 +539,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
