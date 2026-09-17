@@ -4210,7 +4210,7 @@ class DeepseekV4AttnBackend(
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
+                forward_batch, core_attn_metadata, num_qo_tokens=q_flat.shape[0]
             )
             self.forward_metadata.sparse_prefill_cache = cache
 

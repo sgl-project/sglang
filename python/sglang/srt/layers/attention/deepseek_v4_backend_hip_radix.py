@@ -263,7 +263,7 @@ class DSV4AttnMetadata:
         )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
-        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.index_topk == other.index_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
 

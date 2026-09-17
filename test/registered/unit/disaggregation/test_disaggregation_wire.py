@@ -855,6 +855,7 @@ def _make_dsv4_target(*, unified, mapping=None):
 
 def _make_dsv4_draft(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
+    pool.compression_ratios = [0, 2, 1]
     pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256

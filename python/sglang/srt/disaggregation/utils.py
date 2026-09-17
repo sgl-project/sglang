@@ -1403,6 +1403,7 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
