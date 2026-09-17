@@ -471,10 +471,7 @@ def _normalize_hf_cache_path(path: str) -> str:
 
 
 def has_registered_diffusion_model_path(model_path: str) -> bool:
-    # Built-in path aliases are populated by _register_configs() at module import.
-    # Load only an explicitly configured external package; detection must not
-    # discover and import every built-in runtime pipeline in an LLM process.
-    load_external_model_package()
+    _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     if is_sensenova_u1_model(model_path):

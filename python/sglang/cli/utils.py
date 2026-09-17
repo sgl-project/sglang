@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from functools import lru_cache
 
 from huggingface_hub import HfApi
@@ -25,13 +26,46 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
 
 
 def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    is_registered = getattr(
+        sys.modules.get("sglang.multimodal_gen.registry"),
+        "is_registered_diffusion_model_path",
+        None,
+    )
+    if is_registered is not None:
+        return is_registered(model_path)
+
+    # Keep diffusion imports and operator registration out of the CLI process
+    # until it has selected a backend. Diffusion itself retains its normal
+    # registry initialization and pipeline discovery order.
     try:
-        from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
-    except ImportError:
-        # if diffusion dependencies are not installed
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys\n"
+                "from sglang.multimodal_gen.registry import is_registered_diffusion_model_path\n"
+                "sys.exit(0 if is_registered_diffusion_model_path(sys.argv[1]) else 1)\n",
+                model_path,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("Failed to query diffusion registry for %s: %s", model_path, exc)
         return False
 
-    return is_registered_diffusion_model_path(model_path)
+    if result.returncode != 0:
+        logger.debug(
+            "Diffusion registry did not match %s (exit %s): %s",
+            model_path,
+            result.returncode,
+            result.stderr,
+        )
+    return result.returncode == 0
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:

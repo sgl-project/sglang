@@ -912,12 +912,7 @@ class TestDiffusionModelDetection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             model_path = os.path.join(root, "Z-Image-Turbo")
             os.mkdir(model_path)
-            with patch(
-                "sglang.multimodal_gen.registry._ensure_registry_initialized"
-            ) as ensure_registry:
-                self.assertTrue(get_is_diffusion_model(model_path))
-
-            ensure_registry.assert_not_called()
+            self.assertTrue(get_is_diffusion_model(model_path))
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
