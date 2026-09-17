@@ -68,10 +68,23 @@ logger = logging.getLogger(__name__)
 
 # Imported lazily so this module has no import-time dependencies: any module can
 # import get_parallel at module level without risking an import cycle.
-def _ps():
-    from sglang.srt.distributed import parallel_state
+_PARALLEL_STATE = None
 
-    return parallel_state
+
+def _ps():
+    """The module every rank and group read ends at.
+
+    Cached because the import statement dominated the read: a group read is
+    two attribute lookups plus this, and it runs per row-linear on an eager
+    forward. The getter is still resolved by name on the returned module, so
+    a test that patches `parallel_state.get_tp_group` is still seen.
+    """
+    global _PARALLEL_STATE
+    if _PARALLEL_STATE is None:
+        from sglang.srt.distributed import parallel_state
+
+        _PARALLEL_STATE = parallel_state
+    return _PARALLEL_STATE
 
 
 def _dp():
@@ -287,7 +300,7 @@ class ParallelContext:
 
     def __init__(self):
         self._overrides = {}  # scoped, restored when the `with` block exits
-        self._stamp = {}  # permanent for the process, dropped by clear_derived_widths
+        self._stamp = {}  # permanent for the process, dropped by clear_stamp
         self._config = None  # parallel config bag, wired at publish
 
     def __getattr__(self, name):
@@ -307,7 +320,7 @@ class ParallelContext:
         or a group handle.
 
         The two override maps stay separate because they are taken down by
-        different things -- a `with` block and `clear_derived_widths()` -- and
+        different things -- a `with` block and `clear_stamp()` -- and
         merging them would let a teardown of one drop the other, and would
         turn "which wins" into whichever was written last.
         """
@@ -360,9 +373,13 @@ class ParallelContext:
         for the process, not scoped to a `with` block: none of the real
         callers ever restore the value they set here.
         """
+        unknown = set(values) - _parallel_fields()
+        if unknown:
+            raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
         self._stamp.update(values)
 
-    def clear_derived_widths(self) -> None:
+    def clear_stamp(self) -> None:
+        """Drop every stamped name, ranks included."""
         self._stamp.clear()
 
     @contextmanager
@@ -395,10 +412,11 @@ def _install_parallel_properties() -> None:
 
     The quotients are declared in `arg_groups/fields/parallel.py`, beside the
     leaves they are computed from; the ranks and group handles are declared in
-    `_LIVE_READS`, because no configuration carries them. Both kinds are
-    written as properties rather than left to `__getattr__` because they are
-    read inside compiled model code, where an attribute load is traceable and
-    a dynamic lookup is not.
+    `_LIVE_READS`, because no configuration carries them. Properties rather
+    than names left to `__getattr__` because the class surface is what the
+    guards introspect -- `hasattr(ParallelContext, "tp_group")` and
+    `vars(ParallelContext)` are how the tests check the set from the class
+    side -- and because each one carries its `Derived.doc`.
 
     Every one of them resolves through `_read`, so there is a single priority
     chain rather than one per kind of name.
@@ -1719,7 +1737,7 @@ def reset_context() -> None:
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
-    _CONTEXT.parallel.clear_derived_widths()
+    _CONTEXT.parallel.clear_stamp()
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()

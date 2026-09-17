@@ -164,10 +164,10 @@ class TestStampedRanks(_IsolatedOverrides):
         super().setUp()
         parallel = get_parallel()
         self._saved_derived = dict(parallel._stamp)
-        parallel.clear_derived_widths()
+        parallel.clear_stamp()
         self.addCleanup(
             lambda: (
-                parallel.clear_derived_widths(),
+                parallel.clear_stamp(),
                 parallel.override_permanently(**self._saved_derived),
             )
         )
@@ -235,10 +235,10 @@ class TestStampedRanks(_IsolatedOverrides):
 class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
     """The overridable set is read from the declarations, not maintained by hand.
 
-    It used to be a literal frozenset, so a width or leaf added next to its
-    siblings needed a second edit here; forgetting it left a name that read
-    fine and could not be stated, which is indistinguishable from the override
-    silently not working.
+    A hand-kept list can hold a name the class does not answer, or miss one it
+    does; either way `override()` refuses or accepts the wrong thing with
+    nothing to say so. The three tests below check the set against the
+    declarations from both sides.
     """
 
     def test_every_declared_name_can_be_stated_and_reads_back(self):
@@ -309,7 +309,7 @@ class TestReadsWithoutAPublishedConfig(_IsolatedOverrides):
         self._saved_stamp = dict(parallel._stamp)
         self.addCleanup(
             lambda: (
-                parallel.clear_derived_widths(),
+                parallel.clear_stamp(),
                 parallel.override_permanently(**self._saved_stamp),
             )
         )
@@ -357,6 +357,37 @@ class TestPrivateAttributeProbing(_IsolatedOverrides):
         import copy
 
         self.assertIsInstance(copy.copy(get_parallel()), ParallelContext)
+
+
+class TestAWidthReadStaysTraceable(_IsolatedOverrides):
+    """A width read inside compiled model code must stay inside the graph.
+
+    Shared layers read widths inside a compiled forward. A graph break there
+    is a performance regression and nothing else -- every suite stays green
+    through it -- so `fullgraph=True` is what turns it into a failure. This
+    pins the read path, whichever form it takes: the sibling leaf test
+    compiles names served by `__getattr__` and they trace too.
+    """
+
+    def test_a_width_read_compiles_into_the_graph(self):
+        import torch
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
+            ),
+            role="test",
+        )
+
+        def read(x):
+            return x * get_parallel().attn_tp_size
+
+        # backend="eager": this pins tracing, not code generation, and stays
+        # runnable on a box with no inductor toolchain.
+        compiled = torch.compile(read, fullgraph=True, backend="eager")
+        self.assertEqual(compiled(torch.ones(3)).tolist(), [4.0, 4.0, 4.0])
 
 
 class TestParallelOverride(_IsolatedOverrides):
@@ -1640,10 +1671,10 @@ class TestDerivedWidths(_IsolatedOverrides):
         super().setUp()
         parallel = get_parallel()
         self._saved_derived = dict(parallel._stamp)
-        parallel.clear_derived_widths()
+        parallel.clear_stamp()
         self.addCleanup(
             lambda: (
-                parallel.clear_derived_widths(),
+                parallel.clear_stamp(),
                 parallel.override_permanently(**self._saved_derived),
             )
         )
@@ -1694,14 +1725,15 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.assertIn("not available", str(caught.exception))
 
     def test_a_permanent_override_and_a_live_group_both_win_over_the_leaves(self):
-        """Order is permanent override, then live group, then the leaves.
-        Where a group exists it is the truth -- elastic scale-up moves the
-        group without a fresh override -- so the leaf derivation only
-        answers where there is none.
+        """Order is scoped override, then the stamp, then the published leaf.
+
+        No group is consulted for a width -- `test_the_group_is_never_consulted`
+        in this class asserts that -- so a stamp is what an elastic scale-up
+        leaves behind, and the leaf answers only where there is none.
         """
         parallel = get_parallel()
         parallel.override_permanently(attn_tp_size=7)
-        self.addCleanup(parallel.clear_derived_widths)
+        self.addCleanup(parallel.clear_stamp)
         with parallel.override(tp_size=8, attn_dp_size=2):
             self.assertEqual(parallel.attn_tp_size, 7)
 
@@ -1789,7 +1821,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         # Elastic scaling overrides again where it updates the live width.
         parallel.override_permanently(attn_dp_size=4)
         self.assertEqual(parallel.attn_dp_size, 4)
-        parallel.clear_derived_widths()
+        parallel.clear_stamp()
         with parallel.override(tp_size=8, attn_dp_size=1):
             self.assertEqual(parallel.attn_dp_size, 1)
 
