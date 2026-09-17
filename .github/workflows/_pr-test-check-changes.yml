@@ -97,6 +97,9 @@ jobs:
               - "test/**/!(*.md)"
               - "rust/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+              # test_server_args_docs_coverage.py diffs this doc against the CLI,
+              # so a docs-only edit can break that test.
+              - "docs/docs/advanced_features/server_arguments.mdx"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
