@@ -1,8 +1,7 @@
 """Golden checks for the DeepSeek-V4.1 engram hash layout.
 
-The compressed token map depends on the `tokenizers` normalizers and the prime
-layout on the local primality test; both feed every hash multiplier, so a silent
-change rehashes the whole table.
+The `tokenizers` normalizers and the prime layout feed every hash multiplier,
+so a silent change in either rehashes the whole table.
 """
 
 import types

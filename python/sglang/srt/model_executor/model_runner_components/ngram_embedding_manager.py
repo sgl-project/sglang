@@ -168,8 +168,7 @@ class NgramEmbeddingManager:
         return batch
 
     def _prepare_engram_history(self, batch: ScheduleBatch) -> None:
-        """Refresh extend predecessors after prefix hits, retraction, or slot reuse,
-        and seed the history row of a request whose prefill ran on another server."""
+        """Refresh extend predecessors after prefix hits, retraction, or slot reuse."""
         n1 = self.engram_hasher.max_ngram_size - 1
         if batch.forward_mode.is_prebuilt():
             # PD decode runs no EXTEND for this request, so the row its first

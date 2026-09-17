@@ -1,7 +1,6 @@
 """Engram: gated n-gram hash memory added to the hc residual stream.
 
-Predecessors come from the live batch and per-request history of the n - 1
-previous tokens. The token map, hash multipliers and prime layout must match
+The token map, hash multipliers and prime layout must match
 sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 """
 
@@ -60,8 +59,7 @@ _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
-    """The Triton kernels serve CUDA tensors on CUDA builds; ROCm and CPU take the
-    torch paths."""
+    """True where the Triton kernels apply; ROCm and CPU take the torch paths."""
     return t.is_cuda and is_cuda()
 
 
@@ -202,8 +200,8 @@ def compute_engram_hash_ids(
     [T, n_engram_layers, (n - 1) * n_heads] row ids into each layer's table."""
     compressed = torch.where(blocked, pad_id, token_map[tokens])
     products = compressed.unsqueeze(1) * multipliers
-    # XOR the multiplied ids one look-back at a time: after step i the running value
-    # is the (i + 1)-gram hash, bucketed by that n-gram size's primes.
+    # After step i the running xor is the (i + 1)-gram hash, bucketed by that
+    # n-gram size's primes.
     rolling, hashes = products[..., 0], []
     for i in range(1, tokens.shape[-1]):
         rolling = torch.bitwise_xor(rolling, products[..., i])
@@ -245,11 +243,7 @@ class EngramHasher(nn.Module):
         self.pad_row = 0
 
     def init_history(self, num_req_slots: int, device) -> None:
-        """Allocate oldest-first history with a spare row for graph padding.
-
-        Extend reads scheduler-provided predecessors after prefix hits or
-        retraction. Decode commits in forward; verify commits after acceptance.
-        """
+        """Allocate oldest-first history with a spare row for graph padding."""
         self.history = torch.zeros(
             num_req_slots + 1,
             self.max_ngram_size - 1,
@@ -296,9 +290,8 @@ class EngramHasher(nn.Module):
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
-        # Which request each token belongs to and where its run starts; tokens at or
-        # past num_real are graph padding. History rows come from self.history via
-        # req_slots unless the scheduler supplied this extend's predecessors.
+        # Tokens at or past num_real are graph padding. History comes from
+        # self.history via req_slots unless the scheduler supplied this extend's rows.
         num_real, block, row, starts = num_tokens, 1, None, None
         history, hist_via_slots = self.history, True
         if mode.is_decode():
@@ -518,11 +511,7 @@ _page_cache_dropped = False
 
 
 def drop_checkpoint_page_cache() -> tuple[int, int]:
-    """Drop checkpoint page cache with posix_fadvise(DONTNEED); return (files, bytes).
-
-    Cached checkpoint pages can prevent 512 MiB huge-page allocation,
-    so drop them before pre-faulting per-rank host tables.
-    """
+    """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
     try:
         model_path = get_model().model_path
     except (ValueError, AttributeError):
@@ -558,18 +547,10 @@ def _drop_page_cache_once(reason: str) -> None:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table.
+    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
-
-    Layouts:
-      shared   one memfd holding every row, mapped by all ranks of the group;
-               rank 0 creates it, the others open it through /proc/<pid>/fd.
-               No all-reduce. Huge pages need transparent_hugepage/shmem_enabled.
-      per_rank one anonymous mapping per rank holding only its own rows, so the
-               lookup keeps the sharded all-reduce. Huge pages come from
-               transparent_hugepage/enabled (madvise or always).
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
@@ -602,9 +583,8 @@ class _HostTable:
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
-            # Fault the shard in now, on a host whose page cache has just been
-            # emptied: cached checkpoint pages left by a previous server, or by
-            # the loader itself, make the 512 MiB huge-page faults fall back.
+            # Cached checkpoint pages, left by a previous server or by the loader,
+            # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
@@ -633,10 +613,8 @@ class _HostTable:
             ) from e
 
     def _collapse(self, tries: int = 3) -> None:
-        """madvise(MADV_COLLAPSE): synchronously fold whatever is still on base pages
-        into huge pages. Anonymous memory only; shmem obeys shmem_enabled and
-        refuses. EAGAIN means compaction ran out of time, so it is retried a few
-        times; anything else is logged and left."""
+        """Synchronously fold whatever is still on base pages into huge pages.
+        Anonymous memory only; shmem obeys shmem_enabled and refuses."""
         MADV_COLLAPSE = 25  # Linux >= 6.1; not in Python's mmap module
         libc = ctypes.CDLL(None, use_errno=True)
         libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
@@ -691,12 +669,10 @@ class _HostTable:
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Default: rows sharded over the TP group in device memory; each rank gathers
-    the rows it owns, zeroes the rest and the all-reduce reassembles the lookup.
-    With SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE the table lives in host memory and
-    the GPU gathers rows over the CPU link -- either one shared copy with no
-    all-reduce, or one shard per rank (see _HostTable). Loading is
-    sharded in every layout: a rank writes only its own row range.
+    Rows are sharded over the TP group in device memory; with
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
+    one shared copy or one shard per rank (see _HostTable). Loading is sharded
+    in every layout: a rank writes only its own row range.
     """
 
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
@@ -755,8 +731,7 @@ class EngramEmbedding(nn.Module):
             self.host_table.dirty = True
 
     def finish_load(self, label: str):
-        """Barrier (shared layout) once every rank has written its rows; log how
-        the table ended up backed."""
+        """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
@@ -837,11 +812,7 @@ class EngramEmbedding(nn.Module):
     def _dp_sharded_lookup(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
     ) -> torch.Tensor:
-        """Gather DP ranks' indices before looking up TP-sharded rows.
-
-        Every rank joins, including idle ranks with zero rows; the reduced result
-        is sliced back to each rank's local tokens.
-        """
+        """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
         rows = get_global_dp_buffer_len()
         ids_global = torch.empty(
@@ -857,8 +828,6 @@ class EngramEmbedding(nn.Module):
             dtype=values.dtype,
             device=values.device,
         )
-        # MAX_LEN or gatherv-sized slices use reduce-scatter;
-        # otherwise scatter the summed buffer to the DP ranks.
         padding = forward_batch.dp_padding_mode
         if (
             padding is not None
@@ -881,10 +850,7 @@ def engram_gate(
     clamp_value: float,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy.
-
-    The fused kernel serves every token count on CUDA; the torch path below is the
-    non-CUDA fallback and materializes fp32 copies of x, key and value."""
+    followed by the shared value. Adds the gated value to every copy."""
     if (
         _cuda_kernels(x)
         and x.ndim == 3

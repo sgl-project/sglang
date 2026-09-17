@@ -1473,11 +1473,10 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
-    # How the host table is laid out: "shared" is one buffer for the whole TP
-    # group, mapped by every rank, with no lookup all-reduce (the ranks must share
-    # a PID namespace); "per_rank" is one anonymous mapping per rank holding only
-    # its rows, gathered with the all-reduce, and the only layout that gets huge
-    # pages without shmem THP.
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
