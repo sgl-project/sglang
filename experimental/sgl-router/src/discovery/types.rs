@@ -39,7 +39,9 @@ pub enum WorkerMode {
 ///
 /// Backends emit [`DiscoveryEvent::Added`] carrying a `WorkerSpec` when a
 /// new worker becomes available, and [`DiscoveryEvent::Removed`] when it
-/// leaves.
+/// leaves. A worker that is present but temporarily unable to serve is
+/// reported with [`DiscoveryEvent::ReadyChanged`] instead, which preserves
+/// its KV-tree state.
 ///
 /// `bootstrap_port` is the SGLang disagg bootstrap server port for
 /// prefill workers (set via `--disaggregation-bootstrap-port` at worker
@@ -67,6 +69,7 @@ pub struct WorkerSpec {
 /// {"event":"added","id":"w1","url":"http://…","mode":"plain","model_ids":["m"]}
 /// {"event":"removed","id":"w1"}
 /// {"event":"mode_changed","id":"w1","mode":"decode"}
+/// {"event":"ready_changed","id":"w1","ready":false}
 /// ```
 ///
 /// The `Added` variant wraps the full [`WorkerSpec`]; the others carry only
@@ -82,6 +85,17 @@ pub enum DiscoveryEvent {
     ModeChanged {
         id: WorkerId,
         mode: WorkerMode,
+    },
+    /// The worker's ability to serve changed, but the worker still exists.
+    ///
+    /// `ready = false` must take the worker out of selection WITHOUT
+    /// dropping it from the registry or clearing its KV-event tree state:
+    /// a readiness flap is measured in seconds, and rebuilding an engine's
+    /// radix view costs minutes. `Removed` remains the only event that
+    /// destroys state, and is reserved for a worker that is genuinely gone.
+    ReadyChanged {
+        id: WorkerId,
+        ready: bool,
     },
 }
 
@@ -156,5 +170,19 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(e, d);
+    }
+
+    /// The wire shape documented on `DiscoveryEvent` is a contract; pin it
+    /// literally so a rename of the variant or its fields is a test failure
+    /// rather than a silently reshaped event.
+    #[test]
+    fn ready_changed_wire_shape() {
+        let e = DiscoveryEvent::ReadyChanged {
+            id: WorkerId("w1".into()),
+            ready: false,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(s, r#"{"event":"ready_changed","id":"w1","ready":false}"#);
+        assert_eq!(serde_json::from_str::<DiscoveryEvent>(&s).unwrap(), e);
     }
 }

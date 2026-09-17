@@ -111,10 +111,11 @@ impl PdPoolResolver {
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
         let all = self.workers.healthy_workers_for(model);
         if all.is_empty() {
-            // No healthy workers — distinguish "model never registered"
-            // (true 404-ish, operator misconfiguration) from "PD model
-            // with all breakers currently open" (transient health
-            // issue, deserves the per-pool code).
+            // No selectable workers — distinguish "model never registered"
+            // (true 404-ish, operator misconfiguration) from "PD model whose
+            // workers are all currently unselectable" (every breaker open, or
+            // every worker reported not-ready by discovery — a transient health
+            // issue that deserves the per-pool code).
             let registered = self.workers.workers_for(model);
             let pd_intent = registered
                 .iter()
@@ -241,13 +242,16 @@ pub fn select_decode_with_affinity(
     }
     let prefill_host = host_of(prefill_url);
 
-    // Build the closed-breaker subset once; both the affinity branch
-    // and the fallback branch read from it. `would_allow` (non-mutating)
-    // is the right filter — `allow()` would claim a half-open probe for
-    // every candidate we look at, including ones we never dispatch to.
+    // Build the selectable subset once; both the affinity branch and the
+    // fallback branch read from it. Two independent gates: `serving` is what
+    // discovery reports, the breaker is the router's own verdict. `would_allow`
+    // (non-mutating) is the right breaker check — `allow()` would claim a
+    // half-open probe for every candidate we look at, including ones we never
+    // dispatch to. The `serving` term is defence in depth: callers already pass
+    // a pool built from `healthy_workers_for`.
     let healthy: Vec<&Arc<Worker>> = candidates
         .iter()
-        .filter(|w| w.breaker.would_allow())
+        .filter(|w| w.serving() && w.breaker.would_allow())
         .collect();
 
     // Compute the median load over the closed-breaker subset.  Empty
@@ -523,6 +527,51 @@ mod tests {
             chosen.url, "http://host_a:30001",
             "same-host decode peer must win over remote peer",
         );
+    }
+
+    /// Affinity peer is discovery-NOT-READY → fall back to the remote peer.
+    ///
+    /// End-to-end pin for the PD path, through BOTH readiness gates:
+    /// `PdPoolResolver::resolve` builds every pool from `healthy_workers_for`,
+    /// and `select_decode_with_affinity` re-filters its own `healthy` subset.
+    /// The second is redundant today — every caller passes an already-filtered
+    /// pool — so deleting either term alone leaves this assertion passing; it
+    /// pins the composed path, not either filter individually. The registry's
+    /// own `healthy_subset_filters_via_serving` pins the choke point directly.
+    #[test]
+    fn decoder_falls_back_when_affinity_peer_is_not_serving() {
+        let r = registry(&[
+            spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m"),
+            spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+            spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(r);
+
+        // d1 is the same-host peer and its breaker is untouched: the ONLY
+        // reason to skip it is the readiness flag.
+        let d1 = resolver
+            .workers
+            .all()
+            .into_iter()
+            .find(|w| w.url == "http://host_a:30001")
+            .expect("d1 registered");
+        assert!(d1.breaker.would_allow(), "d1's breaker stays closed");
+        d1.set_serving(false);
+
+        let chosen = resolver
+            .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
+            .unwrap();
+        assert_eq!(
+            chosen.url, "http://host_b:30001",
+            "a not-ready same-host peer must not win affinity",
+        );
+
+        // And it comes back when readiness does, with no re-registration.
+        d1.set_serving(true);
+        let chosen = resolver
+            .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
+            .unwrap();
+        assert_eq!(chosen.url, "http://host_a:30001");
     }
 
     /// Affinity peer's breaker is open → fall back to the remote

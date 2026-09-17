@@ -123,8 +123,29 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb, protocol));
+        let w = Worker::with_cb_config(spec, cb, protocol);
         let id = w.id.clone();
+        // An upsert must not resurrect a worker discovery reported NOT-READY.
+        // `Worker::with_cb_config` defaults `serving` to true, and the k8s
+        // backend emits `ReadyChanged` only on a TRANSITION — `prev_union`
+        // already holds `ready: false`, so nothing would ever correct a reset
+        // flag. The callers that re-register an existing id are the discovery
+        // `Added` arm and `manager::reconcile_unresolved_workers` (for a worker
+        // whose `/server_info` has not answered yet) — and the latter revisits
+        // exactly the pods that are also not ready, so the flag has to survive
+        // the upsert. `ModeChanged` does not re-register; it mutates in place.
+        //
+        // Safe to read unlocked only because every `add_with_cb` for an id and
+        // every `set_serving` for it are serialized through the manager loop's
+        // `pending` map. A future caller outside that discipline would lose
+        // readiness transitions silently.
+        // Scoped so the `Ref` is dropped before `remove_locked` touches the
+        // same DashMap shard.
+        let prev_serving = self.by_id.get(&id).map(|p| p.serving());
+        if let Some(serving) = prev_serving {
+            w.set_serving(serving);
+        }
+        let w = Arc::new(w);
         self.remove_locked(&id);
         for m in &w.model_ids {
             self.by_model
@@ -169,6 +190,11 @@ impl WorkerRegistry {
     }
 
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
+        // Two independent gates, and both must pass. `serving` is what the
+        // deployment reports through discovery; the breaker is the router's
+        // own observation of failures. A worker can be breaker-healthy while
+        // its engine reports not-ready, and vice versa.
+        //
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,
         // starving the worker that the policy actually picks. The probe
@@ -176,7 +202,7 @@ impl WorkerRegistry {
         // [`crate::proxy`].
         self.workers_for(model)
             .into_iter()
-            .filter(|w| w.breaker.would_allow())
+            .filter(|w| w.serving() && w.breaker.would_allow())
             .collect()
     }
 
@@ -305,6 +331,91 @@ mod tests {
     /// `healthy_workers_for` ignored the breaker entirely and was a
     /// thin alias for `workers_for`. Tripping one breaker and asserting
     /// the surviving set excludes it is the actual contract.
+    /// `serving` and the breaker are independent gates and BOTH must pass.
+    /// A breaker-healthy worker that discovery reports not-ready is not
+    /// selectable.
+    #[test]
+    fn healthy_subset_filters_via_serving() {
+        let r = WorkerRegistry::default();
+        let _ = r.add_with_cb(
+            spec("ok", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        let _ = r.add_with_cb(
+            spec("unready", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        let model = ModelId("m".into());
+        assert_eq!(r.healthy_workers_for(&model).len(), 2);
+
+        let w = r.get(&WorkerId("unready".into())).expect("worker present");
+        assert!(
+            w.breaker.would_allow(),
+            "breaker must be closed: this test is \
+            about readiness alone"
+        );
+        w.set_serving(false);
+
+        let healthy = r.healthy_workers_for(&model);
+        assert_eq!(healthy.len(), 1, "the not-ready worker must drop out");
+        assert_eq!(healthy[0].id.0, "ok");
+        // Still registered — only Removed destroys state.
+        assert_eq!(r.workers_for(&model).len(), 2);
+    }
+
+    /// An upsert must not resurrect a worker discovery reported not-ready.
+    ///
+    /// `Worker::with_cb_config` defaults `serving` to true and the k8s backend
+    /// emits `ReadyChanged` only on a TRANSITION, so a reset flag would never
+    /// be corrected — and `reconcile_unresolved_workers` re-registers exactly
+    /// the pods that are also not ready.
+    #[test]
+    fn re_add_preserves_not_serving() {
+        let r = WorkerRegistry::default();
+        let _ = r.add_with_cb(
+            spec("w", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        r.get(&WorkerId("w".into())).unwrap().set_serving(false);
+
+        // Re-register the same id, as the reconcile pass does.
+        let _ = r.add_with_cb(
+            spec("w", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        assert!(
+            !r.get(&WorkerId("w".into())).unwrap().serving(),
+            "the upsert must carry the previous entry's serving flag forward",
+        );
+        assert!(
+            r.healthy_workers_for(&ModelId("m".into())).is_empty(),
+            "and the worker must stay out of the pool",
+        );
+    }
+
+    /// The converse: a worker that was serving stays serving across an upsert,
+    /// so the carry-forward cannot be implemented as an unconditional `false`.
+    #[test]
+    fn re_add_preserves_serving() {
+        let r = WorkerRegistry::default();
+        let _ = r.add_with_cb(
+            spec("w", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        let _ = r.add_with_cb(
+            spec("w", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::default(),
+        );
+        assert!(r.get(&WorkerId("w".into())).unwrap().serving());
+        assert_eq!(r.healthy_workers_for(&ModelId("m".into())).len(), 1);
+    }
+
     #[test]
     fn healthy_subset_filters_via_breaker() {
         use crate::health::circuit_breaker::CircuitBreakerConfig;

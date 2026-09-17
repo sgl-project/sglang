@@ -453,8 +453,13 @@ impl KvEventIndex {
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
-/// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=1 (after sending END_SEQ) is not filtered.
+/// with no seq.
+///
+/// A publisher that restarts re-numbers from 0, so both the `PublisherReset`
+/// sentinel and a batch arriving at a publisher-start value beneath an
+/// existing cursor run [`reset_rank_for_new_publisher`], clearing the rank's
+/// cursor AND its tree — the new process came up with an empty KV cache, so
+/// nodes still held for it would serve hits it cannot honour.
 async fn pump_loop(
     tree: Arc<HashTree>,
     engine_load: Arc<EngineLoadTable>,
@@ -500,14 +505,64 @@ async fn pump_loop(
                 engine_load.set(&worker.url, worker.dp_rank, load, Instant::now());
             }
             WorkerEvent::PublisherReset { worker } => {
-                if cursors.lock().remove(&worker).is_some() {
-                    info!(
-                        worker = ?worker,
-                        "kv-events pump: publisher reset; cursor cleared",
-                    );
-                }
+                // The END_SEQ sentinel: a GRACEFUL publisher shutdown announcing
+                // itself. Discovery only notices restarts that change its entry
+                // (pod replacement, Removed->Added); a silent in-place restart
+                // (same pod UID/IP, or static worker-urls) emits nothing. A
+                // readiness toggle is not in that list either: since
+                // `DiscoveryEvent::ReadyChanged` exists, a not-ready endpoint
+                // keeps its registry entry, its tree and its cursor by design.
+                // The ungraceful half -- a crash that sends no sentinel -- is
+                // caught by the seq-regression check in the `Batch` arm.
+                reset_rank_for_new_publisher(&tree, &cursors, &worker, "end_seq_sentinel");
             }
             WorkerEvent::Batch { worker, seq, batch } => {
+                // A publisher that comes back numbering from the start restarted
+                // without announcing it: a SIGKILL, OOM or segfault never sends
+                // the END_SEQ sentinel the arm above handles.
+                //
+                // Without this the rank is lost silently and permanently: every
+                // batch at `seq <= cursor` is skipped at debug level below, so a
+                // crash-restarted engine publishes into a router that drops
+                // every batch while still serving cache hits from the dead
+                // process's tree. That used to be survivable by accident --
+                // readiness flapped, the endpoint left the k8s union, and
+                // `Removed` cleared tree and cursor -- but `ReadyChanged` now
+                // keeps the entry on purpose, so the recovery must be explicit.
+                //
+                // `ZmqEventPublisher` seeds `itertools.count()` (python/sglang/
+                // srt/disaggregation/kv_events.py), so a fresh process's FIRST
+                // batch is seq 0, not 1. Seeing seq 0 while a cursor already
+                // exists is therefore unambiguous: this process has published
+                // before, so a batch numbered 0 can only come from a new one.
+                // The duplicate-delivery reading is harmless on the same
+                // evidence -- at `p == 0` the tree holds exactly batch 0, so
+                // clearing and re-applying it lands on the identical state.
+                //
+                // seq 1 is the weaker, ambiguous fallback, for a restart whose
+                // batch 0 was dropped at the ZMQ high-water mark. It needs
+                // `p > 1`: at `p == 1` a seq of 1 is equally a redelivery of the
+                // batch we already hold, and at `p == 0` it is the ordinary
+                // 0 -> 1 progression.
+                //
+                // Deliberately NOT keyed on any backwards step. "Lower than the
+                // cursor" is the pre-existing out-of-order case
+                // (`pump_filters_out_of_order_seq` pins a 5 -> 3 step), and
+                // treating that as a restart would turn a harmless skip into a
+                // tree wipe.
+                let renumbered = cursors
+                    .lock()
+                    .get(&worker)
+                    .is_some_and(|&p| seq == 0 || (seq == 1 && p > 1));
+                if renumbered {
+                    warn!(
+                        worker = ?worker,
+                        seq,
+                        "kv-events pump: sequence restarted at a publisher-start \
+                         value; treating as an unannounced publisher restart",
+                    );
+                    reset_rank_for_new_publisher(&tree, &cursors, &worker, "seq_regression");
+                }
                 let prev = cursors.lock().get(&worker).copied();
                 if let Some(p) = prev {
                     if seq <= p {
@@ -580,6 +635,29 @@ async fn pump_loop(
             }
         }
     }
+}
+
+/// Recover one rank whose publisher started its sequence over.
+///
+/// Shared by the explicit `PublisherReset` sentinel and by the seq-regression
+/// detection in the `Batch` arm, because the aftermath is identical and only
+/// the evidence differs: the sentinel is a graceful shutdown announcing itself,
+/// a regression is a crash-restart that announced nothing.
+///
+/// Clears the rank's TREE as well as its cursor. A process that renumbered from
+/// 1 came up with an empty KV cache, so every node still held for it is a
+/// phantom that would serve cache hits the engine cannot honour -- the rank has
+/// to run cold rather than run wrong.
+fn reset_rank_for_new_publisher(
+    tree: &Arc<HashTree>,
+    cursors: &Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+    worker: &KvWorkerId,
+    cause: &'static str,
+) {
+    if cursors.lock().remove(worker).is_some() {
+        info!(worker = ?worker, cause, "kv-events pump: publisher reset; cursor cleared");
+    }
+    tree.clear_worker(worker);
 }
 
 #[cfg(test)]
@@ -783,10 +861,15 @@ mod tests {
         })
         .await
         .unwrap();
-        // Out of order: filtered, must not be tallied.
+        // Out of order: filtered, must not be tallied. Re-sending seq 2 (a
+        // duplicate) rather than seq 1: `seq == 1` beneath a cursor above 1 is
+        // now read as an unannounced publisher restart and resets the rank, so
+        // seq 1 would no longer exercise the `seq <= last_applied` filter this
+        // line is here for. The 5 -> 3 step in `pump_filters_out_of_order_seq`
+        // covers the non-duplicate shape.
         tx.send(WorkerEvent::Batch {
             worker: id.clone(),
-            seq: 1,
+            seq: 2,
             batch: batch(vec![stored(None, vec![99])]),
         })
         .await
@@ -855,6 +938,295 @@ mod tests {
         assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 12);
         // Load events must not pollute the cache tree.
         assert_eq!(tree.node_count(), 0);
+    }
+
+    /// A crash-restarted publisher renumbers from 0 without sending END_SEQ
+    /// (`ZmqEventPublisher` seeds `itertools.count()`). The rank must recover on
+    /// that very first batch: it applies rather than being filtered as stale,
+    /// and the dead process's blocks must not survive into it.
+    #[tokio::test]
+    async fn pump_seq_regression_is_treated_as_an_unannounced_restart() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+
+        // Pre-crash stream: cursor climbs, and block 11 is attributed to it.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![11],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        // The engine is SIGKILLed and comes back: no END_SEQ, numbering from 0.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![22],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert!(
+            tree.match_prefix(None, &[22]).workers().contains(&id),
+            "the restarted publisher's FIRST batch must apply, not be filtered \
+             as stale — it carries blocks nothing will re-announce",
+        );
+        assert!(
+            !tree.match_prefix(None, &[11]).workers().contains(&id),
+            "the dead process's blocks must not survive: it came back with an \
+             empty cache, so serving a hit for block 11 would be a phantom",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(0));
+    }
+
+    /// The restart's batch 0 can be dropped at the ZMQ high-water mark, so seq 1
+    /// beneath a cursor above 1 is the fallback signal. Without it the rank is
+    /// filtered forever.
+    #[tokio::test]
+    async fn pump_restart_is_caught_at_seq_one_when_batch_zero_is_lost() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![11],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        // Restart; seq 0 never arrives.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![22],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert!(tree.match_prefix(None, &[22]).workers().contains(&id));
+        assert!(
+            !tree.match_prefix(None, &[11]).workers().contains(&id),
+            "the dead process's blocks must not survive",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(1));
+    }
+
+    /// The `p > 1` guard on the seq-1 fallback, pinned from both sides.
+    ///
+    /// At `p == 1` a seq of 1 is a redelivery of the batch already applied, and
+    /// at `p == 0` it is the ordinary 0 -> 1 progression. Neither may reset —
+    /// dropping the guard makes an ordinary second batch wipe a healthy rank.
+    #[tokio::test]
+    async fn pump_seq_one_does_not_reset_at_low_cursors() {
+        // p == 0: the normal 0 -> 1 progression must simply apply.
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![11],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![22],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+        assert!(
+            tree.match_prefix(None, &[11]).workers().contains(&id),
+            "the 0 -> 1 progression must not be read as a restart",
+        );
+        assert!(tree.match_prefix(None, &[22]).workers().contains(&id));
+        assert_eq!(cursors.lock().get(&id).copied(), Some(1));
+    }
+
+    /// seq 0 beneath an existing cursor of 0 is a redelivery of the first batch.
+    /// Resetting is still correct there — the tree holds exactly that batch, so
+    /// clear + re-apply lands on the identical state rather than losing blocks.
+    #[tokio::test]
+    async fn pump_seq_zero_redelivery_is_state_preserving() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+        for _ in 0..2 {
+            tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq: 0,
+                batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                    parent_block_hash: None,
+                    block_hashes: vec![11],
+                    token_ids: vec![],
+                    block_size: 64,
+                    lora_id: None,
+                    medium: None,
+                })]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        pump.await.unwrap();
+        assert!(
+            tree.match_prefix(None, &[11]).workers().contains(&id),
+            "a redelivered batch 0 must leave the rank holding batch 0",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(0));
+    }
+
+    /// The END_SEQ sentinel path clears the TREE, not just the cursor. Reverting
+    /// it to a cursor-only reset leaves the dead process's blocks behind.
+    #[tokio::test]
+    async fn pump_publisher_reset_sentinel_clears_the_tree() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![11],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerEvent::PublisherReset { worker: id.clone() })
+            .await
+            .unwrap();
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![22],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert!(tree.match_prefix(None, &[22]).workers().contains(&id));
+        assert!(
+            !tree.match_prefix(None, &[11]).workers().contains(&id),
+            "END_SEQ means the publisher restarted with an empty cache; its old \
+             blocks are phantoms",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(0));
+    }
+
+    /// A DUPLICATE is not a restart. `seq == cursor` stays an out-of-order skip,
+    /// so a redelivered batch must not be read as evidence of a new publisher
+    /// and wipe a healthy worker's tree.
+    #[tokio::test]
+    async fn pump_duplicate_seq_is_not_treated_as_a_restart() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 5,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![11],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 5,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![33],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert!(
+            tree.match_prefix(None, &[11]).workers().contains(&id),
+            "a duplicate must not clear the tree",
+        );
+        assert!(
+            !tree.match_prefix(None, &[33]).workers().contains(&id),
+            "a duplicate must still be skipped",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(5));
     }
 
     /// Out-of-order seq is filtered: a batch with seq <= last_applied is
