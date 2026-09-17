@@ -5,9 +5,14 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from unified_allocator_fixtures import (
+    build_swa_pool,
+    build_tri_pool,
+    reset_context,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -55,11 +60,6 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
     def test_multiple_flushes_preserve_event_sources(self):
         # Events model reader completion only; these CPU checks make no CUDA
         # stream-ordering claim. The allocator selects the actual move geometry.
-        from test_unified_joint_allocation_eviction import (
-            TestUnifiedJointAllocationEviction,
-        )
-        from test_unified_tri_joint_reclaim import TestTriJointReclaim
-
         for (layout, owner), page_size, mode in itertools.product(
             ((2, "full"), (3, "full"), (3, "mamba")),
             (1, 4, 16),
@@ -68,11 +68,10 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
             with self.subTest(
                 layout=layout, owner=owner, page_size=page_size, mode=mode
             ):
-                fixture = TestTriJointReclaim()
-                fixture.setUp()
                 try:
+                    setup_allocator_context()
                     if layout == 3:
-                        bundle, allocator, _ = fixture.build(
+                        bundle, allocator, _ = build_tri_pool(
                             lazy=True,
                             page_size=page_size,
                             temporal=(1, 4, 8),
@@ -81,8 +80,8 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         states = allocator.mamba_allocator.alloc(8)
                         self.assertIsNotNone(states)
                     else:
-                        allocator, _ = TestUnifiedJointAllocationEviction.build_cache(
-                            fixture, occupancy=0, lazy=True, page_size=page_size
+                        allocator, _ = build_swa_pool(
+                            occupancy=0, lazy=True, page_size=page_size
                         )
                         bundle = SimpleNamespace(
                             token_to_kv_pool=allocator.get_kvcache()
@@ -212,7 +211,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                             )
                         assert_payload()
                 finally:
-                    fixture.tearDown()
+                    reset_context()
 
 
 if __name__ == "__main__":
