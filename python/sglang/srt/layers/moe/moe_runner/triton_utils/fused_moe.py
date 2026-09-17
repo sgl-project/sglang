@@ -699,9 +699,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert (
-                _is_cuda or _is_hip or _is_xpu
-            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            assert _is_cuda or _is_hip or _is_xpu, (
+                "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            )
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -709,9 +709,9 @@ def _fused_moe_kernel_sequence(
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
             else:
-                assert (
-                    _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                assert _is_cuda or _is_xpu, (
+                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
@@ -997,9 +997,9 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert (
-            hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), "Hidden size mismatch"
+        assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
+            "Hidden size mismatch"
+        )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1151,6 +1151,14 @@ def fused_moe(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
+            # These were previously dropped, which silently computed a plain
+            # silu*up for GPT-OSS-style experts instead of the clamped
+            # gate*sigmoid(gate*alpha)*(up+1) the config asks for.
+            activation=moe_runner_config.activation,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
 
     return fused_experts(

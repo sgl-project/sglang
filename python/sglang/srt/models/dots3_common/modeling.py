@@ -112,6 +112,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
+from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.runtime_context import (
     get_device,
@@ -126,7 +127,6 @@ from sglang.srt.utils import (
     ceil_align,
     ceil_div,
     get_bool_env_var,
-    get_device_sm,
     is_cuda,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
@@ -135,16 +135,15 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
-_device_sm = get_device_sm()
 
 # Import-time CUDA kernels would block processor imports on CPU CI.
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 else:
     merge_state_v2 = None
-    dsv3_router_gemm = None
+    tiny_gemm_bf16 = None
 
 
 def _require_cuda() -> None:
@@ -259,17 +258,18 @@ class Dots3MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=config.n_routed_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.weight.dtype,
+        )
 
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
-        if (
-            hidden_states.shape[0] <= 16
-            and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
-            and _device_sm >= 90
-        ):
-            # router gemm output float32
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+            logits = tiny_gemm_bf16(
+                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
+            )
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -735,14 +735,16 @@ class Dots3AttentionMLA(nn.Module):
         self.num_heads = attn_config.num_attention_heads
         assert self.num_heads % attn_tp_size == 0
         self.num_local_heads = self.num_heads // attn_tp_size
-        assert (
-            attn_config.num_attention_heads == attn_config.num_key_value_heads
-        ), "Dots3 Only supports equal number of query and key value heads."
+        assert attn_config.num_attention_heads == attn_config.num_key_value_heads, (
+            "Dots3 Only supports equal number of query and key value heads."
+        )
         self.attention_gate_type = attn_config.attention_gate_type
         assert self.attention_gate_type in {
             "headwise",
             "elementwise",
-        }, f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
+        }, (
+            f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
+        )
         self.g_proj_local_dim = self.num_local_heads * (
             1 if self.attention_gate_type == "headwise" else self.v_head_dim
         )
@@ -832,9 +834,9 @@ class Dots3AttentionMLA(nn.Module):
 
         # Optional NSA (Native Sparse Attention) indexer.
         if self.use_nsa:
-            assert (
-                self.q_lora_rank is not None
-            ), "Dots3 NSA requires q_lora_rank to be set in the config."
+            assert self.q_lora_rank is not None, (
+                "Dots3 NSA requires q_lora_rank to be set in the config."
+            )
             self.indexer = Indexer(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
@@ -1073,9 +1075,9 @@ class Dots3AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1853,9 +1855,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # for quark model load
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         self.fuse_qkv_a_g_proj = True
-        assert (
-            config.q_lora_rank is not None
-        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        assert config.q_lora_rank is not None, (
+            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        )
         if self.fuse_qkv_a_g_proj:
             self.packed_modules_mapping["fused_qkv_a_g_proj_with_mqa"] = [
                 "q_a_proj",
@@ -2039,12 +2041,16 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 assert (
                     self.quant_config is not None
                     and self.quant_config.weight_block_size is not None
-                ), "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
+                ), (
+                    "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
+                )
                 weight_block_size = tuple(self.quant_config.weight_block_size)
                 assert weight_block_size == (
                     128,
                     128,
-                ), f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
+                ), (
+                    f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
+                )
                 block_scale = self_attn.kv_b_proj.weight_scale_inv
 
                 if not (
@@ -2062,9 +2068,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         torch.bfloat16,
                     )
             else:
-                assert (
-                    w.dtype == torch.bfloat16
-                ), f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
+                assert w.dtype == torch.bfloat16, (
+                    f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
+                )
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -2207,9 +2213,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         fuse_qkv_a_g_proj = True
-        assert (
-            self.config.q_lora_rank is not None
-        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        assert self.config.q_lora_rank is not None, (
+            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        )
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -2217,9 +2223,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor, cat_dim: int, is_scale: bool
         ):
-            assert (
-                weight.ndim > cat_dim
-            ), f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
+            assert weight.ndim > cat_dim, (
+                f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
+            )
             dim_size = weight.shape[cat_dim]
             if not is_scale:
                 assert dim_size % attn_tp_size == 0, (

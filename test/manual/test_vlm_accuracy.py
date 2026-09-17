@@ -212,8 +212,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 # per image
                 if len(pixel_b) != len(tgt_b):
                     raise ValueError(
-                        "Inconsistent N lengths, found: "
-                        f"{len(pixel_b)} vs {len(tgt_b)}"
+                        f"Inconsistent N lengths, found: {len(pixel_b)} vs {len(tgt_b)}"
                     )
                 for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                     pixel_values_flat += [pixel_n]
