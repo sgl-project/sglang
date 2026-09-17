@@ -951,7 +951,8 @@
                   "docs/advanced_features/hicache",
                   "docs/advanced_features/hicache_best_practices",
                   "docs/advanced_features/hicache_design",
-                  "docs/advanced_features/hicache_storage_runtime_attach_detach"
+                  "docs/advanced_features/hicache_storage_runtime_attach_detach",
+                  "docs/advanced_features/kvcr_direct_linker"
                 ]
               },
               "docs/advanced_features/sglang_simulator",

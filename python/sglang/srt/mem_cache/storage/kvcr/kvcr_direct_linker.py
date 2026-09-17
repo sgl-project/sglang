@@ -409,10 +409,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self.stats: dict[str, float] = collections.defaultdict(float)
         self._next_stats_log = time.monotonic() + self.config.stats_log_interval_s
 
-        self._kvcr = self._build_kvcr()
-        self._adapter = self._start_adapter(self._kvcr)
         if PoolName.MAMBA in self.pools:
             raise ValueError("KVCR linker does not support Mamba pools.")
+        self._kvcr = self._build_kvcr()
+        self._adapter = self._start_adapter(self._kvcr)
         self._log_startup()
 
     # ------------------------------------------------------------------
@@ -664,7 +664,30 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return page_descriptors(self.layouts[pool], row, self.agent_name, MemDescriptor)
 
     def _rows(self, pool: str, indices: torch.Tensor) -> list[int]:
-        return self.pools[PoolName(pool)].prepare_locations(_cpu_indices(indices))
+        return self.pools[PoolName(pool)].prepare_locations(
+            self._snapshot_indices(indices)
+        )
+
+    def _snapshot_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """CPU copy of device indices, taken on the owner thread's own stream.
+
+        A copy on this thread's default stream would wait for every queued
+        compute kernel. The producer event already guarantees the indices are
+        final, so a private stream only waits for its own copy.
+        """
+        if indices.device.type != "cuda":
+            return _cpu_indices(indices)
+        if self._index_stream is None:
+            self._index_stream = device_module.Stream(device=indices.device)
+        source = indices.detach().flatten()
+        pinned = torch.empty(
+            source.numel(), dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        with device_module.stream(self._index_stream):
+            source.record_stream(self._index_stream)
+            pinned.copy_(source, non_blocking=True)
+        self._index_stream.synchronize()
+        return pinned
 
     # ------------------------------------------------------------------
     # Preparation (scheduler thread -> owner thread)
@@ -1076,7 +1099,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._release_handles(leftover)
             self._discard_hint(prep)
             self._pending_loads[rid] = pools
-            self.stats["admitted_pages"] += len(pools[0].page_hashes) if pools else 0
+            self.stats["admitted_pages"] += sum(
+                len(pool.page_hashes) for pool in pools if pool.pool == str(PoolName.KV)
+            )
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -1340,7 +1365,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             snapshot["offload_inflight_bytes"] = self._inflight_offload_bytes
             snapshot["abandoned_bytes"] = self._abandoned_bytes
         snapshot["kvcr_pending_ops"] = self._adapter.pending_ops
-        snapshot["kvcr_late_ops"] = self._adapter.late_ops
         snapshot["kvcr_inflight_ops_hwm"] = self._adapter.inflight_high_water
         snapshot["dram_bytes"] = self.plan.total_bytes
         return snapshot
@@ -1401,7 +1425,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """
         if self._closed:
             return
-        drained = self._drain(self.config.abandon_timeout_ms / 1000.0)
+        # Bounded by the core's own operation deadline: work still pending
+        # afterwards is quarantined below, never assumed finished.
+        drained = self._drain(self.config.operation_timeout_ms / 1000.0)
         self._release_everything()
         self.layer_done_counter.reset()
         self._adapter.stop(timeout_s=5.0)
@@ -1441,7 +1467,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def close(self) -> None:
         if self._closed:
             return
-        drained = self._drain(self.config.abandon_timeout_ms / 1000.0)
+        drained = self._drain(self.config.operation_timeout_ms / 1000.0)
         self._release_everything()
         with self._lock:
             self._closed = True

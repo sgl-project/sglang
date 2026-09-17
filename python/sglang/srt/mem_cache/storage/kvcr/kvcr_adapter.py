@@ -43,7 +43,6 @@ class KVCRAdapter:
         self._poll_interval_s = poll_interval_s
         self._commands: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._completions: dict[int, Completion] = {}
-        self._late_completions: dict[int, Completion] = {}
         # Work re-checked every loop iteration (device events, deadlines).
         self._tickers: list[Callable[[float], bool]] = []
         self._thread = threading.Thread(
@@ -90,31 +89,6 @@ class KVCRAdapter:
         self.raise_if_failed()
         self._commands.put(command)
 
-    def call(self, function: Callable[[Any], Any], timeout_s: float) -> Any:
-        """Run ``function(kvcr)`` on the owner thread and wait for its result.
-
-        For control-plane setup and teardown only; the scheduler never blocks
-        on the owner thread during serving.
-        """
-        done = threading.Event()
-        box: list[Any] = []
-
-        def run(adapter: KVCRAdapter) -> None:
-            try:
-                box.append((True, function(adapter._kvcr)))
-            except BaseException as error:  # noqa: BLE001 - re-raised below
-                box.append((False, error))
-            finally:
-                done.set()
-
-        self.post(run)
-        if not done.wait(timeout=timeout_s):
-            raise TimeoutError("KVCR owner thread did not answer in time")
-        ok, value = box[0]
-        if not ok:
-            raise value
-        return value
-
     # ---- owner-thread helpers (only call from commands/tickers) ----
 
     @property
@@ -130,22 +104,14 @@ class KVCRAdapter:
                 self._inflight_high_water, self._pending_ops
             )
 
-    def demote(self, op_handle: int, completion: Completion) -> None:
-        """Keep draining an op nobody waits for, so late claims are released."""
-        if self._completions.pop(op_handle, None) is not None:
-            self._late_completions[op_handle] = completion
-
     def add_ticker(self, ticker: Callable[[float], bool]) -> None:
         """Register a per-iteration hook; it returns whether it did work."""
         self._tickers.append(ticker)
 
     @property
     def pending_ops(self) -> int:
+        """Tracked operations KVCR has not completed, including abandoned ones."""
         return self._pending_ops
-
-    @property
-    def late_ops(self) -> int:
-        return len(self._late_completions)
 
     @property
     def inflight_high_water(self) -> int:
@@ -207,15 +173,12 @@ class KVCRAdapter:
         for op_handle, entries in self._kvcr.poll_completed():
             worked = True
             completion = self._completions.pop(op_handle, None)
-            if completion is not None:
-                self._pending_ops -= 1
-            else:
-                completion = self._late_completions.pop(op_handle, None)
             if completion is None:
                 logger.warning(
                     "KVCR linker dropped completion for untracked op %s", op_handle
                 )
                 continue
+            self._pending_ops -= 1
             completion(entries)
         return worked
 

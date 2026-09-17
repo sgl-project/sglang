@@ -1,0 +1,119 @@
+---
+title: "KVCR Direct Linker"
+description: "Offload GPU KV pages into KVCR-owned DRAM over NIXL and reuse prefixes from peer workers, with no SGLang host pool."
+---
+
+The KVCR direct linker connects `UnifiedRadixCache` device pools straight to
+[KVCR](https://github.com/ai-dynamo/kvcr), the KV Cache Runner. Pages move
+between GPU memory and KVCR-owned DRAM through NIXL; SGLang allocates no host
+cache tier in this mode.
+
+```text
+Local offload:  SGLang GPU -> KVCR DRAM
+Local restore:  KVCR DRAM  -> SGLang GPU
+Peer restore:   source KVCR DRAM -> target KVCR DRAM -> target GPU
+```
+
+The peer path hydrates the target's own KVCR tier first, so residency is
+confirmed and claimed before a GPU cache hit is admitted. It includes the
+target-side DRAM hop; it is not a direct remote-to-GPU transfer.
+
+## Enable
+
+```bash
+python3 -m sglang.launch_server --model-path <model> \
+  --enable-unified-cache-external-linker \
+  --unified-cache-external-linker-backend kvcr \
+  --hicache-storage-backend-extra-config '{
+    "local_dram_bytes_per_worker": 68719476736,
+    "enable_remote_hint": true,
+    "control_port": 25000,
+    "control_advertise_host": "10.0.0.5"
+  }'
+```
+
+`--enable-hierarchical-cache` and `--hicache-storage-backend` are incompatible
+with linker mode. The extra-config flag keeps its HiCache name; it is the shared
+channel every direct linker backend reads.
+
+Requirements: the `kvcr` package with typed framework memory regions
+(`KVCRBackendConfigs.framework_regions`) and `nixl==1.3.2` with the UCX plugin,
+installed in the same environment. CUDA only.
+
+### Configuration
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `local_dram_bytes_per_worker` | required | KVCR DRAM for the whole worker; each local scheduler rank gets an equal share. Every rank logs its resolved per-pool allocation and unused tail at startup. |
+| `enable_remote_hint` | `false` | Bind a peer control channel and act on router hints. Requires `control_port` and `control_advertise_host`. |
+| `control_port` | `0` | Base port; rank `r` binds `control_port + r` (engine-global attention rank). |
+| `control_advertise_host` | none | Address peers dial. The bind host (`control_host`, default `0.0.0.0`) is not a substitute. |
+| `preparation_deadline_ms` | `2000` | How long a queued request waits for residency confirmation before admitting whatever prefix was confirmed. |
+| `max_inflight_prepare_requests`, `max_inflight_prepare_bytes`, `max_prepare_bytes_per_request` | `64`, `8 GiB`, `2 GiB` | Preparation bounds. Beyond them, requests admit as misses. |
+| `max_inflight_offload_bytes` | `8 GiB` | Offloads above this are declined; the tree retries later. |
+| `max_abandoned_bytes` | `4 GiB` | Late (abandoned) work above this pauses new preparation until it drains. |
+| `operation_timeout_ms`, `abandon_timeout_ms` | `20000`, `60000` | KVCR core deadlines. |
+| `policy` | `lru` | Local tier placement policy (`lru` or `fifo`). |
+| `fetch_chunk_pages` | `32` | Pages per KVCR operation. |
+
+## How admission works
+
+A source hint is not a cache hit. At enqueue the scheduler runs the ordinary
+device prefix match and hands the uncached tail to the linker, which queries
+KVCR, submits `fetch` for useful local or hinted candidates (acquiring residency
+claims), and reports readiness. Each prefill scheduling pass reduces readiness
+with MIN across the attention group so every rank agrees; requests still
+preparing are skipped while others proceed. Once ready, the normal prefix match
+runs and `lookup` exposes only pages whose claims are held. Claims are released
+after the GPU load completes, or when the request is released.
+
+```text
+UNPREPARED -> FETCHING -> READY -> LOAD_QUEUED -> DMA_ACTIVE -> COMPLETE
+                 \-> MISS / DEADLINE / ABORT -> recompute or retire
+```
+
+Missing or stale hints, peer failure, capacity exhaustion, and deadlines yield a
+smaller confirmed prefix or a miss, and the remainder is recomputed. After a
+load is admitted, a failed or uncertain GPU transfer is not a miss: the layer
+counter fails and the worker stops rather than computing over slots a late
+transfer may still write.
+
+## Storage layout and keys
+
+One KVCR object holds one page of one physical pool, as an ordered descriptor
+list over the page's component and layer spans; each span has a named KVCR
+subpool sized to exactly that span. Keys are
+`<page-hash>#kvcr-linker-v1#<compatibility-digest>#<pool>`. The digest covers
+checkpoint and revision, KV dtype, page geometry and physical spans,
+target/draft identity, and the physical shard, so compatible replicas share
+keys and different head slices never collide. Routers select candidates by the
+64-bit event hash; the full key stays authoritative when bytes are fetched.
+
+Successful offloads publish `EXTERNAL`-tier `BlockStored` KV events; KVCR
+evictions publish `BlockRemoved` and clear the tree's stored mark so
+write-through can offload the page again.
+
+## Supported layouts
+
+| Layout | Status |
+| --- | --- |
+| Dense MHA and MLA (unquantized), packed EAGLE/MTP draft pools of the same type | Supported |
+| DSA (DeepSeek V3 style) with packed draft pools | Supported through the existing assembler |
+| DeepSeek V4 (C4/C128, indexer, SWA, compression state) | Mapped through the existing assembler; validate before relying on it |
+| Pipeline parallelism, Mamba, HiSparse, quantized MHA with scale buffers, DP without attention DP | Rejected at startup |
+| ROCm | Rejected at startup until validated |
+
+A speculative algorithm whose draft KV is not part of the pool layout is
+rejected at startup, because a restored target prefix would leave the draft
+state uninitialized.
+
+## Observability
+
+Each rank logs `KVCRDirectLinker stats` periodically with queried, prepared,
+admitted, and restored page counts, local and peer-fetched bytes, preparation
+latency and deadline counts, miss reasons, GPU transfer bytes and time, queue
+and in-flight high-water marks, outstanding claims, late completions, uncertain
+transfers, actual DRAM allocation, and descriptor build time.
+
+See `examples/runtime/kvcr_direct_linker/` for a launch script and an
+explicit-hint peer reuse check that runs without a router.

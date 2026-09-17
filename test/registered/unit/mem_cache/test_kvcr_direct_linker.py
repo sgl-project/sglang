@@ -464,7 +464,7 @@ def test_hinted_but_absent_pages_never_become_hits(harness):
     h.wait(lambda: h.linker.snapshot_stats().get("late_completions", 0) >= 1, timeout=5)
     late = h.linker.snapshot_stats()
     assert late["abandoned_bytes"] == 0
-    assert late["kvcr_pending_ops"] + late["kvcr_late_ops"] == 0
+    assert late["kvcr_pending_ops"] == 0
     assert h.public_claims() == 0
     # New requests are not blocked by the quarantined work below the bound.
     other = h.prepare("r3b", _hashes("c2", 1))

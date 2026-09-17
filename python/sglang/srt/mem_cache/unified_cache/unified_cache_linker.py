@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -223,9 +223,9 @@ class UnifiedCacheLinkerWrapper:
         # instead of looking up, so enqueue-time preparation never recurses
         # into the backend's lookup.
         self._preparing = False
-        # Page hash -> node that was published as externally stored, so a
+        # Event hash -> (node, page hash) published as externally stored, so a
         # backend eviction can clear the mark and let write-through re-offload.
-        self._stored_page_nodes: dict[str, NodeId] = {}
+        self._stored_page_nodes: dict[int, tuple[NodeId, str]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -672,7 +672,10 @@ class UnifiedCacheLinkerWrapper:
                         node, medium=StorageMedium.EXTERNAL
                     )
                     for page_hash in node.hash_value or ():
-                        self._stored_page_nodes[page_hash] = node_id
+                        self._stored_page_nodes[hash_str_to_int64(page_hash)] = (
+                            node_id,
+                            page_hash,
+                        )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def drain_external_inventory(self) -> None:
@@ -691,17 +694,11 @@ class UnifiedCacheLinkerWrapper:
         tree_core.kv_events.enqueue(
             BlockRemoved(block_hashes=list(removed), medium=StorageMedium.EXTERNAL)
         )
-        from sglang.srt.mem_cache.storage.kvcr.router_hint import page_hash_to_int64
-
-        if not self._stored_page_nodes:
-            return
-        removed_set = set(removed)
-        for page_hash in [
-            page
-            for page in self._stored_page_nodes
-            if page_hash_to_int64(page) in removed_set
-        ]:
-            node_id = self._stored_page_nodes.pop(page_hash)
+        for event_hash in removed:
+            stored = self._stored_page_nodes.pop(event_hash, None)
+            if stored is None:
+                continue
+            node_id, page_hash = stored
             try:
                 node = tree_core.node_by_id(node_id)
             except (KeyError, IndexError):
