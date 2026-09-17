@@ -6,8 +6,8 @@ from sgl_kernel.flash_mla import (
     get_mla_capabilities,
     get_mla_metadata,
 )
-from sglang.srt.layers.attention.dsv4.torch_quant import (
-    cast_scale_inv_to_ue8m0,
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    ceil_pow2_scale,
     dequantize_dsv41_packed_main_kv,
     quantize_dsv41_packed_main_kv,
 )
@@ -19,7 +19,7 @@ MAIN_LAYOUT = "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"
 def _quantize_v4(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     num_pages, page_slots, _, _ = k.shape
     nope = k.squeeze(2)[..., :448].float().view(num_pages, page_slots, 7, 64)
-    scales = cast_scale_inv_to_ue8m0(nope.abs().amax(dim=-1) / 448.0)
+    scales = ceil_pow2_scale(nope.abs().amax(dim=-1) / 448.0)
     quantized = (nope / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
     pages = torch.zeros(

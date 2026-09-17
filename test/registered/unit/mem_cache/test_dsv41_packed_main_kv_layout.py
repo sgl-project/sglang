@@ -6,7 +6,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.layers.attention.dsv4.torch_quant import (
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
     dequantize_dsv41_packed_main_kv,
     fake_quant_compressed_kv,
     quantize_dsv41_packed_main_kv,

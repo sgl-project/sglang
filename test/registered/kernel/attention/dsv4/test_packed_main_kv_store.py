@@ -7,7 +7,7 @@ from sglang.kernels.ops.attention.dsv4.packed_main_kv import (
     flash_c2_prefill_pack_main_kv_fp4,
     pack_dsv41_main_kv_fp4,
 )
-from sglang.srt.layers.attention.dsv4.torch_quant import (
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
     quantize_dsv41_packed_main_kv,
 )
 from sglang.srt.mem_cache.dsv41_main_kv_layout import (
