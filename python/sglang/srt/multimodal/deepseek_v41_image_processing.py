@@ -9,10 +9,7 @@ Every one of those positions carries `image_token_id` in `input_ids`; only the t
 apart. The IMAGE slots are filled with aligner rows in reading order.
 """
 
-import base64
-import io
 import math
-from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -67,37 +64,6 @@ def safe_resize(
     return n_llm_h, n_llm_w, best_height, best_width
 
 
-def load_image_bytes(record) -> bytes:
-    """Load image bytes from raw/base64 data, an Anthropic source, URL, or path."""
-    data = record.get("data")
-    if isinstance(data, bytes):
-        return data
-    if isinstance(data, str):
-        return base64.b64decode(data)
-
-    source = record.get("source")
-    if isinstance(source, dict):
-        if source.get("data") is not None:
-            return base64.b64decode(source["data"])
-        if source.get("url"):
-            return load_image_bytes({"url": source["url"]})
-
-    url = record.get("url")
-    if isinstance(url, str) and url:
-        if url.startswith("data:"):
-            header, _, payload = url.partition(",")
-            if ";base64" not in header:
-                raise ValueError(f"Unsupported data URL encoding: {header}")
-            return base64.b64decode(payload)
-        if url.startswith(("http://", "https://")):
-            with urlopen(url, timeout=30) as response:
-                return response.read()
-        with open(url, "rb") as file:
-            return file.read()
-
-    raise ValueError(f"Cannot load image from record: {list(record.keys())}")
-
-
 def plan_image_grid(width: int, height: int, args):
     """Resize plan for an image of the given original size; a pure function of its arguments."""
     p = args.vision_patch_size
@@ -123,14 +89,9 @@ def plan_image_grid(width: int, height: int, args):
     )
 
 
-def decode_image(record):
-    """Decode using the same RGB conversion for every preprocessing backend."""
-    if isinstance(record, Image.Image):
-        image = record.convert("RGB")
-    else:
-        with Image.open(io.BytesIO(load_image_bytes(record))) as source:
-            image = source.convert("RGB")
-    return image
+def decode_image(image: Image.Image) -> Image.Image:
+    """The same RGB conversion for every preprocessing backend."""
+    return image.convert("RGB")
 
 
 def load_image(record, args):

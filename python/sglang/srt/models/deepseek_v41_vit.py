@@ -1,4 +1,4 @@
-"""Vision tower and aligner from the 260903 reference implementation."""
+"""DeepSeek-V4.1 vision tower and aligner."""
 
 from functools import lru_cache
 
@@ -81,7 +81,6 @@ class Attention(VisionAttention):
                 x,
                 position_embeddings=(cos, sin),
                 forward_metadata=metadata,
-                max_seqlen=x.shape[0],
             )
             .squeeze(0)
         )
