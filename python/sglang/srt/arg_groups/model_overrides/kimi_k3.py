@@ -110,6 +110,16 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "flashmla":
+            logger.info(
+                "Kimi-K3 DCP on Hopper uses split attention backends: "
+                f"prefill={prefill_backend!r} -> 'trtllm_mla', "
+                "decode='flashmla'."
+            )
+            overrides.update(
+                prefill_attention_backend="trtllm_mla",
+                decode_attention_backend="flashmla",
+            )
         elif decode_backend == "aiter":
             _require_kimi_k3_aiter_gluon_dcp_support()
             # Override prefill backend to aiter by default
@@ -126,7 +136,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                "'cutedsl_mla', 'tokenspeed_mla', 'flashmla', or 'aiter', "
+                f"got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
