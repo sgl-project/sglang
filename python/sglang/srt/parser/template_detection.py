@@ -400,6 +400,10 @@ def _is_deepseek_v4(ctx):
     return ctx.has_text("<｜DSML｜tool_calls>")
 
 
+def _is_deepseek_v41(ctx):
+    return ctx.has_text("<｜DSML｜ calls>")
+
+
 def _is_hunyuan(ctx):
     # The shipping Hy3 tokenizer appends a shared suffix to each special token
     # (e.g. ``<tool_calls:opensource>``), so match the bare or suffixed form.
@@ -494,6 +498,16 @@ def _is_qwen3(ctx):
     )
 
 
+def _is_ling3(ctx):
+    return (
+        ctx.has_text("<role>SYSTEM</role>")
+        and ctx.has_text("<role>ASSISTANT</role>")
+        and ctx.has_text("<|role_end|>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
 def _is_deepseek_v3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="thinking", default_enabled=False
@@ -535,7 +549,11 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
+    DetectionRule(
+        name="deepseek_v41", value="deepseek-v41", predicate=_is_deepseek_v41
+    ),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
     DetectionRule(
@@ -562,6 +580,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax-m2", predicate=_is_minimax),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
+    DetectionRule(name="deepseek_v41", value="deepseekv41", predicate=_is_deepseek_v41),
     DetectionRule(name="deepseek_v4", value="deepseekv4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v32", value="deepseekv32", predicate=_is_deepseek_v32),
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
@@ -573,6 +592,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
@@ -753,6 +773,7 @@ def _log_undetected_parser(attr: str, label: str) -> None:
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     """The parsers the model architecture implies, for the fields still on auto."""
+    from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_arch
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     cfg = resolving_view(server_args)
@@ -768,6 +789,13 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch in (
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
+    ) or model_type in ("bailing_hybrid", "bailing_moe_v3_vl"):
+        reasoning_parser, tool_call_parser = "ling3", "ling3"
+    elif is_deepseek_v41_arch(arch=arch, model_type=model_type):
+        reasoning_parser, tool_call_parser = "deepseek-v41", "deepseekv41"
     elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:

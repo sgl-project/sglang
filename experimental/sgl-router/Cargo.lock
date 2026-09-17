@@ -2072,7 +2072,6 @@ dependencies = [
  "memo-map",
  "percent-encoding",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2887,6 +2886,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3284,7 +3284,6 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
- "chrono",
  "clap",
  "criterion",
  "dashmap",
@@ -3293,11 +3292,13 @@ dependencies = [
  "dynamo-tokenizers",
  "futures",
  "hf-hub",
+ "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "minijinja",
- "minijinja-contrib",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",

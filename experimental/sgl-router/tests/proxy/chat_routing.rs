@@ -12,7 +12,7 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -28,11 +28,13 @@ fn config_for(_worker_url: &str) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -42,6 +44,7 @@ fn config_for(_worker_url: &str) -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -838,6 +841,7 @@ async fn forward_json_to_records_failure_on_body_drop() {
     let res: Result<_, ApiError> = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -894,6 +898,7 @@ async fn forward_json_to_records_success_only_after_body_completes() {
     let res: Result<_, ApiError> = proxy
         .forward_json_to(
             &ok_worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -944,6 +949,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     let res: Result<_, ApiError> = proxy
         .forward_streaming_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -994,6 +1000,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     let _: Result<_, ApiError> = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -1027,6 +1034,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     let res = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -1064,6 +1072,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
     let res = proxy
         .forward_json_to(
             "not-a-url",
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
