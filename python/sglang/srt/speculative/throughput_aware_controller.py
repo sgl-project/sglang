@@ -275,7 +275,7 @@ class ThroughputAwarePolicy:
         self._current_steps = initial_steps
         if self._current_steps not in all_candidate_steps:
             self._current_steps = first_candidates[len(first_candidates) // 2]
-        self._batch_count: int = 0
+        self._batches_since_reevaluation = 0
 
         log_info_on_rank0(
             logger,
@@ -376,8 +376,10 @@ class ThroughputAwarePolicy:
                 self._tracker.clear_positions_above(target)
             self._current_steps = target
 
-        if self._should_reevaluate():
-            self._reevaluate_and_switch(batch_size)
+        if self._batches_since_reevaluation >= self._update_interval:
+            if self._should_reevaluate():
+                self._reevaluate_and_switch(batch_size)
+            self._batches_since_reevaluation = 0
 
         return self._current_steps
 
@@ -392,7 +394,7 @@ class ThroughputAwarePolicy:
             return None
         observed_steps = self._current_steps if num_steps is None else num_steps
         self._tracker.update(num_correct_drafts_per_req, observed_steps)
-        self._batch_count += 1
+        self._batches_since_reevaluation += 1
         return None
 
     def on_state_activated(self, steps: int) -> None:
@@ -405,9 +407,7 @@ class ThroughputAwarePolicy:
     def _should_reevaluate(self) -> bool:
         """Return True if this is a valid moment to re-score candidates."""
         return (
-            self._batch_count > 0
-            and self._batch_count % self._update_interval == 0
-            and self._tracker.all_positions_warmed(self._current_steps)
+            self._tracker.all_positions_warmed(self._current_steps)
             and not self._cost_table.is_empty()
         )
 
@@ -423,8 +423,9 @@ class ThroughputAwarePolicy:
         )
 
         logger.debug(
-            "[ThroughputAware] batch_count=%d  bs=%d  pos_rates=%s  scores=%s",
-            self._batch_count,
+            "[ThroughputAware] batches_since_reevaluation=%d  bs=%d  "
+            "pos_rates=%s  scores=%s",
+            self._batches_since_reevaluation,
             batch_size,
             format_position_rates(self._tracker, max(candidates) if candidates else 0),
             format_score_rows(rows, raw_best),
@@ -465,6 +466,7 @@ class ThroughputAwarePolicy:
             log_info_on_rank0(
                 logger,
                 f"[ThroughputAware] Step {direction}: {old_steps} → {best_steps}  "
-                f"(bs={batch_size}, batch_count={self._batch_count}, "
+                f"(bs={batch_size}, "
+                f"batches_since_reevaluation={self._batches_since_reevaluation}, "
                 f"throughput={score_summary})",
             )
