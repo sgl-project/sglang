@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, is_pre_ampere_cuda, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -128,6 +128,8 @@ def _is_transposed_dense_residual(
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
+    if is_pre_ampere_cuda():
+        return False
     return (
         residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype

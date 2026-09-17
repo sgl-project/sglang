@@ -179,3 +179,19 @@ def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
+
+
+def is_pre_ampere_cuda(device: int | torch.device | None = None) -> bool:
+    """Return True on Volta/Turing (compute capability major < 8).
+
+    CUDA ``load_jit`` on these GPUs often fails to compile (host libc vs CUDA
+    ``rsqrt`` headers) and wastes tens of seconds before soft-falling back to
+    Triton/torch. Callers should skip JIT probes up front.
+    """
+    if is_hip_runtime() or is_musa_runtime() or not torch.cuda.is_available():
+        return False
+    if device is None:
+        major, _minor = torch.cuda.get_device_capability()
+    else:
+        major, _minor = torch.cuda.get_device_capability(device)
+    return major < 8
