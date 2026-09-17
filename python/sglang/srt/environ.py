@@ -1458,6 +1458,9 @@ class Envs:
     # DeepSeek V4
     # ===================================================================
 
+    # Request cap for ragged encoder replay; each request retains independent KV.
+    SGLANG_ENCODER_SWA_REPLAY_MAX_BATCH_SIZE = EnvInt(1)
+
     # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
