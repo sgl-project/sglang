@@ -388,7 +388,7 @@ jobs:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ github.event_name == 'pull_request' && inputs.coverage_mode == true }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode == true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
     env:
@@ -538,7 +538,10 @@ jobs:
   # Runs after all test jobs and the coverage-based test recommender.
   # Calls the reusable failure-analysis workflow to collect logs, cross-
   # reference them with the recommended test paths, and produce a report.
-  # if: always() so it runs even when tests fail (which is the whole point).
+  # if: !cancelled() && (success() || failure()) so it runs when tests pass or
+  # fail, but is skipped when the run is cancelled (e.g. superseded by a new
+  # push in the same concurrency group) — prevents zombie jobs that hold the
+  # concurrency group and block the new run.
   analyze-failure-report:
     name: Analyze failure report
     needs:
@@ -560,17 +563,18 @@ jobs:
 
         recommend-tests-from-coverage,
       ]
-    if: ${{ always() && inputs.coverage_mode != true }}
+    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode = true }}
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
 
   # ==================== Coverage Assembly & Upload ==================== #
-  # Runs after all test jobs (regardless of their result, if: always()) on a
-  # runner that shares /root/.cache with the test jobs. Assembles covstub,
-  # builds test_case_map.json, archives outputs.tar.gz and uploads both to OBS.
-  # Only runs in coverage mode (coverage_mode == true).
+  # Runs after all test jobs only when every need succeeded (skipped on any
+  # failure or cancellation). Uses a runner that shares /root/.cache with
+  # the test jobs. Assembles covstub, builds test_case_map.json, archives
+  # outputs.tar.gz and uploads both to OBS. Only runs in coverage mode
+  # (coverage_mode == true).
   setup-covstub:
     needs:
       [
@@ -585,7 +589,7 @@ jobs:
         base-c-test-perf-2-npu-a3,
         base-c-test-perf-16-npu-a3,
       ]
-    if: ${{ always() && inputs.coverage_mode == true }}
+    if: ${{ !cancelled() && success() && inputs.coverage_mode == true }}
     runs-on: linux-aarch64-a3-800t-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
