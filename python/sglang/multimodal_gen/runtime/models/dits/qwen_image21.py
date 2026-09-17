@@ -10,9 +10,11 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_complex_rope,
     can_use_fused_silu_mul,
+    can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_silu_mul_bitexact,
     residual_gate_add,
+    rmsnorm_preserve_reduction,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
@@ -40,6 +42,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
+_QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -103,6 +106,21 @@ def apply_rope(x, rope):
     out = torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
     if fused is not None:
         return _ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
+    return out
+
+
+def apply_qk_norm(x, norm):
+    fused = None
+    if (
+        can_use_rmsnorm_preserve_reduction(x, norm.weight)
+        and _QK_NORM_FUSION.can_attempt_once()
+    ):
+        fused = rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon)
+        if _QK_NORM_FUSION.verified:
+            return fused
+    out = norm(x)
+    if fused is not None:
+        return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
 
 
@@ -235,7 +253,11 @@ class QwenImage21Attention(nn.Module):
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        return apply_rope(self.norm_q(q), rope), apply_rope(self.norm_k(k), rope), v
+        return (
+            apply_rope(apply_qk_norm(q, self.norm_q), rope),
+            apply_rope(apply_qk_norm(k, self.norm_k), rope),
+            v,
+        )
 
     def forward(self, x, rope, prefix, prefix_rope, segments, cache):
         if cache:

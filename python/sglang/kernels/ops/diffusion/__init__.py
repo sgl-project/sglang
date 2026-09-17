@@ -293,6 +293,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "HunyuanVideo QKV pack + RoPE.",
     ),
     (
+        "diffusion.rmsnorm_preserve_reduction",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
+        _CUDA,
+        "Cast-before-weight RMSNorm preserving the native FP32 mean reduction.",
+    ),
+    (
         "diffusion.silu_mul",
         KernelBackend.TRITON,
         "activation.silu_mul_bitexact:fused_silu_mul_bitexact",
@@ -455,6 +462,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
