@@ -72,7 +72,6 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -1250,33 +1249,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive and self._hosts_draft:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_adaptive_strategy,
+            self.adaptive_controller = AdaptiveController.from_config(
+                self,
+                initial_steps=self.speculative_num_steps,
+                config_path=get_spec().speculative_adaptive_config,
             )
-
-            if (
-                resolve_adaptive_strategy(get_spec().speculative_adaptive_config)
-                == "throughput_aware"
-            ):
-                from sglang.srt.speculative.throughput_aware_controller import (
-                    ThroughputAwarePolicy,
-                )
-
-                self.adaptive_controller = AdaptiveController(
-                    self,
-                    ThroughputAwarePolicy(
-                        initial_steps=self.speculative_num_steps,
-                        config_path=get_spec().speculative_adaptive_config,
-                    ),
-                )
-            else:
-                self.adaptive_controller = AdaptiveController(
-                    self,
-                    AdaptiveSpeculativeParams(
-                        initial_steps=self.speculative_num_steps,
-                        cfg_path=get_spec().speculative_adaptive_config,
-                    ),
-                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(

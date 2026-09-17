@@ -148,6 +148,37 @@ class AdaptiveController:
         self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
 
+    @classmethod
+    def from_config(
+        cls,
+        worker: AdaptiveSpecWorker,
+        *,
+        initial_steps: int,
+        config_path: str | None,
+    ) -> "AdaptiveController":
+        """Build a controller with the policy selected by its config."""
+        from sglang.srt.speculative.adaptive_spec_params import (
+            AdaptiveSpeculativeParams,
+            resolve_adaptive_strategy,
+        )
+
+        if resolve_adaptive_strategy(config_path) == "throughput_aware":
+            from sglang.srt.speculative.throughput_aware_controller import (
+                ThroughputAwarePolicy,
+            )
+
+            policy = ThroughputAwarePolicy(
+                initial_steps=initial_steps,
+                config_path=config_path,
+            )
+        else:
+            policy = AdaptiveSpeculativeParams(
+                initial_steps=initial_steps,
+                cfg_path=config_path,
+            )
+
+        return cls(worker, policy)
+
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps

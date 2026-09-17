@@ -76,6 +76,41 @@ class _FakePolicy:
 
 
 class TestAdaptiveController(unittest.TestCase):
+    def test_from_config_selects_policy(self):
+        worker = _FakeWorker()
+
+        for strategy, policy_path, expected_keyword in (
+            (
+                "ema",
+                "sglang.srt.speculative.adaptive_spec_params.AdaptiveSpeculativeParams",
+                "cfg_path",
+            ),
+            (
+                "throughput_aware",
+                "sglang.srt.speculative.throughput_aware_controller.ThroughputAwarePolicy",
+                "config_path",
+            ),
+        ):
+            with (
+                self.subTest(strategy=strategy),
+                patch(
+                    "sglang.srt.speculative.adaptive_spec_params.resolve_adaptive_strategy",
+                    return_value=strategy,
+                ),
+                patch(policy_path, return_value=_FakePolicy()) as policy_cls,
+            ):
+                controller = AdaptiveController.from_config(
+                    worker,
+                    initial_steps=3,
+                    config_path="adaptive.json",
+                )
+
+            self.assertIsInstance(controller, AdaptiveController)
+            policy_cls.assert_called_once_with(
+                initial_steps=3,
+                **{expected_keyword: "adaptive.json"},
+            )
+
     def test_profile_latency_uses_tp_group_broadcast(self):
         class FakeTPGroup:
             device = "cpu"
