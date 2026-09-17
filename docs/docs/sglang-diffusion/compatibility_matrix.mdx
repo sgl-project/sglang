@@ -15,19 +15,47 @@ Transformers 4.57.3, BF16 and matching Torch SDPA settings with cuDNN SDPA
 disabled. The native encoder explicitly preserves that version's pre-final-norm
 hidden state and vision position interpolation semantics.
 
-Full-checkpoint functional checks on up to two H200 GPUs cover TP, Ulysses,
-Ring + FA, CFG parallel, encoder folding, layerwise offload, FA/Sage, parallel
+Full-checkpoint functional checks on up to two H200 GPUs cover DiT TP, Ulysses,
+Ring + FA, CFG parallel, DiT layerwise offload, FA/Sage, parallel
 tiled VAE decode, Cache-DiT, breakable CUDA graphs, and multiple reference
 images and outputs. One H200 with resident weights also passed HTTP generation
 and editing, including multiple outputs and reference images. These are
 functional checks, not a broad quality evaluation of lossy optimizations.
 
-Small random checkpoints on two B200 GPUs cover the same runtime paths.
-Request-local prefix KV reuse and new-request graph replay have CUDA regression
-tests. Full-model checks use authorized weights; the public deployment picker
-marks only the tested H200 server recipe as verified.
+Additional full-checkpoint checks on B200 cover native encoder TP, combined
+TP2 × Ulysses2 and TP2 × Ring2 + FA on four GPUs, and
+`--layerwise-offload-components all`. Two-GPU VAE `spatial_shard` decode passed
+with TP2, CFG parallelism, and all-component offload. These use 512px/4-step
+editing, plus a 1024px/4-step comparison of spatial and full VAE decode.
+Single-GPU 1024px/40-step generation, editing, and transparent PNG output also
+passed at source revision `d629d234f1`.
 
-LoRA, quantized checkpoints and performance remain unverified. Breakable graphs
+Two-B200 component regressions assert actual encoder weight sharding and compare
+text and image conditioning with a single-rank reference. VAE regressions cover
+both decoder structures and even/odd latent heights in FP32 and FP64. FP64
+spatial decode matches the full decoder; BF16 full-checkpoint output is not
+bit-exact. In the tested image, spatial versus full decode gave RGBA PSNR
+60.69 dB; this is one sample, not a general quality guarantee.
+
+Request-local prefix KV reuse and new-request graph replay have CUDA regression
+tests. The deployment picker marks only its exact tested HTTP combinations as
+verified, including H200, B200, RTX 5090, and RTX 4090. CLI-only combinations
+remain Unverified in the picker.
+
+Disaggregated encoder, denoiser, and decoder roles passed full-checkpoint HTTP
+generation, variable-length prompts, image editing, and CFG on three B200 GPUs,
+using Mooncake's same-host TCP transport. At 512px/4 steps, their RGBA pixels
+matched the monolithic server exactly. Multi-host RDMA and multi-rank roles
+are not covered by that check.
+
+Online FP8 for the DiT, encoder, and both together passed 1024px/40-step HTTP
+generation and editing on one B200. These paths change numerical results;
+alpha quality, other hardware, and serialized quantized checkpoints remain
+unverified. Synthetic Diffusers-format LoRA passed dynamic loading, merging,
+and removal on one B200 and TP2 with encoder folding; both removal paths
+restored the base image exactly. Trained-adapter quality remains unverified.
+Platform latency measurements
+and their exact workloads are in the cookbook. Breakable graphs
 replay only matching warmup signatures, including condition-prefix length;
 other shapes run eagerly. VAE tiling is opt-in and can change numerical results.
 Do not infer compatibility from the older Qwen-Image row.
@@ -37,6 +65,19 @@ See the [Qwen-Image 2.1 cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1)
 for checkpoint layout and usage. This entry does not assert public weight
 availability. Public nightly cases and image ground truths remain deferred
 until the checkpoint is available to those runners.
+
+Authorized runners can opt into the shared HTTP test harness now. The cases
+check repeated generation, editing, and real RGBA alpha output; they do not
+silently substitute a local ground truth for the pending public consistency data.
+
+```bash
+export SGLANG_QWEN_IMAGE21_TEST_MODEL=/models/Qwen-Image-2.1
+export SGLANG_QWEN_IMAGE21_TEST_IMAGE=/path/to/reference.png
+python -m pytest -q python/sglang/multimodal_gen/test/server/test_server_qwen_image21.py
+```
+
+The module skips without the model variable; only editing skips when the image
+variable is absent. Credentials stay in the runner environment.
 
 ## Supported model inventory
 

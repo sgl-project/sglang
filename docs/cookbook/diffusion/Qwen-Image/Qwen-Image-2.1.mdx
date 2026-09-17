@@ -28,7 +28,7 @@ upload files from the machine running cURL, so they need not exist on the server
 
 Hardware selection applies the recommended placement for that GPU. H200 and
 B200 keep weights resident; consumer GPUs use offload to fit the full pipeline.
-Custom two-GPU topologies and unverified feature combinations remain selectable and are labeled
+Custom two- and four-GPU topologies and unverified feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
 currently uses the Python/source command; no published Docker image is verified.
 
@@ -184,11 +184,53 @@ Positive and negative prompts have separate request-owned prefix caches.
 TP uses native parallel projections. Ulysses and Ring shard target-image
 attention while keeping the condition prefix replicated. The target token
 count, `(height / 16) × (width / 16)`, must be divisible by the SP degree. Encoder
-parallelism uses the shared native encoder runtime. VAE tiling is disabled by
-default for both encoding and decoding. Enable
+folding shards Qwen3-VL's language projections using the native encoder TP group.
+Full-checkpoint editing passed with TP2 × Ulysses2 and TP2 × Ring2 + FlashAttention
+on four B200 GPUs. These CLI checks do not mark every HTTP topology as verified.
+
+VAE tiling is disabled by default for both encoding and decoding. Enable
 `--vae-tiling true` for tiled encoding and decoding; `--vae-sp true` also distributes tiles
 across the configured GPUs. These paths use the standard VAE runtime; tiled
 decode can differ from full image decode near tile boundaries.
+
+For full-image spatial parallel decode, select **Spatial shard** or pass
+`--vae-config.parallel-decode-mode spatial_shard` with at least two GPUs.
+This mode splits feature-map height, exchanges convolution halos, and gathers
+the full map for VAE attention. It does not require `--vae-tiling` or `--vae-sp`.
+Two-B200 checks cover TP2, CFG parallelism, and all-component layerwise offload.
+FP64 component comparisons match full decode; BF16 full-checkpoint output can
+differ through floating-point rounding.
+
+Select **All components layerwise** or pass `--layerwise-offload-components all`
+to stream repeated blocks in the DiT, Qwen3-VL language and vision encoders, and
+VAE encoder/decoder. Full-checkpoint 512px editing passed on one B200 and on
+two B200s with TP2 plus spatial VAE decode. This setting reduces device memory
+at the cost of host-device transfers; it is not the measured default for the
+consumer-GPU recipes above.
+
+The pipeline also supports the shared
+[disaggregated runtime](/docs/sglang-diffusion/disaggregation). The encoder role
+loads both Qwen3-VL and the VAE to prepare reference-image conditioning; nested
+condition tensors and complex RoPE tensors transfer with the request. Separate
+encoder, denoiser, and decoder processes matched monolithic RGBA output for
+512px/4-step generation, editing, different prompt lengths, and CFG on B200.
+That check used same-host Mooncake TCP; multi-host RDMA remains unverified.
+
+Online FP8 is available independently for the DiT and encoder through
+`--component-quantizations.transformer fp8` and
+`--component-quantizations.text_encoder fp8`. Each component and the combination
+passed 1024px/40-step HTTP generation and editing on a resident B200. FP8 changes
+the output: in one generation/edit pair, DiT-only FP8 gave RGBA PSNR
+37.56/41.07 dB against native precision; quantizing both gave 32.66/40.99 dB.
+These samples do not establish general quality, alpha fidelity, or compatibility
+with serialized FP8/NVFP4 checkpoints. Native precision remains the default.
+
+LoRA uses the shared `--lora-path` and `--lora-merge-mode dynamic|merge` options
+and runtime adapter APIs. Diffusers keys prefixed with `transformer.` map to
+the native DiT. A synthetic adapter covering attention and MLP projections
+passed dynamic loading, merging, and removal on one B200 and TP2 with encoder
+folding. Both removal paths restored the base image exactly. This verifies
+adapter application and lifecycle, not the quality of a trained LoRA.
 
 Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
 Graph execution fills each request's prefix caches eagerly, then replays

@@ -57,6 +57,12 @@ const config = {
           softReason: "This offload topology has not completed an HTTP verification run.",
           description: "Streams DiT layers. RTX 4090 also offloads the encoder between requests to leave room for image editing. Requires sufficient host RAM.",
         },
+        {
+          id: "all_offload", label: "All components layerwise",
+          flags: ["--performance-mode manual", "--layerwise-offload-components all"],
+          soft: true, softReason: "Full-checkpoint 512px editing passed on B200, including TP2 with spatial VAE decode; this HTTP recipe is unverified.",
+          description: "Streams repeated blocks in the DiT, Qwen3-VL, and VAE. Uses more host-device transfers to reduce device memory.",
+        },
       ],
     },
     {
@@ -90,9 +96,23 @@ const config = {
       id: "precision",
       title: "Precision",
       scope: "serve",
-      description: "Use the checkpoint's native BF16 / FP32 computation. Quantized variants are not validated.",
+      description: "Native precision is the default. Online FP8 reduces precision and requires image-quality validation for your workload.",
       default: "native",
-      options: [{ id: "native", label: "Native BF16 / FP32", recommended: true }],
+      options: [
+        { id: "native", label: "Native BF16 / FP32", recommended: true },
+        {
+          id: "fp8_dit", label: "FP8 DiT", flags: ["--component-quantizations.transformer fp8"],
+          soft: true, softReason: "Online FP8 passed 1024px/40-step generation and editing on one resident B200. Other hardware, alpha, and feature combinations remain unverified.",
+        },
+        {
+          id: "fp8_encoder", label: "FP8 encoder", flags: ["--component-quantizations.text_encoder fp8"],
+          soft: true, softReason: "Online encoder FP8 passed 1024px/40-step generation and editing on one resident B200. It changes conditioning and output pixels.",
+        },
+        {
+          id: "fp8_both", label: "FP8 DiT + encoder", flags: ["--component-quantizations.transformer fp8", "--component-quantizations.text_encoder fp8"],
+          soft: true, softReason: "Online FP8 for both components passed generation and editing on one resident B200. This does not validate serialized quantized checkpoints.",
+        },
+      ],
     },
     {
       id: "encoder",
@@ -104,14 +124,14 @@ const config = {
       options: [
         { id: "auto", label: "Auto", flags: ["--encoder-parallel auto"], recommended: true },
         { id: "replicate", label: "Replicate", flags: ["--encoder-parallel replicate"], soft: true, softReason: "Explicit replication has not been verified for this server recipe." },
-        { id: "fold", label: "Fold", flags: ["--encoder-parallel fold"], soft: true, softReason: "Requires node-local P2P access; this explicit server setting is unverified." },
+        { id: "fold", label: "Fold", flags: ["--encoder-parallel fold"], soft: true, softReason: "Native encoder TP and full-checkpoint TP2 × SP2 editing passed on B200. Requires node-local P2P; this HTTP recipe is unverified." },
       ],
     },
     {
       id: "vae",
       title: "VAE decoding",
       scope: "serve",
-      description: "Decode RGBA in full, in tiles, or with tiles distributed across GPUs.",
+      description: "Decode RGBA in full, in tiles, or with spatial work distributed across GPUs.",
       learnMore: "#5-runtime-features",
       default: "full",
       options: [
@@ -122,6 +142,13 @@ const config = {
           disabled: (s) => Number(s.gpus_per_node) < 2,
           disableReason: "Select two GPUs before distributing VAE tiles.",
           soft: true, softReason: "Two-H200 CLI decoding passed; this HTTP recipe is unverified.",
+        },
+        {
+          id: "spatial", label: "Spatial shard", flags: ["--vae-config.parallel-decode-mode spatial_shard"],
+          disabled: (s) => Number(s.gpus_per_node) < 2,
+          disableReason: "Select at least two GPUs for spatial VAE decode.",
+          soft: true, softReason: "Two-B200 full-checkpoint decoding passed with TP, CFG parallelism, and all-component offload; this HTTP recipe is unverified.",
+          description: "Splits feature-map height and exchanges convolution halos. Preserves full-image attention; floating-point rounding can change pixels.",
         },
       ],
     },
@@ -184,7 +211,7 @@ const config = {
       tp_size: 1, ulysses_degree: 1, ring_degree: 1,
     },
     resource: {
-      limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
+      limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
         { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
@@ -198,8 +225,8 @@ const config = {
         const perNode = Number(s.gpus_per_node);
         const { tp_size: tp, ulysses_degree: ulysses, ring_degree: ring } = topology;
         if (nodes !== 1) errors.push("This picker covers single-node deployment only.");
-        if (![1, 2].includes(perNode)) errors.push("Select one or two GPUs per node.");
-        if (![tp, ulysses, ring].every((n) => [1, 2].includes(n))) errors.push("TP, Ulysses and Ring must each be 1 or 2.");
+        if (![1, 2, 4].includes(perNode)) errors.push("Select one, two, or four GPUs per node.");
+        if (![tp, ulysses, ring].every((n) => [1, 2, 4].includes(n))) errors.push("TP, Ulysses and Ring must each be 1, 2, or 4.");
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
         if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
