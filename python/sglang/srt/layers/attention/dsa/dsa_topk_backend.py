@@ -151,11 +151,13 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (GLM DSA prefill, ROCm-only -- CUDA gets the same
-        # fusion from the RAGGED branch above): row_starts / row_to_batch absorb the
-        # per-row score offset and the many-rows-per-request page-table mapping. The
-        # conditions fall back (not raise) on shapes the kernel cannot take, notably
-        # a chunked-extend plan or a row stride that is not 16B-aligned.
+        # Packed PAGED extend (GLM DSA prefill): row_starts / row_to_batch absorb
+        # the per-row score offset and the many-rows-per-request page-table
+        # mapping. The kernel itself is platform-neutral; routing stays ROCm-only
+        # because CUDA already gets the same fusion from the RAGGED branch above,
+        # and switching it over there wants a benchmark first. The conditions fall
+        # back (not raise) on shapes the kernel cannot take, notably a chunked-
+        # extend plan or a row stride that is not 16B-aligned.
         if (
             _is_hip
             and self.should_use_topk_v2()
@@ -166,12 +168,11 @@ class DSATopKBackend(Enum):
             and logits.dtype == torch.float32
             and logits.stride(1) == 1
             and logits.stride(0) % 4 == 0
-            and attn_metadata.topk_v2_plan is not None
-            and attn_metadata.topk_v2_plan.shape[0] == logits.shape[0] + 1
+            and row_starts is not None
             and attn_metadata.token_to_batch_idx is not None
             and attn_metadata.token_to_batch_idx.shape[0] == logits.shape[0]
         ):
-            return _topk_transform_v2_paged(
+            return _topk_transform_v2_packed(
                 logits,
                 lengths,
                 topk,
@@ -310,8 +311,6 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
-    row_starts: Optional[torch.Tensor] = None,
-    row_to_batch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -325,14 +324,12 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
-    ``row_starts`` / ``row_to_batch`` (optional, ``(num_rows,)`` int32) serve DSA
-    extend's packed batch-global scores: row ``i`` owns the window at
-    ``row_starts[i]`` and maps through page-table row ``row_to_batch[i]``. Omitting
-    both gives the decode layout; indices stay row-local either way.
+    For DSA extend's packed batch-global scores see
+    :func:`_topk_transform_v2_packed`.
 
-    This is a committed contract, not a best-effort path: ``topk_transform``
-    routes here only for shapes it has already validated, and for the decode case
-    the fused-decode CUDA graph drops the page_size=1 table (see
+    This is a committed contract, not a best-effort path: ``topk_transform`` routes
+    here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
+    drops the page_size=1 table for exactly this case (see
     ``dsa_drop_wide_page_table``). The preconditions below are therefore
     invariants the caller must uphold -- they assert (raise) on violation rather
     than fall back to the slow legacy path (which may not even have a page_size=1
@@ -376,14 +373,53 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(
+    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    return out
+
+
+def _topk_transform_v2_packed(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    row_starts: torch.Tensor,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused packed-row top-k + page-table transform (DSA extend prefill).
+
+    Same output contract as :func:`_topk_transform_v2_paged` -- ``(num_rows,
+    topk)`` int32 physical KV slots, ``-1`` padded -- but the scores are packed:
+    row ``i`` owns the window at ``row_starts[i]`` of one batch-global buffer and
+    maps through page-table row ``row_to_batch[i]`` (prefill expands one request
+    into many query-token rows). Selected indices stay row-local.
+
+    Being a prefill-only path it dispatches per row inside the kernel, so unlike
+    the paged entry point it needs no ``topk_v2_plan``.
+
+    NOTE: ``logits`` is MODIFIED IN PLACE (the <= 3 columns ahead of each window
+    are masked); the caller must not reuse it. ``lengths`` must be NON-NEGATIVE,
+    for the same reason as in :func:`_topk_transform_v2_paged`.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_packed_v2
+
+    num_rows = logits.shape[0]
+    assert (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_packed_v2(
         logits,
         lengths,
-        page_table,
+        attn_metadata.real_page_table,
         out,
-        page_size,
-        plan,
-        row_starts=(None if row_starts is None else row_starts.to(torch.int32)),
+        attn_metadata.page_size,
+        row_starts=row_starts.to(torch.int32),
         row_to_batch=(None if row_to_batch is None else row_to_batch.to(torch.int32)),
     )
     return out
