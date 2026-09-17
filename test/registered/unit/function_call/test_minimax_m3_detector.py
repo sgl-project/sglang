@@ -665,6 +665,26 @@ class TestMinimaxM3MalformedStillContent(CustomTestCase):
         for seg in _segments(*segments):
             detector.parse_streaming_increment(seg, self.tools)
 
+    def test_finish_releases_held_marker_prefix(self):
+        # "]" is the first char of the namespace marker, so the streaming parser
+        # holds it back; the stream ending must release it (report case
+        # test_12_07: "[SILENCE]" arrived as "[SILENCE").
+        detector = MinimaxM3Detector()
+        streamed = ""
+        for seg in ("[SIL", "ENCE]"):
+            streamed += detector.parse_streaming_increment(seg, self.tools).normal_text
+        self.assertEqual(streamed, "[SILENCE")
+        streamed += detector.finish(self.tools).normal_text
+        self.assertEqual(streamed, "[SILENCE]")
+
+    def test_finish_drops_unfinished_tool_call(self):
+        detector = MinimaxM3Detector()
+        for seg in _segments("<tool_call>", '<invoke name="get_weather">'):
+            detector.parse_streaming_increment(seg, self.tools)
+        result = detector.finish(self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
 
 def _parse_segments_text(text, tools):
     detector = MinimaxM3Detector()

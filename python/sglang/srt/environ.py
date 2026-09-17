@@ -717,6 +717,9 @@ class Envs:
     # Tool calling and native web search
     # ===================================================================
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Reject /v1 requests whose `model` (before any ":adapter" suffix) is not the
+    # served model name with 404, as OpenAI does, instead of serving them anyway.
+    SGLANG_ENABLE_STRICT_MODEL_NAME = EnvBool(False)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.

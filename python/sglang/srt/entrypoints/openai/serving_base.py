@@ -10,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.environ import envs
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -69,6 +70,17 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    def _validate_model_name(self, request: OpenAIServingRequest) -> Optional[str]:
+        """Return an error message when `request.model` names another model."""
+        requested = getattr(request, "model", None)
+        if not requested:
+            return None
+        base_model, _ = self._parse_model_parameter(requested)
+        served = self.tokenizer_manager.served_model_name
+        if base_model in (served, self.tokenizer_manager.model_path):
+            return None
+        return f"The model '{requested}' does not exist"
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -79,6 +91,15 @@ class OpenAIServingBase(ABC):
 
         try:
             # Validate request
+            if envs.SGLANG_ENABLE_STRICT_MODEL_NAME.get():
+                model_error = self._validate_model_name(request)
+                if model_error:
+                    return self.create_error_response(
+                        model_error,
+                        err_type="NotFoundError",
+                        status_code=404,
+                        param="model",
+                    )
             error_msg = self._validate_request(request)
             if error_msg:
                 return self.create_error_response(error_msg)

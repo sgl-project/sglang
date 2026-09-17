@@ -476,6 +476,16 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+
+@app.middleware("http")
+async def add_request_id_header(request: Request, call_next):
+    """Echo the client's X-Request-Id (or mint one) on every response, errors
+    included, so a rejected request can still be traced end to end."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    response = await call_next(request)
+    response.headers.setdefault("X-Request-Id", request_id)
+    return response
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 

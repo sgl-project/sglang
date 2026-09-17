@@ -1332,6 +1332,7 @@ class ServingChatTestCase(unittest.TestCase):
                         }
                     ],
                 },
+                {"role": "tool", "tool_call_id": "call-1", "content": "done"},
             ],
             tools=[tool],
             tool_choice="required",
@@ -1403,6 +1404,7 @@ class ServingChatTestCase(unittest.TestCase):
                         }
                     ],
                 },
+                {"role": "tool", "tool_call_id": "call-1", "content": "done"},
             ],
         )
 
@@ -1410,13 +1412,13 @@ class ServingChatTestCase(unittest.TestCase):
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(messages[-2]["role"], "assistant")
         self.assertEqual(
-            messages[-1]["reasoning_content"],
+            messages[-2]["reasoning_content"],
             "Read <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            messages[-1]["tool_calls"][0]["function"]["arguments"],
+            messages[-2]["tool_calls"][0]["function"]["arguments"],
             "not-json <| kimi_image_placeholder |>",
         )
         self.assertNotIn("image_prompts", kwargs)

@@ -191,6 +191,24 @@ class MinimaxM3Detector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held back as a possible marker prefix (e.g. a final "]").
+
+        Outside a tool call the buffer is plain content; inside one it is an
+        unfinished call the stream can no longer complete, so it is dropped.
+        """
+        pending = self._buffer
+        self._buffer = ""
+        if self._in_tool_call:
+            if pending:
+                logger.warning(
+                    "MiniMax-M3 tool call ended mid-stream; dropping %d buffered chars",
+                    len(pending),
+                )
+            self._in_tool_call = False
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=pending)
+
     def _consume_tool_call_end(self) -> bool:
         start = self._buffer.find(self.TOOL_CALL_END)
         invoke_start = self._buffer.find(self.INVOKE_PREFIX)
