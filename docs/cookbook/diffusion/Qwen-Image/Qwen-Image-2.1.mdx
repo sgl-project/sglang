@@ -338,8 +338,54 @@ PSNR and 0.81 mean absolute error on the 0–255 scale against native precision;
 individual boundary pixels can differ substantially. Online FP8 for both
 components also produced a real transparent PNG in this check. These are
 single-example comparisons, not a quality guarantee. Offline tensorwise scales
-differ from B200 online FP8's channelwise scales. Other serialized formats,
-including NVFP4 and GGUF, remain unverified for this model.
+differ from B200 online FP8's channelwise scales.
+
+### GGUF components
+
+Select **GGUF DiT**, **GGUF encoder**, or **GGUF DiT + encoder** under Server
+precision, then set the corresponding `.gguf` files under **Variables**.
+The picker uses `--component-weights-paths.transformer` and
+`--component-weights-paths.text_encoder`, retaining each component's architecture
+config from the base checkpoint. Each file must contain the entire component
+with native checkpoint tensor names. No online quantization flag is needed;
+the loader reads the quantization type from each GGUF tensor.
+
+The tested Q4_0 export quantizes the same 224 DiT and 252 language-encoder
+matrices listed above. Other tensors retain native precision, including the
+vision tower, embeddings, output head, and VAE. Its DiT and encoder files are
+3.91 and 7.03 GiB respectively. All 476 loaded packed matrices matched the
+exported bytes; sampled CUDA dequantization matched the GGUF CPU reference
+after conversion to BF16.
+
+At revision `7e0d4e9185`, DiT-only, encoder-only, and combined Q4_0 exports
+passed 1024px/40-step HTTP generation, editing, and transparent PNG output on
+B200 with FlashAttention, seed 42, and CFG 1. These are private validation
+exports, not published download targets. Use a compatible export of weights
+you are authorized to access.
+
+The combined export also passed TP2 with encoder folding. On one GPU,
+all-component layerwise offload and whole-encoder CPU offload each matched
+resident generation, editing, and transparent RGBA pixels exactly. TP2 changed
+numerical results. Quantization itself is lossy:
+
+| Q4_0 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 24.99 dB | 33.66 dB |
+| Encoder | 28.97 dB | 43.26 dB |
+| Both | 23.86 dB | 33.46 dB |
+
+The combined export's transparent cat retained alpha values from 0 to 255,
+with 66.8% of pixels at alpha 5 or below. Against native precision, its alpha
+PSNR was 21.20 dB and mean absolute error was 3.29/255; individual boundary
+pixels differed by up to 255. These single-example comparisons do not establish
+general image or cutout quality. Keep native precision when exact output is
+required.
+
+GGUF reduces weight storage; it is not a promise of lower latency. The runtime
+dequantizes packed linears before BF16 matrix multiplication. Other GGUF tensor
+types, exports, and hardware need separate validation. NVFP4 remains unverified
+for this model. See the shared [GGUF guide](/docs/sglang-diffusion/quantization#gguf)
+for loader and parallelism constraints.
 
 ### LoRA and execution options
 

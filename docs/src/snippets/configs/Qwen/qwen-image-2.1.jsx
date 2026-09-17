@@ -96,7 +96,7 @@ const config = {
       id: "precision",
       title: "Precision",
       scope: "serve",
-      description: "Native precision is the default. FP8 changes image and alpha values. Serialized options require compatible component directories under Variables.",
+      description: "Native precision is the default. Quantization changes image and alpha values. Set compatible FP8 directories or GGUF files under Variables.",
       default: "native",
       options: [
         { id: "native", label: "Native BF16 / FP32", recommended: true },
@@ -123,6 +123,18 @@ const config = {
         {
           id: "serialized_fp8_both", label: "Serialized FP8 DiT + encoder", flags: ['--component-paths.transformer "{{FP8_DIT_PATH}}"', '--component-paths.text_encoder "{{FP8_ENCODER_PATH}}"'],
           soft: true, softReason: "Exported components passed 1024px/40-step generation, editing, and transparent output on B200. All-component offload matched resident pixels after the vision RoPE fix; TP2 changes numerical results. Validate your exported checkpoint's quality.",
+        },
+        {
+          id: "gguf_dit", label: "GGUF DiT", flags: ['--component-weights-paths.transformer "{{GGUF_DIT_PATH}}"'],
+          soft: true, softReason: "A Q4_0 DiT export passed 1024px/40-step generation, editing, and transparent output on B200. Other exports and hardware need validation.",
+        },
+        {
+          id: "gguf_encoder", label: "GGUF encoder", flags: ['--component-weights-paths.text_encoder "{{GGUF_ENCODER_PATH}}"'],
+          soft: true, softReason: "A native-name Q4_0 language encoder export passed generation, editing, and transparent output on B200; vision weights retain native precision.",
+        },
+        {
+          id: "gguf_both", label: "GGUF DiT + encoder", flags: ['--component-weights-paths.transformer "{{GGUF_DIT_PATH}}"', '--component-weights-paths.text_encoder "{{GGUF_ENCODER_PATH}}"'],
+          soft: true, softReason: "Combined Q4_0 exports passed 1024px/40-step generation, editing, and transparent output on B200. GGUF reduces weight memory; output quality and speed depend on the export and workload.",
         },
       ],
     },
@@ -298,6 +310,8 @@ const config = {
     MODEL_PATH: { target: "command", label: "Authorized checkpoint directory", default: "/models/qwen-image-2.1" },
     FP8_DIT_PATH: { target: "command", label: "Serialized FP8 DiT directory", default: "/models/qwen-image-2.1-fp8/transformer" },
     FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
+    GGUF_DIT_PATH: { target: "command", label: "GGUF DiT file", default: "/models/qwen-image-2.1-gguf/transformer-Q4_0.gguf" },
+    GGUF_ENCODER_PATH: { target: "command", label: "GGUF encoder file", default: "/models/qwen-image-2.1-gguf/text_encoder-Q4_0.gguf" },
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
