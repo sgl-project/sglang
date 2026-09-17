@@ -700,7 +700,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
         """Request effort for the V4.1 encoder; unsupported tiers warn once and fall back."""
-        effort = chat_encoding.resolve_dsv41_reasoning_effort(value)
+        effort = chat_encoding.parse_dsv41_reasoning_effort(value)
         if effort is not None:
             return effort
         if (
@@ -1535,7 +1535,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     real_input = real_input.replace(
                         encoding_dsv41.IMAGE_PLACEHOLDER,
                         tokenizer.convert_ids_to_tokens(
-                            self.tokenizer_manager.model_config.hf_config.image_token_id
+                            self.tokenizer_manager.image_token_id
                         ),
                     )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)

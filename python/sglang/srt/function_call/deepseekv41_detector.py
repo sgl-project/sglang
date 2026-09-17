@@ -1,5 +1,16 @@
 from typing import List, Literal, Optional, Union
 
+from xgrammar.structural_tag import (
+    AnyTextFormat,
+    ConstStringFormat,
+    JSONSchemaFormat,
+    OrFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
+
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
@@ -38,21 +49,6 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         the unspaced " parameter" name, and the V3.2-lineage parser accepts a
         JSON body inside an invoke.
         """
-        try:
-            from xgrammar.structural_tag import (
-                AnyTextFormat,
-                ConstStringFormat,
-                JSONSchemaFormat,
-                OrFormat,
-                SequenceFormat,
-                StructuralTag,
-                TagFormat,
-                TagsWithSeparatorFormat,
-                TriggeredTagsFormat,
-            )
-        except ImportError:
-            return None
-
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [
