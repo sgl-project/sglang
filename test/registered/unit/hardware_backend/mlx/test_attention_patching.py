@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
@@ -1544,6 +1545,53 @@ if _HAS_MLX:
         def process_batch_result(self, batch, result):
             self.processed_batch = batch
             self.processed_result = result
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxDecodeKvRelease(CustomTestCase):
+    def test_decode_kv_is_published_before_request_row_is_reused(self):
+        """A later flush must not scatter a finished request into its successor's slots."""
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        runner = object.__new__(MlxModelRunner)
+        _set_runner_cache_layout(runner, num_layers=1, attention_layer_indices=[0])
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=8, num_layers=1, n_kv_heads=1, head_dim=1, dtype=mx.float32
+        )
+        runner._req_to_token_pool = ReqToTokenPool(
+            size=1, max_context_len=8, device="cpu", enable_memory_saver=False
+        )
+        row = runner._req_to_token_pool.req_to_token[0]
+        row[:3] = torch.tensor([1, 2, 3])
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=1, max_seq_len=8, dtype=mx.float32
+        )
+        for value in (11, 22, 33):
+            token = mx.full((1, 1, 1, 1), value, dtype=mx.float32)
+            cache.write_token(token, -token)
+        runner._req_caches = {"old": [cache]}
+        runner._req_pool_idx = {"old": 0}
+        runner._req_synced_offset = {"old": 1}
+        worker = object.__new__(MlxTpModelWorker)
+        worker._mlx_runner = runner
+        worker._mlx_active_reqs = {"old": (object(), 0)}
+
+        worker.prepare_for_kv_cache_release(SimpleNamespace(rid="old", kv=ReqKvInfo()))
+        self.assertEqual(worker._mlx_active_reqs, {})
+        keys, values = runner._attention_kv_pool.get_kv(0, mx.array([2, 3]))
+        self.assertEqual(keys.flatten().tolist(), [22, 33])
+        self.assertEqual(values.flatten().tolist(), [-22, -33])
+
+        # Reuse the request row while the old MLX request awaits stale-rid cleanup.
+        row[:3] = torch.tensor([4, 5, 6])
+        token = mx.full((2, 1, 1), 99, dtype=mx.float32)
+        runner._attention_kv_pool.set_kv(0, mx.array([5, 6]), token, -token)
+        runner.flush_all_decode_kv()
+        keys, values = runner._attention_kv_pool.get_kv(0, mx.array([5, 6]))
+        self.assertEqual(keys.flatten().tolist(), [99, 99])
+        self.assertEqual(values.flatten().tolist(), [-99, -99])
 
 
 if __name__ == "__main__":
