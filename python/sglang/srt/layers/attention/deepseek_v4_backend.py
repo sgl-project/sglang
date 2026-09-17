@@ -80,13 +80,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-<<<<<<< HEAD
     deep_gemm_fp4_paged_mqa_logits,
     select_candidate_block_indices,
-=======
-    fp4_paged_mqa_logits,
-    fp32_jit_paged_topk,
->>>>>>> 5373c285b4 (Fuse Hopper DSv4.1 candidate selection)
     select_candidate_blocks,
     topk_transform_paged_from_metadata,
 )
