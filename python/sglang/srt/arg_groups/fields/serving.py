@@ -87,7 +87,8 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "default. Follower nodes expose GetServerInfo only. "
+        "In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.

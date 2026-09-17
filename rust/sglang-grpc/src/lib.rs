@@ -15,6 +15,7 @@ use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 use bridge::{ChunkSendStatus, DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
+use proto::sglang_service_server::SglangService;
 use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
@@ -38,6 +39,72 @@ impl GrpcServerHandle {
     fn is_alive(&self) -> bool {
         self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
+}
+
+fn bind_listener(host: &str, port: u16) -> PyResult<TcpListener> {
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
+    let listener = TcpListener::bind(addr).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to bind gRPC server to {}: {}",
+            addr, e
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to configure gRPC listener for {}: {}",
+            addr, e
+        ))
+    })?;
+    Ok(listener)
+}
+
+fn start_server_thread(
+    rt: tokio::runtime::Runtime,
+    listener: TcpListener,
+    service: impl SglangService,
+) -> PyResult<GrpcServerHandle> {
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    let join_handle = std::thread::Builder::new()
+        .name("sglang-grpc".to_string())
+        .spawn(move || {
+            if let Err(e) = rt.block_on(server::run_grpc_server(listener, service, shutdown_clone))
+            {
+                tracing::error!("gRPC server exited with error: {}", e);
+            }
+        })
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to spawn gRPC thread: {}", e))
+        })?;
+
+    Ok(GrpcServerHandle {
+        shutdown,
+        join_handle: Some(join_handle),
+    })
+}
+
+/// Start a follower server exposing only GetServerInfo, without an inference bridge.
+#[pyfunction]
+fn start_metadata_server(
+    host: String,
+    port: u16,
+    server_info_json: String,
+) -> PyResult<GrpcServerHandle> {
+    let listener = bind_listener(&host, port)?;
+    // Metadata is a startup snapshot; it needs neither Python callbacks nor a
+    // worker pool. The dedicated server thread drives this runtime directly.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to build Tokio runtime for gRPC metadata server: {}",
+                err
+            ))
+        })?;
+    start_server_thread(rt, listener, server::MetadataService { server_info_json })
 }
 
 struct TokenizerInfo {
@@ -164,9 +231,6 @@ fn start_server(
         )
         .try_init();
 
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
     let worker_threads = worker_threads.max(1);
     let response_channel_capacity = if response_channel_capacity == 0 {
         tracing::warn!(
@@ -187,18 +251,7 @@ fn start_server(
         response_timeout_secs
     };
     let response_timeout = Duration::from_secs(response_timeout_secs);
-    let listener = TcpListener::bind(addr).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "Failed to bind gRPC server to {}: {}",
-            addr, e
-        ))
-    })?;
-    listener.set_nonblocking(true).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "Failed to configure gRPC listener for {}: {}",
-            addr, e
-        ))
-    })?;
+    let listener = bind_listener(&host, port)?;
 
     let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
 
@@ -230,35 +283,20 @@ fn start_server(
         response_channel_capacity,
         tokio_handle,
     ));
-    let shutdown = Arc::new(Notify::new());
-    let shutdown_clone = shutdown.clone();
-    let bridge_clone = bridge.clone();
-
-    let join_handle = std::thread::Builder::new()
-        .name("sglang-grpc".to_string())
-        .spawn(move || {
-            if let Err(e) = rt.block_on(server::run_grpc_server(
-                listener,
-                bridge_clone,
-                shutdown_clone,
-                response_timeout,
-            )) {
-                tracing::error!("gRPC server exited with error: {}", e);
-            }
-        })
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to spawn gRPC thread: {}", e))
-        })?;
-
-    Ok(GrpcServerHandle {
-        shutdown,
-        join_handle: Some(join_handle),
-    })
+    start_server_thread(
+        rt,
+        listener,
+        server::SglangServiceImpl {
+            bridge,
+            response_timeout,
+        },
+    )
 }
 
 #[pymodule]
 fn _grpc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
+    m.add_function(wrap_pyfunction!(start_metadata_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
     m.add_class::<ChunkSendStatus>()?;
     Ok(())

@@ -16,6 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(false)
+        // The follower implements only GetServerInfo; all other RPCs return
+        // UNIMPLEMENTED without constructing the inference bridge.
+        .generate_default_stubs(true)
         .protoc_arg("--experimental_allow_proto3_optional")
         .file_descriptor_set_path(
             std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())

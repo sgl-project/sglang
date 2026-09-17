@@ -165,6 +165,12 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    grpc_server: Optional[Any] = None
+
+    def stop_grpc_server(self) -> None:
+        if self.grpc_server is not None:
+            self.grpc_server.shutdown()
+            self.grpc_server = None
 
 
 def init_tokenizer_manager(
@@ -937,6 +943,17 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            if any("kv_event_sources" in info for info in infos):
+                # Both gRPC entrypoints consume the first scheduler info. Keep
+                # the sources from every local scheduler, not just the first.
+                infos[0]["kv_event_sources"] = sorted(
+                    (
+                        source
+                        for info in infos
+                        for source in info.get("kv_event_sources", [])
+                    ),
+                    key=lambda source: source["dp_rank"],
+                )
             scheduler_infos.extend(infos)
             if use_dp_controller:
                 for info in infos:
@@ -1159,6 +1176,20 @@ class Engine(EngineScoreMixin, EngineBase):
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
+            from sglang.srt.entrypoints.grpc_metadata import start_follower_grpc_server
+
+            try:
+                scheduler_init_result.grpc_server = start_follower_grpc_server(
+                    server_args, scheduler_init_result.scheduler_infos[0]
+                )
+            except BaseException:
+                # Engine.__init__ has not received these handles yet. Do not
+                # leave GPU workers behind if binding the metadata port fails.
+                for proc in scheduler_procs or []:
+                    kill_process_tree(proc.pid, wait_timeout=60)
+                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                raise
+
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
@@ -1174,14 +1205,16 @@ class Engine(EngineScoreMixin, EngineBase):
             rust_server_owns_base_port = (
                 envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             )
-            if not rust_server_owns_base_port:
-                launch_dummy_health_check_server(
-                    get_serving().host,
-                    get_serving().port,
-                    get_observability().enable_metrics,
-                )
-
-            scheduler_init_result.block_until_scheduler_exits()
+            try:
+                if not rust_server_owns_base_port:
+                    launch_dummy_health_check_server(
+                        get_serving().host,
+                        get_serving().port,
+                        get_observability().enable_metrics,
+                    )
+                scheduler_init_result.block_until_scheduler_exits()
+            finally:
+                scheduler_init_result.stop_grpc_server()
             return (
                 None,
                 None,
@@ -1275,6 +1308,9 @@ class Engine(EngineScoreMixin, EngineBase):
         its GPU context so the caller can immediately reallocate on the same
         device."""
         try:
+            scheduler_init_result = getattr(self, "_scheduler_init_result", None)
+            if scheduler_init_result is not None:
+                scheduler_init_result.stop_grpc_server()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
@@ -1666,7 +1702,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
