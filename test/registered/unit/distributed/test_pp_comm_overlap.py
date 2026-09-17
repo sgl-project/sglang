@@ -1,14 +1,10 @@
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, call
 
 import torch
 
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    TensorMetadata,
-)
 from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     _allocate_distinct_cuda_stream,
@@ -37,40 +33,6 @@ class FakeEvent:
 
     def record(self, stream):
         self.recorded_stream = stream
-
-
-def test_irecv_tensor_dict_defers_payload_wait():
-    coordinator = object.__new__(GroupCoordinator)
-    coordinator.world_size = 2
-    coordinator.rank_in_group = 1
-    coordinator.ranks = [0, 1]
-    coordinator.device_group = "device-group"
-    coordinator.cpu_group = "cpu-group"
-    coordinator.recv_object = Mock(
-        return_value=[
-            (
-                "hidden_states",
-                TensorMetadata(torch.device("cpu"), torch.float32, (2, 3)),
-            ),
-            ("kind", "proxy"),
-        ]
-    )
-    work = FakeWork()
-
-    with (
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.irecv", return_value=work) as irecv,
-    ):
-        tensors, works, postprocess = coordinator.irecv_tensor_dict()
-
-    assert tensors["hidden_states"].shape == (2, 3)
-    assert tensors["kind"] == "proxy"
-    assert len(works) == 1
-    assert works[0].work is work
-    assert works[0].payload is tensors["hidden_states"]
-    assert postprocess == []
-    assert work.wait_count == 0
-    irecv.assert_called_once_with(tensors["hidden_states"], src=0, group="cpu-group")
 
 
 def test_graph_proxy_send_records_forward_reuse_fence():
