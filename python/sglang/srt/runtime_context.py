@@ -132,6 +132,10 @@ class Live(msgspec.Struct, frozen=True):
 
     source: Any = None
     doc: str = ""
+    # For a stamp-only name (`source=None`): what a reader should be told when
+    # nothing has stamped it. These names have no fallback by construction, so
+    # the message is the only thing pointing at what did not happen.
+    unstamped: str = ""
 
 
 _LIVE_READS: dict = {
@@ -177,7 +181,50 @@ _LIVE_READS: dict = {
     "attn_cp_rank": "get_attn_context_model_parallel_rank",
     "dcp_rank": "get_dcp_rank",
     "attn_dcp_rank": lambda self: self.dcp_rank if self.dcp_enabled else 0,
-    "attn_dp_rank": None,
+    "attn_dp_rank": Live(
+        source=None,
+        doc=(
+            "This process's index in the attention-DP group. Computed from "
+            "`tp_rank` when the attention topology is initialized, and moved "
+            "by an elastic scale-up, so no coordinator can answer it."
+        ),
+        unstamped=(
+            "it is computed from this process's `tp_rank` when the attention "
+            "topology is initialized, so a process that never ran "
+            "`initialize_dp_attention` has no answer to give"
+        ),
+    ),
+    "dp_rank": Live(
+        source=None,
+        doc=(
+            "Which data-parallel replica this process serves, as the data "
+            "parallel controller numbered them at spawn. `None` when there is "
+            "no controller. Unlike `attn_dp_rank` and `moe_dp_rank` it is not "
+            "a position in any process group -- no group has one member per "
+            "replica -- which is why nothing can derive it and the spawn "
+            "states it instead."
+        ),
+        unstamped=(
+            "it is a spawn identity, handed to `publish(..., ranks=...)` by "
+            "the process entry; a process that published without a rank "
+            "bundle has no replica index to report"
+        ),
+    ),
+    "gpu_id": Live(
+        source=None,
+        doc=(
+            "The device this process was given, as the launcher assigned it. "
+            "Per-process like the ranks beside it, and like them not a "
+            "position in any group -- the spawn states it. It is here rather "
+            "than on the `device` configuration because a config bag holds "
+            "what every process in the deployment shares."
+        ),
+        unstamped=(
+            "it is a spawn identity, handed to `publish(..., ranks=...)` by "
+            "the process entry; a process that published without a rank "
+            "bundle was not told which device it owns"
+        ),
+    ),
     "world_group": "get_world_group",
     "tp_group": "get_tp_group",
     "pp_group": "get_pp_group",
@@ -327,6 +374,26 @@ def dcp_enabled_of(cfg: Any):
     return parallel_widths_of(cfg)["dcp_enabled"]
 
 
+class SpawnRanks(msgspec.Struct, frozen=True):
+    """Who this process is, as the launcher decided when it spawned it.
+
+    Not configuration -- every field varies per process while the record is
+    identical across them -- and not derivable from the process groups either:
+    `dp_rank` counts replicas, and no group has one member per replica. The
+    launcher already computes all of it (`entrypoints/engine.py` lays out the
+    ranks it is about to spawn), so the process entry hands it over at publish
+    rather than each subsystem re-deriving its own copy.
+    """
+
+    gpu_id: int
+    tp_rank: int
+    pp_rank: int
+    dp_rank: Optional[int] = None
+    attn_cp_rank: int = 0
+    moe_dp_rank: int = 0
+    moe_ep_rank: int = 0
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
@@ -394,11 +461,10 @@ class ParallelContext:
                 return getattr(_ps(), source)()
             if source is not None:
                 return source(self)
+            why = live.unstamped if isinstance(live, Live) else ""
             raise RuntimeError(
-                f"parallel rank {name!r} is not available: it is computed from "
-                "this process's `tp_rank` when the attention topology is "
-                "initialized, so a process that never ran "
-                "`initialize_dp_attention` has no answer to give"
+                f"parallel name {name!r} is not available: "
+                + (why or "nothing has stamped it in this process")
             )
         if config is None and name in _parallel_config_leaves():
             raise ValueError("config namespace 'parallel' not published")
@@ -1598,7 +1664,13 @@ def _dump_recorded_namespace_reads() -> None:
         )
 
 
-def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+def publish(
+    server_args,
+    *,
+    role: str,
+    hf_config: Any = None,
+    ranks: SpawnRanks | None = None,
+) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
     Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
@@ -1608,6 +1680,12 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
+
+    ``ranks`` is who this process is, from the entry that spawned it. It is
+    optional because most roles are not placed in the topology at all -- a
+    tokenizer has no ``tp_rank`` -- and those processes raise on a rank read
+    exactly as they do today, with a message naming the missing bundle rather
+    than an absent process group.
 
     A process holds at most one live config: the bags always describe the
     engine running now. Re-publish is allowed and is **last-publish-wins**
@@ -1634,6 +1712,14 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             ),
         )
     _CONTEXT._publish_role = role
+    if ranks is not None:
+        # Two per-process identities with no group to answer them: `dp_rank`
+        # counts replicas, `gpu_id` names the device this process was given.
+        # Neither belongs on a config bag -- a bag holds what every process in
+        # the deployment shares -- so both are recorded here.
+        _CONTEXT.parallel.override_permanently(
+            dp_rank=ranks.dp_rank, gpu_id=ranks.gpu_id
+        )
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).

@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
     RuntimeContext,
+    SpawnRanks,
     _FlagGroupBase,
     assert_published,
     derive_parallel_widths,
@@ -198,6 +199,68 @@ class TestTheTwoWorldWidths(_IsolatedOverrides):
             with parallel.override(max_ep_size=6):
                 self.assertEqual(parallel.max_world_size, 6)
                 self.assertEqual(parallel.launch_world_size, 2)
+
+
+class TestSpawnIdentities(_IsolatedOverrides):
+    """`dp_rank` and `gpu_id` come from the spawn, because nothing else has them.
+
+    Both vary per process while the record is identical across them, and
+    neither is a position in any process group -- no group has one member per
+    data-parallel replica. So the process entry states them at publish.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_derived_widths(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_publishing_with_a_bundle_records_both(self):
+        publish(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="test",
+            ranks=SpawnRanks(gpu_id=3, tp_rank=1, pp_rank=0, dp_rank=2),
+        )
+        self.assertEqual(get_parallel().dp_rank, 2)
+        self.assertEqual(get_parallel().gpu_id, 3)
+
+    def test_no_controller_is_an_answer_not_a_failure(self):
+        """`dp_rank=None` means "not under a data parallel controller", which
+        is a fact about the deployment, unlike never having been told."""
+        publish(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=0, pp_rank=0, dp_rank=None),
+        )
+        self.assertIsNone(get_parallel().dp_rank)
+
+    def test_publishing_without_a_bundle_names_what_is_missing(self):
+        publish(ServerArgs(model_path="dummy", tp_size=2), role="test")
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().dp_rank
+        self.assertIn("rank bundle", str(caught.exception))
+
+    def test_the_device_is_a_spawn_identity_too(self):
+        """It is per-process, so it is recorded next to the ranks rather than
+        on a config bag, which holds what the whole deployment shares."""
+        publish(ServerArgs(model_path="dummy", tp_size=2), role="test")
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().gpu_id
+        self.assertIn("rank bundle", str(caught.exception))
+
+    def test_the_attention_rank_keeps_its_own_explanation(self):
+        """Two stamp-only names, two different reasons to be missing."""
+        publish(ServerArgs(model_path="dummy", tp_size=2), role="test")
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_dp_rank
+        self.assertIn("initialize_dp_attention", str(caught.exception))
 
 
 class TestStampedRanks(_IsolatedOverrides):
