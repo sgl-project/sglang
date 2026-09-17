@@ -7,6 +7,12 @@ single GPU/rank/node, bf16, resident non-FSDP weights, FA attention and eager
 execution. Other components use their ordinary loaders. Unsupported resolved
 configurations and missing/incompatible owners are errors, not disk fallback.
 
+Cache-off keeps the ordinary pipeline's automatic attention, device placement
+and config validation. Both paths reuse the same transformer loader resolver
+and materializer; only cache preparation freezes the FA/resident recipe. Compare
+ordinary/cache numerics with explicit `--attention-backend fa` on both sides,
+not ordinary auto-selection (which can choose a different backend on Blackwell).
+
 ## Run
 
 Use the same immutable checkpoint and installed code for both processes:
@@ -45,6 +51,9 @@ do not edit a snapshot or installed native package in place. Python source is
 hashed across the installed `sglang` package; editing it requires restarting the
 owner. Development-only weak/unverified identity switches explicitly relax this
 contract and are not production defaults.
+The unverified-build switch permits missing native provider RECORDs only: stable
+complete Python source hashing is always required. Directory symlinks in the
+source package fail closed rather than silently omitting importable code.
 
 Identity includes installed `sglang-kernel` (Python import `sgl_kernel`), selected
 FA4 provider, and native/JIT dependency versions and publication RECORD hashes.
@@ -70,13 +79,15 @@ Status remains available after exhaustion; new launcher admissions and fetches
 fail closed. Consumer exit never refunds budget. `admission_stopped` is distinct
 from budget exhaustion. This is a snapshot, not a reservation or allocator/VRAM
 measurement; a draining/exited owner may no longer serve the socket.
+Set the owner's `--weight-cache-max-deliveries` to configure the delivery cap
+(default 128); the additional component storage-export cap remains 65536.
 
 ## Reuse boundary
 
 | Responsibility | Implementation |
 | --- | --- |
 | IPC serialization/import, UUID mapping | Existing SRT `TorchIpcTransportBackend`, serializer and Torch reduction patch |
-| Message framing/cap, environment stamp, stale cleanup | Existing SRT `weight_cache.protocol` |
+| Message framing/cap, environment stamp | Existing SRT `weight_cache.protocol` |
 | Parameter/buffer traversal, registration, producer watchdog | `weight_cache_common`, also consumed by SRT |
 | Weight loading and finalization | Existing diffusion `TransformerLoader` and `ComponentLoader`, using frozen decisions |
 | Pipeline component materialization | Existing `ComposedPipelineBase` load loop, including uncached components |
@@ -121,10 +132,22 @@ sglang serve --model-path /path/to/pinned/H3/snapshot --model-variant fl2va \
   generation; its watchdog starts before requesting any handles.
 - A same-user Unix peer is authenticated with kernel credentials. Fetches bind
   the full compatibility plan, producer PID/start identity and generation nonce.
+  Consumer PID/start identity is checked before pinning its pidfd. The diffusion
+  owner requires Linux pidfd open/signal support; it never signals bare stale PIDs.
+- Device-level ownership (within the configured runtime directory) and actual
+  socket/ready paths are locked. Live sockets cannot be stolen even without a
+  ready file. Stale cleanup never kills a PID recorded by a previous generation.
+- Up to 16 concurrent control connections are served. An idle/meta-building
+  client does not monopolize admission/status. Socket timeout uses the configured
+  `--weight-cache-timeout`; excess connections are closed without exporting.
 - The owner retains every finalized allocation. SIGTERM stops admission and
   terminates/drains actual fetching consumers before releasing ownership.
   Unexpected owner death kills attached consumers; recovery requires restarting
   them. It is not safe for a consumer to keep running without its owner.
+  After a 5-second graceful window, SIGKILL is sent once through pinned pidfds.
+  A stuck consumer or unobservable exit keeps the owner and allocations alive
+  with critical diagnostics; another SIGTERM does not bypass this safety rule.
+  Forced owner SIGKILL is emergency, non-graceful teardown, not GPU-reset recovery.
 - Each delivery serializes fresh counted sends. Abandoned/fatal consumers may
   retain Torch bookkeeping until owner exit. Non-refundable delivery and storage
   export budgets bound this; restart the owner after draining when exhausted.
@@ -161,6 +184,10 @@ checks real owner status through budget exhaustion and client exit. It is not a
 generic syscall/security sandbox. The lifecycle test uses a tiny CUDA adapter
 with real diffusion socket/IPC orchestration and injects generation replacement
 and producer death before fetch, during finalize, and during slow uncached load.
+It also blocks two fresh workers in meta construction simultaneously, checks
+status while both connections remain open, then imports concurrently and drains
+both real consumers. The large Wan test's starts are sequential; its inference
+requests are concurrent.
 The automatic-placement test injects only free-memory observations in separate
 processes and verifies stable cached identity despite uncached placement changes.
 
@@ -181,7 +208,7 @@ mutation APIs and covers both graceful and abrupt owner loss plus restart:
 pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_qwen_image_1_gpu.py -v -s
 ```
 
-Use `SGLANG_WEIGHT_CACHE_QWEN_TEST_MODEL` for a local Qwen snapshot. Its default
+Use `SGLANG_TEST_WEIGHT_CACHE_QWEN_MODEL` for a local Qwen snapshot. Its default
 is the pinned original Qwen-Image revision, not an automatically selected variant.
 
 H3's acceptance test compares valid 4-second 1344×768 T2VA output at 4/8 sampling
@@ -194,13 +221,16 @@ not certification of H3's separate multi-GPU `quality="high"` deployment profile
 pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_minimax_h3_1_gpu.py -v -s
 ```
 
-`SGLANG_WEIGHT_CACHE_MINIMAX_TEST_MODEL` can select a local pinned repository root.
+`SGLANG_TEST_WEIGHT_CACHE_MINIMAX_MODEL` can select a local pinned repository root.
 
-`SGLANG_WEIGHT_CACHE_TEST_MODEL` can point to a local published mirror. The
+`SGLANG_TEST_WEIGHT_CACHE_MODEL` can point to a local published mirror. The
 default uses a pinned HF revision. Readiness samples and median/p90 for both
 `/liveness` and `/health` are written to the pytest temporary output directory.
-The initial regression threshold is not a speedup claim; speedup must be
-established separately for the target model, storage and host.
+Wall-clock measurements are artifacts, not per-PR correctness gates; speedup
+must be established separately for the target model, storage and host. The
+startup guard is registered in the 1-GPU diffusion suite. Native H3 is registered
+in the large-memory 1-GPU B200 diffusion suite; local H200 results do not replace
+that runner's acceptance result.
 
 For startup performance, use the separate paired benchmark from the repo root:
 

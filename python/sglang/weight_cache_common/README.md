@@ -28,7 +28,7 @@ subclasses and unsupported parameter metadata fail closed.
 manifest. It validates all registrations and storage bounds before changing the
 module, constructs zero-copy typed views, restores exact object ties and buffer
 persistence, and restores training flags without recursive `train()` side effects.
-Scalar/container metadata and constructor-local callables on ordinary parameters
+Scalar/container metadata and constructor-local callables on parameters/buffers
 are retained; remote Python objects and derived tensor attributes are not imported.
 Adapters remain responsible for derived state and for auditing immutable forward
 behavior. `.eval()` and `requires_grad=False` are not write protection.
@@ -89,6 +89,21 @@ are safety bounds, not tuned production lifetime promises. A future control
 service must expose them and propagate errors; it must never silently reload disk
 weights while a live producer occupies the GPU. This implementation does not
 claim unlimited leak-free crash recovery.
+
+SRT's standalone/engine-spawned owner accepts `--weight-cache-max-deliveries`.
+Its `query_status` request returns the configured/reserved/remaining delivery
+budget without exporting. Exhaustion returns an explicit `budget_exhausted`
+response, and the loader reports it without treating it as a config mismatch
+or falling back to disk. To query one local rank without loading weights:
+
+```bash
+python -m sglang.srt.weight_cache.daemon --status --model-path /path/to/model --gpu-id 0
+```
+
+Use `--weight-cache-socket` to override discovery. Queries remain available after
+exhaustion. Successful exits and failed sends never refund delivery reservations.
+The SRT loader closes a failed-load watchdog only if no import began; partial
+imports can retain traceback-held storages and stay guarded until worker exit.
 
 ## Identity helpers
 
