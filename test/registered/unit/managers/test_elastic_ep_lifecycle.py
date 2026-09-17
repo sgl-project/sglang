@@ -52,6 +52,7 @@ def _manager() -> TokenizerManager:
     manager.elastic_last_error = None
     manager.elastic_runtime_health = "healthy"
     manager.elastic_runtime_error = None
+    manager.elastic_scheduler_response_timeout = 30
     manager.elastic_joining_rank_offset = None
     manager.elastic_joining_rank_count = 0
     manager.elastic_ready_rank_count = 0
@@ -125,6 +126,81 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.scale_phase, "waiting_for_cohort")
         self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 2)
+
+    async def test_submission_timeout_releases_lock_for_retry(self):
+        manager = _manager()
+        submission_ids = []
+
+        async def submit(request):
+            submission_ids.append(request.submission_id)
+            if len(submission_ids) == 1:
+                await asyncio.Event().wait()
+            return [
+                ScaleElasticEPReqOutput(
+                    success=True,
+                    message="existing operation",
+                    old_ep_size=4,
+                    new_ep_size=8,
+                    pending_ep_size=8,
+                    scale_phase="waiting_for_cohort",
+                    submission_id=request.submission_id,
+                )
+            ]
+
+        manager.scale_elastic_ep_communicator.side_effect = submit
+        manager.elastic_scheduler_response_timeout = 0.01
+        request = ScaleElasticEPReqInput(new_ep_size=8, operation_id="grow-1")
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await manager.scale_elastic_ep(request)
+
+        self.assertFalse(manager._elastic_scale_lock.locked())
+        self.assertEqual(manager.elastic_scale_phase, "submission_unknown")
+
+        result = await manager.scale_elastic_ep(request)
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.terminal)
+        self.assertEqual(result.scale_phase, "waiting_for_cohort")
+        self.assertEqual(len(submission_ids), 2)
+        self.assertNotEqual(submission_ids[0], submission_ids[1])
+
+    async def test_terminal_update_wins_over_late_acceptance_response(self):
+        manager = _manager()
+
+        async def complete_then_accept(request):
+            manager.forward_elastic_scale_update(
+                ElasticScaleUpdateReq(
+                    success=True,
+                    effective_ep_size=8,
+                    operation_id="grow-1",
+                    scale_phase="serving_expanded",
+                )
+            )
+            return [
+                ScaleElasticEPReqOutput(
+                    success=True,
+                    message="accepted",
+                    old_ep_size=4,
+                    new_ep_size=8,
+                    pending_ep_size=8,
+                    scale_phase="waiting_for_cohort",
+                    submission_id=request.submission_id,
+                )
+            ]
+
+        manager.scale_elastic_ep_communicator.side_effect = complete_then_accept
+
+        result = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(new_ep_size=8, operation_id="grow-1")
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.terminal)
+        self.assertEqual(result.scale_phase, "serving_expanded")
+        self.assertEqual(result.effective_ep_size, 8)
+        self.assertTrue(manager.elastic_operation_succeeded)
+        self.assertIsNone(manager.elastic_pending_ep_size)
 
     async def test_retry_observes_operation_completed_after_unknown_submission(self):
         manager = _manager()
@@ -377,6 +453,7 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
             operation_id="grow-1",
             runtime_instance_id="runtime-1",
             expected_joining_member_ids=["pod-uid-5"],
+            submission_id="submission-2",
         )
 
         with (
@@ -392,6 +469,7 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
         self.assertFalse(result.terminal)
         self.assertEqual(result.pending_ep_size, 8)
         self.assertEqual(result.scale_phase, "waiting_for_cohort")
+        self.assertEqual(result.submission_id, "submission-2")
 
     def test_same_operation_with_different_target_conflicts_in_scheduler(self):
         state = ElasticEPState(
