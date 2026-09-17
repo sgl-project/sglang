@@ -1789,29 +1789,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "sglang.srt.arg_groups.model_overrides.deepseek_v4.is_flashinfer_available",
             return_value=True,
         ):
-            with override_platform(
-                is_sm100=True, is_sm120=False, is_hip=False
-            ):
+            with override_platform(is_sm100=True, is_sm120=False, is_hip=False):
                 self.assertEqual(
-                    _deepseek_v4_overrides(_args(), hf_v41)[
-                        "fp8_gemm_runner_backend"
-                    ],
+                    _deepseek_v4_overrides(_args(), hf_v41)["fp8_gemm_runner_backend"],
                     "flashinfer_cutedsl",
                 )
-            with override_platform(
-                is_sm100=False, is_sm120=True, is_hip=False
-            ):
+            with override_platform(is_sm100=False, is_sm120=True, is_hip=False):
                 self.assertEqual(
-                    _deepseek_v4_overrides(_args(), hf_v41)[
-                        "fp8_gemm_runner_backend"
-                    ],
+                    _deepseek_v4_overrides(_args(), hf_v41)["fp8_gemm_runner_backend"],
                     "flashinfer_cutlass",
                 )
             self.assertNotIn(
                 "fp8_gemm_runner_backend",
-                _deepseek_v4_overrides(
-                    _args(fp8_gemm_runner_backend="triton"), hf_v41
-                ),
+                _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf_v41),
             )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(
