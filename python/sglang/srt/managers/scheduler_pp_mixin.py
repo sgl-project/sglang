@@ -1165,6 +1165,11 @@ class SchedulerPPMixin:
             return
         fwd_batch.seq_lens = seq_lens
         fwd_batch.out_cache_loc = verify_out_cache_loc
+        # ScheduleBatch.copy() intentionally keeps only result-processing
+        # fields and drops tree_cache.  The shared commit helper needs its page
+        # size to derive the Mamba tracking grid, so restore this scheduler's
+        # live cache context on the forward snapshot.
+        fwd_batch.tree_cache = batch.tree_cache
         accept_index = accept_index.to(device)
         accept_lens = pp_outputs["spec_accept_lens"].to(device)
 
