@@ -150,6 +150,19 @@ class ResponseTemplateStreamAdapter:
             tools=parser_tools,
         )
 
+    def _initial_events(self, parser: Any) -> list[dict]:
+        if self._mode != AdapterMode.TOOL:
+            return []
+        active_open = None
+        for event in parser.initial_events:
+            if event.get("field") != self._tool_field:
+                continue
+            if event["type"] == "region_open":
+                active_open = {**event, "from_prefix": True}
+            elif event["type"] == "region_close":
+                active_open = None
+        return [] if active_open is None else [active_open]
+
     def _recover_failed_tool_input(self, current_text: str) -> str:
         if self._stream_parser is None:
             return current_text
@@ -164,7 +177,7 @@ class ResponseTemplateStreamAdapter:
     def _raw_tool_events(self, events: Sequence[dict]) -> str:
         parts: List[str] = []
         for event in events:
-            if event.get("field") != self._tool_field:
+            if event.get("field") != self._tool_field or event.get("from_prefix"):
                 continue
             if event["type"] == "region_chunk":
                 parts.append(event["text"])
@@ -177,9 +190,9 @@ class ResponseTemplateStreamAdapter:
         text: str,
         tools: Sequence[Any] | None = None,
     ) -> tuple[list[dict], bool]:
-        parser = self._make_parser(tools)
         try:
-            events = list(parser.initial_events)
+            parser = self._make_parser(tools)
+            events = self._initial_events(parser)
             events += parser.feed(text)
             _, final_events = parser.finalize()
             events += final_events
@@ -202,7 +215,8 @@ class ResponseTemplateStreamAdapter:
         try:
             if self._stream_parser is None:
                 self._stream_parser = self._make_parser(tools)
-                initial_events = list(self._stream_parser.initial_events)
+                initial_events = self._initial_events(self._stream_parser)
+                self._committed_input_offset = len(self._stream_parser.input_text)
             events = initial_events + self._stream_parser.feed(text)
             self._committed_input_offset = self._stream_parser.consumed_offset
             return events, True
@@ -239,7 +253,8 @@ class ResponseTemplateStreamAdapter:
         try:
             if self._stream_parser is None:
                 self._stream_parser = self._make_parser(tools)
-                initial_events = list(self._stream_parser.initial_events)
+                initial_events = self._initial_events(self._stream_parser)
+                self._committed_input_offset = len(self._stream_parser.input_text)
             _, events = self._stream_parser.finalize()
             self._committed_input_offset = self._stream_parser.consumed_offset
             self._finalized = True
@@ -313,23 +328,21 @@ class ResponseTemplateStreamAdapter:
                 normal_parts.append(event["text"])
             elif field == self._tool_field:
                 if etype == "region_open":
-                    self._pending_tool_raw = event.get("raw", "")
+                    raw_open = event.get("raw", "")
+                    self._pending_tool_raw = (
+                        "" if event.get("from_prefix") else raw_open
+                    )
                     if on_tool_open is not None:
-                        self._pending_tool_streamed = on_tool_open(
-                            self._pending_tool_raw
-                        )
+                        self._pending_tool_streamed = on_tool_open(raw_open)
                 elif etype == "region_chunk":
                     self._pending_tool_raw += event["text"]
                 elif etype == "region_close":
                     raw_close = event.get("raw", "")
-                    if raw_close:
-                        if (
-                            not on_tool_close(event["value"])
-                            and not self._pending_tool_streamed
-                        ):
-                            normal_parts.append(self._pending_tool_raw + raw_close)
-                    elif not self._pending_tool_streamed:
-                        normal_parts.append(self._pending_tool_raw)
+                    if (
+                        not on_tool_close(event["value"])
+                        and not self._pending_tool_streamed
+                    ):
+                        normal_parts.append(self._pending_tool_raw + raw_close)
                     self._pending_tool_raw = ""
                     self._pending_tool_streamed = False
         return "".join(normal_parts)
@@ -341,7 +354,6 @@ class _ResponseTemplateParserInputMixin:
     @staticmethod
     def configure_request_for_parsing(request: Any) -> None:
         request.skip_special_tokens = False
-        request.no_stop_trim = True
 
 
 class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
@@ -377,7 +389,7 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         )
         self.think_start_self_label = ""
         self.thinks_internally = False
-        self.reasoning_default = "always"
+        self.reasoning_default = "explicit_enable_thinking"
         self._adapter = ResponseTemplateStreamAdapter(
             template,
             mode=AdapterMode.REASONING,
@@ -518,6 +530,23 @@ class ResponseTemplateToolDetector(
             arguments = json.dumps(arguments, ensure_ascii=False)
         return ToolCallItem(tool_index=tool_index, name=name, parameters=arguments)
 
+    def _to_tool_call_items(
+        self,
+        value: Any,
+        tool_indices: Dict[str, int],
+        first_tool_index: int,
+    ) -> Optional[List[ToolCallItem]]:
+        values = value if isinstance(value, list) else [value]
+        if not values:
+            return None
+        items = [
+            self._to_tool_call_item(item, tool_indices, first_tool_index + offset)
+            for offset, item in enumerate(values)
+        ]
+        if any(item is None for item in items):
+            return None
+        return items
+
     def _emit_tool_call(
         self, item: ToolCallItem, pending_calls: List[ToolCallItem]
     ) -> None:
@@ -570,11 +599,11 @@ class ResponseTemplateToolDetector(
         calls: List[ToolCallItem] = []
 
         def on_close(value: Any) -> bool:
-            item = self._to_tool_call_item(value, tool_indices, len(calls))
-            if item is not None:
-                calls.append(item)
-                return True
-            return False
+            items = self._to_tool_call_items(value, tool_indices, len(calls))
+            if items is None:
+                return False
+            calls.extend(items)
+            return True
 
         normal_text = self._adapter.route_tool_events(events, on_tool_close=on_close)
         return normal_text, calls
@@ -635,10 +664,15 @@ class ResponseTemplateToolDetector(
 
         def on_close(value: Any) -> bool:
             tool_index = self.current_tool_id if self.current_tool_id >= 0 else 0
-            item = self._to_tool_call_item(value, self._tool_indices, tool_index)
-            if item is None:
+            items = self._to_tool_call_items(
+                value,
+                self._tool_indices,
+                tool_index,
+            )
+            if items is None:
                 return False
-            self._emit_tool_call(item, pending_calls)
+            for item in items:
+                self._emit_tool_call(item, pending_calls)
             return True
 
         normal_text = self._adapter.route_tool_events(

@@ -2114,7 +2114,6 @@ class MessageProcessingResult:
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
-    no_stop_trim: bool = False
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
 

@@ -1044,7 +1044,7 @@ class TestResolveAutoParsers(CustomTestCase):
             _declared(args, "reasoning_parser"),
             "response_template",
         )
-        self.assertIsNone(_declared(args, "tool_call_parser"))
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_invalid_response_template_uses_existing_detection(self):
         args = self._make_server_args(
@@ -1225,6 +1225,17 @@ class TestResolveAutoParsers(CustomTestCase):
 
     def test_explicit_jinja_template_takes_precedence(self):
         tokenizer = _DummyTokenizer([], chat_template=None)
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {"open": "<think>", "close": "</think>"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                },
+            },
+        }
 
         with tempfile.NamedTemporaryFile("w", suffix=".jinja") as f:
             f.write(

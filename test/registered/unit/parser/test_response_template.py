@@ -70,11 +70,11 @@ TOOL_CALL = (
 )
 
 
-def _tool() -> Tool:
+def _tool(name: str = "get_weather") -> Tool:
     return Tool(
         type="function",
         function=Function(
-            name="get_weather",
+            name=name,
             parameters={
                 "type": "object",
                 "properties": {
@@ -380,6 +380,31 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         )
         self.assertEqual(parsed.normal_text + finished.normal_text, "Done")
 
+    def test_nonempty_prefix_content_is_not_replayed(self):
+        reasoning = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "<|channel>thought\nExisting reasoning",
+        )
+        content = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer",
+        )
+        non_streaming = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer",
+        )
+
+        reasoning_parsed = reasoning.parse_streaming_increment(
+            " continued<channel|>Done<turn|>"
+        )
+        content_parsed = content.parse_streaming_increment(" continued<turn|>")
+        non_streaming_parsed = non_streaming.detect_and_parse(" continued<turn|>")
+
+        self.assertEqual(reasoning_parsed.reasoning_text, " continued")
+        self.assertEqual(reasoning_parsed.normal_text, "Done")
+        self.assertEqual(content_parsed.normal_text, " continued")
+        self.assertEqual(non_streaming_parsed.normal_text, " continued")
+
     def test_checkpoint_json_null_is_parsed_as_null(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,
@@ -403,7 +428,7 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertEqual(parsed.normal_text, " between calls ")
         self.assertEqual(len(parsed.calls), 2)
 
-    def test_parser_input_delimiters_are_preserved(self):
+    def test_parser_preserves_special_tokens_without_changing_stop_trimming(self):
         request = SimpleNamespace(
             skip_special_tokens=True,
             no_stop_trim=False,
@@ -412,7 +437,73 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         ResponseTemplateToolDetector.configure_request_for_parsing(request)
 
         self.assertFalse(request.skip_special_tokens)
-        self.assertTrue(request.no_stop_trim)
+        self.assertFalse(request.no_stop_trim)
+
+    def test_reasoning_requires_explicit_enable_without_template_policy(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+
+        self.assertEqual(detector.reasoning_default, "explicit_enable_thinking")
+
+    def test_transform_each_tool_region_emits_all_calls(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open": "<calls>",
+                    "close": "</calls>",
+                    "content": "json",
+                    "transform_each": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "{name}",
+                            "arguments": "{arguments}",
+                        },
+                    },
+                },
+            },
+        }
+        tools = [_tool(), _tool("get_forecast")]
+        text = (
+            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+        )
+        detector = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+
+        parsed = detector.detect_and_parse(text, tools)
+
+        self.assertEqual(parsed.normal_text, "")
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in parsed.calls],
+            [
+                ("get_weather", {"location": "Paris"}),
+                ("get_forecast", {"days": 3}),
+            ],
+        )
+
+        streaming = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+        opened = streaming.parse_streaming_increment("<calls>", tools)
+        closed = streaming.parse_streaming_increment(
+            text.removeprefix("<calls>"),
+            tools,
+        )
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in closed.calls],
+            [
+                ("get_weather", {"location": "Paris"}),
+                ("get_forecast", {"days": 3}),
+            ],
+        )
 
     def test_malformed_call_is_preserved_as_content(self):
         detector = ResponseTemplateToolDetector(
@@ -504,7 +595,7 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertEqual(content.normal_text, "hello")
         self.assertEqual(failed.normal_text, malformed)
 
-    def test_prefilled_malformed_call_restores_opening_delimiter(self):
+    def test_prefilled_malformed_call_does_not_replay_prefix(self):
         opening, body = TOOL_CALL.split("{", 1)
         malformed_body = "{" + body.replace(
             "<tool_call|>",
@@ -517,8 +608,53 @@ class TestResponseTemplateAdapters(unittest.TestCase):
 
         parsed = detector.parse_streaming_increment(malformed_body, [_tool()])
 
-        self.assertEqual(parsed.normal_text, opening + malformed_body)
+        self.assertEqual(parsed.normal_text, malformed_body)
         self.assertEqual(parsed.calls, [])
+
+    def test_complete_call_without_closing_delimiter_finalizes(self):
+        without_close = TOOL_CALL.removesuffix("<tool_call|>")
+        non_streaming = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        ).detect_and_parse(without_close, [_tool()])
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+
+        streamed = detector.parse_streaming_increment(without_close, [_tool()])
+        finished = detector.finish([_tool()])
+
+        self.assertEqual(
+            _call_values(non_streaming.calls),
+            [
+                (
+                    "get_weather",
+                    {
+                        "location": "New York",
+                        "days": 3,
+                        "details": {"metric": True},
+                        "hours": [1, 2],
+                    },
+                )
+            ],
+        )
+        self.assertEqual(
+            [(call.name, call.parameters) for call in streamed.calls],
+            [("get_weather", "")],
+        )
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in finished.calls],
+            [
+                (
+                    None,
+                    {
+                        "location": "New York",
+                        "days": 3,
+                        "details": {"metric": True},
+                        "hours": [1, 2],
+                    },
+                )
+            ],
+        )
 
     def test_truncated_call_is_preserved_at_stream_end(self):
         detector = ResponseTemplateToolDetector(

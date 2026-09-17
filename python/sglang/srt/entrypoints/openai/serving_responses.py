@@ -493,11 +493,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         not processed_messages.skip_special_tokens
                     ):
                         sampling_params["skip_special_tokens"] = False
-                    if (
-                        processed_messages is not None
-                        and processed_messages.no_stop_trim
-                    ):
-                        sampling_params["no_stop_trim"] = True
 
                     context: ConversationContext
                     if self.use_harmony:

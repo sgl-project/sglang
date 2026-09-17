@@ -820,8 +820,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 def resolve_auto_parsers(server_args) -> None:
     """Resolve parser fields explicitly set to `auto`.
 
-    Checkpoint `response_template` metadata takes precedence over chat-template
-    and architecture detection.
+    Checkpoint `response_template` metadata takes precedence for fields it
+    defines, unless the operator supplied a different chat template.
     """
     cfg = resolving_view(server_args)
     needs = tuple(
@@ -853,7 +853,8 @@ def resolve_auto_parsers(server_args) -> None:
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
 
-    if tokenizer is not None:
+    detected: Dict[str, Optional[str]] = {}
+    if tokenizer is not None and chat_template_arg is None:
         from sglang.srt.parser.response_template_config import (
             resolve_detector_response_template,
         )
@@ -876,19 +877,21 @@ def resolve_auto_parsers(server_args) -> None:
                     "reasoning_parser": "thinking",
                     "tool_call_parser": "tool_calls",
                 }
-                detected = {
-                    attr: "response_template" if parser_fields[attr] in fields else None
-                    for attr in needs
-                }
-                logger.info(
-                    "Auto-detected response-template parsers from tokenizer configuration"
-                )
-                declare_resolution(
-                    server_args,
-                    "template-detection",
-                    **detected,
-                )
-                return
+                for attr in needs:
+                    if parser_fields[attr] in fields:
+                        detected[attr] = "response_template"
+                if detected:
+                    logger.info(
+                        "Auto-detected response-template parsers from tokenizer configuration"
+                    )
+                    needs = tuple(attr for attr in needs if attr not in detected)
+                    if not needs:
+                        declare_resolution(
+                            server_args,
+                            "template-detection",
+                            **detected,
+                        )
+                        return
 
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
@@ -899,7 +902,6 @@ def resolve_auto_parsers(server_args) -> None:
         template, tokenizer, reasoning_config, force_reasoning
     )
 
-    detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
