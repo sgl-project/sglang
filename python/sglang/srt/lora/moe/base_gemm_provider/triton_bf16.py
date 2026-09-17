@@ -5,7 +5,10 @@ from __future__ import annotations
 import msgspec
 import torch
 
-from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
+from sglang.srt.lora.moe.base_gemm_provider.base import (
+    MoeBaseProviderContract,
+    prepare_buffer,
+)
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
 )
@@ -18,7 +21,7 @@ class TritonRowState(msgspec.Struct, kw_only=True):
     sorted_token_ids: torch.Tensor  # [em_ceiling] int32 route ids, pad = numel
     expert_ids: torch.Tensor  # [em_ceiling / block_m] int32 per-block expert
     num_tokens_post_padded: torch.Tensor  # [1] int32 device scalar
-    pair_to_row: torch.Tensor  # [num_pairs] int32 identity
+    pair_to_row: torch.Tensor  # [num_pairs] int32 pair index, or -1 when dropped
     num_pairs: int
     top_k: int
     config: dict
@@ -89,23 +92,21 @@ class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
         top_k: int,
         workspace=None,
     ) -> TritonRowState:
-        from sglang.srt.lora.moe.kernels.align_rows import align_rows, pair_to_row_map
+        from sglang.srt.lora.moe.base_gemm_provider.input_alignment import align_rows
 
         config, down_config = self._config_for(hidden_states.shape[0], top_k)
-        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
-            topk_ids, int(config["BLOCK_SIZE_M"]), self.quant_info.num_local_experts
-        )
         num_pairs = topk_ids.numel()
         device = hidden_states.device
-        if workspace is not None:
-            rows = workspace.tensor(
-                "pair_to_row", (num_pairs,), dtype=torch.int32, device=device
-            )
-        else:
-            rows = torch.empty((num_pairs,), dtype=torch.int32, device=device)
-        # Pair-major rows: pair p is row p, and a pair without an expert reads as
-        # -1 (the finalize gates on the row map, not on topk_ids).
-        pair_to_row = pair_to_row_map(topk_ids, rows)
+        pair_to_row = prepare_buffer(
+            workspace, "pair_to_row", (num_pairs,), dtype=torch.int32, device=device
+        )
+        # Finalize uses pair_to_row, with -1 for pairs without an expert.
+        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
+            topk_ids,
+            int(config["BLOCK_SIZE_M"]),
+            self.quant_info.num_local_experts,
+            pair_to_row_out=pair_to_row,
+        )
         return TritonRowState(
             hidden_states=hidden_states,
             topk_ids=topk_ids,

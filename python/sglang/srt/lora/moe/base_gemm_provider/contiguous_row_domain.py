@@ -8,25 +8,22 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
-from sglang.srt.lora.moe.base_gemm_provider.base import (
-    MoeBaseProvider,
-    admit_weight_layout,
-)
-from sglang.srt.lora.moe.kernels.activation_delta import (
-    act_delta_contiguous,
-)
-from sglang.srt.lora.moe.kernels.dispatch_contiguous import (
+from sglang.kernels.ops.lora.moe.activation_delta import act_delta
+from sglang.kernels.ops.lora.moe.dispatch_contiguous import (
     contiguous_m_pad_ceiling,
     dispatch_fill_rows_contiguous_bf16,
     dispatch_layout_contiguous,
 )
-from sglang.srt.lora.moe.kernels.fused_act import (
-    fused_b_act_contiguous,
+from sglang.kernels.ops.lora.moe.fused_act import fused_b_act
+from sglang.srt.lora.moe.base_gemm_provider.base import (
+    MoeBaseProvider,
+    admit_weight_layout,
+    prepare_buffer,
 )
 from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.route_view import RouteView
+    from sglang.kernels.ops.lora.common.route_view import RouteView
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
@@ -36,7 +33,7 @@ class ContiguousRowState(msgspec.Struct, kw_only=True):
     seg_offsets: torch.Tensor  # [E_local + 1] int32 first row of each segment
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32 compact rows
     m_pad_ceiling: int
-    retained_inputs: bool
+    input_buffer_reuse: bool
     # Quantized activation and scales for the down GEMM.
     act_quant: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -48,10 +45,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             raise ValueError(f"m_alignment must be a positive int, got {m_alignment!r}")
         self._m_alignment = m_alignment
         self._gate_up_slices = admit_weight_layout(quant_info)
-
-    @property
-    def m_alignment(self) -> int:
-        return self._m_alignment
 
     def prepare(
         self,
@@ -68,26 +61,29 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             num_pairs, num_experts, self._m_alignment
         )
         device = hidden_states.device
+        prefix = f"contiguous:a{self._m_alignment}"
+        seg_counts = prepare_buffer(
+            workspace,
+            f"{prefix}:seg_counts",
+            (num_experts,),
+            dtype=torch.int32,
+            device=device,
+        )
+        seg_offsets = prepare_buffer(
+            workspace,
+            f"{prefix}:seg_offsets",
+            (num_experts + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        pair_to_row = prepare_buffer(
+            workspace,
+            f"{prefix}:pair_to_row",
+            (num_pairs,),
+            dtype=torch.int32,
+            device=device,
+        )
         if workspace is not None:
-            prefix = f"contiguous:a{self._m_alignment}"
-            seg_counts = workspace.tensor(
-                f"{prefix}:seg_counts",
-                (num_experts,),
-                dtype=torch.int32,
-                device=device,
-            )
-            seg_offsets = workspace.tensor(
-                f"{prefix}:seg_offsets",
-                (num_experts + 1,),
-                dtype=torch.int32,
-                device=device,
-            )
-            pair_to_row = workspace.tensor(
-                f"{prefix}:pair_to_row",
-                (num_pairs,),
-                dtype=torch.int32,
-                device=device,
-            )
             # Padding outputs are ignored, so reused padding needs no reset.
             hidden_compact = (
                 None
@@ -101,9 +97,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
                 )
             )
         else:
-            seg_counts = torch.empty(num_experts, dtype=torch.int32, device=device)
-            seg_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-            pair_to_row = torch.empty(num_pairs, dtype=torch.int32, device=device)
             hidden_compact = (
                 None
                 if not fill_rows
@@ -133,12 +126,12 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             seg_offsets=seg_offsets,
             pair_to_row=pair_to_row,
             m_pad_ceiling=m_pad_ceiling,
-            retained_inputs=workspace is not None,
+            input_buffer_reuse=workspace is not None,
         )
 
     def release_prepared_inputs(self, row_state: ContiguousRowState) -> None:
         # Workspace buffers retain their addresses for graph replay.
-        if row_state.retained_inputs or row_state.hidden_compact is None:
+        if row_state.input_buffer_reuse or row_state.hidden_compact is None:
             return
         from sglang.srt.utils import dispose_tensor
 
@@ -158,14 +151,14 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         if act_quant is not None:
             row_state.act_quant = act_quant
-        act_delta_contiguous(
+        act_delta(
             gateup_out,
             gate_up_delta,
             act_out,
             activation_lora_input,
             row_state.pair_to_row,
             topk_ids,
-            self.num_local_experts,
+            num_local_experts=self.num_local_experts,
             gate_first=self.contract.gate_first,
             interleaved=self.contract.interleaved,
             activation=activation,
@@ -190,10 +183,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
     ) -> None:
-        fused_b_act_contiguous(
+        fused_b_act(
             activation=activation,
             base_gateup=base_gateup,
-            act_compact=act_rows,
+            act_rows=act_rows,
             act_pairs=act_pairs,
             pair_to_row=row_state.pair_to_row,
             routing=routing,

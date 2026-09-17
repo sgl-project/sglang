@@ -1536,6 +1536,9 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     Runs before the deprecated cutlass environment override.
     """
     runner = view.moe_runner_backend
+    if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+        logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
+        return {"disable_shared_experts_fusion": True}
     if runner == "flashinfer_cutedsl":
         logger.warning(
             "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1643,11 +1646,16 @@ def _speculative_moe_runner_default(view: Any) -> dict:
     with a quantized draft can set --speculative-moe-runner-backend explicitly.
     (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
     when its weights are not prepared, so it needs no override.)
+
+    A target-only lora_* runner defaults the draft to auto: the draft carries
+    no adapters, so it takes the regular runner chain.
     """
     if view.speculative_moe_runner_backend is None:
         default = view.moe_runner_backend
         if default == "flashinfer_megamoe":
             default = "flashinfer_trtllm"
+        elif default.startswith("lora_"):
+            default = "auto"
         return {"speculative_moe_runner_backend": default}
     return {}
 

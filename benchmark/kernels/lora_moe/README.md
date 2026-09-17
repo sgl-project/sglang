@@ -1,122 +1,117 @@
-# Changing the MoE LoRA config tables
+# MoE LoRA tile tuning
 
-The file format is documented next to the tables, in
-`python/sglang/srt/lora/moe/configs/README.md`. This file is about the other
-half: how selection actually cascades, how to change a table without breaking
-a case you did not think about, and how to tell a real measurement from a
-hopeful one.
+`tune_plans.py` searches bounded LoRA launch tiles for a resident model shape
+and GPU, retaining shipped plan families and base-GEMM configurations. The result
+is the best validated candidate in that space, not a globally optimal plan,
+production qualification or model TPS.
 
-Read this before editing `{arch}.plans.json` by hand.
+## Inputs
 
-## The cascade, in the order it runs
+Create a JSON list of explicit local cases, for example:
 
-Four things pick what a layer executes, and they run at two different times.
+```json
+[{
+  "name": "decode-mixed",
+  "hidden_size": 2048,
+  "intermediate_size": 512,
+  "num_local_experts": 256,
+  "tokens": 16,
+  "rank": 32,
+  "top_k": 8,
+  "slots": 2,
+  "quant": "bf16",
+  "vendor": "cutedsl",
+  "layout": "per_expert",
+  "phase": "decode",
+  "mode": "eager",
+  "routing": "balanced",
+  "traffic": "mixed"
+}]
+```
 
-**At weight bind (once per layer, per server):**
+Run from this checkout with its installed GPU dependencies:
 
-1. **Plan row.** `resolve_plans` walks `scenarios` top to bottom and takes the
-   FIRST row whose `layout`, `phase` and `max_rank` all admit this layer. An
-   absent key is a wildcard. If the model's geometry is outside `domain`, or no
-   row matches, the `fallback` rows are walked the same way instead.
-2. **Provider.** Joined from two places: the matched row's `base_gemm_rows`
-   (`expert_major` / `route_major`) says which row order the plan needs, and
-   `--moe-runner-backend lora_<vendor>` says which vendor implements it
-   (`cutedsl`, the bf16/fp8 default; `triton`; `marlin`, the nvfp4 default).
-   Triton and Marlin have no masked slab domain and run an `expert_major` row
-   on their route-major class. A geometry a vendor cannot admit fails at attach.
-3. **Tile rules.** `resolve_plans` takes that row's `tiles` list and drops every
-   rule whose `max_rank` is below the bound rank. What survives is a ladder.
+```bash
+python benchmark/kernels/lora_moe/tune_plans.py \
+  --cases cases.json --out /tmp/my-moe-study \
+  --repeats 6 --warmup 5 --iterations 20 --max-candidates 32
+```
 
-**Per forward:**
+The output directory must not exist. Optional
+`--model-config /local/config.json` supplies conventional routed-MoE geometry
+instead of the three shape fields. It requires `hidden_size`,
+`moe_intermediate_size`, a routed expert count and explicit SiLU activation;
+inspect the model to confirm gated SiLU. Nothing is downloaded.
+`--tp-size` means total TP including EP; MoE DP is fixed at one.
+Local intermediate width is `I / (TP / EP)`, resident experts `E / EP`,
+with exact divisibility required. Explicit local geometry is preferable for
+padded, fused-shared-expert or model-specific layouts. Contradictory inferred
+and explicit dimensions fail. TP/EP are identity metadata, not distributed work.
 
-4. **Tile pick.** `TileTable.config_for(num_tokens)` walks the surviving ladder
-   and takes the first rule whose `max_tokens` admits this batch.
+Fixtures support gated SiLU, BF16/block-128 FP8, SM90/SM100, CuTeDSL/Triton, and
+per-expert/shared-outer LoRA. Rank is the physical padded rank: a multiple of
+eight, at most 256. FP8 H/I must be 128-aligned. Routing is balanced/skewed;
+traffic active/mixed/base_only. Every routed expert must be resident.
+NVFP4, other activations, distributed dispatch/collectives and serving integration
+are unsupported. Failures are recorded, not converted to another vendor.
+External plan/base configuration override environments are rejected.
 
-Two consequences that are easy to miss, and both have bitten:
+## Measurement and selection
 
-- **A rule with no `max_tokens` terminates the ladder.** Everything below it is
-  unreachable for any rank that rule survives at. `decode.per_expert`'s
-  `max_rank: 16` rule has no `max_tokens`, so at rank 16 the whole rest of the
-  ladder is dead. If you add a rule and it seems to do nothing, check whether an
-  earlier rule ends the ladder first.
-- **Ordering is the only precedence.** There is no specificity scoring. A
-  catch-all placed above a narrow rule silently wins.
+The fixture invokes production `MoeLoraRunner.run`: routing, provider
+preparation/base GEMMs, LoRA A/B, activation and finalization. A local subclass
+changes only output allocation to ordinary `torch.empty`, because the serving
+allocator requires a TP group. No production method is monkeypatched and no
+backend environment is changed. Serving symmetric allocation, communication,
+scheduler and model execution are excluded.
 
-## Before you change a table
+Eager timing is synchronized whole-call wall time. Graph timing warms the actual
+capture stream and measures real replay, excluding graph construction and
+capture-only host work. These are separate case identities, not interchangeable
+latencies or sums of stage medians.
 
-Work out, on paper, the full cross product of (rank × tokens) the change
-touches, and which cells must be **unchanged**. You need that list twice: to
-convince yourself the edit is scoped, and to read the benchmark afterwards.
+Before timing, incumbent and candidates are checked against independent FP32
+gated-MoE algebra with exact effective weights. Fixed gates: finite output,
+relative L2 <= 0.02 BF16 / 0.06 FP8, and elementwise atol=0.018/rtol=0.06.
+Graph checks overwrite captured output with NaNs and verify replay replaces it.
+These fixture gates are not model-level numerical gates.
 
-`test_moe_lora_plan_tables.py` has a helper shape worth copying — resolve the
-table for several ranks and assert the whole matrix, e.g. rank 32 walking
-tiny/mid/mid/large across 4/16/32/33 tokens. Asserting the matrix catches an
-ordering mistake that asserting one cell will not.
+One-axis candidates vary A/B block width, warps or stages; routing, split mode,
+plan family and provider remain fixed. Paired repeats alternate AB/BA against
+the incumbent. Gain is `baseline_us / candidate_us - 1`. WIN/LOSS require
+unanimous signs and median magnitude >= max(2%, baseline `(max-min)/median`
+spread). Otherwise a negative tail beyond 2% is INCONCLUSIVE; the rest is TIE.
+A search WIN must WIN again on independent inputs and weights. Validation is
+not pooled with search; a failed shortlist is not replaced until something passes.
 
-## Measuring a change
+## Results and scope
 
-Point `SGLANG_LORA_MOE_CONFIG_DIR` at a directory holding **only the file you
-are changing**. Lookup falls back per file, so a directory with just
-`sm100.plans.json` leaves sm90 on the package table. Do not copy files you
-are not changing — a stale copy is worse than none.
+`study.json` records cases/budget, `trials.jsonl` retains all trials/failures,
+and `results.json` reports decisions. No WIN retains the incumbent. Incumbent,
+all-candidate or invalid-validation failure fails the case. Fatal CUDA errors
+stop the study. Evidence includes source hashes, loaded-checkout checks, device
+UUID, runtime versions, actual provider and resolved base configuration.
 
-Two different questions, two different setups, do not mix them:
+A winner contains an exact-study descriptor, **not** a production
+`*.plans.json` override. Do not install it as one. Production rows cannot
+restrict exact model/I/rank/token/routing identity: copying a measured tile
+would affect unmeasured regions. Promotion requires separate declared coverage;
+this tool neither widens domains nor writes packaged tables.
 
-- **"Is this candidate faster?"** — force the candidate on one row and compare
-  against the shipped table. Fine for exploring.
-- **"Does the table I am about to commit do what I claim?"** — run the actual
-  edited file against the actual old file, same tree, same flags, nothing else
-  different. This is the one that belongs in a commit message.
+Base-GEMM optimization is separate: see
+`benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py` for Triton.
+The adjacent `tune_down_moe.py` is retained to screen a distinct down-GEMM
+configuration while holding gate/up fixed. Both are screening tools: their
+output still needs numerical and full-pipeline validation. This tuner does
+not inject custom CuTeDSL base tables or jointly optimize base and LoRA kernels.
 
-### Reading the result
+## Retired experiments
 
-**The cells your change cannot reach are the control.** If the change only
-touches tokens 17–32 at rank ≤32, then batches 1, 8 and 16 must come back flat.
-When they do, they also measure the run-to-run noise for that machine and model
-on that day, which is what makes the cell that did move interpretable. When they
-do not, something else moved — stop and find out what.
+The old seed/variant writers, partial CuTeDSL base-stage sweep and FP8 profiler
+are available in Git history, not maintained tuning entrypoints. Blind domain
+widening, outdated tile-schema emission and stage-profiler ranking are not part
+of this workflow. Production table format/selection documentation remains in
+`python/sglang/srt/lora/moe/configs/README.md`.
 
-A candidate that is byte-identical to the incumbent is a **self-check, not a
-test**. It should reproduce the baseline; it tells you the forcing mechanism
-works. It does not tell you the incumbent is right. Check before concluding
-anything: two rules in a shipped ladder may already hold the same values.
-
-Protocol used by every number in the campaign docs: four passes per batch size,
-median after discarding the first, batch sizes 1/8/16/32, 4096 in / 1024 out,
-`--max-loras-per-batch 4`. Noise is about ±2%, wider at batch 1. **Effects under
-about 1% cannot be resolved by this protocol** — take more passes at one batch
-size instead of arguing about the fourth digit.
-
-## Traps that have cost real time
-
-- **`SGLANG_LORA_MOE_CONFIG_DIR` also moves the base-GEMM search root.** The
-  `base_gemm/` bucket tables resolve under the same root. Lookup falls back per
-  file, so an override directory without a `base_gemm/` subtree still finds the
-  packaged ones — but check `configs/base_gemm/` before assuming a forced run
-  and its baseline used the same base-GEMM tables.
-- **Do not index rules positionally in tooling.** A script that says "rule 2 is
-  the mid-M one" breaks the moment anyone inserts a rule. Match on the
-  predicate instead.
-- **Some rules are duplicated on purpose, and nothing enforces it.** See the
-  note in `configs/README.md`. If you retune one of a duplicated pair, retune
-  the other in the same edit.
-- **Vendor and row order are different axes, and the config only holds one.**
-  `base_gemm_rows` in the table is the row order; the vendor is the server flag.
-  Changing the row order changes the memory footprint and can make a server
-  fail to start; changing the vendor does not. Measure them separately or you
-  will not know which one moved the number — an earlier sweep forced whole
-  providers and conflated the two, which is how a 30% decode result got
-  attributed to the wrong axis.
-
-## Scripts here
-
-- `tune_lora_config.py` — report which shipped rows serve a model for one
-  `--quant-family` (`--check`) and emit a seed plan table whose `domain`
-  covers it (`--emit-seed`) into an output directory that
-  `SGLANG_LORA_MOE_CONFIG_DIR` can point at directly. The seed reuses existing
-  plans: validate admission and correctness on the new geometry, then tune it
-  end to end with the campaign protocol. The former `--sweep` mode was retired.
-- `sweep_masked_gemm_configs.py` — sweep masked base-GEMM launch configs for one
-  geometry on the current device and emit the M-bucketed store.
-- `make_config_variant.py` — build a one-file override directory for a
-  forcing run, matching rows by name rather than by position.
+CPU contracts: `test/registered/unit/lora/test_moe_lora_tuning.py`.
+CPU tests alone do not establish GPU compilation, numerics or performance.
