@@ -97,6 +97,10 @@ class CompressStatePool:
         state_cache_page_size: int = 1,
     ):
         self.ratio = ratio
+        # Request-scoped state is addressed by req_pool_idx (one ring per request
+        # slot) and travels on the PD request-state component; page-scoped state
+        # follows the SWA pages.
+        self.request_scoped = ratio == 128
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
         self.page_size = state_cache_page_size

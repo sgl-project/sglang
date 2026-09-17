@@ -1000,9 +1000,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.indexer_compress_state_pools,
         ]:
             for pool in pools:
-                if pool is None:
-                    continue
-                if pool.ratio == 128:
+                if pool is None or pool.request_scoped:
                     continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
@@ -1019,7 +1017,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
         for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
+            if pool is None or not pool.request_scoped:
                 continue
             t = pool.kv_score_buffer.kv_score
             assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
@@ -1256,9 +1254,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             state[state_locs, half:] = float("-inf")
 
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
-        """Reset request-scoped C128 state for one req slot."""
+        """Reset request-scoped state for one req slot."""
         for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
+            if pool is None or not pool.request_scoped:
                 continue
 
             state = pool.kv_score_buffer.kv_score

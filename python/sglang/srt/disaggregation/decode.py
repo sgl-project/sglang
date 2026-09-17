@@ -61,10 +61,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce,
@@ -1499,13 +1498,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
+                return get_dsv4_request_state_indices(
+                    self.token_to_kv_pool,
                     int(decode_req.req.kv.req_pool_idx),
                     seq_len,
-                    online=online,
-                    ring_size=ring_size,
                 )
 
             state_types = self.kv_manager.kv_args.state_types
