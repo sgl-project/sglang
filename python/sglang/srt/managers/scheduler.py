@@ -3225,6 +3225,11 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
+        status_code = (
+            HTTPStatus.TOO_MANY_REQUESTS
+            if envs.SGLANG_ENABLE_QUEUE_FULL_429.get()
+            else HTTPStatus.SERVICE_UNAVAILABLE
+        )
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -3251,7 +3256,7 @@ class Scheduler(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "status_code": status_code,
                     "message": message,
                 },
             ),

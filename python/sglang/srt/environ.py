@@ -575,6 +575,9 @@ class Envs:
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
+    # Answer a full waiting queue (--max-queued-requests) with 429 Too Many
+    # Requests instead of 503, for clients that back off on 429 only.
+    SGLANG_ENABLE_QUEUE_FULL_429 = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.

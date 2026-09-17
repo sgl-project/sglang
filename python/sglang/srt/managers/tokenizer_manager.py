@@ -1708,6 +1708,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "status_code"
         ) in (
             HTTPStatus.SERVICE_UNAVAILABLE,
+            HTTPStatus.TOO_MANY_REQUESTS,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
