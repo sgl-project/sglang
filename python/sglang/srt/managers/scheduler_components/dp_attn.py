@@ -237,6 +237,21 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    from sglang.srt.speculative.dp_prefill_spec import ENABLED
+
+    if ENABLED:
+        # ScheduleBatch is reused between iterations. Gathered counts are raw
+        # again, so a previous heterogeneous phase must not suppress normal
+        # speculative count scaling or pure-decode graph padding this step.
+        batch.dp_prefill_spec_phase = None
+        info = mlp_sync_info.tp0_info_cpu
+        if info is None:
+            raise RuntimeError("DP prefill/spec requires complete gathered metadata")
+        batch.dp_prefill_spec_metadata = (
+            tuple(info[:, 0].tolist()),
+            tuple(info[:, 1].tolist()),
+            tuple(bool(x) for x in info[:, 3].tolist()),
+        )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -581,6 +596,11 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
+        from sglang.srt.speculative.dp_prefill_spec import ENABLED
+
+        if ENABLED:
+            # Keep verification rows in their native mode on heterogeneous steps.
+            return batch
         if batch is None or not batch.forward_mode.is_decode():
             return batch
         # Global triggers from the gather. This rank's own eligibility (spec/

@@ -3726,11 +3726,14 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
+        from sglang.srt.speculative.dp_prefill_spec import ENABLED as dp_prefill_spec
+
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
             and not get_spec().speculative_skip_dp_mlp_sync
+            and not dp_prefill_spec
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
