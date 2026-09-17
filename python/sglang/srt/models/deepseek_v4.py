@@ -2647,7 +2647,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
-            from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+            from sglang.kernels.ops.layernorm.mhc import (
                 split_tf32_hc_weight,
             )
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -2665,7 +2665,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     getattr(getattr(self, "config", None), "model_type", None)
                     == "deepseek_v41"
                 ):
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         split_bf16_hc_weight,
                     )
 
@@ -3232,7 +3232,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         parts = getattr(self, "_hc_ffn_tf32_parts", None)
                         bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
                 if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_bf16x3,
                     )
 
@@ -3246,7 +3246,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_eps,
                     )
                 elif parts is not None:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_deepgemm,
                     )
 
