@@ -1,4 +1,4 @@
-"""Compare BF16 wo_a einsum and the production linear helper on one Ascend NPU.
+"""Compare BF16 wo_a einsum and F.linear on one Ascend NPU.
 
 python test/manual/dsv4/bench_npu_wo_a.py --batch-sizes 1 8
 
@@ -6,7 +6,7 @@ Simulates one DSV4 Flash TP8 rank with one local output group. Both variants
 share the same inputs and 43 distinct layer weights by default. One iteration
 replays all --layers projections; ms_per_iteration reports their total time,
 and us_per_layer reports the average. Model loading and serving are not timed.
-The optimized helper is called directly, so no optimization flags are needed.
+F.linear is called directly, as in the model, so no optimization flags are needed.
 Optional --profile-dir exports a trace for checking weight transposes.
 """
 
@@ -16,6 +16,7 @@ import math
 import statistics
 
 import torch
+import torch.nn.functional as F
 
 
 def _einsum(o, weight):
@@ -100,10 +101,6 @@ def main():
 
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_wo_a import (
-        apply_npu_wo_a_bf16,
-    )
-
     torch.npu.set_device(args.device)
     torch.manual_seed(42)
     print(
@@ -126,7 +123,7 @@ def main():
     ]
     variants = {
         "einsum_original": _einsum,
-        "linear_original": apply_npu_wo_a_bf16,
+        "linear_original": F.linear,
     }
     for tokens in args.batch_sizes:
         inputs = [

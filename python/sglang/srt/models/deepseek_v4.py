@@ -50,9 +50,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     prime_rope_cos_sin,
     rope_cos_sin,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_wo_a import (
-    apply_npu_wo_a_bf16,
-)
 from sglang.srt.hardware_backend.npu.utils import (
     is_npu_arch35,
     use_npu_arch35_mxfp8_wo_a,
@@ -2032,7 +2029,9 @@ class MQALayer(MqaAttentionBase):
                         and o.dtype == wo_a_weight.dtype == torch.bfloat16
                         and wo_a_weight.is_contiguous()
                     ):
-                        o = apply_npu_wo_a_bf16(o, wo_a_weight)
+                        # One local group needs no grouped contraction; linear
+                        # avoids materializing a transpose of the BF16 weight.
+                        o = F.linear(o, wo_a_weight)
                     else:
                         wo_a = wo_a_weight.view(
                             self.n_local_groups, self.o_lora_rank, -1
