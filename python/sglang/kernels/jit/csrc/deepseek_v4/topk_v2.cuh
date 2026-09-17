@@ -251,10 +251,8 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
 }
 
 #ifdef USE_ROCM
-// The packed (DSA extend) layout is only produced by the ROCm DSA prefill path
-// today. Keep it behind USE_ROCM so CUDA/XPU builds are bit-for-bit unchanged;
-// nothing in the kernel itself is AMD-specific, so the guard can be dropped
-// once a non-ROCm caller needs it.
+// Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
+// unchanged. Nothing below is AMD-specific; the guard can be dropped later.
 
 /**
  * \brief Parameters of the packed (DSA extend) layout.
@@ -317,11 +315,8 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
     return trivial_transform<kPDL, TopKMode::PAGE_TABLE>(problem, transform);
   }
 
-  // The 16-byte vectorized read has to start on a `kVecSize` boundary, so round
-  // the window down and mask the columns that pulls in -- they belong to the
-  // preceding request and would otherwise win. `bias` shifts the emitted index
-  // back to row-local, `input_start` tells the histogram how many of the
-  // leading entries are padding.
+  // Round the window down to a `kVecSize` boundary and mask the <= 3 columns
+  // that pulls in, with the same bias / input_start as `topk_ragged_kernel`.
   const auto rem = row_start % kVecSize;
   if (rem != 0) {
     // The mask has to land after the indexer has retired

@@ -151,13 +151,8 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (GLM DSA prefill): row_starts / row_to_batch absorb
-        # the per-row score offset and the many-rows-per-request page-table
-        # mapping. The kernel itself is platform-neutral; routing stays ROCm-only
-        # because CUDA already gets the same fusion from the RAGGED branch above,
-        # and switching it over there wants a benchmark first. The conditions fall
-        # back (not raise) on shapes the kernel cannot take, notably a chunked-
-        # extend plan or a row stride that is not 16B-aligned.
+        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
+        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
         if (
             _is_hip
             and self.should_use_topk_v2()
