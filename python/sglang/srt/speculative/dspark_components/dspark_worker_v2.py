@@ -1067,13 +1067,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             if get_parallel().enable_dp_attention:
                 idle_layout = self._idle_verify_ragged_layout(batch)
                 if self._replicated_pp_decode:
-                    self._verify_executor.run_idle_participation(
+                    idle_verify_result = self._verify_executor.run_idle_participation(
                         batch=batch, idle_layout=idle_layout
                     )
                     if self._draft_is_moe:
                         self._proposer.run_idle_participation(
                             self._pp_draft_sync_batch(batch, local_bs=0)
                         )
+                    if self.ps.pp_rank < self.ps.pp_size - 1:
+                        return idle_verify_result
                 else:
                     if self._draft_is_moe:
                         self._proposer.run_idle_participation(batch)
