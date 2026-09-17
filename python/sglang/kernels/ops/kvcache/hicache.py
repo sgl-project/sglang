@@ -356,3 +356,357 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
             ptr_src,
             page_size,
         )
+
+
+# A separate module from `_jit_hicache_module`: this one instantiates
+# HiCacheKernel with `kElementSize` set to one head group's token row rather than
+# the whole row, which is often not the 128-byte multiple `run_one` / `run_all`
+# need. Only the exported entry points are instantiated, so those never compile
+# here.
+@cache_once
+def _jit_hicache_page_unified_module(*, element_size: int, block_quota: int) -> Module:
+    args = make_cpp_args(
+        element_size,
+        1,  # kUnroll: unread by this entry point, which always moves 16B per thread
+        block_quota,
+        1024,  # num_threads, can be tuned for performance
+    )
+    return load_jit(
+        "hicache_page_unified",
+        *args,
+        cuda_files=[
+            "kvcacheio/hicache.cuh",
+        ],
+        cuda_wrappers=[
+            (
+                "launch_one_page_unified",
+                f"&HiCacheKernel<{args}>::run_one_page_unified<false>",
+            ),
+            (
+                "launch_one_mla_page_unified",
+                f"&HiCacheKernel<{args}>::run_one_page_unified<true>",
+            ),
+        ],
+    )
+
+
+def can_use_page_unified_load_back_jit_kernel(
+    *,
+    group_bytes: int,
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> bool:
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified JIT load-back")
+        return False
+    try:
+        _jit_hicache_page_unified_module(
+            element_size=group_bytes,
+            block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT load-back kernel: {e}")
+        return False
+
+
+@debug_kernel_api
+def transfer_hicache_one_layer_page_unified_lf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    *,
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> None:
+    """Load one layer of page_unified host pages into the device KV pool.
+
+    ``src`` is a contiguous host tensor with layout
+    (page, head_group, layer, 2, page_size, head_in_group, dim); K=0, V=1 --
+    the order the page-unified write-back produces. It must be pinned or
+    CUDA-registered, because the kernel reads it in place over its device
+    mapping; no staging buffer is allocated.
+
+    ``k_cache_dst`` / ``v_cache_dst`` are one layer of the device pool, shaped
+    (token, head, dim) with the pool's full head count. ``src_indices`` holds
+    host-pool TOKEN indices (the page is ``index // page_size``) and
+    ``dst_indices`` the device-pool token indices they land on, in matching
+    order; both are CUDA int32/int64 vectors on the destination device.
+    One head group's token row must be a positive multiple of 16 bytes.
+
+    Runs on the current CUDA stream. Keep ``src`` alive and unwritten until
+    that stream completes.
+    """
+    if src.ndim != 7:
+        raise ValueError(
+            "Expected (page, head_group, layer, 2, page_size, head_in_group, dim)"
+        )
+    if src.shape[3] != 2 or any(d <= 0 for d in src.shape[1:]):
+        raise ValueError(
+            "Page dimensions must be positive and the K/V dimension must be 2"
+        )
+    _transfer_hicache_one_layer_page_unified(
+        k_cache_dst,
+        v_cache_dst,
+        src,
+        src_indices,
+        dst_indices,
+        layer_id=layer_id,
+        group_bytes=src.shape[5] * src.shape[6] * src.element_size(),
+        num_layers=src.shape[2],
+        num_groups=src.shape[1],
+        page_size=src.shape[4],
+        is_mla=False,
+        block_quota=block_quota,
+    )
+
+
+@cache_once
+def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> Module:
+    args = make_cpp_args(group_bytes, is_mla)
+    return load_jit(
+        "hicache_page_unified_write_back",
+        *args,
+        cuda_files=["kvcacheio/staged_write_back.cuh"],
+        cuda_wrappers=[("launch", f"&HiCachePageUnifiedWriteBackKernel<{args}>::run")],
+    )
+
+
+def can_use_page_unified_write_back_jit_kernel(
+    *,
+    group_bytes: int,
+    is_mla: bool = False,
+) -> bool:
+    """Probe the module the page-unified write-back actually launches.
+
+    Its own build, not the page_first staged one: same header, a different
+    template instantiation under a different `cache_once` key, so a page_first
+    probe says nothing about whether this one compiles.
+    """
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified write-back")
+        return False
+    try:
+        _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT write-back kernel: {e}")
+        return False
+
+
+@debug_kernel_api
+def transfer_hicache_all_layer_staged_lf_page_unified(
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write full GPU KV pages to pinned host memory in page_unified layout.
+
+    ``staging`` and ``dst`` are contiguous tensors with layout
+    (page, head_group, layer, 2, page_size, head_in_group, dim); K=0, V=1.
+    Only their page capacities may differ. Each source pointer addresses a
+    contiguous (token, head_group * head_in_group, dim) GPU tensor of the same
+    dtype as ``dst``, with a 16-byte-aligned base. Pointer tables are contiguous
+    CUDA uint64 tensors, one pointer per layer, on the staging device.
+
+    ``src_pages`` contains CUDA int32/int64 physical PAGE IDs, not token offsets.
+    ``dst_pages`` contains CPU int64 physical page IDs, in matching order.
+    Source IDs must be in bounds; destination IDs must be unique. The caller
+    owns the source allocations, which cannot be validated via pointer tables.
+    One group's token data must be a positive multiple of 16 bytes.
+
+    Reuses caller-provided staging in chunks on the current CUDA stream.
+    Keep all inputs alive and staging exclusive until that stream completes;
+    wait for completion before reading the host output. No GPU buffer is allocated.
+    """
+    if dst.ndim != 7 or staging.ndim != 7:
+        raise ValueError(
+            "Expected (page, head_group, layer, 2, page_size, head_in_group, dim)"
+        )
+    if dst.shape[3] != 2 or any(d <= 0 for d in dst.shape[1:]):
+        raise ValueError(
+            "Page dimensions must be positive and the K/V dimension must be 2"
+        )
+    _transfer_hicache_all_layer_staged_page_unified(
+        k_ptr_src,
+        v_ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[5] * dst.shape[6] * dst.element_size(),
+        num_groups=dst.shape[1],
+        page_size=dst.shape[4],
+        is_mla=False,
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_one_layer_mla_page_unified_lf(
+    cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    *,
+    block_quota: int | None = None,
+) -> None:
+    """Load one layer of compressed MLA pages in (page, layer, page_size, dim) order.
+
+    MLA has one latent cache per layer, with no head-group or separate K/V
+    axes; ``dim`` covers all stored latent and positional components.
+    ``cache_dst`` is one layer of the device pool, shaped (token, 1, dim).
+    Host memory, index and stream requirements match the MHA entry point.
+    """
+    if src.ndim != 4:
+        raise ValueError("Expected MLA (page, layer, page_size, dim)")
+    if any(d <= 0 for d in src.shape[1:]):
+        raise ValueError("MLA page dimensions must be positive")
+    _transfer_hicache_one_layer_page_unified(
+        cache_dst,
+        cache_dst,
+        src,
+        src_indices,
+        dst_indices,
+        layer_id=layer_id,
+        group_bytes=src.shape[3] * src.element_size(),
+        num_layers=src.shape[1],
+        num_groups=1,
+        page_size=src.shape[2],
+        is_mla=True,
+        block_quota=block_quota,
+    )
+
+
+def _transfer_hicache_one_layer_page_unified(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    *,
+    layer_id: int,
+    group_bytes: int,
+    num_layers: int,
+    num_groups: int,
+    page_size: int,
+    is_mla: bool,
+    block_quota: int | None,
+) -> None:
+    if not src.is_contiguous():
+        raise ValueError("The host pool must be contiguous")
+    if src.device.type != "cpu" and not src.is_cuda:
+        raise ValueError("Expected a CPU or CUDA-registered host pool")
+    if group_bytes % 16:
+        raise ValueError("Each copied token row must be 16-byte aligned")
+    module = _jit_hicache_page_unified_module(
+        element_size=group_bytes,
+        block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
+    )
+    launch = (
+        module.launch_one_mla_page_unified if is_mla else module.launch_one_page_unified
+    )
+    launch(
+        k_cache_dst.view(k_cache_dst.shape[0], -1),
+        v_cache_dst.view(v_cache_dst.shape[0], -1),
+        src.view(src.shape[0], -1),
+        src_indices,
+        dst_indices,
+        layer_id,
+        num_layers,
+        num_groups,
+        page_size,
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_all_layer_mla_staged_lf_page_unified(
+    ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write compressed MLA KV pages in (page, layer, page_size, dim) order.
+
+    MLA has one latent cache per layer, with no head-group or separate K/V
+    axes. Source pointers address contiguous (token, dim) tensors; ``dim``
+    includes all stored latent and positional components. No dtype conversion
+    is performed. Each token row must be a positive multiple of 16 bytes.
+
+    Pointer tables, page IDs, pinned destination memory, staging reuse and
+    stream lifetime requirements match the MHA page_unified entry point.
+    ``src_pages`` and ``dst_pages`` contain physical page IDs, not token offsets.
+    """
+    if dst.ndim != 4 or staging.ndim != 4:
+        raise ValueError("Expected MLA (page, layer, page_size, dim)")
+    if any(d <= 0 for d in dst.shape[1:]):
+        raise ValueError("MLA page dimensions must be positive")
+    _transfer_hicache_all_layer_staged_page_unified(
+        ptr_src,
+        ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[3] * dst.element_size(),
+        num_groups=1,
+        page_size=dst.shape[2],
+        is_mla=True,
+    )
+
+
+def _transfer_hicache_all_layer_staged_page_unified(
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+    *,
+    group_bytes: int,
+    num_groups: int,
+    page_size: int,
+    is_mla: bool,
+) -> None:
+    if staging.shape[1:] != dst.shape[1:] or staging.dtype != dst.dtype:
+        raise ValueError(
+            "Staging and destination must have matching page shapes and dtype"
+        )
+    if not staging.is_contiguous() or not dst.is_contiguous():
+        raise ValueError("Staging and destination must be contiguous")
+    if not staging.is_cuda or dst.device.type != "cpu" or not dst.is_pinned():
+        raise ValueError("Expected CUDA staging and a pinned CPU destination")
+    if staging.shape[0] == 0:
+        raise ValueError("Staging must hold at least one page")
+    if (
+        src_pages.ndim != 1
+        or dst_pages.ndim != 1
+        or src_pages.numel() != dst_pages.numel()
+    ):
+        raise ValueError("Source and destination page IDs must be equal-length vectors")
+    if group_bytes % 16:
+        raise ValueError("Each copied token row must be 16-byte aligned")
+    module = _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+    capacity = staging.shape[0]
+    page_elements = staging[0].numel()
+    staging_flat = staging.view(capacity, page_elements)
+    dst_flat = dst.view(dst.shape[0], page_elements)
+    for begin in range(0, src_pages.numel(), capacity):
+        end = min(begin + capacity, src_pages.numel())
+        module.launch(
+            dst_flat,
+            staging_flat[: end - begin],
+            k_ptr_src,
+            v_ptr_src,
+            src_pages[begin:end],
+            dst_pages[begin:end],
+            num_groups,
+            page_size,
+        )

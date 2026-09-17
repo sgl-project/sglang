@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -97,6 +98,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
+                head_group_num=resolve_head_group_num(self.kv_cache.head_num),
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
