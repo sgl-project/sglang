@@ -541,7 +541,7 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
 
 def _drop_page_cache_once(reason: str) -> None:
     global _page_cache_dropped
-    if _page_cache_dropped or not envs.SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE.get():
+    if _page_cache_dropped:
         return
     _page_cache_dropped = True
     files, nbytes = drop_checkpoint_page_cache()
@@ -565,13 +565,12 @@ class _HostTable:
                transparent_hugepage/enabled (madvise or always).
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group, pin: bool):
+    def __init__(self, layout: str, nbytes: int, name: str, group):
         assert layout in ("shared", "private"), layout
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        self.registered = False
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -601,11 +600,9 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        if pin:
-            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-            if int(err) != 0:
-                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
-            self.registered = True
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
 
     @staticmethod
     def choose_layout(requested: str) -> str:
@@ -668,15 +665,14 @@ class _HostTable:
         if self.layout == "private" and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
-            if envs.SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE.get():
-                drop_checkpoint_page_cache()
+            drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
             f"engram host table {label}: layout={self.layout}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
-            f"({pct:.0f}%){', pinned' if self.registered else ', unpinned (ATS)'}"
+            f"({pct:.0f}%)"
         )
         if huge_kb == 0:
             knob = "shmem_enabled" if self.layout == "shared" else "enabled"
@@ -739,7 +735,6 @@ class EngramEmbedding(nn.Module):
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_tp_group(),
-            pin=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get(),
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
@@ -965,13 +960,6 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
-        return self.apply_gate(x, kv)
-
-    def project(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
-        return kv
-
-    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
