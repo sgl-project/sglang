@@ -5,11 +5,13 @@ Two pins against a paged SDPA reference: the spec-decode call
 layers, which need bidirectional attention), and the expanded formulation
 (bs*L single-token rows, kv length = prefix + L) matches the full-window
 reference -- what TRTLLMHAAttnBackend runs for ENCODER_ONLY layers on the
-draft worker.
+draft worker. Causal-window cases also check the fixed-query decode helper used
+by DSpark against the same paged reference.
 """
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -29,10 +31,10 @@ NUM_KV_HEADS = 2
 HEAD_DIM = 64
 
 
-def _build_inputs(seed=3):
+def _build_inputs(seed=3, *, prefix=PREFIX):
     torch.manual_seed(seed)
     dtype = torch.bfloat16
-    seq_len = PREFIX + L
+    seq_len = prefix + L
     pages_per_req = math.ceil(seq_len / PAGE_SIZE)
     num_pages = BS * pages_per_req + 1
 
@@ -51,9 +53,9 @@ def _build_inputs(seed=3):
     return q, (k_cache, v_cache), block_tables, workspace
 
 
-def _gather_kv(kv_cache, block_tables, req):
+def _gather_kv(kv_cache, block_tables, req, *, prefix=PREFIX):
     k_cache, v_cache = kv_cache
-    seq_len = PREFIX + L
+    seq_len = prefix + L
     pages = block_tables[req].long()
     # [pages, kv_heads, page, dim] -> [kv_heads, pages*page, dim]
     k = k_cache[pages].permute(1, 0, 2, 3).reshape(NUM_KV_HEADS, -1, HEAD_DIM)
@@ -61,23 +63,28 @@ def _gather_kv(kv_cache, block_tables, req):
     return k[:, :seq_len], v[:, :seq_len]
 
 
-def _sdpa_reference(q, kv_cache, block_tables, *, bidirectional):
+def _sdpa_reference(
+    q, kv_cache, block_tables, *, bidirectional, prefix=PREFIX, window_left=-1
+):
     """Per-request SDPA over the paged KV; the L query tokens sit at the last
     L positions. bidirectional=True lets every query see all prefix+L keys;
     False applies the verify-style causal mask (query i sees prefix+i+1)."""
-    seq_len = PREFIX + L
+    seq_len = prefix + L
     group = NUM_Q_HEADS // NUM_KV_HEADS
     outs = []
     for req in range(BS):
-        k, v = _gather_kv(kv_cache, block_tables, req)
+        k, v = _gather_kv(kv_cache, block_tables, req, prefix=prefix)
         k = k.repeat_interleave(group, dim=0).float()
         v = v.repeat_interleave(group, dim=0).float()
         qi = q.view(BS, L, NUM_Q_HEADS, HEAD_DIM)[req].permute(1, 0, 2).float()
         scores = torch.einsum("hqd,hkd->hqk", qi, k) / math.sqrt(HEAD_DIM)
         if not bidirectional:
             kv_pos = torch.arange(seq_len, device=DEVICE).view(1, 1, -1)
-            q_pos = (PREFIX + torch.arange(L, device=DEVICE)).view(1, -1, 1)
-            scores = scores.masked_fill(kv_pos > q_pos, float("-inf"))
+            q_pos = (prefix + torch.arange(L, device=DEVICE)).view(1, -1, 1)
+            mask = kv_pos > q_pos
+            if window_left >= 0:
+                mask = mask | (kv_pos < q_pos - window_left)
+            scores = scores.masked_fill(mask, float("-inf"))
         out = torch.einsum("hqk,hkd->hqd", torch.softmax(scores, dim=-1), v)
         outs.append(out.permute(1, 0, 2))
     return torch.cat(outs, dim=0).to(q.dtype)
@@ -143,6 +150,53 @@ class TestTrtllmMhaEncoderOnlyVerify(CustomTestCase):
             atol=2e-2,
             rtol=2e-2,
         )
+
+
+class TestTrtllmMhaCausalWindow(CustomTestCase):
+    def test_dspark_fixed_query_window_boundaries(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        # The query block crosses the window and page edges; long prefixes must
+        # keep bottom-right causal alignment, not rebase to window-local positions.
+        cases = [(1, 0), (1, 40), (2, 0), (2, 40)]
+        cases += [(w, w - L + delta) for w in (32, 2048) for delta in (-1, 0, 1)]
+        cases += [(2048, 4097)]
+        for window, prefix in cases:
+            with self.subTest(window=window, prefix=prefix):
+                q, kv_cache, block_tables, workspace = _build_inputs(prefix=prefix)
+                seq_lens = torch.full(
+                    (BS,), prefix + L, dtype=torch.int32, device=DEVICE
+                )
+                backend = SimpleNamespace(
+                    workspace_buffer=workspace,
+                    max_context_len=prefix + L,
+                    q_data_type=q.dtype,
+                    decode_seq_len_splits=1,
+                    _multi_ctas_kv_counter_buffer=None,
+                )
+                out = TRTLLMHAAttnBackend._run_fixed_q_len_decode(
+                    backend,
+                    q,
+                    kv_cache,
+                    block_tables,
+                    seq_lens,
+                    bmm1_scale=1.0 / math.sqrt(HEAD_DIM),
+                    bmm2_scale=1.0,
+                    window_left=window - 1,
+                    sinks=None,
+                    q_len_per_req=L,
+                )
+                ref = _sdpa_reference(
+                    q,
+                    kv_cache,
+                    block_tables,
+                    bidirectional=False,
+                    prefix=prefix,
+                    window_left=window - 1,
+                )
+                torch.testing.assert_close(
+                    out.view_as(ref).float(), ref.float(), atol=2e-2, rtol=2e-2
+                )
 
 
 if __name__ == "__main__":

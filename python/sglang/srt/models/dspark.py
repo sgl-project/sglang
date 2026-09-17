@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -484,6 +485,7 @@ class DSparkDraftMixin:
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
+        self._draft_window_size: Optional[int] = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -510,6 +512,35 @@ class DSparkDraftMixin:
         # out of range. DSv4 (MoE) drafts expose this via ``num_stages``; mirror
         # that convention for dense DSpark drafts.
         self.num_stages = int(config.num_hidden_layers)
+
+    def set_attention_window(self, window_size: int) -> None:
+        if not self.layers or any(
+            not isinstance(layer.self_attn.attn, RadixAttention)
+            or layer.self_attn.attn.attn_type != AttentionType.DECODER
+            for layer in self.layers
+        ):
+            raise ValueError(
+                "DSpark --speculative-draft-window-size requires nonempty causal "
+                "draft attention layers."
+            )
+        # The CLI includes the current token; RadixAttention stores window_left.
+        window_left = window_size - 1
+        native_windows = {layer.self_attn.sliding_window_size for layer in self.layers}
+        if native_windows not in ({-1}, {window_left}):
+            raise ValueError(
+                "DSpark --speculative-draft-window-size cannot override a mixed "
+                "or conflicting checkpoint attention-window layout. Omit the "
+                "option to retain the checkpoint's windows."
+            )
+        for layer in self.layers:
+            layer.self_attn.sliding_window_size = window_left
+            layer.self_attn.attn.sliding_window_size = window_left
+        self._draft_window_size = window_left
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        if self._draft_window_size is not None:
+            return self._draft_window_size
+        return super().get_attention_sliding_window_size()
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module

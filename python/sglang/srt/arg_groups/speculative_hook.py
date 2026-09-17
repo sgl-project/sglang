@@ -161,7 +161,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # DFLASH compacts draft KV; DSPARK and Llama EAGLE-3 apply draft attention SWA.
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:
@@ -173,10 +173,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH", "DSPARK"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH, and DSPARK only).",
                 cfg.speculative_algorithm,
             )
 
