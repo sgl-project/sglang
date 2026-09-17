@@ -20,6 +20,18 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
+<Warning>
+**Verify vision after every deploy.** `Glm5NextProcessor` landed in transformers on 2026-08-26 and is missing from release builds up to (at least) `transformers==5.12.1`, which current SGLang builds pin. On such builds the server starts normally and `/model_info` still reports `"has_image_understanding": true`, but every image collapses to 3 placeholder tokens and the model hallucinates image content ([#39831](https://github.com/sgl-project/sglang/issues/39831)).
+
+Send one small image and check the response `usage.prompt_tokens`: it should grow by roughly the image grid size (about 100 tokens for a 256×256 image), not by 3. If it does not, install a transformers revision that contains glm5_next until the SGLang pin catches up, for example:
+
+```dockerfile
+FROM <your sglang image>
+RUN pip install --no-cache-dir \
+    "transformers @ git+https://github.com/huggingface/transformers.git@<commit-with-glm5_next>"
+```
+</Warning>
+
 Choose your hardware, then choose the operating point that matches your workload:
 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
