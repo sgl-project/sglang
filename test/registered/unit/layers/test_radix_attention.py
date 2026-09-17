@@ -175,6 +175,71 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertEqual(output.shape, query.shape)
                     self.assertTrue(torch.all(output == 5))
 
+    def test_deferred_norm_rope_operands_follow_real_tokens_on_each_call(self):
+        layer = self._new_layer()
+        query = torch.zeros((4, 2, 3))
+        positions = torch.arange(4)
+        temp_scale = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+        norm_weight = torch.ones(3)
+        operands = {
+            "mxfp8_norm_rope_positions": positions,
+            "mxfp8_norm_rope_temp_scale": temp_scale,
+            "norm_weight": norm_weight,
+        }
+        for breakable in (False, True):
+            with self.subTest(breakable=breakable):
+                context = self._new_impl_context([layer])
+                forward_batch = context.forward_batch
+                forward_batch.forward_mode = ForwardMode.EXTEND
+                original_cache_loc = forward_batch.out_cache_loc
+                backend = _RecordingAttentionBackend(return_lse=False)
+                with (
+                    patch.object(
+                        radix_attention_module,
+                        "get_tc_piecewise_forward_context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "get_attn_backend",
+                        return_value=backend,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "is_in_breakable_cuda_graph",
+                        return_value=breakable,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "breakable_attention_with_output_extra_kwargs",
+                        side_effect=radix_attention_module.attention_with_output_extra_kwargs,
+                    ) as graph_break,
+                ):
+                    for real_tokens in (2, 4):
+                        forward_batch.global_num_token_non_padded_cpu = real_tokens
+                        positions.add_(10)
+                        result = layer(query, query, query, forward_batch, **operands)
+                        call = backend.calls[-1]
+                        self.assertEqual(call.query.shape[0], real_tokens)
+                        self.assertTrue(
+                            torch.equal(
+                                call.kwargs["mxfp8_norm_rope_positions"],
+                                positions[:real_tokens],
+                            )
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                call.kwargs["mxfp8_norm_rope_temp_scale"],
+                                temp_scale[:real_tokens],
+                            )
+                        )
+                        self.assertIs(call.kwargs["norm_weight"], norm_weight)
+                        self.assertIs(forward_batch.out_cache_loc, original_cache_loc)
+                        self.assertTrue(torch.all(result[:real_tokens] == 3))
+                        self.assertEqual(positions.shape[0], 4)
+                        self.assertEqual(temp_scale.shape[0], 4)
+                    self.assertEqual(graph_break.call_count, 2 if breakable else 0)
+
     def test_impl_preserves_attention_identity_and_lse(self):
         mqa = SimpleNamespace()
         mha = SimpleNamespace()
