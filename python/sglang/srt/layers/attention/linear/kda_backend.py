@@ -1020,15 +1020,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 or (a.ndim == 4 and a.stride(-2) != 128)
             ):
                 return False
-            return all(
-                t.is_contiguous()
-                for t in (
-                    ssm_states,
-                    conv_states,
-                    intermediate_conv_window_cache,
-                    *rings,
-                )
-            )
+            # PLA reads/writes conv windows by stride; commit accepts either
+            # dense axis order for conv state.
+            if not intermediate_conv_window_cache.is_contiguous() and any(
+                s <= 0 for s in intermediate_conv_window_cache.stride()
+            ):
+                return False
+            return (
+                conv_states.is_contiguous()
+                or conv_states.transpose(-1, -2).is_contiguous()
+            ) and all(t.is_contiguous() for t in (ssm_states, *rings))
         if intermediate_state_cache is None:
             # ReplaySSM: the ring replaces the per-step snapshots. The kernel
             # wrapper validates ring layout/dtypes and raises loudly (there is

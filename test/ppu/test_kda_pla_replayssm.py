@@ -137,7 +137,13 @@ def test_verify_commit_and_graph(heads, steps):
     from sglang.srt.environ import envs
 
     backend, initial, layer, inputs, forward = make_case(heads, steps)
-    reference, candidate = copy.deepcopy(initial), copy.deepcopy(initial)
+    reference = copy.deepcopy(initial)
+    if (heads, steps) == (12, 8):
+        # Exercise transposed conv pools before backend dispatch.
+        for pools in (initial.conv, initial.intermediate_conv_window):
+            pools[0] = pools[0].transpose(-1, -2).contiguous().transpose(-1, -2)
+            assert not pools[0][0].is_contiguous()
+    candidate = copy.deepcopy(initial)
     commit_args = dict(
         state_batch_indices=backend.forward_metadata.mamba_cache_indices,
         accept_lens=torch.tensor(
@@ -174,12 +180,18 @@ def test_verify_commit_and_graph(heads, steps):
                     == inputs[0].untyped_storage().data_ptr()
                 )
                 assert not kwargs["cs_q"].is_contiguous()
+                conv = candidate.conv[0][layer.layer_id]
+                assert kwargs["cs_q"].data_ptr() == conv.data_ptr()
                 assert not kwargs["intermediate_conv_q"].is_contiguous()
+                window = candidate.intermediate_conv_window[0][layer.layer_id]
+                assert kwargs["intermediate_conv_q"].data_ptr() == window.data_ptr()
             torch.testing.assert_close(candidate.temporal, before, rtol=0, atol=0)
             torch.testing.assert_close(candidate.conv[0], conv_before, rtol=0, atol=0)
             # Isolate FP32 fold accuracy from BF16 verify/conv rounding across
             # iterations: both commit paths consume exactly the same rings.
             same_rings = copy.deepcopy(candidate)
+            # Triton scatter requires a contiguous reference destination.
+            same_rings.conv[0] = same_rings.conv[0].contiguous()
             with envs.SGLANG_SAIL_PLA_CUDA.override(False):
                 commit(spec_state=same_rings, **commit_args)
             with patch.object(
@@ -349,5 +361,16 @@ def test_dispatch_guards():
             {"intermediate_state_cache": state.temporal},
             {"draft_token_num": 9},
             {"a": inputs[1].float()},
+            {
+                "conv_states": args["conv_states"]
+                .transpose(0, 1)
+                .contiguous()
+                .transpose(0, 1)
+            },
+            {
+                "intermediate_conv_window_cache": args[
+                    "intermediate_conv_window_cache"
+                ][:, :1].expand(-1, 6, -1, -1)
+            },
         ):
             assert not backend._can_run_dspark_cutedsl_mtp(**(args | changes))
