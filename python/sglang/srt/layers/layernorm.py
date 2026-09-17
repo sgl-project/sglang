@@ -1341,9 +1341,13 @@ class Gemma3RMSNorm(BaseFusedOp):
             # output and residual becomes x + residual for the next layer.
             gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
             return x, residual
-        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
-        # can all go through it directly without a Python-side reshape.
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs go
+        # through directly without a Python-side reshape. It handles
+        # non-contiguous batch/row strides but requires a contiguous last dim,
+        # which a permuted hidden state may not have.
         elif residual is None and x.dim() in (2, 3, 4):
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x, residual)
 
