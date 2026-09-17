@@ -1,4 +1,4 @@
-"""Coverage for the AITER FP8-Q unified-attention decode path."""
+"""Coverage for the AITER FP8-Q unified-attention prefill and decode paths."""
 
 import math
 import unittest
@@ -127,6 +127,65 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         )
         return backend, layer, forward_batch, q
 
+    def _make_prefill_case(self, kv_cache_dtype=None):
+        if kv_cache_dtype is None:
+            kv_cache_dtype = fp8_dtype
+        batch, num_q_heads, num_kv_heads, head_dim = 2, 2, 1, 8
+        query_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([4, 6], dtype=torch.int32, device="cuda")
+        scale = torch.tensor([0.02], dtype=torch.float32, device="cuda")
+        k_cache = torch.zeros(
+            12,
+            1,
+            num_kv_heads,
+            head_dim,
+            dtype=kv_cache_dtype,
+            device="cuda",
+        )
+        v_cache = torch.zeros_like(k_cache)
+
+        backend = object.__new__(AiterAttnBackend)
+        backend.kv_cache_dtype = kv_cache_dtype
+        backend.input_dtype = torch.bfloat16
+        backend.page_size = 1
+        backend.k_scale = scale
+        backend.use_sliding_window_kv_pool = False
+        backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
+        backend.forward_metadata = SimpleNamespace(max_q_len=3)
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            tp_v_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=scale,
+            sliding_window_size=-1,
+            scaling=head_dim**-0.5,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=batch,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            req_pool_indices=torch.arange(batch, dtype=torch.int32, device="cuda"),
+            extend_seq_lens=query_lens,
+        )
+        q = torch.randn(
+            int(query_lens.sum().item()),
+            num_q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        page_table = torch.arange(
+            batch * int(seq_lens.max().item()),
+            dtype=torch.int32,
+            device="cuda",
+        ).view(batch, -1)
+        return backend, layer, forward_batch, q, page_table
+
     def test_q_quantization_is_isolated_to_unified_attention(self):
         for branch in ("mla", "vectorized", "unified", "legacy"):
             with self.subTest(branch=branch):
@@ -200,6 +259,81 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             observed_q.reshape(q.shape[0], -1),
             original_q,
         )
+
+    def test_prefill_quantizes_q_for_fp8_kv(self):
+        backend, layer, forward_batch, q, page_table = self._make_prefill_case()
+        q_2d = q.reshape(q.shape[0], -1)
+        sentinel_q = torch.full(q_2d.shape, 7, dtype=fp8_dtype, device=q.device)
+
+        with (
+            mock.patch.object(
+                backend,
+                "_build_extend_unified_page_table",
+                return_value=(page_table, None),
+            ),
+            mock.patch.object(
+                aiter_backend,
+                "scaled_fp8_quant",
+                return_value=(sentinel_q, layer.k_scale),
+            ) as quant,
+            mock.patch.object(aiter_backend, "unified_attention") as unified,
+        ):
+            output = backend._forward_extend_unified(
+                q,
+                layer,
+                forward_batch,
+                forward_batch.batch_size,
+                (-1, -1),
+                None,
+                layer.k_scale,
+                layer.k_scale,
+            )
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(output.shape, (q.shape[0], q.shape[1] * q.shape[2]))
+        quant.assert_called_once()
+        torch.testing.assert_close(quant.call_args.args[0], q_2d)
+        self.assertIs(quant.call_args.args[1], layer.k_scale)
+        self.assertIs(unified.call_args.kwargs["q_descale"], layer.k_scale)
+        torch.testing.assert_close(
+            unified.call_args.kwargs["q"].reshape(q.shape[0], -1),
+            sentinel_q,
+        )
+        torch.testing.assert_close(
+            unified.call_args.kwargs["cu_seqlens_q"],
+            torch.tensor([0, 2, 5], dtype=torch.int32, device=q.device),
+        )
+
+    def test_prefill_keeps_bf16_q_for_bf16_kv(self):
+        backend, layer, forward_batch, q, page_table = self._make_prefill_case(
+            torch.bfloat16
+        )
+        original_q = q.clone()
+
+        with (
+            mock.patch.object(
+                backend,
+                "_build_extend_unified_page_table",
+                return_value=(page_table, None),
+            ),
+            mock.patch.object(aiter_backend, "scaled_fp8_quant") as quant,
+            mock.patch.object(aiter_backend, "unified_attention") as unified,
+        ):
+            backend._forward_extend_unified(
+                q,
+                layer,
+                forward_batch,
+                forward_batch.batch_size,
+                (-1, -1),
+                None,
+                None,
+                None,
+            )
+
+        quant.assert_not_called()
+        self.assertIsNone(unified.call_args.kwargs["q_descale"])
+        self.assertEqual(unified.call_args.kwargs["q"].dtype, torch.bfloat16)
+        torch.testing.assert_close(unified.call_args.kwargs["q"], original_q)
 
     def test_fp8_q_kv_matches_bf16_reference_at_decode_shape(self):
         # This is the per-TP-rank production shape used by the full trace.
