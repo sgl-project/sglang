@@ -1650,6 +1650,7 @@ def _situ_mul_quant_contig_kernel(
 def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
+    """Clamp the contiguous runner's owned GEMM workspace in place."""
     assert swiglu_limit == 10
 
     num_tokens, hidden_size_x2 = gateup_output.shape
@@ -1659,12 +1660,12 @@ def _apply_swiglu_limit(
     assert gate.shape == (num_tokens, hidden_size_x2 // 2)
     assert up.shape == (num_tokens, hidden_size_x2 // 2)
 
-    up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-    gate = torch.clamp(gate, max=swiglu_limit)
-
-    out = torch.cat([gate, up], dim=-1)
-    assert out.shape == (num_tokens, hidden_size_x2)
-    return out
+    # Both halves are views of a fresh GEMM output. Avoid separate clamped
+    # copies and their concatenation: large compact prefills need that
+    # headroom for the activation and down-projection workspaces.
+    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+    gate.clamp_(max=swiglu_limit)
+    return gateup_output
 
 
 @register_pre_permute("deepep_v2", "deep_gemm")
@@ -1691,10 +1692,12 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
     deepep_v2_total_expanded = dispatch_output.total_expanded
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
-    if hidden_states_scale is None:
+    is_fp8 = hidden_states_scale is not None
+    if not is_fp8 and hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(
-            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation "
-            "scales, but the dispatch output carried none."
+            "DeepEP v2 -> DeepGEMM requires either FP8 dispatch output with "
+            "activation scales or BF16 dispatch output, but the dispatch "
+            f"output carried {hidden_states.dtype} without scales."
         )
     assert runner_config.activation == "silu"
 
@@ -1763,7 +1766,9 @@ def pre_permute_deepep_v2_to_deep_gemm(
     input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+    if not is_fp8:
+        input_tensor_scale = None
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # Packed UE8M0 scales require zero padding lanes.
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
@@ -1791,7 +1796,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
     dispose_tensor(hidden_states)
-    dispose_tensor(hidden_states_scale)
+    if hidden_states_scale is not None:
+        dispose_tensor(hidden_states_scale)
     running_state["output_index"] = output_index
 
     return DeepGemmRunnerInput(

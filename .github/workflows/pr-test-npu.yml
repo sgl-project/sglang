@@ -3,6 +3,8 @@ name: PR Test (NPU)
 on:
   push:
     branches: [ main ]
+  schedule:
+    - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -39,11 +41,11 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for workflow_call (when ref input is provided)
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -56,7 +58,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/**/!(*.md)"
+              - "!python/sglang/multimodal_gen/**"
+              - "!python/sglang/kernels/ops/diffusion/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/npu/**"
@@ -64,7 +68,7 @@ jobs:
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/kernels/ops/diffusion/triton/npu_fallback.py"
+              - "python/sglang/kernels/ops/diffusion/**"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -227,7 +231,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  multimodal-gen-test-2-npu-a3:
+  multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-4
@@ -297,7 +301,7 @@ jobs:
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800t-2
+      runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: base-c-test-acc-2-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -311,7 +315,7 @@ jobs:
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800t-16
+      runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: base-c-test-acc-16-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -359,7 +363,7 @@ jobs:
         base-b-test-16-npu-a3,
 
         multimodal-gen-test-1-npu-a3,
-        multimodal-gen-test-2-npu-a3,
+        multimodal-gen-test-4-npu-a3,
 
         base-c-test-acc-2-npu-a3,
         base-c-test-acc-16-npu-a3,

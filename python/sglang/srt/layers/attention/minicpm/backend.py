@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.minicpm.attention_adapter import (
 from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_schedule,
@@ -189,7 +190,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             model_runner.token_to_kv_pool_allocator,
             kernel_size=self.kernel_size,
             kernel_stride=self.kernel_stride,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
         )
         self.req_to_sparse_k1_token = self.req_to_token_pool.req_to_sparse_k1_token
         self.req_to_sparse_k2_token = self.req_to_token_pool.req_to_sparse_k2_token

@@ -23,7 +23,7 @@ Addressing law under test:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -345,17 +345,36 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         )
 
     def test_transfer_entry_points_fail_loud(self):
-        """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
-        id and would silently mis-index the row space, so each must raise."""
+        """The entry points that assume per-layer buffers indexed by TOKEN id
+        would silently mis-index against the row space (or hit a missing-attr
+        AttributeError), so each must raise. `get_contiguous_buf_infos` is NOT
+        among them: PD addresses this pool as whole page envelopes, pinned by
+        `test_pd_registration_is_one_whole_envelope` below."""
         _, pool = _make_pool_and_kv(1)
-        with self.assertRaises(NotImplementedError):
-            pool.get_contiguous_buf_infos()
         with self.assertRaises(NotImplementedError):
             pool.get_cpu_copy(torch.tensor([1]))
         with self.assertRaises(NotImplementedError):
             pool.load_cpu_copy(None, torch.tensor([1]))
         with self.assertRaises(NotImplementedError):
             pool.set_kv_buffer_prefix_valid()
+
+    def test_pd_registration_is_one_whole_envelope(self):
+        """PD registers ONE region -- the whole raw buffer -- with the page
+        envelope as the item, so the transfer engine addresses it as
+        `raw_ptr + physical_page * page_envelope_bytes`. Per-layer regions
+        would be wrong here: the per-layer views overlap inside the envelope
+        and index in kernel-facing ids, not token ids."""
+        kv, pool = _make_pool_and_kv(1)
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), 1)
+        self.assertEqual(len(lens), 1)
+        self.assertEqual(len(item_lens), 1)
+        self.assertEqual(ptrs[0], kv._raw.data_ptr())
+        self.assertEqual(lens[0], kv._raw.numel())
+        self.assertEqual(item_lens[0], pool._page_bytes)
+        # The whole addressable page range must fit the registered region, or
+        # the last page's write would run off the end of the RDMA mapping.
+        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE must not flip this pool's layout: HND indexes
@@ -367,6 +386,18 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 
 class TestFactoryViews(unittest.TestCase):
+    def setUp(self):
+        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `attn_dcp_size`, which is a quotient of the configured leaves and is
+        # computed at publish. A bare process has none, so state one the way a
+        # real process does.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
     """Over the real SWA factory: matching kernel-facing multipliers in the
     composite allocator, and a rebind that emits both write locs."""
 

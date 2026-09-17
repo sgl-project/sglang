@@ -7,7 +7,7 @@ from sglang.srt.parser.hunyuan_reasoning import normalize_hunyuan_reasoning_effo
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(

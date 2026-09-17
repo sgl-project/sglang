@@ -10,7 +10,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -43,6 +43,11 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_hidden_states=False,
         return_routed_experts=False,
         routed_experts_start_len=0,
+        bootstrap_host=None,
+        bootstrap_port=None,
+        bootstrap_room=None,
+        routed_dp_rank=None,
+        disagg_prefill_dp_rank=None,
         priority=None,
         routing_key=None,
         extra_key=None,

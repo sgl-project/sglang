@@ -49,9 +49,8 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_spec,
-    mamba_extra_buffer_enabled,
-    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -166,15 +165,46 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+def sample_draft_proposal(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
     only if q is exactly the distribution X was drawn from, so callers must hand
     the returned q (not a recomputed one) to the verify.
+
+    A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
+    rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
+    tell a greedy request from a T=1 one, and sampling a sharp-but-not-
+    degenerate distribution proposes a non-argmax token often enough to cost
+    real accept length.
+
+    That row's X is then not drawn from the q returned beside it, which the
+    unbiasedness argument above otherwise rests on. It stays correct because
+    eagle_sample renormalises the target by the same per-row ``top_ks`` before
+    the accept test, so a greedy row's p is one-hot: X equal to the target
+    argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
+    (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
+    which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
+    if top_ks is not None:
+        # Assert rather than skip on a device mismatch: a host-side top_ks would
+        # make this correction silently vanish, and the symptom -- draft accept
+        # length quietly dropping about 20% -- reads as a model problem, not a
+        # plumbing one.
+        assert top_ks.device == probs.device, (
+            f"top_ks must be on {probs.device} to reach the draft proposal, "
+            f"got {top_ks.device}; the caller has to carry the real per-request "
+            "top_k, not a host placeholder"
+        )
+        greedy = (top_ks <= 1).view(-1, 1)
+        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
+        topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 
@@ -778,10 +808,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
-    if not mamba_extra_buffer_enabled():
+    if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
-    if mamba_extra_buffer_lazy_enabled():
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -806,6 +836,23 @@ def _verify_commit_step_indices(
     mamba-track interval-crossing step (-1 = no crossing; None when tracking
     is off)."""
     bs = accept_lens.shape[0]
+    if accept_index.is_cuda:
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_commit_track_indices,
+        )
+
+        track_grid = (
+            mamba_track_grid(batch.tree_cache.page_size)
+            if batch.mamba_track_indices is not None
+            else 0
+        )
+        return fused_commit_track_indices(
+            accept_index,
+            accept_lens,
+            batch.seq_lens if track_grid > 0 else None,
+            draft_token_num,
+            track_grid,
+        )
     accept_indices_offset = torch.arange(
         0,
         bs * draft_token_num,
@@ -1066,7 +1113,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if mamba_extra_buffer_lazy_enabled():
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),

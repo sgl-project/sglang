@@ -1,6 +1,6 @@
 """Config-time override declarations for qwen3_moe.
 
-Architectures: InternS2PreviewForConditionalGeneration, Qwen3MoeForCausalLM, Qwen3NextForCausalLM, Qwen3VLMoeForConditionalGeneration, Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration.
+Architectures: InternS2PreviewForConditionalGeneration, Qwen3MoeForCausalLM, Qwen3NextForCausalLM, Qwen3VLMoeForConditionalGeneration, Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration, Qwen4ExpForConditionalGeneration.
 """
 
 import logging
@@ -10,10 +10,23 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
+
+
+def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
+    """quant_algo values ModelOpt MIXED_PRECISION assigns to `*.experts` layers."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return set()
+    return {
+        str(info.get("quant_algo", "")).upper()
+        for name, info in quantization_config.get("quantized_layers", {}).items()
+        if ".experts" in name and isinstance(info, dict)
+    }
 
 
 @_register_for(
@@ -23,6 +36,7 @@ logger = logging.getLogger(__name__)
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
@@ -37,8 +51,38 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["quantization"] = quant_method
             quantization = quant_method
-        if (
-            (quantization in ("fp8", "modelopt_fp4") or quantization is None)
+        has_w4a16_moe_layers = (
+            quantization == "modelopt_mixed"
+            and "W4A16_NVFP4" in _mixed_precision_moe_quant_algos(hf_config)
+        )
+        if has_w4a16_moe_layers:
+            # trtllm-gen only has the W4A4 NVFP4 MoE path.
+            # CuTe DSL v2 also supports W4A16 with BF16 activations when opted in.
+            use_cutedsl_w4a16 = (
+                cfg.moe_runner_backend == "flashinfer_cutedsl"
+                and cfg.moe_a2a_backend in ("none", "flashinfer")
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
+            if (
+                cfg.moe_runner_backend not in ("auto", "marlin")
+                and not use_cutedsl_w4a16
+            ):
+                raise ValueError(
+                    "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
+                    "or flashinfer_cutedsl with --moe-a2a-backend=none/flashinfer "
+                    "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
+                )
+            if cfg.moe_runner_backend == "auto":
+                overrides["moe_runner_backend"] = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend for "
+                    f"{hf_config.architectures[0]} with W4A16_NVFP4 MoE layers"
+                )
+        elif (
+            (
+                quantization in ("fp8", "modelopt_fp4", "modelopt_mixed")
+                or quantization is None
+            )
             and cfg.moe_a2a_backend == "none"
             and cfg.moe_runner_backend == "auto"
         ):

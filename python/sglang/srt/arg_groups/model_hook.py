@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -28,6 +30,7 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
     validate_declarations,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -78,6 +81,59 @@ def _rocm_fp8_wo_a_supported() -> bool:
         return is_wo_a_fp8_mxscale_supported()
     except Exception:  # pragma: no cover - env-dependent
         return False
+
+
+def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str | None:
+    """Read one indexed wo_a dtype without downloading a weight shard."""
+    try:
+        from huggingface_hub import (
+            parse_local_safetensors_file_metadata,
+            parse_safetensors_file_metadata,
+        )
+        from transformers.utils.hub import cached_file
+
+        model_path = model_config.model_path
+        revision = (
+            getattr(model_config.hf_config, "_commit_hash", None)
+            or model_config.revision
+        )
+        index_path = cached_file(
+            model_path,
+            "model.safetensors.index.json",
+            revision=revision,
+            cache_dir=download_dir,
+        )
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        name = next((key for key in weight_map if key.endswith(".wo_a.weight")), None)
+        if name is None:
+            return None
+
+        shard = weight_map[name]
+        local_shard = os.path.join(os.path.dirname(index_path), shard)
+        metadata = (
+            parse_local_safetensors_file_metadata(local_shard)
+            if os.path.isfile(local_shard)
+            else parse_safetensors_file_metadata(model_path, shard, revision=revision)
+        )
+        return getattr(metadata.tensors.get(name), "dtype", None)
+    except Exception:
+        logger.debug("Unable to inspect the checkpoint wo_a dtype", exc_info=True)
+        return None
+
+
+def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -> None:
+    flag = envs.SGLANG_OPT_FP8_WO_A_GEMM
+    if not _rocm_fp8_wo_a_supported():
+        flag.set(False)
+        return
+    if flag.is_set():
+        return
+
+    dtype = _probe_wo_a_weight_dtype(model_config, download_dir)
+    if dtype is not None and dtype != "F8_E4M3":
+        flag.set(False)
+        logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
 
 
 def handle_model_specific_adjustments(server_args: Any):
@@ -183,6 +239,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
@@ -243,6 +300,21 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
+            elif get_platform().is_xpu:
+                run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
+                run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # Disable fused topk (requires sgl-kernel ops not available on XPU)
+                if (
+                    envs.SGLANG_DSA_FUSE_TOPK.is_set()
+                    and envs.SGLANG_DSA_FUSE_TOPK.get()
+                ):
+                    logger.warning(
+                        "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
+                    )
+                envs.SGLANG_DSA_FUSE_TOPK.set(False)
+                # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
             if cfg.enable_prefill_cp:
                 assert cfg.disaggregation_mode != "decode", (
                     "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
@@ -268,9 +340,7 @@ def handle_model_specific_adjustments(server_args: Any):
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split requires "
-                    "--enable-prefill-cp and --cp-strategy interleave "
-                    "(or legacy --enable-nsa-prefill-context-parallel with "
-                    "--nsa-prefill-cp-mode round-robin-split)."
+                    "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
@@ -325,24 +395,9 @@ def handle_model_specific_adjustments(server_args: Any):
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
-            if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
-                # CUDA/Hopper-only path: its JIT source includes
-                # <cooperative_groups.h> and uses cg::this_cluster()
-                # (thread-block clusters), neither of which exists on ROCm,
-                # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                # here for the rest of the DSA family (DeepSeek-V3.2 /
-                # GLM-5.x) that shares the same decode top-k path.
+            if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                # Prefer HIP top-k by default while honoring an explicit selection.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if model_arch == "GlmMoeDsaForCausalLM":
-                # Open the fused top-k v2 kernel for the GLM-5.x DSA
-                # family on ROCm: it shares this decode top-k path, and
-                # the kernel's ROCm build compiles the streaming levels
-                # on gfx9xx. Order is load-bearing: the blanket disable
-                # above `set`s the variable unconditionally, so this has
-                # to follow it.
-                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
@@ -387,11 +442,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
-            # e8m0 block-scale equivalent, but only on gfx950 -- everywhere else
-            # keeps the bf16 absorb GEMM.
-            if not _rocm_fp8_wo_a_supported():
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
@@ -534,12 +585,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "intel_xpu",
             "intel_amx",
+            "aiter",
         )
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
-            f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override
@@ -578,6 +630,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         # The quantization/moe_runner_backend resolution moved to the
         # override registry (arg_groups/overrides.py:
@@ -770,7 +823,11 @@ def handle_model_capability_adjustments(server_args: Any):
                 "_handle_model_capability_adjustments",
                 prefill_only_disable_kv_cache=True,
             )
-            validate_prefill_only_disable_kv_cache_args(server_args)
+            # Through the registry, not a bare call: an out-of-tree
+            # replacement registered at this validator's own pipeline
+            # position must also win here, at this later re-validation after
+            # the Hopper/Blackwell no-KV-pool default declares itself.
+            run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",

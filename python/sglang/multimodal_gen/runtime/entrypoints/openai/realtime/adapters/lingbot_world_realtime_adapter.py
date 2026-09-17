@@ -14,14 +14,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
-    LINGBOT_CAMERA_ACTIONS_CONDITION,
-    LINGBOT_PROMPT_UPDATED_CONDITION,
-)
 from sglang.multimodal_gen.runtime.realtime.control_signals import (
     ControlSignalQueue,
     ParsedControlEventPayload,
     parse_control_event_payload,
+)
+from sglang.multimodal_gen.runtime.realtime.lingbot_world import (
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
 )
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCameraControlState,

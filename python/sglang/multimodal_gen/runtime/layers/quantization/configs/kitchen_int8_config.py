@@ -8,9 +8,16 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+    is_comfy_int8_embedding,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -45,6 +52,8 @@ class KitchenInt8Config(QuantizationConfig):
         self._serialized_group_sizes: dict[str, int] = {}
         if layer_markers is not None:
             for prefix, marker in layer_markers.items():
+                if is_comfy_int8_embedding(marker):
+                    continue
                 if marker.get("format") != "int8_tensorwise":
                     raise ValueError(
                         f"Unsupported Comfy INT8 format for {prefix!r}: "
@@ -102,6 +111,13 @@ class KitchenInt8Config(QuantizationConfig):
             KitchenInt8LinearMethod,
         )
 
+        if isinstance(layer, VocabParallelEmbedding) and self.quantizes_embedding(
+            prefix
+        ):
+            self.selected.append(prefix)
+            return ComfyInt8EmbeddingMethod(
+                tensorwise=bool(self.layer_markers[prefix].get("_is_tensorwise_scalar"))
+            )
         if not isinstance(layer, LinearBase):
             return None
         if self.layer_markers is not None:
@@ -166,3 +182,8 @@ class KitchenInt8Config(QuantizationConfig):
                 return True
             group_size = marker_group_size
         return input_size_per_partition % group_size == 0
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        return self.layer_markers is not None and is_comfy_int8_embedding(
+            self.layer_markers.get(prefix)
+        )

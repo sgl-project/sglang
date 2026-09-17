@@ -65,7 +65,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedSWAAllocatorBase,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -121,12 +121,13 @@ class KVIndexTranslator:
         self.is_translating = (
             isinstance(
                 token_to_kv_pool_allocator,
-                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWAAllocatorBase),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
+            self._capture_page_size = alloc.page_size
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
             self._full_page_multiplier = alloc.kernel_page_multiplier
@@ -139,7 +140,7 @@ class KVIndexTranslator:
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
+            if isinstance(alloc, UnifiedSWAAllocatorBase):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
@@ -170,6 +171,16 @@ class KVIndexTranslator:
             else None
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
+
+    def capture_token_capacity(self, max_token_pool_size: int) -> int:
+        """Host capture rows are indexed by request-token IDs, not kernel IDs.
+
+        Unified IDs span the whole virtual table even when admission is capped.
+        DCP widens allocator pages; the runner's page size stays physical.
+        """
+        if self.is_translating:
+            return self._full_v2p_table.numel() * self._capture_page_size
+        return max_token_pool_size + self.page_size
 
     # -- per-batch view --------------------------------------------------------
 
@@ -432,19 +443,54 @@ class KVIndexTranslator:
 
     def rebind_write_loc(self, forward_batch) -> None:
         """Phase 1 of the WRITE contract: translate the batch's write loc to
-        FULL-side kernel-facing ids exactly once, at ForwardBatch
-        construction. No-op on non-unified pools.
+        FULL-side kernel-facing ids, once, at ForwardBatch construction.
 
         REBIND, never mutate: the translate returns a FRESH tensor, so the
         ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
-        in-flight machinery that reads it.
+        in-flight machinery that reads it. The pre-translate tensor stays on
+        the batch for `fill_capture_write_loc`.
         """
         self._index_table_memo = None
         if not self.is_translating or forward_batch.out_cache_loc is None:
             return
+        forward_batch.out_cache_loc_virtual = forward_batch.out_cache_loc
         forward_batch.out_cache_loc = self._translate_write_full(
             forward_batch.out_cache_loc
         )
+
+    def fill_capture_write_loc(
+        self,
+        *,
+        out: torch.Tensor,
+        forward_batch,
+        width: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Translate this batch's WRITE loc straight into ``out``, a backend's
+        capture-stable buffer, and return the live ``[:n]`` view. One launch
+        fills the live prefix and clears the tail a shorter replay leaves;
+        None when this pool needs no translation.
+
+        Must run at metadata-init time: `out` is reused every step, so filling
+        it sooner would race a still-pending previous step under overlap
+        scheduling.
+        """
+        if not self.is_translating:
+            return None
+        virtual = forward_batch.out_cache_loc_virtual
+        if virtual is None:
+            loc = forward_batch.out_cache_loc
+            if loc is None:
+                return None
+            # The runner builds the capture batch outside `init_new`, so no
+            # rebind marked its virtual source; bake it holding sink ids.
+            width = int(loc.numel()) if width is None else int(width)
+            out[:width].zero_()
+            return out[: int(loc.numel())]
+        n = int(virtual.numel())
+        width = n if width is None else int(width)
+        buf = out[:width]
+        self._translate_write_full(virtual, out=buf, out_width=width)
+        return buf[:n]
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]

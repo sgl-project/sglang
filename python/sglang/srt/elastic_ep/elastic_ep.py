@@ -110,7 +110,7 @@ class ElasticEPStateManager:
                 cls._on_scale = cls._on_scale_nixl
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
-            if server_args.is_ep_joiner:
+            if get_exec().moe.is_ep_joiner:
                 cls._init_joiner_state(inst)
 
             cls._instance = inst
