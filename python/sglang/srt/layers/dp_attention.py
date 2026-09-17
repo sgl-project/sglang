@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import logging
-from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -53,9 +52,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_ATTN_DP_RANK: Optional[int] = None
-_ATTN_DP_SIZE: Optional[int] = None
-
 
 def world_dp_gather_enabled() -> bool:
     """Whether DP gathers should use expanded WORLD after joiner admission."""
@@ -68,9 +64,6 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    global _ATTN_DP_SIZE, _ATTN_DP_RANK
-    _ATTN_DP_SIZE = new_dp_size
-    _ATTN_DP_RANK = new_dp_rank
     get_parallel().override_permanently(
         attn_dp_size=new_dp_size, attn_dp_rank=new_dp_rank
     )
@@ -377,7 +370,6 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_DP_RANK, _ATTN_DP_SIZE
     dp = get_flags().dp
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
@@ -408,7 +400,6 @@ def initialize_dp_attention(
     # Stamped together, after the elastic adjustment: the width and the rank
     # describe one topology, and a reader that caught them mid-update would
     # see this process placed in a group it is not in.
-    _ATTN_DP_RANK, _ATTN_DP_SIZE = attn_dp_rank, attn_dp_size
     get_parallel().override_permanently(
         attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
     )
@@ -426,39 +417,6 @@ def is_dp_attention_enabled() -> bool:
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
-
-
-def get_attention_dp_rank() -> int:
-    assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
-    return _ATTN_DP_RANK
-
-
-def get_attention_dp_size() -> int:
-    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
-    return _ATTN_DP_SIZE
-
-
-@contextmanager
-def disable_dp_size():
-    """Run without DP attention until this scope ends.
-
-    This is for draft workers of speculative decoding, which run the draft model
-    at a different width from the target model's workers.
-
-    The scope replaces both the module global that ``get_attention_dp_size()``
-    reads and the derived width the runtime context answers with, so the two
-    spellings of the name cannot disagree inside it.
-    """
-    global _ATTN_DP_SIZE
-    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
-
-    old_dp_size = _ATTN_DP_SIZE
-    _ATTN_DP_SIZE = 1
-    try:
-        with get_parallel().override(attn_dp_size=1):
-            yield
-    finally:
-        _ATTN_DP_SIZE = old_dp_size
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:

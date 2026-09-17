@@ -192,6 +192,29 @@ class TestStampedRanks(_IsolatedOverrides):
             get_parallel().attn_dp_rank
         self.assertIn("initialize_dp_attention", str(caught.exception))
 
+    def test_a_stated_width_reaches_the_padding_mode(self):
+        """The reason this PR exists, from a reader's side.
+
+        `get_dp_padding_mode` reads the attention-DP width. Before the width
+        had one home, a scoped `override` moved the context and left the
+        module global answering, so stating a topology moved only half the
+        runtime: this asserted `SUM_LEN` with the width stated as 1.
+        """
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        with get_parallel().override(attn_dp_size=1):
+            mode = DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True, global_num_tokens=[3, 5]
+            )
+        self.assertIs(mode, DpPaddingMode.MAX_LEN)
+
+        # And the branch it would have taken with the target's width.
+        with get_parallel().override(attn_dp_size=2):
+            mode = DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True, global_num_tokens=[3, 5]
+            )
+        self.assertIs(mode, DpPaddingMode.SUM_LEN)
+
     def test_a_scale_up_stamps_the_width_and_the_rank_together(self):
         """The two describe one topology; a reader that saw only one moved
         would place this process in a group it is not in."""
@@ -1631,22 +1654,6 @@ class TestDerivedWidths(_IsolatedOverrides):
         ):
             with self.assertRaisesRegex(RuntimeError, r"derived parallel width"):
                 get_parallel().attn_tp_size
-
-    def test_a_temporary_disable_beats_the_permanent_override(self):
-        """`disable_dp_size()` runs a draft scope without DP attention. It moves
-        the module global the legacy getter reads, so it has to move the derived
-        width too -- the scoped override wins over the permanent one, and a
-        scope that left it alone would answer with the target model's width
-        for its duration."""
-        from sglang.srt.layers import dp_attention
-
-        parallel = get_parallel()
-        parallel.override_permanently(attn_dp_size=4)
-        with patch.object(dp_attention, "_ATTN_DP_SIZE", 4):
-            with dp_attention.disable_dp_size():
-                self.assertEqual(dp_attention.get_attention_dp_size(), 1)
-                self.assertEqual(parallel.attn_dp_size, 1)
-            self.assertEqual(parallel.attn_dp_size, 4)
 
     def test_the_permanent_override_is_cleared_and_reset(self):
         parallel = get_parallel()
