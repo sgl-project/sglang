@@ -184,6 +184,16 @@ def _get_indexer_query_shard(
         layer_scatter_modes is not None
         and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
     ):
+        # Same silent-fallback shape as the width check below, so it says so
+        # too. The plan assumes every attention-TP rank holds the whole batch,
+        # which is what TP_ATTN_FULL means; under any other scatter mode the
+        # rank already holds a slice and this would slice it twice. Refusing is
+        # correct -- going quiet about it is not, which is how the width check
+        # cost 16x the indexer for four weeks.
+        print_info_once(
+            "DSA indexer query sharding is off: attention scatter mode is "
+            f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
+        )
         return None
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
         forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
