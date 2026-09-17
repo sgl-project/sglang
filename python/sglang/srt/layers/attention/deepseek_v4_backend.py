@@ -225,14 +225,33 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
+        """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
+        if compress_ratio == 4:
+            return self.c4_sparse_page_indices
+        raise ValueError(f"invalid {compress_ratio=}")
+
+    def sparse_raw_indices(self, compress_ratio: int) -> Optional[torch.Tensor]:
+        """The same top-k as request-local compressed positions, for the sparse
+        prefill workspace; allocated for prefill metadata only."""
+        if compress_ratio == 4:
+            return self.c4_sparse_raw_indices
+        raise ValueError(f"invalid {compress_ratio=}")
+
+    def sparse_topk_lengths(self, compress_ratio: int) -> torch.Tensor:
+        if compress_ratio == 4:
+            return self.c4_sparse_topk_lengths
+        raise ValueError(f"invalid {compress_ratio=}")
+
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=[
-                "c4_sparse_topk",
+                "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
+                "present_ratios",
             ],
             copy_fields=[
                 "raw_out_loc",
@@ -1519,17 +1538,22 @@ class DeepseekV4AttnBackend(
         )
         if use_sparse_prefill:
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=num_qo_tokens
+                forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
             )
         # Marked for dense prefill too: that path reads only core_attn_metadata,
         # which init_forward_metadata already snapshotted.
         metadata.prefill_shared_reads_snapshotted = True
 
     def _build_sparse_prefill_chunk_cache(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self,
+        forward_batch: ForwardBatch,
+        core_attn_metadata: DSV4AttnMetadata,
+        *,
+        num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
+        extend_seq_lens = forward_batch.extend_seq_lens
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
         seq_lens_cpu_list = seq_lens_cpu.tolist()
@@ -1539,9 +1563,16 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
+        # The rows this forward runs are the extend; padding rows are never
+        # combined, so their position is irrelevant.
+        query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
+        if query_pos.shape[0] < num_qo_tokens:
+            query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+            extend_seq_lens=extend_seq_lens.to(torch.int32),
+            query_lens=extend_seq_lens.to(torch.int32),
+            query_pos=query_pos,
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
@@ -2050,16 +2081,18 @@ class DeepseekV4AttnBackend(
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "sparse-prefill c4 path requires c4_sparse_raw_indices "
-                    "(allocated in init_flashmla_related when is_prefill=True)"
+                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
+                assert raw_indices is not None, (
+                    f"sparse-prefill c{compress_ratio} path requires the raw "
+                    "top-k indices (allocated in init_flashmla_related when "
+                    "is_prefill=True)"
                 )
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
-                flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
-                        : cache.num_qo_tokens
-                    ],
+                gather = cache.ensure_compressed(
+                    compress_ratio, core_attn_metadata.page_table, extra_page_size
+                )
+                flat_token_ids = gather.flat_token_ids
+                combined_indices, combined_lens = cache.combine_compressed(
+                    compress_ratio, raw_indices[: cache.num_qo_tokens]
                 )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
@@ -2228,16 +2261,18 @@ class DeepseekV4AttnBackend(
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "Q8KV8 sparse-prefill c4 path requires c4_sparse_raw_indices "
-                    "(allocated in init_flashmla_related when is_prefill=True)"
+                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
+                assert raw_indices is not None, (
+                    f"Q8KV8 sparse-prefill c{compress_ratio} path requires the raw "
+                    "top-k indices (allocated in init_flashmla_related when "
+                    "is_prefill=True)"
                 )
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
-                flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
-                        : cache.num_qo_tokens
-                    ],
+                gather = cache.ensure_compressed(
+                    compress_ratio, core_attn_metadata.page_table, extra_page_size
+                )
+                flat_token_ids = gather.flat_token_ids
+                combined_indices, combined_lens = cache.combine_compressed(
+                    compress_ratio, raw_indices[: cache.num_qo_tokens]
                 )
 
             n_compressed = flat_token_ids.shape[0]

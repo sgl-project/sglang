@@ -318,6 +318,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             swa_page_size=128,
             seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
             query_start_loc=torch.tensor([0, 1, 2], **int32),
+            query_pos=torch.tensor([max_seq_len - 1, max_seq_len - 1], **int32),
             swa_token_ids=torch.empty(0, **int32),
             swa_first_pos=torch.zeros(2, **int32),
             swa_gather_lens=torch.zeros(2, **int32),
@@ -646,12 +647,10 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         for max_seq_len in (3, 4, 255, 256, 259, 260):
             with self.subTest(max_seq_len=max_seq_len):
                 cache = self._make_sparse_prefill_cache(max_seq_len)
-                cache.ensure_c4(page_table, c4_page_size=64)
+                gather = cache.ensure_compressed(4, page_table, c_page_size=64)
                 expected_extent = max(max_seq_len // 4, 1)
-                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(
-                    cache.c4_compressed_base.tolist(), [0, expected_extent]
-                )
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.compressed_base.tolist(), [0, expected_extent])
 
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
