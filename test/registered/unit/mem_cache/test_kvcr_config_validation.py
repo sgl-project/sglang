@@ -4,7 +4,7 @@ A worker with ``control_port = 0`` or a wildcard advertise host comes up,
 offloads, gets indexed by the router and receives hints -- every fetch just
 fails to reach it, which presents as "P2P does not work on this branch".
 
-``get_timeout_s <= operation_timeout_ms`` is worse: it corrupts. See
+``get_timeout_s <= abandon_timeout_ms`` is worse: it corrupts. See
 :class:`TimeoutOrderingValidationTest`.
 
 Needs no ``kvcr`` wheel: ``KVCRBackendConfig`` is a plain msgspec struct.
@@ -49,26 +49,45 @@ class RemoteHintEndpointValidationTest(unittest.TestCase):
 
 
 class TimeoutOrderingValidationTest(unittest.TestCase):
-    """``get_timeout_s`` must outlast ``operation_timeout_ms``.
+    """``get_timeout_s`` must outlast ``abandon_timeout_ms``.
 
     ``_drain_until`` abandons an op at ``get_timeout_s`` and cannot cancel it:
     ``kvcr.abort()`` is a no-op stub and NIXL's cancellation releases the transfer
     handle without fencing an in-flight DMA. HiCache then frees that op's host pages
     and hands them to the next prefetch. Only the core giving up first keeps that
-    safe. Invert the order and an abandoned transfer writes into pages another
-    request owns -- KVCR block keys are token hashes with no content check, so it
-    surfaces as wrong generated text, not an error.
+    safe, and the core keeps driving until ``abandon_timeout_ms`` -- not
+    ``operation_timeout_ms``, which is merely when it starts cancelling. Invert
+    the order and an abandoned transfer writes into pages another request owns --
+    KVCR block keys are token hashes with no content check, so it surfaces as
+    wrong generated text, not an error.
     """
 
-    def test_get_timeout_below_operation_timeout_is_refused(self):
+    def test_get_timeout_below_abandon_timeout_is_refused(self):
         with self.assertRaises(ValueError) as caught:
-            KVCRBackendConfig(operation_timeout_ms=30000, get_timeout_s=10.0)
+            KVCRBackendConfig(
+                operation_timeout_ms=10000,
+                abandon_timeout_ms=30000,
+                get_timeout_s=20.0,
+            )
         self.assertIn("get_timeout_s", str(caught.exception))
+
+    def test_abandon_below_twice_operation_is_refused(self):
+        """The core's own precondition, checked here so it fails at parse time.
+
+        Reaching the core with this pair raises out of ``_build_kvcr`` on the
+        scheduler thread instead, which kills the engine mid-boot.
+        """
+        with self.assertRaises(ValueError) as caught:
+            KVCRBackendConfig(operation_timeout_ms=20000, abandon_timeout_ms=30000)
+        self.assertIn("abandon_timeout_ms", str(caught.exception))
 
     def test_the_shipped_defaults_satisfy_the_rule(self):
         """The negative branch: a stricter rule would fail every launch."""
         config = KVCRBackendConfig()
-        self.assertGreater(config.get_timeout_s * 1000.0, config.operation_timeout_ms)
+        self.assertGreaterEqual(
+            config.abandon_timeout_ms, 2 * config.operation_timeout_ms
+        )
+        self.assertGreater(config.get_timeout_s * 1000.0, config.abandon_timeout_ms)
 
 
 if __name__ == "__main__":

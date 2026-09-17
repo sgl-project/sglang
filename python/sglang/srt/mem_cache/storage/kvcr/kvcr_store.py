@@ -19,10 +19,10 @@ that solely holds the NIXL agent + ZMQ control socket and advances every
 in-flight op. This backend never touches NIXL directly. Main-thread state
 (residency, pins) is advanced by calling ``kvcr.poll_completed()``, which two
 threads here do: the HiCache controller's prefetch thread (inside
-``_drain_until``) and one daemon of our own, ``kvcr-source-pump``. The pump
-exists because a *source*-side serve makes no progress unless somebody polls,
-and an idle worker has no traffic of its own to poll for -- see
-``_start_source_pump``. ``_poll_lock`` serializes the two.
+``_drain_until``) and the scheduler thread (inside ``tick``, which HiCache
+calls once per loop iteration). The tick exists because a *source*-side serve
+makes no progress unless somebody polls, and an idle worker has no traffic of
+its own to poll for -- see ``tick``. ``_poll_lock`` serializes the two.
 
 Both directions of the KV path are now wired to real KVCR operations: set via
 ``deposit``, get via the unified ``deliver`` (which the core routes per key to
@@ -111,23 +111,6 @@ logger = logging.getLogger(__name__)
 _DRAIN_POLL_MIN_S = 50e-6
 _DRAIN_POLL_MAX_S = 2e-3
 
-# How often the source-side pump calls poll_completed() when this worker has no
-# get/set traffic of its own. See _source_pump_func: a peer's fetch cannot make
-# progress until we pump, so this bounds how long a P2P source keeps a peer
-# waiting. Well under KVCR's operation_timeout_ms so a pin still has room to
-# complete before the source-side deadline expires.
-_SOURCE_PUMP_INTERVAL_S = 5e-3
-
-# Consecutive pump faults tolerated before giving up. Arbitrary; chosen to ride
-# out a blip without spinning on a core that is genuinely dead. At the interval
-# above this is ~50ms of retrying.
-_PUMP_MAX_CONSECUTIVE_FAULTS = 10
-
-# How long close() waits for the pump to leave its last poll. One pump period is
-# the wait plus one poll_completed(), so this is ample unless the poll itself has
-# stalled -- which is precisely the case close() must not close underneath.
-_PUMP_JOIN_TIMEOUT_S = 1.0
-
 # How often the remote-path counters are summarized to the log. The remote path
 # is the whole point of this backend and it fails *silently* -- a hint that
 # never arrives and a fetch that returns nothing both look like an ordinary
@@ -139,6 +122,12 @@ _STATS_LOG_INTERVAL_S = 30.0
 # How many abandoned op handles to remember. Arbitrary; large enough to cover
 # the ops in flight when a stall starts, small enough to stay negligible.
 _ABANDONED_OP_HISTORY = 256
+
+# Longest the scheduler may park under --sleep-on-idle while this backend is a
+# live P2P source, in ms. It bounds how long a peer's pull waits for its first
+# pump. Matches kvcr's own progress-thread idle wait (1ms) so the two sides of
+# a serve run at the same cadence.
+_IDLE_TICK_INTERVAL_MS = 1
 
 # KVCR splits its local DRAM tier into named pools, each with its own block
 # size. This backend deposits one segment kind at one size, so it uses the
@@ -461,7 +450,7 @@ class KVCRStore(HiCacheStorage):
         # Completions drained from poll_completed() that belong to an op other
         # than the one currently being waited on. poll_completed() clears the
         # core's queue, so a result seen by the wrong waiter would be lost
-        # without this stash. Guarded by _poll_lock -- the source pump drains
+        # without this stash. Guarded by _poll_lock -- the scheduler tick drains
         # the same queue, so it can be the one to observe the completion of a get.
         self._completed_ops: Dict[int, Dict] = {}
         # Handles a _drain_until is currently blocked on. A completion for
@@ -488,11 +477,10 @@ class KVCRStore(HiCacheStorage):
         # behaviour, which is the right way to lose this signal.
         self._abandoned_ops: Deque[int] = deque(maxlen=_ABANDONED_OP_HISTORY)
         # Serializes poll_completed() between the prefetch thread (_drain_until)
-        # and the source pump. poll_completed() both drains a queue and advances
-        # core state machines, so two callers must not interleave.
+        # and the scheduler thread (tick). poll_completed() both drains a queue
+        # and advances core state machines, so two callers must not interleave.
+        # Also fences close() against both -- see close().
         self._poll_lock = threading.Lock()
-        self._pump_stop = threading.Event()
-        self._pump_thread: Optional[threading.Thread] = None
         # Source of request ids for the core's hint table; see
         # _hint_request_id. Locked because HiCache runs one prefetch thread but
         # the v1 entry points are reachable from the scheduler thread too.
@@ -504,7 +492,7 @@ class KVCRStore(HiCacheStorage):
         # (a broken fetch here vs. an index miss upstream) and the backend is
         # the only place that can tell them apart. Guarded by _stats_lock
         # because the v2 entry points run on the prefetch thread while the
-        # source pump touches the same counters.
+        # scheduler tick touches the same counters.
         self._stats_lock = threading.Lock()
         self._stats: Dict[str, int] = defaultdict(int)
         self._next_stats_log_at = 0.0
@@ -643,6 +631,7 @@ class KVCRStore(HiCacheStorage):
             pool_layouts=[(_KVCR_POOL_NAME, self._slot_size)],
             enable_telemetry=self._config.enable_telemetry,
             operation_timeout_ms=self._config.operation_timeout_ms,
+            abandon_timeout_ms=self._config.abandon_timeout_ms,
             nixl_listen_port=nixl_listen_port,
         )
         bindings = KVCRBindings(
@@ -666,7 +655,6 @@ class KVCRStore(HiCacheStorage):
             ),
         )
         self._kvcr = KVCR(config, bindings, backend_configs)
-        self._start_source_pump()
         logger.info(
             "KVCRStore initialized (agent=%s, slot_size=%s, remote_hint=%s, policy=%s)",
             self._agent_name,
@@ -676,10 +664,11 @@ class KVCRStore(HiCacheStorage):
         )
 
     # ------------------------------------------------------------------
-    # Source-side pump
+    # Scheduler-thread tick (source-side progress)
     # ------------------------------------------------------------------
 
-    def _start_source_pump(self) -> None:
+    @_fail_closed(lambda self, *a, **kw: None)
+    def tick(self) -> None:
         """Advance KVCR state even when this worker issues no traffic of its own.
 
         ``poll_completed()`` is what moves the core's state machines forward, and
@@ -691,72 +680,62 @@ class KVCRStore(HiCacheStorage):
         would therefore serve nothing, and the requesting peer would sit until
         its deadline expired.
 
-        So the pump is what makes a worker usable as a P2P *source*. It is
-        deliberately a plain daemon thread rather than a scheduler-tick hook:
-        the scheduler is free to be idle precisely when a peer needs us, and
-        HiCacheStorage has no tick seam. Cost when nothing is in flight is one
-        lock acquire plus an empty queue check per interval.
+        So this tick is what makes a worker usable as a P2P *source*. It runs on
+        the scheduler thread, from ``check_hicache_events``, once per loop
+        iteration -- idle iterations included, which is exactly when a peer needs
+        us. A pump thread would be the obvious alternative and was the previous
+        implementation; it cost a wakeup per interval on a thread the GIL hands
+        off to only when the scheduler releases it, and measured ~1.08s of pure
+        wakeup delay inside a 1.15s source-side serve. Here the handoff count is
+        zero.
+
+        ``_fail_closed`` for the usual reason plus one specific to this seam:
+        the scheduler thread has no handler above ``check_hicache_events``, so
+        an exception here ends the engine rather than merely a storage thread.
+        A tick that fails is a source-side serve that stalls; the next tick
+        retries, and ``faults_tick`` is the counter that says how often.
+
+        Cost when nothing is in flight is one lock acquire plus an empty queue
+        check.
         """
-        if not self._config.enable_remote_hint or self._pump_thread is not None:
-            return
-        self._pump_thread = threading.Thread(
-            target=self._source_pump_func,
-            name="kvcr-source-pump",
-            daemon=True,
-        )
-        self._pump_thread.start()
+        self._poll_once(self._kvcr)
 
-    def _source_pump_func(self) -> None:
-        """Poll until stopped, surviving transient faults.
+    def idle_poll_timeout_ms(self) -> Optional[int]:
+        """Cap the idle park so a peer's pull is not stalled behind it.
 
-        Exiting on the first exception would silently retire this worker as a
-        P2P source for the rest of the process: nothing restarts the thread
-        (``_start_source_pump`` returns early once ``_pump_thread`` is set), the
-        engine keeps serving inference, and peers see only that we never have
-        anything -- indistinguishable from a cold cache. A transient NIXL or ZMQ
-        error is not worth that, so keep polling and count the faults.
+        ``--sleep-on-idle`` parks the loop in a 1s poll on the request sockets.
+        A peer's pull wakes neither of them, so under it a source-side serve
+        would advance once per second. Capping the park at the tick interval
+        bounds that to one interval instead.
 
-        Consecutive failures are what distinguish a blip from a dead core. Give
-        up only after ``_PUMP_MAX_CONSECUTIVE_FAULTS`` of them, and log that at
-        error level, since past this point the worker is silently source-dead.
+        Not "skip the park entirely", which is what this returned first. A
+        scheduler loop that never parks holds the GIL and spins; the threads it
+        starves are the ones driving the very transfer it is spinning for --
+        kvcr's progress thread and HiCache's prefetch daemon are both in this
+        process. Measured on the target side of a hinted fetch: the scheduler
+        thread ticked ~10k times a second while its own GIL canary was
+        scheduled 45 times to a sibling process's 5935, and ``remote_deliver``
+        took 3.9s against a 2s budget. The park is what yields.
         """
-        consecutive_faults = 0
-        while not self._pump_stop.wait(_SOURCE_PUMP_INTERVAL_S):
-            kvcr = self._kvcr
-            if kvcr is None:
-                return
-            try:
-                self._poll_once(kvcr)
-            except Exception:
-                consecutive_faults += 1
-                self._note("source_pump_faults")
-                if consecutive_faults >= _PUMP_MAX_CONSECUTIVE_FAULTS:
-                    self._note("source_pump_dead")
-                    logger.error(
-                        "KVCRStore source pump failed %d times in a row; this "
-                        "worker can no longer serve peers as a P2P source",
-                        consecutive_faults,
-                        exc_info=True,
-                    )
-                    return
-                logger.warning(
-                    "KVCRStore source pump failed (%d/%d consecutive)",
-                    consecutive_faults,
-                    _PUMP_MAX_CONSECUTIVE_FAULTS,
-                    exc_info=True,
-                )
-            else:
-                consecutive_faults = 0
+        if not self._config.enable_remote_hint or self._kvcr is None:
+            return None
+        return _IDLE_TICK_INTERVAL_MS
 
-    def _poll_once(self, kvcr: KVCR) -> None:
+    def _poll_once(self, kvcr: Optional[KVCR]) -> None:
         """Drain one round of completions, stashing them for their waiters.
 
-        Both the pump and ``_drain_until`` call this. Whoever gets there first
+        Both ``tick`` and ``_drain_until`` call this. Whoever gets there first
         drains the queue, so every result must be stashed rather than assumed to
         belong to the current caller -- except results for ops nobody is waiting
         on any more, which are dropped (see ``_waiting_ops``).
+
+        The caller's core is re-checked against the live one under the lock:
+        ``close()`` clears the field while holding it, so a caller that read the
+        core just before would otherwise poll one that is being torn down.
         """
         with self._poll_lock:
+            if kvcr is None or kvcr is not self._kvcr:
+                return
             for done_handle, entries in kvcr.poll_completed():
                 if done_handle not in self._waiting_ops:
                     if done_handle in self._abandoned_ops:
@@ -898,52 +877,42 @@ class KVCRStore(HiCacheStorage):
         )
 
     def close(self) -> None:
-        """Stop the pump, then the core -- never the other way round.
+        """Retire the core from every poller, then close it -- not the reverse.
 
-        The pump calls ``poll_completed()``, which walks core state the core's
-        own ``close()`` tears down (it closes the progress thread and the local
-        tier). So a pump still inside a poll when the core goes away is a
-        use-after-free on the KVCR side, not a benign late tick.
+        ``poll_completed()`` walks core state the core's own ``close()`` tears
+        down (it closes the progress thread and the local tier), so a poller
+        still inside one when the core goes away is a use-after-free on the KVCR
+        side, not a benign late tick. Two pollers reach it: ``tick`` on the
+        scheduler thread and ``_drain_until`` on HiCache's prefetch daemon.
 
-        The join therefore has to be honoured rather than merely attempted: if
-        it times out, the pump is inside a poll that is taking longer than its
-        entire interval, and closing under it is exactly the race. Leaving the
-        core open leaks it for the remaining life of a process that is shutting
-        down anyway, which is the strictly safer of the two outcomes.
+        Dropping the reference under ``_poll_lock`` is what fences them. Holding
+        the lock means no poll is in progress; clearing the field means none
+        starts, because both pollers read it and bail on None. Close the core
+        only after that, using the reference we took.
 
-        The core's own ``close()`` makes the same trade one level down: when its
-        progress loop does not go quiescent it keeps the backend resources and
-        raises, precisely so nothing unmaps memory a native transfer still
-        references. We hold the reference in that case for the same reason, and
-        report rather than propagate -- ``close()`` is a teardown path, and the
-        rule for this backend is that it never raises at a HiCache seam.
+        The core's own ``close()`` makes a related trade one level down: when
+        its progress loop does not go quiescent it keeps the backend resources
+        and raises, precisely so nothing unmaps memory a native transfer still
+        references. We put our reference back in that case for the same reason,
+        and report rather than propagate -- ``close()`` is a teardown path, and
+        the rule for this backend is that it never raises at a HiCache seam.
         """
-        self._pump_stop.set()
-        pump = self._pump_thread
-        if pump is not None:
-            # Generous relative to the pump's own period: one poll plus slack.
-            pump.join(timeout=_PUMP_JOIN_TIMEOUT_S)
-            if pump.is_alive():
-                logger.error(
-                    "KVCRStore: source pump still running after %.1fs; leaving "
-                    "the KVCR core open rather than closing it underneath a "
-                    "live poll.",
-                    _PUMP_JOIN_TIMEOUT_S,
-                )
-                return
-            self._pump_thread = None
-        if self._kvcr is not None:
-            try:
-                self._kvcr.close()
-            except BaseException:
-                # Core-side close is idempotent, so keeping the reference costs
-                # nothing and leaves a later attempt possible.
-                logger.exception(
-                    "KVCRStore: KVCR core did not close cleanly; keeping the "
-                    "core so its still-registered memory is not unmapped."
-                )
-                return
+        with self._poll_lock:
+            kvcr = self._kvcr
             self._kvcr = None
+        if kvcr is None:
+            return
+        try:
+            kvcr.close()
+        except BaseException:
+            # Core-side close is idempotent, so keeping the reference costs
+            # nothing and leaves a later attempt possible.
+            with self._poll_lock:
+                self._kvcr = kvcr
+            logger.exception(
+                "KVCRStore: KVCR core did not close cleanly; keeping the "
+                "core so its still-registered memory is not unmapped."
+            )
 
     # ------------------------------------------------------------------
     # v2 interface (the real HiCache path)
@@ -1439,7 +1408,7 @@ class KVCRStore(HiCacheStorage):
         return PoolTransferResult(prefix, {})
 
     # ------------------------------------------------------------------
-    # Progress pump
+    # Op submission and completion
     # ------------------------------------------------------------------
 
     def _submit_and_wait(self, submit: Callable[[], int]) -> Tuple[int, Dict]:
@@ -1447,10 +1416,11 @@ class KVCRStore(HiCacheStorage):
 
         ``submit`` runs under ``_poll_lock`` so the op is registered as awaited
         before anyone can drain its completion. Registering afterwards would
-        race: a local-tier deposit can finish in microseconds while the source
-        pump polls every 5 ms, so the pump would see a completion with no waiter,
-        drop it as late, and the caller would sit out the full ``get_timeout_s``
-        before reporting a miss on an op that actually succeeded.
+        race: a local-tier deposit can finish in microseconds while the scheduler
+        ticks once per loop iteration, so the tick would see a completion with no
+        waiter, drop it as late, and the caller would sit out the full
+        ``get_timeout_s`` before reporting a miss on an op that actually
+        succeeded.
 
         The handle comes back because it is the only join between our logs and
         KVCR's -- a failure here is usually diagnosed from the core's side.
@@ -1497,7 +1467,7 @@ class KVCRStore(HiCacheStorage):
         host pages HiCache frees on our return are nobody's target. An
         *abandoned* op is not. ``kvcr.abort()`` is a no-op stub, so we cannot
         cancel it, only agree to ignore whatever it reports -- or never reports.
-        ``get_timeout_s > operation_timeout_ms`` (enforced in
+        ``get_timeout_s > abandon_timeout_ms`` (enforced in
         ``KVCRBackendConfig``) means both ends have passed their own deadline by
         the time we give up, so no *new* descriptor is submitted after this
         point; it does not fence a descriptor the NIC has already begun. Closing
@@ -1516,7 +1486,7 @@ class KVCRStore(HiCacheStorage):
         try:
             self._register_waiter(op_handle)
             while True:
-                # Always go through the stash: the source pump drains the same
+                # Always go through the stash: the scheduler tick drains the same
                 # queue, so our own completion may well be observed by it rather
                 # than by the poll below.
                 self._poll_once(self._kvcr)

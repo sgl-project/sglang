@@ -47,7 +47,7 @@ class NoFrameworkPinning:
 
     Thread contract: ``request_pin`` / ``poll_pin_results`` /
     ``cancel_pin_request`` are all called from whichever thread is inside
-    ``poll_completed`` -- the source pump or the prefetch thread's
+    ``poll_completed`` -- the scheduler tick or the prefetch thread's
     ``_drain_until``, which the store serializes -- but the lock is kept so a
     future caller outside that seam cannot corrupt the queue.
     """

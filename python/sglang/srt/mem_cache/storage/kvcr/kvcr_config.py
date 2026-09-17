@@ -52,6 +52,12 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # before it expires. At 1000ms that reliably force-failed a fetch that had
     # every key resident on the source.
     operation_timeout_ms: int = 20000
+    # How long past its own deadline the core keeps driving a transfer that did
+    # not complete, before it declares the memory abandoned. The core requires
+    # at least twice operation_timeout_ms and refuses to construct otherwise, so
+    # the two are set together; the pair is what bounds the hazard window in
+    # ``_validate_timeout_ordering``.
+    abandon_timeout_ms: int = 40000
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
@@ -75,9 +81,9 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     # Wall-clock budget for one deposit/deliver to report completion on the
     # HiCache prefetch daemon thread. A remote fetch crosses the control plane
-    # plus a NIXL transfer, so this is generously above operation_timeout_ms;
+    # plus a NIXL transfer, so this is generously above abandon_timeout_ms;
     # exceeding it is reported as a miss and HiCache recomputes.
-    get_timeout_s: float = 30.0
+    get_timeout_s: float = 45.0
 
     def __post_init__(self) -> None:
         """Refuse a config that cannot be operated safely.
@@ -90,7 +96,7 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         self._validate_control_port_range()
 
     def _validate_timeout_ordering(self) -> None:
-        """``get_timeout_s`` must outlast the core's own operation deadline.
+        """``get_timeout_s`` must outlast the core's abandon deadline.
 
         ``_drain_until`` stops waiting at ``get_timeout_s`` and returns a miss.
         It cannot cancel: ``kvcr.abort()`` is a no-op stub, and NIXL's
@@ -100,15 +106,19 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         ``check_prefetch_progress`` on the scheduler thread -- and hands them to
         the next prefetch.
 
-        Ordering the two this way is necessary, not sufficient. Both ends anchor
-        their deadline to ``operation_timeout_ms``, so waiting past it means no
-        peer *starts* a new write into those pages -- but the deadline is a
-        timer, not a DMA fence. The source's expiry drives ``poll_transfer
-        (cancellation_requested=True)`` into NIXL, whose contract is that the
-        transfer is cancelled *or errors*; a descriptor the NIC has already
-        begun can still land after the handle is released. Closing that hole
-        needs a per-op quiescence signal from KVCR (``abort()`` is a no-op stub
-        today, ``core.py``), which is filed upstream; this check only removes the
+        ``operation_timeout_ms`` is the wrong end to compare against: it is when
+        the core starts *cancelling*, not when it stops driving. A source that
+        misses it gets a cancel deadline of ``deadline + (abandon -
+        operation)``, and only there does it report the memory abandoned
+        (``dangling_ops.poll_source``). Waiting past ``abandon_timeout_ms`` is
+        therefore what guarantees no peer is still pushing into those pages.
+
+        Necessary, not sufficient. The deadline is a timer, not a DMA fence: the
+        source's expiry drives ``poll_transfer(cancellation_requested=True)``
+        into NIXL, whose contract is that the transfer is cancelled *or errors*,
+        and a descriptor the NIC has already begun can still land after the
+        handle is released. Closing that hole needs KVCR's per-op quiescence
+        signal, which is filed upstream; this check only removes the
         configuration that makes the race certain rather than unlikely.
 
         Order the two the other way and an abandoned fetch is still being
@@ -118,14 +128,21 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         knobs are operator-settable, so the ordering is enforced here rather than
         left as a comment on the defaults.
         """
-        if self.get_timeout_s * 1000.0 <= self.operation_timeout_ms:
+        if self.abandon_timeout_ms < 2 * self.operation_timeout_ms:
+            raise ValueError(
+                f"KVCR abandon_timeout_ms ({self.abandon_timeout_ms}ms) must be "
+                f"at least twice operation_timeout_ms "
+                f"({self.operation_timeout_ms}ms); the core refuses to "
+                "construct otherwise."
+            )
+        if self.get_timeout_s * 1000.0 <= self.abandon_timeout_ms:
             raise ValueError(
                 f"KVCR get_timeout_s ({self.get_timeout_s}s) must exceed "
-                f"operation_timeout_ms ({self.operation_timeout_ms}ms): giving "
+                f"abandon_timeout_ms ({self.abandon_timeout_ms}ms): giving "
                 "up before the core does leaves an uncancellable transfer "
                 "writing into host pages HiCache has already reused, which "
                 "corrupts KV silently. Raise get_timeout_s or lower "
-                "operation_timeout_ms in --hicache-storage-backend-extra-config."
+                "abandon_timeout_ms in --hicache-storage-backend-extra-config."
             )
 
     def _validate_control_port_range(self) -> None:
