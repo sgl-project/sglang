@@ -16,7 +16,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
 import types
@@ -114,15 +114,18 @@ def _load_lora_weight_to_buffer(pool, **kwargs):
 
 def _load_moe_backend_enum():
     tree = ast.parse(MOE_UTILS_PATH.read_text())
-    backend = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MoeRunnerBackend"
-    )
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    backend = classes["MoeRunnerBackend"]
+    body = [
+        classes[base.id]
+        for base in backend.bases
+        if isinstance(base, ast.Name) and base.id in classes
+    ]
+    body.append(backend)
     namespace = {"Enum": Enum}
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[backend], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
             str(MOE_UTILS_PATH),
             "exec",
         ),
@@ -903,17 +906,19 @@ class TestModuleLevelHelpers(unittest.TestCase):
         # Without a specific flashinfer backend selected, default is False.
         self.assertFalse(_moe_runner_keeps_global_expert_ids())
 
-    def test_real_backend_predicate_matches_dispatcher_and_pool(self):
+    def test_real_backend_predicates_match_supported_id_contracts(self):
         backends = _load_moe_backend_enum()
-        expected_global = {
+        dispatcher_global_ids = {
             backends.FLASHINFER_TRTLLM,
             backends.EXPERIMENTAL_SGL_TRTLLM,
             backends.FLASHINFER_TRTLLM_ROUTED,
             backends.FLASHINFER_CUTLASS,
             backends.FLASHINFER_MXFP4,
             backends.FLASHINFER_CUTEDSL,
+            backends.FLASHINFER_MEGAMOE,
             backends.HPC_OPS,
         }
+        lora_global_ids = dispatcher_global_ids - {backends.FLASHINFER_MEGAMOE}
         config = types.SimpleNamespace(
             num_experts=8,
             num_local_experts=2,
@@ -935,11 +940,11 @@ class TestModuleLevelHelpers(unittest.TestCase):
                 dispatcher = standard_dispatcher(config)
                 self.assertEqual(
                     dispatcher.skip_local_expert_mapping,
-                    backend in expected_global,
+                    backend in dispatcher_global_ids,
                 )
                 self.assertEqual(
                     _moe_runner_keeps_global_expert_ids(),
-                    backend in expected_global,
+                    backend in lora_global_ids,
                 )
 
 

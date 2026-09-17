@@ -7,10 +7,11 @@
 //! always operate together in production:
 //!
 //! - [`HashTree`] — the cache-aware routing index keyed by SGLang block hash.
-//! - [`KvEventSubscriberRegistry`] — one ZMQ SUB connection per `(worker_url,
-//!   dp_rank)`.
-//! - A pump task that drains [`WorkerEvent`]s from the subscriber and applies
-//!   them to the tree.
+//! - [`EngineLoadTable`] — engine-reported per-worker load.
+//! - Two [`KvEventSubscriberRegistry`]s — one per `(worker_url, dp_rank)` on
+//!   the cache topic, one on the load topic.
+//! - A pump task that drains [`WorkerEvent`]s and applies KV batches to the
+//!   tree and `Load` snapshots to the engine-load table.
 //!
 //! `add_worker` / `remove_worker` are driven from the worker manager on every
 //! `DiscoveryEvent::Added` / `DiscoveryEvent::Removed`.
@@ -26,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -36,9 +37,11 @@ use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
-use super::subscriber::{KvEventSubscriberRegistry, WorkerEvent};
-use super::tree::{HashTree, KvWorkerId};
+use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
+use super::tally::{EventKind, EventTally};
+use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::KvCacheEvent;
+use crate::policies::engine_load::EngineLoadTable;
 
 /// Channel buffer between the subscriber registry and the pump task.
 ///
@@ -58,6 +61,31 @@ struct WorkerEntry {
     dp_ranks: Vec<u32>,
 }
 
+/// Ranks whose socket port is representable for a publisher range. This is
+/// shared by lifecycle bookkeeping and the subscriber registry contract so an
+/// expected load rank always has a corresponding SUB socket.
+fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
+    let port_base = u32::from(port_base);
+    (0..dp_size)
+        .filter(|rank| port_base.saturating_add(*rank) <= u32::from(u16::MAX))
+        .collect()
+}
+
+/// The read-only handles the `/metrics` scrape pulls the KV storage-tier
+/// series from. Narrower than an [`KvEventIndex`] handle on purpose: a route
+/// has no business calling `add_worker` / `remove_worker` / `shutdown`.
+#[derive(Clone)]
+pub struct KvIndexMetrics {
+    pub(crate) tree: Arc<HashTree>,
+    pub(crate) tally: Arc<EventTally>,
+}
+
+impl KvIndexMetrics {
+    pub fn new(tree: Arc<HashTree>, tally: Arc<EventTally>) -> Self {
+        Self { tree, tally }
+    }
+}
+
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
@@ -65,7 +93,16 @@ struct WorkerEntry {
 /// routing path entirely.
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
+    maintain_tree: bool,
     subscribers: Arc<KvEventSubscriberRegistry>,
+    /// Second registry subscribing to the load topic (one per worker rank),
+    /// feeding `LoadStat` snapshots into `engine_load`. Shares the pump
+    /// channel with `subscribers`; keyed independently so KV and load
+    /// subscribers for the same worker don't collide.
+    load_subscribers: Arc<KvEventSubscriberRegistry>,
+    /// Engine-reported per-worker load, written by the pump from
+    /// `WorkerEvent::Load` and captured at request ingress.
+    engine_load: Arc<EngineLoadTable>,
     pump: Mutex<Option<JoinHandle<()>>>,
     pump_cancel: CancellationToken,
     workers: Mutex<HashMap<String, WorkerEntry>>,
@@ -82,11 +119,14 @@ pub struct KvEventIndex {
     /// may legitimately have a fresh publisher whose sequence numbers
     /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
-    /// Worker-sourced `page_size` shared with the cache-aware-zmq policy.
+    /// Applied events by kind and storage medium, for the `/metrics` scrape.
+    /// Written only by the pump.
+    tally: Arc<EventTally>,
+    /// Worker-sourced `page_size` shared with prefix providers.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
     /// establishes the value; subsequent workers that disagree are
-    /// rejected (logged + not subscribed). The policy reads it at routing
-    /// time to size its `compute_block_hashes` call.
+    /// rejected (logged + not subscribed). Prefix providers read it at routing
+    /// time to size their `compute_block_hashes` calls.
     block_size_oracle: Arc<BlockSizeOracle>,
 }
 
@@ -108,43 +148,67 @@ impl KvEventIndex {
 
     /// Constructor that lets the caller supply a pre-shared
     /// [`BlockSizeOracle`]. Production wires this from `AppContext` so
-    /// the same oracle the index seeds is the one the cache-aware-zmq
-    /// policy reads at routing time. Tests use this to pre-populate the
+    /// the same oracle the index seeds is available to prefix providers.
+    /// Tests use this to pre-populate the
     /// oracle and exercise the mismatch-rejection path.
     pub fn new_with_http_and_oracle(
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
+        Self::new_with_mode(http, block_size_oracle, true)
+    }
+
+    /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
+    /// but neither subscribes to KV events nor maintains the local tree, because
+    /// an external Indexer is the routing signal.
+    pub fn new_metadata_only_with_http_and_oracle(
+        http: reqwest::Client,
+        block_size_oracle: Arc<BlockSizeOracle>,
+    ) -> Arc<Self> {
+        Self::new_with_mode(http, block_size_oracle, false)
+    }
+
+    fn new_with_mode(
+        http: reqwest::Client,
+        block_size_oracle: Arc<BlockSizeOracle>,
+        maintain_tree: bool,
+    ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
+        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
+        let engine_load = EngineLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
+        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
+            engine_load.clone(),
             cursors.clone(),
             live_workers.clone(),
+            Arc::clone(&tally),
             pump_cancel.clone(),
             rx,
         ));
         Arc::new(Self {
             tree,
+            maintain_tree,
             subscribers,
+            load_subscribers,
+            engine_load,
             pump: Mutex::new(Some(pump)),
             pump_cancel,
             workers: Mutex::new(HashMap::new()),
             http,
             live_workers,
             cursors,
+            tally,
             block_size_oracle,
         })
     }
 
-    /// Shared accessor for the per-process block-size oracle. The
-    /// `CacheAwareZmqPolicy` (via [`crate::policies::factory`]) holds the
-    /// same `Arc` so the value the index seeds is the value the policy
-    /// hashes against.
+    /// Shared accessor for the per-process block-size oracle.
     pub fn block_size_oracle(&self) -> Arc<BlockSizeOracle> {
         Arc::clone(&self.block_size_oracle)
     }
@@ -156,15 +220,40 @@ impl KvEventIndex {
         self.tree.clone()
     }
 
+    /// Handles for the `/metrics` storage-tier series, or `None` when this
+    /// router does not maintain a local tree.
+    ///
+    /// In metadata-only mode (an external Indexer is the routing signal) no KV
+    /// subscription is opened, so every tier series would be a structural
+    /// zero — while their own HELP text tells the operator to read a zero
+    /// `CPU_PINNED` row as "the tier stream is not reaching the router". That
+    /// is a different fault with a different fix, so emit nothing rather than
+    /// a confidently wrong zero.
+    pub fn metrics_source(&self) -> Option<KvIndexMetrics> {
+        self.maintain_tree.then(|| KvIndexMetrics {
+            tree: Arc::clone(&self.tree),
+            tally: Arc::clone(&self.tally),
+        })
+    }
+
+    /// Shared accessor for the engine-load table. Load values are written solely by the pump
+    /// (from `LoadStat` events); `add_worker` / `remove_worker` here manage
+    /// the expected set and per-worker eviction.
+    pub fn engine_load(&self) -> Arc<EngineLoadTable> {
+        Arc::clone(&self.engine_load)
+    }
+
     /// Register a worker. If `preresolved` is `Some`, the caller has
     /// already fetched `/server_info` (worker manager path) and we skip
     /// the internal HTTP round-trip; otherwise (standalone callers,
     /// e.g. integration tests) we fall back to `fetch_event_config`.
     ///
-    /// Opens one ZMQ SUB per advertised DP rank. If the worker is not
-    /// publishing KV events (older SGLang, opt-out config), this is a
-    /// logged no-op — the worker still routes via the non-cache-aware
-    /// policies.
+    /// Opens one ZMQ SUB per advertised DP rank for each usable stream. In
+    /// metadata-only mode KV subscriptions remain disabled, but the separate
+    /// #34608 load stream is still attached when its full descriptor exists.
+    /// If the worker is not publishing KV events (older SGLang, opt-out
+    /// config), this is a logged no-op — the worker still routes via the
+    /// non-cache-aware policies.
     pub async fn add_worker(&self, worker_url: &str, preresolved: Option<EventConfig>) {
         let cfg: EventConfig = match preresolved {
             Some(c) => c,
@@ -208,29 +297,57 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        info!(
-            worker_url = %worker_url,
-            dp_size = cfg.dp_size,
-            port_base = cfg.port_base,
-            block_size = cfg.block_size,
-            is_bigram = cfg.is_bigram,
-            "kv-events: subscribing",
-        );
-        // Compute the DP ranks that will actually be subscribed (skip
-        // ranks whose port overflows u16; the subscriber will warn on
-        // each skipped rank).
-        let port_base_u32 = u32::from(cfg.port_base);
-        let dp_ranks: Vec<u32> = (0..cfg.dp_size)
-            .filter(|rank| (port_base_u32 + rank) <= u32::from(u16::MAX))
-            .collect();
+        let kv_dp_ranks = if self.maintain_tree {
+            subscribable_ranks(cfg.port_base, cfg.dp_size)
+        } else {
+            Vec::new()
+        };
+        let load_descriptor_complete = cfg.load_port_base.is_some() && cfg.load_topic.is_some();
+        if cfg.load_port_base.is_some() != cfg.load_topic.is_some() {
+            warn!(
+                worker_url = %worker_url,
+                load_port_base = ?cfg.load_port_base,
+                load_topic = ?cfg.load_topic,
+                "kv-events: incomplete load descriptor; refusing load subscription"
+            );
+        }
+        let load_dp_ranks = cfg
+            .load_port_base
+            .filter(|_| load_descriptor_complete)
+            .map(|port_base| subscribable_ranks(port_base, cfg.dp_size))
+            .unwrap_or_default();
+        let mut dp_ranks = kv_dp_ranks.clone();
+        dp_ranks.extend(load_dp_ranks.iter().copied());
+        dp_ranks.sort_unstable();
+        dp_ranks.dedup();
         if dp_ranks.is_empty() {
             warn!(
                 worker_url = %worker_url,
                 port_base = cfg.port_base,
                 dp_size = cfg.dp_size,
-                "kv-events: every advertised rank's port overflows u16; skipping worker",
+                "kv-events: no usable KV or load publisher ranks; skipping worker",
             );
             return;
+        }
+        if self.maintain_tree {
+            info!(
+                worker_url = %worker_url,
+                dp_size = cfg.dp_size,
+                port_base = cfg.port_base,
+                load_port_base = ?cfg.load_port_base,
+                block_size = cfg.block_size,
+                is_bigram = cfg.is_bigram,
+                "kv-events: subscribing",
+            );
+        } else {
+            info!(
+                worker_url = %worker_url,
+                dp_size = cfg.dp_size,
+                load_port_base = ?cfg.load_port_base,
+                block_size = cfg.block_size,
+                is_bigram = cfg.is_bigram,
+                "kv-events: external Indexer configured; subscribing only to engine load",
+            );
         }
         // Mark every rank live BEFORE the subscriber starts so any event
         // it queues is accepted by the pump.
@@ -249,7 +366,17 @@ impl KvEventIndex {
                 dp_ranks: dp_ranks.clone(),
             },
         );
-        self.subscribers.add_worker(worker_url, &cfg).await;
+        if self.maintain_tree && !kv_dp_ranks.is_empty() {
+            self.subscribers.add_worker(worker_url, &cfg).await;
+        }
+        // Mark only the ranks that have an actual SUB socket. `EngineLoadTable`
+        // then rejects missing or stale advertised ranks as a whole worker.
+        if !load_dp_ranks.is_empty() {
+            for rank in &load_dp_ranks {
+                self.engine_load.mark_expected_rank(worker_url, *rank);
+            }
+            self.load_subscribers.add_worker(worker_url, &cfg).await;
+        }
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -278,12 +405,14 @@ impl KvEventIndex {
                 live.remove(id);
             }
         }
-        // 2. Cancel and join the per-rank subscriber tasks. No further
-        //    events for these ranks will be queued after this returns.
+        // 2. Cancel and join the per-rank subscriber tasks (KV + load). No
+        //    further events for these ranks will be queued after this returns.
         self.subscribers.remove_worker(worker_url).await;
-        // 3. Drop each rank's tree state and cursor. Any event already in
-        //    the mpsc buffer at this point will be filtered by the
-        //    live-set check inside the pump.
+        self.load_subscribers.remove_worker(worker_url).await;
+        // 3. Drop each rank's tree state and cursor, and the worker's engine
+        //    load. Any event already in the mpsc buffer at this point will be
+        //    filtered by the live-set check inside the pump.
+        self.engine_load.forget_worker(worker_url);
         let mut cursors = self.cursors.lock();
         for id in &ids {
             self.tree.clear_worker(id);
@@ -305,6 +434,7 @@ impl KvEventIndex {
     /// events are discarded and the task exits promptly.
     pub async fn shutdown(&self) {
         self.subscribers.shutdown().await;
+        self.load_subscribers.shutdown().await;
         self.pump_cancel.cancel();
         let handle = self.pump.lock().take();
         if let Some(h) = handle {
@@ -320,14 +450,17 @@ impl KvEventIndex {
     }
 }
 
-/// Drain `WorkerEvent`s and apply each batch to the tree. Out-of-order
-/// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches
-/// are skipped. `PublisherReset` events clear the cursor so a publisher
+/// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
+/// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
+/// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
+/// with no seq. `PublisherReset` events clear the cursor so a publisher
 /// restarting from seq=1 (after sending END_SEQ) is not filtered.
 async fn pump_loop(
     tree: Arc<HashTree>,
+    engine_load: Arc<EngineLoadTable>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    tally: Arc<EventTally>,
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<WorkerEvent>,
 ) {
@@ -361,6 +494,11 @@ async fn pump_loop(
         }
 
         match ev {
+            WorkerEvent::Load { worker, load } => {
+                // Gauge: last value wins, no sequence/dedup. The live-worker
+                // filter above already dropped load from detached workers.
+                engine_load.set(&worker.url, worker.dp_rank, load, Instant::now());
+            }
             WorkerEvent::PublisherReset { worker } => {
                 if cursors.lock().remove(&worker).is_some() {
                     info!(
@@ -381,16 +519,59 @@ async fn pump_loop(
                         );
                         continue;
                     }
+                    // The publisher's seq is dense, so a jump is exactly the
+                    // batches ZMQ dropped at its high-water mark. This became
+                    // worth counting with tier-tagged removals: a removal now
+                    // clears only its own tier, so losing the batch carrying a
+                    // block's LAST removal leaves the worker owning it until
+                    // the next AllBlocksCleared or teardown. The tree cannot
+                    // see that happened — only the sequence can. The
+                    // operator-visible signature is tree coverage above 1.
+                    let lost = (seq - p - 1) as u64;
+                    if lost > 0 {
+                        tally.record_lost_batches(lost);
+                        warn!(
+                            worker = ?worker,
+                            seq,
+                            last_applied = p,
+                            lost,
+                            "kv-events pump: sequence gap; batches were dropped in transit and the tree may hold stale tiers for this worker",
+                        );
+                    }
                 }
                 for event in &batch.events {
+                    // The `medium` tag decides which tier a store lands on and
+                    // which tier a removal clears, so a device eviction leaves
+                    // a worker that still holds the block on host as an owner
+                    // — see the tree's "Storage tiers" docs.
                     match event {
                         KvCacheEvent::BlockStored(b) => {
-                            tree.insert(&worker, b.parent_block_hash, &b.block_hashes);
+                            tally.record(
+                                EventKind::BlockStored,
+                                b.medium.as_deref(),
+                                b.block_hashes.len(),
+                            );
+                            tree.insert_tiered(
+                                &worker,
+                                b.parent_block_hash,
+                                &b.block_hashes,
+                                Tiers::for_store(b.medium.as_deref()),
+                            );
                         }
                         KvCacheEvent::BlockRemoved(b) => {
-                            tree.remove(&worker, &b.block_hashes);
+                            tally.record(
+                                EventKind::BlockRemoved,
+                                b.medium.as_deref(),
+                                b.block_hashes.len(),
+                            );
+                            tree.remove_tiered(
+                                &worker,
+                                &b.block_hashes,
+                                Tiers::for_remove(b.medium.as_deref()),
+                            );
                         }
                         KvCacheEvent::AllBlocksCleared => {
+                            tally.record(EventKind::AllBlocksCleared, None, 0);
                             tree.clear_worker(&worker);
                         }
                     }
@@ -404,6 +585,7 @@ async fn pump_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::engine_load::LoadStat;
     use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
@@ -425,7 +607,9 @@ mod tests {
     /// can destructure just the bits they need.
     struct PumpHarness {
         tree: Arc<HashTree>,
+        engine_load: Arc<EngineLoadTable>,
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+        tally: Arc<EventTally>,
         #[allow(dead_code)]
         live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
         #[allow(dead_code)]
@@ -438,21 +622,27 @@ mod tests {
     /// the given workers pre-marked live.
     fn spawn_pump(live: &[KvWorkerId]) -> PumpHarness {
         let tree = Arc::new(HashTree::new());
+        let engine_load = EngineLoadTable::new();
         let cursors = Arc::new(Mutex::new(HashMap::new()));
         let live_set: Arc<Mutex<HashSet<KvWorkerId>>> =
             Arc::new(Mutex::new(live.iter().cloned().collect()));
         let cancel = CancellationToken::new();
+        let tally = Arc::new(EventTally::new());
         let (tx, rx) = mpsc::channel(4);
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
+            engine_load.clone(),
             cursors.clone(),
             live_set.clone(),
+            Arc::clone(&tally),
             cancel.clone(),
             rx,
         ));
         PumpHarness {
             tree,
+            engine_load,
             cursors,
+            tally,
             live_set,
             cancel,
             tx,
@@ -489,7 +679,182 @@ mod tests {
 
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
-        assert!(m.workers.contains(&id), "tree must hold the worker");
+        assert!(m.workers().contains(&id), "tree must hold the worker");
+    }
+
+    /// The pump must carry each event's `medium` into the tree. The engine's
+    /// write-back sequence for a backed-up block is a host-tagged store
+    /// followed by a device-tagged removal; applied tier-blind, the removal
+    /// erased the worker and every repeat of that prefix routed cold for the
+    /// whole host retention horizon.
+    #[tokio::test]
+    async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![10, 20],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        let removed = |medium: Option<&str>| {
+            KvCacheEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![20],
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![
+                stored(Some("GPU")),
+                stored(Some("CPU_PINNED")),
+                removed(Some("GPU")),
+            ]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let m = tree.match_prefix(None, &[10, 20]);
+        assert_eq!(m.matched_blocks, 2, "host copy keeps the block routable");
+        assert!(m.workers().contains(&id));
+        assert!(!m.device_workers().contains(&id), "device copy is gone");
+    }
+
+    /// The metadata-only gate. Its whole justification is that a structural
+    /// zero would be read as "the tier stream is not reaching the router" — a
+    /// different fault with a different fix — so the gate itself needs pinning:
+    /// inverting it leaves every test green while `/metrics` starts lying.
+    #[tokio::test]
+    async fn metrics_source_is_none_only_without_a_local_tree() {
+        let http = reqwest::Client::builder().build().unwrap();
+        let with_tree =
+            KvEventIndex::new_with_http_and_oracle(http.clone(), BlockSizeOracle::new());
+        assert!(
+            with_tree.metrics_source().is_some(),
+            "a router maintaining its own tree must publish the tier series",
+        );
+        let metadata_only =
+            KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
+        assert!(
+            metadata_only.metrics_source().is_none(),
+            "an external-Indexer router must emit nothing rather than a structural zero",
+        );
+    }
+
+    /// Every applied event is tallied by kind and medium, blocks included, so
+    /// the scrape can show the tier stream the tree is consuming. An
+    /// out-of-order batch is filtered before the tally and must not count.
+    #[tokio::test]
+    async fn pump_tallies_applied_events_by_medium() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tally, tx, pump) = (h.tally, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>, hashes: Vec<i64>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: hashes,
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 2,
+            batch: batch(vec![
+                stored(Some("GPU"), vec![10, 20, 30]),
+                stored(Some("CPU_PINNED"), vec![10, 20, 30]),
+                KvCacheEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: vec![30],
+                    medium: Some("GPU".into()),
+                }),
+            ]),
+        })
+        .await
+        .unwrap();
+        // Out of order: filtered, must not be tallied.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![stored(None, vec![99])]),
+        })
+        .await
+        .unwrap();
+        // A gap: seq 3 and 4 were dropped in transit. Counted, because a
+        // tagged removal now clears only its own tier, so a lost batch can
+        // strand a tier the tree will never clear on its own.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 5,
+            batch: batch(vec![KvCacheEvent::AllBlocksCleared]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert_eq!(tally.batches_lost(), 2, "seq 3 and 4 never arrived");
+        let rows = tally.snapshot();
+        let cell = |event: &str, medium: &str| {
+            rows.iter()
+                .find(|r| r.event == event && r.medium == medium)
+                .cloned()
+                .expect("cell rendered")
+        };
+        assert_eq!(cell("block_stored", "GPU").blocks, 3);
+        assert_eq!(cell("block_stored", "CPU_PINNED").blocks, 3);
+        assert_eq!(cell("block_removed", "GPU").events, 1);
+        assert_eq!(
+            cell("block_stored", "untagged").events,
+            0,
+            "the out-of-order batch was filtered before the tally",
+        );
+        assert_eq!(
+            cell("all_blocks_cleared", "untagged").events,
+            1,
+            "a clear carries no medium and lands on the untagged row",
+        );
+    }
+
+    /// A `WorkerEvent::Load` lands in the engine-load table (gauge, no
+    /// cursor) keyed by the worker URL, and does not touch the tree.
+    #[tokio::test]
+    async fn pump_applies_load_to_engine_load_table() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, engine_load, tx, pump) = (h.tree, h.engine_load, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Load {
+            worker: id.clone(),
+            load: LoadStat {
+                num_running_reqs: 8,
+                num_waiting_reqs: 4,
+                num_tokens: 0,
+                max_total_num_tokens: 0,
+                native_cache: None,
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let snapshot = engine_load.capture_snapshot(Instant::now());
+        let load = snapshot.fresh_load_for_url("http://w1").unwrap();
+        assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 12);
+        // Load events must not pollute the cache tree.
+        assert_eq!(tree.node_count(), 0);
     }
 
     /// Out-of-order seq is filtered: a batch with seq <= last_applied is
@@ -649,6 +1014,8 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30100,
             topic: String::new(),
+            load_port_base: None,
+            load_topic: None,
             block_size: 128,
             dp_size: 1,
             is_bigram: false,
@@ -678,6 +1045,8 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30200,
             topic: String::new(),
+            load_port_base: None,
+            load_topic: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: false,
@@ -699,6 +1068,8 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30300,
             topic: String::new(),
+            load_port_base: None,
+            load_topic: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: true,
@@ -708,6 +1079,86 @@ mod tests {
             index.block_size_oracle().is_bigram(),
             "add_worker must seed the bigram flag from EventConfig"
         );
+        index.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_only_mode_keeps_the_load_subscriber() {
+        let oracle = BlockSizeOracle::new();
+        let index = KvEventIndex::new_metadata_only_with_http_and_oracle(
+            reqwest::Client::new(),
+            Arc::clone(&oracle),
+        );
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 30400,
+            topic: "kv-events".into(),
+            load_port_base: Some(30410),
+            load_topic: Some("load".into()),
+            block_size: 64,
+            dp_size: 2,
+            is_bigram: true,
+        };
+
+        index.add_worker("http://127.0.0.1:30400", Some(cfg)).await;
+
+        assert_eq!(oracle.get(), Some(64));
+        assert!(oracle.is_bigram());
+        assert_eq!(index.known_worker_count(), 1);
+        assert_eq!(index.engine_load().expected_count(), 1);
+        index.shutdown().await;
+    }
+
+    /// `remove_worker` clears the worker's engine load and its expected mark,
+    /// so a re-added worker does not inherit stale load. The worker advertises
+    /// a load port (no publisher there; the subscriber just retries in the
+    /// background and is cancelled on remove).
+    #[tokio::test]
+    async fn remove_worker_clears_engine_load() {
+        let index = KvEventIndex::new();
+        let url = "http://127.0.0.1:59123";
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 59123,
+            topic: String::new(),
+            load_port_base: Some(59223),
+            load_topic: Some("load".into()),
+            block_size: 64,
+            dp_size: 1,
+            is_bigram: false,
+        };
+        index.add_worker(url, Some(cfg)).await;
+        assert_eq!(index.engine_load().expected_count(), 1);
+
+        let now = Instant::now();
+        index.engine_load().set(
+            url,
+            0,
+            LoadStat {
+                num_running_reqs: 3,
+                num_waiting_reqs: 1,
+                num_tokens: 0,
+                max_total_num_tokens: 0,
+                native_cache: None,
+            },
+            now,
+        );
+        assert!(index
+            .engine_load()
+            .capture_snapshot(now)
+            .fresh_load_for_url(url)
+            .is_some());
+
+        index.remove_worker(url).await;
+        assert!(
+            index
+                .engine_load()
+                .capture_snapshot(Instant::now())
+                .fresh_load_for_url(url)
+                .is_none(),
+            "remove_worker must clear engine load"
+        );
+        assert_eq!(index.engine_load().expected_count(), 0);
         index.shutdown().await;
     }
 }

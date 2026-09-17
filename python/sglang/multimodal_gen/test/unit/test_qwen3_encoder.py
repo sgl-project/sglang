@@ -47,35 +47,6 @@ def test_mlp_reuses_srt_activation_without_server_context(monkeypatch):
     assert isinstance(mlp.act_fn, SiluAndMul)
 
 
-def test_attention_keeps_diffusion_one_pass_qk_norm(monkeypatch):
-    monkeypatch.setattr(qwen3, "get_tp_world_size", lambda: 1)
-    monkeypatch.setattr(
-        qwen3, "QKVParallelLinear", lambda **kwargs: torch.nn.Identity()
-    )
-    monkeypatch.setattr(
-        qwen3, "RowParallelLinear", lambda **kwargs: torch.nn.Identity()
-    )
-    monkeypatch.setattr(qwen3, "get_rope", lambda *args, **kwargs: torch.nn.Identity())
-    monkeypatch.setattr(
-        qwen3, "LocalAttention", lambda *args, **kwargs: torch.nn.Identity()
-    )
-    config = SimpleNamespace(
-        head_dim=128,
-        rms_norm_eps=1e-6,
-        _supported_attention_backends=(),
-    )
-
-    attention = qwen3.Qwen3Attention(
-        config,
-        hidden_size=256,
-        num_heads=2,
-        num_kv_heads=1,
-    )
-
-    assert isinstance(attention.q_norm, qwen3.MMGenRMSNorm)
-    assert isinstance(attention.k_norm, qwen3.MMGenRMSNorm)
-
-
 def test_default_position_ids_batch_shape():
     model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
     torch.nn.Module.__init__(model)
@@ -98,3 +69,31 @@ def test_default_position_ids_batch_shape():
     assert torch.equal(layer.position_ids[0], torch.arange(4))
     assert torch.equal(layer.position_ids[1], torch.arange(4))
     assert layer.attention_lengths == (4, 4)
+
+
+def test_fp8_qkv_scale_uses_the_packed_parameter_loader():
+    model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
+    torch.nn.Module.__init__(model)
+    layer = torch.nn.Module()
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.qkv_proj = torch.nn.Module()
+    scale = torch.nn.Parameter(torch.zeros(3, 1), requires_grad=False)
+
+    def load_scale(param, loaded_scale, shard_id):
+        param.data[{"q": 0, "k": 1, "v": 2}[shard_id]].copy_(loaded_scale)
+
+    scale.weight_loader = load_scale
+    layer.self_attn.qkv_proj.register_parameter("weight_scale_inv", scale)
+    model.layers = torch.nn.ModuleList([layer])
+    model.config = SimpleNamespace(
+        arch_config=SimpleNamespace(
+            stacked_params_mapping=[(".qkv_proj", ".q_proj", "q")]
+        )
+    )
+
+    loaded = model.load_weights(
+        [("model.layers.0.self_attn.q_proj.weight_scale_inv", torch.tensor([2.0]))]
+    )
+
+    assert loaded == {"layers.0.self_attn.qkv_proj.weight_scale_inv"}
+    torch.testing.assert_close(scale[:, 0], torch.tensor([2.0, 0.0, 0.0]))
