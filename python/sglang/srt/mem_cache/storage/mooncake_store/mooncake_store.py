@@ -913,6 +913,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         all_ptrs = []
         all_sizes = []
         all_group_ids = []
+        buffer_requests = []
         for transfer in transfers:
             host_pool = self.registered_pools.get(transfer.name)
             keys = transfer.keys
@@ -930,13 +931,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_strs = self._tag_keys(key_strs)
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if len(ptr_list) != len(key_strs):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
-            all_ptrs.extend(ptr_list)
-            all_sizes.extend(element_size_list)
+            buffer_requests.append(
+                (host_pool, host_indices, key_strs, key_multiplier, start)
+            )
             if is_set and self._can_use_group_semantics():
                 all_group_ids.extend(
                     self._expand_group_ids(tagged_keys, key_multiplier)
@@ -945,6 +942,54 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if not prepared:
             return {}
+
+        exist_result = self._batch_exist(all_key_strs) if is_set else None
+        for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
+            object_indices = list(range(len(key_strs)))
+            if exist_result is not None:
+                # Only pages the store is missing need per-layer addresses. Zero
+                # placeholders keep result and group offsets aligned for the rest.
+                missing_pages = [
+                    page
+                    for page in range(len(key_strs) // key_multiplier)
+                    if any(
+                        state != 1
+                        for state in exist_result[
+                            start + page * key_multiplier : start
+                            + (page + 1) * key_multiplier
+                        ]
+                    )
+                ]
+                if not missing_pages:
+                    all_ptrs.extend([0] * len(key_strs))
+                    all_sizes.extend([0] * len(key_strs))
+                    continue
+                if len(missing_pages) * key_multiplier < len(key_strs):
+                    # Metadata generation consumes CPU indices anyway, so select
+                    # the logical pages there rather than uploading a new index.
+                    page_size = host_pool.page_size or 1
+                    host_indices = host_indices.detach().to(device="cpu")
+                    host_indices = host_indices.reshape(-1, page_size)[
+                        missing_pages
+                    ].reshape(-1)
+                    object_indices = [
+                        page * key_multiplier + component
+                        for page in missing_pages
+                        for component in range(key_multiplier)
+                    ]
+            selected_keys = [key_strs[i] for i in object_indices]
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if len(ptr_list) != len(selected_keys):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    selected_keys, ptr_list, element_size_list
+                )
+            pool_ptrs = [0] * len(key_strs)
+            pool_sizes = [0] * len(key_strs)
+            for index, ptr, size in zip(object_indices, ptr_list, element_size_list):
+                pool_ptrs[index] = ptr
+                pool_sizes[index] = size
+            all_ptrs.extend(pool_ptrs)
+            all_sizes.extend(pool_sizes)
 
         if any(isinstance(ptr, Sequence) for ptr in all_ptrs):
             all_ptrs = [
@@ -956,7 +1001,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ]
 
         if is_set:
-            exist_result = self._batch_exist(all_key_strs)
+            assert exist_result is not None
             io_results = [0 if state == 1 else -1 for state in exist_result]
             missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
             if missing_idx:
