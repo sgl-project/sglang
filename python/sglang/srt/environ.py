@@ -1494,6 +1494,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # NPU BF16 wo_a: use F.linear for single-local-group decode (Flash TP8),
+    # retaining the original weight layout. Opt-in for A/B.
+    SGLANG_OPT_NPU_BF16_WO_A_GEMM = EnvBool(False)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
