@@ -14,17 +14,22 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+    AnthropicServing,
+    _anthropic_usage_from_openai,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
+    PromptTokensDetails,
+    UsageInfo,
 )
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
@@ -338,9 +343,15 @@ class TestAnthropicServing(unittest.TestCase):
             0
         ]
 
-        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 6)
+        start_usage = message_start["message"]["usage"]
+        self.assertEqual(start_usage["input_tokens"], 0)
+        self.assertEqual(start_usage["cache_creation_input_tokens"], 6)
+        self.assertEqual(start_usage["cache_read_input_tokens"], 4)
         self.assertEqual(
-            message_start["message"]["usage"]["cache_read_input_tokens"], 4
+            start_usage["input_tokens"]
+            + start_usage["cache_creation_input_tokens"]
+            + start_usage["cache_read_input_tokens"],
+            10,
         )
         self.assertNotIn("input_tokens", message_delta["usage"])
         self.assertEqual(message_delta["usage"]["output_tokens"], 2)
@@ -368,8 +379,9 @@ class TestAnthropicServing(unittest.TestCase):
 
         anthropic_response = self._serving()._convert_response(response)
 
-        self.assertEqual(anthropic_response.usage.input_tokens, 6)
+        self.assertEqual(anthropic_response.usage.input_tokens, 0)
         self.assertEqual(anthropic_response.usage.output_tokens, 2)
+        self.assertEqual(anthropic_response.usage.cache_creation_input_tokens, 6)
         self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 4)
 
     def test_tool_result_search_result_content_is_flattened(self):
@@ -662,6 +674,7 @@ class TestAnthropicServing(unittest.TestCase):
         usage_out = message_start["message"]["usage"]
         self.assertEqual(usage_out["input_tokens"], 0)
         self.assertEqual(usage_out["cache_read_input_tokens"], 10)
+        self.assertNotIn("cache_creation_input_tokens", usage_out)
 
     def test_usage_without_prompt_tokens_details(self):
         """Usage object without prompt_tokens_details must omit cache_read_input_tokens cleanly."""
@@ -681,6 +694,64 @@ class TestAnthropicServing(unittest.TestCase):
         usage_out = message_start["message"]["usage"]
         self.assertEqual(usage_out["input_tokens"], 5)
         self.assertNotIn("cache_read_input_tokens", usage_out)
+        self.assertNotIn("cache_creation_input_tokens", usage_out)
+
+    def test_usage_mapping_cold_write_is_cache_creation(self):
+        """Cold prefix-cache miss reports the prompt as cache_creation, not input."""
+        usage = UsageInfo(prompt_tokens=10, completion_tokens=2, total_tokens=12)
+        mapped = _anthropic_usage_from_openai(
+            usage,
+            include_input=True,
+            include_output=True,
+            enable_cache_report=True,
+        )
+        self.assertEqual(mapped.input_tokens, 0)
+        self.assertEqual(mapped.cache_creation_input_tokens, 10)
+        self.assertIsNone(mapped.cache_read_input_tokens)
+        self.assertEqual(mapped.output_tokens, 2)
+        self.assertEqual(
+            (mapped.input_tokens or 0)
+            + (mapped.cache_creation_input_tokens or 0)
+            + (mapped.cache_read_input_tokens or 0),
+            10,
+        )
+
+    def test_usage_mapping_warm_fields_are_mutually_exclusive(self):
+        """Warm hit: cache_read + cache_creation partition the prompt with no overlap."""
+        usage = UsageInfo(
+            prompt_tokens=10,
+            completion_tokens=2,
+            total_tokens=12,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
+        )
+        mapped = _anthropic_usage_from_openai(
+            usage,
+            include_input=True,
+            include_output=True,
+            enable_cache_report=True,
+        )
+        self.assertEqual(mapped.input_tokens, 0)
+        self.assertEqual(mapped.cache_creation_input_tokens, 6)
+        self.assertEqual(mapped.cache_read_input_tokens, 4)
+        self.assertEqual(
+            mapped.input_tokens
+            + mapped.cache_creation_input_tokens
+            + mapped.cache_read_input_tokens,
+            usage.prompt_tokens,
+        )
+
+    def test_usage_mapping_without_cache_report_keeps_prompt_in_input_tokens(self):
+        """Without cache stats the prompt stays in input_tokens (no invented writes)."""
+        usage = UsageInfo(prompt_tokens=10, completion_tokens=1, total_tokens=11)
+        mapped = _anthropic_usage_from_openai(
+            usage,
+            include_input=True,
+            include_output=True,
+            enable_cache_report=False,
+        )
+        self.assertEqual(mapped.input_tokens, 10)
+        self.assertIsNone(mapped.cache_creation_input_tokens)
+        self.assertIsNone(mapped.cache_read_input_tokens)
 
     def test_non_streaming_error_with_non_json_body(self):
         """Non-JSON upstream error body falls back to body[:500] as the message (for 4xx)."""

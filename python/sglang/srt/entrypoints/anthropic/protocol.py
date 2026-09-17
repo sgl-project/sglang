@@ -40,6 +40,10 @@ class AnthropicUsage(BaseModel):
     ``input_tokens``/``output_tokens`` are ``Optional`` because Anthropic's
     streaming ``message_delta`` event omits ``input_tokens`` (the spec
     requires it only on ``message_start``). Non-streaming responses set both.
+
+    The three input-side fields are a disjoint partition of the prompt:
+
+    ``input_tokens + cache_creation_input_tokens + cache_read_input_tokens``
     """
 
     input_tokens: Optional[NonNegativeInt] = None
