@@ -9,12 +9,13 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     List,
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -24,8 +25,7 @@ from sglang.srt.arg_groups.choices import DISAGG_TRANSFER_BACKEND_CHOICES
 from sglang.srt.utils.common import json_list_type
 
 
-@dataclasses.dataclass
-class Disagg:
+class Disagg(msgspec.Struct):
     """Namespace ``disagg``."""
 
     _NS_PATH = "disagg"
@@ -70,6 +70,12 @@ class Disagg:
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
         ),
     ] = "mooncake"
+    disaggregation_enable_kv_checksum: A[
+        bool,
+        "Compute an Adler-32 checksum over each request's KV pages on prefill "
+        "and verify it on decode. Enable on both prefill and decode engines. "
+        "A mismatch aborts the request, or raises in CI. Disabled by default.",
+    ] = False
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998
@@ -137,7 +143,7 @@ class Disagg:
             choices=["auto", "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"],
         ),
     ] = "auto"
-    encoder_urls: A[List[str], "List of encoder server urls."] = dataclasses.field(
+    encoder_urls: A[List[str], "List of encoder server urls."] = msgspec.field(
         default_factory=list
     )
     encoder_bootstrap_port: A[
@@ -147,7 +153,7 @@ class Disagg:
     encoder_register_urls: A[
         List[str],
         "One or more EncoderBootstrapServer URLs to register this encoder with on startup, for dynamic encoder discovery. Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. Used with --encoder-only servers.",
-    ] = dataclasses.field(default_factory=list)
+    ] = msgspec.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: A[
         bool,
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
