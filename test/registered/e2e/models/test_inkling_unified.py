@@ -217,7 +217,12 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
 
     @classmethod
     def server_args(cls):
-        return _unified_args(attention_backend="fa4", prefill_cuda_graph=True)
+        # Keep the historical 8192 // 512 request axis for this numerical guard.
+        # Large request-axis capture/replay is covered by the metadata tests.
+        return _unified_args(attention_backend="fa4", prefill_cuda_graph=True) + [
+            "--cuda-graph-config",
+            '{"prefill":{"full_prefill_max_req":16}}',
+        ]
 
 
 @unittest.skipUnless(
