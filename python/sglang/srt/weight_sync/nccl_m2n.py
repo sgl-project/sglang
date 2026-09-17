@@ -286,11 +286,6 @@ class NcclM2NReceiver:
         ):
             raise ValueError(f"{parameter} is not serialized 128x128 block FP8")
 
-        uses_deepgemm = getattr(
-            method, "is_deepgemm_moe_runner_backend_enabled", lambda: False
-        )
-        if not uses_deepgemm():
-            raise ValueError("NCCL M2N FP8 requires the DeepGEMM MoE backend")
         weight_name = (
             parameter.removesuffix("_scale_inv")
             if entry["tensor_role"] == "scale"
@@ -303,27 +298,62 @@ class NcclM2NReceiver:
             or weight.ndim != 3
             or not weight.is_contiguous()
             or getattr(weight, "is_shuffled", False)
+            or getattr(weight, "is_transposed", False)
+            or getattr(module, "use_triton_kernels", False)
         ):
             raise ValueError(
                 f"{weight_name} must be a contiguous unshuffled 3-D FP8 weight"
             )
         scale_name = f"{weight_name}_scale_inv"
         scale = self._params.get(scale_name)
+        scale_format = self.manifest.get("quantization", {}).get("scale_format")
+        packed = scale_format == "ue8m0_unpacked"
         expected_shape = (
-            weight.shape[0],
-            weight.shape[1],
-            (weight.shape[2] // _FP8_BLOCK_SIZE + 3) // 4,
+            (
+                weight.shape[0],
+                weight.shape[1],
+                (weight.shape[2] // _FP8_BLOCK_SIZE + 3) // 4,
+            )
+            if packed
+            else _block_scale_shape(weight.shape)
         )
         if (
             scale is None
-            or not getattr(scale, "format_ue8m0", False)
-            or scale.dtype != torch.int32
+            or bool(getattr(scale, "format_ue8m0", False)) != packed
+            or scale.dtype != (torch.int32 if packed else torch.float32)
             or tuple(scale.shape) != expected_shape
         ):
             raise ValueError(
-                f"{scale_name} must already use packed DeepGEMM UE8M0 inference storage "
+                f"{scale_name} must already use {scale_format} inference storage "
                 f"with shape {expected_shape}; NCCL M2N does not replace FP8 storage"
             )
+        # HPC-Ops may read a separately padded scale copy. Only a view of the
+        # parameter itself stays current across in-place refits and graph replay.
+        inference_scale = getattr(
+            module, f"hpc_ops_{weight_name.rsplit('.', 1)[1]}_scale", scale
+        )
+        if inference_scale.data_ptr() != scale.data_ptr():
+            raise ValueError(f"{scale_name} has a separate derived inference buffer")
+        if (
+            not packed
+            and getattr(
+                method, "is_deepgemm_moe_runner_backend_enabled", lambda: False
+            )()
+        ):
+            # Defer this backend-specific import for ordinary canonical FP8.
+            from sglang.srt.model_loader.utils import (
+                should_deepgemm_weight_requant_ue8m0,
+            )
+
+            if should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=config.weight_block_size,
+                output_dtype=torch.bfloat16,
+                weight_shape=weight.shape[-2:],
+            ):
+                raise ValueError(
+                    "Canonical FP8 would be repacked during DeepGEMM finalization; "
+                    "NCCL M2N requires existing UE8M0 inference buffers instead"
+                )
 
     def _validate_fp8_pairs(
         self,
@@ -562,9 +592,12 @@ class NcclM2NReceiver:
             if pair_id is not None:
                 pairs[pair_id][tensor_role] = record
         if pairs:
-            if self.manifest.get("quantization") != _FP8_QUANTIZATION:
+            if self.manifest.get("quantization") not in (
+                _FP8_QUANTIZATION,
+                {**_FP8_QUANTIZATION, "scale_format": "canonical"},
+            ):
                 raise ValueError(
-                    "Paired FP8 entries require ue8m0_unpacked "
+                    "Paired FP8 entries require canonical or ue8m0_unpacked "
                     "128x128 FP8 manifest quantization metadata"
                 )
             self._validate_fp8_pairs(pairs)
@@ -606,7 +639,9 @@ class NcclM2NReceiver:
             )
             valid = tuple(param.shape) == expected
         elif recipe in _FP8_SCALE_RECIPES:
-            valid = bool(getattr(param, "format_ue8m0", False))
+            valid = bool(getattr(param, "format_ue8m0", False)) or tuple(
+                param.shape
+            ) == self._canonical_parameter_shape(recipe, local_shape)
         elif recipe == "expert_down":
             expected = (
                 (local_shape[0], local_shape[2], local_shape[1])
@@ -764,7 +799,10 @@ class NcclM2NReceiver:
         self, entry: Mapping[str, Any], shape: tuple[int, ...]
     ) -> tuple[torch.Tensor, Callable[[], None] | None]:
         descriptor = entry["destination"]
-        if entry.get("tensor_role") == "scale":
+        if (
+            entry.get("tensor_role") == "scale"
+            and self.manifest["quantization"]["scale_format"] == "ue8m0_unpacked"
+        ):
             return self._packed_scale_destination(entry, shape)
         param = self._params[descriptor["parameter"]].data
         recipe = descriptor["recipe"]
@@ -781,9 +819,14 @@ class NcclM2NReceiver:
         if recipe in ("dense_gate", "dense_up"):
             start = 0 if recipe == "dense_gate" else shape[0]
             return buffer, lambda: param.narrow(0, start, shape[0]).copy_(buffer)
-        if recipe in ("expert_gate", "expert_up"):
+        if recipe in (
+            "expert_gate",
+            "expert_up",
+            "expert_gate_scale",
+            "expert_up_scale",
+        ):
             starts = self._expert_gate_up_starts(descriptor["parameter"], shape[1])
-            start = starts[recipe == "expert_up"]
+            start = starts[recipe.removesuffix("_scale") == "expert_up"]
             if tuple(param.shape) == (shape[0], shape[1] * 2, shape[2]):
                 return buffer, lambda: param.narrow(1, start, shape[1]).copy_(buffer)
             return buffer, lambda: param.narrow(2, start, shape[1]).copy_(
@@ -797,7 +840,7 @@ class NcclM2NReceiver:
         if getattr(self, "_failed_receive_buffers", None) is not None:
             raise RuntimeError("A failed M2N stream must be destroyed before retrying")
         # Refresh and validate live parameters before any native receive. FP8
-        # updates must keep the existing inference storage and packed-scale flag.
+        # updates must keep the existing inference storage and scale format.
         self._params = dict(self.model.named_parameters())
         self._prepare_unquantized_expert_destinations()
         self._entries = self._validate_manifest(self._world_size)

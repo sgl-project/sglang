@@ -38,7 +38,7 @@ _QUANTIZATION = {
 }
 
 
-def _model(*, fp8=True, moe_tp=False, device="cpu"):
+def _model(*, fp8=True, moe_tp=False, device="cpu", scale_format="ue8m0_unpacked"):
     root = torch.nn.Module()
     root.model = torch.nn.Module()
     root.model.layers = torch.nn.ModuleList([torch.nn.Module()])
@@ -62,20 +62,29 @@ def _model(*, fp8=True, moe_tp=False, device="cpu"):
             ),
         )
         if fp8:
-            # Packed inference scales have padded, transposed strides.
-            words = (shape[2] // 128 + 3) // 4
-            value = torch.zeros(
-                (shape[0], words, shape[1] + 4), dtype=torch.int32, device=device
-            )[:, :, : shape[1]].transpose(1, 2)
+            if scale_format == "ue8m0_unpacked":
+                # Packed inference scales have padded, transposed strides.
+                words = (shape[2] // 128 + 3) // 4
+                value = torch.zeros(
+                    (shape[0], words, shape[1] + 4), dtype=torch.int32, device=device
+                )[:, :, : shape[1]].transpose(1, 2)
+            else:
+                value = torch.zeros(
+                    (shape[0], shape[1] // 128, shape[2] // 128),
+                    dtype=torch.float32,
+                    device=device,
+                )
             scale = torch.nn.Parameter(value, requires_grad=False)
-            scale.format_ue8m0 = True
+            scale.format_ue8m0 = scale_format == "ue8m0_unpacked"
             setattr(experts, name + "_scale_inv", scale)
     experts.quant_method = SimpleNamespace(
         block_quant=True,
         use_mxfp8=False,
         is_fp4_expert=False,
         load_up_proj_weight_first=False,
-        is_deepgemm_moe_runner_backend_enabled=Mock(return_value=True),
+        is_deepgemm_moe_runner_backend_enabled=Mock(
+            return_value=scale_format == "ue8m0_unpacked"
+        ),
         quant_config=SimpleNamespace(
             use_mxfp8=False,
             is_fp4_experts=False,
@@ -91,10 +100,10 @@ def _model(*, fp8=True, moe_tp=False, device="cpu"):
     return root
 
 
-def _manifest(*, fp8=True, moe_tp=False):
+def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
     manifest = {"schema_version": 1, "communicator_world_size": 4, "entries": []}
     if fp8:
-        manifest["quantization"] = deepcopy(_QUANTIZATION)
+        manifest["quantization"] = {**_QUANTIZATION, "scale_format": scale_format}
     for component, recipe, parameter in (
         ("gate", "expert_fc1_0", "w13_weight"),
         ("up", "expert_fc1_1", "w13_weight"),
@@ -562,13 +571,15 @@ def _pack_scales_reference(scales):
         ),
     ],
 )
-def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
-    device, moe_tp, up_first
+@pytest.mark.parametrize("scale_format", ["canonical", "ue8m0_unpacked"])
+def test_fp8_refits_never_replace_inference_storage(
+    device, moe_tp, up_first, scale_format
 ):
-    model = _model(moe_tp=moe_tp, device=device)
+    packed = scale_format == "ue8m0_unpacked"
+    model = _model(moe_tp=moe_tp, device=device, scale_format=scale_format)
     experts = model.model.layers[0].mlp.experts
     experts.quant_method.load_up_proj_weight_first = up_first
-    manifest = _manifest(moe_tp=moe_tp)
+    manifest = _manifest(moe_tp=moe_tp, scale_format=scale_format)
     receiver = _receiver(
         manifest, model=model, topology=_MOE_TP_TOPOLOGY if moe_tp else _TOPOLOGY
     )
@@ -599,7 +610,11 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
                 shape[0] * shape[1] * shape[2], device=device
             ).reshape(shape)
             payloads[entry["destination"]["recipe"]] = (
-                (2.0 ** (values % 3 - 4 + index + update)).float()
+                (
+                    (2.0 ** (values % 3 - 4 + index + update)).float()
+                    if packed
+                    else (values.float() + index + update) / 10
+                )
                 if entry["tensor_role"] == "scale"
                 else (values % 7 + index + update).to(torch.float8_e4m3fn)
             )
@@ -613,6 +628,8 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
             recipe = entry["destination"]["recipe"]
             if recipe == "expert_down":
                 assert destination.data_ptr() == experts.w2_weight.data_ptr()
+            if recipe == "expert_down_scale" and not packed:
+                assert destination.data_ptr() == experts.w2_weight_scale_inv.data_ptr()
             destination.copy_(payloads[recipe])
 
         m2n = Mock()
@@ -627,7 +644,7 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
             patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
         ):
             receiver.receive()
-        assert pack.call_count == 3
+        assert pack.call_count == (3 if packed else 0)
         order = (
             ("expert_up", "expert_gate") if up_first else ("expert_gate", "expert_up")
         )
@@ -641,7 +658,7 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
                     payloads[component + suffix].float() for component in components
                 ]
                 expected = torch.cat(values, dim=1) if len(values) == 2 else values[0]
-                if scale:
+                if scale and packed:
                     expected = _pack_scales_reference(expected)
                 name = f"model.layers.0.mlp.experts.{parameter}" + (
                     "_scale_inv" if scale else ""
@@ -653,8 +670,7 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
                     actual.float(), expected.float(), rtol=0, atol=0
                 )
                 if scale:
-                    # The finalization hook must skip requantization.
-                    assert actual.format_ue8m0
+                    assert actual.format_ue8m0 == packed
         if graph is not None:
             graph.replay()
             assert (
@@ -663,22 +679,61 @@ def test_ue8m0_refits_only_pack_scales_and_never_replace_inference_storage(
             )
 
 
+@pytest.mark.parametrize("requires_ue8m0", [False, True])
+def test_canonical_fp8_requires_storage_preserving_finalization(requires_ue8m0):
+    model = _model(scale_format="canonical")
+    model.model.layers[
+        0
+    ].mlp.experts.quant_method.is_deepgemm_moe_runner_backend_enabled.return_value = (
+        True
+    )
+    manifest = _manifest(scale_format="canonical")
+    # Keep this CPU layout test independent of model-loader/GPU dependencies.
+    loader_utils = SimpleNamespace(
+        should_deepgemm_weight_requant_ue8m0=Mock(return_value=requires_ue8m0)
+    )
+    with patch.dict("sys.modules", {"sglang.srt.model_loader.utils": loader_utils}):
+        if requires_ue8m0:
+            with pytest.raises(
+                ValueError, match="repacked during DeepGEMM finalization"
+            ):
+                _receiver(manifest, model=model)
+        else:
+            _receiver(manifest, model=model)
+
+
 @pytest.mark.parametrize(
     "incompatible",
-    ["wire_format", "backend", "unpacked", "weight_layout", "scale_shape"],
+    [
+        "wire_format",
+        "other_format",
+        "scale_flag",
+        "weight_layout",
+        "scale_shape",
+        "derived_scales",
+    ],
 )
-def test_fp8_rejects_incompatible_formats_without_replacing_storage(incompatible):
-    model = _model()
+@pytest.mark.parametrize("scale_format", ["canonical", "ue8m0_unpacked"])
+def test_fp8_rejects_incompatible_formats_without_replacing_storage(
+    incompatible, scale_format
+):
+    model = _model(scale_format=scale_format)
     experts = model.model.layers[0].mlp.experts
-    manifest = _manifest()
+    manifest = _manifest(scale_format=scale_format)
     if incompatible == "wire_format":
-        manifest["quantization"]["scale_format"] = "canonical"
-    elif incompatible == "backend":
-        experts.quant_method.is_deepgemm_moe_runner_backend_enabled.return_value = False
-    elif incompatible == "unpacked":
-        experts.w13_weight_scale_inv.format_ue8m0 = False
+        manifest["quantization"]["scale_format"] = "unknown"
+    elif incompatible == "other_format":
+        manifest["quantization"]["scale_format"] = (
+            "ue8m0_unpacked" if scale_format == "canonical" else "canonical"
+        )
+    elif incompatible == "scale_flag":
+        experts.w13_weight_scale_inv.format_ue8m0 = (
+            not experts.w13_weight_scale_inv.format_ue8m0
+        )
     elif incompatible == "weight_layout":
         experts.w13_weight.data = experts.w13_weight.data.transpose(1, 2)
+    elif incompatible == "derived_scales":
+        experts.hpc_ops_w13_weight_scale = experts.w13_weight_scale_inv.detach().clone()
     else:
         experts.w13_weight_scale_inv.data = torch.zeros((1, 2, 2), dtype=torch.int32)
     buffers = {name: param.detach() for name, param in model.named_parameters()}
