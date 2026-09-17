@@ -201,8 +201,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
         SGLANG_GEN_BASELINE="0",
         SGLANG_GEN_GT="0",
     )
-    env.pop("SGLANG_DIFFUSION_DIAGNOSTICS_DIR", None)
-    env.pop("SGLANG_DIFFUSION_DIAGNOSTICS_ATTEMPT_DIR", None)
     command = (
         "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; "
         f"result = run_pytest([{str(test_file)!r}], junit_xml_path={str(report)!r}); "

@@ -174,6 +174,15 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
+        # runner pools with the same gpu can have different host-side latency
+        runner_name = os.environ.get("RUNNER_NAME", "")
+        for prefix, overrides in data.get("runner_overrides", {}).items():
+            if runner_name.startswith(prefix):
+                for name, metrics in overrides.items():
+                    data["scenarios"][name].update(metrics)
+                print(f"--- Performance Runner Baseline: {prefix} ---")
+                break
+
         # Get tolerance profile, defaulting to 'pr_test'
         profile_name = "pr_test"
         tolerances = ToleranceConfig.load_profile(

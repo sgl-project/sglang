@@ -5,6 +5,16 @@
         "description": "Reference estimates for B200-only diffusion cases, split out from the shared diffusion baseline file.",
         "last_updated": "2026-07-01"
     },
+    "runner_overrides": {
+        "b200-di": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1334.16
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 16126.87
+            }
+        }
+    },
     "tolerances": {
         "long_term": {
             "e2e": 0.15,

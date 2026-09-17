@@ -1,61 +1,4 @@
-# CI performance diagnostics
-
-The NVIDIA H100 one- and two-GPU diffusion jobs set
-`SGLANG_DIFFUSION_DIAGNOSTICS_DIR`.
-Other jobs and local runs remain opt-in. This records evidence only: it does
-not change baselines, tolerances, warmup inputs, retry policy, or exit codes.
-The metric and failure contracts below apply independently of this sampler.
-
-Each invocation and retry gets a unique `attempt-N-*` directory:
-
-| Artifact | Contents |
-| --- | --- |
-| `events.jsonl` | Actual checkout SHA, selected dependency versions, CI run/attempt/partition, observed case/module/worker/stage log boundaries, and subprocess exit status |
-| `requests.jsonl` | Every formal request's existing E2E/stage/step/memory metrics, flushed before assertions, including cases with `run_perf_check=False` |
-| `processes.jsonl` | Approximately 1 Hz process-tree CPU, I/O, memory, fault and scheduler counters, plus host I/O and memory pressure |
-| `resources.jsonl` (GPU opt-in only) | Process counters and attributed GPU utilization, clocks, power/limit, temperature and throttle reasons, including NVML query durations |
-
-GPU sampling requires `SGLANG_DIFFUSION_DIAGNOSTICS_GPU=1` in addition to the
-diagnostics directory. It is off by default: NVML process-ownership queries can
-contend with inference driver calls and perturb the latency being measured.
-Use it for a separate diagnostic replay, not the clean performance comparison.
-Process/pressure sampling and request metrics remain enabled without it; the
-attempt metadata records whether GPU sampling was enabled.
-
-JSONL is flushed per event so completed evidence survives interrupted pytest
-sessions. A missing `attempt_end` means incomplete, not success. The workflow
-uploads these files with `always()` separately from the existing final-result
-report, so retries do not erase failed samples. Abrupt runner loss can still
-prevent artifact upload.
-
-## Interpretation
-
-- `observed_boundary` timestamps are **stdout receipt times**, not synchronized
-  CUDA timings. Use case-begin to workers-ready to locate startup, not the first
-  tqdm `0/N` refresh, which may occur well into warmup. Do not treat this as a
-  precise loading assertion. Module loading is a subset of startup.
-- Ordinary request E2E is the existing worker forward metric, not total pytest
-  wall time. Realtime E2E measures the complete requested WebSocket generation
-  session, from sending initialization to receiving its frames and chunk stats;
-  it is not the last chunk's latency. Startup, warmup and later MP4 encoding are
-  excluded. Keep these two E2E scopes distinct when comparing results.
-- Cumulative CPU/I/O/fault counters must be differenced by `(pid, created)`.
-  Processes shorter than a sample interval may be missed. Zero observed disk
-  reads do not prove a warm cache or absence of I/O.
-- GPU ownership is matched to live descendants, not CUDA ordinal assumptions.
-  Before CUDA context creation there may be no attributed GPU. NVML/process PID
-  namespace mismatches can also leave GPU samples empty; this is missing data,
-  not zero utilization. Unsupported counters are explicit errors, not zero.
-- Software power capping is not automatically faulty hardware. Compare its
-  bitmask, power limit and clocks across equivalent runs. Resource samples alone
-  cannot prove a kernel, synchronization or storage root cause; a focused trace
-  may still be necessary. The sampler adds overhead; measure it before making
-  performance claims from instrumented runs.
-
-No arbitrary environment, command lines, prompts, file contents or full logs
-are saved. Only allowlisted log markers and numeric process/resource data are
-collected. Sampling runs in the pytest parent, never adds CUDA synchronization,
-does not attach a debugger, and does not change device settings.
+# CI performance guards and baselines
 
 ## Metric and failure contracts
 
@@ -75,6 +18,32 @@ Standalone infrastructure failures retain their existing retry policy.
 Valid failed measurements are recorded
 before threshold validation; realtime chunk and memory guards remain enabled
 according to their existing configuration.
+
+## B200 runner baselines
+
+`b200.json` keeps the existing Verda references as its defaults. Its
+`runner_overrides` map applies metric overrides by the GitHub `RUNNER_NAME`
+prefix. DeepInfra runners (`b200-di*`) use separate E2E references for the two
+cases below; unknown runners keep the defaults. Loading, stage/step and memory
+references, other cases, and the 25% E2E tolerance are unchanged.
+
+| Case | Default E2E (ms) | DeepInfra E2E (ms) |
+| --- | ---: | ---: |
+| `flux1_modelopt_nvfp4_t2i` | 836.71 | 1334.16 |
+| `qwen_image_2512_modelopt_nvfp4_t2i` | 9650.06 | 16126.87 |
+
+The pool mismatch was observed in [B200 CI job 103856482654](https://github.com/sgl-project/sglang/actions/runs/34805428031/job/103856482654).
+The DeepInfra references are the medians of three unprofiled, warmed requests
+using the CI case configuration at commit
+`9b7e11f32b88d4c1bfd9cf44550a30a702dd9df8`:
+Flux: 1367.47, 1327.48, 1334.16 ms; Qwen: 16126.87, 16806.36, 15240.80 ms.
+The matching Verda measurements were 811.26, 771.97, 783.31 ms and
+9169.16, 9045.49, 9071.78 ms, respectively. These calibrate the runner pools;
+they do not establish a model-level root cause for the difference.
+
+When refreshing a pool-specific reference, update its `runner_overrides` entry,
+not the shared `scenarios` entry. The baseline generation script writes shared
+scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
 ## Initial loading references
 
