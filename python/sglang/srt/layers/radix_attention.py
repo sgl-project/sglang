@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.disaggregation.layerwise_hooks import layerwise_save_kv_layer
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -164,138 +165,150 @@ class RadixAttention(nn.Module):
         key_value_num_tokens: Optional[int] = None,
         **kwargs,
     ):
-        if k is not None:
-            # For cross-layer sharing, kv can be None
-            assert v is not None
-            if "k_rope" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            else:
-                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+        try:
+            if k is not None:
+                # For cross-layer sharing, kv can be None
+                assert v is not None
+                if "k_rope" not in kwargs:
+                    k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                    v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+                else:
+                    k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        context = get_tc_piecewise_forward_context()
-        if (
-            forward_batch.forward_mode.is_extend()
-            and context is not None
-            # ``_force_eager_attn`` is only set inside Inkling's eager
-            # norm+attn+sconv region, never during tc-piecewise capture. Reading
-            # the ContextVar under the fullgraph torch.compile trace is
-            # untraceable ("Unsupported method call: ContextVar.get"), so
-            # short-circuit it while compiling -- force-eager is always off there.
-            and (torch.compiler.is_compiling() or not _force_eager_attn.get())
-        ):
-            if kwargs.get("idx_q") is not None:
-                if is_in_breakable_cuda_graph():
-                    return get_attn_backend().forward(
-                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
+            context = get_tc_piecewise_forward_context()
+            if (
+                forward_batch.forward_mode.is_extend()
+                and context is not None
+                # ``_force_eager_attn`` is only set inside Inkling's eager
+                # norm+attn+sconv region, never during tc-piecewise capture. Reading
+                # the ContextVar under the fullgraph torch.compile trace is
+                # untraceable ("Unsupported method call: ContextVar.get"), so
+                # short-circuit it while compiling -- force-eager is always off there.
+                and (torch.compiler.is_compiling() or not _force_eager_attn.get())
+            ):
+                if kwargs.get("idx_q") is not None:
+                    if is_in_breakable_cuda_graph():
+                        return get_attn_backend().forward(
+                            q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                        )
+                    idx_q = kwargs["idx_q"]
+                    idx_k = kwargs["idx_k"]
+                    idx_v = kwargs.get("idx_v")
+                    attn_out = q.new_empty(
+                        (q.shape[0], self.tp_q_head_num * self.v_head_dim)
                     )
-                idx_q = kwargs["idx_q"]
-                idx_k = kwargs["idx_k"]
-                idx_v = kwargs.get("idx_v")
-                attn_out = q.new_empty(
-                    (q.shape[0], self.tp_q_head_num * self.v_head_dim)
+                    idx_out = q.new_empty(
+                        (q.shape[0], idx_q.shape[1] * idx_q.shape[2])
+                    )
+                    unified_sparse_attention_with_output(
+                        q,
+                        k,
+                        v,
+                        attn_out,
+                        idx_out,
+                        idx_q,
+                        idx_k,
+                        save_kv_cache,
+                        self.layer_id,
+                        idx_v=idx_v,
+                    )
+                    return idx_out, attn_out
+                # Output dtype follows v (the model dtype) when available: qk-norm
+                # may emit q in a different dtype without changing the dtype the
+                # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
+                # produce a bf16 attention output; sizing the buffer off an fp8
+                # dtype would silently cast-copy the result to fp8.
+                out_dtype = v.dtype if v is not None else q.dtype
+                if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    out_dtype = torch.bfloat16
+                if self.qk_head_dim != self.v_head_dim:
+                    output = q.new_empty(
+                        (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+                        dtype=out_dtype,
+                    )
+                else:
+                    output = torch.empty_like(q, dtype=out_dtype)
+                if any(
+                    key in kwargs
+                    for key in (
+                        "score_mod",
+                        "aux_tensors",
+                        "rel_bias",
+                        "return_lse",
+                        "q_descale",
+                        "k_descale",
+                        "v_descale",
+                    )
+                ):
+                    # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
+                    # tensors can't cross the unified_attention_with_output custom-op
+                    # schema; route this backend's extend attention through the plain
+                    # eager path.
+                    if is_in_breakable_cuda_graph():
+                        lse = breakable_attention_with_output_extra_kwargs(
+                            q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                        )
+                    else:
+                        lse = attention_with_output_extra_kwargs(
+                            q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                        )
+                    if kwargs.get("return_lse") or forward_batch.mha_return_lse:
+                        assert lse is not None
+                        return (
+                            output.view(-1, self.tp_q_head_num, self.v_head_dim),
+                            lse,
+                        )
+                    return output
+                # Chunked-prefix MHA needs LSE to merge independently normalized
+                # suffix and cached-prefix attention states.
+                return_lse = bool(forward_batch.mha_return_lse)
+                mha_companion_layers = context.mha_companion_layers
+                use_mha_companion = (
+                    mha_companion_layers is not None
+                    and mha_companion_layers[self.layer_id] is self
                 )
-                idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
-                unified_sparse_attention_with_output(
+                if is_in_breakable_cuda_graph():
+                    op = (
+                        breakable_unified_attention_with_output_and_lse
+                        if return_lse
+                        else breakable_unified_attention_with_output
+                    )
+                else:
+                    op = (
+                        unified_attention_with_output_and_lse
+                        if return_lse
+                        else unified_attention_with_output
+                    )
+                lse = op(
                     q,
                     k,
                     v,
-                    attn_out,
-                    idx_out,
-                    idx_q,
-                    idx_k,
+                    output,
                     save_kv_cache,
                     self.layer_id,
-                    idx_v=idx_v,
+                    use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
+                    **kwargs,
                 )
-                return idx_out, attn_out
-            # Output dtype follows v (the model dtype) when available: qk-norm
-            # may emit q in a different dtype without changing the dtype the
-            # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
-            # produce a bf16 attention output; sizing the buffer off an fp8
-            # dtype would silently cast-copy the result to fp8.
-            out_dtype = v.dtype if v is not None else q.dtype
-            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                out_dtype = torch.bfloat16
-            if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty(
-                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
-                    dtype=out_dtype,
-                )
-            else:
-                output = torch.empty_like(q, dtype=out_dtype)
-            if any(
-                key in kwargs
-                for key in (
-                    "score_mod",
-                    "aux_tensors",
-                    "rel_bias",
-                    "return_lse",
-                    "q_descale",
-                    "k_descale",
-                    "v_descale",
-                )
-            ):
-                # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
-                # tensors can't cross the unified_attention_with_output custom-op
-                # schema; route this backend's extend attention through the plain
-                # eager path.
-                if is_in_breakable_cuda_graph():
-                    lse = breakable_attention_with_output_extra_kwargs(
-                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                if return_lse:
+                    return (
+                        output.view(-1, self.tp_q_head_num, self.v_head_dim),
+                        lse,
                     )
-                else:
-                    lse = attention_with_output_extra_kwargs(
-                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
-                    )
-                if kwargs.get("return_lse") or forward_batch.mha_return_lse:
-                    assert lse is not None
-                    return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
                 return output
-            # Chunked-prefix MHA needs LSE to merge independently normalized
-            # suffix and cached-prefix attention states.
-            return_lse = bool(forward_batch.mha_return_lse)
-            mha_companion_layers = context.mha_companion_layers
-            use_mha_companion = (
-                mha_companion_layers is not None
-                and mha_companion_layers[self.layer_id] is self
-            )
-            if is_in_breakable_cuda_graph():
-                op = (
-                    breakable_unified_attention_with_output_and_lse
-                    if return_lse
-                    else breakable_unified_attention_with_output
-                )
             else:
-                op = (
-                    unified_attention_with_output_and_lse
-                    if return_lse
-                    else unified_attention_with_output
+                return get_attn_backend().forward(
+                    q,
+                    k,
+                    v,
+                    self,
+                    forward_batch,
+                    save_kv_cache,
+                    **kwargs,
                 )
-            lse = op(
-                q,
-                k,
-                v,
-                output,
-                save_kv_cache,
-                self.layer_id,
-                use_mha_companion=use_mha_companion,
-                key_value_num_tokens=key_value_num_tokens,
-                **kwargs,
-            )
-            if return_lse:
-                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
-            return output
-        else:
-            return get_attn_backend().forward(
-                q,
-                k,
-                v,
-                self,
-                forward_batch,
-                save_kv_cache,
-                **kwargs,
-            )
+        finally:
+            if save_kv_cache and self.attn_type != AttentionType.ENCODER_ONLY:
+                layerwise_save_kv_layer(self.layer_id)
 
 
 def _unified_attention_with_output_impl(
