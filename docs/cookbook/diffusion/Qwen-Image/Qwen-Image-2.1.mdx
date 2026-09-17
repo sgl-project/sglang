@@ -129,6 +129,23 @@ All corresponding RGBA pixels were identical across the 10 generation and six
 editing samples per variant. These are additional gains over the RoPE baseline;
 this comparison does not establish the gain on other GPUs.
 
+### Lossless Q/K normalization
+
+Q/K RMSNorm fuses the input conversion and square, then the normalization,
+output cast, and weight multiply. It retains the original FP32 mean reduction
+with the same tensor shape, preserving the eager reduction order and
+cast-before-weight rounding. The native DiT verifies its first eager call and
+uses the original implementation if the outputs differ. No flag is needed.
+
+A B200 comparison on 2026-09-17 used revision `4e5459e0eda` (including the
+RoPE, MLP, and residual fusions) versus `d9e1e5dac96`. With resident weights,
+FlashAttention, and the four-startup protocol above, generation decreased from
+**3.114 to 2.828 s** (9.17%) and editing from **3.742 to 3.450 s** (7.81%).
+Each variant has 10 generation and six editing measurements at 1024px,
+40 steps, seed 42, and CFG 1. Every corresponding RGBA pixel was identical.
+These gains apply to this fixed B200 workload; other GPUs were not measured
+in this comparison.
+
 ## 2. Model capabilities
 
 Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
