@@ -97,6 +97,33 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # Cache-salt TTL
+    # -------------------------------------------------------------------------
+    cache_salt_ttl_seconds: A[
+        Optional[float],
+        "Bound how long prefix-cache KV produced under a request's cache_salt is retained. When the TTL elapses the salt's radix subtree is evicted and its KV slots are returned to the allocator without waiting for memory pressure. Unset disables the TTL.",
+    ] = None
+    cache_salt_ttl_max_seconds: A[
+        Optional[float],
+        "Ceiling on a client-supplied per-request cache_salt_ttl_seconds. A client may shorten its retention window, never extend it. Defaults to --cache-salt-ttl-seconds.",
+    ] = None
+    cache_salt_ttl_mode: A[
+        str,
+        Arg(
+            help="Which event starts a salt's TTL clock. 'last_use' is an idle timeout that each request refreshes; 'first_use' is a hard lifetime from the salt's first request that no activity extends.",
+            choices=["last_use", "first_use"],
+        ),
+    ] = "last_use"
+    cache_salt_ttl_sweep_interval_seconds: A[
+        float,
+        "How often the TokenizerManager checks for expired cache salts.",
+    ] = 1.0
+    cache_salt_ttl_max_tracked_salts: A[
+        int,
+        "Cap on simultaneously tracked cache salts. Nothing bounds how many distinct salts a client can mint, so past this cap the salts closest to their deadline are expired early.",
+    ] = 16384
+
+    # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False

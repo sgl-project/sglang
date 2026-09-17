@@ -21,7 +21,15 @@ import sys
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Callable,
+    NamedTuple,
+    Optional,
+    Sequence,
+)
 
 import msgspec
 import torch
@@ -68,6 +76,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
+    CacheSaltExpiryResult,
     DecSwaLockOnlyResult,
     DemoteResult,
     DriveHostEvictionResult,
@@ -398,6 +407,15 @@ class _InsertWalkState(msgspec.Struct):
     target_node: Optional[UnifiedTreeNode] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
+
+
+def _is_pinned(node: UnifiedTreeNode) -> bool:
+    """Whether an in-flight request still needs this node's KV."""
+    if node.write_through_pending_id is not None:
+        return True
+    if node.load_back_pending_id is not None:
+        return True
+    return any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data)
 
 
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -1634,6 +1652,55 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         result.is_dropped = True
         return result
+
+    def expire_cache_salts(self, salts: AbstractSet[str]) -> CacheSaltExpiryResult:
+        """Evict every node carrying one of these cache salts.
+
+        `RadixKey.child_key` folds the salt into the children-dict key at every
+        level and slicing preserves it, so a salt's nodes are whole subtrees
+        hanging off the root -- the walk is bounded by those root edges rather
+        than the whole tree.
+        """
+        result = CacheSaltExpiryResult()
+        for root_child in list(self.root_node.children.values()):
+            salt = root_child.key.cache_salt
+            if salt not in salts:
+                continue
+            retained = self._expire_subtree(root_child, result)
+            if retained:
+                result.retained[salt] = result.retained.get(salt, 0) + retained
+        return result
+
+    def _expire_subtree(
+        self, subtree_root: UnifiedTreeNode, result: CacheSaltExpiryResult
+    ) -> int:
+        """Delete the subtree bottom-up; returns how many nodes survived."""
+        walk_order: list[UnifiedTreeNode] = []
+        stack = [subtree_root]
+        while stack:
+            node = stack.pop()
+            walk_order.append(node)
+            stack.extend(node.children.values())
+
+        retained = 0
+        for node in reversed(walk_order):
+            # A surviving child means a pinned descendant, and the parent has
+            # to stay to keep the path to it addressable.
+            if node.children or _is_pinned(node):
+                retained += 1
+                continue
+            medium = StorageMedium.CPU if node.evicted else StorageMedium.GPU
+            self._release_all_component_layers(
+                node,
+                medium,
+                result.tracker,
+                result.device_frees,
+                result.host_frees,
+            )
+            parent = node.parent
+            self._remove_leaf_from_parent(node)
+            self._update_evictable_leaf_sets(parent)
+        return retained
 
     def _release_all_component_layers(
         self,

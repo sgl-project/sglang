@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -238,6 +246,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
+        # Cache salts told to expire whose subtree is not gone yet
+        # (--cache-salt-ttl-seconds).
+        self._pending_cache_salt_expiry: set[str] = set()
+
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
         # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
@@ -379,6 +391,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        # The tree is gone, so there is nothing left to expire.
+        self._pending_cache_salt_expiry = set()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -600,6 +614,45 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(self.tree_core.end_insert())
 
     @rank_consensus(same_params=True, same_results=True)
+    def expire_cache_salts(self, salts: Iterable[str]) -> int:
+        """Evict the KV of salts whose TTL elapsed; returns the pinned node
+        count still held back.
+
+        Not budget-driven like `evict`: the caller is bounding retention, not
+        reclaiming space.
+        """
+        self._pending_cache_salt_expiry.update(salts)
+        return self.drain_expiring_cache_salts()
+
+    def cancel_pending_cache_salt_expiry(self, salt: Optional[str]) -> None:
+        """A new request under `salt` opens a fresh TTL epoch, so stop tearing
+        the old one down. Only nodes a live request pinned can still be there:
+        everything unpinned was freed when the expiry landed."""
+        if salt is not None:
+            self._pending_cache_salt_expiry.discard(salt)
+
+    def has_pending_cache_salt_expiry(self) -> bool:
+        return bool(self._pending_cache_salt_expiry)
+
+    def drain_expiring_cache_salts(self) -> int:
+        """Retry the part of an expiry an in-flight request was holding."""
+        if not self._pending_cache_salt_expiry:
+            return 0
+        # A suspended insert walk holds node references across its barrier;
+        # deleting one under it would corrupt the walk.
+        if self.tree_core.has_ongoing_insert():
+            return 0
+
+        result = self.tree_core.expire_cache_salts(self._pending_cache_salt_expiry)
+        try:
+            self._free_values(result.device_frees, result.host_frees)
+        finally:
+            num_expired = len(self._pending_cache_salt_expiry) - len(result.retained)
+            self._pending_cache_salt_expiry = set(result.retained)
+        if num_expired:
+            logger.info("cache-salt TTL: expired %d salt(s)", num_expired)
+        return sum(result.retained.values())
+
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
