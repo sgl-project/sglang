@@ -152,15 +152,11 @@ class TestNPUMiMoV2_5_Pro_W4A8_4P_Acceptance(CustomTestCase):
             str(MAX_CONCURRENCY),
         ]
 
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=3600
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         print(result.stdout)
         if result.returncode != 0:
             print(f"STDERR:\n{result.stderr}")
-        self.assertEqual(
-            result.returncode, 0, f"bench_serving failed: {result.stderr}"
-        )
+        self.assertEqual(result.returncode, 0, f"bench_serving failed: {result.stderr}")
 
         # Parse accept_length from bench_serving CLI output
         match = re.search(r"Accept length:\s+([\d.]+)", result.stdout)
