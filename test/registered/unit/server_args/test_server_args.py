@@ -2723,6 +2723,7 @@ class TestDeepEPv2Args(CustomTestCase):
             tp_size=16,
             dp_size=2,
             enable_dp_attention=True,
+            max_running_requests=16,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
             with self.assertRaisesRegex(ValueError, "required=256"):
@@ -2738,6 +2739,7 @@ class TestDeepEPv2Args(CustomTestCase):
             tp_size=16,
             dp_size=1,
             enable_dp_attention=False,
+            max_running_requests=16,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
             with self.assertRaisesRegex(ValueError, "required=128"):
