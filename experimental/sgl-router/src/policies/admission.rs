@@ -17,9 +17,9 @@
 //! fleet reads below the floor, the request pins to the least-pressured
 //! prefix owner instead of cold-prefilling on a non-owner.
 
-use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::policies::power_of_two::select_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::workers::engine_reports::{EngineSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -179,7 +179,7 @@ pub struct CacheCandidateResolution {
 /// and the gate fails open rather than comparing the limit against a
 /// different quantity.
 pub(crate) fn queue_gate_admits(
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     worker: &Worker,
     limit: Option<u64>,
 ) -> bool {
@@ -196,7 +196,7 @@ pub(crate) fn queue_gate_admits(
 /// an empty fleet, or a single worker with no fresh sample all make this
 /// false — an unknown queue is not a proven full one.
 pub(crate) fn fleet_is_all_queued(
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     fleet: &[Arc<Worker>],
     limit: Option<u64>,
 ) -> bool {
@@ -216,7 +216,7 @@ pub(crate) fn fleet_is_all_queued(
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     fleet: &[Arc<Worker>],
 ) -> CacheCandidateResolution {
     let queue_limit = proposal.worker_queue_limit;
@@ -397,7 +397,7 @@ pub fn resolve_prefill(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     queue_limit: Option<u64>,
 ) -> Option<FinalDecision> {
     resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot, queue_limit).or_else(
@@ -429,7 +429,7 @@ pub fn resolve_prefill_admitted(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     queue_limit: Option<u64>,
 ) -> Option<FinalDecision> {
     if !contains_worker(range, &proposal.primary) {
@@ -490,7 +490,7 @@ pub fn resolve_decode(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
 ) -> Option<FinalDecision> {
     if domain.stage != RoutingStage::Decode || !contains_domain_worker(domain, &proposal.primary) {
         return None;
@@ -558,7 +558,7 @@ fn is_prefill_admitted(
     range: &CandidateRange<'_>,
     worker: &Arc<Worker>,
     request_input_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
 ) -> bool {
     let load = snapshot.fresh_native_cache_load_for_url(&worker.url);
     has_kv_capacity(load, request_input_tokens)
@@ -574,7 +574,7 @@ fn is_prefill_admitted(
 fn is_decode_admitted(
     worker: &Arc<Worker>,
     request_kv_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
 ) -> bool {
     has_kv_capacity(
         snapshot.fresh_native_cache_load_for_url(&worker.url),
@@ -699,7 +699,7 @@ pub(crate) struct FreshLoadLookup<'a> {
 
 impl<'a> FreshLoadLookup<'a> {
     pub(crate) fn new<'w>(
-        snapshot: Option<&'a EngineLoadSnapshot>,
+        snapshot: Option<&'a EngineSnapshot>,
         workers: impl IntoIterator<Item = &'w Arc<Worker>>,
     ) -> Self {
         let workers: Vec<&Arc<Worker>> = workers.into_iter().collect();
@@ -859,7 +859,7 @@ fn range_fallback(
     range: &CandidateRange<'_>,
     legal: &[Arc<Worker>],
     request_input_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
     queue_limit: Option<u64>,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let admitted = legal
@@ -920,7 +920,7 @@ fn legal_prefill_candidates(
 fn decode_domain_fallback(
     domain: &CandidateDomain,
     request_kv_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let admitted = domain
         .workers
@@ -938,7 +938,7 @@ fn decode_domain_fallback(
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineSnapshot>,
 ) -> Ordering {
     match snapshot.and_then(|snapshot| {
         Some((
@@ -976,7 +976,7 @@ fn compare_prefill_load(left: &NativeCacheWorkerLoad, right: &NativeCacheWorkerL
 pub(crate) fn compare_decode_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineSnapshot>,
 ) -> Ordering {
     match snapshot.and_then(|snapshot| {
         Some((
@@ -1008,7 +1008,7 @@ fn pressure_guard_prefers_backup(
     primary: &Arc<Worker>,
     backup: &Arc<Worker>,
     hints: &GuardHints,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineSnapshot,
 ) -> bool {
     if !hints.enable_pressure_guard {
         return false;
@@ -1056,8 +1056,8 @@ mod tests {
         }))
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineSnapshot {
+        EngineSnapshot::from_native_cache_workers(
             7,
             entries
                 .iter()
@@ -1697,7 +1697,7 @@ mod tests {
         // waits 5 (over the limit) behind 1 uncached token, busy_unqueued
         // waits 3 (under the limit) behind 1000 uncached tokens. The primary
         // is KV-full, so it is not admitted at all.
-        let loads = EngineLoadSnapshot::from_native_cache_workers(
+        let loads = EngineSnapshot::from_native_cache_workers(
             7,
             [
                 (primary.url.clone(), load(0, 0, 10_000, 10_000)),

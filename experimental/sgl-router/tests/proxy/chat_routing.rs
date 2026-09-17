@@ -1178,15 +1178,15 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     );
 }
 
-/// Task A: the chat handler mints an `ActiveLoadGuard` from the shared
-/// `ActiveLoadRegistry` and drops it when the request completes. The
+/// Task A: the chat handler mints an `TrackedRequest` from the shared
+/// `RequestTracker` and drops it when the request completes. The
 /// non-streaming path drops the guard on handler exit; this test
 /// asserts the round-trip increment → 0 across a single request.
 #[tokio::test]
 async fn non_streaming_active_load_increments_then_returns_to_zero() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
-    let active_load = Arc::clone(&ctx.active_load);
+    let active_load = Arc::clone(&ctx.request_tracker);
     let app = build_router(ctx);
 
     assert_eq!(
@@ -1228,7 +1228,7 @@ async fn non_streaming_active_load_increments_then_returns_to_zero() {
     );
 }
 
-/// Task A: the streaming path holds the `ActiveLoadGuard` until the
+/// Task A: the streaming path holds the `TrackedRequest` until the
 /// SSE pump finishes. Mid-stream the registry shows `inflight_count >= 1`;
 /// after the body drains it returns to 0. Counterpart to
 /// `streaming_load_guard_persists_for_body_lifetime` — both guards must
@@ -1260,7 +1260,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    let active_load = Arc::clone(&ctx.active_load);
+    let active_load = Arc::clone(&ctx.request_tracker);
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -1329,7 +1329,7 @@ async fn streaming_active_load_drops_on_client_disconnect() {
     )
     .await;
     let (ctx, body) = stream_chat(&worker.url).await;
-    let active_load = Arc::clone(&ctx.active_load);
+    let active_load = Arc::clone(&ctx.request_tracker);
 
     // Read one chunk to confirm the stream is live, then drop the body.
     use futures::StreamExt;
@@ -1357,13 +1357,13 @@ async fn streaming_active_load_drops_on_client_disconnect() {
 /// `ApiError::StaleRequestExpired`.
 ///
 /// Wiring: build an `AppContext` with a short
-/// `stale_request_timeout` `ActiveLoadRegistry` + spawn a janitor
+/// `stale_request_timeout` `RequestTracker` + spawn a janitor
 /// with sub-second cadence + dispatch to a slow upstream that takes
 /// longer than the timeout. The janitor sweeps before the upstream
 /// returns; cancellation fires; handler returns 504.
 #[tokio::test]
 async fn janitor_expiry_returns_504_stale_request_expired() {
-    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    use sgl_router::workers::request_tracker::{spawn_janitor, RequestTracker};
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
     let worker =
@@ -1384,12 +1384,12 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     // Aggressive 50ms timeout: the janitor will sweep on the next
     // tick (every 20ms) and fire the cancellation token before the
     // upstream returns.
-    let active_load = ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+    let active_load = RequestTracker::new(
+        Arc::new(sgl_router::workers::request_tracker::SystemTimeClock),
         Duration::from_millis(50),
     );
     let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
-    let ctx = Arc::new(AppContext::with_active_load(
+    let ctx = Arc::new(AppContext::with_request_tracker(
         cfg,
         tokenizers,
         proxy,
@@ -1445,7 +1445,7 @@ async fn non_streaming_error_path_drops_active_load_guard() {
     drop(listener);
 
     let ctx = build_ctx_with_worker(&dead_url);
-    let active_load = Arc::clone(&ctx.active_load);
+    let active_load = Arc::clone(&ctx.request_tracker);
     let app = build_router(ctx);
 
     let req = Request::builder()

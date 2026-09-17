@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod engine_reports;
 pub mod introspect;
 pub mod manager;
+pub mod pools;
 pub mod registry;
+pub mod request_tracker;
 pub mod worker;
 
 pub use introspect::{ServerInfo, WorkerIntrospector};

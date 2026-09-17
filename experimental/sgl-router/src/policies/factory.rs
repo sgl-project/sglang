@@ -5,9 +5,9 @@ use crate::config::{
     Config, FilterKind, ModelConfig, PolicyKind, ScoreTermKind, StickyFallbackKind,
 };
 use crate::discovery::ModelId;
+use crate::kv_events::{BlockSizeOracle, HashTree};
 use crate::policies::{
     cache_aware::CacheAwarePolicy,
-    kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,

@@ -12,8 +12,8 @@ use sgl_router::policies::decode::{
     resolve_decode_with_capacity_fallback, DecodePolicy, DecodePowerOfTwoPolicy,
     DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };
-use sgl_router::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use sgl_router::policies::SelectionProposal;
+use sgl_router::workers::engine_reports::{EngineSnapshot, NativeCacheWorkerLoad};
 use sgl_router::workers::Worker;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -30,8 +30,8 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
-fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-    EngineLoadSnapshot::from_native_cache_workers(
+fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineSnapshot {
+    EngineSnapshot::from_native_cache_workers(
         7,
         entries
             .iter()
