@@ -38,6 +38,10 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Storage backends are constructed with the logical anchor pool after the
+    # HostPoolGroup refactor. Preserve the complete pool composition for
+    # backends whose initialization lifecycle depends on sidecar pools.
+    host_pool_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -110,6 +114,10 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Number of anchor/KV logical pages represented by one storage object.
+    # Most pools are one-to-one. Coarse pools such as DSV4 C128 set this to
+    # their physical-group coverage so exists() can return a logical prefix.
+    logical_pages_per_object: int = 1
 
 
 @dataclass(frozen=True)
@@ -173,6 +181,10 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def prepare_for_backup(self) -> None:
+        """Optional lifecycle hook run after inference, before an L3 backup."""
+        pass
 
     def batch_exists_v2(
         self,

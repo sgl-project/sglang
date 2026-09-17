@@ -250,6 +250,12 @@ def alloc_with_pin_memory(
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
+    # NPU pin-memory pointers live in the NPU VA range. MemFabric device_rdma
+    # classifies them as device memory and rejects MR registration. When a
+    # caller disables pinning, use its mmap allocator so HugeTLB-backed host
+    # memory remains registerable.
+    if not pin_memory and allocator is not None:
+        return allocator.allocate(dims, dtype=dtype, device=device)
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
