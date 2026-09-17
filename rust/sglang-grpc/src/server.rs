@@ -23,6 +23,7 @@ pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
     engine_state: EngineStatePublisher,
+    stream_shutdown: watch::Receiver<bool>,
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -651,12 +652,29 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         _request: Request<proto::WatchEngineStateRequest>,
     ) -> Result<Response<Self::WatchEngineStateStream>, Status> {
         let mut receiver = self.engine_state.subscribe();
+        let mut shutdown = self.stream_shutdown.clone();
         let stream = async_stream::stream! {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
             let initial = receiver.borrow_and_update().clone();
             yield Ok(initial);
-            while receiver.changed().await.is_ok() {
-                let update = receiver.borrow_and_update().clone();
-                yield Ok(update);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    result = receiver.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        let update = receiver.borrow_and_update().clone();
+                        yield Ok(update);
+                    }
+                }
             }
         };
         Ok(Response::new(Box::pin(stream)))
@@ -1077,10 +1095,12 @@ pub async fn run_grpc_server(
     let (state_changed_tx, mut state_changed_rx) = tokio::sync::mpsc::channel(1);
     bridge.set_engine_state_changed_callback(state_changed_tx)?;
     let engine_state = EngineStatePublisher::new(bridge.clone()).await?;
+    let (stream_shutdown_tx, stream_shutdown_rx) = watch::channel(false);
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
         engine_state: engine_state.clone(),
+        stream_shutdown: stream_shutdown_rx,
     };
 
     let monitor = tokio::spawn(async move {
@@ -1103,6 +1123,7 @@ pub async fn run_grpc_server(
         .add_service(svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
+            stream_shutdown_tx.send_replace(true);
             tracing::info!("gRPC server shutting down");
         })
         .await;
