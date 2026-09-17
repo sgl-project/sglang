@@ -102,22 +102,35 @@ class ProducerWatchdog:
         os.kill(os.getpid(), signal.SIGKILL)
 
     def _watch(self) -> None:
+        failure = None
         try:
+            poller = select.poll()
+            if self._pidfd is not None:
+                poller.register(self._pidfd, select.POLLIN)
             while not self._stop.wait(self._poll_interval):
                 if self._pidfd is not None:
-                    dead = bool(select.select([self._pidfd], [], [], 0)[0])
+                    events = poller.poll(0)
+                    if any(
+                        mask & (select.POLLERR | select.POLLNVAL) for _, mask in events
+                    ):
+                        raise RuntimeError("Invalid producer pidfd poll state")
+                    dead = bool(events)
                 else:
                     dead = not self.identity.is_alive()
                 if dead:
                     break
             else:
                 return
-        except Exception:
-            logger.exception("Weight-cache producer monitoring failed")
+        except Exception as error:
+            failure = error
+            logger.exception(
+                "Weight-cache producer monitoring failed; fail-stopping consumer"
+            )
         self._lost.set()
         logger.critical(
-            "Weight-cache producer %s was lost; terminating its consumer",
+            "Weight-cache producer %s is dead or cannot be monitored (%s); terminating its consumer",
             self.identity,
+            failure or "exit observed",
         )
         self._on_death()
 

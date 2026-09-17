@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests for shared, opt-in weight-cache correctness primitives."""
 
+import fcntl
 import hashlib
 import json
 import multiprocessing as mp
@@ -386,6 +387,28 @@ class TestIdentity(unittest.TestCase):
 
 
 class TestProducerIdentity(unittest.TestCase):
+    def test_high_pidfd_does_not_report_live_producer_dead(self):
+        """select.select previously killed healthy consumers for fd >= 1024."""
+        original = os.pidfd_open
+
+        def high_pidfd(pid):
+            low = original(pid)
+            try:
+                return fcntl.fcntl(low, fcntl.F_DUPFD_CLOEXEC, 1100)
+            finally:
+                os.close(low)
+
+        lost = threading.Event()
+        with patch("os.pidfd_open", side_effect=high_pidfd):
+            guard = ProducerWatchdog(
+                ProcessIdentity.read(os.getpid()), on_death=lost.set, poll_interval=0.01
+            )
+        try:
+            self.assertFalse(lost.wait(0.15))
+            guard.check_alive()
+        finally:
+            guard.close()
+
     def test_invalid_intervals_do_not_start_a_watchdog(self):
         identity = ProcessIdentity.read(os.getpid())
         for interval in (0, -1, 11, float("nan"), float("inf"), True):
