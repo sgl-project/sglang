@@ -517,7 +517,7 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
     """Drop checkpoint page cache with posix_fadvise(DONTNEED); return (files, bytes).
 
     Cached checkpoint pages can prevent 512 MiB huge-page allocation,
-    so drop them before pre-faulting private host tables.
+    so drop them before pre-faulting per-rank host tables.
     """
     try:
         model_path = get_model().model_path
@@ -560,13 +560,17 @@ class _HostTable:
       shared   one memfd holding every row, mapped by all ranks of the group;
                rank 0 creates it, the others open it through /proc/<pid>/fd.
                No all-reduce. Huge pages need transparent_hugepage/shmem_enabled.
-      private  one anonymous mapping per rank holding only its own rows, so the
+      per_rank one anonymous mapping per rank holding only its own rows, so the
                lookup keeps the sharded all-reduce. Huge pages come from
                transparent_hugepage/enabled (madvise or always).
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
-        assert layout in ("shared", "private"), layout
+        if layout not in ("shared", "per_rank"):
+            raise ValueError(
+                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
+                "'shared' or 'per_rank'"
+            )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
@@ -590,11 +594,11 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "private":
+        if layout == "per_rank":
             # Fault the shard in now, on a host whose page cache has just been
             # emptied: cached checkpoint pages left by a previous server, or by
             # the loader itself, make the 512 MiB huge-page faults fall back.
-            _drop_page_cache_once("before pre-faulting the private shard")
+            _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
@@ -603,16 +607,6 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
-
-    @staticmethod
-    def choose_layout(requested: str) -> str:
-        if requested != "auto":
-            return requested
-        if _thp_mode("shmem_enabled") in ("advise", "always", "within_size", "force"):
-            return "shared"
-        if _thp_mode("enabled") in ("madvise", "always"):
-            return "private"
-        return "shared"
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -662,7 +656,7 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "private" and huge_kb < mapped_kb * 0.98:
+        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -694,7 +688,7 @@ class EngramEmbedding(nn.Module):
     the rows it owns, zeroes the rest and the all-reduce reassembles the lookup.
     With SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE the table lives in host memory and
     the GPU gathers rows over the CPU link -- either one shared copy with no
-    all-reduce, or one private shard per rank (see _HostTable). Loading is
+    all-reduce, or one shard per rank (see _HostTable). Loading is
     sharded in every layout: a rank writes only its own row range.
     """
 
@@ -724,9 +718,7 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = _HostTable.choose_layout(
-            envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        )
+        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
@@ -798,7 +790,7 @@ class EngramEmbedding(nn.Module):
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
-        private host shards zero unowned rows and the all-reduce reassembles."""
+        per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
             return self._empty(indices)
         values = self._owned_rows(indices)
