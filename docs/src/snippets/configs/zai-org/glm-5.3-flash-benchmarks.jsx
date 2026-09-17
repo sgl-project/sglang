@@ -425,6 +425,19 @@ export const benchmarks = [
     notes:
       "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
   },
+  // BF16 + Q8 sparse prefill is a separate pairing. These entries carry no
+  // measurement: they exist so the BF16 + TileLang rows above (which match on
+  // hw + strategy alone) cannot be attributed to it, since findBenchmark prefers
+  // the most specific match. The enabling PR reports a relative A/B against
+  // BF16 + TileLang on 4x H200 (TP4); absolute numbers here are still pending.
+  // Do not add defaultAccuracy to glm-5.3-flash.jsx without revisiting these
+  // rows: effectiveAccuracy merges the variant default under any entry that
+  // exists, which would attribute unmeasured accuracy to this pairing and flip
+  // the card out of its pending state.
+  { match: { hw: "h200", strategy: "low-latency", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h200", strategy: "high-throughput", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h100", strategy: "low-latency", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h100", strategy: "high-throughput", kvDsaPair: "bf16-q8-prefill" } },
   // TODO: speed measured on the earlier TP8/EP8 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "b200", strategy: "low-latency" },
