@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -69,6 +70,9 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 
 
 class DeepSeekV4SingleKVPool(KVCache):
+    # Paged FlashMLA main-KV format of this pool's rows.
+    kv_layout: KVLayout = KVLayout.V4
+
     def __init__(
         self,
         size: int,
@@ -719,6 +723,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.uniform_fp8 = (
             not self._unified_kv
         ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        self.kv_layout = KVLayout.V4
         c4_ring_size = self.get_ring_size(4)
         if self._unified_kv:
             # Unified C4 state is request-addressed: one ring per req slot,
@@ -1317,6 +1322,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.page_size
+
+    def get_extra_key_layout(self, layer_id: int) -> KVLayout:
+        _, _, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.kv_layout
+
+    def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
+        """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
+        kernel detects the extra cache's format from."""
+        if self.uniform_fp8:
+            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
+            _, _, compress_kv_pool = self.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            return compress_kv_pool.kv_cache_total_dim
+        return self.get_extra_key_layout(layer_id).bytes_per_token
+
+    def get_swa_key_layout(self) -> KVLayout:
+        return self.kv_layout
+
+    def get_swa_key_bytes_per_token(self) -> int:
+        """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
+        kernel detects the SWA cache's format from."""
+        if self.uniform_fp8:
+            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
+            return self.swa_kv_pool.kv_cache_total_dim
+        return self.kv_layout.bytes_per_token
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         self.wait_layer_transfer(layer_id)
