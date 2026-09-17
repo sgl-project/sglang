@@ -52,6 +52,39 @@ fn array_only_template_content_parity() {
     }
 }
 
+/// Replace every `YYYY-MM-DD` with a placeholder.
+///
+/// Templates that call `strftime_now` render the day the prompt is built, so a
+/// fixture captured earlier differs from today's render in the date alone. That
+/// is not drift: the engine consumes forwarded IDs verbatim and never re-renders.
+/// Masking keeps the rest of the prompt under exact comparison, and dates that
+/// come from the request render the same on both sides, so masking them is a
+/// no-op.
+fn mask_dates(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if starts_with_iso_date(rest) {
+            out.push_str("<DATE>");
+            rest = &rest[10..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn starts_with_iso_date(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
     let hf_home = std::env::var("HF_HOME")
         .ok()
@@ -126,11 +159,24 @@ fn chat_render_parity_matrix() {
                 "{}/{}: fell back to raw text",
                 fixture.model_id, case.shape
             );
-            assert_eq!(
-                tokens.ids, case.expected_token_ids,
-                "DRIFT on {}/{}",
-                fixture.model_id, case.shape
-            );
+            if tokens.ids != case.expected_token_ids {
+                // Decode with special tokens kept, so a difference in them still fails.
+                let tokenizer = reg.get(&fixture.model_id).unwrap();
+                let rendered = adapter::decode_complete(&tokenizer, &tokens.ids, false).unwrap();
+                let expected =
+                    adapter::decode_complete(&tokenizer, &case.expected_token_ids, false).unwrap();
+                assert_eq!(
+                    mask_dates(&rendered),
+                    mask_dates(&expected),
+                    "DRIFT on {}/{}",
+                    fixture.model_id,
+                    case.shape
+                );
+                eprintln!(
+                    "{}/{}: date drift only; fixture captured on another day",
+                    fixture.model_id, case.shape
+                );
+            }
             checked += 1;
         }
     }
