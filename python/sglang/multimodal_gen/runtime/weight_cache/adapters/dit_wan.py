@@ -11,6 +11,8 @@ ADAPTER_ID = "dit.wan2_1.transformer.v1"
 PIPELINE_NAME = "WanPipeline"
 PIPELINE_MODULE = "sglang.multimodal_gen.runtime.pipelines.wan_pipeline"
 MODEL_LABEL = "Wan2.1 T2V 1.3B"
+SUPPORTS_SUBFOLDER = False
+validate_model_index = None
 EXPECTED_CONFIG = {
     "added_kv_proj_dim": None,
     "attention_head_dim": 128,
@@ -44,7 +46,7 @@ def validate_supported(frozen, *, pipeline_name, attention):
 
     recipe = frozen.thaw()
     if (
-        pipeline_name != "WanPipeline"
+        pipeline_name != PIPELINE_NAME
         or recipe.component_name != "transformer"
         or recipe.model_cls is not WanTransformer3DModel
     ):

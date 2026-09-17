@@ -822,7 +822,7 @@ class ServerArgsAutoTuner:
 
     def _can_apply_fsdp_policy(self, *, require_memory_headroom: bool) -> bool:
         args = self.server_args
-        if getattr(args, "weight_cache_mode", "off") != "off":
+        if args.weight_cache_mode != "off":
             return False
         deployment_config = self._deployment_config()
         if not self._supports_high_confidence_fsdp():

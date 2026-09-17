@@ -18,6 +18,8 @@ ADAPTER_ID = "dit.qwen_image.transformer.v1"
 PIPELINE_NAME = "QwenImagePipeline"
 PIPELINE_MODULE = "sglang.multimodal_gen.runtime.pipelines.qwen_image"
 MODEL_LABEL = "original Qwen-Image"
+SUPPORTS_SUBFOLDER = False
+validate_model_index = None
 EXPECTED_CONFIG = {
     "attention_head_dim": 128,
     "axes_dims_rope": [16, 56, 56],
@@ -69,12 +71,7 @@ def validate_supported(frozen, *, pipeline_name, attention):
             actual = list(actual)
         if actual != expected:
             raise ValueError(f"Unverified resolved Qwen-Image architecture: {name}")
-    if (
-        type(arch) is not QwenImageArchConfig
-        or arch.zero_cond_t
-        or getattr(arch, "use_additional_t_cond", False)
-        or getattr(arch, "use_layer3d_rope", False)
-    ):
+    if type(arch) is not QwenImageArchConfig or arch.zero_cond_t:
         raise ValueError("Unverified Qwen-Image edit/layered/conditioning variant")
     common.validate_recipe(recipe, attention=attention, label="Qwen-Image")
 

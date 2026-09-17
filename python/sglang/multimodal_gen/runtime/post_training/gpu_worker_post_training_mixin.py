@@ -41,7 +41,7 @@ class GPUWorkerPostTrainingMixin:
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
-        if getattr(self.server_args, "weight_cache_mode", "off") != "off":
+        if self.server_args.weight_cache_mode != "off":
             return (
                 False,
                 "Weight updates are unavailable with shared weight-cache allocations",
@@ -64,7 +64,7 @@ class GPUWorkerPostTrainingMixin:
         self,
         req: UpdateWeightFromTensorReqInput,
     ) -> tuple[bool, str]:
-        if getattr(self.server_args, "weight_cache_mode", "off") != "off":
+        if self.server_args.weight_cache_mode != "off":
             return (
                 False,
                 "Weight updates are unavailable with shared weight-cache allocations",

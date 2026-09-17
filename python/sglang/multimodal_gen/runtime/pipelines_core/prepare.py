@@ -82,7 +82,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
         or server_args.disagg_role != "monolithic"
         or (
             (server_args.model_subfolder or server_args.model_variant)
-            and not getattr(adapter, "SUPPORTS_SUBFOLDER", False)
+            and not adapter.SUPPORTS_SUBFOLDER
         )
     ):
         if required:
@@ -94,7 +94,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     # Do not recursively include an earlier plan in a frozen recipe.
     args._prepared_pipeline = None
     args._weight_cache_admission = None
-    if getattr(adapter, "SUPPORTS_SUBFOLDER", False):
+    if adapter.SUPPORTS_SUBFOLDER:
         model_path, model_index = pipeline_cls.resolve_model_config(
             args.model_path, args
         )
@@ -123,11 +123,9 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     paths = {
         name: (
             str(
-                prepare_diffusers_component_path_for_loading(
-                    server_args.component_paths[name]
-                )
+                prepare_diffusers_component_path_for_loading(args.component_paths[name])
             )
-            if name in server_args.component_paths
+            if name in args.component_paths
             else str(root / name)
         )
         for name in names
@@ -160,7 +158,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
             "Weight-cache transformer recipe uses FA attention; ordinary auto selection is unchanged"
         )
     try:
-        if hasattr(adapter, "validate_model_index"):
+        if adapter.validate_model_index is not None:
             adapter.validate_model_index(model_index)
         frozen = loader.prepare_customized(
             paths["transformer"],

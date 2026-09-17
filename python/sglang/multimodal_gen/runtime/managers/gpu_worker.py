@@ -1444,9 +1444,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             reject_cached_weight_mutation,
         )
 
-        reject_cached_weight_mutation(
-            getattr(self, "pipeline", None), "Wake/resume memory"
-        )
+        reject_cached_weight_mutation(self.pipeline, "Wake/resume memory")
         if self.memory_occupation is None:
             return {
                 "success": True,
