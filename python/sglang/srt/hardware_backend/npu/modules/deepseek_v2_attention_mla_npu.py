@@ -895,7 +895,8 @@ def forward_dsa_core_npu(
             # batch, which is what they get without DSA-CP, so the sharding
             # ends here instead of propagating through the rest of the layer.
             attn_output = dsa_cp_restore_tokens(
-                attn_output.view(dsa_cp_plan.rows, -1, m.kv_lora_rank), dsa_cp_plan
+                attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank),
+                dsa_cp_plan,
             )
     if dcp_extend:
         # Dropped here, before the MoE, not at the end of the forward. The

@@ -244,7 +244,10 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     missing = plan.num_tokens_pad - x.shape[0]
     if missing > 0:
         x = torch.cat([x, x.new_zeros((missing, h, d))], dim=0)
-    send = x.view(tp, plan.rows, h, d).contiguous()
+    # reshape, not view: q_nope_out arrives from npu_transpose_batchmatmul
+    # with a permuted output layout, and view() refuses a non-contiguous
+    # tensor outright.
+    send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
     parallel.attn_tp_group.all_to_all_single(recv, send)
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
@@ -265,7 +268,7 @@ def dsa_cp_restore_tokens(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     assert x.shape[1] == h * tp, (
         f"DSA-CP restore expects a full head set, got {x.shape[1]} for tp_size {tp}"
     )
-    send = x.view(plan.rows, tp, h, d).permute(1, 0, 2, 3).contiguous()
+    send = x.reshape(plan.rows, tp, h, d).permute(1, 0, 2, 3).contiguous()
     recv = torch.empty_like(send)
     parallel.attn_tp_group.all_to_all_single(recv, send)
     return recv.reshape(plan.num_tokens_pad, h, d)[: plan.num_tokens]
