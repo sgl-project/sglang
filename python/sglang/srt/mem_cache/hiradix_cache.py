@@ -1891,7 +1891,8 @@ class HiRadixCache(RadixCache):
     def _match_prefix_helper(
         self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
     ):
-        node.last_access_time = time.monotonic()
+        access_time = time.monotonic()
+        node.last_access_time = access_time
         child_key = key.child_key(self.page_size)
         value = []
 
@@ -1900,13 +1901,13 @@ class HiRadixCache(RadixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if observe_kv_age:
                 self.metrics_collector.observe_kv_age(
-                    time.monotonic() - child.last_access_time,
+                    access_time - child.last_access_time,
                     prefix_len,
                     event="hit",
                     tier="host" if child.evicted else "device",
                     outcome="hit",
                 )
-            child.last_access_time = time.monotonic()
+            child.last_access_time = access_time
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:

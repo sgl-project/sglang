@@ -1047,7 +1047,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
-        node.last_access_wall = time.monotonic()
+        if self.kv_age_observer is not None:
+            node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:

@@ -215,6 +215,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # KV age metrics: the tree core reports per-node hit / eviction ages.
         if self.metrics_collector is not None:
             self.tree_core.kv_age_observer = self._observe_kv_age_event
+            if not isinstance(self.tree_core, UnifiedTreeCore):
+                logger.warning(
+                    "KV age metrics (sglang:kv_age_seconds and friends) are only emitted "
+                    "by the Python tree core; %s does not call the observer, so those "
+                    "series will stay empty.",
+                    type(self.tree_core).__name__,
+                )
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1

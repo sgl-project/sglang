@@ -1153,6 +1153,9 @@ class Req(ReqDllmMixin):
         # KV age metrics: set once the first match_prefix for this request has
         # recorded its hit ages, so per-round re-matches and the post-insert
         # re-anchor in cache_unfinished_req do not count as reuse.
+        # Consumed by the request's first non-empty prefix match (KV age metrics).
+        # Deliberately not reset on retraction: a retracted request re-matches KV
+        # it inserted moments earlier, which would flood the sub-second hit bucket.
         self.kv_age_hit_observed = False
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
