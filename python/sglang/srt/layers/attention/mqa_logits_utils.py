@@ -8,7 +8,7 @@ helpers bound that matrix and slice it by query rows.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -69,14 +69,22 @@ def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
 
 
 def mqa_logits_should_chunk(
-    *, num_rows: int, num_cols: int, budget_bytes: int, rocm: bool
+    *,
+    num_rows: int,
+    num_cols: int,
+    get_budget_bytes: Callable[[], int],
+    rocm: bool,
 ) -> Tuple[bool, int]:
-    """Whether a [num_rows, num_cols] fp32 logits matrix exceeds the budget.
+    """Whether a [num_rows, num_cols] fp32 logits matrix must be row-chunked.
 
-    Returns (need_chunk, effective_budget_bytes); on ROCm the budget is also
-    capped by aiter's logits ceiling. Callers gate the (possibly synchronizing)
-    budget query with mqa_logits_needs_budget_check first.
+    Returns (need_chunk, effective_budget_bytes). Matrices below
+    MQA_LOGITS_STATIC_SKIP_ELEMS never chunk and the budget is not queried
+    (it may synchronize the host), hence the callable. On ROCm the budget is
+    also capped by aiter's logits ceiling.
     """
+    if not mqa_logits_needs_budget_check(num_rows=num_rows, num_cols=num_cols):
+        return False, 0
+    budget_bytes = get_budget_bytes()
     if rocm:
         budget_bytes = min(budget_bytes, MQA_LOGITS_MAX_BYTES_ROCM)
     logits_bytes = num_rows * num_cols * MQA_LOGITS_BYTES_PER_ELEM

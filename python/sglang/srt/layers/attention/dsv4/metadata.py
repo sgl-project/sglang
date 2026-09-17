@@ -88,7 +88,7 @@ def plan_indexer_row_chunks(
         need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
             num_cols=num_cols,
-            budget_bytes=budget_bytes,
+            get_budget_bytes=lambda: budget_bytes,
             rocm=is_hip(),
         )
         by_budget = (

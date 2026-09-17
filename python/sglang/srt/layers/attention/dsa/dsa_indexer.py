@@ -39,7 +39,6 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
-    mqa_logits_needs_budget_check,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
@@ -1014,19 +1013,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes
 
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device_index: int
-    ) -> Tuple[bool, int]:
-        """(need_chunk, logits_budget_bytes) for a [num_q, num_k] fp32 logits matrix."""
-        if not mqa_logits_needs_budget_check(num_rows=num_q, num_cols=num_k):
-            return False, 0
-        return mqa_logits_should_chunk(
-            num_rows=num_q,
-            num_cols=num_k,
-            budget_bytes=self._get_mqa_logits_budget_bytes(device_index),
-            rocm=_is_hip,
-        )
-
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1116,8 +1102,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
-            q_offset, k_offset, device_index
+        need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
+            num_rows=q_offset,
+            num_cols=k_offset,
+            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
+            rocm=_is_hip,
         )
 
         if not need_chunk:

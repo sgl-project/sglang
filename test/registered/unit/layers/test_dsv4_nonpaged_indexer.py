@@ -657,16 +657,30 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
         # 16384 x 32768 x 4 B is exactly 2 GiB, aiter's compile-time ceiling.
         self.assertEqual(
             mqa_logits_should_chunk(
-                num_rows=16384, num_cols=32768, budget_bytes=huge, rocm=True
+                num_rows=16384, num_cols=32768, get_budget_bytes=lambda: huge, rocm=True
             ),
             (True, MQA_LOGITS_MAX_BYTES_ROCM),
         )
         self.assertEqual(
             mqa_logits_should_chunk(
-                num_rows=16384, num_cols=32768, budget_bytes=huge, rocm=False
+                num_rows=16384,
+                num_cols=32768,
+                get_budget_bytes=lambda: huge,
+                rocm=False,
             ),
             (False, huge),
         )
+
+    def test_should_chunk_skips_small_matrices_without_querying_the_budget(self):
+        get_budget = MagicMock(return_value=1)
+        # 64 decode rows x 100K columns is far below the 8M-element threshold.
+        self.assertEqual(
+            mqa_logits_should_chunk(
+                num_rows=64, num_cols=100_000, get_budget_bytes=get_budget, rocm=False
+            ),
+            (False, 0),
+        )
+        get_budget.assert_not_called()
 
     def test_plan_combines_sm120_cap_with_budget(self):
         budget = 512 << 20
