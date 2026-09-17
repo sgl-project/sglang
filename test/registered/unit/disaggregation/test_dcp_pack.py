@@ -36,10 +36,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
     def test_one_virtual_page_explicit_rows(self):
         # P=2, N=4. Prefill pages 5,2,11,4; decode virtual page 7.
         # pos 0..7 src rows: 10,11, 4,5, 22,23, 8,9
-        # draft dest page is P*N=8 → 56..63
-        # each rank stores local rows 14,15 (page P=2)
-        expected_draft_src = [10, 11, 4, 5, 22, 23, 8, 9]
-        expected_draft_dst = list(range(56, 64))
+        # draft follows the target's DCP sharding (owner mask + loc // dcp):
+        # each rank stores only its own shard at division rows 14,15 (page P=2)
         expected_target_src = {
             0: [10, 22],
             1: [11, 23],
@@ -56,20 +54,17 @@ class TestDcpTokenTransferPlan(CustomTestCase):
                 dcp_rank=rank,
                 num_kv_tokens=8,
             )
-            np.testing.assert_array_equal(
-                plan.draft_src_token_indices, expected_draft_src
-            )
-            np.testing.assert_array_equal(
-                plan.draft_dst_token_indices, expected_draft_dst
-            )
+            np.testing.assert_array_equal(plan.draft_src_token_indices, src)
+            np.testing.assert_array_equal(plan.draft_dst_token_indices, [14, 15])
             np.testing.assert_array_equal(plan.target_src_token_indices, src)
             np.testing.assert_array_equal(plan.target_dst_token_indices, [14, 15])
             seen_src.extend(plan.target_src_token_indices.tolist())
-        self.assertEqual(sorted(seen_src), sorted(expected_draft_src))
+        self.assertEqual(sorted(seen_src), sorted([10, 11, 4, 5, 22, 23, 8, 9]))
 
     def test_second_chunk_crosses_dest_pages(self):
         # Prefix already filled one virtual page (P*N=4). This chunk's 4 tokens
-        # start at dest pos 4 and spill from virtual page 4 onto page 6.
+        # start at dest pos 4 and spill onto the next division-row pages.
+        # draft follows the target's DCP sharding, so both plans coincide.
         plan = _plan(
             src=[9, 3],
             dst=[4, 6],
@@ -80,8 +75,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
-        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 19, 6, 7])
-        np.testing.assert_array_equal(plan.draft_dst_token_indices, [16, 17, 26, 27])
+        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 6])
+        np.testing.assert_array_equal(plan.draft_dst_token_indices, [12, 13])
         np.testing.assert_array_equal(plan.target_src_token_indices, [18, 6])
         np.testing.assert_array_equal(plan.target_dst_token_indices, [12, 13])
 
@@ -95,7 +90,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
-        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [18, 19, 6, 7])
+        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [19, 7])
+        np.testing.assert_array_equal(plan_r1.draft_dst_token_indices, [12, 13])
         np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
         np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [12, 13])
 
@@ -119,7 +115,7 @@ class TestDcpTokenTransferPlan(CustomTestCase):
 
 
 class TestPackedDcpGrouping(CustomTestCase):
-    def test_target_needs_pack_draft_does_not(self):
+    def test_draft_packs_like_target(self):
         plan = _plan(
             src=[0, 1, 2, 3],
             dst=[0],
@@ -144,8 +140,8 @@ class TestPackedDcpGrouping(CustomTestCase):
         draft_src, draft_dst = group_concurrent_contiguous(
             plan.draft_src_token_indices, plan.draft_dst_token_indices
         )
-        self.assertEqual(draft_src, [[0, 1, 2, 3, 4, 5, 6, 7]])
-        self.assertEqual(draft_dst, [[0, 1, 2, 3, 4, 5, 6, 7]])
+        self.assertEqual(draft_src, [[0], [4]])
+        self.assertEqual(draft_dst, [[0], [1]])
 
 
 def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
