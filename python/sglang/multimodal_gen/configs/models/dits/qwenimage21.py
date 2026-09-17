@@ -18,6 +18,9 @@ class QwenImage21ArchConfig(DiTArchConfig):
     eps: float = 1e-6
     causal_condition: bool = True
     causal_block: bool = True
+    lora_param_names_mapping: dict = field(
+        default_factory=lambda: {r"^transformer\.": ""}
+    )
 
     def __post_init__(self):
         super().__post_init__()

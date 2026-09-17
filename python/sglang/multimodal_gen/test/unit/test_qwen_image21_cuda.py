@@ -6,6 +6,7 @@ from copy import deepcopy
 import pytest
 import torch
 from diffusers.models.normalization import RMSNorm as ReferenceRMSNorm
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
@@ -26,7 +27,15 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Transformer2DModel,
     build_layout,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
+from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -91,6 +100,44 @@ def test_bf16_qk_norm_matches_reference(model):
         norm.weight.copy_(weight)
         reference.weight.copy_(weight)
         torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("merge_mode", ["dynamic", "merge"])
+@torch.no_grad()
+def test_diffusers_lora_matches_weight_delta_and_restores_base(
+    model, tmp_path, monkeypatch, merge_mode
+):
+    # Reuse loaded native components, then exercise the real adapter loader.
+    monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
+    pipeline = object.__new__(QwenImage21Pipeline)
+    pipeline.server_args = get_global_server_args()
+    actual_model = deepcopy(model)
+    reference = deepcopy(model)
+    pipeline.modules = {"transformer": actual_model}
+    pipeline.__init__()
+    weights = {}
+    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
+        layer = reference.get_submodule(name)
+        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
+        weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
+        layer.weight.add_(b @ a)
+    adapter = tmp_path / "adapter.safetensors"
+    save_file(weights, str(adapter))
+    kwargs = dict(inputs(5, False), prefix_caches=None)
+    with set_forward_context(None, None):
+        baseline = actual_model(**kwargs)
+        expected = reference(**kwargs)
+        pipeline.set_lora(
+            "test", str(adapter), target="transformer", merge_mode=merge_mode
+        )
+        assert pipeline.is_lora_effective("transformer")
+        actual = actual_model(**kwargs)
+        assert not torch.equal(actual, baseline)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        pipeline.unmerge_lora_weights("transformer")
+        torch.testing.assert_close(actual_model(**kwargs), baseline, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("edit", [False, True])
