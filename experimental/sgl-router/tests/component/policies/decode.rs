@@ -12,8 +12,8 @@ use sgl_router::policies::decode::{
     resolve_decode_with_capacity_fallback, DecodePolicy, DecodePowerOfTwoPolicy,
     DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };
-use sgl_router::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use sgl_router::policies::SelectionProposal;
+use sgl_router::workers::engine_load_reports::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use sgl_router::workers::Worker;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

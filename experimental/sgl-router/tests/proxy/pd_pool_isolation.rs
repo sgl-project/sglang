@@ -143,7 +143,7 @@ async fn no_workers_returns_no_healthy_workers() {
 /// match KV transfers via `bootstrap_room`. Pool *isolation* — the
 /// guarantee that the policy's prefill candidate set excludes decode
 /// workers — is exercised at the resolver layer
-/// (`policies::registry::tests::pd_resolution_returns_distinct_pools`).
+/// (`workers::pools::tests::pd_resolution_returns_distinct_pools`).
 /// Here we only assert the HTTP-layer wiring of the dual dispatch.
 #[tokio::test]
 async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {

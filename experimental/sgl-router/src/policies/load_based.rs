@@ -48,9 +48,9 @@ impl ScoringPolicy for LoadBasedPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::scoring::argmax::TIE_EPSILON;
     use crate::policies::Policy;
+    use crate::workers::engine_load_reports::{EngineLoadSnapshot, EngineWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
 

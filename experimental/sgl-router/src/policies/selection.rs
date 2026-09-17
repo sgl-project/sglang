@@ -35,11 +35,11 @@ use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
+use crate::workers::engine_load_reports::EngineLoadSnapshot;
 use crate::workers::Worker;
 
 /// Everything one prefill selection reads. Collaborators first, then the
@@ -696,12 +696,12 @@ mod tests {
     use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
     };
+    use crate::workers::engine_load_reports::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::workers::Worker;
     use std::sync::Arc;
     use std::time::Instant;

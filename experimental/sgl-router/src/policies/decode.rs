@@ -8,9 +8,9 @@ use crate::policies::admission::{
     compare_decode_pressure, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
     RoutingStage,
 };
-use crate::policies::engine_load::EngineLoadSnapshot;
-use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
+use crate::workers::engine_load_reports::EngineLoadSnapshot;
+use crate::workers::pools::select_decode_with_affinity;
 use rand::Rng;
 use std::sync::Arc;
 

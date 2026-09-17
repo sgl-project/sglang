@@ -16,12 +16,12 @@ use sgl_router::config::{
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::workers::engine_load_reports::{LoadStat, NativeCacheRankLoad};
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -235,7 +235,7 @@ fn set_native_load_with_waiting(
     max_total_num_tokens: u64,
     num_waiting_uncached_tokens: u64,
 ) {
-    ctx.engine_load.set(
+    ctx.engine_load_reports.set(
         worker_url,
         0,
         LoadStat {

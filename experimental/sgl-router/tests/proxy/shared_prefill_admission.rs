@@ -11,7 +11,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
@@ -20,6 +19,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::workers::engine_load_reports::{LoadStat, NativeCacheRankLoad};
 use sgl_router::workers::{Worker, WorkerRegistry};
 use tower::ServiceExt;
 
@@ -306,7 +306,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
             total_prefill_busy_us,
         }),
     };
-    fixture.ctx.engine_load.set(
+    fixture.ctx.engine_load_reports.set(
         &fixture.workers[0].url,
         0,
         native_load(1, 1),
@@ -314,7 +314,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
     );
     fixture
         .ctx
-        .engine_load
+        .engine_load_reports
         .set(&fixture.workers[0].url, 0, native_load(2, 2), now);
 
     assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
@@ -350,7 +350,7 @@ async fn capacity_exhaustion_does_not_return_503() {
     })
     .await;
     for worker in &fixture.workers {
-        fixture.ctx.engine_load.set(
+        fixture.ctx.engine_load_reports.set(
             &worker.url,
             0,
             LoadStat {
@@ -433,7 +433,7 @@ async fn chat_records_cache_candidates_exhausted() {
         })
     })
     .await;
-    fixture.ctx.engine_load.set(
+    fixture.ctx.engine_load_reports.set(
         &fixture.workers[0].url,
         0,
         LoadStat {

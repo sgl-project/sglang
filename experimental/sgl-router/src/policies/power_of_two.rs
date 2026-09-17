@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::policies::admission::compare_prefill_pressure;
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::workers::engine_load_reports::EngineLoadSnapshot;
 use crate::workers::Worker;
 use rand::Rng;
 use std::sync::Arc;
