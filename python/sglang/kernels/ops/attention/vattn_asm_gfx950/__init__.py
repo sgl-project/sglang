@@ -5,7 +5,8 @@ KV cache, GQA ratios 16 and 8.
 vattn3_core.s (split-KV main kernel, one code object per GQA ratio) and vred.s
 (segment reduce) ship as source and are assembled at first use with ROCm clang
 into a per-process temp dir; launches go through ctypes hipModuleLaunchKernel
-on the current torch stream. Kernarg ABI is guarded three ways:
+on the current torch stream, bound to the HIP runtime torch itself is running
+on (see _torch_hip_runtime). Kernarg ABI is guarded three ways:
   1. single ctypes.Structure(_pack_=1) definition, fields filled by name;
   2. sizeof() asserted against the expected constant at import;
   3. sizeof() cross-checked against the .amdhsa_kernarg_size the kernel itself
@@ -96,18 +97,29 @@ def _declared_kernarg_size(source_file):
     return int(m.group(1))
 
 
+def _torch_hip_runtime():
+    """Path of the libamdhip64 torch itself is running on, or None.
+
+    ROCm 10 splits the SDK into a runtime wheel (_rocm_sdk_core, which torch
+    maps under its versioned SONAME libamdhip64.so.7) and a toolchain wheel
+    (_rocm_sdk_devel, which owns the unversioned libamdhip64.so on
+    LD_LIBRARY_PATH). dlopen matches an already-mapped object by SONAME, so
+    CDLL("libamdhip64.so") misses torch's copy and maps devel's as a *second*
+    HIP runtime with its own contexts and queues. Launches then carry a torch
+    stream handle into a runtime that never created it: they stop being ordered
+    against everything torch does and fail outright under graph capture.
+    """
+    torch.cuda.current_device()  # map torch's copy before looking for it
+    return find_loaded_library("libamdhip64", require_unique=True)
+
+
 def _hip_lib():
     global _hip
     if _hip is None:
-        # ROCm 10 ships the HIP runtime (_rocm_sdk_core) and the toolchain
-        # (_rocm_sdk_devel) as separate wheels. Torch maps core's
-        # libamdhip64.so.7, which an unversioned CDLL("libamdhip64.so") does not
-        # match, so the loader takes devel's copy off LD_LIBRARY_PATH as a
-        # second HIP runtime and every launch on a torch stream then fails with
-        # hipErrorContextIsDestroyed (709). Initialize CUDA first so torch's
-        # copy is mapped, then bind to that one.
-        torch.cuda.current_device()
-        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
+        path = _torch_hip_runtime()
+        if path is None:
+            _disable("torch does not have exactly one libamdhip64 mapped")
+        _hip = ctypes.CDLL(path)
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
@@ -191,14 +203,19 @@ def _clang():
 
 
 def asm_kernel_available() -> bool:
-    """True on a gfx950 device with ROCm clang present, until a build or load
-    failure disables the kernel for the rest of the process."""
+    """True on gfx950 with ROCm clang and an unambiguous torch HIP runtime,
+    until a build or load failure disables the kernel for the process."""
     global _available
     if _available is None:
         arch = ""
         if torch.version.hip and torch.cuda.is_available():
             arch = torch.cuda.get_device_properties(0).gcnArchName
         _available = arch.startswith("gfx950") and os.path.exists(_clang())
+    if _available and _disabled_reason is None and _hip is None:
+        try:
+            _hip_lib()
+        except AsmKernelUnavailable:
+            return False
     return _available and _disabled_reason is None
 
 

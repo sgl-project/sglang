@@ -5,11 +5,14 @@ Guards, on a gfx950 device:
     kernel ships (16 and 8), skewed and tiny lengths, bs 1 / 2 / 24 / 64 and ragged query lengths;
   * the plan itself (segment length T, work list, per-token segment count) matches a Python reference;
   * the per-forward plan cache: one plan launch per forward, reset / in-place update / other tensor
-    each trigger a rebuild, cached output bit-identical to uncached.
+    each trigger a rebuild, cached output bit-identical to uncached;
+  * the launcher drives the same HIP runtime torch does, without which nothing above is ordered.
 """
 
 import math
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -106,6 +109,21 @@ for _hq, _hkv in ((16, 1), (16, 2)):  # GQA ratios 16 and 8, the two the kernel 
     ]
 
 
+class TestHipRuntimeBinding(CustomTestCase):
+    def test_unidentified_runtime_disables_asm_before_routing(self):
+        import sglang.kernels.ops.attention.vattn_asm_gfx950 as V
+
+        with (
+            patch.object(V, "_torch_hip_runtime", return_value=None),
+            patch.object(V, "_available", True),
+            patch.object(V, "_disabled_reason", None),
+            patch.object(V, "_hip", None),
+        ):
+            self.assertFalse(V.asm_kernel_available())
+            self.assertIsNone(V._hip)
+            self.assertIn("exactly one libamdhip64", V._disabled_reason)
+
+
 @unittest.skipUnless(_asm_available(), "needs a gfx950 device with ROCm clang")
 class TestVattnSegPlan(CustomTestCase):
     @classmethod
@@ -114,6 +132,25 @@ class TestVattnSegPlan(CustomTestCase):
 
         cls.V = V
         torch.set_default_device("cuda")
+
+    def test_binds_the_hip_runtime_torch_uses(self):
+        # ROCm 10 ships the HIP runtime (_rocm_sdk_core, which torch maps as
+        # libamdhip64.so.7) and the toolchain (_rocm_sdk_devel, which owns the
+        # unversioned libamdhip64.so) as separate wheels, so loading by SONAME
+        # maps a second runtime whose queues are not torch's. Launches then race
+        # the plan kernel, the scratch buffers and the output read instead of
+        # being ordered against them. Sorts first so a mis-binding says so
+        # rather than reaching the output tests as an unexplained mismatch.
+        lib = self.V._hip_lib()
+        mapped = {
+            os.path.realpath(line[line.index("/") :].strip())
+            for line in open("/proc/self/maps")
+            if "libamdhip64" in line and "/" in line
+        }
+        self.assertEqual(
+            len(mapped), 1, f"the launcher cannot pick between {sorted(mapped)}"
+        )
+        self.assertEqual(os.path.realpath(lib._name), mapped.pop())
 
     def _check_plan(self, lens, qlens, hkv, seq_lens, cu_q):
         V = self.V
