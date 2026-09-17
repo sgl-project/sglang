@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -192,6 +194,69 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
         self.assertIsNone(args.linear_attn_decode_backend)
         self.assertEqual(args.linear_attn_backend, "helion")
+
+    def test_pp_spec_kda_flashinfer_verify_falls_back_to_triton(self):
+        hf_config = SimpleNamespace(
+            architectures=["KimiK3LinearForCausalLM"],
+            linear_attn_config={"kda_layers": [0]},
+        )
+        for explicit_verify in (None, "flashinfer"):
+            with self.subTest(explicit_verify=explicit_verify):
+                args = ServerArgs(
+                    model_path="dummy",
+                    linear_attn_decode_backend="flashinfer",
+                    linear_attn_verify_backend=explicit_verify,
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook.model_config_of",
+                        return_value=SimpleNamespace(hf_config=hf_config),
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook."
+                        "envs.SGLANG_ENABLE_PP_SPEC.get",
+                        return_value=True,
+                    ),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                ):
+                    handle_linear_attn_backend(args)
+
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), "triton"
+                )
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_decode_backend"),
+                    "flashinfer",
+                )
+
+    def test_pp_spec_gdn_keeps_flashinfer_verify(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_decode_backend="flashinfer",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=["Qwen3NextForCausalLM"],
+                        linear_attn_config={"linear_attention_layers": [0]},
+                    )
+                ),
+            ),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.envs.SGLANG_ENABLE_PP_SPEC.get",
+                return_value=True,
+            ),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            handle_linear_attn_backend(args)
+
+        # No KDA-only declaration was made. The field remains unset so runtime
+        # backend resolution keeps its normal "follow FlashInfer decode" rule.
+        self.assertIsNone(resolution_result(args, "linear_attn_verify_backend"))
 
 
 class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
