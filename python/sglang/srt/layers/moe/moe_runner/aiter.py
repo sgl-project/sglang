@@ -244,8 +244,6 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not is_gfx95_supported():
-            return
         from sglang.kernels.ops.moe.moe_sorting_small import (
             apply_aiter_small_moe_sort_patch,
         )
