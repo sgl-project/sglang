@@ -19,11 +19,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
-from sglang.srt.cuda_vmm_utils import _gpu_fabric_clique
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -445,9 +445,9 @@ def can_use_custom_all_reduce_with_nvlink(
     supported_world_size: List[int],
     cls_name: str,
 ) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
-    assert (
-        dist.get_backend(group) != dist.Backend.NCCL
-    ), f"{cls_name} should be attached to a non-NCCL group."
+    assert dist.get_backend(group) != dist.Backend.NCCL, (
+        f"{cls_name} should be attached to a non-NCCL group."
+    )
 
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -459,7 +459,7 @@ def can_use_custom_all_reduce_with_nvlink(
     # No need to initialize custom allreduce for multi-node case.
     if not all(in_the_same_node_as(group, source_rank=0)):
         logger.warning(
-            f"{cls_name} is disabled because this process group" " spans across nodes."
+            f"{cls_name} is disabled because this process group spans across nodes."
         )
         return
 

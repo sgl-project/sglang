@@ -3,13 +3,20 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
@@ -71,11 +78,12 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             self.assertTrue(torch.equal(key[indices], expected_key))
             self.assertTrue(torch.equal(value[indices], expected_value))
 
-    def test_restores_target_and_draft_kv(self):
+    def _build_cache(self, hicache_ratio: float):
+        """Bring up a UnifiedRadixCache with a draft sidecar over fresh pools."""
         server_args = ServerArgs(
             model_path="dummy",
             page_size=1,
-            hicache_ratio=1.0,
+            hicache_ratio=hicache_ratio,
             hicache_io_backend="kernel",
             hicache_mem_layout="page_first",
         )
@@ -114,21 +122,64 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 mode=HiCacheDraftMode.SIDECAR,
                 device_pools=(draft_pool,),
             ),
-            server_args=server_args,
-            page_size=1,
         )
         self.assertIn(PoolName.DRAFT, cache.host_pool_group.entry_map)
         cache.validate_retraction_host_capacity()
+        return SimpleNamespace(
+            server_args=server_args,
+            req_to_token_pool=req_to_token_pool,
+            allocator=allocator,
+            target_pool=target_pool,
+            draft_pool=draft_pool,
+            cache=cache,
+        )
 
-        req = SimpleNamespace(
-            rid="request", req_pool_idx=None, seqlen=self.num_tokens + 1
-        )
-        self.assertIsNotNone(req_to_token_pool.alloc([req]))
-        source_indices = allocator.alloc(self.num_tokens)
+    def _admit_req(self, env, num_tokens: int):
+        req = SimpleNamespace(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
+        self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
+        source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)
-        req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, self.num_tokens)), source_indices
+        env.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, num_tokens)), source_indices
         )
+        return req, source_indices
+
+    def test_backup_declined_when_host_pool_too_small(self):
+        # A backup-only host pool is deliberately smaller than the device pool,
+        # so a large enough request cannot be preserved.
+        env = self._build_cache(hicache_ratio=0.1)
+        self.assertLess(env.cache.host_pool_group.available_size(), self.num_tokens)
+
+        req, source_indices = self._admit_req(env, self.num_tokens)
+        host_free_before = env.cache.host_pool_group.available_size()
+
+        self.assertIsNone(env.cache.retraction_backup(req))
+        # The declined backup must not leak host slots.
+        self.assertEqual(env.cache.host_pool_group.available_size(), host_free_before)
+
+        # This is the signal release_req propagates so retract_decode aborts.
+        self.assertFalse(
+            retraction_backup(
+                req,
+                env.cache,
+                env.req_to_token_pool,
+                env.allocator,
+                "host_pool",
+            )
+        )
+
+        env.allocator.free(source_indices)
+        env.req_to_token_pool.free(req)
+
+    def test_restores_target_and_draft_kv(self):
+        env = self._build_cache(hicache_ratio=1.0)
+        req_to_token_pool = env.req_to_token_pool
+        allocator = env.allocator
+        target_pool = env.target_pool
+        draft_pool = env.draft_pool
+        cache = env.cache
+
+        req, source_indices = self._admit_req(env, self.num_tokens)
 
         self._seed_pool(target_pool, source_indices, base=1000)
         self._seed_pool(draft_pool, source_indices, base=3000)
@@ -155,7 +206,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         self.assertIsNotNone(destination_indices)
         self.assertFalse(torch.equal(source_indices, destination_indices))
         req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, self.num_tokens)), destination_indices
+            (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
 
         cache.retraction_restore(req, backup)
@@ -167,6 +218,68 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         allocator.free(blocker_indices)
         allocator.free(destination_indices)
         req_to_token_pool.free(req)
+
+
+DCP_SIZE = 4
+DCP_RANK = 1
+DCP_ROWS = 8
+
+
+def _bare_mla_pool() -> MLATokenToKVPool:
+    pool = object.__new__(MLATokenToKVPool)
+    pool.layer_num = 2
+    pool.cpu_offloading_chunk_size = 3
+    pool.kv_buffer = [
+        (torch.arange(DCP_ROWS, dtype=torch.float32) + 100 * layer).view(DCP_ROWS, 1, 1)
+        for layer in range(pool.layer_num)
+    ]
+    return pool
+
+
+def _dcp():
+    return get_parallel().override(
+        dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
+    )
+
+
+class TestDcpRetractionBackup(unittest.TestCase):
+    """`req_to_token` names KV slots in the widened DCP id space while
+    `kv_buffer` holds only this rank's rows; a widened id used as a row index
+    reads past the buffer or copies another token's row."""
+
+    def test_restore_lands_on_new_owned_rows(self):
+        pool = _bare_mla_pool()
+        before = [buf.clone() for buf in pool.kv_buffer]
+        old_widened = torch.arange(0, 12, dtype=torch.int64)
+        new_widened = torch.arange(12, 24, dtype=torch.int64)
+
+        with _dcp():
+            pool.load_cpu_copy(pool.get_cpu_copy(old_widened), new_widened)
+
+        old_rows = old_widened[DCP_RANK::DCP_SIZE] // DCP_SIZE
+        new_rows = new_widened[DCP_RANK::DCP_SIZE] // DCP_SIZE
+        self.assertEqual(new_rows.tolist(), [3, 4, 5])
+        untouched = torch.tensor(
+            [r for r in range(DCP_ROWS) if r not in new_rows.tolist()]
+        )
+        for layer in range(pool.layer_num):
+            torch.testing.assert_close(
+                pool.kv_buffer[layer][new_rows], before[layer][old_rows]
+            )
+            torch.testing.assert_close(
+                pool.kv_buffer[layer][untouched], before[layer][untouched]
+            )
+
+    def test_resolved_pool_takes_ids_as_rows(self):
+        pool = _bare_mla_pool()
+        pool.write_loc_is_dcp_resolved = True
+        rows = torch.arange(DCP_ROWS, dtype=torch.int64)
+
+        with _dcp():
+            kv_cpu = pool.get_cpu_copy(rows)
+
+        for layer in range(pool.layer_num):
+            torch.testing.assert_close(torch.cat(kv_cpu[layer]), pool.kv_buffer[layer])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ dependencies = [
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
+  "memfabric-hybrid==1.1.4",
+  "memfabric-zbal==1.1.2",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -56,7 +58,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "smg-grpc-servicer>=0.5.0",
+  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -104,6 +106,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
   "tabulate",
 ]
 
@@ -150,6 +153,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"

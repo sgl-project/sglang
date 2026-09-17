@@ -34,6 +34,8 @@ def _build_cosmos3_param_names_mapping(gated_mlp: bool = True) -> dict:
     unchanged.
     """
     mapping = {
+        # PEFT saves adapter keys as <module>.lora_{A,B}.default.weight.
+        r"^(.*\.lora_[AB])\.default$": r"\1",
         # Inherited from text pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",

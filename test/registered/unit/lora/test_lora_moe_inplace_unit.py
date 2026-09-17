@@ -24,7 +24,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import types
 import unittest
@@ -65,6 +65,7 @@ def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
         moe_tp_size=1,
         moe_tp_rank=0,
         intermediate_size_per_partition=32,
+        runner=None,
     )
 
 

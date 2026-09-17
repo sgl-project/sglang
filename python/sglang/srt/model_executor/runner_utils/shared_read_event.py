@@ -1,4 +1,4 @@
-"""Shared-read-done event utilities for CUDA graph runners."""
+"""Shared-read-done event utilities for graph and eager runners."""
 
 import logging
 from typing import Optional
@@ -31,14 +31,18 @@ def maybe_publish_prefill_shared_read_done(
         return
     if forward_batch.forward_mode != ForwardMode.EXTEND:
         return
-    # TODO(Jialin): Relax this gate for speculative decoding after its prefill
-    # WAR boundaries are validated.
-    if not model_runner.spec_algorithm.is_none():
-        return
     # The record lands right after replay prep, so PRE_REPLAY only.
     declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
     if declared is not SharedReadEnds.PRE_REPLAY:
         return
+    if (
+        not model_runner.spec_algorithm.is_none()
+        and not model_runner.spec_algorithm.is_dflash_family()
+    ):
+        # Stage the draft's shared reads before publishing the read-done event.
+        stage = getattr(model_runner, "prefill_shared_read_stager", None)
+        if stage is None or not stage(forward_batch):
+            return
     logger.info_once(
         "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,

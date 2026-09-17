@@ -142,9 +142,10 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     // radix math below is fp32 either way — only the load width differs.
     AlignedVector<packed_t<TScore>, kVecSize / 2> scores_vec;
 
-    // prefetch bias (frozen weight) before the PDL wait
-    bias_vec.load(params.bias, tx);
+    // Bias may be produced by a preceding cast or fill kernel (the caller
+    // does not guarantee a frozen weight), so wait before loading either input.
     PDLWaitPrimary<kUsePDL>();
+    bias_vec.load(params.bias, tx);
     scores_vec.load(scores, tx);
 
 #pragma unroll

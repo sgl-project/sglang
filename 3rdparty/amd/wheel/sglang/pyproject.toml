@@ -63,22 +63,10 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
-  "smg-grpc-servicer>=0.5.0",
+  "smg-grpc-servicer>=0.9.0",
 ]
 
 # ROCm specific packages (https://repo.radeon.com/rocm/manylinux/)
-# Existing practice for daily rocm700 docker images relies on 700-rc
-# versions of software that are not public available. Here we pin some
-# from rocm702 as the closest set as daily rocm700 images.
-rocm700 = [
-  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl",
-  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl",
-  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
-  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
-  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.0/sglang_kernel-0.4.0+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
-]
-
 rocm720 = [
   "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl",
   "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl",
@@ -89,8 +77,7 @@ rocm720 = [
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
-# Install with one of:
-#   pip install "amd-sglang[srt_hip,rocm700]"
+# Install with:
 #   pip install "amd-sglang[srt_hip,rocm720]"
 srt_hip = [
   "amd-sglang[runtime_common]",
@@ -213,6 +200,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
