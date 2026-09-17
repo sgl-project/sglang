@@ -148,6 +148,11 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    quant_method = getattr(module, "quant_method", None)
+    prepare_weights = getattr(quant_method, "prepare_weights_for_post_load", None)
+    if prepare_weights is not None:
+        prepare_weights(module)
+
     if target_device.type == "cpu":
         yield module
         return
