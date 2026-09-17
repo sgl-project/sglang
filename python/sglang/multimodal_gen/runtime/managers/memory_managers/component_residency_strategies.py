@@ -10,7 +10,9 @@ from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    GIB_BYTES,
     HostPinBudget,
+    module_weight_bytes,
     shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -28,6 +30,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 # the allocator's reserve (9.4 GiB measured for H3 at 1344x768x124f) plus margin.
 SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES = 12 * 1024**3
 
+# Device memory kept free for a stage's activations, whose working set is only
+# known once the stage runs. A fraction rather than a size so it scales with the
+# device; 0.05 is arbitrary, ~3x the smallest value measured to be enough.
+XPU_HEADROOM_FRACTION = 0.05
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -35,6 +42,22 @@ if TYPE_CHECKING:
         ComponentUse,
         ResidencyState,
     )
+
+
+def xpu_headroom_bytes() -> int:
+    """Device memory a stage needs free beyond the weights it keeps resident."""
+    return int(XPU_HEADROOM_FRACTION * current_platform.get_device_total_memory())
+
+
+def release_xpu_idle_reserve() -> None:
+    """Return the allocator's idle reserve to the driver at a request boundary."""
+    if not torch.xpu.is_available():
+        return
+    idle_reserve = torch.xpu.memory_reserved() - torch.xpu.memory_allocated()
+    # A stage's headroom has to be free at the driver, not inside the allocator;
+    # below that much idle reserve the release does not pay for its sync.
+    if idle_reserve >= xpu_headroom_bytes():
+        torch.xpu.empty_cache()
 
 
 def _module_to_local_device(
@@ -217,6 +240,50 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             self.wait_for_use(module, use, state)
             return
         self.finish_use(module, use, state)
+
+
+class XpuComponentOffloadStrategy(ComponentOffloadStrategy):
+    """Component offload that parks a component only while a stage's headroom fits."""
+
+    def finish_request(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+        *,
+        preferred: bool,
+    ) -> None:
+        if (
+            preferred
+            and state.batch_is_warmup
+            and not self._park_keeps_headroom(module)
+        ):
+            self.finish_use(module, use, state)
+            return
+        super().finish_request(module, use, state, preferred=preferred)
+
+    def _park_keeps_headroom(self, module: nn.Module) -> bool:
+        # Parked weights hold whole allocator segments, so a later release cannot
+        # recover the room; it has to be free at the moment of the park.
+        if not torch.xpu.is_available():
+            return True
+        # Driver-free, not free plus idle reserve: parking with too little room
+        # leaves the next stage nothing, parking less often costs one onload.
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(empty_cache=False) * GIB_BYTES
+        )
+        parked = module_weight_bytes(module)
+        headroom = xpu_headroom_bytes()
+        if parked + headroom <= free_bytes:
+            return True
+        logger.info(
+            "Releasing %.2f GiB component after warmup: %.2f GiB free leaves less "
+            "than the %.2f GiB a stage needs.",
+            parked / GIB_BYTES,
+            free_bytes / GIB_BYTES,
+            headroom / GIB_BYTES,
+        )
+        return False
 
 
 class SnapshotOffloadStrategy(ComponentOffloadStrategy):

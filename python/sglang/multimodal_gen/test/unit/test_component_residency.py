@@ -6,6 +6,9 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_residency_strategies,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
@@ -17,9 +20,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    XPU_HEADROOM_FRACTION,
     ComponentOffloadStrategy,
     ResidentStrategy,
     SnapshotOffloadStrategy,
+    XpuComponentOffloadStrategy,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    GIB_BYTES,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
@@ -877,3 +885,170 @@ def test_component_is_not_kept_across_another_component_use():
     manager.end_use(text_use)
 
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
+
+
+# Every case is stated as a fraction of the device, so it holds at any device size.
+# The two sizes bracket: replacing the fraction with an absolute byte count fails
+# on the small device if the count is too big, on the large one if it is too small.
+xpu_device_total_bytes = pytest.mark.parametrize(
+    "total_bytes", [4 * GIB_BYTES, 128 * GIB_BYTES]
+)
+
+
+def _xpu_headroom_bytes(total_bytes):
+    return int(XPU_HEADROOM_FRACTION * total_bytes)
+
+
+def _xpu_manager(monkeypatch, *, total_bytes, idle_bytes):
+    """A manager on XPU whose allocator holds `idle_bytes` of idle reserve."""
+    empty_cache = Mock()
+    allocated = total_bytes // 4
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+    monkeypatch.setattr(torch.xpu, "memory_reserved", lambda: allocated + idle_bytes)
+    monkeypatch.setattr(torch.xpu, "memory_allocated", lambda: allocated)
+    monkeypatch.setattr(torch.xpu, "empty_cache", empty_cache)
+    monkeypatch.setattr(current_platform, "device_shares_host_memory", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "get_device_total_memory", lambda *a, **k: total_bytes
+    )
+
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(
+        pipeline,
+        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+    )
+    return manager, empty_cache
+
+
+@xpu_device_total_bytes
+def test_finish_request_releases_idle_reserve_on_xpu(monkeypatch, total_bytes):
+    """The reserve left at a request boundary is handed back before the next onload.
+
+    The next request's stages need that room free at the driver rather than held
+    inside the allocator, so the reserve is released while it is still idle.
+    """
+    manager, empty_cache = _xpu_manager(
+        monkeypatch,
+        total_bytes=total_bytes,
+        idle_bytes=2 * _xpu_headroom_bytes(total_bytes),
+    )
+
+    manager.finish_request()
+
+    empty_cache.assert_called_once_with()
+
+
+@xpu_device_total_bytes
+def test_finish_request_keeps_reserve_when_little_is_idle(monkeypatch, total_bytes):
+    manager, empty_cache = _xpu_manager(
+        monkeypatch,
+        total_bytes=total_bytes,
+        idle_bytes=_xpu_headroom_bytes(total_bytes) // 2,
+    )
+
+    manager.finish_request()
+
+    empty_cache.assert_not_called()
+
+
+@xpu_device_total_bytes
+def test_finish_request_skips_release_on_non_xpu_platforms(monkeypatch, total_bytes):
+    manager, empty_cache = _xpu_manager(
+        monkeypatch,
+        total_bytes=total_bytes,
+        idle_bytes=2 * _xpu_headroom_bytes(total_bytes),
+    )
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+
+    manager.finish_request()
+
+    empty_cache.assert_not_called()
+
+
+def _park_module(monkeypatch, *, total_bytes, free_bytes, weight_bytes):
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_available_gpu_memory",
+        lambda **kwargs: free_bytes / GIB_BYTES,
+    )
+    monkeypatch.setattr(
+        current_platform, "get_device_total_memory", lambda *a, **k: total_bytes
+    )
+    module = torch.nn.Linear(1, 1)
+    monkeypatch.setattr(
+        component_residency_strategies, "module_weight_bytes", lambda _m: weight_bytes
+    )
+    return module
+
+
+def _warmup_park_kept_ready(strategy, module) -> bool:
+    """Whether finish_request parked the component instead of releasing it."""
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    strategy.finish_request(
+        module,
+        SimpleNamespace(component_name="text_encoder", target_dtype=None),
+        SimpleNamespace(batch_is_warmup=True),
+        preferred=True,
+    )
+    assert strategy.prepare_for_use.called != strategy.finish_use.called
+    return strategy.prepare_for_use.called
+
+
+@xpu_device_total_bytes
+def test_warmup_park_is_skipped_when_it_leaves_no_headroom(monkeypatch, total_bytes):
+    """A component that nearly fills the device is released after warmup, not parked.
+
+    Its weights still fit; the room the next request's stages need does not, and
+    parked weights hold whole allocator segments a later release cannot recover.
+    """
+    free_bytes = total_bytes - _xpu_headroom_bytes(total_bytes)
+    strategy = XpuComponentOffloadStrategy()
+    module = _park_module(
+        monkeypatch,
+        total_bytes=total_bytes,
+        free_bytes=free_bytes,
+        weight_bytes=free_bytes - _xpu_headroom_bytes(total_bytes) // 2,
+    )
+
+    assert _warmup_park_kept_ready(strategy, module) is False
+
+
+@xpu_device_total_bytes
+def test_warmup_park_is_kept_when_headroom_remains(monkeypatch, total_bytes):
+    free_bytes = total_bytes - _xpu_headroom_bytes(total_bytes)
+    strategy = XpuComponentOffloadStrategy()
+    module = _park_module(
+        monkeypatch,
+        total_bytes=total_bytes,
+        free_bytes=free_bytes,
+        weight_bytes=free_bytes - 2 * _xpu_headroom_bytes(total_bytes),
+    )
+
+    assert _warmup_park_kept_ready(strategy, module) is True
+
+
+@pytest.mark.parametrize("is_xpu", [False, True])
+def test_component_offload_selects_the_xpu_strategy_only_on_xpu(monkeypatch, is_xpu):
+    """The memory-aware park is reached by strategy selection, not a runtime branch.
+
+    Other backends keep the plain strategy, whose park never reads device memory.
+    """
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: is_xpu)
+    monkeypatch.setattr(current_platform, "is_mps", lambda: False)
+
+    strategy = build_component_residency_strategy(
+        "text_encoder",
+        torch.nn.Linear(1, 1),
+        SimpleNamespace(residency_mode=lambda _: "component-offload"),
+    )
+
+    assert isinstance(strategy, XpuComponentOffloadStrategy) is is_xpu
+    assert isinstance(strategy, ComponentOffloadStrategy)

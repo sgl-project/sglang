@@ -78,34 +78,31 @@ class XpuPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group=None,
     ) -> float:
-        """Return the available device memory in GiB."""
+        """Return the driver's free device memory in GiB, as on CUDA/ROCm.
+
+        Reserve the caching allocator holds is not counted: what a stage needs is
+        for the driver to have the room, not the allocator.
+        """
 
         if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
             return 0.0
+
+        if empty_cache:
+            torch.xpu.empty_cache()
+
+        if device_id is None:
+            device_id = torch.xpu.current_device()
 
         num_gpus = torch.xpu.device_count()
         if device_id < 0 or device_id >= num_gpus:
             raise ValueError(f"Invalid XPU device_id={device_id}. num_gpus={num_gpus}")
 
-        current = torch.xpu.current_device()
-        if current != device_id:
-            logger.warning(
-                "current device is not %s, but %s; this may cause useless memory allocation for torch XPU context.",
-                device_id,
-                current,
-            )
-
-        if empty_cache:
-            torch.xpu.empty_cache()
-
-        used_memory = torch.xpu.memory_allocated(device_id)
-        total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory, _total = torch.xpu.mem_get_info(device_id)
 
         if distributed:
             import torch.distributed as dist

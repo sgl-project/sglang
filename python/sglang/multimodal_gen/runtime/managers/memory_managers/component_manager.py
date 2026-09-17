@@ -19,7 +19,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     LayerwiseOffloadStrategy,
     ResidentStrategy,
     SnapshotOffloadStrategy,
+    XpuComponentOffloadStrategy,
     is_fsdp_managed_module,
+    release_xpu_idle_reserve,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
@@ -118,6 +120,8 @@ def build_component_residency_strategy(
         and not is_fsdp_managed_module(module)
         and residency_mode == COMPONENT_OFFLOAD
     ):
+        if current_platform.is_xpu():
+            return XpuComponentOffloadStrategy()
         return ComponentOffloadStrategy()
     return ResidentStrategy()
 
@@ -689,6 +693,8 @@ class ComponentResidencyManager:
                     self.placement_modules(),
                     label=f"after request {self._debug_requests_seen}",
                 )
+        if current_platform.is_xpu():
+            release_xpu_idle_reserve()
 
     def _begin_warmup_phase(
         self,
