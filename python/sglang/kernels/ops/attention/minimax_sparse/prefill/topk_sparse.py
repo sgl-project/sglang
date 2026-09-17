@@ -1,13 +1,12 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-import functools
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported
 
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -17,25 +16,10 @@ from ..common.utils import (
     unit_scale,
 )
 
-_is_hip = is_hip()
-
-
-@functools.cache
-def _sparse_subk_divisor() -> int:
-    """How many sub-tiles a KV tile is split into: 2 on gfx950, where it was measured;
-    0 (the single-tile loop, unchanged from before) everywhere else, gfx942 included."""
-    return 2 if is_gfx95_supported() else 0
-
 
 def _sparse_subk(block_size_k: int) -> int:
-    """KV sub-tile width, or 0 to keep the single-tile loop. Derived from
-    block_size_k on every call: the kernel walks BLOCK_SIZE_K // SUB_K sub-tiles,
-    so a width that does not divide the block would silently drop the remainder.
-    """
-    divisor = _sparse_subk_divisor()
-    if divisor == 0 or block_size_k % divisor != 0:
-        return 0
-    return block_size_k // divisor
+    """Sub-tile only the measured 128-token block; keep other widths unchanged."""
+    return 64 if is_gfx95_supported() and block_size_k == 128 else 0
 
 
 @triton.heuristics(
@@ -54,8 +38,7 @@ def _sparse_subk(block_size_k: int) -> int:
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
+    # Keep the additional configs on gfx95; gfx942 retains the original set.
     configs=[
         # CDNA sub-tiled MFMA configs; NVIDIA's Triton rejects these launch kwargs.
         *(
@@ -71,7 +54,7 @@ def _sparse_subk(block_size_k: int) -> int:
                     num_stages=1,
                 ),
             ]
-            if _is_hip
+            if is_gfx95_supported()
             else []
         ),
         *[

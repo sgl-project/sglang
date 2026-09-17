@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported
 
 from ..common.utils import (
     _bitonic_merge,
@@ -18,7 +18,6 @@ from ..common.utils import (
     unit_scale,
 )
 
-_is_hip = is_hip()
 _MAX_PER_PAGE_SLOT_UNROLL = 8
 
 
@@ -691,12 +690,15 @@ def flash_prefill_with_topk_index(
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
 
     if (
-        _is_hip
+        is_gfx95_supported()
         and disable_index_value
         and score_type == "max"
         and sink is None
         and q_scale in (None, 1.0)
         and k_scale == 1.0
+        and qk_head_dim == 128
+        and block_size_k == 128
+        and page_size > 0
         and block_size_k % page_size == 0
     ):
         # Source layers do not use idx_o, so run the score-only kernel.
