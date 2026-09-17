@@ -19,27 +19,64 @@ profile on the machine that runs it (the GPU devbox has neither). The tag is `m3
 
 ## Serving command
 
-Models: `amd/MiniMax-M3-MXFP4` (quark MXFP4 checkpoint) and `Inferact/MiniMax-M3-EAGLE3-GQA` under `$MODEL_ROOT` (default `/models`).
+Models: `amd/MiniMax-M3-MXFP4` (quark MXFP4 checkpoint) and `Inferact/MiniMax-M3-EAGLE3-GQA`, as directories under `/models`.
+
+There is no wrapper script — this is the whole thing. The image already sets `SGLANG_USE_AITER=1` and
+`HIP_FORCE_DEV_KERNARG=1`, so only the non-default knobs are passed here:
 
 ```bash
 docker run --rm -it --network host --device /dev/kfd --device /dev/dri --group-add video --ipc host --shm-size 64g \
-  -v /models:/models -e MODEL_ROOT=/models -e SGLANG_API_KEY=<bearer key> -e PORT=30000 \
-  <image> bash /sgl-workspace/sglang/benchmark/minimax_m3_mi355x/endpoint/serve_endpoint.sh
+  -v /models:/models \
+  -e SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 \
+  -e SGLANG_FORWARD_UNKNOWN_TOOLS=1 -e SGLANG_ENABLE_STRICT_MODEL_NAME=1 -e SGLANG_ENABLE_QUEUE_FULL_429=1 \
+  -e SGLANG_M3_ALLOW_CUSTOM_AR=1 -e SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144 -e ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+  -e SGLANG_TRITON_EXTEND_LONG_PREFIX=1 -e SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1 \
+  -e SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5 -e SGLANG_TIMEOUT_KEEP_ALIVE=3600 -e NCCL_MIN_NCHANNELS=112 \
+  <image> \
+  sglang serve --model-path /models/MiniMax-M3-MXFP4 --served-model-name MiniMax-M3 --trust-remote-code \
+    --tp-size 4 --host 0.0.0.0 --port 30000 --api-key <bearer key> \
+    --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 8192 --mem-fraction-static 0.9 \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path /models/MiniMax-M3-EAGLE3-GQA \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --speculative-attention-mode decode --triton-attention-num-kv-splits 64 \
+    --cuda-graph-backend-prefill breakable --reasoning-parser minimax-m3 --tool-call-parser minimax-m3 \
+    --enable-metrics --enable-cache-report --max-running-requests 48 --max-queued-requests 64 \
+    --watchdog-timeout 3600
 ```
 
-`serve_endpoint.sh` expands to (env vars listed in the script):
+On a devbox started **from this image** (`rx devbox acquire --gpu mi350x --count 4 --image <image>`), drop the `docker run`
+wrapper and run the `sglang serve` line with those variables exported.
 
-```
-python3 -m sglang.launch_server --model-path $MODEL_ROOT/MiniMax-M3-MXFP4 --served-model-name MiniMax-M3 --trust-remote-code \
-  --tp 4 --host 0.0.0.0 --port 30000 --api-key $SGLANG_API_KEY --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.9 --speculative-algorithm EAGLE3 --speculative-draft-model-path $MODEL_ROOT/MiniMax-M3-EAGLE3-GQA \
-  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-attention-mode decode \
-  --triton-attention-num-kv-splits 64 --cuda-graph-backend-prefill breakable --reasoning-parser minimax-m3 --tool-call-parser minimax-m3 \
-  --enable-metrics --enable-cache-report --max-running-requests 48 --max-queued-requests 64 --watchdog-timeout 3600
-```
+**Acceptance-test shape:** delete the five `--speculative-*` flags. That is the `SPEC=none` configuration in the results
+below — slower, but the only one measured to pass every vendor gate (aime25 non-stop 0.21% against the handbook's 0.5%).
 
-Knobs: `SPEC=none` turns speculative decoding off; `PTPC_FP8=1` adds the online per-token FP8 dense path; `INDEX_TOPK_FREQ` (default 4)
-is the sparse-index top-k share frequency; `MAXRUN` / `MAXQUEUE` size admission (a full queue answers HTTP 429).
+**Omit `--api-key`** to run without auth (needed for `sglang.test.few_shot_gsm8k`, which sends no bearer token).
+
+### Why each variable is there
+
+| variable | default | why it is set |
+|---|---|---|
+| `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1` | `2` | **The one that matters.** At 2 or 4 the model drops the `="` of its tool-call tags past ~60K tokens. See the root-cause section below. |
+| `SGLANG_FORWARD_UNKNOWN_TOOLS=1` | `False` | parse tool calls with no/unknown inventory (handbook) |
+| `SGLANG_ENABLE_STRICT_MODEL_NAME=1` | `False` | unknown model name -> 404 (handbook) |
+| `SGLANG_ENABLE_QUEUE_FULL_429=1` | `False` | full queue -> 429 rather than a stall (handbook) |
+| `SGLANG_M3_ALLOW_CUSTOM_AR=1` | `False` | M3-on-ROCm disables custom all-reduce by default; this opt-in re-enables it so quick-reduce can accelerate the prefill all-reduce |
+| `SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144` | `0` | one-stage all-reduce threshold |
+| `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` | `NONE` | quick-reduce INT4 path |
+| `SGLANG_TRITON_EXTEND_LONG_PREFIX=1` | `False` | long-prefix extend kernels |
+| `SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1` | `False` | aiter long-prefix extend |
+| `SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5` | `0.0` | decode fairness against chunked prefill |
+| `SGLANG_TIMEOUT_KEEP_ALIVE=3600` | `5` | long generations must not be reaped |
+| `NCCL_MIN_NCHANNELS=112` | unset | RCCL channel count measured on gfx950 |
+
+Dropped from the old `serve_endpoint.sh`, verified individually against `python/sglang/srt/environ.py`:
+`SGLANG_USE_AITER` / `HIP_FORCE_DEV_KERNARG` (already `ENV` in the image);
+`SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE` / `SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL` (already default `True`);
+`SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL` / `SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX` (**dead names** — read nowhere in the tree);
+`HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` (redundant when the container is given exactly 4 GPUs; set them only when
+carving 4 GPUs out of a larger box). `--tp` became `--tp-size`: `--tp` is not a declared alias and only resolved by
+argparse prefix matching. `python -m sglang.launch_server` became `sglang serve`, which the module itself now recommends
+in a `UserWarning`; it is a strict superset (same `load_plugins()`, same `kill_process_tree` cleanup, plus backend detection).
 
 ## Vendor quality check (MiniMax provider handbook 2026-08-15)
 
@@ -101,7 +138,7 @@ Speculative decoding on top of frequency 4 made it worse (32/42 vs 22/42 malform
 
 ### Final production config: results
 
-`serve_endpoint.sh` as committed (EAGLE3 GQA 3 steps / 4 draft tokens, mem 0.9, `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1`, lenient tool parser).
+The serving command above (EAGLE3 GQA 3 steps / 4 draft tokens, mem 0.9, `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1`, lenient tool parser).
 
 | Check | Result | Reference |
 |---|---|---|

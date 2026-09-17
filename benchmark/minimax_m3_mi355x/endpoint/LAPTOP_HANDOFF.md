@@ -34,7 +34,7 @@ VM=m3-image-build; TAG=m3-mi355x-20260917-5f94c88e5e
 REG=976589843892.dkr.ecr.us-west-2.amazonaws.com; REPO=radixark/sglang-ext; REMOTE=$REG/$REPO:$TAG
 rx devbox run $VM -- bash -c 'grep "^BUILD_EXIT=" ~/build.log; docker images sglang-ext'
 rx devbox run $VM -- bash -c "docker run --rm --entrypoint python sglang-ext:$TAG -c 'import sglang.srt.function_call.minimax_m3 as m; assert hasattr(m.MinimaxM3Detector, \"finish\"); import sglang.srt.environ as e; assert hasattr(e.Envs, \"SGLANG_ENABLE_STRICT_MODEL_NAME\"); print(\"OVERLAY_OK\")'"
-rx devbox run $VM -- bash -c "docker run --rm --entrypoint bash sglang-ext:$TAG -c 'cd /sgl-workspace/aiter && git diff --stat | tail -1; ls aiter/configs/model_configs | grep minimax_m3_gfx950; grep -c INDEX_TOPK_FREQ:-1 /sgl-workspace/sglang/benchmark/minimax_m3_mi355x/endpoint/serve_endpoint.sh'"
+rx devbox run $VM -- bash -c "docker run --rm --entrypoint bash sglang-ext:$TAG -c 'cd /sgl-workspace/aiter && git diff --stat | tail -1; ls aiter/configs/model_configs | grep minimax_m3_gfx950; grep -c SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 /sgl-workspace/sglang/benchmark/minimax_m3_mi355x/endpoint/ENDPOINT.md'"
 aws --profile radixark --region us-west-2 ecr describe-repositories --repository-names $REPO >/dev/null 2>&1 || aws --profile radixark --region us-west-2 ecr create-repository --repository-name $REPO --image-tag-mutability MUTABLE
 aws --profile radixark --region us-west-2 ecr get-login-password | rx devbox run $VM -- bash -c "docker login --username AWS --password-stdin $REG"   # foreground: it reads stdin
 rx devbox run $VM -- bash -c "docker tag sglang-ext:$TAG $REMOTE && nohup bash -c 'docker push $REMOTE > ~/push.log 2>&1; echo PUSH_EXIT=\$? >> ~/push.log' >/dev/null 2>&1 </dev/null & echo PUSH_STARTED"
@@ -57,4 +57,4 @@ rx devbox release m3-image-build
 
 ## 4. Run the endpoint from the image
 
-See `ENDPOINT.md` in this directory: `docker run ... -v /models:/models -e MODEL_ROOT=/models -e SGLANG_API_KEY=<key> <image> bash /sgl-workspace/sglang/benchmark/minimax_m3_mi355x/endpoint/serve_endpoint.sh` (models `amd/MiniMax-M3-MXFP4` and `Inferact/MiniMax-M3-EAGLE3-GQA` under `/models`). `SPEC=none` is the shape that passes every vendor gate measured; the default EAGLE3 shape is faster but fails the aime25 non-stop gate.
+See `ENDPOINT.md` in this directory for the full `sglang serve` command (models `amd/MiniMax-M3-MXFP4` and `Inferact/MiniMax-M3-EAGLE3-GQA` under `/models`). Dropping the `--speculative-*` flags is the shape that passes every vendor gate measured; the default EAGLE3 shape is faster but fails the aime25 non-stop gate.
