@@ -110,38 +110,20 @@ class AdaptiveProfilingPolicy(Protocol):
 logger = logging.getLogger(__name__)
 
 
-def _broadcast_float_from_rank0(value: float) -> float:
-    """Broadcast a profile measurement so every TP rank shares a cost table."""
+def _broadcast_profile_latency_from_tp_rank0(value: float) -> float:
+    """Broadcast TP rank 0's profile latency so every rank shares a cost table."""
     import torch
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        return value
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_world_size,
         get_tp_group,
+        model_parallel_is_initialized,
     )
 
-    if get_tensor_model_parallel_world_size() <= 1:
+    if not model_parallel_is_initialized():
         return value
     tp_group = get_tp_group()
     value_tensor = torch.tensor([value], dtype=torch.float64, device=tp_group.device)
-    dist.broadcast(value_tensor, src=0, group=tp_group.device_group)
+    tp_group.broadcast(value_tensor, src=0)
     return float(value_tensor.item())
-
-
-def _is_tp_rank0() -> bool:
-    """Return whether this process should render TP-local startup progress."""
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        return True
-    try:
-        from sglang.srt.distributed import get_tp_group
-
-        return get_tp_group().rank_in_group == 0
-    except Exception:
-        return dist.get_rank() == 0
 
 
 class AdaptiveController:
@@ -239,11 +221,19 @@ class AdaptiveController:
             f"seq_len={profile.seq_len}, n_warmup={profile.n_warmup}, "
             f"n_measure={profile.n_measure}",
         )
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
+
+        is_tp_rank0 = (
+            not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0
+        )
         progress = tqdm(
             total=len(profile.points),
             desc="Adaptive speculative profiling",
             unit="point",
-            disable=not (_is_tp_rank0() and logger.isEnabledFor(logging.INFO)),
+            disable=not (is_tp_rank0 and logger.isEnabledFor(logging.INFO)),
         )
         try:
             for point in profile.points:
@@ -257,7 +247,7 @@ class AdaptiveController:
                     n_warmup=profile.n_warmup,
                     n_measure=profile.n_measure,
                 ).measure()
-                median_ms = _broadcast_float_from_rank0(median_ms)
+                median_ms = _broadcast_profile_latency_from_tp_rank0(median_ms)
                 self.params.record_profile(point.batch_size, point.steps, median_ms)
                 progress.set_postfix(
                     bs=point.batch_size,

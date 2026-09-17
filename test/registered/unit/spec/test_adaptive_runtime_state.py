@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    _broadcast_profile_latency_from_tp_rank0,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -74,6 +76,30 @@ class _FakePolicy:
 
 
 class TestAdaptiveController(unittest.TestCase):
+    def test_profile_latency_uses_tp_group_broadcast(self):
+        class FakeTPGroup:
+            device = "cpu"
+
+            def __init__(self):
+                self.src = None
+
+            def broadcast(self, value, src=0):
+                self.src = src
+                value.fill_(7.5)
+
+        tp_group = FakeTPGroup()
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        ):
+            value = _broadcast_profile_latency_from_tp_rank0(2.5)
+
+        self.assertEqual(tp_group.src, 0)
+        self.assertEqual(value, 7.5)
+
     def test_injected_policy_builds_pruned_states_and_applies_initial_state(self):
         worker = _FakeWorker(initial_steps=3)
         policy = _FakePolicy()
