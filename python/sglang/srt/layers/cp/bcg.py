@@ -23,17 +23,22 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -50,12 +55,18 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    supports_layout = (
+        cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha"
+    ) or (
+        cfg.cp_strategy == "interleave"
+        and prefill_attention_backend == "dsv4"
+        and is_deepseek_v4(model_config_of(server_args).hf_config)
+    )
     return (
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
-        and cfg.cp_strategy == "zigzag"
-        and prefill_attention_backend == "trtllm_mha"
+        and supports_layout
     )
 
 
@@ -67,8 +78,12 @@ def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
 def filter_prefill_cp_bcg_capture_num_tokens(
     capture_num_tokens: list[int], server_args: ServerArgs
 ) -> list[int]:
-    """Keep only token buckets where the zigzag CP strategy can run."""
-    min_num_tokens = resolved_view(server_args).attn_cp_size * 2
+    """Keep only token buckets where the configured CP strategy can run."""
+    cfg = resolving_view(server_args)
+    cp_segments_per_token_block = 2 if cfg.cp_strategy == "zigzag" else 1
+    min_num_tokens = (
+        resolved_view(server_args).attn_cp_size * cp_segments_per_token_block
+    )
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(
@@ -96,6 +111,8 @@ class PrefillCPBCGInput:
 
     input_embeds: torch.Tensor
     positions: torch.Tensor
+    input_ids: Optional[torch.Tensor] = None
+    num_token_non_padded: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
 
@@ -114,12 +131,22 @@ class PrefillCPBCGInput:
                     (runner.max_num_tokens,),
                     dtype=torch.int64,
                 ),
+                input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                num_token_non_padded=torch.zeros((), dtype=torch.int32),
             )
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
-        """Return the aligned CP-local rows required by a live zigzag layout."""
+        """Return the aligned CP-local rows required by the active layout."""
         strategy = get_cp_strategy()
-        if not isinstance(strategy, ZigzagCPStrategy) or extend_seq_lens is None:
+        if extend_seq_lens is None:
+            return None
+        if isinstance(strategy, InterleaveCPStrategy):
+            logical_tokens = (
+                sum(int(length) for length in extend_seq_lens) + strategy.cp_size - 1
+            ) // strategy.cp_size
+            align_size = get_cp_padding_align_size()
+            return (logical_tokens + align_size - 1) // align_size * align_size
+        if not isinstance(strategy, ZigzagCPStrategy):
             return None
 
         cp_segment_num = strategy.cp_size * 2
@@ -219,6 +246,7 @@ class PrefillCPBCGInput:
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
+        local_input_ids = cp_shard_hidden_states(global_input_ids, forward_batch)
         global_input_embeds = runner.model_runner.model.get_input_embeddings()(
             global_input_ids
         )
@@ -249,12 +277,31 @@ class PrefillCPBCGInput:
 
         input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
+        assert self.input_ids is not None
+        input_ids = self.input_ids[:captured_local_tokens]
         input_embeds.zero_()
         positions.zero_()
+        input_ids.zero_()
         input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
+        input_ids[:live_local_tokens].copy_(local_input_ids)
         forward_batch.input_embeds = input_embeds
-        forward_batch.positions = positions
+        forward_batch._cp_positions = positions
+        # Keep the global input_ids field intact: the runner uses its length to
+        # select the global capture bucket. The DSV4 body consumes this fixed,
+        # rank-local view for hash routing and MegaMoE.
+        forward_batch._cp_input_ids = input_ids
+        forward_batch.input_ids_global = input_ids
+        if forward_batch.num_token_non_padded is not None:
+            assert self.num_token_non_padded is not None
+            metadata = forward_batch.attn_cp_metadata
+            logical_tokens = (
+                metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            )
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
+            forward_batch.num_token_non_padded = self.num_token_non_padded
         self.live_local_tokens = live_local_tokens
 
 
@@ -307,10 +354,50 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             torch.cuda.current_stream(),
         )
-        return model.logits_processor(
-            forward_batch.input_ids,
+        if aux_hidden_states is not None:
+            if torch.is_tensor(aux_hidden_states):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, static_forward_batch, torch.cuda.current_stream()
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(
+                        aux, static_forward_batch, torch.cuda.current_stream()
+                    )
+                    for aux in aux_hidden_states
+                ]
+        hidden_states_before_norm = None
+        if isinstance(hidden_states, tuple):
+            assert len(hidden_states) == 2
+            hidden_states, hidden_states_before_norm = hidden_states
+
+        input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        tail = None
+        language_model = getattr(model, "model", None)
+        if (
+            capture_aux_hidden_states
+            and getattr(language_model, "late_layer_start", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail_metadata = runner.model_runner.attn_backend.tail_forward_metadata
+            tail = tail_metadata.late_layer_tail
+            input_ids = tail.rows(input_ids)
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+
+        output = model.logits_processor(
+            input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else hidden_states_before_norm
+            ),
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.token_indices
+        return output
