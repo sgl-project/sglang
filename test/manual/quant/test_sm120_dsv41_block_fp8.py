@@ -21,7 +21,7 @@ class TestSM120DSV41BlockFP8(CustomTestCase):
         (5120, 288),
         (25600, 6144),
     )
-    MS = (1, 3, 4, 5, 12, 16, 24, 32, 33, 64)
+    MS = (1, 3, 4, 5, 12, 16, 24, 32, 33, 64, 100, 128, 512, 777, 2048)
     DTYPES = (torch.bfloat16, torch.float16, torch.float32)
     LAYOUTS = ("contiguous", "transposed", "strided")
 
