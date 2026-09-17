@@ -9,7 +9,6 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -40,7 +39,7 @@ def ranks_per_host() -> int:
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
     try:
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
     except AssertionError:
         return 1
     if world_group.world_size == 1:
@@ -75,9 +74,9 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
     except AssertionError:
         return size
 

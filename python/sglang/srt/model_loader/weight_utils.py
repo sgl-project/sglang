@@ -44,7 +44,6 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
-from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -1007,7 +1006,7 @@ def _prefetch_all_checkpoints(
     # full checkpoint into its own page cache. Global rank would split files
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         local_rank = world_group.local_rank
         local_world_size = world_group.local_size or world_group.world_size
     else:
