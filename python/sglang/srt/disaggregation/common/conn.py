@@ -33,10 +33,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
-)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -197,8 +193,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.attn_dp_size = get_attention_dp_size()
-        self.attn_dp_rank = get_attention_dp_rank()
+        self.attn_dp_size = parallel.attn_dp_size
+        self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = (
             1 if get_parallel().enable_dp_attention else get_parallel().dp_size
         )

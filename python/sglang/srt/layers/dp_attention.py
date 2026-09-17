@@ -103,7 +103,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = get_attention_dp_size()
+        dp_size = get_parallel().attn_dp_size
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -463,7 +463,7 @@ def disable_dp_size():
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -487,7 +487,7 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch
@@ -767,7 +767,7 @@ def is_dp_gatherv_active() -> bool:
         _USE_DP_GATHERV
         and not world_dp_gather_enabled()
         and get_attn_tensor_model_parallel_world_size() == 1
-        and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size
         and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
@@ -801,7 +801,7 @@ def _dp_gather_via_all_gatherv(
     # each rank's local tensor up to sizes[rank] with zeros (matching the
     # buffer's reserved per-rank slot) so sum(sizes) == buffer rows and there
     # is no uninitialized tail for the MoE to read.
-    rank = get_attention_dp_rank()
+    rank = get_parallel().attn_dp_rank
     local_rows = sizes[rank]
     if local_tokens.shape[0] == local_rows:
         local_real = local_tokens
@@ -926,7 +926,7 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         if sizes is not None:
             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
             return
-    if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+    if get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size:
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(

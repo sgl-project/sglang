@@ -27,7 +27,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -505,7 +504,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.use_attn_tp_ngram = _use_attn_tp_ngram()
         self.gather_dp_tokens = (
             is_dp_attention_enabled()
-            and get_attention_dp_size() > 1
+            and get_parallel().attn_dp_size > 1
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
@@ -1360,7 +1359,7 @@ class Qwen4ExpLayerExtensionMixin:
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
-        return get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
+        return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
 
     def _qwen4_exp_use_attn_tp_a2a_scatter(self) -> bool:
         return get_parallel().attn_tp_size > 1 and not get_moe_a2a_backend().is_none()

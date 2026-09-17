@@ -292,9 +292,8 @@ class ParallelContext:
     def _v(self, name, getter):
         """Scoped override, else the permanent stamp, else the live group.
 
-        The stamp sits in the middle for ranks exactly as it does for widths
-        (`_derived_width`): an elastic scale-up moves this process's attention
-        rank to a value no group coordinator answers with.
+        One priority order for ranks and widths alike (`_derived_width`), so a
+        stamped value wins over the coordinator for both.
         """
         overrides = self._overrides
         if name in overrides:
@@ -597,9 +596,9 @@ class MoeFlags(_FlagGroupBase):
 
 class DpFlags(_FlagGroupBase):
     """DP-attention runtime flags, materialized by ``initialize_dp_attention``
-    (after distributed setup; reads the model config). Topology values
-    (sizes/ranks) stay on ``layers.dp_attention`` until the parallel vertical
-    migrates them."""
+    (after distributed setup; reads the model config). The topology values it
+    also computes -- the attention-DP width and rank -- are stamped on
+    ``get_parallel()``, not kept here."""
 
     enabled: bool = False
     use_world_group_for_gather: bool = False
