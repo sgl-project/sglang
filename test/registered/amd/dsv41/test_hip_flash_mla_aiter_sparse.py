@@ -160,8 +160,6 @@ class TestAiterSparseBackend(CustomTestCase):
         self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
 
 
-
-
 SWA, TOPK = 128, 512
 
 

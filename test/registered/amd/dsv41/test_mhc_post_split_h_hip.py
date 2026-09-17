@@ -70,6 +70,5 @@ class TestMhcPostSplitH(unittest.TestCase):
                     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
-
 if __name__ == "__main__":
     unittest.main()

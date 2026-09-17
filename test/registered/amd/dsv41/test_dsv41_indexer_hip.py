@@ -18,11 +18,6 @@ TOPK = 512
 TOPK_BLOCKS, BLOCK_SIZE = 2048, 8
 
 
-
-
-
-
-
 def index_slots(page_table, pos):
     """Slot of compressed position `pos` through the expanded indexer page table."""
     return (
@@ -72,10 +67,6 @@ def reference_consumer_rows(logits, lens, pos_mask, topk):
         s = logits[b].masked_fill(~cand, -torch.inf)
         out.append((set(s.topk(k).indices.tolist()), k))
     return out
-
-
-
-
 
 
 @unittest.skipUnless(
@@ -184,16 +175,6 @@ class TestTwoLevelDecodeHip(CustomTestCase):
                 self._assert_consumer_matches_reference(
                     raw, seq, cands, page_table, "consumer"
                 )
-
-
-
-
-
-
-
-
-
-
 
 
 @unittest.skipUnless(
@@ -336,7 +317,6 @@ class TestOversizedPrefillRequestChunking(CustomTestCase):
 
         self.assertEqual(result.score_sizes, [2, 2, 1])
         self.assertEqual(result.consumed_ids, [[0, 1], [2, 3], [4]])
-
 
 
 if __name__ == "__main__":

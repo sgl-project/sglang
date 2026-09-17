@@ -96,7 +96,6 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
     def setUp(self):
         self.device = torch.device("cuda")
 
-
     def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
         self._check_block_window_replay(cpu_mirror=True)
 
@@ -300,10 +299,8 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                 )
 
 
-
 @unittest.skipUnless(is_hip(), "HIP multi-stream preparation")
 class TestLowRatioPrepareStreams(CustomTestCase):
-
     def test_graph_replay_joins_kv_and_source_streams(self):
         from unittest.mock import patch
 

@@ -21,12 +21,8 @@ register_amd_ci(est_time=40, stage="jit-kernel-unit", runner_config="amd")
 HEAD_DIM, ROPE_DIM, NOPE_DIM = 512, 64, 448
 
 
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestFusedKNormRopeFlashMLA(CustomTestCase):
-
-
     @unittest.skipUnless(
         is_hip() and is_gfx95_supported(),
         "the query rope rides the HIP K launch; its bitwise parity with the flat rope"

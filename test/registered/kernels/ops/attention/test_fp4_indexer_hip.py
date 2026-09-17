@@ -326,7 +326,9 @@ def test_index_q_pack_weights_matches_standalone(
     assert torch.equal(q_scale, ref_scale)
     assert torch.equal(weights, ref_w)
     exact_weights = (x.double() @ w.double().T * scale).bfloat16()
-    ulps = (weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()).abs()
+    ulps = (
+        weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()
+    ).abs()
     assert int(ulps.max()) <= 1
     # repeatable, and a row alone equals the row inside the batch
     again = index_q_pack_weights_hip(

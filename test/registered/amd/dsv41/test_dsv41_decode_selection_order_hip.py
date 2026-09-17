@@ -16,11 +16,8 @@ HEAD_DIM = 512
 HEADS = 16
 
 
-
-
 @unittest.skipUnless(is_hip(), "HIP radix backend")
 class TestDecodeSelectionOrder(CustomTestCase):
-
     def test_position_ordered_selection_is_page_invariant(self):
         """Same keys on two page layouts: the position-sorted selection attends bitwise
         the same, and the AOT sort with raw indices produces that order."""
