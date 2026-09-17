@@ -117,14 +117,57 @@ def _parallel_config_leaves() -> frozenset:
 # this process's attention-DP rank.
 _MISSING_READ = object()
 
+
+class Live(msgspec.Struct, frozen=True):
+    """How a rank / group / world width is answered, and what it means.
+
+    `source` is the canonical getter's name in `parallel_state`, a callable
+    taking the context, or `None` for a name only a stamp can answer.
+
+    Most entries in the table below are a bare getter name: a rank or a group
+    handle is its own explanation. This shape is for a name whose meaning is
+    not in its getter, and it carries the prose with the declaration rather
+    than in a second table keyed by the same names.
+    """
+
+    source: Any = None
+    doc: str = ""
+
+
 _LIVE_READS: dict = {
-    # Three widths, three questions about the WORLD group, one for each point
-    # on its timeline: what it was built at, what it has room for, and what is
-    # serving now. They are one number until an elastic scale-up moves the
-    # third one, which is why each of them has to say which it is.
-    "launch_world_size": "get_world_size",
-    "max_world_size": lambda self: self.max_ep_size or self.launch_world_size,
-    "world_rank": "get_world_rank",
+    # Two widths of the WORLD group: what it was built at, and what it has
+    # room for. Both are properties of the group itself. How much of that room
+    # is currently serving is elastic-EP state, owned by `ElasticEPStateManager`
+    # and asked of it directly -- a width that lives somewhere else does not
+    # become a WORLD fact by being readable from here.
+    "launch_world_size": Live(
+        source="get_world_size",
+        doc=(
+            "Width the WORLD group was built at: `len(ranks)`, frozen when the "
+            "coordinator was constructed. What every startup reader wants -- "
+            "memory accounting, KV cache sizing, graph capture, weight loading "
+            "-- and what a scale-up leaves behind rather than updates."
+        ),
+    ),
+    "max_world_size": Live(
+        source=lambda self: self.max_ep_size or self.launch_world_size,
+        doc=(
+            "Ranks the WORLD group has room for: `--max-ep-size` when it is "
+            "set, otherwise the launch width. This is the ceiling the process "
+            "group was pre-allocated to -- mooncake sizes its active-rank mask "
+            "to it -- which is why `init_distributed_environment` takes it "
+            "under this name. Whether the group can grow at all is a separate "
+            "question, answered by the leaf being set rather than by this width."
+        ),
+    ),
+    "launch_world_rank": Live(
+        source="get_world_rank",
+        doc=(
+            "This process's rank in the WORLD group as built. Frozen with the "
+            "coordinator, exactly like `launch_world_size`, and named for the "
+            "same reason: a scale-up does not renumber it."
+        ),
+    ),
     "tp_rank": "get_tensor_model_parallel_rank",
     "pp_rank": "get_pipeline_model_parallel_rank",
     "moe_ep_rank": "get_moe_expert_parallel_rank",
@@ -144,25 +187,6 @@ _LIVE_READS: dict = {
     "attn_tp_group": "get_attn_tp_group",
     "attn_cp_group": "get_attn_cp_group",
     "dcp_group": "get_dcp_group",
-}
-
-# Docs for the names above that need one. A rank or a group handle is its own
-# explanation; the three world widths are not, because they are the same number
-# right up until the moment they are not.
-_LIVE_READ_DOCS: dict = {
-    "launch_world_size": (
-        "Width the WORLD group was built at: `len(ranks)`, frozen when the "
-        "coordinator was constructed. What every startup reader wants -- "
-        "memory accounting, KV cache sizing, graph capture, weight loading -- "
-        "and what a scale-up leaves behind rather than updates."
-    ),
-    "max_world_size": (
-        "Ranks the WORLD group has room for: `--max-ep-size` when it is set, "
-        "otherwise the launch width. This is the ceiling the process group was "
-        "pre-allocated to, which is why `init_distributed_environment` takes it "
-        "under this name. Whether the group can grow at all is a separate "
-        "question, and its answer is the leaf being set, not this width."
-    ),
 }
 
 
@@ -220,15 +244,14 @@ def derive_parallel_widths(
     coordinators.
 
     The world widths are not among them: neither is a quotient, and they are
-    not one number. `launch_world_size` is what the WORLD group was built at and is
-    frozen there -- `GroupCoordinator.world_size` is `len(ranks)`, so it does
-    not move when mooncake admits ranks into an expandable WORLD;
+    not one number. `launch_world_size` is what the WORLD group was built at
+    and is frozen there -- `GroupCoordinator.world_size` is `len(ranks)`, so it
+    does not move when mooncake admits ranks into an expandable WORLD;
     `max_world_size` is what that group has room for. How much of that room is
-    serving right now is elastic-EP state, asked of the manager that owns it
-    rather than mirrored here. Deriving either from the leaves
-    would be wrong in a fourth way: on a scale joiner it would answer with the
-    joining cohort's own `tp * pp`, while that process's WORLD spans
-    `ep_join_rank_offset + tp * pp`.
+    serving right now is elastic-EP state and is asked of its owner. Deriving
+    either from the leaves would be wrong in a further way: on a scale joiner it
+    would answer with the joining cohort's own `tp * pp`, while that process's
+    WORLD spans `ep_join_rank_offset + tp * pp`.
     """
     return {
         "attn_dp_size": attn_dp_size,
@@ -366,10 +389,11 @@ class ParallelContext:
             return getattr(config, name)
         live = _LIVE_READS.get(name, _MISSING_READ)
         if live is not _MISSING_READ:
-            if isinstance(live, str):
-                return getattr(_ps(), live)()
-            if live is not None:
-                return live(self)
+            source = live.source if isinstance(live, Live) else live
+            if isinstance(source, str):
+                return getattr(_ps(), source)()
+            if source is not None:
+                return source(self)
             raise RuntimeError(
                 f"parallel rank {name!r} is not available: it is computed from "
                 "this process's `tp_rank` when the attention topology is "
@@ -453,7 +477,13 @@ def _install_parallel_properties() -> None:
     chain rather than one per kind of name.
     """
     docs = {name: decl.doc for name, decl in _derived_widths().items()}
-    docs.update(_LIVE_READ_DOCS)
+    docs.update(
+        {
+            name: live.doc
+            for name, live in _LIVE_READS.items()
+            if isinstance(live, Live) and live.doc
+        }
+    )
 
     for name in list(_derived_widths()) + list(_LIVE_READS):
 

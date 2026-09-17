@@ -5665,9 +5665,6 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        # Falling back to the current width would have been the same number:
-        # with no ceiling configured there is no room to grow into, so nothing
-        # has scaled and the current width is still the launch one.
         max_ep_size = get_parallel().max_world_size
 
         logger.debug(
