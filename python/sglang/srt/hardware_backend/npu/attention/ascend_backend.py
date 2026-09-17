@@ -24,6 +24,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
+from sglang.srt.layers.attention.dsa.dsa_cp_layout import cumulative
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_local_kv_block_table,
@@ -1250,8 +1252,19 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # DSA-CP replaces both length vectors, because this rank now holds a
+        # slice of the batch's tokens rather than all of them. Resolved once
+        # per forward and cached on the batch by the model side.
+        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_cp_plan is not None:
+                actual_seq_qlen = torch.tensor(
+                    cumulative(dsa_cp_plan.query_lens),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1388,6 +1401,20 @@ class AscendAttnBackend(AttentionBackend):
                 key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
+                if dsa_cp_plan is not None:
+                    # This rank's queries end partway through the request, so
+                    # they see fewer keys than the buffer holds. These lengths
+                    # are cumulative and therefore double as the request
+                    # boundaries inside the buffer -- which is exactly why
+                    # DSA-CP refuses multi-request extends: shortening one
+                    # request's entry would move where the next one starts.
+                    # With a single request the shortened length is a true
+                    # prefix of the buffer and the read is exact.
+                    seq_lengths_kv = torch.tensor(
+                        cumulative(dsa_cp_plan.key_lens),
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
                 layout_kv = "TND"
                 # layout_kv must equal layout_query unless it is PA_BSND
                 # (sparse_flash_attention_tiling.cpp:1761), which is why this is

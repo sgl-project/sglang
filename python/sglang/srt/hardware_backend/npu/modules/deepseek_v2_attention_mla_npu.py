@@ -12,6 +12,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.attention.dsa.dsa_cp import (
+    dsa_cp_redistribute_heads,
+    dsa_cp_restore_tokens,
+    dsa_cp_slice,
+    get_dsa_cp_plan,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -391,6 +397,11 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    # Resolve DSA-CP once per forward, here rather than in the core, because
+    # this is the half of the pair that receives layer_scatter_modes and the
+    # gate needs it: the slice assumes this rank was handed the whole batch.
+    # The result is cached on the batch and the core reads it back.
+    get_dsa_cp_plan(forward_batch, layer_scatter_modes)
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -837,7 +848,38 @@ def forward_dsa_core_npu(
             )
             attn_output = attn_output.transpose(0, 1)
     else:
-        attn_output = m.attn_mqa(
+        attn_mqa = m.attn_mqa
+        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
+        if dsa_cp_plan is not None and (
+            topk_indices is None or m.attn_mqa_for_dsa_cp is None
+        ):
+            # Both are built from the same condition as the plan, so a mismatch
+            # is a wiring bug rather than a configuration. Say which, instead of
+            # failing later on a shape.
+            raise RuntimeError(
+                "DSA-CP planned this forward but the layer is not set up for "
+                f"it: attn_mqa_for_dsa_cp={m.attn_mqa_for_dsa_cp is not None}, "
+                f"topk_indices={topk_indices is not None}"
+            )
+        if dsa_cp_plan is not None:
+            # DSA-CP. Swap "this rank's heads for every token" for "every head
+            # for this rank's tokens". The group holds the same set of
+            # (token, head) pairs either way and each is still computed exactly
+            # once, so this is the same attention rather than an approximation
+            # of it -- what changes is that the operator now reads the top-k KV
+            # for 1/attn_tp_size as many queries, and that read is what it is
+            # bound by (measured 803 GB/s, HBM speed, at 32.7 GB per layer).
+            #
+            # k_nope and k_pe stay full width and are NOT touched: the KV cache
+            # write and the DCP context gather below both address every token.
+            q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
+            q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
+            # The indexer ran at full width, so its top-k is full width too;
+            # take this rank's rows of it. Padded rows get index 0, which is a
+            # valid position whose output is discarded on the way back.
+            topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
+            attn_mqa = m.attn_mqa_for_dsa_cp
+        attn_output = attn_mqa(
             q_nope_out.contiguous(),
             k_nope.contiguous(),
             k_nope.contiguous(),
@@ -847,6 +889,14 @@ def forward_dsa_core_npu(
             k_rope=k_pe.contiguous(),
             topk_indices=topk_indices,
         )
+        if dsa_cp_plan is not None:
+            # Undo the swap before anything else sees it. w_vc, o_proj and the
+            # layer communicator all expect this rank's own heads for the whole
+            # batch, which is what they get without DSA-CP, so the sharding
+            # ends here instead of propagating through the rest of the layer.
+            attn_output = dsa_cp_restore_tokens(
+                attn_output.view(dsa_cp_plan.rows, -1, m.kv_lora_rank), dsa_cp_plan
+            )
     if dcp_extend:
         # Dropped here, before the MoE, not at the end of the forward. The
         # tensors themselves are now reserved buffers and survive either way
