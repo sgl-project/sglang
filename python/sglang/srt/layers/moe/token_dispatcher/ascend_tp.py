@@ -89,6 +89,10 @@ class AscendTPDispatcher(BaseDispatcher):
             self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
+        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP4:
+            self.init = NPUMoEInitRouting_v2(quant_mode=9)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type = 1
         else:
             raise ValueError(
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
