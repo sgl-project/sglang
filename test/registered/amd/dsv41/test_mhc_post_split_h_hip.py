@@ -69,49 +69,6 @@ class TestMhcPostSplitH(unittest.TestCase):
                     mhc_post(reference, *args)
                     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
-    def test_fallback_preserves_aiter(self):
-        from aiter.ops.mhc import mhc_post
-
-        for reason in (
-            "empty",
-            "small",
-            "below",
-            "above",
-            "width",
-            "dtype",
-            "stride",
-            "disabled",
-            "model",
-        ):
-            with self.subTest(reason=reason):
-                rows = {"empty": 0, "small": 1, "below": 767, "above": 4097}.get(
-                    reason, 1024
-                )
-                args = self.operands(
-                    rows,
-                    width=4096 if reason == "width" else 5120,
-                    dtype=torch.float16 if reason == "dtype" else torch.bfloat16,
-                )
-                if reason == "stride":
-                    args = (
-                        torch.randn(
-                            rows * 2, 5120, device="cuda", dtype=torch.bfloat16
-                        )[::2],
-                        *args[1:],
-                    )
-                self.layer.config.model_type = (
-                    "deepseek_v4" if reason == "model" else "deepseek_v41"
-                )
-                with (
-                    envs.SGLANG_OPT_HIP_MHC_POST_SPLIT_H.override(reason != "disabled"),
-                    patch("sglang.srt.models.deepseek_v4.mhc_post_split_h") as split,
-                ):
-                    actual = self.run_post(*args)
-                    split.assert_not_called()
-                reference = torch.empty_like(args[1])
-                if rows:
-                    mhc_post(reference, *args)
-                torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

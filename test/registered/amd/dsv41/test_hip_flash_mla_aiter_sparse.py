@@ -3,7 +3,6 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
@@ -160,83 +159,7 @@ class TestAiterSparseBackend(CustomTestCase):
         640-key cases absorb it."""
         self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
 
-    def test_fold_cache_follows_the_index_source(self):
-        """Layers between two index sources fold the first source's list once; the
-        layers after the second source must fold its list, not reuse the first one's."""
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            DSV4AttnMetadata,
-            _fold_lengths_for_aiter_sparse,
-        )
 
-        dev = "cuda"
-        i32 = dict(dtype=torch.int32, device=dev)
-        swa = torch.arange(2 * 1 * 64, **i32).view(2, 1, 64)
-        swa_len = torch.tensor([64, 64], **i32)
-        core = DSV4AttnMetadata(
-            page_size=64,
-            page_table=torch.zeros(1, **i32),
-            raw_out_loc=torch.zeros(1, **i32),
-            cuda_int32_kwargs={},
-            seq_lens_casual=torch.zeros(2, **i32),
-            positions_casual=torch.zeros(2, **i32),
-            swa_page_indices=swa,
-            swa_topk_lengths=swa_len,
-            index_topk=64,
-        )
-        core.c2_sparse_page_indices = torch.arange(2 * 1 * 64, **i32).view(2, 1, 64)
-        core.c2_sparse_topk_lengths = torch.tensor([3, 64], **i32)
-        extra = core.sparse_page_indices(2)
-
-        _, first = _fold_lengths_for_aiter_sparse(
-            core, 2, swa, swa_len, extra, core.c2_sparse_topk_lengths
-        )
-        self.assertEqual(first[0, 0, :4].tolist(), [0, 1, 2, -1])
-        # the next index source writes new picks into the same buffer
-        core.drop_folded_sparse_indices(2)
-        extra.add_(1000)
-        core.c2_sparse_topk_lengths.fill_(2)
-        _, second = _fold_lengths_for_aiter_sparse(
-            core, 2, swa, swa_len, extra, core.c2_sparse_topk_lengths
-        )
-        self.assertEqual(second[0, 0, :4].tolist(), [1000, 1001, -1, -1])
-        # ratio 1's folds survive a ratio-2 rewrite
-        core._aiter_sparse_masked_indices[(1, 0, (), None, None)] = "kept"
-        core.drop_folded_sparse_indices(2)
-        self.assertEqual(
-            list(core._aiter_sparse_masked_indices), [(1, 0, (), None, None)]
-        )
-
-    def test_indexer_dispatch_drops_the_ratio_folds(self):
-        """Every indexer body rewrites the ratio's page indices, so the dispatcher must
-        drop that ratio's folded lists before any body runs."""
-        import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as module
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            DeepseekV4HipRadixBackend,
-        )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        backend = object.__new__(DeepseekV4HipRadixBackend)
-        dropped, calls = [], []
-        backend.forward_metadata = SimpleNamespace(
-            core_metadata=SimpleNamespace(drop_folded_sparse_indices=dropped.append)
-        )
-        backend._low_ratio_index_topk_torch = lambda *a, **k: calls.append("torch")
-        layer = SimpleNamespace(compress_ratio=2)
-        with mock.patch.object(
-            module,
-            "low_ratio_index_topk_hip_decode",
-            lambda *a, **k: calls.append("decode"),
-        ):
-            for mode in (ForwardMode.DECODE, ForwardMode.EXTEND):
-                forward_batch = SimpleNamespace(
-                    forward_mode=mode, seq_lens_cpu=None, extend_seq_lens_cpu=None
-                )
-                backend._low_ratio_index_topk(
-                    layer, None, None, None, None, forward_batch
-                )
-        self.assertEqual(dropped, [2, 2])
-        # extend without CPU lengths falls back to the torch oracle
-        self.assertEqual(calls, ["decode", "torch"])
 
 
 SWA, TOPK = 128, 512

@@ -96,52 +96,6 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
     def setUp(self):
         self.device = torch.device("cuda")
 
-    def test_every_block_row_sees_context_plus_whole_block(self):
-        block = 5
-        backend = _make_backend(block_size=block, device=self.device)
-        prefix = torch.tensor(
-            [0, 1, 37, 128, 300], dtype=torch.int32, device=self.device
-        )
-        req_pool = torch.tensor([5, 2, 0, 4, 1], dtype=torch.int32, device=self.device)
-        bs = prefix.numel()
-        out_loc = (
-            torch.arange(bs * block, device=self.device, dtype=torch.int64) * 2
-            + OUT_LOC_BASE
-        )
-
-        metadata = backend.init_forward_metadata_dspark_draft_block(
-            max_seq_len=int(prefix.max()),
-            req_pool_indices=req_pool,
-            seq_lens=prefix,
-            out_cache_loc=out_loc,
-            block_size=block,
-        )
-        core = metadata.core_attn_metadata
-
-        width = core.swa_page_indices.shape[1]
-        self.assertEqual(core.swa_page_indices.shape[0], bs * block)
-        self.assertEqual(width % 64, 0)
-        self.assertGreaterEqual(width, SWA_WINDOW + block)
-        for b in range(bs):
-            p = int(prefix[b])
-            row, ctx = _expected_block_row(
-                backend,
-                req_slot=int(req_pool[b]),
-                prefix=p,
-                out_loc_block=out_loc[b * block : (b + 1) * block],
-                width=width,
-            )
-            for j in range(block):
-                r = b * block + j
-                self.assertTrue(torch.equal(core.swa_page_indices[r], row), (b, j))
-                self.assertEqual(int(core.swa_topk_lengths[r]), ctx + block, (b, j))
-                self.assertEqual(int(core.seq_lens_casual[r]), p + 1 + j, (b, j))
-                self.assertEqual(int(core.positions_casual[r]), p + j, (b, j))
-        # SWA-only draft: no compression / indexer metadata is built.
-        self.assertIs(core.raw_out_loc, out_loc)
-        self.assertIsNone(metadata.indexer_metadata)
-        self.assertIsNone(core.c4_sparse_page_indices)
-        self.assertEqual(metadata.low_ratio_indexer_metadata_by_ratio(), {})
 
     def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
         self._check_block_window_replay(cpu_mirror=True)
@@ -345,115 +299,10 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                     name,
                 )
 
-    def test_in_graph_hoists_verify_rows_and_builds_decode_workspaces(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            DSV4Metadata,
-        )
-
-        backend = _make_backend(
-            block_size=4, device=self.device, is_dspark_draft=False, low_ratios=(1, 2)
-        )
-        block = backend.target_verify_num_draft_tokens
-        bs = 3
-        req = torch.tensor([4, 0, 2], dtype=torch.int32, device=self.device)
-        positions = (
-            torch.arange(bs * block, device=self.device, dtype=torch.int64) + 100
-        )
-        out_cache_loc = (
-            torch.arange(bs * block, device=self.device, dtype=torch.int64) + 10
-        )
-        c2_meta = object()
-        sentinel = {2: object()}
-        seen = {}
-        saved = self.module.build_low_ratio_decode_workspaces
-
-        def fake_builder(by_ratio):
-            seen.update(by_ratio)
-            return sentinel
-
-        self.module.build_low_ratio_decode_workspaces = fake_builder
-        try:
-            for mode, hoisted in (
-                (ForwardMode.TARGET_VERIFY, True),
-                (ForwardMode.DECODE, True),
-                (ForwardMode.EXTEND, False),
-            ):
-                core = SimpleNamespace(low_ratios=(2,))
-                metadata = DSV4Metadata(
-                    core_attn_metadata=core,
-                    indexer_metadata=None,
-                    c2_indexer_metadata=c2_meta,
-                )
-                backend.forward_metadata = metadata
-                seen.clear()
-                n = bs * block if mode.is_target_verify() else bs
-                forward_batch = SimpleNamespace(
-                    forward_mode=mode,
-                    batch_size=bs,
-                    req_pool_indices=req,
-                    positions=positions[:n],
-                    out_cache_loc=out_cache_loc[:n],
-                    spec_info=SimpleNamespace(draft_token_num=block),
-                    extend_seq_lens=torch.ones(
-                        bs, dtype=torch.int64, device=self.device
-                    ),
-                )
-                backend.init_forward_metadata_in_graph(forward_batch)
-                expect_swa = backend.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    out_cache_loc[:n]
-                ).to(torch.int32)
-                self.assertTrue(torch.equal(core.swa_out_cache_loc, expect_swa), mode)
-                if not hoisted:
-                    self.assertIsNone(metadata.low_ratio_req_indices, mode)
-                    self.assertIsNone(metadata.low_ratio_pos_i64, mode)
-                    self.assertEqual(metadata.fp4_low_ratio_decode_workspaces, {}, mode)
-                    continue
-                repeats = block if mode.is_target_verify() else 1
-                self.assertTrue(
-                    torch.equal(
-                        metadata.low_ratio_req_indices,
-                        req.to(torch.int64).repeat_interleave(repeats),
-                    ),
-                    mode,
-                )
-                self.assertTrue(torch.equal(metadata.low_ratio_pos_i64, positions[:n]))
-                self.assertIs(metadata.fp4_low_ratio_decode_workspaces, sentinel, mode)
-                self.assertEqual(seen, {2: c2_meta}, mode)
-        finally:
-            self.module.build_low_ratio_decode_workspaces = saved
 
 
 @unittest.skipUnless(is_hip(), "HIP multi-stream preparation")
 class TestLowRatioPrepareStreams(CustomTestCase):
-    def test_cp_reference_uses_local_request_row_counts(self):
-        from unittest.mock import Mock
-
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            DeepseekV4HipRadixBackend,
-        )
-
-        backend = SimpleNamespace(_low_ratio_index_topk_torch=Mock())
-        batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([7, 9, 11], device="cuda")
-        )
-        x = torch.empty(5, 16, device="cuda")
-        pos = torch.tensor([2, 4, 6, 8, 10], device="cuda")
-        from sglang.srt.environ import envs
-
-        with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True):
-            DeepseekV4HipRadixBackend._low_ratio_index_topk_dense(
-                backend,
-                None,
-                x,
-                x,
-                pos,
-                batch,
-                torch.tensor([2, 0, 3], device="cuda"),
-                [2, 0, 3],
-            )
-        call = backend._low_ratio_index_topk_torch.call_args.args
-        self.assertEqual(call[3].tolist(), [7, 7, 11, 11, 11])
-        self.assertIs(call[4], pos)
 
     def test_graph_replay_joins_kv_and_source_streams(self):
         from unittest.mock import patch

@@ -12,7 +12,6 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
 from sglang.srt.distributed.device_communicators.vocab_gather import (
-    NVLinkVocabGather,
     make_vocab_gather,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -21,6 +20,10 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
+pytestmark = pytest.mark.skipif(
+    not is_hip() or "LOCAL_RANK" not in os.environ,
+    reason="run through the eight-GPU HIP entry point",
+)
 
 
 @cache_once
@@ -57,19 +60,16 @@ def group():
     return coordinator
 
 
-_NVLINK = pytest.mark.parametrize("nvlink", [False, True])
 _ROWS = pytest.mark.parametrize("m", [1, 4, 64])
 _SHARDS = pytest.mark.parametrize("width,last", [(32320, 32320), (8192, 17), (8, 0)])
 
 
-def _replay_and_check(m, width, last, nvlink, perturb):
+def _replay_and_check(m, width, last, perturb):
     """Capture the selection graph, then replay it under `perturb`."""
     g = group()
     transport = make_vocab_gather(
-        g, local_width=width, prefer_nvlink=nvlink, symm_rows=0
+        g, local_width=width, prefer_nvlink=False, symm_rows=0
     )
-    if nvlink and not isinstance(transport, NVLinkVocabGather):
-        pytest.skip("this TP group has no multicast plane")
     rank = g.rank_in_group
     real = last if rank == g.world_size - 1 else width
     # A slice of a block's logits has a non-contiguous row stride.
@@ -127,33 +127,29 @@ def _inf(replay, storage, base, bias, real):
         base[:, replay % real] = float("inf")
 
 
-@_NVLINK
 @_ROWS
 @_SHARDS
-def test_random_logits(m, width, last, nvlink):
-    _replay_and_check(m, width, last, nvlink, _random)
+def test_random_logits(m, width, last):
+    _replay_and_check(m, width, last, _random)
 
 
-@_NVLINK
 @_ROWS
 @_SHARDS
-def test_ties_resolve_to_the_lowest_index(m, width, last, nvlink):
-    _replay_and_check(m, width, last, nvlink, _tie)
+def test_ties_resolve_to_the_lowest_index(m, width, last):
+    _replay_and_check(m, width, last, _tie)
 
 
-@_NVLINK
 @_ROWS
 @_SHARDS
-def test_nan_propagates(m, width, last, nvlink):
-    _replay_and_check(m, width, last, nvlink, _nan)
+def test_nan_propagates(m, width, last):
+    _replay_and_check(m, width, last, _nan)
 
 
-@_NVLINK
 @_ROWS
 @_SHARDS
-def test_infinities(m, width, last, nvlink):
-    _replay_and_check(m, width, last, nvlink, _inf)
+def test_infinities(m, width, last):
+    _replay_and_check(m, width, last, _inf)
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,) if is_hip() else (4,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))

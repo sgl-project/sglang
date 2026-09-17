@@ -18,10 +18,9 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     rmsnorm_fake_quant_fp8,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
@@ -54,6 +53,7 @@ def _ulp(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 SHAPES = [(1, 5120), (33, 5120)]
 
 
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
 class TestRmsnormFakeQuantFp8(CustomTestCase):
     def _make(self, m, k):
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 2
@@ -145,6 +145,7 @@ def _silu_mul_clamp_reference(gate_up: torch.Tensor, limit: float) -> torch.Tens
     return (torch.nn.functional.silu(g) * u).to(gate_up.dtype)
 
 
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
 class TestSiluAndMulClampTriton(CustomTestCase):
     def test_matches_torch_form(self):
         torch.manual_seed(0)
