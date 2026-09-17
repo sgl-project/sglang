@@ -7,6 +7,7 @@ import torch
 from sglang.srt.lora.backend.base_backend import (
     BaseLoRABackend,
     _compute_moe_lora_info,
+    _compute_token_lora_mapping,
 )
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
@@ -123,6 +124,57 @@ def test_compute_moe_lora_info_cpu_fallback_normalizes_inactive_slots(
     assert actual_mapping.tolist() == expected_mapping
     assert actual_enabled.tolist() == expected_enabled
     assert mapping_buffer[6:].tolist() == [-1, -1, -1]
+
+
+@pytest.mark.parametrize("mode", ["legacy", "mapping_only"])
+def test_token_mapping_reuse_clears_padding_and_optional_mask(mode):
+    storage = torch.full((516,), 777, dtype=torch.int32, device=DEVICE)
+    mask, mapping_storage = storage[:4], storage[4:]
+    mask.fill_(13)
+    cases = (
+        ([257, 0, 7], [1, 2, 3], [0, 16, 8, 4]),
+        ([1, 0, 3], [2, 1, 0], [0, 0, 8, 0]),
+        ([2, 1], [1, 3], [0, 0, 0, 0]),
+        ([0, 0], [1, 2], [0, 16, 8, 4]),
+        ([], [], [0, 16, 8, 4]),
+    )
+    for lengths, slots, ranks in cases:
+        pointers = [0]
+        expected = []
+        for length, slot in zip(lengths, slots):
+            pointers.append(pointers[-1] + length)
+            expected.extend([slot if ranks[slot] > 0 else -1] * length)
+        indptr = torch.tensor(pointers, dtype=torch.int32, device=DEVICE)
+        assignments = torch.tensor(slots, dtype=torch.int32, device=DEVICE)
+        rank_tensor = torch.tensor(ranks, dtype=torch.int32, device=DEVICE)
+        common = dict(max_len=max(lengths, default=0), bucket_len=512)
+        if mode == "mapping_only":
+            actual = _compute_token_lora_mapping(
+                len(expected),
+                indptr,
+                rank_tensor,
+                assignments,
+                mapping_storage,
+                **common,
+            )
+        else:
+            _, actual = _compute_moe_lora_info(
+                len(expected),
+                indptr,
+                rank_tensor,
+                assignments,
+                mask,
+                mapping_storage,
+                **common,
+            )
+        assert actual.tolist() == expected
+        assert mapping_storage[len(expected) :].tolist() == [-1] * (512 - len(expected))
+        if mode == "legacy":
+            assert mask.tolist() == [
+                int(i in slots and rank > 0) for i, rank in enumerate(ranks)
+            ]
+        else:
+            assert mask.tolist() == [13] * 4
 
 
 def test_moe_graph_metadata_uses_matching_static_buffers():

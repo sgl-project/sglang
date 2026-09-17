@@ -8,25 +8,25 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
-from sglang.srt.lora.moe.base_gemm_provider.base import (
-    MoeBaseProvider,
-    admit_weight_layout,
-)
-from sglang.srt.lora.moe.kernels.activation_delta import (
+from sglang.kernels.ops.lora.moe.activation_delta import (
     act_delta_contiguous,
 )
-from sglang.srt.lora.moe.kernels.dispatch_contiguous import (
+from sglang.kernels.ops.lora.moe.dispatch_contiguous import (
     contiguous_m_pad_ceiling,
     dispatch_fill_rows_contiguous_bf16,
     dispatch_layout_contiguous,
 )
-from sglang.srt.lora.moe.kernels.fused_act import (
+from sglang.kernels.ops.lora.moe.fused_act import (
     fused_b_act_contiguous,
+)
+from sglang.srt.lora.moe.base_gemm_provider.base import (
+    MoeBaseProvider,
+    admit_weight_layout,
 )
 from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.route_view import RouteView
+    from sglang.kernels.ops.lora.common.route_view import RouteView
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
@@ -36,7 +36,7 @@ class ContiguousRowState(msgspec.Struct, kw_only=True):
     seg_offsets: torch.Tensor  # [E_local + 1] int32 first row of each segment
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32 compact rows
     m_pad_ceiling: int
-    retained_inputs: bool
+    input_buffer_reuse: bool
     # Quantized activation and scales for the down GEMM.
     act_quant: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -133,12 +133,12 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             seg_offsets=seg_offsets,
             pair_to_row=pair_to_row,
             m_pad_ceiling=m_pad_ceiling,
-            retained_inputs=workspace is not None,
+            input_buffer_reuse=workspace is not None,
         )
 
     def release_prepared_inputs(self, row_state: ContiguousRowState) -> None:
         # Workspace buffers retain their addresses for graph replay.
-        if row_state.retained_inputs or row_state.hidden_compact is None:
+        if row_state.input_buffer_reuse or row_state.hidden_compact is None:
             return
         from sglang.srt.utils import dispose_tensor
 

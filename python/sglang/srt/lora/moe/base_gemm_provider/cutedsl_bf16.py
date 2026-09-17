@@ -4,6 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.lora.moe.dispatch_masked_small import (
+    small_masked_prepare,
+    small_masked_prepare_applies,
+)
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProviderContract,
     expected_rows_per_expert,
@@ -16,6 +20,8 @@ from sglang.srt.lora.moe.base_gemm_provider.cutedsl_common import CuteDslTileMix
 from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
     MaskedRowState,
+    masked_m_max,
+    prepare_buffer,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
@@ -69,6 +75,12 @@ class _CuteDslBf16Mixin(CuteDslTileMixin):
             row_state.gemm2_tiles,
         )
 
+    def down_output(self, row_state, workspace: LoraWorkspace) -> torch.Tensor:
+        # Gate/up has finished reading the prepared rows before down starts.
+        if row_state.input_buffer_reuse:
+            return self._input_rows(row_state)
+        return super().down_output(row_state, workspace)
+
 
 class CuteDslBf16MaskedRowState(MaskedRowState, kw_only=True):
     token_width: int
@@ -93,8 +105,8 @@ class CuteDslBf16MaskedProvider(_CuteDslBf16Mixin, MaskedRowDomainProvider):
 
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
         super().__init__(quant_info)
-        from sglang.srt.lora.moe.kernels.cutedsl.api import prepare_masked_bf16
-        from sglang.srt.lora.moe.kernels.cutedsl.schedule_builder import (
+        from sglang.kernels.ops.lora.moe.cutedsl.api import prepare_masked_bf16
+        from sglang.kernels.ops.lora.moe.cutedsl.schedule_builder import (
             build_dual_stage_schedules_masked,
             dual_stage_schedule_capacities_masked,
         )
@@ -132,16 +144,8 @@ class CuteDslBf16MaskedProvider(_CuteDslBf16Mixin, MaskedRowDomainProvider):
     def _group_arg(row_state: CuteDslBf16MaskedRowState) -> torch.Tensor:
         return row_state.masked_m
 
-    def prepare(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        top_k: int,
-        workspace: LoraWorkspace | None = None,
-    ) -> CuteDslBf16MaskedRowState:
-        base = super().prepare(hidden_states, topk_ids, top_k, workspace)
-        token_width = self._token_width_for(base.m_max, base.expected_m)
-        geometry = dict(
+    def _masked_geometry(self, token_width: int) -> dict:
+        return dict(
             token_width=token_width,
             n_gemm1=self.gate_up_slices * self.quant_info.intermediate_size,
             n_gemm2=self.quant_info.hidden_size,
@@ -149,6 +153,81 @@ class CuteDslBf16MaskedProvider(_CuteDslBf16Mixin, MaskedRowDomainProvider):
             cluster_shape_mn=self.CLUSTER_SHAPE_MN,
             use_2cta_instrs=self.USE_2CTA_INSTRS,
         )
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        workspace: LoraWorkspace | None = None,
+    ) -> CuteDslBf16MaskedRowState:
+        num_pairs = topk_ids.numel()
+        if small_masked_prepare_applies(hidden_states.size(0), num_pairs):
+            # Prepare rows, pair map and both schedules in one launch.
+            num_experts = self.quant_info.num_local_experts
+            m_max = masked_m_max(hidden_states.size(0))
+            expected_m = expected_rows_per_expert(num_pairs, num_experts)
+            token_width = self._token_width_for(m_max, expected_m)
+            geometry = self._masked_geometry(token_width)
+            device = hidden_states.device
+            masked_m = prepare_buffer(
+                workspace,
+                "masked:masked_m",
+                (num_experts,),
+                dtype=torch.int32,
+                device=device,
+            )
+            pair_to_row = prepare_buffer(
+                workspace,
+                "masked:pair_to_row",
+                (num_pairs,),
+                dtype=torch.int32,
+                device=device,
+            )
+            hidden_permuted = prepare_buffer(
+                workspace,
+                "masked:hidden_permuted",
+                (num_experts, m_max, hidden_states.size(1)),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            outputs = self._small_prepare_outputs(
+                workspace,
+                f"cutedsl_masked:tw{token_width}",
+                self._schedule_capacities(
+                    num_experts=num_experts, m_max=m_max, **geometry
+                ),
+                num_experts,
+                device,
+            )
+            small_masked_prepare(
+                hidden_states,
+                topk_ids,
+                top_k,
+                masked_m_out=masked_m,
+                pair_to_row_out=pair_to_row,
+                rows_out=hidden_permuted,
+                token_width=token_width,
+                out_clusters1=self._output_clusters(geometry["n_gemm1"]),
+                out_clusters2=self._output_clusters(geometry["n_gemm2"]),
+                **outputs,
+            )
+            return CuteDslBf16MaskedRowState(
+                hidden_permuted=hidden_permuted,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                pair_to_row=pair_to_row,
+                m_max=m_max,
+                input_buffer_reuse=workspace is not None,
+                token_width=token_width,
+                gemm1_schedule=outputs["schedule1_out"],
+                gemm1_tiles=outputs["tiles1_out"],
+                gemm2_schedule=outputs["schedule2_out"],
+                gemm2_tiles=outputs["tiles2_out"],
+            )
+        base = super().prepare(hidden_states, topk_ids, top_k, workspace)
+        token_width = self._token_width_for(base.m_max, base.expected_m)
+        geometry = self._masked_geometry(token_width)
         schedule_outputs = {}
         if workspace is not None:
             schedule_outputs = self._schedule_buffers(
@@ -168,7 +247,7 @@ class CuteDslBf16MaskedProvider(_CuteDslBf16Mixin, MaskedRowDomainProvider):
             expected_m=base.expected_m,
             pair_to_row=base.pair_to_row,
             m_max=base.m_max,
-            retained_inputs=base.retained_inputs,
+            input_buffer_reuse=base.input_buffer_reuse,
             token_width=token_width,
             gemm1_schedule=schedule1,
             gemm1_tiles=tiles1,
@@ -204,8 +283,8 @@ class CuteDslBf16ContiguousProvider(_CuteDslBf16Mixin, ContiguousRowDomainProvid
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
         super().__init__(quant_info, m_alignment=self.M_ALIGNMENT)
 
-        from sglang.srt.lora.moe.kernels.cutedsl.api import prepare_contiguous_bf16
-        from sglang.srt.lora.moe.kernels.cutedsl.schedule_builder import (
+        from sglang.kernels.ops.lora.moe.cutedsl.api import prepare_contiguous_bf16
+        from sglang.kernels.ops.lora.moe.cutedsl.schedule_builder import (
             build_dual_stage_schedules_contiguous,
             dual_stage_schedule_capacities_contiguous,
             validate_tile_geometry_contiguous,
@@ -295,7 +374,7 @@ class CuteDslBf16ContiguousProvider(_CuteDslBf16Mixin, ContiguousRowDomainProvid
             seg_offsets=base.seg_offsets,
             pair_to_row=base.pair_to_row,
             m_pad_ceiling=base.m_pad_ceiling,
-            retained_inputs=base.retained_inputs,
+            input_buffer_reuse=base.input_buffer_reuse,
             token_width=token_width,
             gemm1_schedule=schedule1,
             gemm1_tiles=tiles1,
