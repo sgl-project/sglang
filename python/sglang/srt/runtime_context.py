@@ -122,7 +122,6 @@ _LIVE_READS: dict = {
     # on its timeline: what it was built at, what it has room for, and what is
     # serving now. They are one number until an elastic scale-up moves the
     # third one, which is why each of them has to say which it is.
-    "world_size": "get_world_size",
     "launch_world_size": "get_world_size",
     "max_world_size": lambda self: self.max_ep_size or self.launch_world_size,
     "world_rank": "get_world_rank",
