@@ -6,6 +6,11 @@ import math
 import torch
 from torch import nn
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_complex_rope,
+    fused_complex_rope,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -26,7 +31,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -81,8 +90,16 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
 
 
 def apply_rope(x, rope):
+    fused = None
+    if can_use_fused_complex_rope(x, rope) and _ROPE_FUSION.can_attempt_once():
+        fused = fused_complex_rope(x, rope)
+        if _ROPE_FUSION.verified:
+            return fused
     z = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
+    out = torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
+    if fused is not None:
+        return _ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
+    return out
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):

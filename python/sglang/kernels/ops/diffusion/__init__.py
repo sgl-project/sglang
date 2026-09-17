@@ -279,6 +279,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired in-place Helios transposed Q/K RoPE.",
     ),
     (
+        "diffusion.complex_rope",
+        KernelBackend.TRITON,
+        "rope.complex_rope_triton:fused_complex_rope",
+        _CUDA,
+        "Paired RoPE preserving PyTorch complex64 multiplication rounding.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
@@ -501,6 +508,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    "can_use_fused_complex_rope": "rope.complex_rope_triton",
+    "fused_complex_rope": "rope.complex_rope_triton",
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
