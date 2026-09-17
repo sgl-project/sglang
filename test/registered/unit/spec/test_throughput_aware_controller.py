@@ -171,7 +171,7 @@ class TestThroughputAwareController(unittest.TestCase):
         batch = SimpleNamespace(reqs=[SimpleNamespace(is_retracted=True)])
         tokens = namespace["_resolve_spec_v2_tokens"](processor, result, batch)
         self.assertEqual(tokens, [[10, 11]])
-        self.assertEqual(controller.params._batch_count, 1)
+        self.assertEqual(controller.params._batches_since_reevaluation, 1)
         self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
 
     def test_batch_change_selects_captured_state_before_tracker_warmup(self):
@@ -179,7 +179,7 @@ class TestThroughputAwareController(unittest.TestCase):
         # BS=5 pads to the captured BS=8, whose only allowed step is 1.
         controller.activate_step_by_batch(5)
         self.assertEqual(controller.worker.speculative_num_steps, 1)
-        self.assertEqual(controller.params._batch_count, 0)
+        self.assertEqual(controller.params._batches_since_reevaluation, 0)
 
     def test_profile_plan_uses_resolved_buckets_and_request_limit(self):
         controller = self.make_controller(profile_run_batch_sizes=[1, 2, 4, 8, 16])
@@ -226,7 +226,7 @@ class TestThroughputAwareController(unittest.TestCase):
         self.assertEqual(factory.call_count, 4)
         self.assertEqual(controller.params._cost_table.lookup(4, 3), 2.5)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
-        self.assertEqual(controller.params._batch_count, 0)
+        self.assertEqual(controller.params._batches_since_reevaluation, 0)
 
 
 if __name__ == "__main__":
