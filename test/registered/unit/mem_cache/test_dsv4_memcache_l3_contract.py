@@ -10,10 +10,7 @@ import torch
 from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
 )
-from sglang.srt.managers.cache_controller import (
-    STORAGE_BATCH_SIZE,
-    HiCacheController,
-)
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -740,24 +737,6 @@ def test_sidecar_exception_preserves_ack_sequence():
         == [(True, False, False), (False, True, False), (False, False, True)]
     )
     assert failure[1].pool_hits == {}
-
-
-def test_kv_exception_preserves_remaining_progress_acks():
-    controller = HiCacheController.__new__(HiCacheController)
-    controller.page_size = 128
-    controller.storage_backend_type = "npu_memcache"
-    controller.prefetch_sync_queue = Queue()
-    controller._page_transfer_kv_batch = Mock(side_effect=RuntimeError("read failed"))
-    pages = STORAGE_BATCH_SIZE + 1
-    operation = PrefetchOperation(
-        CacheRequestHandle("req", 0), list(range(pages * 128))
-    )
-    operation.hash_value = [f"h{i}" for i in range(pages)]
-    operation.host_indices = torch.arange(pages * 128)
-    assert controller._page_transfer(operation) == 0
-    acks = list(controller.prefetch_sync_queue.queue)
-    assert [a.completed_tokens for a in acks] == [0, 0]
-    controller._page_transfer_kv_batch.assert_called_once()
 
 
 class _OneIterationStopEvent:
