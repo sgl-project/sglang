@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//! Routing strategies and their shared selection workflow.
+//!
+//! Request handling enters `selection`; policies supply pair preferences or an
+//! evaluated cache decision. `admission` owns shared constraints, while worker
+//! observations and KV indexing live outside the policy layer.
+
 pub mod admission;
 pub mod affinity;
 pub mod balancing;
@@ -14,6 +20,7 @@ use crate::discovery::ModelId;
 use crate::kv_events::PrefixSignal;
 use crate::policies::admission::EligibilityFilter;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::cache_aware::CacheSelection;
 use crate::policies::scoring::ScoringPolicy;
 use crate::server::metrics::MetricsRegistry;
 use crate::workers::engine_reports::EngineSnapshot;
@@ -21,10 +28,19 @@ use crate::workers::Worker;
 use dashmap::DashMap;
 use std::sync::Arc;
 
+/// Whether a routing attempt may consult or create affinity assignments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffinityAccess {
+    Disabled,
+    LookupOnly,
+    LookupAndAssign,
+}
+
 /// Immutable request data consumed by a routing policy.
 #[derive(Clone)]
 pub struct SelectionContext<'a> {
     model: &'a ModelId,
+    routable_fleet: Option<&'a [Arc<Worker>]>,
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
     session_id: Option<&'a str>,
@@ -34,14 +50,14 @@ pub struct SelectionContext<'a> {
     external_prefix: Option<&'a PrefixSignal>,
     load_snapshot: Option<&'a EngineSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
-    affinity_lookup_enabled: bool,
-    affinity_assignment_enabled: bool,
+    affinity_access: AffinityAccess,
 }
 
 impl<'a> SelectionContext<'a> {
     pub fn new(model: &'a ModelId, request_body: Option<&'a [u8]>) -> Self {
         Self {
             model,
+            routable_fleet: None,
             request_body,
             routing_key: None,
             session_id: None,
@@ -51,8 +67,7 @@ impl<'a> SelectionContext<'a> {
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
-            affinity_lookup_enabled: true,
-            affinity_assignment_enabled: true,
+            affinity_access: AffinityAccess::LookupAndAssign,
         }
     }
 
@@ -63,6 +78,7 @@ impl<'a> SelectionContext<'a> {
     ) -> Self {
         Self {
             model,
+            routable_fleet: None,
             request_body,
             routing_key,
             session_id: None,
@@ -72,8 +88,7 @@ impl<'a> SelectionContext<'a> {
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
-            affinity_lookup_enabled: true,
-            affinity_assignment_enabled: true,
+            affinity_access: AffinityAccess::LookupAndAssign,
         }
     }
 
@@ -123,17 +138,32 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Disables affinity lookup and assignment.
-    pub fn without_affinity_lookup(mut self) -> Self {
-        self.affinity_lookup_enabled = false;
-        self.affinity_assignment_enabled = false;
+    pub fn with_affinity_access(mut self, access: AffinityAccess) -> Self {
+        self.affinity_access = access;
         self
     }
 
-    /// Enables affinity lookup without recording new assignments.
-    pub fn without_affinity_assignment(mut self) -> Self {
-        self.affinity_assignment_enabled = false;
+    /// Disables affinity lookup and assignment.
+    pub fn without_affinity_lookup(mut self) -> Self {
+        self.affinity_access = AffinityAccess::Disabled;
         self
+    }
+
+    /// Disables assignment without re-enabling a disabled lookup.
+    pub fn without_affinity_assignment(mut self) -> Self {
+        if self.affinity_access != AffinityAccess::Disabled {
+            self.affinity_access = AffinityAccess::LookupOnly;
+        }
+        self
+    }
+
+    pub fn with_routable_fleet(mut self, workers: &'a [Arc<Worker>]) -> Self {
+        self.routable_fleet = Some(workers);
+        self
+    }
+
+    pub fn routable_fleet(&self) -> Option<&[Arc<Worker>]> {
+        self.routable_fleet
     }
 
     pub fn model(&self) -> &ModelId {
@@ -177,11 +207,11 @@ impl<'a> SelectionContext<'a> {
     }
 
     pub fn affinity_lookup_enabled(&self) -> bool {
-        self.affinity_lookup_enabled
+        self.affinity_access != AffinityAccess::Disabled
     }
 
     pub fn affinity_assignment_enabled(&self) -> bool {
-        self.affinity_assignment_enabled
+        self.affinity_access == AffinityAccess::LookupAndAssign
     }
 }
 
@@ -198,65 +228,23 @@ pub struct SelectionProposal {
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
 
-/// Cache-Aware prefill candidate where `E = L - H`.
+/// A pair for shared admission, or a completed cache evaluation with fallback audit.
 #[derive(Clone)]
-pub struct CacheCandidate {
-    pub worker: Arc<Worker>,
-    pub matched_prefix_tokens: u64,
-    pub uncached_tokens: u64,
-    /// Matched prefix length in blocks, as reported by the prefix signal.
-    /// Selection reads `matched_prefix_tokens`; the block count exists for
-    /// observability (the diverted-overlap histogram reads against the
-    /// tree/indexer block domain).
-    pub matched_prefix_blocks: u32,
-    /// Domain containing this candidate.
-    pub candidate_range_id: String,
-    /// Optional pending prefill limit checked against `E`.
-    pub max_pending_prefill_tokens: Option<u64>,
-}
-
-/// Bounded set of Cache-Aware candidates.
-#[derive(Clone, Default)]
-pub struct CacheCandidateProposal {
-    pub candidates: Vec<CacheCandidate>,
-    pub cache_switch_margin_tokens: u64,
-    pub enable_pressure_guard: bool,
-    pub pressure_abs_threshold_tokens: u64,
-    pub pressure_abs_threshold_ms: Option<f64>,
-    pub pressure_rel_threshold: f64,
-    /// Queue gate: a candidate whose engine reports at least this many
-    /// waiting requests cannot win on cache affinity. `None` disables the
-    /// gate. See [`crate::config::AffinityConfig::worker_queue_limit`].
-    pub worker_queue_limit: Option<u64>,
-    /// Saturation pin: when no candidate survives the gate and hard
-    /// admission, at least one was queue-gate-rejected, and no worker in
-    /// the routable fleet has a fresh queue reading strictly below this
-    /// floor, the request pins to the least-pressured rejected prefix
-    /// owner instead of diverting — the diversion cannot dodge a wait and
-    /// would forfeit the matched prefix. `None` disables the pin. See
-    /// [`crate::config::AffinityConfig::saturation_queue_floor`].
-    pub saturation_queue_floor: Option<u64>,
-}
-
-/// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
-#[derive(Clone)]
-pub enum PrefillProposal {
+pub enum PrefillEvaluation {
     Pair(SelectionProposal),
-    CacheCandidates(CacheCandidateProposal),
+    Cache(CacheSelection),
 }
 
-impl PrefillProposal {
-    /// Applies eligibility filtering to either proposal form.
+impl PrefillEvaluation {
+    /// Carries the eligible fallback pool; cache evaluations already used this pool.
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
             Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
-            Self::CacheCandidates(mut proposal) => {
-                proposal.candidates.retain(|candidate| {
-                    workers
-                        .iter()
-                        .any(|worker| worker.id == candidate.worker.id)
-                });
-                Self::CacheCandidates(proposal)
+            Self::Cache(selection) => {
+                debug_assert!(selection.candidates.iter().all(|candidate| workers
+                    .iter()
+                    .any(|worker| worker.id == candidate.worker.id)));
+                Self::Cache(selection)
             }
         }
     }
@@ -332,9 +320,11 @@ impl Default for GuardHints {
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
+    /// Returns an unconstrained preference. Request routing uses the workflow
+    /// to apply admission, domain fallback, and final affinity commitment.
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
 
-    /// Produces a primary worker and an optional backup.
+    /// Produces a provisional pair, including for affinity probes.
     fn propose(
         &self,
         workers: &[Arc<Worker>],
@@ -343,13 +333,14 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         self.select(workers, ctx).map(SelectionProposal::primary)
     }
 
-    /// Produces a prefill proposal, including cache-aware candidate sets.
-    fn propose_prefill(
+    /// Evaluates prefill routing. Cache policies resolve their own candidates;
+    /// pair proposals enter shared admission in the routing workflow.
+    fn evaluate_prefill(
         &self,
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
-    ) -> Option<PrefillProposal> {
-        self.propose(workers, ctx).map(PrefillProposal::Pair)
+    ) -> Option<PrefillEvaluation> {
+        self.propose(workers, ctx).map(PrefillEvaluation::Pair)
     }
 
     /// Commits policy-owned affinity state after choosing the final prefill worker.
@@ -377,7 +368,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     }
 
     /// Whether this policy resolves an affinity primary within its candidate range.
-    fn is_bucket_affinity_policy(&self) -> bool {
+    fn resolves_affinity_in_range(&self) -> bool {
         false
     }
 
@@ -444,6 +435,7 @@ impl PolicyRegistry {
 pub(crate) mod test_support {
     use super::*;
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::cache_aware::CacheCandidate;
     use crate::workers::engine_reports::NativeCacheWorkerLoad;
     use std::collections::HashMap;
     use std::time::Instant;
@@ -522,6 +514,16 @@ mod proposal_tests {
     use crate::policies::test_support::worker;
     use crate::policies::*;
     #[test]
+    fn disabling_assignment_does_not_reenable_affinity_lookup() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None)
+            .without_affinity_lookup()
+            .without_affinity_assignment();
+        assert!(!ctx.affinity_lookup_enabled());
+        assert!(!ctx.affinity_assignment_enabled());
+    }
+
+    #[test]
     fn only_step_one_policies_opt_into_shared_prefill_admission() {
         assert!(PowerOfTwoChoicesPolicy::new().uses_shared_prefill_admission());
         assert!(SessionAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
@@ -545,10 +547,10 @@ mod proposal_tests {
         let ctx = SelectionContext::new(&model, None);
 
         let proposal = policy
-            .propose_prefill(&workers, &ctx)
+            .evaluate_prefill(&workers, &ctx)
             .expect("P2 must produce a prefill proposal");
 
-        let PrefillProposal::Pair(pair) = proposal else {
+        let PrefillEvaluation::Pair(pair) = proposal else {
             panic!("existing policies must use the pair adapter");
         };
         assert_eq!(pair.kind, ProposalKind::PowerOfTwo);

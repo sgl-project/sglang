@@ -201,7 +201,6 @@ fn pick_prefill_worker(
             .map(|config| config.session_affinity_mode)
             .unwrap_or(SessionAffinityMode::Bucket),
         worker_queue_limit: affinity.and_then(|config| config.worker_queue_limit),
-        saturation_queue_floor: affinity.and_then(|config| config.saturation_queue_floor),
     })
     .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
 }
