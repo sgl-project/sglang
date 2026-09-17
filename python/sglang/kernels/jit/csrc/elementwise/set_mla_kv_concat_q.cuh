@@ -325,10 +325,10 @@ struct SetMlaKVConcatQFp8Params {
   int32_t qo_stride_1;
 };
 
-// 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn NOSAT (matches aten: overflow -> NaN).
+// 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn.satfinite.
 SGL_DEVICE uint16_t bf16x2_to_fp8x2(const bf16x2_t v) {
   const float2 f = __bfloat1622float2(v);
-  return __nv_cvt_float2_to_fp8x2(f, __NV_NOSAT, __NV_E4M3);
+  return __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
 }
 
 // Convert 8 bf16 (one int4 load) to 8 fp8 packed in a uint2.

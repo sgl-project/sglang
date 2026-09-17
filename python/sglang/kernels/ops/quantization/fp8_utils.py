@@ -12,6 +12,14 @@ from sglang.kernels.jit.utils import (
 )
 
 
+def to_fp8_satfinite(x: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+    """Cast to an fp8 dtype with satfinite semantics: finite values beyond the
+    format's range clamp to +-finfo.max (448 for e4m3fn); NaN stays NaN.
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    return x.clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+
 def cuda_capability_uses_fp8_e4b15(cuda_capability: Tuple[int, int]) -> bool:
     """Triton names E4M3 as fp8e4b15 on CUDA architectures before SM89."""
     return cuda_capability < (8, 9)
