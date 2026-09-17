@@ -35,8 +35,6 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    get_dsv4_c4_state_indices,
-    get_dsv4_c128_state_indices,
     get_qsa_pending_state_indices,
     setup_state_kv_args,
     should_send_replicated_state,
@@ -45,6 +43,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    c4_state_transfer_indices,
+    request_scoped_state_transfer_indices,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
@@ -775,8 +777,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
 class TestDSV4C4StateIndices(unittest.TestCase):
     def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
         # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
-        src = get_dsv4_c4_state_indices(2, 13, ring_size=8)
-        dst = get_dsv4_c4_state_indices(2, 13, ring_size=16)
+        src = c4_state_transfer_indices(2, 13, ring_size=8)
+        dst = c4_state_transfer_indices(2, 13, ring_size=16)
 
         np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
         np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
@@ -784,49 +786,57 @@ class TestDSV4C4StateIndices(unittest.TestCase):
 
     def test_ring_wrap_preserves_position_order(self):
         np.testing.assert_array_equal(
-            get_dsv4_c4_state_indices(0, 10, ring_size=8),
+            c4_state_transfer_indices(0, 10, ring_size=8),
             np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
         )
 
     def test_short_and_empty_sequences(self):
         np.testing.assert_array_equal(
-            get_dsv4_c4_state_indices(3, 3, ring_size=8),
+            c4_state_transfer_indices(3, 3, ring_size=8),
             np.array([24, 25, 26], dtype=np.int32),
         )
         np.testing.assert_array_equal(
-            get_dsv4_c4_state_indices(3, 0, ring_size=8),
+            c4_state_transfer_indices(3, 0, ring_size=8),
             np.empty((0,), dtype=np.int32),
         )
 
     def test_invalid_ring_size_is_rejected(self):
         with self.assertRaises(ValueError):
-            get_dsv4_c4_state_indices(0, 8, ring_size=4)
+            c4_state_transfer_indices(0, 8, ring_size=4)
         with self.assertRaises(ValueError):
-            get_dsv4_c4_state_indices(0, 8, ring_size=10)
+            c4_state_transfer_indices(0, 8, ring_size=10)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
     def test_online_aligned_boundary_has_no_partial_state(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 256, online=True, ring_size=1),
+            request_scoped_state_transfer_indices(
+                7, 256, ratio=128, online=True, ring_size=1
+            ),
             np.empty((0,), dtype=np.int32),
         )
 
     def test_online_partial_boundary_uses_request_slot(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 257, online=True, ring_size=1),
+            request_scoped_state_transfer_indices(
+                7, 257, ratio=128, online=True, ring_size=1
+            ),
             np.array([7], dtype=np.int32),
         )
 
     def test_offline_aligned_boundary_has_no_partial_state(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 256, online=False, ring_size=128),
+            request_scoped_state_transfer_indices(
+                7, 256, ratio=128, online=False, ring_size=128
+            ),
             np.empty((0,), dtype=np.int32),
         )
 
     def test_offline_partial_boundary_uses_request_local_page(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 129, online=False, ring_size=256),
+            request_scoped_state_transfer_indices(
+                7, 129, ratio=128, online=False, ring_size=256
+            ),
             np.array([15], dtype=np.int32),
         )
 
@@ -855,7 +865,6 @@ def _make_dsv4_target(*, unified, mapping=None):
 
 def _make_dsv4_draft(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
-    pool.compression_ratios = [0, 4, 128]
     pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256

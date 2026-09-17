@@ -77,45 +77,6 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     return get_dsa_mtp_topk_width(hf_config)
 
 
-def get_dsv4_c4_state_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    ring_size: int,
-) -> np.ndarray:
-    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
-    # pair the overlap compressor's live rows by logical token position.
-    if ring_size < 8 or ring_size % 4 != 0:
-        raise ValueError(
-            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
-        )
-
-    seq_len = max(0, int(seq_len))
-    state_len = seq_len % 4 + 4
-    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
-    return rows.astype(np.int32)
-
-
-def get_dsv4_c128_state_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    online: bool,
-    ring_size: int,
-) -> np.ndarray:
-    """Return the PD transfer row/page indices for DSV4 C128 state."""
-    if seq_len == 0 or seq_len % 128 == 0:
-        return np.empty((0,), dtype=np.int32)
-    if online:
-        return np.array([int(req_pool_idx)], dtype=np.int32)
-
-    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
-    pages_per_req = ring_size // 128
-    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
-    return np.array([page], dtype=np.int32)
-
-
 def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     """Return the request-pool row that owns a QSA pending-state ring."""
     req_pool_idx = req.kv.req_pool_idx

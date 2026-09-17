@@ -226,23 +226,54 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    # Per-ratio extra-cache metadata stays as flat fields (copy_metadata and the
+    # CUDA-graph refresh enumerate fields by name); these accessors unify the
+    # read and write paths over the ratio.
+
     def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
-        """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
+        """Slots into the ratio's extra cache, -1 padded: the indexer's top-k for
+        c4, every compressed block up to the position for c128."""
         if compress_ratio == 4:
             return self.c4_sparse_page_indices
-        raise ValueError(f"invalid {compress_ratio=}")
-
-    def sparse_raw_indices(self, compress_ratio: int) -> Optional[torch.Tensor]:
-        """The same top-k as request-local compressed positions, for the sparse
-        prefill workspace; allocated for prefill metadata only."""
-        if compress_ratio == 4:
-            return self.c4_sparse_raw_indices
+        if compress_ratio == 128:
+            return self.c128_page_indices
         raise ValueError(f"invalid {compress_ratio=}")
 
     def sparse_topk_lengths(self, compress_ratio: int) -> torch.Tensor:
         if compress_ratio == 4:
             return self.c4_sparse_topk_lengths
+        if compress_ratio == 128:
+            return self.c128_topk_lengths_clamp1
         raise ValueError(f"invalid {compress_ratio=}")
+
+    def sparse_raw_indices(self, compress_ratio: int) -> Optional[torch.Tensor]:
+        """The top-k as request-local compressed positions, for the sparse
+        prefill workspace; allocated for prefill metadata only. Only the indexer
+        ratios have one (c128 remaps its page indices instead)."""
+        if compress_ratio == 4:
+            return self.c4_sparse_raw_indices
+        raise ValueError(f"invalid {compress_ratio=}")
+
+    def set_sparse_topk(
+        self,
+        compress_ratio: int,
+        *,
+        page_indices: torch.Tensor,
+        topk_lengths: torch.Tensor,
+        raw_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Writer counterpart of the accessors above (test fixtures seed through it)."""
+        if compress_ratio == 4:
+            self.c4_sparse_page_indices = page_indices
+            self.c4_sparse_topk_lengths = topk_lengths
+            if raw_indices is not None:
+                self.c4_sparse_raw_indices = raw_indices
+        elif compress_ratio == 128:
+            assert raw_indices is None, "c128 has no raw top-k"
+            self.c128_page_indices = page_indices
+            self.c128_topk_lengths_clamp1 = topk_lengths
+        else:
+            raise ValueError(f"invalid {compress_ratio=}")
 
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
@@ -1856,16 +1887,12 @@ class DeepseekV4AttnBackend(
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
-            if compress_ratio == 4:
+            if compress_ratio != 0:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                     compress_ratio
                 )
-            elif compress_ratio == 128:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                extra_indices = core_attn_metadata.c128_page_indices
-                extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
             swa_page_size = token_to_kv_pool.swa_page_size
             assert swa_k_cache.ndim == 2
