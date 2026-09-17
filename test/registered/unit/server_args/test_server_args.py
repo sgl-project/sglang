@@ -1732,6 +1732,48 @@ class TestHiCacheArgs(unittest.TestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
+        common = {
+            "enable_hierarchical_cache": True,
+            "disaggregation_mode": "prefill",
+            "optimistic_prefill_attempts": 3,
+        }
+        cases = [
+            ({"hicache_write_policy": "write_back"}, 3),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through",
+                },
+                3,
+            ),
+            ({"hicache_write_policy": "write_through"}, 0),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "cache",
+                    "hicache_write_policy": "write_through",
+                },
+                0,
+            ),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through_selective",
+                },
+                0,
+            ),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(model_path="dummy", **common, **overrides)
+                serving_hook.handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
