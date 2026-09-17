@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 @lru_cache(maxsize=None)
 def gvr_available(device: torch.device) -> bool:
@@ -44,6 +46,11 @@ def check_flashinfer_gvr_available(device=None) -> None:
             "flashinfer-gvr requires FlashInfer with hint-free top_k_varlen "
             "backend='gvr_2' and release_gvr2_resources on a supported GPU."
         )
+
+
+@lru_cache(maxsize=None)
+def _device_sms(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 class GvrTopkState:
@@ -217,6 +224,30 @@ def flashinfer_sparse_topk(
         )
         packed[:, : logits.shape[1]].copy_(logits)
         logits = packed
+    if (
+        envs.SGLANG_DSA_GVR_FUSE_OUTPUT.get()
+        and backend == "gvr_2"
+        and page_table is not None
+        and state is None
+        and offsets is None
+        and page_offsets is None
+        and row_starts is None
+        and logits.shape[1] <= 16384
+        and rows <= _device_sms(logits.device)
+    ):
+        # These envelopes route to GVR's register families. Other shapes keep
+        # the existing complete path until the fused backend supports them.
+        return flashinfer.top_k_page_table_transform(
+            logits,
+            page_table,
+            lengths,
+            top_k,
+            page_size=page_size,
+            row_to_batch=row_to_batch,
+            out=out,
+            out_raw_indices=raw_out,
+            backend="gvr_2",
+        )
     raw = (
         torch.empty((rows, top_k), dtype=torch.int32, device=logits.device)
         if raw_out is None

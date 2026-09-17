@@ -746,6 +746,9 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Opt-in FlashInfer GVR page-table epilogue; keep the unfused path available
+    # for comparisons and for shapes not supported by the fused backend.
+    SGLANG_DSA_GVR_FUSE_OUTPUT = EnvBool(False)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
