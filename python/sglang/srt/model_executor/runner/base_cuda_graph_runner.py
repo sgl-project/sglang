@@ -132,6 +132,17 @@ class BaseCudaGraphRunner(BaseRunner):
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        # Publishes the replay-side runner and this batch's metadata around
+        # execute(), which is where CUDA-graph-compatible tensor dumping reads
+        # the raw row counts and the forward mode from. See
+        # sglang.srt.debug_utils.cuda_graph. The seam is inert (a few getattrs
+        # per call) unless DUMPER_CUDA_GRAPH_ENABLE is set.
+        super().__init_subclass__(**kwargs)
+        from sglang.srt.debug_utils.cuda_graph.seams import install_runner_seam
+
+        install_runner_seam(cls)
+
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         """Return the smallest buckets[i] >= raw_size.
