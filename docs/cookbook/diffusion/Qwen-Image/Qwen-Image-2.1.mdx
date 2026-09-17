@@ -250,6 +250,19 @@ two B200s with TP2 plus spatial VAE decode. This setting reduces device memory
 at the cost of host-device transfers; it is not the measured default for the
 consumer-GPU recipes above.
 
+Revision `f1f3366c7c` fixes CPU/GPU initialization rounding in the vision
+encoder's rotary frequencies after device transfer. On one B200, native
+1024px/40-step generation, editing, and transparent output with all-component
+layerwise offload matched resident RGBA pixels exactly. Repeated editing after
+a transparent-generation request also matched. Resident output was unchanged
+from revision `6ee35b52fb`. These checks use FlashAttention, seed 42, and CFG 1.
+
+Revision `81c8c550fa` also preserves the loader's FP8 weights and FP32 rotary
+buffers when moving the whole encoder between CPU and GPU. With that fix,
+`--text-encoder-cpu-offload true` matched resident generation, editing, and
+transparent RGBA pixels for both native precision and the combined serialized
+FP8 export in the same B200 workload, including repeated editing.
+
 The pipeline also supports the shared
 [disaggregated runtime](/docs/sglang-diffusion/disaggregation). The encoder role
 loads both Qwen3-VL and the VAE to prepare reference-image conditioning; nested
@@ -307,8 +320,12 @@ At revision `5a117c9f3f`, DiT-only, encoder-only, and combined exports passed
 1024px/40-step generation, editing, and transparent PNG requests on B200 with
 FlashAttention, seed 42, and CFG 1. The combined export also passed TP2 with
 encoder folding and single-GPU `--layerwise-offload-components all`.
-Offload matched resident generation and transparent output exactly; the edit
-differed at 49.50 dB RGBA PSNR. TP2 also changes numerical results.
+At that revision, offload matched resident generation and transparent output
+exactly, but editing differed at 49.50 dB RGBA PSNR. Revision `f1f3366c7c` fixes
+the vision rotary initialization difference: a new 1024px/40-step comparison
+matched resident generation, editing, and transparent RGBA pixels exactly
+with all-component layerwise offload. Resident outputs were unchanged. TP2
+still changes numerical results.
 
 | Serialized FP8 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
 | --- | --- | --- |

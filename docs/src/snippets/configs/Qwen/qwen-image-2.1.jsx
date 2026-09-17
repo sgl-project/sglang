@@ -122,7 +122,7 @@ const config = {
         },
         {
           id: "serialized_fp8_both", label: "Serialized FP8 DiT + encoder", flags: ['--component-paths.transformer "{{FP8_DIT_PATH}}"', '--component-paths.text_encoder "{{FP8_ENCODER_PATH}}"'],
-          soft: true, softReason: "Exported components passed 1024px/40-step generation, editing, and transparent output on B200, including TP2 and all-component offload. Results are not bit-exact across these modes.",
+          soft: true, softReason: "Exported components passed 1024px/40-step generation, editing, and transparent output on B200. All-component offload matched resident pixels after the vision RoPE fix; TP2 changes numerical results. Validate your exported checkpoint's quality.",
         },
       ],
     },

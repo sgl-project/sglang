@@ -56,8 +56,14 @@ each component and both together. The combined export also passed separate
 checks with TP2 plus encoder folding and with single-GPU all-component
 layerwise offload. The 476 loaded quantized matrices and
 scales matched their checkpoint values. Quantization and TP change numerical
-results; serialized offload also changed editing pixels (49.50 dB RGBA PSNR
-versus resident). See the cookbook for sample quality metrics. Other hardware
+results. Revision `f1f3366c7c` fixes vision rotary initialization rounding during
+CPU/GPU transfer. In 1024px/40-step B200 checks, all-component layerwise offload
+matched resident generation, editing, and transparent RGBA pixels exactly
+for both native precision and the combined serialized export. Revision
+`81c8c550fa` additionally preserves FP8 weights and FP32 buffers during
+whole-encoder CPU offload; separate checks of that mode also matched resident
+pixels. Resident output was unchanged by these fixes. See the cookbook for
+sample quality metrics. Other hardware
 and serialized formats remain unverified. Synthetic Diffusers-format LoRA
 passed dynamic loading, merging,
 and removal on one B200 and TP2 with encoder folding; both removal paths
