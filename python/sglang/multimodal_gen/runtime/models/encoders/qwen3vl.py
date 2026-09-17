@@ -1191,7 +1191,11 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
-    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+    layer_names = [
+        *TextEncoder.layer_names,
+        "model.visual.blocks",
+        "model.visual.deepstack_merger_list",
+    ]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",

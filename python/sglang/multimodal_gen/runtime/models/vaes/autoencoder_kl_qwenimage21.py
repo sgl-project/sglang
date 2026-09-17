@@ -672,6 +672,14 @@ def enable_qwen21_spatial_decode(module):
 
 
 class AutoencoderKLQwenImage21(ParallelTiledVAE):
+    layer_names = [
+        *ParallelTiledVAE.layer_names,
+        "encoder.mid_block.resnets",
+        "encoder.mid_block.attentions",
+        "decoder.mid_block.resnets",
+        "decoder.mid_block.attentions",
+    ]
+
     def __init__(self, config: QwenImage21VAEConfig, **kwargs):
         super().__init__(config, **kwargs)
         ac = config.arch_config
