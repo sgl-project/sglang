@@ -71,8 +71,9 @@ PullPlaneObj::PullPlaneObj(
       mc_workspace() {
   CHECK_HOST(workspaces.size() == world_size) << "Bad pull workspace count";
   CHECK_HOST(semaphores.size() == world_size) << "Bad pull semaphore count";
-  // Either half may be empty (a 0-element tensor); the halves a caller does
-  // own still have to agree on size and device across ranks.
+  // Every half may be empty (a 0-element tensor), including both at once: a
+  // push-only communicator holds such a plane as a placeholder. The halves a
+  // caller does own still have to agree on size and device across ranks.
   auto N = SymbolicSize{"num_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
@@ -87,7 +88,6 @@ PullPlaneObj::PullPlaneObj(
         .with_device(device_sym)
         .verify(semaphores[i]);
   }
-  CHECK_HOST(N.unwrap() > 0 || M.unwrap() > 0) << "A pull plane with neither workspaces nor semaphores is useless";
 
   // only set the value safely after the symbolic size has been verified
   this->num_blocks = static_cast<uint32_t>(M.unwrap());
