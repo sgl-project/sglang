@@ -113,8 +113,6 @@ jobs:
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
               - "test/registered/kernel/diffusion/**"
-              - "test/registered/unit/models/test_flux2_fp8_norm_quant_gate.py"
-              - "test/registered/unit/models/test_qwen_image_fp8_norm_quant.py"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
