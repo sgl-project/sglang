@@ -84,6 +84,17 @@ class CpDecodeAttnTpContext:
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
         return sliced if dim == 0 else sliced.contiguous()
 
+    def _slice_aiter_bpreshuffled_weight(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Slice an AITER B-preshuffled weight along logical K."""
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            unshuffle_aiter_fp8_weight,
+        )
+
+        logical = unshuffle_aiter_fp8_weight(tensor)
+        return shuffle_weight(self._slice(logical, 1), layout=(16, 16))
+
     # ==================== Unified activate/restore ====================
 
     def _activate(self, obj, attr_name: str, dim: int):
@@ -105,7 +116,16 @@ class CpDecodeAttnTpContext:
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            cache = (raw, self._slice(raw, dim), is_param)
+            if (
+                attr_name == "weight"
+                and dim == 1
+                and getattr(obj, "aiter_bpreshuffled", False)
+            ):
+                sliced = self._slice_aiter_bpreshuffled_weight(raw)
+            else:
+                sliced = self._slice(raw, dim)
+            # Cache shards to avoid recomputation and keep CUDA graph pointers stable.
+            cache = (raw, sliced, is_param)
             self._slice_cache[cache_key] = cache
 
         if cache[2]:
