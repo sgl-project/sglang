@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -98,11 +99,13 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    pp_dspark_owned_num_tokens: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_pp_dspark_owned_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -118,6 +121,7 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
+                self.pp_dspark_owned_num_tokens,
             ],
             device=device,
             dtype=dtype,
@@ -134,6 +138,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
+                0,  # pp_dspark_owned_num_tokens
             ],
             device=device,
             dtype=dtype,
@@ -144,6 +149,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_pp_dspark_owned_num_tokens = [self.pp_dspark_owned_num_tokens]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -212,6 +218,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.global_pp_dspark_owned_num_tokens = tp0_info_cpu[:, 8].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -237,6 +244,9 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    batch.global_pp_dspark_owned_num_tokens = (
+        mlp_sync_info.global_pp_dspark_owned_num_tokens
+    )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -248,6 +258,22 @@ def _update_gather_batch(
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
     )
+
+
+def _pp_dspark_owned_num_tokens(
+    local_batch: Optional[ScheduleBatch],
+) -> int:
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or not get_spec().speculative_dspark_pp_replicated_draft
+    ):
+        return 0
+    from sglang.srt.speculative.dspark_components.dspark_pp import draft_owner
+
+    pp_rank = get_parallel().pp_rank
+    pp_size = get_parallel().pp_size
+    return sum(draft_owner(req.rid, pp_size) == pp_rank for req in local_batch.reqs)
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -462,6 +488,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        pp_dspark_owned_num_tokens=_pp_dspark_owned_num_tokens(local_batch),
     )
 
     if dp_size == 1:

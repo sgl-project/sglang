@@ -40,6 +40,13 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_dspark_pp_replicated_draft=False
+                ),
+            ),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
         ):
             result = dp_attn.prepare_mlp_sync_batch_raw(
@@ -66,12 +73,41 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
 
         all_gather.assert_not_called()
         self.assertEqual(result.global_num_tokens, [4])
+        self.assertEqual(result.global_pp_dspark_owned_num_tokens, [0])
         self.assertEqual(result.tbo_split_seq_index, 2)
         self.assertEqual(result.global_forward_mode, ForwardMode.DECODE)
         self.assertEqual(result.recv_skipper_forward_mode, ForwardMode.DECODE)
         self.assertEqual(
             tbo_preparer.compute_output.call_args.args[0].tolist(),
             [[1, ForwardMode.DECODE.value]],
+        )
+
+    def test_pp_dspark_owner_count_is_gathered_with_scheduler_metadata(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[SimpleNamespace(rid=f"request-{i}") for i in range(8)],
+        )
+        with (
+            patch.object(
+                dp_attn,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_dspark_pp_replicated_draft=True
+                ),
+            ),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_rank=1, pp_size=2),
+            ),
+        ):
+            owned = dp_attn._pp_dspark_owned_num_tokens(batch)
+
+        from sglang.srt.speculative.dspark_components.dspark_pp import draft_owner
+
+        self.assertEqual(
+            owned,
+            sum(draft_owner(req.rid, 2) == 1 for req in batch.reqs),
         )
 
 

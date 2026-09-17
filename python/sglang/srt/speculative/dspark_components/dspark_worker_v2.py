@@ -1438,12 +1438,16 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> ScheduleBatch:
         if not self._pp_draft_dp_enabled:
             return batch
-        # Request ownership must stay stable when P/D route to different DP lanes.
-        # Gather the filtered counts so every TP-MoE rank uses matching metadata.
-        local_count = torch.tensor([local_bs], dtype=torch.int64, device=self.device)
-        global_counts = (
-            get_parallel().tp_group.all_gather(local_count, dim=0).to("cpu").tolist()
-        )
+        global_counts = batch.global_pp_dspark_owned_num_tokens
+        if global_counts is None:
+            raise RuntimeError(
+                "PP DSpark requires owner counts from the scheduler DP sync."
+            )
+        if global_counts[self.ps.attn_dp_rank] != local_bs:
+            raise RuntimeError(
+                "PP DSpark owner count does not match the local filtered batch: "
+                f"expected={global_counts[self.ps.attn_dp_rank]}, actual={local_bs}."
+            )
         draft_batch = copy.copy(batch)
         draft_batch.global_num_tokens = global_counts
         draft_batch.global_num_tokens_for_logprob = global_counts
