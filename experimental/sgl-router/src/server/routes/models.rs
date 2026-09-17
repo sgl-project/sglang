@@ -50,6 +50,7 @@ mod tests {
         ctx.config.model = crate::config::ModelConfig {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
