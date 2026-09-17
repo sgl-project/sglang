@@ -74,18 +74,14 @@ class NativeFIAGraphHandler(NpuGraphOpHandler):
     @classmethod
     def prepare_capture(cls, func, args, kwargs):
         ops = torch.ops.batch_invariant_ops
-        out_op = ops.npu_fused_infer_attention_score_batch_invariant.out
+        out_op = npu_fused_infer_attention_score_batch_invariant.out
         # graph.update replaces matching kwargs; include optional lengths too.
         kwargs = dict(kwargs)
         kwargs.setdefault("actual_seq_lengths", None)
         kwargs.setdefault("actual_seq_lengths_kv", None)
         if func is out_op:
             return func, args, kwargs
-        workspace = (
-            ops._npu_fused_infer_attention_score_batch_invariant_get_max_workspace(
-                *args, **kwargs
-            )
-        )
+        workspace = npu_fia_batch_invariant_get_max_workspace(*args, **kwargs)
         keys = [
             "input_layout",
             "quant_scale2",
