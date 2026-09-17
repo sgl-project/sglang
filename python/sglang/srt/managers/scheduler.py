@@ -2879,7 +2879,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if recv_req.pp_prefetch_ticketed:
+        if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
 
