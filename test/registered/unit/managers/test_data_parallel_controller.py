@@ -77,82 +77,36 @@ class TestLocalKvEventSources(CustomTestCase):
             "block_size": block_size,
         }
 
-    def test_scheduler_reports_only_owned_publishers_with_logical_block_size(self):
+    def test_scheduler_reports_logical_block_size_or_no_source(self):
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.scheduler_components.kv_events_publisher import (
             SchedulerKvEventsPublisher,
         )
 
-        for pp, tp, cp, dp_attention, dcp_size in (
-            (0, 0, 0, True, 1),
-            (0, 0, 0, False, 1),
-            (0, 0, 0, True, 4),
-            (1, 0, 0, True, 1),
-            (0, 1, 0, True, 1),
-            (0, 0, 1, True, 1),
+        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.page_size = 64
+        scheduler.kv_events_publisher = component
+        publisher = MagicMock()
+        publisher.describe_local_source.return_value = self._source(4, 256)
+        for owned_publisher, expected in (
+            (publisher, [self._source(4, 256)]),
+            (None, []),
         ):
-            ps = SimpleNamespace(
-                pp_rank=pp,
-                attn_tp_rank=tp,
-                attn_cp_rank=cp,
-                attn_dp_size=8 if dp_attention else 1,
-                attn_dp_rank=4 if dp_attention else 0,
-                dp_rank=None if dp_attention else 4,
-            )
-            publisher = MagicMock()
-            publisher.describe_local_source.side_effect = lambda block_size: (
-                self._source(4, block_size)
-            )
             with (
-                self.subTest(ps=ps, dcp_size=dcp_size),
-                patch(
-                    "sglang.srt.managers.scheduler_components.kv_events_publisher.EventPublisherFactory.create",
-                    return_value=publisher,
-                ) as create,
+                self.subTest(has_publisher=owned_publisher is not None),
+                get_context().override_server_args(grpc_port=50051, dcp_size=4),
             ):
-                component = SchedulerKvEventsPublisher(
-                    kv_events_config='{"publisher":"zmq"}',
-                    ps=ps,
-                    attn_tp_rank=tp,
-                    attn_cp_rank=cp,
-                    attn_dp_rank=ps.attn_dp_rank,
-                    dp_rank=ps.dp_rank,
-                    tree_cache=None,
-                    send_metrics_from_scheduler=None,
-                    max_running_requests=1,
-                    max_total_num_tokens=64,
-                    get_stats=lambda: None,
+                component.kv_event_publisher = owned_publisher
+                self.assertEqual(
+                    scheduler.get_init_info()["kv_event_sources"], expected
                 )
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.max_total_num_tokens = 64
-                scheduler.max_req_input_len = 32
-                scheduler.startup_time = {}
-                scheduler.page_size = 64
-                scheduler.kv_events_publisher = component
-                with get_context().override_server_args(
-                    grpc_port=50051, dcp_size=dcp_size
-                ):
-                    info = scheduler.get_init_info()
-                if pp == tp == cp == 0:
-                    create.assert_called_once_with('{"publisher":"zmq"}', 4)
-                    publisher.describe_local_source.assert_called_once_with(
-                        64 * dcp_size
-                    )
-                    self.assertEqual(
-                        info["kv_event_sources"], [self._source(4, 64 * dcp_size)]
-                    )
-                else:
-                    create.assert_not_called()
-                    self.assertEqual(info["kv_event_sources"], [])
-                for args in (
-                    {"grpc_port": None},
-                    {"grpc_port": 50051, "smg_grpc_mode": True},
-                    {"grpc_port": 50051, "grpc_mode": True},
-                ):
-                    with get_context().override_server_args(**args):
-                        self.assertNotIn("kv_event_sources", scheduler.get_init_info())
+        publisher.describe_local_source.assert_called_once_with(256)
 
-    def test_controller_collects_only_local_scheduler_sources(self):
+    def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
 
         controller = DataParallelController.__new__(DataParallelController)

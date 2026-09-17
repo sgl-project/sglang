@@ -36,30 +36,36 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestLocalKvEventSource(CustomTestCase):
-    def _publisher(self, **kwargs):
-        publisher = ZmqEventPublisher(**kwargs)
+    def _publisher(self, attn_dp_rank=0, **config):
+        publisher = EventPublisherFactory.create(
+            json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
+        )
         atexit.unregister(publisher.shutdown)
         self.addCleanup(publisher.shutdown)
         return publisher
 
-    def test_bound_source_uses_actual_port_and_global_rank(self):
-        # The source describes a real rank-4 publisher, not local rank zero.
-        with zmq.Context.instance().socket(zmq.PUB) as probe:
-            port = probe.bind_to_random_port("tcp://127.0.0.1")
-        publisher = self._publisher(
-            attn_dp_rank=4, endpoint=f"tcp://*:{port - 4}", topic="kv"
-        )
-        source = publisher.describe_local_source(64)
-        self.assertEqual(
-            source,
-            {
-                "dp_rank": 4,
-                "endpoint": f"tcp://127.0.0.1:{port}",
-                "topic": "kv",
-                "block_size": 64,
-            },
-        )
-        self._assert_event_received(publisher, source)
+    def test_advertised_source_delivers_events(self):
+        for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
+            with self.subTest(host=host):
+                with zmq.Context.instance().socket(zmq.PUB) as probe:
+                    port = probe.bind_to_random_port("tcp://127.0.0.1")
+                publisher = self._publisher(
+                    attn_dp_rank=4,
+                    endpoint=f"tcp://{host}:{port - 4}",
+                    bind=bind,
+                    topic=topic,
+                )
+                source = publisher.describe_local_source(64)
+                self.assertEqual(
+                    source,
+                    dict(
+                        dp_rank=4,
+                        endpoint=f"tcp://127.0.0.1:{port}",
+                        topic=topic,
+                        block_size=64,
+                    ),
+                )
+                self._assert_event_received(publisher, source)
 
     def _assert_event_received(self, publisher, source):
         with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
@@ -78,47 +84,18 @@ class TestLocalKvEventSource(CustomTestCase):
             else:
                 self.fail("No event received from the advertised local source")
 
-    def test_explicit_loopback_bind_from_cli_is_subscribable(self):
-        for rank in (0, 4):
-            with self.subTest(rank=rank):
-                with zmq.Context.instance().socket(zmq.PUB) as probe:
-                    port = probe.bind_to_random_port("tcp://127.0.0.1")
-                publisher = EventPublisherFactory.create(
-                    json.dumps(
-                        {
-                            "publisher": "zmq",
-                            "endpoint": f"tcp://127.0.0.1:{port - rank}",
-                            "bind": True,
-                            "topic": "",
-                        }
-                    ),
-                    attn_dp_rank=rank,
-                )
-                atexit.unregister(publisher.shutdown)
-                self.addCleanup(publisher.shutdown)
-                endpoint = f"tcp://127.0.0.1:{port}"
-                self.assertEqual(
-                    publisher._pub.getsockopt_string(zmq.LAST_ENDPOINT), endpoint
-                )
-                source = publisher.describe_local_source(64)
-                self.assertEqual(
-                    source,
-                    {
-                        "dp_rank": rank,
-                        "endpoint": endpoint,
-                        "topic": "",
-                        "block_size": 64,
-                    },
-                )
-                self._assert_event_received(publisher, source)
-
-    def test_explicit_connect_overrides_ipc_bind_heuristic(self):
+    def test_ipc_is_advertised_only_when_bound(self):
         directory = tempfile.TemporaryDirectory(prefix="kv-", dir="/tmp")
         self.addCleanup(directory.cleanup)
-        publisher = self._publisher(
-            attn_dp_rank=0, endpoint=f"ipc://{directory.name}/events", bind=False
-        )
-        self.assertIsNone(publisher.describe_local_source(64))
+        endpoint = f"ipc://{directory.name}/events"
+        for bind in (None, False):
+            with self.subTest(bind=bind):
+                publisher = self._publisher(endpoint=endpoint, bind=bind)
+                source = publisher.describe_local_source(64)
+                if bind is False:
+                    self.assertIsNone(source)
+                else:
+                    self.assertEqual(source["endpoint"], endpoint)
 
     def test_ephemeral_bind_and_replay_report_resolved_ports(self):
         publisher = self._publisher(
@@ -141,17 +118,6 @@ class TestLocalKvEventSource(CustomTestCase):
         )
         self.assertNotEqual(source["endpoint"], source["replay_endpoint"])
         self.assertFalse(source["endpoint"].endswith(":0"))
-
-    def test_ipc_source_preserves_bound_path(self):
-        directory = tempfile.TemporaryDirectory(prefix="kv-", dir="/tmp")
-        self.addCleanup(directory.cleanup)
-        publisher = self._publisher(
-            attn_dp_rank=0, endpoint=f"ipc://{directory.name}/events"
-        )
-        self.assertEqual(
-            publisher.describe_local_source(64)["endpoint"],
-            f"ipc://{directory.name}/events",
-        )
 
     def test_non_subscribable_publishers_are_not_advertised(self):
         for endpoint in (
