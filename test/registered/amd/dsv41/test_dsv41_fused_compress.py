@@ -382,6 +382,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
 
+    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_static_verify_dispatch_and_real_pool_writes(self):
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c2_decode_norm_rope_store,
@@ -457,6 +458,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
             )
 
+    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_padded_rows_publish_nothing(self):
         """A padded graph suffix carries `raw_out_loc == 0` and `out_loc == 0`, which
         both kernels must read off the arrays (the caller passes no mask)."""
@@ -484,6 +486,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 else:
                     self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
 
+    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it `c2_out_loc == -1`; an index-K writer taking that -1 straight from
