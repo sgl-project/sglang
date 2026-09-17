@@ -78,6 +78,15 @@ def model():
     return model
 
 
+@pytest.fixture
+def bf16_model(model):
+    # parallel modules own process groups and cannot be deep-copied
+    config = QwenImage21DitConfig(arch_config=model.config)
+    result = QwenImage21Transformer2DModel(config, {}).cuda().bfloat16().eval()
+    result.load_state_dict(model.state_dict())
+    return result
+
+
 def inputs(seed, edit):
     torch.manual_seed(seed)
     slots = [False] * 3 + ([True, False, False] if edit else [])
@@ -183,8 +192,10 @@ def test_graph_replay_uses_new_request_prefix(model, edit):
 
 @pytest.mark.parametrize("edit", [False, True])
 @torch.no_grad()
-def test_bf16_fusions_match_eager_prefill_and_cached_steps(model, edit, monkeypatch):
-    actual_model = deepcopy(model).bfloat16()
+def test_bf16_fusions_match_eager_prefill_and_cached_steps(
+    bf16_model, edit, monkeypatch
+):
+    actual_model = bf16_model
     kwargs = inputs(5, edit)
     for key in (
         "hidden_states",
@@ -234,8 +245,8 @@ def test_bf16_fusions_match_eager_prefill_and_cached_steps(model, edit, monkeypa
 
 
 @torch.no_grad()
-def test_silu_fusion_mismatch_restores_eager(model, monkeypatch):
-    mlp = deepcopy(model.transformer_blocks[0].img_mlp).bfloat16()
+def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
+    mlp = bf16_model.transformer_blocks[0].img_mlp
     x = torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16)
     gate = BitExactFusionGate("test mismatch")
     monkeypatch.setattr(model_module, "_SILU_MUL_FUSION", gate)
