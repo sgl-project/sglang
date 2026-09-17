@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from sglang.utils import read_jsonl
 
 
 def get_one_example(lines, i, include_answer):
@@ -31,12 +31,21 @@ def main(args):
     # Select backend
     set_default_backend(select_sglang_backend(args))
 
-    # Read data
-    data_path = args.data_path
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    if not os.path.isfile(data_path):
-        data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
+    # Read data. This used to fetch data/hellaswag_val.jsonl from the
+    # rowanz/hellaswag GitHub repo, which a DMCA claim disabled on 2026-09-14;
+    # it answers 451 now, so the split comes from its HuggingFace mirror. The
+    # mirror keeps the row order the jsonl had, which the leading few-shot rows
+    # depend on, but types label as a string where the jsonl had an int, and
+    # label both indexes endings and is compared against predicted indices.
+    if os.path.isfile(args.data_path):
+        lines = list(read_jsonl(args.data_path))
+    else:
+        from datasets import load_dataset
+
+        lines = [
+            {**example, "label": int(example["label"])}
+            for example in load_dataset("Rowan/hellaswag", split="validation")
+        ]
 
     # Construct prompts
     num_questions = args.num_questions
