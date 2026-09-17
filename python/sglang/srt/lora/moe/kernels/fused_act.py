@@ -44,7 +44,7 @@ def _base_columns(
 @triton.jit
 def _delta_slice(
     bridge_ptr,
-    weight_group_ptr,
+    weight_bucket_ptr,
     bridge_rows,
     pair_mask,
     w_offsets,
@@ -72,7 +72,7 @@ def _delta_slice(
             other=0.0,
         )
         rhs = tl.load(
-            weight_group_ptr
+            weight_bucket_ptr
             + (slice_id * width + w_offsets)[None, :] * stride_wn
             + k_offsets[:, None] * stride_wk,
             mask=k_mask[:, None] & w_mask[None, :],
@@ -92,7 +92,7 @@ def _b_act_kernel(
     pair_to_row_ptr,
     topk_ids_ptr,
     sorted_pairs_ptr,
-    block_veids_ptr,
+    block_bucket_ids_ptr,
     pairs_post_padded_ptr,
     num_pairs,
     stride_xm,
@@ -137,7 +137,7 @@ def _b_act_kernel(
     dst_rows = tl.load(pair_to_row_ptr + pair_ids, mask=base_valid, other=0).to(
         tl.int64
     )
-    veid = tl.load(block_veids_ptr + pid_m).to(tl.int64)
+    bucket_id = tl.load(block_bucket_ids_ptr + pid_m).to(tl.int64)
 
     w_offsets = pid_w * block_w + tl.arange(0, block_w).to(tl.int64)
     w_mask = w_offsets < width
@@ -151,12 +151,12 @@ def _b_act_kernel(
 
     delta_gate = tl.zeros((block_m, block_w), tl.float32)
     delta_up = tl.zeros((block_m, block_w), tl.float32)
-    if veid != -1:
+    if bucket_id != -1:
         bridge_rows = pair_ids // top_k if bridge_token_major else pair_ids
-        group_ptr = b_ptr + veid * stride_bg
+        weight_bucket_ptr = b_ptr + bucket_id * stride_bg
         delta_gate += _delta_slice(
             bridge_ptr,
-            group_ptr,
+            weight_bucket_ptr,
             bridge_rows,
             pair_mask,
             w_offsets,
@@ -175,7 +175,7 @@ def _b_act_kernel(
         if num_slices == 2:
             delta_up += _delta_slice(
                 bridge_ptr,
-                group_ptr,
+                weight_bucket_ptr,
                 bridge_rows,
                 pair_mask,
                 w_offsets,
@@ -239,7 +239,7 @@ def _launch_b_act(
     bridge_top_k: int,
 ) -> None:
     ActivationFn.parse(activation)
-    pairs = routing.topk_ids.numel()
+    pairs = routing.num_rows
     if pairs == 0:
         return
     width = act_rows.shape[1]
@@ -256,9 +256,9 @@ def _launch_b_act(
         act_rows,
         pair_target,
         pair_to_row,
-        routing.topk_ids,
+        routing.group_ids,
         routing.sorted_pair_ids,
-        routing.block_group_ids,
+        routing.block_bucket_ids,
         routing.num_pairs_post_padded,
         pairs,
         bridge_gateup.stride(0),
@@ -273,7 +273,7 @@ def _launch_b_act(
         pair_target.stride(0),
         pair_target.stride(1),
         num_local_experts=num_local_experts,
-        top_k=routing.topk_ids.shape[1],
+        top_k=routing.width,
         width=width,
         rank=rank,
         num_slices=slices,

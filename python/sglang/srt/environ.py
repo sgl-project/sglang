@@ -1222,6 +1222,8 @@ class Envs:
 
     # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
     SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+    # Per-file overrides for dense LoRA plan tables.
+    SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution

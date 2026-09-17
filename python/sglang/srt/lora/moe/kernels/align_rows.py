@@ -1,8 +1,7 @@
 """Align routed pairs for Triton and Marlin, dropping negative expert IDs.
 
-For one token, distinct top-k IDs allow one block per expert in a single launch.
-``pair_to_row_map`` writes the pair-major row map those providers hand to the
-finalize (row p for pair p, -1 for a pair without an expert) in one launch.
+Distinct top-k IDs allow a single-token fast path. pair_to_row maps pair p
+to row p, or -1 for a pair without an expert.
 """
 
 from __future__ import annotations
@@ -18,6 +17,8 @@ def _align_single_token_kernel(
     sorted_ids_ptr,  # int32 [TOPK * BLOCK_SIZE]
     expert_ids_ptr,  # int32 [TOPK]
     num_post_ptr,  # int32 [1]
+    pair_to_row_ptr,  # int32 [TOPK] out: pair p is row p, -1 without an expert
+    WRITE_PAIR_TO_ROW: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LANES: tl.constexpr,  # next pow2 >= TOPK
@@ -50,10 +51,12 @@ def _align_single_token_kernel(
     )
     tl.store(sorted_ids_ptr + slot, tl.full([SLOTS], TOPK, tl.int32), mask=pad)
     tl.store(num_post_ptr, n_valid * BLOCK_SIZE)
+    if WRITE_PAIR_TO_ROW:
+        tl.store(pair_to_row_ptr + lane, tl.where(valid, lane, -1), mask=in_range)
 
 
-def moe_align_single_token(
-    topk_ids: torch.Tensor, block_size: int
+def _moe_align_single_token(
+    topk_ids: torch.Tensor, block_size: int, pair_to_row: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Align distinct top-k IDs for one token; accepts int32 [1, topk], topk <= 32."""
     topk = topk_ids.shape[1]
@@ -66,6 +69,8 @@ def moe_align_single_token(
         sorted_ids,
         expert_ids,
         num_post,
+        topk_ids if pair_to_row is None else pair_to_row,
+        WRITE_PAIR_TO_ROW=pair_to_row is not None,
         TOPK=topk,
         BLOCK_SIZE=block_size,
         LANES=triton.next_power_of_2(topk),
@@ -76,14 +81,24 @@ def moe_align_single_token(
 
 
 def align_rows(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    *,
+    pair_to_row_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Align pairs, optionally filling pair_to_row_out [tokens * topk].
+
+    The single-token path fills the row map in its alignment launch.
+    """
     if (
         topk_ids.shape[0] == 1
         and topk_ids.shape[1] <= 32
         and topk_ids.dtype == torch.int32
     ):
-        return moe_align_single_token(topk_ids, block_size)
+        return _moe_align_single_token(topk_ids, block_size, pair_to_row_out)
+    if pair_to_row_out is not None:
+        pair_to_row_map(topk_ids, pair_to_row_out)
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
     )
@@ -102,8 +117,7 @@ def _pair_to_row_kernel(topk_ids_ptr, out_ptr, n, BLOCK: tl.constexpr):
 
 
 def pair_to_row_map(topk_ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """out[p] = p for a routed pair, -1 for a pair without an expert; the
-    finalize gates on this map, not on topk_ids. One launch per layer."""
+    """Write out[p] = p for routed pairs, else -1; finalize gates on this map."""
     flat = topk_ids.reshape(-1)
     n = flat.numel()
     block = 1024

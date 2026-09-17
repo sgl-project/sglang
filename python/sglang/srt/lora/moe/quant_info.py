@@ -53,11 +53,11 @@ class MoeLoraFp8QuantInfo(msgspec.Struct, kw_only=True):
             intermediate_size=int(base_layer.w2_weight.shape[2]),
             hidden_size=int(base_layer.w2_weight.shape[1]),
         )
-        admit_fp8_block_weights(quant_info)
+        _admit_fp8_block_weights(quant_info)
         return quant_info
 
 
-def admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
+def _admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
     """Validate 128x128 weight blocks and scales once when binding weights."""
     if tuple(quant_info.block_shape) != (128, 128):
         raise NotImplementedError(

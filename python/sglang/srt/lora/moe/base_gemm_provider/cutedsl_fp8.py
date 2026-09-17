@@ -29,6 +29,10 @@ from sglang.srt.lora.moe.kernels.dispatch_contiguous import (
     dispatch_fill_rows_contiguous_fp8,
 )
 from sglang.srt.lora.moe.kernels.dispatch_masked import dispatch_fill_masked_fp8
+from sglang.srt.lora.moe.kernels.dispatch_masked_small import (
+    small_masked_prepare,
+    small_masked_prepare_applies,
+)
 from sglang.srt.lora.moe.quant_info import MoeLoraFp8QuantInfo
 
 QUANT_GROUP = 128
@@ -37,6 +41,16 @@ QUANT_GROUP = 128
 class _CuteDslFp8Mixin(CuteDslTileMixin):
     _DTYPE_TAG = "fp8"
     WIDE_EXPECTED_M_THRESHOLD = 32
+
+    @staticmethod
+    def _prepare_input_rows(workspace, shape, device):
+        if workspace is None:
+            return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+        output = workspace.tensor(
+            "base:down", shape, dtype=torch.bfloat16, device=device
+        )
+        # Gate/up consumes the packed FP8 prefix before down overwrites the BF16 slab.
+        return output.view(torch.float8_e4m3fn).flatten()[: output.numel()].view(shape)
 
     def _bind_weights(self, quant_info: MoeLoraFp8QuantInfo) -> None:
         self._sf_w13 = quant_info.w13_scale.contiguous()
@@ -183,7 +197,10 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
         experts = self.quant_info.num_local_experts
         k = hidden_states.size(1)
         inter = self.quant_info.intermediate_size
-        m_max = masked_m_max(hidden_states.size(0))
+        expected_m = expected_rows_per_expert(topk_ids.numel(), experts)
+        token_width = self._token_width_for(hidden_states.size(0), expected_m)
+        # FP8 scale loads are unpredicated across the whole selected token tile.
+        m_max = masked_m_max(hidden_states.size(0), token_width)
         device = hidden_states.device
 
         def _buf(name, shape, dtype):
@@ -191,7 +208,7 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
 
         masked_m = _buf("masked:masked_m", (experts,), torch.int32)
         pair_to_row = _buf("masked:pair_to_row", (topk_ids.numel(),), torch.int32)
-        rows_fp8 = _buf("masked:rows_fp8", (experts, m_max, k), torch.float8_e4m3fn)
+        rows_fp8 = self._prepare_input_rows(workspace, (experts, m_max, k), device)
         sf_rows = _buf(
             "masked:sf_rows", (experts, m_max, k // QUANT_GROUP), torch.float32
         )
@@ -199,17 +216,6 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
         act_scale = _buf(
             "masked:act_scale", (experts, m_max, inter // QUANT_GROUP), torch.float32
         )
-        dispatch_fill_masked_fp8(
-            hidden_states,
-            topk_ids,
-            top_k,
-            masked_m_out=masked_m,
-            pair_to_row_out=pair_to_row,
-            rows_fp8_out=rows_fp8,
-            scale_out=sf_rows,
-        )
-        expected_m = expected_rows_per_expert(topk_ids.numel(), experts)
-        token_width = self._token_width_for(m_max, expected_m)
         geometry = dict(
             token_width=token_width,
             n_gemm1=self.gate_up_slices * inter,
@@ -218,24 +224,64 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
             cluster_shape_mn=self.CLUSTER_SHAPE_MN,
             use_2cta_instrs=self.USE_2CTA_INSTRS,
         )
-        schedule_outputs = {}
-        if workspace is not None:
-            schedule_outputs = self._schedule_buffers(
+        capacities = self._schedule_capacities(
+            num_experts=experts, m_max=m_max, **geometry
+        )
+        if small_masked_prepare_applies(
+            hidden_states.size(0), topk_ids.numel(), fp8=True
+        ):
+            # Prepare quantized rows, pair map and both schedules in one launch.
+            outputs = self._small_prepare_outputs(
                 workspace,
                 f"cutedsl_masked:tw{token_width}",
-                self._schedule_capacities(num_experts=experts, m_max=m_max, **geometry),
+                capacities,
+                experts,
                 device,
             )
-        schedule1, tiles1, schedule2, tiles2 = self._build_schedules(
-            masked_m, m_max=m_max, **geometry, **schedule_outputs
-        )
+            small_masked_prepare(
+                hidden_states,
+                topk_ids,
+                top_k,
+                masked_m_out=masked_m,
+                pair_to_row_out=pair_to_row,
+                rows_out=rows_fp8,
+                scale_out=sf_rows,
+                token_width=token_width,
+                out_clusters1=self._output_clusters(geometry["n_gemm1"]),
+                out_clusters2=self._output_clusters(geometry["n_gemm2"]),
+                **outputs,
+            )
+            schedule1, tiles1, schedule2, tiles2 = (
+                outputs["schedule1_out"],
+                outputs["tiles1_out"],
+                outputs["schedule2_out"],
+                outputs["tiles2_out"],
+            )
+        else:
+            dispatch_fill_masked_fp8(
+                hidden_states,
+                topk_ids,
+                top_k,
+                masked_m_out=masked_m,
+                pair_to_row_out=pair_to_row,
+                rows_fp8_out=rows_fp8,
+                scale_out=sf_rows,
+            )
+            schedule_outputs = {}
+            if workspace is not None:
+                schedule_outputs = self._schedule_buffers(
+                    workspace, f"cutedsl_masked:tw{token_width}", capacities, device
+                )
+            schedule1, tiles1, schedule2, tiles2 = self._build_schedules(
+                masked_m, m_max=m_max, **geometry, **schedule_outputs
+            )
         return CuteDslFp8MaskedRowState(
             hidden_permuted=rows_fp8,
             masked_m=masked_m,
             expected_m=expected_m,
             pair_to_row=pair_to_row,
             m_max=m_max,
-            retained_inputs=workspace is not None,
+            input_buffer_reuse=workspace is not None,
             token_width=token_width,
             sf_rows=sf_rows,
             gemm1_schedule=schedule1,
@@ -372,12 +418,10 @@ class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider
         hidden = hidden_states.size(1)
         device = hidden_states.device
         prefix = f"contiguous:a{self._m_alignment}"
-        rows_fp8 = prepare_buffer(
+        rows_fp8 = self._prepare_input_rows(
             workspace,
-            f"{prefix}:rows_fp8",
             (base.m_pad_ceiling, hidden),
-            dtype=torch.float8_e4m3fn,
-            device=device,
+            device,
         )
         sf_rows = prepare_buffer(
             workspace,
@@ -425,7 +469,7 @@ class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider
             seg_offsets=base.seg_offsets,
             pair_to_row=base.pair_to_row,
             m_pad_ceiling=base.m_pad_ceiling,
-            retained_inputs=base.retained_inputs,
+            input_buffer_reuse=base.input_buffer_reuse,
             token_width=token_width,
             sf_rows=sf_rows,
             gemm1_schedule=schedule1,

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.lora.moe.moe_lora_runner import MoeLoraBatch, MoeLoraRunner
+    from sglang.srt.lora.moe.runner import MoeLoraBatch, MoeLoraRunner
 
 
 @dataclass

@@ -69,7 +69,12 @@ class CuteDslTileMixin:
         self._bind_weights(quant_info)
 
         device = quant_info.w13_weight.device
-        # The 152-cluster choice was tuned on GB300.
+        # Keep the SM90 FP8 heuristic at 64-wide tiles; tables may override it.
+        self._xwide_by_heuristic = not (
+            self._DTYPE_TAG == "fp8"
+            and torch.cuda.get_device_capability(device) < (10, 0)
+        )
+        # Use one persistent cluster per SM on 152-SM Blackwell devices.
         xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
         if (
             torch.cuda.get_device_capability(device) >= (10, 0)
@@ -170,11 +175,11 @@ class CuteDslTileMixin:
             sf_weights=self._stage_scale(stage),
         )
 
-    def _token_width_for(self, m_max: int, expected_m: int) -> int:
+    def _token_width_for(self, max_expert_rows: int, expected_m: int) -> int:
         """Widen the tuned choice if needed to fit the packed schedule."""
         if self._config_table is not None:
             performance_width = self._config_table.pick(expected_m)["token_width"]
-        elif expected_m >= self.XWIDE_EXPECTED_M_THRESHOLD:
+        elif expected_m >= self.XWIDE_EXPECTED_M_THRESHOLD and self._xwide_by_heuristic:
             performance_width = self.XWIDE_TOKEN_WIDTH
         elif (
             expected_m >= self.WIDE_EXPECTED_M_THRESHOLD
@@ -184,16 +189,54 @@ class CuteDslTileMixin:
         else:
             performance_width = self.NARROW_TOKEN_WIDTH
         for width in sorted(self._compiled):
-            if width >= performance_width and m_max <= width * self._max_token_clusters:
+            if (
+                width >= performance_width
+                and max_expert_rows <= width * self._max_token_clusters
+            ):
                 return width
         widest = max(self._compiled)
         raise ValueError(
-            f"m_max={m_max} exceeds the widest compiled tile's schedule "
-            f"packing ({widest * self._max_token_clusters})"
+            f"max_expert_rows={max_expert_rows} exceeds the widest compiled "
+            f"tile's schedule packing ({widest * self._max_token_clusters})"
         )
 
     def _stream(self, device: torch.device):
         return self._cu_stream(torch.cuda.current_stream(device).cuda_stream)
+
+    @staticmethod
+    def _output_clusters(n: int) -> int:
+        return (n + CuteDslTileMixin.OUTPUT_WIDTH - 1) // CuteDslTileMixin.OUTPUT_WIDTH
+
+    def _small_prepare_outputs(
+        self,
+        workspace: LoraWorkspace | None,
+        prefix: str,
+        capacities: tuple[int, int],
+        num_experts: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Schedule buffers plus the small prepare's stage-begin scratch."""
+        import triton
+
+        scratch_len = 2 * max(16, triton.next_power_of_2(num_experts))
+        if workspace is None:
+            capacity1, capacity2 = capacities
+            return {
+                "schedule1_out": torch.empty(
+                    capacity1, dtype=torch.int64, device=device
+                ),
+                "tiles1_out": torch.empty(1, dtype=torch.int32, device=device),
+                "schedule2_out": torch.empty(
+                    capacity2, dtype=torch.int64, device=device
+                ),
+                "tiles2_out": torch.empty(1, dtype=torch.int32, device=device),
+                "scratch": torch.empty(scratch_len, dtype=torch.int32, device=device),
+            }
+        outputs = self._schedule_buffers(workspace, prefix, capacities, device)
+        outputs["scratch"] = workspace.tensor(
+            f"{prefix}:small_scratch", (scratch_len,), dtype=torch.int32, device=device
+        )
+        return outputs
 
     @staticmethod
     def _schedule_buffers(

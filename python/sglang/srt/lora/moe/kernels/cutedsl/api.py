@@ -20,7 +20,7 @@ from sglang.srt.lora.moe.kernels.cutedsl.kernel_sm100_bf16 import (
 
 
 @cute.jit
-def grouped_gemm_bf16_swap_ab(
+def _grouped_gemm_bf16_swap_ab(
     gemm_op: cutlass.Constexpr,
     a: cute.Tensor,  # physical routed input (expert, m_max, k)
     b: cute.Tensor,  # physical weight (expert, n_out, k)
@@ -65,7 +65,7 @@ def _bf16_kernel_class_for(device: torch.device):
 
 
 @cute.jit
-def grouped_gemm_fp8_swap_ab(
+def _grouped_gemm_fp8_swap_ab(
     gemm_op: cutlass.Constexpr,
     a: cute.Tensor,  # physical routed input (expert, m_max, k) e4m3
     b: cute.Tensor,  # physical weight (expert, n_out, k) e4m3
@@ -246,7 +246,7 @@ def prepare_masked_bf16(
     n = b.shape[1]
     return _compile_prepared(
         kernel_cls=_bf16_kernel_class_for(a.device),
-        wrapper=grouped_gemm_bf16_swap_ab,
+        wrapper=_grouped_gemm_bf16_swap_ab,
         ab_dtype=cutlass.BFloat16,
         config=config,
         contiguous_segments=False,
@@ -278,7 +278,7 @@ def prepare_contiguous_bf16(
     experts, n, _ = b.shape
     return _compile_prepared(
         kernel_cls=_bf16_kernel_class_for(a.device),
-        wrapper=grouped_gemm_bf16_swap_ab,
+        wrapper=_grouped_gemm_bf16_swap_ab,
         ab_dtype=cutlass.BFloat16,
         config=config,
         contiguous_segments=True,
@@ -312,7 +312,7 @@ def prepare_masked_fp8(
     n = b.shape[1]
     return _compile_prepared(
         kernel_cls=_fp8_kernel_class_for(a.device),
-        wrapper=grouped_gemm_fp8_swap_ab,
+        wrapper=_grouped_gemm_fp8_swap_ab,
         ab_dtype=cutlass.Float8E4M3FN,
         config=config,
         contiguous_segments=False,
@@ -348,7 +348,7 @@ def prepare_contiguous_fp8(
     experts, n, _ = b.shape
     return _compile_prepared(
         kernel_cls=_fp8_kernel_class_for(a.device),
-        wrapper=grouped_gemm_fp8_swap_ab,
+        wrapper=_grouped_gemm_fp8_swap_ab,
         ab_dtype=cutlass.Float8E4M3FN,
         config=config,
         contiguous_segments=True,

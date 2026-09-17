@@ -15,10 +15,11 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 )
 from sglang.srt.models.inkling_common.util import (
     FusedMoELoadingMixin,
+    deinterleave_gate_up,
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_exec, get_model
+from sglang.srt.runtime_context import get_exec, get_lora, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,8 @@ def _sum_dim0(x: torch.Tensor) -> torch.Tensor:
 
 
 class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
+    _w13_gate_up_contiguous = False
+
     def __init__(
         self,
         n_shared_experts: int,
@@ -247,6 +250,11 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         else:
             self.register_buffer("_w2_lin", None, persistent=False)
         self._bf16_linearized_ready = False
+        self._w13_gate_up_contiguous = (
+            self._linearized_bf16_enabled
+            and lora_compatible_layout_enabled()
+            and get_lora().lora_backend == "triton_v2"
+        )
 
     def weight_loader_fused(
         self,
@@ -255,6 +263,15 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         weight_name: str,
         shard_id: str,
     ) -> None:
+        if self._w13_gate_up_contiguous and param is self.w13_weight:
+            n, two_f, d = loaded_weight.shape
+            # Keep each TP block intact: the fused loader shards after conversion.
+            loaded_weight = deinterleave_gate_up(
+                loaded_weight.reshape(
+                    n, self.moe_tp_size, two_f // self.moe_tp_size, d
+                ),
+                dim=2,
+            ).reshape(n, two_f, d)
         FusedMoELoadingMixin.weight_loader_fused(
             self, param, loaded_weight, weight_name, shard_id
         )
@@ -384,14 +401,21 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
     def _swiglu(self, y_st2f: torch.Tensor, gammas_st: torch.Tensor) -> torch.Tensor:
         # Helion's kernel can produce NaNs for small shared-expert batches.
         from sglang.kernels.ops.moe.inkling_moe import (
+            silu_and_mul,
             silu_and_mul_triton,
         )
 
-        assert self.inference_moe_w13_interleaved, (
-            "silu_and_mul_triton requires interleaved w13"
-        )
         y_st_2f = y_st2f.view(-1, y_st2f.size(-1))
-        y_st_f = silu_and_mul_triton(y_st_2f, gammas_st.reshape(-1))
+        gammas = gammas_st.reshape(-1)
+        if self._w13_gate_up_contiguous:
+            # Same fp32 math and rounding as the interleaved kernel, reading
+            # the two contiguous halves of each row.
+            y_st_f = silu_and_mul(y_st_2f, gammas, use_interleaved=False)
+        else:
+            assert self.inference_moe_w13_interleaved, (
+                "silu_and_mul_triton requires interleaved w13"
+            )
+            y_st_f = silu_and_mul_triton(y_st_2f, gammas)
         return y_st_f.view(*y_st2f.shape[:-1], y_st2f.size(-1) // 2)
 
     # NVFP4 shared-expert serving uses the generic ModelOpt FP4 linears.

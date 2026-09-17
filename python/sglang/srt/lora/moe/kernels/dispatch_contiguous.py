@@ -16,7 +16,6 @@ from sglang.srt.lora.moe.kernels.dispatch_checks import (
 )
 from sglang.srt.lora.moe.kernels.fp8_quant import quantize_fp8_groups
 
-# Eight pairs per program outperformed 16/32 on 65k-pair prefill chunks.
 PAIRS_PER_PROGRAM = 8
 
 
@@ -72,8 +71,7 @@ def _fill_rows_contiguous_bf16_kernel(
     PAIRS_PER_PROGRAM: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    # Finalize pair_to_row in a separate launch: fusing it with this copy caused
-    # out-of-bounds stores at 65536 pairs and hidden=2048.
+    # Row copying consumes the map finalized by the preceding launch.
     lane = tl.arange(0, PAIRS_PER_PROGRAM)
     base = tl.program_id(0).to(tl.int64) * PAIRS_PER_PROGRAM
     pairs = base + lane
@@ -119,8 +117,7 @@ def _finalize_pair_to_row_contiguous_kernel(
                 seg_base = tl.load(seg_offsets_ptr + expert)
                 tl.store(pair_to_row_ptr + pair, seg_base + slot)
             else:
-                # The finalize (post_reorder) gates on the row map, not on
-                # topk_ids: a pair without an expert must read as -1.
+                # Finalize gates on this map, so invalid pairs must read as -1.
                 tl.store(pair_to_row_ptr + pair, -1)
 
 

@@ -1,7 +1,12 @@
-"""LoRA-B projections over aligned or raw pairs, including in-place down updates."""
+"""MoE LoRA-B dispatch over shared grouped/per-row expand kernels.
+
+MoE slots are pre-scaled; every reachable delta cell is written. In-place
+down-B uses the grouped kernel with provider row mappings.
+"""
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -9,106 +14,31 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.kernels.routing import (
-    grouped_tile_coords,
-    route_group_ids,
-)
+from sglang.srt.lora.kernels import lora_b as shared
+from sglang.srt.lora.kernels.routing import grouped_tile_coords
 from sglang.srt.lora.route_view import RouteView
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.moe.execution_plan import LoraBSpec
+    from sglang.srt.lora.moe.plan import BSpec
 
 
-@triton.jit
-def _grouped_lora_b_kernel(
-    bridge_ptr,
-    weight_ptr,
-    destination_ptr,
-    sorted_pair_ids_ptr,
-    block_group_ids_ptr,
-    num_pairs_post_padded_ptr,
-    num_pairs,
-    dest_offset_0,
-    dest_offset_1,
-    stride_bm,
-    stride_bk,
-    stride_wg,
-    stride_wn,
-    stride_wk,
-    stride_dm,
-    stride_dn,
-    INTERMEDIATE_TOP_K: tl.constexpr,
-    NUM_SLICES: tl.constexpr,
-    N_PER_SLICE: tl.constexpr,
-    RANK: tl.constexpr,
-    NUM_M_BLOCKS: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
-    tiles_per_slice: tl.constexpr = (N_PER_SLICE + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    num_pid_n: tl.constexpr = NUM_SLICES * tiles_per_slice
-    pid_m, pid_n = grouped_tile_coords(pid, num_pid_n, NUM_M_BLOCKS, GROUP_SIZE_M)
-    if pid_m * BLOCK_SIZE_M >= num_pairs_post_padded:
-        return
+@functools.lru_cache(maxsize=None)
+def _rows(weight_rows: int, num_slices: int) -> tuple[int, ...]:
+    """The equal weight-row slices of a MoE B weight."""
+    width = weight_rows // num_slices
+    return tuple(s * width for s in range(num_slices + 1))
 
-    slice_id = pid_n // tiles_per_slice
-    n_tile = pid_n % tiles_per_slice
-    destination_offset = tl.where(slice_id == 0, dest_offset_0, dest_offset_1).to(
-        tl.int64
-    )
-    pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    pair_ids = tl.load(sorted_pair_ids_ptr + pair_slots).to(tl.int64)
-    pair_mask = pair_ids < num_pairs
-    group = tl.load(block_group_ids_ptr + pid_m).to(tl.int64)
-    n_offsets = n_tile * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    n_mask = n_offsets < N_PER_SLICE
-    destination_ptrs = (
-        destination_ptr
-        + pair_ids[:, None] * stride_dm
-        + (destination_offset + n_offsets)[None, :] * stride_dn
-    )
-    store_mask = pair_mask[:, None] & n_mask[None, :]
 
-    if group == -1:
-        # Zero sentinel destinations so graph replay cannot reuse stale deltas.
-        zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        tl.store(
-            destination_ptrs,
-            zeros.to(destination_ptr.dtype.element_ty),
-            mask=store_mask,
-        )
-        return
-
-    bridge_rows = pair_ids // INTERMEDIATE_TOP_K
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k_begin in range(0, RANK, BLOCK_SIZE_K):
-        k_offsets = k_begin + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-        k_mask = k_offsets < RANK
-        lhs = tl.load(
-            bridge_ptr
-            + bridge_rows[:, None] * stride_bm
-            + (slice_id * RANK + k_offsets)[None, :] * stride_bk,
-            mask=pair_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        rhs = tl.load(
-            weight_ptr
-            + group * stride_wg
-            + (slice_id * N_PER_SLICE + n_offsets)[None, :] * stride_wn
-            + k_offsets[:, None] * stride_wk,
-            mask=n_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        accumulator += tl.dot(lhs, rhs, out_dtype=tl.float32)
-
-    tl.store(
-        destination_ptrs,
-        accumulator.to(destination_ptr.dtype.element_ty),
-        mask=store_mask,
+def _geometry(
+    weight: torch.Tensor, destination_offsets: Sequence[int], config: Mapping[str, int]
+) -> shared.SliceGeometry:
+    """A MoE B weight holds equal slices of its rows, written at the given
+    destination columns."""
+    return shared.slice_geometry(
+        _rows(weight.shape[1], len(destination_offsets)),
+        config["BLOCK_SIZE_N"],
+        weight.device,
+        out_offsets=destination_offsets,
     )
 
 
@@ -120,154 +50,22 @@ def grouped_lora_b(
     *,
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
-    intermediate_top_k: int = 1,
+    pair_bridge: bool = True,
 ) -> None:
-    _, weight_rows, rank = weight.shape
-    num_slices = len(destination_offsets)
-    slice_width = weight_rows // num_slices
-    num_pairs = routing.topk_ids.numel()
-    if num_pairs == 0:
-        return
-    offsets = tuple(int(offset) for offset in destination_offsets)
-    block_size_n = int(config["BLOCK_SIZE_N"])
-    num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
-    num_pid_n = num_slices * triton.cdiv(slice_width, block_size_n)
-    _grouped_lora_b_kernel[(num_m_blocks * num_pid_n,)](
+    shared.grouped_lora_b(
         bridge,
         weight,
         destination,
-        routing.sorted_pair_ids,
-        routing.block_group_ids,
-        routing.num_pairs_post_padded,
-        num_pairs,
-        offsets[0],
-        offsets[1] if num_slices == 2 else offsets[0],
-        bridge.stride(0),
-        bridge.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        destination.stride(0),
-        destination.stride(1),
-        INTERMEDIATE_TOP_K=intermediate_top_k,
-        NUM_SLICES=num_slices,
-        N_PER_SLICE=slice_width,
-        RANK=rank,
-        NUM_M_BLOCKS=num_m_blocks,
-        BLOCK_SIZE_M=routing.block_size,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),
-        GROUP_SIZE_M=int(config["GROUP_SIZE_M"]),
-        num_warps=int(config["num_warps"]),
-        num_stages=int(config["num_stages"]),
+        routing,
+        geometry=_geometry(weight, destination_offsets, config),
+        config=config,
+        add_inplace=False,
+        zero_sentinel=True,
+        pair_bridge=pair_bridge,
     )
 
 
-@triton.jit
-def _per_pair_lora_b_kernel(
-    bridge_ptr,
-    weight_ptr,
-    destination_ptr,
-    topk_ids_ptr,
-    token_lora_mapping_ptr,
-    num_pairs,
-    routed_expert_id_bound,
-    dest_offset_0,
-    dest_offset_1,
-    stride_bs,
-    stride_bm,
-    stride_bk,
-    stride_wg,
-    stride_wn,
-    stride_wk,
-    stride_dm,
-    stride_dn,
-    INTERMEDIATE_TOP_K: tl.constexpr,
-    NUM_SLICES: tl.constexpr,
-    N_PER_SLICE: tl.constexpr,
-    RANK: tl.constexpr,
-    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
-    MAX_LORAS: tl.constexpr,
-    TOP_K: tl.constexpr,
-    SHARED_OUTER: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    # stride_bs selects an adapter plane when shared A used a batched GEMM.
-    pair_id = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    tiles_per_slice: tl.constexpr = (N_PER_SLICE + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    slice_id = pid_n // tiles_per_slice
-    n_tile = pid_n % tiles_per_slice
-
-    key = route_group_ids(
-        topk_ids_ptr,
-        token_lora_mapping_ptr,
-        pair_id,
-        pair_id < num_pairs,
-        routed_expert_id_bound,
-        LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
-        MAX_LORAS=MAX_LORAS,
-        TOP_K=TOP_K,
-        SHARED_OUTER=SHARED_OUTER,
-    )
-    pair64 = pair_id.to(tl.int64)
-    destination_offset = tl.where(slice_id == 0, dest_offset_0, dest_offset_1).to(
-        tl.int64
-    )
-    n_offsets = n_tile.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(
-        tl.int64
-    )
-    n_mask = n_offsets < N_PER_SLICE
-    destination_ptrs = (
-        destination_ptr
-        + pair64 * stride_dm
-        + (destination_offset + n_offsets) * stride_dn
-    )
-
-    if key == -1:
-        # Zero invalid destinations without reading uninitialized bridge rows.
-        zeros = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-        tl.store(
-            destination_ptrs,
-            zeros.to(destination_ptr.dtype.element_ty),
-            mask=n_mask,
-        )
-        return
-
-    group = key.to(tl.int64)
-    slot = group // LORA_EXPERTS_PER_ADAPTER
-    bridge_row = pair64 // INTERMEDIATE_TOP_K
-    accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-    for k_begin in range(0, RANK, BLOCK_SIZE_K):
-        k_offsets = k_begin + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-        k_mask = k_offsets < RANK
-        lhs = tl.load(
-            bridge_ptr
-            + slot * stride_bs
-            + bridge_row * stride_bm
-            + (slice_id * RANK + k_offsets) * stride_bk,
-            mask=k_mask,
-            other=0.0,
-        )
-        rhs = tl.load(
-            weight_ptr
-            + group * stride_wg
-            + (slice_id * N_PER_SLICE + n_offsets)[:, None] * stride_wn
-            + k_offsets[None, :] * stride_wk,
-            mask=n_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        accumulator += tl.sum(rhs.to(tl.float32) * lhs[None, :].to(tl.float32), axis=1)
-
-    tl.store(
-        destination_ptrs,
-        accumulator.to(destination_ptr.dtype.element_ty),
-        mask=n_mask,
-    )
-
-
-def per_pair_lora_b(
+def _per_row_lora_b(
     bridge: torch.Tensor,
     weight: torch.Tensor,
     destination: torch.Tensor,
@@ -275,56 +73,25 @@ def per_pair_lora_b(
     *,
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
-    intermediate_top_k: int = 1,
+    pair_bridge: bool = True,
+    slot_planes: bool = False,
 ) -> None:
-    _, weight_rows, rank = weight.shape
-    num_slices = len(destination_offsets)
-    slice_width = weight_rows // num_slices
-    num_pairs = routing.topk_ids.numel()
-    if num_pairs == 0:
-        return
-    offsets = tuple(int(offset) for offset in destination_offsets)
-    shared_outer = routing.is_shared_outer
-    routed_bound = routing.num_local_experts
-    block_size_n = int(config["BLOCK_SIZE_N"])
-    stride_bs = bridge.stride(0) if bridge.dim() == 3 else 0
-    _per_pair_lora_b_kernel[
-        (num_pairs, num_slices * triton.cdiv(slice_width, block_size_n))
-    ](
+    shared.per_row_lora_b(
         bridge,
         weight,
         destination,
-        routing.topk_ids,
-        routing.token_lora_mapping,
-        num_pairs,
-        routed_bound,
-        offsets[0],
-        offsets[1] if num_slices == 2 else offsets[0],
-        stride_bs,
-        bridge.stride(-2),
-        bridge.stride(-1),
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        destination.stride(0),
-        destination.stride(1),
-        INTERMEDIATE_TOP_K=intermediate_top_k,
-        NUM_SLICES=num_slices,
-        N_PER_SLICE=slice_width,
-        RANK=rank,
-        LORA_EXPERTS_PER_ADAPTER=routing.lora_experts_per_adapter,
-        MAX_LORAS=routing.max_loras,
-        TOP_K=routing.topk_ids.shape[1],
-        SHARED_OUTER=shared_outer,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),
-        num_warps=int(config["num_warps"]),
-        num_stages=int(config["num_stages"]),
+        routing,
+        geometry=_geometry(weight, destination_offsets, config),
+        config=config,
+        add_inplace=False,
+        zero_sentinel=True,
+        pair_bridge=pair_bridge,
+        slot_planes=slot_planes,
     )
 
 
 def run_lora_b(
-    spec: LoraBSpec,
+    spec: BSpec,
     *,
     bridge: torch.Tensor,
     weight: torch.Tensor,
@@ -332,8 +99,11 @@ def run_lora_b(
     routing: RouteView,
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
-    intermediate_top_k: int = 1,
+    pair_bridge: bool = True,
+    slot_planes: bool = False,
 ) -> None:
+    """``slot_planes``: ``bridge`` is [slots, tokens, N], one plane per
+    adapter slot (the token_dense shrink); only the per_row family reads it."""
     family = spec.family.value
     match family:
         case "grouped":
@@ -344,18 +114,18 @@ def run_lora_b(
                 routing,
                 destination_offsets=destination_offsets,
                 config=config,
-                intermediate_top_k=intermediate_top_k,
+                pair_bridge=pair_bridge,
             )
-        case "per_pair":
-            # A [slots, tokens, 2R] bridge (token_dense A) selects planes by slot.
-            per_pair_lora_b(
+        case "per_row":
+            _per_row_lora_b(
                 bridge,
                 weight,
                 destination,
                 routing,
                 destination_offsets=destination_offsets,
                 config=config,
-                intermediate_top_k=intermediate_top_k,
+                pair_bridge=pair_bridge,
+                slot_planes=slot_planes,
             )
         case _:
             raise NotImplementedError(f"no production LoRA-B executor for {family!r}")
@@ -368,7 +138,7 @@ def _down_b_into_base_kernel(
     down_rows_ptr,
     pair_to_row_ptr,
     sorted_pair_ids_ptr,
-    block_group_ids_ptr,
+    block_bucket_ids_ptr,
     num_pairs_post_padded_ptr,
     num_pairs,
     stride_bm,
@@ -393,8 +163,8 @@ def _down_b_into_base_kernel(
     if pid_m * BLOCK_SIZE_M >= num_pairs_post_padded:
         return
 
-    group = tl.load(block_group_ids_ptr + pid_m).to(tl.int64)
-    if group == -1:
+    bucket_id = tl.load(block_bucket_ids_ptr + pid_m).to(tl.int64)
+    if bucket_id == -1:
         return
 
     pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -402,7 +172,7 @@ def _down_b_into_base_kernel(
     pair_mask = pair_ids < num_pairs
     n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     n_mask = n_offsets < N_HIDDEN
-    # Valid groups exclude sentinel pairs whose pair_to_row was never written.
+    # Valid buckets exclude sentinel pairs whose pair_to_row was never written.
     dest_rows = tl.load(pair_to_row_ptr + pair_ids, mask=pair_mask, other=0).to(
         tl.int64
     )
@@ -422,7 +192,7 @@ def _down_b_into_base_kernel(
         )
         rhs = tl.load(
             weight_ptr
-            + group * stride_wg
+            + bucket_id * stride_wg
             + n_offsets[None, :] * stride_wn
             + k_offsets[:, None] * stride_wk,
             mask=n_mask[None, :] & k_mask[:, None],
@@ -448,7 +218,7 @@ def invoke_down_b_into_base(
     config: Mapping[str, int],
 ) -> None:
     """Add down-B into base rows addressed by pair_to_row."""
-    num_tokens, top_k = routing.topk_ids.shape
+    num_tokens, top_k = routing.num_tokens, routing.width
     pairs = num_tokens * top_k
     hidden = down_rows.shape[1]
     rank = bridge.shape[1]
@@ -463,7 +233,7 @@ def invoke_down_b_into_base(
         down_rows,
         pair_to_row,
         routing.sorted_pair_ids,
-        routing.block_group_ids,
+        routing.block_bucket_ids,
         routing.num_pairs_post_padded,
         pairs,
         bridge.stride(0),

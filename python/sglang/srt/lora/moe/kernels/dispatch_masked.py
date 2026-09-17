@@ -1,6 +1,6 @@
 """Dispatch rows into [expert, m_max, hidden] slabs, optionally quantizing to FP8.
 
-Negative expert IDs leave pair_to_row untouched; consumers must mask them.
+Negative expert IDs write pair_to_row == -1; consumers must skip those rows.
 """
 
 from __future__ import annotations

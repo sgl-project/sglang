@@ -970,6 +970,13 @@ class LoRAMemoryPool:
                     else:
                         temp_B_buffer[target_module] = weights
                         temp_B_cache_keys[target_module] = name
+                elif is_shared_expert and expert_match:
+                    # Without a shared-MoE destination, "shared_experts.<id>."
+                    # would match "experts.<id>." and overwrite routed weights.
+                    raise ValueError(
+                        f"Cannot load LoRA weight {name!r}: layer {layer_id} has no "
+                        "matching target for indexed shared-expert weights."
+                    )
                 elif expert_match:
                     # Per-expert MoE weight — 2D tensors, one per expert
                     target_module = target_module + "_moe"

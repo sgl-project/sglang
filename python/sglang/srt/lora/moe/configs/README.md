@@ -2,7 +2,7 @@
 
 One JSON file per architecture, `{arch}.plans.json`: execution-plan rows, each
 carrying its launch-tile rules, loaded by
-`sglang/srt/lora/moe/execution_plan.py` (`load_plans`/`resolve_plans`).
+`sglang/srt/lora/moe/plan.py` (`resolve_plans`).
 
 Architectures:
 
@@ -15,6 +15,91 @@ Architectures:
   sizes) where route-major scales with routed pairs.
 - `base_gemm/` — M-bucketed base-GEMM launch tables (separate key space:
   provider × geometry × device, not plan rows; see its README)
+
+Current tables (end-to-end sweep, 2026-09-23). The row options were
+re-measured in serving as an ablation (all-module adapters, CUDA graphs on in
+both phases, H200 = SM90, GB300 = SM100, 3 rounds, arms alternating on one
+GPU; a change is kept only if it never costs 3% or more in any cell, or 2%
+consistently across jobs). What changed:
+
+- the down-B into-base epilogue (`down_b_into_base`) stays on the `sm90`
+  per-expert prefill rows: without it Qwen3.5-397B FP8 per-expert prefill on
+  H200 is 1.3-2.5% slower per round (512 tokens -2.2%). The `sm100` rows run
+  without it: prefill ties on GB300. Decode cells that moved with the flag
+  (DeepSeek-V3 on GB300 18% faster without it, Qwen3.5-35B rank 32 at 16
+  requests on H200 3.6% slower) were a workload change, not kernel speed:
+  into-base changes the rounding order of the down projection, so greedy
+  decoding with random adapters picks a different token on some requests (22
+  of 48 at the H200 cell), and the new text hits a different number of
+  experts. Compare decode only between arms whose generated tokens match;
+- prefill rank bands: only the rank-16 bands remain (`prefill.per_expert.rank_le16`,
+  and on H200 `prefill.shared.rank_le16`). The H200 `rank_le8`/`rank_le32`/
+  `rank_le64` and SM100 `rank_le32` bands tied the unbanded row or lost to it
+  (shared rank 64 on H200 was 2.5% faster unbanded); the rank-16 per-expert
+  band is worth 3.5-4% prefill at rank 16 and up to 7% at rank 8.
+
+What stays, with the cost of removing it: decode overlap windows (5-15%
+decode), the parallel shared-outer route builder (2-5% decode), token-grouped
+gate/up-A (2-5% prefill), the fused B activation (2-2.5% prefill on the shared
+rows), the shared finalizes (2.5-6% prefill), the per-row A/B families
+(removing them together with the dense geometry rows cost 1-3% decode on the
+Qwen3.5 per-expert models at ranks 16-64), the SM100 per-expert decode tile
+ladder (one rule for every rank and token count tied on the small models at
+rank 16 but cost 3-8% decode at 1-32 requests: Qwen3.5-35B and GLM-4.7-Flash
+at rank 64, Inkling-Small NVFP4, Qwen3.5-397B NVFP4), and the H200
+shared-prefill route blocks (16 up to rank 16, 64 above; the common block of
+32 cost 3% at 512-token prefill on Qwen3.5-397B NVFP4). The quant and
+expert-count rows are only reached by the big models: dropping them cost
+Inkling-Small NVFP4 6.5% decode on GB300. The sections below are the
+historical record; rows and options they name that are not in the tables above
+no longer exist.
+
+Tile update (2026-09-26): the `sm100` row `prefill.per_expert.rank_le16` now
+carries two tile rules. Pools above rank 8 run gate/up-A 32 wide (K 64, 2
+warps, 3 stages; was 16 wide) and down-A 16 wide (K 128, 4 warps, 2 stages;
+was 64 wide); a first rule `{"max_rank": 8}` keeps the previous tiles for
+rank-8 pools, where the 32-wide gate/up-A tile is four times the rank and ran
+20 percent slower. MoE harness on GB300 at rank 16 (bf16 base stand-in; the
+two A kernels / the LoRA kernel sum, new over previous): Qwen3.5-397B TP4
+shard (512 experts, hidden 4096, intermediate 256, top-k 10) 4k tokens 0.73 /
+0.98, at rank 8 with its own rule 1.00 / 1.00; Qwen3.5-35B-A3B (256 experts,
+hidden 2048, intermediate 512, top-k 8) 512 tokens 1.01 / 1.00, 2k 0.84 / 0.99,
+4k 0.73 / 0.98, 8k 0.76 / 0.98; GLM-4.7-Flash (64 experts, hidden 2048,
+intermediate 1536, top-k 4) 512 0.99 / 1.00, 2k 0.98 / 1.00, 4k 0.86 / 0.99,
+8k 0.69 / 0.98; DeepSeek-V3 TP4 shard (256 experts, hidden 7168, intermediate
+512, top-k 8) 2k 0.85 / 0.99, 4k 0.72 / 0.98.
+
+Decode split-K (2026-09-26): the `sm100` row `decode.per_expert` carries a
+token ladder for pools up to rank 16 ahead of its rank-16 rule: up to 4
+tokens the gate/up shrink runs `SPLIT_K` 8, up to 16 tokens `SPLIT_K` 4
+(serial mode: fp32 planes per K split, the last program at a tile sums them;
+the runner allocates the planes and the self-resetting tile counters from
+the workspace). At batch 1 the shrink over K 4096 was a 32-step serial K
+loop per program. Synthetic decode bench on GB300, both grouped-A launches
+per layer in microseconds, plain / 4-way / 8-way: Qwen3.5-397B TP4 shard
+(K 4096) batch 1 16.3 / 9.3 / 7.9, batch 8 19.3 / 14.4 / 14.1, batch 16
+21.6 / 19.0 / 20.1, batch 64 34.1 / 34.1 / 37.7; Qwen3.5-35B-A3B (K 2048)
+batch 1 7.9 / 7.2, batch 8 13.6 / 11.5; DeepSeek-V3 TP4 shard (K 7168)
+batch 1 29.0 / 13.7, batch 8 29.4 / 17.1. The down shrink (K 256, two
+128-deep steps) loses 1.5-2 us with a split and stays plain. Above 16
+tokens the rule is unchanged (64 tokens is level at 4-way).
+
+Small routes (2026-09-26): an aligned route of up to 512 rows is built by one
+launch (`_build_small_route` in `lora/kernels/routing.py`) instead of the
+bucket kernel plus the CUDA alignment's two kernels and a fill: per-bucket
+atomic counters give each row its slot in the bucket, a prefix sum over the
+sentinel bin and the buckets gives the padded starts, and the same program
+writes the row array, the block ids and the padded total. The layout is the
+CUDA builder's (sentinel bucket of the dead rows first, then the buckets
+ascending; the order inside a bucket is arbitrary in both). GB300 device
+time: 10 rows 3.2 us (was 5.7 in 3 launches), 160 rows 3.5, 510 rows 5.0
+(6.0); the dense one-row-per-token routes 1.8-2.0 us (3.6 in 2 launches).
+The low-bucket extension raises this limit to 768 pairs when the configured
+bucket count (`groups_per_slot * max_loras`) is between 1 and 4, independently
+of block size. This is configured capacity, not the number of live adapters:
+for dense routes, raising `max_loras` from 4 to 5 sends 513-768 rows back to
+CUDA alignment without dropping rows. RAW views do not build an aligned
+route; explicit capacity and the large-route limits still take priority.
 
 Plans file:
 
@@ -59,14 +144,13 @@ measured rows, so a ReLU2 MoE is now served by the SwiGLU winners:
   where the ReLU2 row was not);
 - per-expert prefill on SM100: materially different — the retired
   `prefill.relu2` ran the expert-major (masked) rows with an early gate/up-A
-  window and a late down-A+B window and no into-base epilogue, where the
-  per-expert prefill rows run the route-major (contiguous) rows strictly
-  serially with down-B adding into the base down output.
+  window and a late down-A+B window, where the per-expert prefill rows run the
+  route-major (contiguous) rows strictly serially.
 
 Both are numerically correct (every provider registers relu2 for the fused
 middle); the ReLU2-tuned schedules are simply no longer served. Re-adding
 them means re-adding an `activation` predicate to the row model. `plan` carries kernel families, fusion shape, overlap windows, and
-route builder (see `build_plan` in execution_plan.py for the field list).
+route builder (see `_build_plan` in plan.py for the field list).
 Every served row is validated through the execution-plan contracts at bind
 time — a malformed row fails startup, never serves.
 
@@ -94,7 +178,9 @@ inside whichever LoRA kernel tiles over it, and nothing anywhere else.
 
 Shipped values: decode rows 16 (their measured optimum at 1-16 pairs per
 group; also the tensor-core floor), prefill rows 32, except the H200
-shared-prefill rank bands, which carry their own winners (16-64 by rank).
+shared-outer prefill rows: 16 up to rank 16 and 64 above. Moving those to 32
+cost 3% at 512-token prefill on Qwen3.5-397B NVFP4 (2026-09-23), so they keep
+their own blocks.
 
 There USED to be a second granularity — `gate_up_a_routing_block_size`, a
 private gate/up-A list at 64 over a shared 16 — retired 2026-08-19 along
@@ -115,28 +201,28 @@ shared value — is NOT that number: gate/up-A's weight slab (2R x hidden, the
 largest K-deep panel of the four kernels) loses 4x its fetch amortization
 there. Do not "simplify" this value downward without rerunning the matrix.
 
-Occupancy is what moves the optimum — routed pairs per routing group,
+Occupancy is what moves the optimum — routed pairs per routing bucket,
 `tokens x top_k / (local_experts x live adapter slots)`. A 4096-token
-prefill of a 256-expert model with 4 adapters resident is 1024 groups of
+prefill of a 256-expert model with 4 adapters resident is 1024 buckets of
 ~32 pairs, not the thousands the token count suggests. The tuner sweeps
 this knob per phase end-to-end (decode scored on output throughput, prefill
 on input throughput).
 
 The SHARED-OUTER prefill rows remain the open lead: they run the opposite
-regime (4 routing groups, ~16k pairs each, padding 0.4% of slots) and a
+regime (4 routing buckets, ~16k pairs each, padding 0.4% of slots) and a
 kernel-level sweep on GB300 put a block of 128 at +19.6% (2k tokens) to
 +26.0% (8k) over a block of 16, with no padding tax to give it back. The
 shipped rows have since moved to 32 (H200's top band to 64); the 128 cell
 has not been rerun against them.
 
-Route builder launch tiles (constants in `routing.py`, kernels in
-`kernels/routing.py`):
+Route builder launch tiles (constants and kernels in
+`lora/kernels/routing.py`):
 
 These are module constants, not table entries and not autotuned, because
 graph capture wants one launch shape per call site. The route build is three
 kernels: count pairs per bucket, plan the blocks, then label blocks and place
-pairs. `HIST_BLOCK`/`HIST_WARPS` size the count, `SCAN_CHUNK`/`SCAN_WARPS`
-the plan, `EXPAND_BLOCK`/`EXPAND_WARPS` the place.
+pairs. `_HIST_BLOCK`/`_HIST_WARPS` size the count, `_SCAN_CHUNK`/`_SCAN_WARPS`
+the plan, `_EXPAND_BLOCK`/`_EXPAND_WARPS` the place.
 
 Swept on GB300 2026-07-25 (64 points over 4 cells), then re-verified
 per-kernel on H200/B200/GB300 2026-08-19 (5 cells x 48 configs, profiler GPU
@@ -152,8 +238,8 @@ the first attempt at this sweep measured the shipped config 9.6% FASTER THAN
 ITSELF, and one arch's three stages each +13% while their combination went
 -3.9%. Per-kernel `self_device_time_total` has a <=1% floor.
 
-The JIT id-pass tile in `routing.py` (`block_size = 1024`, a flat map over
-pairs) was never swept; it is ~1-3us of exposure.
+The JIT id-pass tile in `lora/kernels/routing.py` (`block_size = 1024`, a flat
+map over pairs) was never swept; it is ~1-3us of exposure.
 
 Cost of one route build, measured on B200 2026-08-19 (16,384 pairs = 2048
 tokens at top-8, block 32, profiler GPU time per kernel):
@@ -192,9 +278,10 @@ Removing 3.35ms of kernel time bought 3.22ms of wall clock.
 Read that before optimizing the route build. Today a shared-outer plan
 builds its two aligned views with the standard builder, the shared one forked
 onto the workspace side stream (`parallel_shared_outer`; the joint builder it
-replaced is recorded below); a per-expert plan builds one. Per-expert DECODE
-builds neither -- 8 pairs is below `_FUSED_ALIGN_MIN_PAIRS`, so it runs the JIT
-id pass at 1.2us per layer.
+replaced is recorded below); a per-expert plan builds one. For the grouped
+per-expert decode plan, an 8-pair route now uses `_build_small_route` in one
+launch, provided no explicit capacity or large-bucket limit overrides it.
+The earlier 1.2us JIT id-pass measurement does not describe this current path.
 
 BEWARE when A/B-ing adapter counts: at batch size 1 a single request uses a
 single adapter, so `max_loras_per_batch` 1 and 4 put every pair on the SAME
@@ -226,7 +313,7 @@ Verdicts on the two leads this evidence settles:
 
 The per-block paths CANNOT simply replace the per-pair ones -- they pay a fixed
 cost per block, so they lose badly on small work, which is why `_histogram_bins` and
-`CLAIM_MIN_PAIRS_PER_BUCKET` gate them on the host and both per-pair paths
+`_CLAIM_MIN_PAIRS_PER_BUCKET` gate them on the host and both per-pair paths
 stay. Measured win factor by pairs and live adapters (above 1.00 means the
 per-block path wins):
 
@@ -247,7 +334,7 @@ unaffected. Do NOT branch inside a kernel on a device value.
 
 What is left: the counting path is bounded at 512 bins, so a per-expert route
 with more than 511 buckets -- 256 experts with 2 or more adapter slots -- still
-counts one pair at a time. Raising `COUNT_MAX_BINS` needs 1024 measured first;
+counts one pair at a time. Raising `_COUNT_MAX_BINS` needs 1024 measured first;
 2048 is known to lose.
 
 MEASURED AND DECLINED, so nobody re-derives it: the plan kernel's `CHUNK` is a
@@ -262,7 +349,7 @@ wider route also masked the narrow one's gain.) Above 1024 buckets 2048 is
 simply correct.
 
 Not a lead, and worth recording so nobody re-derives it: the padding fill's
-2D tile is `EXPAND_BLOCK x routing_block_size`, which looks like it should
+2D tile is `_EXPAND_BLOCK x routing_block_size`, which looks like it should
 blow up registers as the block grows. It does not. Blocks 16 through 512 all
 compile with zero spills (32 registers, 56 at block 64), and 256 and 512 run
 correctly. Whatever limits the route block, it is not this kernel.
@@ -508,7 +595,7 @@ Prefill flat within noise. On this evidence every shipped joint row moved to
 the route kernels: `_hist`/`_scan`/`_place` are single-route (the constexpr
 NEED branches compiled to exactly these instantiations before, verified by a
 post-deletion timing spot check matching to the microsecond), and
-`_build_aligned_route` builds one route per call.
+`_build_large_route` builds one route per call.
 
 Route builder on the H200 prefill rows (2026-08-20, added after the flip). The
 48-cell sweep above reached one prefill row only, SM100's `prefill.shared`,
@@ -536,17 +623,12 @@ A general lesson from this sweep and the into-base sweep: rank 16 selects a
 different row from rank 8 or rank 128 on H200. A sweep at one rank does not
 cover a table whose rows carry `max_rank`.
 
-To onboard a model whose geometry the shipped `domain`/rows do not cover:
-
-```
-python benchmark/kernels/lora_moe/tune_lora_config.py --model-path <path> --emit-seed --out <dir>
-```
-
-and point `SGLANG_LORA_MOE_CONFIG_DIR` at that directory; files there take
-precedence over the packaged ones, per architecture. The seed only reuses the
-existing plans for the wider geometry: validate provider admission and
-correctness on that geometry before serving it, then benchmark it with the
-campaign protocol below. `--check` reports rows for one `--quant-family`.
+For new workloads, use the [MoE tuning workflow](../../../../../../benchmark/kernels/lora_moe/README.md).
+The former `--emit-seed` command merely widened existing plan domains; it did
+not tune them. Provider admission, numerical checks and independent timing
+validation are required before proposing a wider domain. Override files under
+`SGLANG_LORA_MOE_CONFIG_DIR` take precedence per architecture; do not install
+an exact-study candidate as a production table without reviewing its full reach.
 
 The finalize family names in the evidence below are the current ones:
 `shared_token_delta` was called `shared_token_gemm` and `shared_one_pass` was
@@ -681,7 +763,7 @@ change in decode tokens/s of materialized against the shipped one-pass finalize:
 The one-pass finalize keeps its lead at rank 8 and ties at 128 and 256, so the
 decode rows stay on it across the whole rank range.
 
-Token route from the request segments (2026-09-03). The shared-outer token
+Token route from the request segments (2026-09-03; removed 2026-09-22, see below). The shared-outer token
 route, one row per token grouped by adapter slot, used to be built like the
 pair routes: a histogram over tokens keyed by slot, a scan, and a placement
 pass, three kernels plus a masking pass, every forward. That is a sort of
@@ -701,9 +783,23 @@ per request, bs 32/16/8/1, two rounds each, H200, rank 16:
 | Qwen3.5-35B bf16 | -1.4% | -1.4% | -1.1% | -1.2% |
 | Inkling-Small NVFP4 | -0.7% | -1.1% | -2.1% | -0.5% |
 
-Per-pair inner product on the NVFP4 decode row (2026-09-03). The sm100 NVFP4
-decode row runs `token_dense` A, `per_pair` B over its slot planes, `per_pair`
-down-A and `shared_one_pass`. A variant of both per-pair kernels on
+Retired for the shared-token route (2026-09-22). Under CUDA graphs the
+shared-token route had moved to the sorted bucket route over one pseudo-expert
+(its capacity does not depend on the request count, which a replay needs), built
+once per forward through the route cache; eager batches kept the per-request
+segment builder, called once per MoE layer. Eager now takes the same cached
+sorted route. Server A/B on Qwen3.5-35B-A3B (one fused shared expert, shared-
+expert LoRA rank 8, eager prefill batches of 1 x 8192, 8 x 1024, 32 x 256 and
+64 x 128 tokens, five alternating server pairs): first-chunk latency 0.994-1.005
+on B200 and 0.968-1.010 on GB300 (round spread up to +-7 % on that
+node's eager prefill; medians within 3 % everywhere), decode unchanged. The table above compared
+two per-layer builds; one cached build per forward is what closes the gap.
+`build_segmented_token_route` and its kernel were then removed together with
+the dense engine's `route` plan field (2026-09-22).
+
+Per-row inner product on the NVFP4 decode row (2026-09-03). The sm100 NVFP4
+decode row runs `token_dense` A, `per_row` B over its slot planes, `per_row`
+down-A and `shared_one_pass`. A variant of both per-row kernels on
 `tl.dot`, a 16-row tile holding one live row, was measured against the shipped
 `tl.sum` kernels on that row (128 input, 256 output tokens, bs 64/32/8/1, two
 rounds):

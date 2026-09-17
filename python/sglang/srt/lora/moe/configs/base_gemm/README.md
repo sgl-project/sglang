@@ -17,15 +17,12 @@ installed package; a mismatch warns and falls back to the heuristics.
 No file, or an invalid file, means the providers use their built-in
 heuristics — byte-identical to a build without this directory.
 
-Generate entries on the target device (do not hand-write):
-
-```
-python benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py \
-    --num-local-experts <E_local> --hidden-size <H> \
-    --intermediate-size <I> --gate-up-slices 2 --top-k <K> \
-    --output-dir python/sglang/srt/lora/moe/configs/base_gemm
-```
-
 `SGLANG_LORA_MOE_CONFIG_DIR` names an override config root at load time;
-tables are read from its `base_gemm/` subdirectory (the layout
-`tune_lora_config.py --sweep` emits).
+tables are read from its `base_gemm/` subdirectory.
+
+The [maintained LoRA tuner](../../../../../../../benchmark/kernels/lora_moe/README.md)
+currently searches LoRA launch tiles while retaining these base configurations.
+It does not emit base-GEMM tables. The old partial-GEMM sweep is historical
+screening evidence, not a complete-runner correctness or performance gate.
+New tables need numerical checks and complete-runner validation on their exact
+device/geometry; do not populate this directory from isolated stage timings.

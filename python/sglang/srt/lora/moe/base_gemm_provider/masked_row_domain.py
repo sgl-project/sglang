@@ -21,9 +21,9 @@ if TYPE_CHECKING:
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
-def masked_m_max(num_tokens: int) -> int:
-    """Use the same slab bound as the upstream masked preprocess."""
-    return (num_tokens // 256 + 1) * 256
+def masked_m_max(num_tokens: int, alignment: int = 8) -> int:
+    """Fit all input rows in one expert, with a nonzero aligned slab extent."""
+    return max(alignment, (num_tokens + alignment - 1) // alignment * alignment)
 
 
 class MaskedRowState(msgspec.Struct, kw_only=True):
@@ -36,7 +36,7 @@ class MaskedRowState(msgspec.Struct, kw_only=True):
     expected_m: int
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32
     m_max: int
-    retained_inputs: bool
+    input_buffer_reuse: bool
 
 
 class MaskedRowDomainProvider(MoeBaseProvider):
@@ -106,12 +106,12 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             expected_m=expected_rows_per_expert(num_pairs, num_experts),
             pair_to_row=pair_to_row,
             m_max=m_max,
-            retained_inputs=workspace is not None,
+            input_buffer_reuse=workspace is not None,
         )
 
     def release_prepared_inputs(self, row_state: MaskedRowState) -> None:
         # Workspace buffers retain their addresses for graph replay.
-        if row_state.retained_inputs:
+        if row_state.input_buffer_reuse:
             return
         from sglang.srt.utils import dispose_tensor
 

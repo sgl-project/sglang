@@ -97,7 +97,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
-    _set_capture_lora_variant,
+    capture_lora_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -212,6 +212,13 @@ def build_replay_fb_view(
     )
 
 
+def _lora_backend_skips_inactive(model_runner) -> bool:
+    manager = getattr(model_runner, "lora_manager", None)
+    return manager is not None and bool(
+        getattr(manager.lora_backend, "skip_inactive_dense_lora", False)
+    )
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -230,7 +237,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        # A LoRA backend whose dense layers skip inactive batches gets a LoRA-free
+        # graph per batch size for all-base batches (see BaseLoRABackend).
+        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
+            model_runner
+        )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -381,7 +392,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+            self.model_runner.lora_manager.init_decode_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_req=self.captured_req_width,
             )
@@ -1111,22 +1122,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                for attention_variant in attention_variants:
-                    _set_capture_attention_variant(attention_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
-                        )
+                with capture_lora_variant(variant_label):
+                    for attention_variant in attention_variants:
+                        _set_capture_attention_variant(attention_variant)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                            )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1162,6 +1173,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
+                if forward_batch.lora_ids is not None:
+                    self.model_runner.lora_manager.reset_routing_cache()
                 # Graph-recordable metadata-prep hook. The unified memory pool
                 # records ZERO translate nodes here: all its read/write translates
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so

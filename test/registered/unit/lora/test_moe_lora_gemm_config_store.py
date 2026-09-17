@@ -17,7 +17,7 @@ from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-c-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _GEOMETRY = dict(num_local_experts=32, n_gemm1=1536, n_gemm2=7168, k=7168)
 _VALID = {

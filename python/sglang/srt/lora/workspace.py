@@ -1,28 +1,70 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.lora.route_view import RouteView
+
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
 
 _T = TypeVar("_T")
 
 
 class LoraWorkspace:
+    """Scratch for the LoRA runners.
+
+    Graph buckets share prefix views per (name, dtype, device, graph phase).
+    Prefill and decode keep separate capacities. A larger warm-up retires the old
+    storage without freeing it: previously captured graphs retain its address.
+    """
+
     def __init__(self) -> None:
-        self._graph_buffers: dict[
-            tuple[str, tuple[int, ...], torch.dtype, torch.device], torch.Tensor
+        self._graph_storage: dict[
+            tuple[str, torch.dtype, torch.device, bool], torch.Tensor
         ] = {}
+        self._graph_iota: dict[tuple[torch.device, bool], torch.Tensor] = {}
+        self._retired: list[
+            torch.Tensor
+        ] = []  # outgrown storages captured graphs still read
         self._eager_buffers: dict[
             tuple[str, torch.dtype, torch.device], torch.Tensor
         ] = {}
         self._iota: dict[torch.device, torch.Tensor] = {}
-        self._streams: dict[torch.device, torch.cuda.Stream] = {}
-        self._events: dict[tuple[torch.device, str], torch.cuda.Event] = {}
+        self._streams: dict[tuple[torch.device, int], torch.cuda.Stream] = {}
+        self._events: dict[tuple[torch.device, int, str], torch.cuda.Event] = {}
         self._graph_mode = False
+        self._is_prefill_graph = False
+        self.routes: dict[tuple, dict[tuple, RouteView]] = {}
 
-    def begin_forward(self, *, graph_mode: bool) -> None:
+    def route(
+        self, mapping: torch.Tensor, key: tuple, build: Callable[[], RouteView]
+    ) -> RouteView:
+        stream = self._caller(mapping.device) if mapping.is_cuda else 0
+        routes = self.routes.setdefault((mapping.device, stream), {})
+        key = (
+            self._graph_mode,
+            self._is_prefill_graph if self._graph_mode else False,
+            mapping.dtype,
+            mapping.data_ptr(),
+            mapping.numel(),
+            mapping.stride(),
+            *key,
+        )
+        route = routes.get(key)
+        if route is None:
+            route = build()
+            routes[key] = route
+        return route
+
+    def begin_forward(
+        self, *, graph_mode: bool, is_prefill_graph: bool = False
+    ) -> None:
         self._graph_mode = bool(graph_mode)
+        self._is_prefill_graph = bool(is_prefill_graph)
 
     @staticmethod
     def _capturing(device: torch.device) -> bool:
@@ -40,24 +82,27 @@ class LoraWorkspace:
         # Per-forward clears belong to the caller so graphs replay them.
         resolved_device = torch.device(device)
         resolved_shape = tuple(int(dim) for dim in shape)
+        elements = 1
+        for dimension in resolved_shape:
+            elements *= dimension
+        key = (name, dtype, resolved_device)
         if self._graph_mode:
-            key = (name, resolved_shape, dtype, resolved_device)
-            tensor = self._graph_buffers.get(key)
-            if tensor is None:
+            key = (*key, self._is_prefill_graph)
+            storage = self._graph_storage.get(key)
+            if storage is None or storage.numel() < elements:
                 if self._capturing(resolved_device):
                     raise RuntimeError(
                         "MoE LoRA workspace was not warmed before CUDA capture: "
                         f"missing {name!r} {resolved_shape} {dtype} on "
                         f"{resolved_device}"
                     )
+                if storage is not None:
+                    self._retired.append(storage)
                 factory = torch.zeros if zero_on_first_allocation else torch.empty
-                tensor = factory(resolved_shape, dtype=dtype, device=resolved_device)
-                self._graph_buffers[key] = tensor
+                storage = factory((elements,), dtype=dtype, device=resolved_device)
+                self._graph_storage[key] = storage
+            tensor = storage[:elements].view(resolved_shape)
         else:
-            key = (name, dtype, resolved_device)
-            elements = 1
-            for dimension in resolved_shape:
-                elements *= dimension
             storage = self._eager_buffers.get(key)
             if storage is None or storage.numel() < elements:
                 if self._capturing(resolved_device):
@@ -73,21 +118,24 @@ class LoraWorkspace:
     def iota(self, n: int, device: torch.device | str) -> torch.Tensor:
         """Return an int32 identity map [0..n), filled outside capture.
 
-        Graph mode keys the map by length so a captured pointer is never
-        freed by later growth; eager mode grows one shared buffer.
+        A prefix of a longer map is a shorter one, so graph mode shares a single
+        map per device and graph phase, grown outside capture (an outgrown map
+        is retired, not freed); eager mode grows one buffer.
         """
         resolved_device = torch.device(device)
         if self._graph_mode:
-            key = ("iota", (n,), torch.int32, resolved_device)
-            tensor = self._graph_buffers.get(key)
-            if tensor is None:
+            key = (resolved_device, self._is_prefill_graph)
+            buffer = self._graph_iota.get(key)
+            if buffer is None or buffer.numel() < n:
                 if self._capturing(resolved_device):
                     raise RuntimeError(
                         "the MoE LoRA iota buffer was not warmed before CUDA capture"
                     )
-                tensor = torch.arange(n, dtype=torch.int32, device=resolved_device)
-                self._graph_buffers[key] = tensor
-            return tensor
+                if buffer is not None:
+                    self._retired.append(buffer)
+                buffer = torch.arange(n, dtype=torch.int32, device=resolved_device)
+                self._graph_iota[key] = buffer
+            return buffer[:n]
         buffer = self._iota.get(resolved_device)
         if buffer is None or buffer.numel() < n:
             if self._capturing(resolved_device):
@@ -99,28 +147,34 @@ class LoraWorkspace:
             self._iota[resolved_device] = buffer
         return buffer[:n]
 
+    @staticmethod
+    def _caller(device: torch.device) -> int:
+        # Read the raw handle without constructing a Python Stream wrapper.
+        if _raw_stream is not None and device.type == "cuda":
+            index = device.index
+            return _raw_stream(
+                index if index is not None else torch.cuda.current_device()
+            )
+        return torch.cuda.current_stream(device).cuda_stream
+
     def side_stream(self, device: torch.device | str) -> torch.cuda.Stream:
-        # Calls on one device must fork from the same stream.
         resolved_device = torch.device(device)
-        stream = self._streams.get(resolved_device)
+        caller = self._caller(resolved_device)
+        key = (resolved_device, caller)
+        stream = self._streams.get(key)
         if stream is None:
-            if self._capturing(resolved_device):
-                raise RuntimeError(
-                    "MoE LoRA side stream was not created before CUDA capture"
-                )
+            # The stream pool can return the caller's stream, preventing overlap.
             stream = torch.cuda.Stream(device=resolved_device)
-            self._streams[resolved_device] = stream
+            while stream.cuda_stream == caller:
+                stream = torch.cuda.Stream(device=resolved_device)
+            self._streams[key] = stream
         return stream
 
     def event(self, device: torch.device | str, name: str) -> torch.cuda.Event:
         resolved_device = torch.device(device)
-        key = (resolved_device, name)
+        key = (resolved_device, self._caller(resolved_device), name)
         event = self._events.get(key)
         if event is None:
-            if self._capturing(resolved_device):
-                raise RuntimeError(
-                    f"MoE LoRA event was not created before CUDA capture: {name}"
-                )
             event = torch.cuda.Event()
             self._events[key] = event
         return event
@@ -144,9 +198,19 @@ class LoraWorkspace:
 
         ready.record(current)
         side_stream.wait_event(ready)
+        caller_routes = self.routes.setdefault(
+            (current.device, current.cuda_stream), {}
+        )
+        side_routes = self.routes.setdefault(
+            (side_stream.device, side_stream.cuda_stream), {}
+        )
+        # Routes become visible across streams at the existing event waits.
+        side_routes.update(caller_routes)
         with torch.cuda.stream(side_stream):
             side()
             done.record(side_stream)
+        completed_routes = side_routes.copy()
         result = compute()
         current.wait_event(done)
+        caller_routes.update(completed_routes)
         return result

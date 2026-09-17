@@ -9,8 +9,13 @@ import msgspec
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.lora.moe.plan import FinalizeFamily, MoeLoraLaunchConfig
     from sglang.srt.lora.route_view import RouteView
     from sglang.srt.lora.workspace import LoraWorkspace
+
+
+# Token-count cutoff for the vectorized top-k gather.
+_SMALL_FINALIZE_MAX_TOKENS = 64
 
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
@@ -149,6 +154,14 @@ class MoeBaseProvider:
     ) -> None:
         raise NotImplementedError
 
+    def down_output(self, row_state, workspace: LoraWorkspace) -> torch.Tensor:
+        return workspace.tensor(
+            "base:down",
+            self.down_out_shape(row_state),
+            dtype=torch.bfloat16,
+            device=row_state.pair_to_row.device,
+        )
+
     def finalize(
         self,
         row_state,
@@ -162,8 +175,21 @@ class MoeBaseProvider:
     ) -> None:
         """Weight base + unweighted LoRA delta [T, K, H], then scale once."""
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
+        from sglang.srt.lora.moe.kernels.finalize import invoke_small_finalize
 
         num_tokens, hidden = output.shape
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        if num_tokens <= _SMALL_FINALIZE_MAX_TOKENS and topk_weights.is_contiguous():
+            # Gather top-k rows together instead of issuing dependent row loads.
+            invoke_small_finalize(
+                down_out.view(-1, hidden),
+                output,
+                row_state.pair_to_row,
+                topk_weights,
+                scaling,
+                lora_delta=lora_delta,
+            )
+            return
         post_reorder_deepgemm(
             down_out.view(-1, hidden),
             output,
@@ -173,11 +199,11 @@ class MoeBaseProvider:
             topk_ids.shape[1],
             num_tokens,
             hidden,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            scaling,
             lora_delta=lora_delta,
         )
 
-    def shared_token_delta_finalize(
+    def shared_outer_finalize(
         self,
         row_state,
         *,
@@ -188,13 +214,52 @@ class MoeBaseProvider:
         topk_weights: torch.Tensor,
         routed_scaling_factor: float | None,
         output: torch.Tensor,
-        token_rank: torch.Tensor,
-        token_delta: torch.Tensor,
-        token_route: RouteView,
-        delta_config: Mapping[str, int],
-        config: Mapping[str, Mapping[str, int]],
+        family: FinalizeFamily,
+        launch_config: MoeLoraLaunchConfig,
+        workspace: LoraWorkspace,
+        token_route: RouteView | None,
     ) -> None:
-        """Reduce in rank space before applying the shared down-B per token."""
+        """Apply shared down-B with the plan's fused or staged finalize."""
+        from sglang.srt.lora.moe.plan import FinalizeFamily, Site
+
+        if topk_weights.dtype != torch.float32:
+            raise TypeError(
+                "topk_weights must stay FP32 until the finalize applies them"
+            )
+        if family is FinalizeFamily.SHARED_ONE_PASS:
+            from sglang.srt.lora.moe.kernels.finalize import invoke_shared_one_pass
+
+            invoke_shared_one_pass(
+                num_local_experts=self.num_local_experts,
+                down_rows=down_rows,
+                pair_to_row=row_state.pair_to_row,
+                bridge=bridge,
+                b_down=b_down,
+                routing=routing,
+                topk_weights=topk_weights,
+                routed_scaling_factor=routed_scaling_factor,
+                output=output,
+                config=launch_config.shared_one_pass,
+            )
+            return
+        if family is not FinalizeFamily.SHARED_TOKEN_DELTA:
+            raise ValueError(f"not a shared-outer finalize family: {family}")
+        if token_route is None:
+            raise ValueError("shared token route was not constructed")
+
+        num_tokens = output.shape[0]
+        token_rank = workspace.tensor(
+            "finalize:shared_token_rank",
+            (num_tokens, bridge.shape[1]),
+            dtype=bridge.dtype,
+            device=bridge.device,
+        )
+        token_delta = workspace.tensor(
+            "finalize:shared_token_delta",
+            (num_tokens, self.hidden_size),
+            dtype=self.contract.lora_delta_dtype,
+            device=bridge.device,
+        )
         from sglang.srt.lora.moe.kernels.finalize import (
             invoke_shared_token_delta_reduce,
             invoke_shared_token_delta_tail,
@@ -202,11 +267,12 @@ class MoeBaseProvider:
         from sglang.srt.lora.moe.kernels.lora_b import grouped_lora_b
 
         invoke_shared_token_delta_reduce(
+            num_local_experts=self.num_local_experts,
             bridge=bridge,
             routing=routing,
             topk_weights=topk_weights,
             token_rank=token_rank,
-            config=config["reduce"],
+            config=launch_config.shared_token_delta["reduce"],
         )
         grouped_lora_b(
             token_rank,
@@ -214,10 +280,11 @@ class MoeBaseProvider:
             token_delta,
             token_route,
             destination_offsets=(0,),
-            config=delta_config,
-            intermediate_top_k=1,
+            config=launch_config.for_b(Site.DOWN),
+            pair_bridge=True,
         )
         invoke_shared_token_delta_tail(
+            num_local_experts=self.num_local_experts,
             down_rows=down_rows,
             pair_to_row=row_state.pair_to_row,
             token_delta=token_delta,
@@ -225,34 +292,7 @@ class MoeBaseProvider:
             topk_weights=topk_weights,
             routed_scaling_factor=routed_scaling_factor,
             output=output,
-            config=config["tail"],
-        )
-
-    def shared_one_pass_finalize(
-        self,
-        row_state,
-        *,
-        down_rows: torch.Tensor,
-        bridge: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        from sglang.srt.lora.moe.kernels.finalize import invoke_shared_one_pass
-
-        invoke_shared_one_pass(
-            down_rows=down_rows,
-            pair_to_row=row_state.pair_to_row,
-            bridge=bridge,
-            b_down=b_down,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            output=output,
-            config=config,
+            config=launch_config.shared_token_delta["tail"],
         )
 
     def mapped_down_lora_a_input(
@@ -260,7 +300,7 @@ class MoeBaseProvider:
         row_state,
         activation: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sentinel mappings are uninitialized; their route blocks are skipped."""
+        """Return flat provider rows and their pair map; skip sentinel route blocks."""
         return activation.view(-1, activation.shape[-1]), row_state.pair_to_row
 
     def gateup_out_shape(self, row_state) -> tuple[int, ...]:

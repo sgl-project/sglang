@@ -221,13 +221,14 @@ def _shared_one_pass_kernel(
 
 def invoke_shared_token_delta_reduce(
     *,
+    num_local_experts: int,
     bridge: torch.Tensor,
     routing: RouteView,
     topk_weights: torch.Tensor,
     token_rank: torch.Tensor,
     config: Mapping[str, int],
 ) -> None:
-    num_tokens, top_k = routing.topk_ids.shape
+    num_tokens, top_k = routing.num_tokens, routing.width
     if num_tokens == 0:
         return
     rank = bridge.shape[1]
@@ -236,8 +237,8 @@ def invoke_shared_token_delta_reduce(
         bridge,
         token_rank,
         topk_weights,
-        routing.topk_ids,
-        routing.token_lora_mapping,
+        routing.group_ids,
+        routing.token_slots,
         num_tokens,
         bridge.stride(0),
         bridge.stride(1),
@@ -248,7 +249,7 @@ def invoke_shared_token_delta_reduce(
         rank=rank,
         top_k=top_k,
         max_loras=routing.max_loras,
-        local_expert_count=routing.num_local_experts,
+        local_expert_count=num_local_experts,
         block_t=block_t,
         block_r=max(16, triton.next_power_of_2(rank)),
         num_warps=int(config["num_warps"]),
@@ -258,6 +259,7 @@ def invoke_shared_token_delta_reduce(
 
 def invoke_shared_token_delta_tail(
     *,
+    num_local_experts: int,
     down_rows: torch.Tensor,
     pair_to_row: torch.Tensor,
     token_delta: torch.Tensor,
@@ -267,7 +269,7 @@ def invoke_shared_token_delta_tail(
     output: torch.Tensor,
     config: Mapping[str, int],
 ) -> None:
-    num_tokens = routing.topk_ids.shape[0]
+    num_tokens = routing.num_tokens
     if num_tokens == 0:
         return
     hidden = down_rows.shape[-1]
@@ -278,8 +280,8 @@ def invoke_shared_token_delta_tail(
         token_delta,
         output,
         topk_weights,
-        routing.topk_ids,
-        routing.token_lora_mapping,
+        routing.group_ids,
+        routing.token_slots,
         down_rows.stride(-2),
         down_rows.stride(-1),
         output.stride(0),
@@ -289,9 +291,9 @@ def invoke_shared_token_delta_tail(
         token_delta.stride(0),
         token_delta.stride(1),
         1.0 if routed_scaling_factor is None else routed_scaling_factor,
-        num_local_experts=routing.num_local_experts,
+        num_local_experts=num_local_experts,
         hidden=hidden,
-        top_k=routing.topk_ids.shape[1],
+        top_k=routing.width,
         max_loras=routing.max_loras,
         block_h=block_h,
         num_warps=int(config["num_warps"]),
@@ -301,6 +303,7 @@ def invoke_shared_token_delta_tail(
 
 def invoke_shared_one_pass(
     *,
+    num_local_experts: int,
     down_rows: torch.Tensor,
     pair_to_row: torch.Tensor,
     bridge: torch.Tensor,
@@ -311,7 +314,7 @@ def invoke_shared_one_pass(
     output: torch.Tensor,
     config: Mapping[str, int],
 ) -> None:
-    num_tokens, top_k = routing.topk_ids.shape
+    num_tokens, top_k = routing.num_tokens, routing.width
     if num_tokens == 0:
         return
     hidden = down_rows.shape[-1]
@@ -323,8 +326,8 @@ def invoke_shared_one_pass(
         bridge,
         topk_weights,
         b_down,
-        routing.topk_ids,
-        routing.token_lora_mapping,
+        routing.group_ids,
+        routing.token_slots,
         output,
         down_rows.stride(-2),
         down_rows.stride(-1),
@@ -338,7 +341,7 @@ def invoke_shared_one_pass(
         output.stride(0),
         output.stride(1),
         1.0 if routed_scaling_factor is None else routed_scaling_factor,
-        num_local_experts=routing.num_local_experts,
+        num_local_experts=num_local_experts,
         hidden=hidden,
         rank=rank,
         top_k=top_k,
@@ -347,4 +350,74 @@ def invoke_shared_one_pass(
         block_r=max(16, triton.next_power_of_2(rank)),
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
+    )
+
+
+# Vectorize index/weight loads, retaining the shared finalizer's top-k sum order.
+@triton.jit
+def _small_finalize_kernel(
+    down_ptr,  # [rows, H] base down rows (pair_to_row indexes them)
+    delta_ptr,  # [T * TOPK, H] unweighted LoRA delta per pair (or down_ptr when absent)
+    out_ptr,  # [T, H]
+    pair_to_row_ptr,  # [T * TOPK]; < 0 = no row for this pair
+    topk_weights_ptr,  # [T * TOPK] fp32
+    hidden,
+    scaling,
+    TOPK: tl.constexpr,
+    TOPK_P2: tl.constexpr,
+    HAS_DELTA: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    cmask = cols < hidden
+    ks = tl.arange(0, TOPK_P2)
+    kmask = ks < TOPK
+    rows = tl.load(pair_to_row_ptr + t * TOPK + ks, mask=kmask, other=-1).to(tl.int64)
+    weights = tl.load(topk_weights_ptr + t * TOPK + ks, mask=kmask, other=0.0).to(
+        tl.float32
+    )
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        pick = ks == k
+        row = tl.sum(tl.where(pick, rows, 0), axis=0)
+        weight = tl.sum(tl.where(pick, weights, 0.0), axis=0)
+        live = row >= 0
+        x = tl.load(down_ptr + row * hidden + cols, mask=cmask & live, other=0.0).to(
+            tl.float32
+        )
+        if HAS_DELTA:
+            x += tl.load(
+                delta_ptr + (t * TOPK + k) * hidden + cols, mask=cmask & live, other=0.0
+            ).to(tl.float32)
+        acc += x * weight
+    acc *= scaling
+    tl.store(out_ptr + t * hidden + cols, acc.to(out_ptr.dtype.element_ty), mask=cmask)
+
+
+def invoke_small_finalize(
+    down_rows: torch.Tensor,
+    output: torch.Tensor,
+    pair_to_row: torch.Tensor,
+    topk_weights: torch.Tensor,
+    routed_scaling_factor: float,
+    *,
+    lora_delta: torch.Tensor | None,
+    block_h: int = 512,
+) -> None:
+    num_tokens, hidden = output.shape
+    topk = topk_weights.shape[1]
+    _small_finalize_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        down_rows,
+        down_rows if lora_delta is None else lora_delta,
+        output,
+        pair_to_row,
+        topk_weights,
+        hidden,
+        float(routed_scaling_factor),
+        TOPK=topk,
+        TOPK_P2=triton.next_power_of_2(topk),
+        HAS_DELTA=lora_delta is not None,
+        BLOCK_H=block_h,
+        num_warps=4,
     )

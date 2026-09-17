@@ -1,5 +1,5 @@
 """The MoE LoRA runner's route bundle: the views its execution plan asks for,
-built from the shared route builders in ``sglang.srt.lora.routing``."""
+built from the shared route builders in ``sglang.srt.lora.kernels.routing``."""
 
 from __future__ import annotations
 
@@ -7,16 +7,13 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.lora.moe.execution_plan import (
-    MoeLoraExecutionPlan,
+from sglang.srt.lora.kernels.routing import build_route
+from sglang.srt.lora.moe.plan import (
+    MoePlan,
     RouteBuilderFamily,
     RouteRequirement,
 )
 from sglang.srt.lora.route_view import RouteView, RouteViewKind
-from sglang.srt.lora.routing import (
-    build_group_route,
-    build_segmented_token_route,
-)
 from sglang.srt.lora.workspace import LoraWorkspace
 
 
@@ -45,35 +42,32 @@ class MoeLoraRoutes:
         return route
 
 
-def build_routes(
-    plan: MoeLoraExecutionPlan,
+def build_moe_routes(
+    plan: MoePlan,
     *,
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
-    seg_indptr: torch.Tensor,
     num_local_experts: int,
     max_loras: int,
     block_size: int,
     workspace: LoraWorkspace,
-    graph_mode: bool = False,
 ) -> MoeLoraRoutes:
     requirements = plan.route_requirements()
     values: dict[str, object] = {}
     if RouteRequirement.RAW_PER_EXPERT in requirements:
-        values["raw_per_expert"] = build_group_route(
-            topk_ids,
+        values["raw_per_expert"] = build_route(
             token_lora_mapping,
-            num_local_experts=num_local_experts,
+            group_ids=topk_ids,
+            groups_per_slot=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             view=RouteViewKind.RAW,
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
-        values["raw_shared_outer"] = build_group_route(
-            topk_ids,
+        values["raw_shared_outer"] = build_route(
             token_lora_mapping,
-            num_local_experts=num_local_experts,
-            is_shared_outer=True,
+            group_ids=topk_ids,
+            groups_per_slot=1,
             max_loras=max_loras,
             block_size=block_size,
             view=RouteViewKind.RAW,
@@ -82,10 +76,10 @@ def build_routes(
     if plan.route_builder is RouteBuilderFamily.PARALLEL_SHARED_OUTER:
 
         def _build_per_expert() -> RouteView:
-            return build_group_route(
-                topk_ids,
+            return build_route(
                 token_lora_mapping,
-                num_local_experts=num_local_experts,
+                group_ids=topk_ids,
+                groups_per_slot=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -94,11 +88,10 @@ def build_routes(
             )
 
         def _build_shared() -> None:
-            values["aligned_shared_outer"] = build_group_route(
-                topk_ids,
+            values["aligned_shared_outer"] = build_route(
                 token_lora_mapping,
-                num_local_experts=num_local_experts,
-                is_shared_outer=True,
+                group_ids=topk_ids,
+                groups_per_slot=1,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -114,10 +107,10 @@ def build_routes(
         )
     else:
         if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
-            values["aligned_per_expert"] = build_group_route(
-                topk_ids,
+            values["aligned_per_expert"] = build_route(
                 token_lora_mapping,
-                num_local_experts=num_local_experts,
+                group_ids=topk_ids,
+                groups_per_slot=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -125,11 +118,10 @@ def build_routes(
                 tensor_prefix="route:aligned_per_expert",
             )
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
-            values["aligned_shared_outer"] = build_group_route(
-                topk_ids,
+            values["aligned_shared_outer"] = build_route(
                 token_lora_mapping,
-                num_local_experts=num_local_experts,
-                is_shared_outer=True,
+                group_ids=topk_ids,
+                groups_per_slot=1,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -138,36 +130,19 @@ def build_routes(
             )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:
-        if graph_mode:
-            # Request counts can change on replay; sort the fixed token buffer
-            # by adapter slot instead of capturing the live segment count.
-            num_tokens = topk_ids.shape[0]
-            token_experts = workspace.tensor(
-                "route:shared_token:sorted_experts",
-                (num_tokens, 1),
-                dtype=torch.int32,
-                device=topk_ids.device,
-                zero_on_first_allocation=True,
-            )
-            values["shared_token"] = build_group_route(
-                token_experts,
+
+        def build_token_route():
+            # Shared experts use one row per token, grouped by adapter slot.
+            return build_route(
                 token_lora_mapping,
-                num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                is_shared_outer=True,
                 view=RouteViewKind.ALIGNED,
                 workspace=workspace,
-                tensor_prefix="route:shared_token:sorted",
+                tensor_prefix=f"route:shared_token:sorted:{block_size}",
             )
-        else:
-            values["shared_token"] = build_segmented_token_route(
-                seg_indptr=seg_indptr,
-                token_lora_mapping=token_lora_mapping,
-                num_tokens=topk_ids.shape[0],
-                num_local_experts=num_local_experts,
-                max_loras=max_loras,
-                block_size=block_size,
-                workspace=workspace,
-            )
+
+        values["shared_token"] = workspace.route(
+            token_lora_mapping, ("sorted", block_size, max_loras), build_token_route
+        )
     return MoeLoraRoutes(**values)
