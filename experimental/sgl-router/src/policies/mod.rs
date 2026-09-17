@@ -19,7 +19,11 @@ pub mod sticky;
 pub use cache_aware::{CacheCandidate, CacheCandidateProposal};
 
 use crate::discovery::ModelId;
+use crate::policies::admission::{
+    resolve_prefill, CandidateRange, CapacityFallback, DecisionReason, FinalDecision,
+};
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::cache_aware::CacheSelection;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -144,6 +148,14 @@ pub(crate) fn extract_prompt_text_from_value(v: &serde_json::Value) -> Option<St
     None
 }
 
+/// Whether a routing attempt may consult or create affinity assignments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffinityAccess {
+    Disabled,
+    LookupOnly,
+    LookupAndAssign,
+}
+
 /// Immutable request data consumed by a routing policy.
 #[derive(Clone)]
 pub struct SelectionContext<'a> {
@@ -157,8 +169,7 @@ pub struct SelectionContext<'a> {
     external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a EngineLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
-    affinity_lookup_enabled: bool,
-    affinity_assignment_enabled: bool,
+    affinity_access: AffinityAccess,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -174,8 +185,7 @@ impl<'a> SelectionContext<'a> {
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
-            affinity_lookup_enabled: true,
-            affinity_assignment_enabled: true,
+            affinity_access: AffinityAccess::LookupAndAssign,
         }
     }
 
@@ -195,8 +205,7 @@ impl<'a> SelectionContext<'a> {
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
-            affinity_lookup_enabled: true,
-            affinity_assignment_enabled: true,
+            affinity_access: AffinityAccess::LookupAndAssign,
         }
     }
 
@@ -249,16 +258,22 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Disables affinity lookup and assignment.
-    pub fn without_affinity_lookup(mut self) -> Self {
-        self.affinity_lookup_enabled = false;
-        self.affinity_assignment_enabled = false;
+    pub fn with_affinity_access(mut self, access: AffinityAccess) -> Self {
+        self.affinity_access = access;
         self
     }
 
-    /// Enables affinity lookup without recording new assignments.
+    /// Disables affinity lookup and assignment.
+    pub fn without_affinity_lookup(mut self) -> Self {
+        self.affinity_access = AffinityAccess::Disabled;
+        self
+    }
+
+    /// Disables assignment without re-enabling a disabled lookup.
     pub fn without_affinity_assignment(mut self) -> Self {
-        self.affinity_assignment_enabled = false;
+        if self.affinity_access != AffinityAccess::Disabled {
+            self.affinity_access = AffinityAccess::LookupOnly;
+        }
         self
     }
 
@@ -303,11 +318,11 @@ impl<'a> SelectionContext<'a> {
     }
 
     pub fn affinity_lookup_enabled(&self) -> bool {
-        self.affinity_lookup_enabled
+        self.affinity_access != AffinityAccess::Disabled
     }
 
     pub fn affinity_assignment_enabled(&self) -> bool {
-        self.affinity_assignment_enabled
+        self.affinity_access == AffinityAccess::LookupAndAssign
     }
 }
 
@@ -331,7 +346,69 @@ pub enum PrefillProposal {
     CacheCandidates(CacheCandidateProposal),
 }
 
+/// A completed policy evaluation. An exhausted candidate set retains its audit.
+pub(crate) enum PrefillEvaluation {
+    Pair {
+        kind: ProposalKind,
+        decision: Option<FinalDecision>,
+    },
+    Cache(CacheSelection),
+}
+
 impl PrefillProposal {
+    /// Evaluates the already-filtered proposal without committing affinity state.
+    /// `range` retains the full routing domain for capacity and saturation checks.
+    pub(crate) fn evaluate(
+        self,
+        range: &CandidateRange<'_>,
+        ctx: &SelectionContext<'_>,
+        policy: &dyn Policy,
+        queue_limit: Option<u64>,
+        capacity_fallback: CapacityFallback,
+    ) -> PrefillEvaluation {
+        match self {
+            Self::CacheCandidates(proposal) => PrefillEvaluation::Cache(
+                proposal.evaluate(
+                    ctx.input_tokens()
+                        .expect("cache evaluation requires input tokens"),
+                    ctx.load_snapshot()
+                        .expect("cache evaluation requires a load snapshot"),
+                    range.workers,
+                    ctx.model(),
+                ),
+            ),
+            Self::Pair(proposal) => {
+                let decision = if policy.uses_shared_prefill_admission() {
+                    resolve_prefill(
+                        range,
+                        &proposal,
+                        ctx.input_tokens()
+                            .expect("prefill admission requires input tokens"),
+                        ctx.load_snapshot()
+                            .expect("shared prefill admission requires a load snapshot"),
+                        queue_limit,
+                        capacity_fallback,
+                    )
+                } else {
+                    Some(FinalDecision {
+                        selected: Arc::clone(&proposal.primary),
+                        primary: proposal.primary,
+                        backup: proposal.backup,
+                        reason: DecisionReason::Primary,
+                        candidate_range_id: range.id.to_string(),
+                        load_snapshot_version: ctx
+                            .load_snapshot()
+                            .map_or(0, |snapshot| snapshot.version),
+                    })
+                };
+                PrefillEvaluation::Pair {
+                    kind: proposal.kind,
+                    decision,
+                }
+            }
+        }
+    }
+
     /// Applies eligibility filtering to either proposal form.
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
@@ -565,6 +642,41 @@ mod tests {
     }
 
     #[test]
+    fn disabling_assignment_does_not_reenable_affinity_lookup() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None)
+            .without_affinity_lookup()
+            .without_affinity_assignment();
+        assert!(!ctx.affinity_lookup_enabled());
+        assert!(!ctx.affinity_assignment_enabled());
+    }
+
+    #[test]
+    fn round_robin_evaluation_needs_no_engine_snapshot_and_advances_once() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let workers = vec![worker("first"), worker("second")];
+        let policy = RoundRobinPolicy::new();
+        for expected in [0, 1, 0] {
+            let proposal = policy.propose_prefill(&workers, &ctx).unwrap();
+            let PrefillEvaluation::Pair {
+                decision: Some(decision),
+                ..
+            } = proposal.evaluate(
+                &CandidateRange::global(&workers),
+                &ctx,
+                &policy,
+                Some(0),
+                CapacityFallback::Disabled,
+            )
+            else {
+                panic!("round robin must retain its direct choice")
+            };
+            assert_eq!(decision.selected.id, workers[expected].id);
+        }
+    }
+
+    #[test]
     fn default_proposal_preserves_legacy_single_worker_selection() {
         let model = ModelId("model".into());
         let ctx = SelectionContext::new(&model, None);
@@ -753,6 +865,7 @@ mod tests {
             32,
             &loads,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
@@ -1547,8 +1660,15 @@ mod tests {
         let range = CandidateRange::global(&workers);
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
-        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None)
-            .expect("an admitted backup must be selected");
+        let decision = resolve_prefill(
+            &range,
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            CapacityFallback::Allowed,
+        )
+        .expect("an admitted backup must be selected");
 
         assert_eq!(decision.selected.id, backup.id);
         assert_eq!(decision.reason, DecisionReason::BackupPrimaryAdmission);
@@ -1566,6 +1686,7 @@ mod tests {
             1_000_000,
             &snapshot,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("disabled reporting must preserve the healthy registry candidate");
 
@@ -1604,6 +1725,7 @@ mod tests {
             80,
             &snapshot,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("both candidates fit capacity");
 
@@ -1654,6 +1776,7 @@ mod tests {
             32,
             &snapshot,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("an admitted range fallback must be selected");
 

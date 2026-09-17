@@ -416,7 +416,7 @@ mod tests {
     use super::*;
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::admission::{resolve_prefill, CandidateRange};
+    use crate::policies::admission::{resolve_prefill, CandidateRange, CapacityFallback};
     use crate::policies::load_based::LoadBasedPolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
@@ -424,6 +424,54 @@ mod tests {
     use crate::workers::engine_load_reports::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn pipeline_preserves_fleet_scope_for_cache_saturation() {
+        use crate::policies::cache_aware::CacheAwarePolicy;
+        use crate::policies::{ExternalPrefixSignal, PrefillEvaluation};
+        let owner = worker("owner");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&idle)];
+        let loads = snapshot(&[(&owner, 1, 4, 0, 10_000), (&idle, 0, 0, 0, 10_000)]);
+        let model = ModelId("tiny".into());
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![sgl_kv_indexer::PrefixMatch {
+                    worker_id: owner.id.0.clone(),
+                    address: owner.url.clone(),
+                    matched_prefix_blocks: 1,
+                }],
+                best_prefix_blocks: 1,
+            },
+            query_blocks: 1,
+        };
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(100)
+            .with_external_prefix(Some(&signal))
+            .with_load_snapshot(&loads);
+        let cache = Arc::new(CacheAwarePolicy::new(AffinityConfig {
+            worker_queue_limit: Some(4),
+            saturation_queue_floor: Some(1),
+            cache_affinity_min_matched_tokens: None,
+            cache_affinity_min_match_ratio: None,
+            ..Default::default()
+        }));
+        let pipeline =
+            Pipeline::new(vec![Arc::new(Keep(vec!["owner"], OnEmpty::Hold))], cache).unwrap();
+        let proposal = pipeline.propose_prefill(&workers, &ctx).unwrap();
+        let PrefillEvaluation::Cache(selection) = proposal.evaluate(
+            &CandidateRange::global(&workers),
+            &ctx,
+            &pipeline,
+            Some(4),
+            CapacityFallback::Disabled,
+        ) else {
+            panic!("the owner must produce a cache evaluation")
+        };
+        assert_eq!(selection.resolution.queue_gate_rejected_candidates, 1);
+        assert!(!selection.resolution.fleet_all_queued);
+        assert!(selection.resolution.decision.is_none(), "the idle fleet worker prevents a saturation pin even when a filter excluded it from the cache candidate set");
+    }
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -747,9 +795,15 @@ mod tests {
             (&ws[2], 0, 0, 0, 4_096),
         ]);
 
-        let decision =
-            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
-                .expect("capacity exhaustion must degrade inside the filtered domain");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            CapacityFallback::Allowed,
+        )
+        .expect("capacity exhaustion must degrade inside the filtered domain");
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
     }
 
@@ -784,9 +838,15 @@ mod tests {
         assert_eq!(proposal.primary.id, ws[2].id);
 
         let snapshot = EngineLoadSnapshot::default();
-        let decision =
-            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
-                .expect("an eligible escape worker exists");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            CapacityFallback::Allowed,
+        )
+        .expect("an eligible escape worker exists");
         assert_ne!(decision.selected.id, ws[2].id);
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
 

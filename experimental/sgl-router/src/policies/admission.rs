@@ -169,39 +169,48 @@ pub(crate) fn fleet_is_all_queued(
             .all(|worker| !queue_gate_admits(snapshot, worker, limit))
 }
 
+/// Whether to use P2 when no worker passes capacity admission in this domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityFallback {
+    Allowed,
+    Disabled,
+}
+
 pub fn resolve_prefill(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
     queue_limit: Option<u64>,
+    fallback: CapacityFallback,
 ) -> Option<FinalDecision> {
-    resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot, queue_limit).or_else(
-        || {
-            if !contains_worker(range, &proposal.primary) {
-                return None;
-            }
-            let backup = proposal
-                .backup
-                .as_ref()
-                .filter(|worker| contains_worker(range, worker))
-                .cloned();
-            let legal = legal_prefill_candidates(range, proposal);
-            let selected = select_with_snapshot(&legal, Some(snapshot))?;
-            Some(FinalDecision {
-                selected,
-                primary: Arc::clone(&proposal.primary),
-                backup,
-                reason: DecisionReason::CapacityFallbackPowerOfTwo,
-                candidate_range_id: range.id.to_string(),
-                load_snapshot_version: snapshot.version,
-            })
-        },
-    )
+    admit_prefill_pair(range, proposal, request_input_tokens, snapshot, queue_limit).or_else(|| {
+        if fallback == CapacityFallback::Disabled {
+            return None;
+        }
+        if !contains_worker(range, &proposal.primary) {
+            return None;
+        }
+        let backup = proposal
+            .backup
+            .as_ref()
+            .filter(|worker| contains_worker(range, worker))
+            .cloned();
+        let legal = legal_prefill_candidates(range, proposal);
+        let selected = select_with_snapshot(&legal, Some(snapshot))?;
+        Some(FinalDecision {
+            selected,
+            primary: Arc::clone(&proposal.primary),
+            backup,
+            reason: DecisionReason::CapacityFallbackPowerOfTwo,
+            candidate_range_id: range.id.to_string(),
+            load_snapshot_version: snapshot.version,
+        })
+    })
 }
 
 /// Resolves prefill admission without overcommitting a full candidate range.
-pub fn resolve_prefill_admitted(
+fn admit_prefill_pair(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
@@ -807,13 +816,21 @@ mod tests {
             20,
             &loads,
             None,
+            CapacityFallback::Allowed
         )
         .is_some());
         assert_eq!(
-            resolve_prefill(&range, &SelectionProposal::primary(full), 20, &loads, None)
-                .expect("fallback selects the admitted worker")
-                .selected
-                .id,
+            resolve_prefill(
+                &range,
+                &SelectionProposal::primary(full),
+                20,
+                &loads,
+                None,
+                CapacityFallback::Allowed
+            )
+            .expect("fallback selects the admitted worker")
+            .selected
+            .id,
             unknown.id
         );
     }
@@ -842,6 +859,7 @@ mod tests {
             32,
             &loads,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("capacity exhaustion must degrade within the legal domain");
 
@@ -870,6 +888,7 @@ mod tests {
             32,
             &explicit,
             None,
+            CapacityFallback::Allowed,
         )
         .expect("capacity exhaustion must degrade to Power-of-Two");
 
@@ -1425,6 +1444,7 @@ mod tests {
             32,
             &loads,
             Some(4),
+            CapacityFallback::Allowed,
         )
         .expect("an admitted worker exists");
 
@@ -1452,23 +1472,25 @@ mod tests {
             (&unqueued, 0, 0, 10, 10_000),
         ]);
 
-        let ungated = resolve_prefill_admitted(
+        let ungated = resolve_prefill(
             &CandidateRange::global(&workers),
             &proposal,
             32,
             &loads,
             None,
+            CapacityFallback::Disabled,
         )
         .expect("without a limit the primary is admitted");
         assert_eq!(ungated.selected.id, queued_primary.id);
         assert_eq!(ungated.reason, DecisionReason::Primary);
 
-        let gated = resolve_prefill_admitted(
+        let gated = resolve_prefill(
             &CandidateRange::global(&workers),
             &proposal,
             32,
             &loads,
             Some(4),
+            CapacityFallback::Disabled,
         )
         .expect("the unqueued worker takes over");
         assert_eq!(gated.selected.id, unqueued.id);
@@ -1484,12 +1506,13 @@ mod tests {
         let proposal = SelectionProposal::primary(Arc::clone(&only));
         let loads = snapshot(&[(&only, 0, 9, 10, 10_000)]);
 
-        let decision = resolve_prefill_admitted(
+        let decision = resolve_prefill(
             &CandidateRange::global(&workers),
             &proposal,
             32,
             &loads,
             Some(4),
+            CapacityFallback::Disabled,
         )
         .expect("an all-queueing fleet must still route");
 
@@ -1519,6 +1542,7 @@ mod tests {
             32,
             &loads,
             Some(4),
+            CapacityFallback::Allowed,
         )
         .expect("an all-queueing fleet must still route");
 

@@ -9,16 +9,17 @@ use std::sync::Arc;
 use crate::config::{DecodePolicyKind, PolicyKind, SessionAffinityMode};
 use crate::discovery::ModelId;
 use crate::policies::admission::{
-    resolve_decode, resolve_prefill, resolve_prefill_admitted, CandidateDomain, CandidateRange,
-    DecisionReason,
+    resolve_decode, CandidateDomain, CandidateRange, CapacityFallback, DecisionReason,
 };
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::cache_aware::CacheFallbackAudit;
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
+use crate::policies::AffinityAccess;
 use crate::policies::{
-    ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
+    ExternalPrefixSignal, Policy, PrefillEvaluation, PrefillProposal, ProposalKind,
+    SelectionContext,
 };
 use crate::server::metrics::{MetricsRegistry, PolicySelectionFailureReason};
 use crate::workers::engine_load_reports::EngineLoadSnapshot;
@@ -59,7 +60,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
 pub(crate) fn select_prefill_worker(
     inputs: &PrefillSelectionInputs<'_>,
 ) -> Result<Arc<Worker>, PolicySelectionFailureReason> {
-    let mut selector = Selector {
+    let mut selector = PrefillWorkflow {
         inputs,
         // Prefill reserves no peak sequence room: the decode peer, not the
         // prefill worker, holds the KV for the tokens still to be generated.
@@ -80,7 +81,7 @@ pub(crate) fn select_prefill_worker(
 /// Each rung that gives up overwrites the reason, so the reported one is what
 /// the last rung to record any gave — a rung that returns `None` without
 /// recording leaves the previous reason standing.
-struct Selector<'a> {
+struct PrefillWorkflow<'a> {
     inputs: &'a PrefillSelectionInputs<'a>,
     bucket_request: BucketRequest,
     failure_reason: PolicySelectionFailureReason,
@@ -88,7 +89,7 @@ struct Selector<'a> {
     cache_gate_audit: CacheFallbackAudit,
 }
 
-impl<'a> Selector<'a> {
+impl<'a> PrefillWorkflow<'a> {
     fn run(&mut self) -> Option<Arc<Worker>> {
         let inputs = self.inputs;
         let bucket_request = self.bucket_request;
@@ -134,7 +135,13 @@ impl<'a> Selector<'a> {
                 )
             })
             // Rebuild the backup inside the primary's own Bucket.
-            .and_then(|domain| self.select_in_domain(&domain, true, false, false));
+            .and_then(|domain| {
+                self.select_in_domain(
+                    &domain,
+                    AffinityAccess::LookupOnly,
+                    CapacityFallback::Disabled,
+                )
+            });
 
         let selected = cache_winner.or_else(|| {
             // Materializing the normal domains clones the member list of every
@@ -146,20 +153,20 @@ impl<'a> Selector<'a> {
             };
             if inputs.policy_kind == PolicyKind::CacheAware {
                 // Cache miss or failure retries ordered domains with ordinary P2.
-                return self.select_domains(&prefill_domains(), false, false);
+                return self.select_domains(&prefill_domains(), AffinityAccess::Disabled);
             }
             if let Some(worker) = global_affinity_worker {
                 return Some(worker);
             }
             match session_affinity_mode {
                 SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
-                    self.select_domains(&prefill_domains(), true, true)
+                    self.select_domains(&prefill_domains(), AffinityAccess::LookupAndAssign)
                 }
                 SessionAffinityMode::GlobalPreserve => {
-                    self.select_domains(&prefill_domains(), false, false)
+                    self.select_domains(&prefill_domains(), AffinityAccess::Disabled)
                 }
                 SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
-                    self.select_domains(&prefill_domains(), true, true)
+                    self.select_domains(&prefill_domains(), AffinityAccess::LookupAndAssign)
                 }
             }
         });
@@ -200,18 +207,21 @@ impl<'a> Selector<'a> {
             .base_context(global_range.id)
             .with_load_snapshot(snapshot)
             .with_prefill_cache_bucket(inputs.bucket_selector, bucket_request);
-        let PrefillProposal::CacheCandidates(proposal) = inputs
+        let proposal @ PrefillProposal::CacheCandidates(_) = inputs
             .policy
             .propose_prefill(global_range.workers, &cache_ctx)?
         else {
             return None;
         };
-        let selection = proposal.evaluate(
-            inputs.request_input_tokens,
-            snapshot,
-            inputs.workers,
-            inputs.model_id,
-        );
+        let PrefillEvaluation::Cache(selection) = proposal.evaluate(
+            &global_range,
+            &cache_ctx,
+            inputs.policy,
+            inputs.worker_queue_limit,
+            CapacityFallback::Disabled,
+        ) else {
+            unreachable!("cache proposal evaluates to a cache selection")
+        };
         self.cache_gate_audit = CacheFallbackAudit::from(&selection.resolution);
         let selected = selection.record_selection(
             inputs.metrics,
@@ -230,27 +240,16 @@ impl<'a> Selector<'a> {
     fn select_domains(
         &mut self,
         domains: &[CandidateDomain],
-        affinity_lookup_enabled: bool,
-        affinity_assignment_enabled: bool,
+        affinity_access: AffinityAccess,
     ) -> Option<Arc<Worker>> {
         domains
             .iter()
             .find_map(|domain| {
-                self.select_in_domain(
-                    domain,
-                    affinity_lookup_enabled,
-                    affinity_assignment_enabled,
-                    false,
-                )
+                self.select_in_domain(domain, affinity_access, CapacityFallback::Disabled)
             })
             .or_else(|| {
                 domains.iter().find_map(|domain| {
-                    self.select_in_domain(
-                        domain,
-                        affinity_lookup_enabled,
-                        affinity_assignment_enabled,
-                        true,
-                    )
+                    self.select_in_domain(domain, affinity_access, CapacityFallback::Allowed)
                 })
             })
     }
@@ -258,9 +257,8 @@ impl<'a> Selector<'a> {
     fn select_in_domain(
         &mut self,
         domain: &CandidateDomain,
-        affinity_lookup_enabled: bool,
-        affinity_assignment_enabled: bool,
-        allow_capacity_fallback: bool,
+        affinity_access: AffinityAccess,
+        capacity_fallback: CapacityFallback,
     ) -> Option<Arc<Worker>> {
         let inputs = self.inputs;
         let candidate_range = domain.prefill_range()?;
@@ -268,63 +266,44 @@ impl<'a> Selector<'a> {
         if let Some(snapshot) = inputs.load_snapshot {
             selection_ctx = selection_ctx.with_load_snapshot(snapshot);
         }
-        let selection_ctx = if !affinity_lookup_enabled {
-            selection_ctx.without_affinity_lookup()
-        } else if !affinity_assignment_enabled {
-            selection_ctx.without_affinity_assignment()
-        } else {
-            selection_ctx
-        };
-        let Some(PrefillProposal::Pair(proposal)) = inputs
+        let selection_ctx = selection_ctx.with_affinity_access(affinity_access);
+        let Some(proposal @ PrefillProposal::Pair(_)) = inputs
             .policy
             .propose_prefill(candidate_range.workers, &selection_ctx)
         else {
             // Domain retries are ordinary pair proposals.
             return None;
         };
+        let PrefillEvaluation::Pair { kind, decision } = proposal.evaluate(
+            &candidate_range,
+            &selection_ctx,
+            inputs.policy,
+            inputs.worker_queue_limit,
+            capacity_fallback,
+        ) else {
+            unreachable!("pair proposal evaluates to a pair selection")
+        };
+        let Some(decision) = decision else {
+            self.failure_reason = PolicySelectionFailureReason::PrefillAdmissionExhausted;
+            return None;
+        };
         if inputs.policy.uses_shared_prefill_admission() {
-            let snapshot = inputs
-                .load_snapshot
-                .expect("shared prefill admission requires a load snapshot");
-            let decision = if allow_capacity_fallback {
-                resolve_prefill(
-                    &candidate_range,
-                    &proposal,
-                    inputs.request_input_tokens,
-                    snapshot,
-                    inputs.worker_queue_limit,
-                )
-            } else {
-                resolve_prefill_admitted(
-                    &candidate_range,
-                    &proposal,
-                    inputs.request_input_tokens,
-                    snapshot,
-                    inputs.worker_queue_limit,
-                )
-            };
-            let Some(decision) = decision else {
-                self.failure_reason = PolicySelectionFailureReason::PrefillAdmissionExhausted;
-                return None;
-            };
             let reason = prefill_policy_reason(
                 inputs.policy_kind,
-                proposal.kind,
+                kind,
                 decision.reason,
                 inputs.session_id.is_some_and(|value| !value.is_empty()),
-                affinity_lookup_enabled,
+                selection_ctx.affinity_lookup_enabled(),
             );
-            inputs.policy.commit_prefill_selection(
-                &selection_ctx,
-                proposal.kind,
-                &decision.selected,
-            );
+            inputs
+                .policy
+                .commit_prefill_selection(&selection_ctx, kind, &decision.selected);
             inputs
                 .metrics
                 .record_policy_decision(&inputs.policy_kind.to_string(), reason);
             tracing::debug!(
                 model = %inputs.model_id,
-                policy = ?proposal.kind,
+                policy = ?kind,
                 range = %decision.candidate_range_id,
                 primary = %decision.primary.url,
                 backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
@@ -337,12 +316,12 @@ impl<'a> Selector<'a> {
         } else {
             tracing::debug!(
                 model = %inputs.model_id,
-                policy = ?proposal.kind,
+                policy = ?kind,
                 range = %candidate_range.id,
-                selected = %proposal.primary.url,
+                selected = %decision.selected.url,
                 "prefill policy decision without shared admission",
             );
-            Some(proposal.primary)
+            Some(decision.selected)
         }
     }
 }
@@ -505,7 +484,9 @@ mod tests {
     };
     use crate::config::{AffinityConfig, DecodePolicyKind, PolicyKind, SessionAffinityMode};
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
+    use crate::policies::admission::{
+        resolve_prefill, CandidateRange, CapacityFallback, DecisionReason,
+    };
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::cache_aware_fallback_decision;
     use crate::policies::cache_aware::CacheAwarePolicy;
@@ -846,12 +827,13 @@ mod tests {
         // the request, and would prove nothing about the fallback rung.
         let range = CandidateRange::global(&workers);
         assert!(
-            resolve_prefill_admitted(
+            resolve_prefill(
                 &range,
                 &SelectionProposal::with_backup(Arc::clone(&full), Arc::clone(&also_full)),
                 64,
                 &loads,
                 None,
+                CapacityFallback::Disabled
             )
             .is_none(),
             "fixture must saturate every worker so the strict rung admits none",
