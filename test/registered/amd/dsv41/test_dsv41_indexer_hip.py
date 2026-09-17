@@ -50,7 +50,7 @@ def index_slots(page_table, pos):
 
 def reference_position_mask(logits, lens, topk_blocks, block_size):
     """The reference's level one on logits whose tail past the reach is -inf."""
-    from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+    from sglang.srt.layers.attention.dsv4.candidate_indexer import select_candidate_blocks
 
     col = torch.arange(logits.shape[1], device=logits.device)
     pre = logits.masked_fill(col >= lens[:, None], -torch.inf)
