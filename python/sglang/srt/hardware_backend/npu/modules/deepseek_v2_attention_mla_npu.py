@@ -22,7 +22,10 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
-from sglang.srt.layers.dcp.layout import plan_dcp_extend_gather
+from sglang.srt.layers.dcp.layout import (
+    dcp_extend_gather_buffer,
+    plan_dcp_extend_gather,
+)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_dcp_mla_decode_phase,
@@ -607,16 +610,18 @@ def _dcp_gather_extend_kv_npu(
     ``actual_seq_lengths_kv`` **cumulative**, which together require one
     contiguous run per request.
 
-    **Nothing the size of the context outlives one layer's attention.** The
-    prefix is gathered in pieces of at most
+    **The context-sized footprint is one output plus one piece, reserved once.**
+    The prefix is gathered in pieces of at most
     ``SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS`` rows, and each piece -- the gathered rows, rank-major as
     ``all_gather_into_tensor`` writes them, then this chunk's own KV for the
     requests that end in it -- is written straight into its place in the output
     with one ``index_select`` (``plan_dcp_extend_gather``) before the next is
     gathered. The output is returned as two contiguous tensors, the latent and
-    the rope key, and the caller drops them as soon as attention returns. The
-    peak is the output plus one piece -- about 1.3x the context at a ~976k
-    prefix -- and nothing context-sized is alive through the MoE.
+    the rope key. Both, and the piece scratch, come from
+    ``dcp_extend_gather_buffer`` and are reused by every layer and every
+    forward, so the high-water mark is about 1.3x the context at a ~976k prefix
+    and is reached once, on the first extend, instead of being re-reached on
+    each of 78 layers.
 
     Both halves were learned at ``--mem-fraction-static 0.76`` with decode
     capture, where the dies have little headroom and a shortfall shows up as a
@@ -628,9 +633,20 @@ def _dcp_gather_extend_kv_npu(
     that scratch, and ``dcp_kv_buffer``, alive for the whole forward -- and the
     stall came *earlier*, in the cold warm-up from a ~590k prefix. So the
     binding peak is not the gather itself but whatever else runs while
-    context-sized tensors are held, which is why the planner's buffer is
-    released on the first layer (nothing on this path reads it) and the output
-    lives for one attention call.
+    context-sized tensors are held, which is why the planner's buffer is still
+    released on the first layer: nothing on this path reads it, so holding it is
+    pure cost.
+
+    **A permanent reservation is not the thing that stalled.** What stalled was
+    a context-sized tensor being *allocated* while held: each forward asked the
+    allocator for it again, so the request landed on a differently-fragmented
+    pool each time and the ranks freed and refilled out of step, which is what
+    makes a collective wait on the slowest rank for minutes. The buffers here
+    are allocated once and then only sliced, so after the first extend no rank
+    asks the allocator for anything context-sized again. The footprint is the
+    same size; it just stops moving. ``SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY``
+    prints the peak per forward, which is how to check that claim rather than
+    trust it.
 
     The two keys are gathered and written separately, not as one 576-wide row,
     because the operator takes them as separate tensors: slices of a wide buffer
@@ -669,8 +685,24 @@ def _dcp_gather_extend_kv_npu(
             )
 
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
-    out_nope = k_nope.new_empty((total_rows, *k_nope.shape[1:]))
-    out_rope = k_pe.new_empty((total_rows, *k_pe.shape[1:]))
+    out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
+    out_rope = dcp_extend_gather_buffer("rope", k_pe, total_rows)
+
+    # One scratch per key, sized for the widest piece and sliced per piece, so
+    # the reservation happens once rather than once per piece per layer. The
+    # widest is not always the first: the last piece carries this chunk's own
+    # KV on top of its share of the prefix.
+    scratch_rows = max(
+        (
+            (piece.send_end - piece.send_start) * parallel.dcp_size
+            + piece.extend_end
+            - piece.extend_start
+            for piece in plan.pieces
+        ),
+        default=0,
+    )
+    scratch_nope = dcp_extend_gather_buffer("latent_scratch", k_nope, scratch_rows)
+    scratch_rope = dcp_extend_gather_buffer("rope_scratch", k_pe, scratch_rows)
 
     send_nope = send_rope = None
     if plan.send_rows:
@@ -688,13 +720,12 @@ def _dcp_gather_extend_kv_npu(
     # with no prefix rows, skips -- the same collectives in the same order.
     for piece in plan.pieces:
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
-        for out, send, own in (
-            (out_nope, send_nope, k_nope),
-            (out_rope, send_rope, k_pe),
+        rows = gathered + piece.extend_end - piece.extend_start
+        for out, buf, send, own in (
+            (out_nope, scratch_nope, send_nope, k_nope),
+            (out_rope, scratch_rope, send_rope, k_pe),
         ):
-            scratch = out.new_empty(
-                (gathered + piece.extend_end - piece.extend_start, *out.shape[1:])
-            )
+            scratch = buf[:rows]
             if gathered:
                 parallel.dcp_group.all_gather_into_tensor(
                     scratch[:gathered], send[piece.send_start : piece.send_end]
@@ -703,7 +734,6 @@ def _dcp_gather_extend_kv_npu(
             torch.index_select(
                 scratch, 0, piece.index, out=out[piece.out_start : piece.out_end]
             )
-            del scratch
     return out_nope, out_rope
 
 
@@ -809,8 +839,11 @@ def forward_dsa_core_npu(
             topk_indices=topk_indices,
         )
     if dcp_extend:
-        # Dropped here, before the MoE, not at the end of the forward: held,
-        # the gathered context is alive through every layer's peak.
+        # Dropped here, before the MoE, not at the end of the forward. The
+        # tensors themselves are now reserved buffers and survive either way
+        # (_dcp_extend_gather_buffer); what this drops is the batch's reference,
+        # so a stale gather can never be read by a later forward that took a
+        # different path.
         forward_batch.npu_dcp_extend_kv = None
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 

@@ -25,7 +25,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.layout import plan_dcp_extend_gather
+from sglang.srt.layers.dcp import layout as dcp_layout
+from sglang.srt.layers.dcp.layout import (
+    dcp_extend_gather_buffer,
+    plan_dcp_extend_gather,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -184,6 +188,92 @@ class TestDcpExtendGatherPlan(CustomTestCase):
         last = plan.pieces[-1]
         self.assertEqual(last.extend_end - last.extend_start, 16384)
         self.assertEqual(last.out_end, 976384 + 16384)
+
+
+class TestDcpExtendGatherBuffer(CustomTestCase):
+    """Pins ``dcp_extend_gather_buffer``, the reuse the gather allocates from.
+
+    The gather's three context-sized tensors -- the latent output, the rope-key
+    output and the per-piece scratch -- used to be allocated on each of 78
+    layers; they are now reserved once and sliced. The failure that reuse
+    introduces is aliasing: two tensors that must differ handed the same
+    storage writes one over the other, and attention then reads real KV from
+    the wrong place, which this model answers fluently and off-prompt rather
+    than crashing. So the keying is what these tests are about.
+    """
+
+    def setUp(self):
+        super().setUp()
+        dcp_layout._dcp_extend_gather_buffers.clear()
+        self.addCleanup(dcp_layout._dcp_extend_gather_buffers.clear)
+        # Only dtype, device and the trailing shape are read off the reference,
+        # so a zero-row one is enough and costs nothing.
+        self.ref = torch.empty((0, 4), dtype=torch.float32)
+
+    def test_two_names_with_identical_shapes_get_different_storage(self):
+        # THE aliasing case. The latent and the rope key are asked for with the
+        # same row count on every layer; if the name were not in the key they
+        # would share one buffer and the second gather would overwrite the
+        # first. Held at once, so comparing addresses is sound.
+        latent = dcp_extend_gather_buffer("latent", self.ref, 8)
+        rope = dcp_extend_gather_buffer("rope", self.ref, 8)
+        self.assertNotEqual(latent.data_ptr(), rope.data_ptr())
+
+    def test_the_row_shape_is_part_of_the_key(self):
+        wide = dcp_extend_gather_buffer("x", torch.empty((0, 4)), 8)
+        narrow = dcp_extend_gather_buffer("x", torch.empty((0, 2)), 8)
+        self.assertNotEqual(wide.data_ptr(), narrow.data_ptr())
+        self.assertEqual(tuple(wide.shape), (8, 4))
+        self.assertEqual(tuple(narrow.shape), (8, 2))
+
+    def test_the_dtype_is_part_of_the_key(self):
+        f32 = dcp_extend_gather_buffer("x", torch.empty((0, 4)), 8)
+        bf16 = dcp_extend_gather_buffer(
+            "x", torch.empty((0, 4), dtype=torch.bfloat16), 8
+        )
+        self.assertNotEqual(f32.data_ptr(), bf16.data_ptr())
+        self.assertIs(bf16.dtype, torch.bfloat16)
+
+    def test_the_same_request_twice_reuses_one_allocation(self):
+        # What makes this worth doing at all: layer 2..78 must not allocate.
+        first = dcp_extend_gather_buffer("latent", self.ref, 1024)
+        second = dcp_extend_gather_buffer("latent", self.ref, 1024)
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+    def test_a_smaller_request_is_served_from_the_same_buffer(self):
+        big = dcp_extend_gather_buffer("latent", self.ref, 1024)
+        small = dcp_extend_gather_buffer("latent", self.ref, 16)
+        self.assertEqual(small.shape[0], 16)
+        self.assertEqual(small.data_ptr(), big.data_ptr())
+
+    def test_growth_sticks_and_a_later_small_request_does_not_shrink_it(self):
+        dcp_extend_gather_buffer("latent", self.ref, 16)
+        grown = dcp_extend_gather_buffer("latent", self.ref, 1024)
+        self.assertEqual(grown.shape[0], 1024)
+        dcp_extend_gather_buffer("latent", self.ref, 16)
+        again = dcp_extend_gather_buffer("latent", self.ref, 1024)
+        # Grow-only: the second 1024-row request must be the same allocation,
+        # not a reallocation the 16-row one shrank us into.
+        self.assertEqual(again.data_ptr(), grown.data_ptr())
+
+    def test_the_result_is_a_view_and_writes_reach_the_next_caller(self):
+        # The gather writes through the returned tensor (index_select(out=...)),
+        # so a copy would silently drop every layer's result.
+        view = dcp_extend_gather_buffer("latent", self.ref, 8)
+        view.fill_(3.5)
+        self.assertTrue(
+            torch.equal(
+                dcp_extend_gather_buffer("latent", self.ref, 8),
+                torch.full((8, 4), 3.5),
+            )
+        )
+
+    def test_zero_rows_is_allowed(self):
+        # An extend batch can plan no pieces at all; the caller asks for 0 rows
+        # rather than branching, so this must not raise.
+        empty = dcp_extend_gather_buffer("latent", self.ref, 0)
+        self.assertEqual(tuple(empty.shape), (0, 4))
+        self.assertEqual(dcp_extend_gather_buffer("latent", self.ref, 4).shape[0], 4)
 
 
 if __name__ == "__main__":

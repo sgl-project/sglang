@@ -15,11 +15,14 @@
 """Pure index math for decode context parallel (DCP): per-rank lengths,
 the owner-rule local-index filter, and the NPU extend-gather plan."""
 
-from typing import List, NamedTuple, Sequence
+import logging
+from typing import Dict, List, NamedTuple, Sequence, Tuple
 
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
 
 
 def get_dcp_lens(
@@ -200,6 +203,58 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     if not parallel.dcp_enabled:
         return
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
+
+
+# Reusable device buffers for the extend gather, keyed by purpose, dtype, device
+# and row shape. See dcp_extend_gather_buffer.
+_dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
+
+
+def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
+    """Return a reusable ``rows``-row buffer shaped and typed like ``ref``.
+
+    The NPU extend gather's context-sized tensors -- the position-ordered latent
+    output, the rope-key output, and the per-piece all-gather scratch -- were
+    allocated fresh on each of the model's 78 layers. The bytes moved are the
+    same either way, but the *peak* was then whatever the allocator happened to
+    hold when a layer asked for another ~1.1 GiB, which is data-dependent and is
+    what OOM'd at ``--mem-fraction-static 0.76``. Reserving them once turns that
+    peak into a budget: the reservation is logged, it is identical on every
+    rank, and everything allocated after it -- the MoE above all -- comes out of
+    a pool whose size no longer moves between layers.
+
+    Grow-only and never shrunk, so a longer context raises the reservation and
+    keeps it. No env var pins it up front because none is needed in practice:
+    warm-up prefills the longest context the deployment serves, so the growth
+    lands there rather than mid-serving.
+
+    ``name`` separates buffers that must not alias. It is part of the key
+    together with dtype, device and row shape, so the latent and the rope key
+    get different buffers even where their row counts agree, and so does a
+    second device or a dtype change. Two callers that pass the same key share
+    one buffer and must not hold their slices across each other's calls.
+
+    This is also what makes overlapping the gather with compute possible at all.
+    Overlap means two layers' outputs are alive at once, and allocating those
+    per layer is exactly the pattern that stalled before -- see
+    ``_dcp_gather_extend_kv_npu`` in the NPU MLA module, which has the history.
+    """
+    key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
+    buf = _dcp_extend_gather_buffers.get(key)
+    if buf is None or buf.shape[0] < rows:
+        # Release the old buffer before asking for the new one, or the peak is
+        # briefly both of them.
+        _dcp_extend_gather_buffers.pop(key, None)
+        buf = None
+        buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        _dcp_extend_gather_buffers[key] = buf
+        logger.info(
+            "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
+            name,
+            rows,
+            buf.numel() * buf.element_size() / (1 << 30),
+        )
+    return buf[:rows]
 
 
 class DcpExtendGatherPiece(NamedTuple):
