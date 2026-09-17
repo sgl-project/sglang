@@ -1372,9 +1372,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
-        ``req_pool_indices`` serves implementations that must re-derive the state
-        slot ids instead of reusing this step's ``forward_metadata``; the scatter
-        below reads the metadata it just planned.
+        Under PP-spec, ``req_pool_indices`` identifies the delayed micro-batch's
+        stable scratch rows and lets the commit re-derive its destination slots
+        after the original forward context has exited. Non-PP commits keep the
+        historical hot path: they read the active ``forward_metadata`` directly
+        and launch no request-to-mamba lookup or virtual-to-physical translation.
         """
         request_number = last_correct_step_indices.shape[0]
         source_indices_tensor = None
@@ -1390,7 +1392,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        if req_pool_indices is not None:
+        if source_indices_tensor is not None:
             # A relayed PP accept result is committed after its verify forward
             # context has exited.  At that point forward_metadata belongs to the
             # most recently launched micro-batch, not necessarily the batch whose
