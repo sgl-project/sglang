@@ -5,15 +5,14 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4 import dense_prefill_indexer
-from sglang.srt.layers.attention.dsv4.candidate_indexer import candidate_block_mask
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
-def make_inputs(request_lengths, ratio=1, zero_queries=False):
-    torch.manual_seed(17)
+def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
+    torch.manual_seed(seed)
     rows = sum(q for q, _ in request_lengths)
     q = torch.randn((rows, 32, 128), dtype=torch.bfloat16, device="cuda")
     if zero_queries:
@@ -110,9 +109,19 @@ class TestDensePrefillIndexer(CustomTestCase):
                         ratio=ratio,
                         zero_queries=zero_queries,
                     )
+                    inputs["candidate_topk_blocks"] = 128
                     scores = dense_scores(inputs)
+                    consumer_inputs = make_inputs(
+                        inputs["request_lengths"],
+                        ratio=ratio,
+                        zero_queries=zero_queries,
+                        seed=29,
+                    )
+                    consumer_inputs["kv"] = inputs["kv"]
+                    consumer_inputs["candidate_topk_blocks"] = 128
+                    consumer_scores = dense_scores(consumer_inputs)
                     with patch.object(
-                        dense_prefill_indexer, "_SCORE_BUDGET_BYTES", 32768
+                        dense_prefill_indexer, "_SCORE_BUDGET_BYTES", 128 << 10
                     ):
                         selected, candidates = dense_prefill_indexer.dense_prefill_topk(
                             **inputs, publish_candidates=True, candidates=None
@@ -145,18 +154,32 @@ class TestDensePrefillIndexer(CustomTestCase):
                                     rtol=1e-5,
                                     atol=1e-5,
                                 )
-                                scores[row : row + queries, :context].masked_fill_(
-                                    ~candidate_block_mask(
-                                        blocks=blocks, width=context, block_size=8
-                                    ),
+                                columns = torch.arange(context, device="cuda")
+                                member = (
+                                    columns[None, :, None] // 8 == blocks[:, None, :]
+                                ).any(-1)
+                                consumer_scores[
+                                    row : row + queries, :context
+                                ].masked_fill_(
+                                    ~member,
                                     -torch.inf,
                                 )
                             row += queries
+                        self.assertGreater(
+                            torch.isfinite(consumer_scores[-1]).sum().item(),
+                            inputs["topk"],
+                        )
+                        self.assertLess(
+                            torch.isfinite(consumer_scores[-1]).sum().item(),
+                            inputs["lengths"][-1].item(),
+                        )
                         selected, published = dense_prefill_indexer.dense_prefill_topk(
-                            **inputs, publish_candidates=False, candidates=candidates
+                            **consumer_inputs,
+                            publish_candidates=False,
+                            candidates=candidates,
                         )
                         self.assertIsNone(published)
-                        self.assert_topk(inputs, selected, scores)
+                        self.assert_topk(consumer_inputs, selected, consumer_scores)
                         tail_lengths = [0, 0, 7, 31]
                         rows, row = [], 0
                         for (queries, _), tail in zip(
@@ -166,9 +189,9 @@ class TestDensePrefillIndexer(CustomTestCase):
                             row += queries
                         rows = torch.tensor(rows, dtype=torch.int64, device="cuda")
                         tail_inputs = dict(
-                            inputs,
-                            q=tuple(t[rows] for t in inputs["q"]),
-                            weights=inputs["weights"][rows],
+                            consumer_inputs,
+                            q=tuple(t[rows] for t in consumer_inputs["q"]),
+                            weights=consumer_inputs["weights"][rows],
                             starts=inputs["starts"][rows],
                             lengths=inputs["lengths"][rows],
                             request_lengths=list(
@@ -183,7 +206,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                             publish_candidates=False,
                             candidates=candidates.tail(tail_lengths),
                         )
-                        self.assert_topk(tail_inputs, selected, scores[rows])
+                        self.assert_topk(tail_inputs, selected, consumer_scores[rows])
 
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
@@ -229,7 +252,29 @@ class TestDensePrefillIndexer(CustomTestCase):
                 self.assertEqual(
                     tuple(candidates.request_blocks[0].shape), (16384, 2048)
                 )
-                del inputs, selected, candidates
+                del selected
+                selected, published = dense_prefill_indexer.dense_prefill_topk(
+                    **inputs, publish_candidates=False, candidates=candidates
+                )
+                self.assertIsNone(published)
+                del selected
+                torch.cuda.synchronize()
+                baseline = torch.cuda.memory_allocated()
+                for _ in range(3):
+                    torch.cuda.reset_peak_memory_stats()
+                    selected, published = dense_prefill_indexer.dense_prefill_topk(
+                        **inputs, publish_candidates=False, candidates=candidates
+                    )
+                    torch.cuda.synchronize()
+                    self.assertIsNone(published)
+                    self.assertLess(
+                        torch.cuda.max_memory_allocated() - baseline, 4 << 30
+                    )
+                    self.assertEqual(tuple(selected.shape), (16384, 512))
+                    del selected
+                    torch.cuda.synchronize()
+                    self.assertEqual(torch.cuda.memory_allocated(), baseline)
+                del inputs, candidates
 
 
 if __name__ == "__main__":
