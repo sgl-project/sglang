@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.engram import EngramHasher
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -24,7 +25,7 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     # Draft runners have no hasher even when their config has engram layers.
-    engram_hasher: Optional[torch.nn.Module] = None
+    engram_hasher: Optional[EngramHasher] = None
 
     @classmethod
     def from_model(
@@ -109,6 +110,7 @@ class NgramEmbeddingManager:
         *,
         chunked_req: Optional[Req],
     ) -> Optional[ScheduleBatch]:
+        """Fill the ngram token table and engram history before a forward pass."""
         if batch is None:
             return batch
         if self.engram_hasher is not None:

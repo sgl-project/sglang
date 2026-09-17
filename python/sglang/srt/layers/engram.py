@@ -8,6 +8,7 @@ sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 from __future__ import annotations
 
 import ctypes
+import errno
 import glob
 import logging
 import mmap
@@ -21,6 +22,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -34,7 +36,6 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -59,10 +60,7 @@ _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
 def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin: exact for every n < 3.3e24, so it agrees with
-    ``sympy.isprime`` over the whole range the layout can reach. Kept local
-    because sympy is not a declared sglang dependency -- it only happens to
-    arrive with torch, and the engram layout must not depend on that."""
+    """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
         return False
     for p in _MILLER_RABIN_WITNESSES:
@@ -155,17 +153,14 @@ class EngramLayout(msgspec.Struct, frozen=True):
     head_dim: int
 
     @classmethod
-    def build(
-        cls,
-        layer_ids: tuple[int, ...],
-        num_embeddings: tuple[int, ...],
-        max_ngram_size: int,
-        n_heads: int,
-        head_dim: int,
-        vocab_size: int,
-    ) -> EngramLayout:
+    def from_config(cls, config) -> Optional[EngramLayout]:
         """Primes are drawn in (layer, n-gram size, head) order from one shared
-        ascending sequence starting above vocab_size - 1."""
+        ascending sequence starting above engram_vocab_size - 1."""
+        layer_ids = tuple(config.engram_layer_ids)
+        if not layer_ids:
+            return None
+        max_ngram_size, n_heads = config.engram_max_ngram_size, config.engram_n_heads
+        vocab_size = config.engram_vocab_size
         primes, seen = [], set()
         for _ in layer_ids:
             per_ngram = []
@@ -180,25 +175,11 @@ class EngramLayout(msgspec.Struct, frozen=True):
         return cls(
             max_ngram_size=max_ngram_size,
             layer_ids=layer_ids,
-            num_embeddings=num_embeddings,
+            num_embeddings=tuple(config.engram_num_embeddings),
             primes=tuple(primes),
             n_heads=n_heads,
-            head_dim=head_dim,
+            head_dim=config.engram_head_dim,
         )
-
-
-def build_engram_layout(config) -> Optional[EngramLayout]:
-    layer_ids = tuple(config.engram_layer_ids)
-    if not layer_ids:
-        return None
-    return EngramLayout.build(
-        layer_ids=layer_ids,
-        num_embeddings=tuple(config.engram_num_embeddings),
-        max_ngram_size=config.engram_max_ngram_size,
-        n_heads=config.engram_n_heads,
-        head_dim=config.engram_head_dim,
-        vocab_size=config.engram_vocab_size,
-    )
 
 
 def compute_engram_hash_ids(
@@ -532,18 +513,17 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
 _page_cache_dropped = False
 
 
-def drop_checkpoint_page_cache(model_path: Optional[str] = None) -> tuple[int, int]:
+def drop_checkpoint_page_cache() -> tuple[int, int]:
     """Drop checkpoint page cache with posix_fadvise(DONTNEED); return (files, bytes).
 
     Cached checkpoint pages can prevent 512 MiB huge-page allocation,
     so drop them before pre-faulting private host tables.
     """
-    if model_path is None:
-        try:
-            model_path = get_model().model_path
-        except (ValueError, AttributeError):
-            # No published runtime context (unit tests, offline tools): nothing to drop.
-            return 0, 0
+    try:
+        model_path = get_model().model_path
+    except (ValueError, AttributeError):
+        # No published runtime context (unit tests, offline tools): nothing to drop.
+        return 0, 0
     files, nbytes = 0, 0
     for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
         try:
@@ -672,7 +652,7 @@ class _HostTable:
                 return
             err = ctypes.get_errno()
             if (
-                err != 11 or attempt == tries - 1
+                err != errno.EAGAIN or attempt == tries - 1
             ):  # EAGAIN is the only one worth retrying
                 logger.info("engram host table: MADV_COLLAPSE errno %d", err)
                 return
@@ -780,7 +760,7 @@ class EngramEmbedding(nn.Module):
         if self.host_table is not None:
             self.host_table.dirty = True
 
-    def finish_load(self, label: str = ""):
+    def finish_load(self, label: str):
         """Barrier (shared layout) once every rank has written its rows; log how
         the table ended up backed."""
         if self.host_table is not None:
@@ -987,10 +967,8 @@ class Engram(nn.Module):
         kv, _ = self.wkv(emb.flatten(-2))
         return self.apply_gate(x, kv)
 
-    def project(
-        self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
-    ) -> torch.Tensor:
-        kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
+    def project(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
         return kv
 
     def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:

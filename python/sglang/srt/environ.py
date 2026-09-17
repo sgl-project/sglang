@@ -1470,23 +1470,8 @@ class Envs:
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
 
-    # Kernels and indexer
-    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
-    SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
-    # Per-rank local query rows (after DP-attention sharding when enabled),
-    # not request ISL.
-    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
-    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
-    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
-    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
-    # rows from the GPU instead of sharding them over HBM.
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # Pin and map the host table with cudaHostRegister. False leaves the plain
     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
@@ -1502,6 +1487,22 @@ class Envs:
     # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
     # huge-page faults. Costs the next restart its warm page cache.
     SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
+
+    # Kernels and indexer
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
+    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    # Per-rank local query rows (after DP-attention sharding when enabled),
+    # not request ISL.
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
+    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
