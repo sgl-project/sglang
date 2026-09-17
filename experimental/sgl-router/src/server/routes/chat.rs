@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::SessionAffinityMode;
+use crate::config::{
+    ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides, SessionAffinityMode,
+};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
@@ -23,7 +25,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Observability header carrying the final decode-pool URL for a
@@ -54,34 +55,354 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
-/// does two things:
+/// Minimal probe over the request body — the fields the ROUTER itself acts on,
+/// plus the sampling parameters the fleet-wide contract governs.
+/// Deserializing into this struct (vs `serde_json::Value`) does two things:
 ///
-/// 1. Avoids the per-field heap allocation of `Value` for a multi-MiB body.
+/// 1. Avoids building a `Value` tree over a multi-MiB body. NOTHING here
+///    retains client-sized data: an unrecognized key is skipped through
+///    `IgnoredAny`, and a sampling value that is not a number is drained the
+///    same way (see [`ProbedValue`]).
 /// 2. Pins the contract: the body MUST be a JSON object. Degenerate
 ///    shapes (`null`, `[]`, `"hi"`) fail at this step rather than being
 ///    silently forwarded with `stream=false`.
 ///
 /// All other fields are ignored — the worker is authoritative for the
 /// full request schema.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 struct RequestProbe {
-    #[serde(default)]
     stream: Option<bool>,
-    #[serde(default)]
     model: Option<String>,
     /// Explicit output budget used by Decode Bucket routing.
-    #[serde(default)]
     max_tokens: Option<u64>,
-    #[serde(default)]
     max_completion_tokens: Option<u64>,
+    /// What the request said about each governed sampling parameter, indexed
+    /// by [`SamplingField::index`] so governing another needs no change here.
+    /// Read by [`apply_sampling_overrides`]; see [`ProbedValue`].
+    sampling: [ProbedValue; SamplingField::ALL.len()],
+}
+
+/// What the request said about one governed sampling parameter.
+///
+/// WHY not `Option<serde_json::Value>`: these keys carry client-controlled
+/// JSON of arbitrary size and the probe runs on every request whether or not a
+/// contract is configured, so holding a `Value` would let
+/// `{"temperature": [1, 1, ...]}` allocate a tree proportional to a
+/// [`MAX_CHAT_BODY_BYTES`] body for a field nothing then reads. Each variant is
+/// resolved during deserialization; nothing client-sized is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum ProbedValue {
+    /// Omitted, or an explicit `null`. The OpenAI API types these parameters
+    /// as nullable with a documented default, so `null` asks for the default —
+    /// and on a governed fleet the configured value IS the default. Both mean
+    /// the configured value is injected.
+    #[default]
+    Absent,
+    /// A JSON number, a bool, or a string the engine's pydantic lax mode reads
+    /// as one — see [`parse_as_engine_number`].
+    Number(f64),
+    /// Present, and NOT readable as a number by this probe. That is a
+    /// statement about the probe, not about the request: the engine's coercion
+    /// rules are laxer and undocumented, so a value landing here may still be
+    /// a number downstream. `reject` therefore refuses it rather than
+    /// forwarding it — see [`apply_sampling_overrides`].
+    Unusable,
+}
+
+/// Longest numeric string the probe will read. A sampling value is a short
+/// literal, so the cap keeps a client-sized string off the parse path
+/// entirely; an over-long one stays [`ProbedValue::Unusable`], which `reject`
+/// refuses rather than forwards.
+const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
+
+/// Read a string the way the engine's pydantic lax mode reads it.
+///
+/// Pydantic parses the TRIMMED string first; failing that it strips
+/// underscores — refusing a leading one, a trailing one, or a doubled one —
+/// and parses WITHOUT trimming. So `"1_0"` is 10 and `" 1.0 "` is 1, but
+/// `" 1_0 "` is an error. That is not Python's own numeric-literal rule
+/// either: pydantic takes `1._5`, `1e_5` and `-_1`, each a `SyntaxError` in
+/// Python source.
+///
+/// WHY this is written out rather than approximated: a contract that forwards
+/// what it cannot parse is only as strong as this function's fidelity to a
+/// transitive dependency's undocumented coercion table, across a fleet whose
+/// engines need not even share a pydantic version. It is not, because
+/// [`apply_sampling_overrides`] refuses the residue — this function only
+/// decides how much of what the engine accepts is answered precisely instead
+/// of with a 400.
+fn parse_as_engine_number(s: &str) -> Option<f64> {
+    // Bounded BEFORE the first parse, not just before the underscore path: the
+    // string is client-controlled and can run to the body limit, and parsing
+    // one is linear in its length. Nothing that long is a sampling value.
+    let trimmed = s.trim();
+    if trimmed.len() > MAX_SAMPLING_NUMERIC_LEN {
+        return None;
+    }
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Some(v);
+    }
+    if s.len() > MAX_SAMPLING_NUMERIC_LEN
+        || !s.contains('_')
+        || s.starts_with('_')
+        || s.ends_with('_')
+        || s.contains("__")
+    {
+        return None;
+    }
+    // Stripped into a fixed stack buffer: the value is client-controlled, and
+    // this type exists to keep client-sized allocations off the request path.
+    let mut buf = [0u8; MAX_SAMPLING_NUMERIC_LEN];
+    let mut len = 0;
+    for &b in s.as_bytes() {
+        if b != b'_' {
+            buf[len] = b;
+            len += 1;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).ok()?.parse().ok()
+}
+
+impl<'de> Deserialize<'de> for ProbedValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ValueVisitor;
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = ProbedValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a sampling parameter value")
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v as f64))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v as f64))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v))
+            }
+
+            /// Parsed, not retained: the engine reads a numeric string as a
+            /// number, so a `reject` contract must too or `"1.5"` slips past
+            /// a pin of 1.
+            fn visit_str<E>(self, v: &str) -> Result<ProbedValue, E> {
+                Ok(parse_as_engine_number(v).map_or(ProbedValue::Unusable, ProbedValue::Number))
+            }
+
+            fn visit_unit<E>(self) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Absent)
+            }
+
+            /// The engine reads a JSON bool as a number, so a pin of 0 must
+            /// see `false` as the 0 the engine will sample with rather than as
+            /// something it cannot judge.
+            fn visit_bool<E>(self, v: bool) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(if v { 1.0 } else { 0.0 }))
+            }
+
+            /// Drained, never collected — the allocation this type exists to
+            /// avoid.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ProbedValue, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ProbedValue::Unusable)
+            }
+
+            /// Drained, never collected — as [`Self::visit_seq`].
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<ProbedValue, M::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ProbedValue::Unusable)
+            }
+        }
+        d.deserialize_any(ValueVisitor)
+    }
+}
+
+/// A field the ROUTER acts on, as opposed to one it only forwards. A repeated
+/// occurrence of one of these is a 400: a body that says two different things
+/// about how to route itself is ambiguous at the edge, and the router must not
+/// decide on one copy while the engine serves the other.
+#[derive(Debug, Clone, Copy)]
+enum RoutingKey {
+    Stream,
+    Model,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl RoutingKey {
+    /// Bit position in the visitor's occurrence mask. Unlike
+    /// [`SamplingField::index`] this indexes no array, so it needs no
+    /// agreement with a separate length constant.
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Stream => 1 << 0,
+            Self::Model => 1 << 1,
+            Self::MaxTokens => 1 << 2,
+            Self::MaxCompletionTokens => 1 << 3,
+        }
+    }
+
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Model => "model",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+/// One key of the request object, resolved WITHOUT allocating: the visitor
+/// matches a borrowed `&str` and keeps only a discriminant, so a body's
+/// unrecognized majority costs no `String` per key.
+enum ProbeKey {
+    Routing(RoutingKey),
+    /// A governed sampling parameter. A repeat LAST-WINS, matching the
+    /// engine's own `json.loads` — so the value the contract compares against
+    /// and the value the engine actually samples with are the same one.
+    Sampling(SamplingField),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ProbeKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl serde::de::Visitor<'_> for KeyVisitor {
+            type Value = ProbeKey;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a request field name")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<ProbeKey, E> {
+                Ok(match v {
+                    "stream" => ProbeKey::Routing(RoutingKey::Stream),
+                    "model" => ProbeKey::Routing(RoutingKey::Model),
+                    "max_tokens" => ProbeKey::Routing(RoutingKey::MaxTokens),
+                    "max_completion_tokens" => ProbeKey::Routing(RoutingKey::MaxCompletionTokens),
+                    other => match SamplingField::from_wire_name(other) {
+                        Some(field) => ProbeKey::Sampling(field),
+                        None => ProbeKey::Other,
+                    },
+                })
+            }
+        }
+        d.deserialize_str(KeyVisitor)
+    }
+}
+
+/// Reads the probed fields out of the request object.
+///
+/// `read_sampling` is false only on [`probe_without_sampling_values`]'s
+/// fallback pass, where a sampling value is scanned rather than converted.
+struct ProbeVisitor {
+    read_sampling: bool,
+}
+
+impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+    type Value = RequestProbe;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<RequestProbe, M::Error> {
+        let mut probe = RequestProbe::default();
+        let mut seen = 0u8;
+        while let Some(key) = map.next_key::<ProbeKey>()? {
+            match key {
+                ProbeKey::Routing(r) => {
+                    if seen & r.bit() != 0 {
+                        return Err(serde::de::Error::custom(format_args!(
+                            "duplicate field `{}`",
+                            r.wire_name()
+                        )));
+                    }
+                    seen |= r.bit();
+                    match r {
+                        RoutingKey::Stream => probe.stream = map.next_value()?,
+                        RoutingKey::Model => probe.model = map.next_value()?,
+                        RoutingKey::MaxTokens => probe.max_tokens = map.next_value()?,
+                        RoutingKey::MaxCompletionTokens => {
+                            probe.max_completion_tokens = map.next_value()?
+                        }
+                    }
+                }
+                ProbeKey::Sampling(field) => {
+                    probe.sampling[field.index()] = if self.read_sampling {
+                        map.next_value()?
+                    } else {
+                        // Scanned, not converted — the whole point of
+                        // this pass. The key IS present, so it is
+                        // unreadable rather than absent: a contract
+                        // must not inject over a value the client sent.
+                        map.next_value::<IgnoredAny>()?;
+                        ProbedValue::Unusable
+                    };
+                }
+                ProbeKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(probe)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // `deserialize_map` is what pins the body to a JSON object: `null`,
+        // `[]` and `"hi"` are all rejected here, so no separate shape-anchoring
+        // pass is needed.
+        d.deserialize_map(ProbeVisitor {
+            read_sampling: true,
+        })
+    }
+}
+
+/// Re-read a body without converting its sampling values.
+///
+/// serde_json converts a number literal while resolving [`ProbedValue`], so a
+/// governed key holding one outside `f64`'s range — `{"temperature": 1e400}` —
+/// fails the WHOLE parse, where the `IgnoredAny` that covered these keys
+/// before the contract existed scanned past it. Left alone that 400s a body
+/// the router used to forward, on a request nothing has opted in to, with a
+/// message ("body must be a JSON object") that is not even true of it.
+///
+/// So the probe falls back to this pass, which reads the routing keys exactly
+/// as before and marks each sampling key present-but-unreadable. A governed
+/// `reject` then refuses it, which is the same answer it gives any other value
+/// it cannot represent.
+fn probe_without_sampling_values(body: &[u8]) -> Result<RequestProbe, serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let probe = serde::Deserializer::deserialize_map(
+        &mut de,
+        ProbeVisitor {
+            read_sampling: false,
+        },
+    )?;
+    de.end()?;
+    Ok(probe)
 }
 
 impl RequestProbe {
     fn requested_max_output_tokens(&self) -> Option<u64> {
         self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    /// Lets [`apply_sampling_overrides`] loop over whatever the operator
+    /// configured instead of repeating a per-field ladder.
+    fn sampling_field(&self, field: SamplingField) -> ProbedValue {
+        self.sampling[field.index()]
     }
 }
 
@@ -134,11 +455,15 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
-    let probe = parse_probe(&body)?;
+    let mut probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let requested_max_output_tokens = probe.requested_max_output_tokens();
+    // `take`n rather than borrowed: the sampling contract further down reads
+    // the rest of `probe`, but nothing reads `model` again, so the `String`
+    // moves out instead of being cloned on every request.
     let model_str = probe
         .model
+        .take()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
@@ -167,18 +492,28 @@ pub async fn chat_completions(
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
+    // Fleet-wide sampling contract (`--override-sampling-params`), applied
+    // once the model is known to be served (so a request naming an unknown
+    // model still gets that answer) and before anything is admitted: under
+    // `reject` a numeric value differing from the configured one is a 400
+    // here, costing no queue slot and no engine round-trip. Either way the
+    // configured values for fields the request omitted come back as the
+    // inject-set for the forwarded body.
+    let inject_sampling =
+        apply_sampling_overrides(&ctx.config.model.sampling_overrides, &probe, &ctx.metrics)?;
+
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the
-    // MODEL (does it have a chat encoder so the router can produce
+    // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * `has_chat_encoder` → a chat request on this model yields
+    //   * `has_chat_formatter` → a chat request on this model yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
     //   * `needs_request_tokens()` → the cache-aware policy ALSO wants the
     //     raw-prompt path tokenized for tree matching even on a model with no
-    //     chat encoder (`/v1/completions` / `text`), which the first gate
+    //     chat formatter (`/v1/completions` / `text`), which the first gate
     //     alone wouldn't trigger.
     //
     //   * Bucket routing also needs the prompt token count.
@@ -189,7 +524,7 @@ pub async fn chat_completions(
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
     let want_tokens = should_tokenize_request(
-        ctx.tokenizers.has_chat_encoder(&model_str),
+        ctx.tokenizers.has_chat_formatter(&model_str),
         policy.needs_request_tokens(),
         ctx.bucket_selector.is_enabled(),
     );
@@ -289,6 +624,24 @@ pub async fn chat_completions(
         .as_ref()
         .map(|config| config.session_affinity_mode)
         .unwrap_or(SessionAffinityMode::Bucket);
+    // The queue gate (`--worker-queue-limit`) applies to the cache-aware
+    // candidate resolution and, beneath it, to primary/backup admission and
+    // the min-load range fallback. It does NOT reach the
+    // `CapacityFallbackPowerOfTwo` last resort: by the time that fires no
+    // worker in the domain is capacity-admitted, so there is no unqueued
+    // destination left to prefer.
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.worker_queue_limit);
+    let saturation_queue_floor = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.saturation_queue_floor);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -307,6 +660,8 @@ pub async fn chat_completions(
         ttft_slo_ms,
         tps_slo,
         session_affinity_mode,
+        worker_queue_limit,
+        saturation_queue_floor,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
@@ -443,8 +798,8 @@ pub async fn chat_completions(
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
-    // engine-equivalent (chat-encoder path) AND the request contains nothing
-    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
+    // engine-equivalent (chat-formatter path) AND the request contains nothing
+    // the router's formatter didn't replicate (see `input_ids_safe_to_forward`).
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
@@ -452,19 +807,19 @@ pub async fn chat_completions(
     // predicate always has a parsed body to inspect.
     let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
     {
-        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
+        (Some(t), Some(v)) if t.rendered_from_chat && input_ids_safe_to_forward(v) => {
             Some(t.ids.as_slice())
         }
         _ => None,
     };
 
-    // Surface a broken offload: when the encoder SHOULD have produced
+    // Surface a broken offload: when the formatter SHOULD have produced
     // engine-equivalent ids but didn't, the chat request silently fell back to
     // engine-side tokenization. Count only that case (see
     // `ingress_tokenize_offload_failed`); successful forwards and expected
     // omissions are not problems.
     if ingress_tokenize_offload_failed(
-        ctx.tokenizers.has_chat_encoder(&model_str),
+        ctx.tokenizers.has_chat_formatter(&model_str),
         request_value.as_ref(),
         request_tokens.as_ref(),
     ) {
@@ -481,10 +836,15 @@ pub async fn chat_completions(
     let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
-    // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    // `input_ids`, bootstrap fields and sampling values, or forwarding the
+    // original bytes untouched when none applies.
+    let outgoing_body = build_outgoing_body(
+        &body,
+        request_value,
+        forward_input_ids,
+        bootstrap.as_ref(),
+        &inject_sampling,
+    )?;
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -526,6 +886,7 @@ pub async fn chat_completions(
         let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
 
         let prefill_url = worker.url.clone();
+        let prefill_protocol = worker.protocol();
         let prefill_breaker = Arc::clone(&worker.breaker);
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
@@ -542,6 +903,7 @@ pub async fn chat_completions(
             match prefill_proxy
                 .forward_json_to(
                     &prefill_url,
+                    prefill_protocol,
                     &prefill_breaker,
                     "/v1/chat/completions",
                     &prefill_headers,
@@ -575,6 +937,7 @@ pub async fn chat_completions(
                 Box::new((decode_guard, decode_active_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -592,6 +955,7 @@ pub async fn chat_completions(
             let _decode_hold = (decode_guard, decode_active_guard);
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -611,6 +975,7 @@ pub async fn chat_completions(
             Box::new((guard, active_guard, make_duration_guard()));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
@@ -640,6 +1005,7 @@ pub async fn chat_completions(
         let _holds: (LoadGuard, _) = (guard, active_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
@@ -832,11 +1198,11 @@ fn parse_optional_positive_f64_header(
 }
 
 fn should_tokenize_request(
-    has_chat_encoder: bool,
+    has_chat_formatter: bool,
     policy_needs_request_tokens: bool,
     bucket_enabled: bool,
 ) -> bool {
-    has_chat_encoder || policy_needs_request_tokens || bucket_enabled
+    has_chat_formatter || policy_needs_request_tokens || bucket_enabled
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -881,38 +1247,106 @@ struct BootstrapFields {
     room: u64,
 }
 
+/// Write `members` in as top-level keys of the JSON object in `body`, without
+/// parsing it.
+///
+/// WHY: going through `serde_json` costs a full parse into a `Value` plus a
+/// full re-serialize, over a body that runs to [`MAX_CHAT_BODY_BYTES`].
+///
+/// Members go in before the CLOSING brace so they win the last-wins reading
+/// every JSON parser performs — the authority `obj.insert` has on the parse
+/// path. Inserting after the opening brace would lose to a client's own later
+/// copy of the key, which a request sending an explicit `null` for a governed
+/// parameter has: the probe reads `null` as absent, so the value IS injected.
+/// The last `}` is the object's closing brace, since `parse_probe` proved the
+/// body is an object and only whitespace may follow it.
+///
+/// `None` (braces not located) falls back to the parse path rather than
+/// panicking on a shape `parse_probe` should already have rejected.
+fn splice_top_level(
+    body: &Bytes,
+    members: &[(SamplingField, serde_json::Number)],
+) -> Option<Bytes> {
+    use std::io::Write as _;
+
+    let open = body.iter().position(|&b| b == b'{')?;
+    let close = body.iter().rposition(|&b| b == b'}')?;
+    if close <= open {
+        return None;
+    }
+    // An empty object takes no separating comma: `{"temperature":1}`, not
+    // `{,"temperature":1}`.
+    let has_members = body[open + 1..close]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace());
+    // 24 bytes per member covers `"repetition_penalty":` plus a short number;
+    // an over-run just costs one realloc, never correctness.
+    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
+    out.extend_from_slice(&body[..close]);
+    for (i, (field, value)) in members.iter().enumerate() {
+        if has_members || i > 0 {
+            out.push(b',');
+        }
+        // Wire names are a fixed set of JSON-safe identifiers and a
+        // `serde_json::Number` renders as valid JSON, so neither needs
+        // escaping. Written straight into `out` — no intermediate `String`.
+        write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+    }
+    out.extend_from_slice(&body[close..]);
+    Some(Bytes::from(out))
+}
+
 /// Build the body forwarded to the engine, injecting (when present) the
-/// precomputed `input_ids` and/or the PD `bootstrap_*` fields into the
-/// already-parsed request object and serializing once. When neither is
-/// needed, returns the original bytes unchanged (no re-serialize).
+/// precomputed `input_ids`, the PD `bootstrap_*` fields and the fleet-wide
+/// sampling values into the already-parsed request object and serializing
+/// once. When none is needed, returns the original bytes unchanged (no
+/// re-serialize).
 ///
-/// `input_ids`: the router-computed prompt tokens. When set, the engine skips
-/// its own chat-template tokenization; `messages` are retained in the body so
-/// the engine still derives stop tokens / tool-call constraint and the OpenAI
-/// response shape. The caller sets this only when the tokens are
-/// engine-equivalent and `input_ids_safe_to_forward` held.
+/// `input_ids`: the router-computed prompt tokens. When set the engine skips
+/// its own chat-template tokenization, so `messages` are retained for the stop
+/// tokens, tool-call constraint and response shape it still derives from them.
+/// Set only when `input_ids_safe_to_forward` held.
 ///
-/// `value` is the already-parsed request body when one is on hand (the
-/// cache-aware path parses once at ingress); it is consumed so the mutation
-/// reuses that parse. It is `None` only for a load-only policy in PD mode — a
-/// path that never parses at ingress — so the bootstrap injection re-parses
-/// the bytes here (matching the pre-refactor behavior). The body shape was
-/// validated by `parse_probe`; the non-object arm defends against a TOCTOU
+/// `value` is the ingress parse when one is on hand, reused rather than
+/// repeated — and dropped unused when splicing makes it unnecessary. Sampling
+/// alone never reaches `serde_json`: only `input_ids` and bootstrap injection
+/// do, because those may have to OVERWRITE a key the client sent, which
+/// [`splice_top_level`] cannot. The non-object arm defends against a TOCTOU
 /// regression rather than panicking.
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    sampling: &[(SamplingField, serde_json::Number)],
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() {
+    // `input_ids` and bootstrap injection may have to OVERWRITE a key the
+    // client sent, which only the parse path can do; sampling injection never
+    // does, because the inject-set holds only keys the request omitted.
+    let only_sampling = input_ids.is_none() && bootstrap.is_none();
+    if only_sampling && sampling.is_empty() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
+    // Splice regardless of whether a parse is already on hand: `value` is
+    // read-only up to this point, so having one does not make splicing wrong —
+    // it only means the parse was already paid for elsewhere. Gating on
+    // `value.is_none()` would confine the splice to the load-only path and
+    // skip every configuration that parses at ingress without forwarding
+    // `input_ids`: the cache-aware policy, bucket routing, and a chat-encoder
+    // model whose request `input_ids_safe_to_forward` withholds (tools,
+    // multimodal, thinking). A chat-encoder model on a plain request is NOT
+    // one of them — there `input_ids` is `Some`, so the parse path runs
+    // either way.
+    if only_sampling {
+        if let Some(spliced) = splice_top_level(body, sampling) {
+            return Ok(spliced);
+        }
+    }
     let parsed = match value {
         Some(v) => v,
-        // Load-only + PD: the ingress skipped the parse, so re-parse for the
-        // bootstrap injection (input_ids is never set on this path).
+        // The ingress skipped the parse, so re-parse. Reached for bootstrap
+        // injection, and as the fallback if `splice_top_level` declined.
         None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?,
@@ -925,6 +1359,15 @@ fn build_outgoing_body(
             ));
         }
     };
+    // The caller passes the inject-set from `apply_sampling_overrides` —
+    // configured values for fields the request omitted — so writing them here
+    // never masks a client value, in either conflict mode.
+    for (field, value) in sampling {
+        obj.insert(
+            field.wire_name().to_string(),
+            serde_json::Value::Number(value.clone()),
+        );
+    }
     if let Some(ids) = input_ids {
         obj.insert(
             "input_ids".to_string(),
@@ -965,27 +1408,28 @@ fn build_outgoing_body(
 /// uses it verbatim and ignores everything that would otherwise steer its
 /// `messages`-side tokenization (only stop tokens / tool-call constraint are
 /// still taken from `messages`). So any request field that changes that
-/// tokenization but which the router's chat encoder does not replicate makes
+/// tokenization but which the router's chat formatter does not replicate makes
 /// the forwarded ids wrong. This predicate is conservative by construction —
 /// any such signal returns `false` and the engine tokenizes from `messages`
 /// (always correct).
 ///
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
-///   * `tools` / `functions` — the encoder doesn't render tool schemas.
-///   * multimodal (array) `content` — a text tokenizer can't represent images.
+///   * `tools` / `functions` — the formatter doesn't render tool schemas.
+///   * non-string or missing `content` (arrays, `null`): the engine normalizes
+///     these before rendering; the router's formatter renders them verbatim.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
 ///     custom one would diverge. (SGLang ignores it today, but block it so the
 ///     offload stays correct across engines / future versions.)
 ///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
 ///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
-///     encoder renders in the engine's default mode only.
+///     formatter renders in the engine's default mode only.
 ///   * `continue_final_message: true`, or a trailing `assistant` message — the
-///     engine rewrites/strips the final assistant turn; the encoder renders it
+///     engine rewrites/strips the final assistant turn; the formatter renders it
 ///     verbatim.
 ///
-/// NOTE: the router's chat encoder renders in the engine's default
+/// NOTE: the router's chat formatter renders in the engine's default
 /// (non-thinking) mode. Current sglang derives thinking from the request
 /// (`chat_template_kwargs`), which this guard already omits, so a plain request
 /// the router rendered matches the engine. The only way to diverge is an engine
@@ -997,11 +1441,11 @@ fn build_outgoing_body(
 /// tokenizer that does not would diverge by a leading special, again undetectable
 /// from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_is_multimodal(value) {
+    if request_has_tools(value) || request_has_non_text_content(value) {
         return false;
     }
     // Fields that steer the engine's template tokenization but which the
-    // router's encoder does not thread through.
+    // router's formatter does not thread through.
     for key in [
         "chat_template",
         "chat_template_kwargs",
@@ -1023,36 +1467,26 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether the ingress tokenization offload was expected to fire but failed —
-/// the condition behind `sgl_router_ingress_tokenize_errors_total`.
+/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
 ///
-/// True only when ALL of:
-///   * the model has a chat encoder (`has_chat_encoder`), so a chat request
-///     on it SHOULD have produced engine-equivalent ids;
-///   * the request is a chat request (`messages` array present);
-///   * the tokens are absent OR not engine-equivalent — i.e. `encode_chat`
-///     render/encode failed and the request silently fell back to engine-side
-///     tokenization.
-///
-/// Non-chat-encoder / non-`messages` requests never expected the offload, so
-/// they are not failures. A tools / multimodal / thinking request on a
-/// chat-encoder model still gets engine-equivalent ids (`encode_chat`
-/// succeeded; the safe-predicate withholds forwarding for other reasons), so it
-/// is an expected omission, not a failure.
+/// Count chats with a configured formatter that pass the forwarding guard
+/// but lack chat-rendered tokens. Excluded requests are expected fallbacks,
+/// even when rendering fails.
 fn ingress_tokenize_offload_failed(
-    has_chat_encoder: bool,
+    has_chat_formatter: bool,
     request_value: Option<&serde_json::Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> bool {
-    if !has_chat_encoder {
+    if !has_chat_formatter {
         return false;
     }
-    let chat_request =
-        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    let chat_request = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array()) && input_ids_safe_to_forward(v)
+    });
     if !chat_request {
         return false;
     }
-    !request_tokens.is_some_and(|t| t.engine_equivalent)
+    !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -1068,7 +1502,7 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
 }
 
 /// Whether the request carries tool / function definitions. The router's chat
-/// encoder renders only `messages`, so its `input_ids` would omit the tool
+/// formatter renders only `messages`, so its `input_ids` would omit the tool
 /// schemas the engine's template injects into the prompt — the caller must let
 /// the engine tokenize these itself.
 fn request_has_tools(value: &serde_json::Value) -> bool {
@@ -1082,17 +1516,130 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
-/// Whether any message carries non-string (array / multimodal) content. A text
-/// tokenizer cannot represent image content, so the router's `input_ids` would
-/// drop it — the caller must let the engine handle these requests.
-fn request_is_multimodal(value: &serde_json::Value) -> bool {
+/// Detect non-string or missing content, which requires engine tokenization:
+/// the engine normalizes arrays and nulls differently from the router's formatter.
+fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
         .and_then(|m| m.as_array())
         .is_some_and(|msgs| {
             msgs.iter()
-                .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
+                .any(|m| !matches!(m.get("content"), Some(serde_json::Value::String(_))))
         })
+}
+
+/// Apply the fleet-wide sampling contract (`--override-sampling-params` /
+/// `--sampling-param-conflict`) to one request, before admission.
+///
+/// Returns the inject-set: the configured value for every exact-valued
+/// parameter the request OMITTED, which [`build_outgoing_body`] writes into
+/// the forwarded body so the engine's own defaults can't drift from what the
+/// operator declared. A band ([`ParamSpec::Range`]) names no single value, so
+/// it never injects.
+///
+/// For a parameter the request DID send:
+///   * [`ConflictPolicy::Allow`] forwards the client value untouched, which
+///     is why the mode check comes before any comparison;
+///   * [`ConflictPolicy::Reject`] 400s a numeric value that differs from the
+///     configured one (or falls outside the band) — never a silent rewrite,
+///     which is the one behavior no client can detect;
+///   * [`ConflictPolicy::Reject`] also 400s a value this probe cannot read as
+///     a number ([`ProbedValue::Unusable`]). `reject` is a promise that
+///     nothing but the configured value reaches the engine, and the engine's
+///     coercion rules are laxer than [`parse_as_engine_number`] and
+///     undocumented — a bool and an underscored numeric string were both once
+///     numbers to the engine and unreadable here. Forwarding the residue
+///     makes the contract only as strong as this probe's fidelity to a
+///     transitive Python dependency, so the residue is refused instead.
+///     Under `allow` it keeps flowing, because `allow` makes no promise to
+///     break.
+///
+/// A rejection is counted per parameter before it is returned, because a
+/// contract rollout turns served traffic into 400s and the operator needs to
+/// see how much and where.
+fn apply_sampling_overrides(
+    overrides: &SamplingOverrides,
+    probe: &RequestProbe,
+    metrics: &MetricsRegistry,
+) -> Result<Vec<(SamplingField, serde_json::Number)>, ApiError> {
+    // Length is a startup constant, and `Vec::with_capacity(0)` does not
+    // allocate — so an unconfigured contract still costs nothing.
+    let mut inject = Vec::with_capacity(overrides.params.len());
+    // Every configured parameter is judged even after one has failed. The
+    // counter is how an operator sizes a rollout's blast radius per parameter,
+    // and stopping at the first violation would report zero for every
+    // parameter that sorts after it — a fleet violating both `temperature` and
+    // `top_p` on every request would look like it violates only `temperature`.
+    // The client is still told about one parameter, so the 400 stays one
+    // sentence.
+    let mut first_violation: Option<ApiError> = None;
+    for (&field, spec) in &overrides.params {
+        let name = field.wire_name();
+        let violation = |detail: String, first: &mut Option<ApiError>| {
+            metrics.record_sampling_contract_rejection(name);
+            let err = ApiError::SamplingContract {
+                param: name,
+                detail,
+            };
+            if first.is_none() {
+                *first = Some(err);
+            }
+        };
+        let got = match probe.sampling_field(field) {
+            // A band names no single value, so it never injects — a request
+            // that omits the parameter gets the engine's own default.
+            ProbedValue::Absent => {
+                if let ParamSpec::Exact(v) = spec {
+                    inject.push((field, v.clone()));
+                }
+                continue;
+            }
+            // `allow` forwards a client value untouched, so everything below
+            // is `reject`-only.
+            _ if overrides.conflict == ConflictPolicy::Allow => continue,
+            // A value the router cannot read as a number is a value it cannot
+            // prove conforms. Under `reject` that is a refusal, not a pass.
+            ProbedValue::Unusable => {
+                violation(
+                    match spec {
+                        ParamSpec::Exact(want) => {
+                            format!("expected {want} (or omit the field), got a non-numeric value")
+                        }
+                        &ParamSpec::Range { lo, hi } => {
+                            format!(
+                                "must be a number between {lo} and {hi}, got a non-numeric value"
+                            )
+                        }
+                    },
+                    &mut first_violation,
+                );
+                continue;
+            }
+            ProbedValue::Number(got) => got,
+        };
+        match spec {
+            ParamSpec::Exact(want) => {
+                if Some(got) != want.as_f64() {
+                    violation(
+                        format!("got {got}, expected {want} (or omit the field)"),
+                        &mut first_violation,
+                    );
+                }
+            }
+            &ParamSpec::Range { lo, hi } => {
+                if !(lo..=hi).contains(&got) {
+                    violation(
+                        format!("must be between {lo} and {hi}, got {got}"),
+                        &mut first_violation,
+                    );
+                }
+            }
+        }
+    }
+    match first_violation {
+        Some(err) => Err(err),
+        None => Ok(inject),
+    }
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
@@ -1102,24 +1649,27 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     // Server-side, the full error is logged with `tracing::debug!` for
     // operator triage.
     //
-    // Two-step deserialize:
-    //   1. `Map<String, IgnoredAny>` *anchors* the shape to a JSON object.
-    //      This rejects `null` / `[]` / `"hi"` (all valid JSON but not
-    //      request shape) without walking the full value into a
-    //      `serde_json::Value` per field.
-    //   2. `RequestProbe` (struct of `Option<bool>` + `Option<String>`)
-    //      lifts out only the fields we care about — `stream` and `model`.
-    //      Other fields are ignored; the worker is authoritative for the
-    //      rest of the schema.
-    let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions body rejected as non-object JSON");
-        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-    })?;
-    let probe: RequestProbe = serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions request-probe deserialize failed");
-        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-    })?;
-    Ok(probe)
+    // ONE deserialize. [`RequestProbe`]'s hand-written `visit_map` both
+    // anchors the shape (its `deserialize_map` rejects `null` / `[]` / `"hi"`
+    // — valid JSON, not request shape) and lifts out the probed fields,
+    // skipping the unknown majority through `IgnoredAny`. It never builds a
+    // `serde_json::Value` and allocates nothing per unrecognized key, so the
+    // shape check costs no separate pass over a multi-MiB body.
+    let err = match serde_json::from_slice::<RequestProbe>(body) {
+        Ok(probe) => return Ok(probe),
+        Err(e) => e,
+    };
+    // The one failure this pass can invent that the fallback cannot is
+    // converting a sampling number literal; malformed JSON, a non-object body
+    // and a duplicated routing key all fail both, so retrying here cannot
+    // launder a body that is genuinely bad.
+    if let Ok(probe) = probe_without_sampling_values(body) {
+        return Ok(probe);
+    }
+    tracing::debug!(error = %err, "chat-completions request-probe deserialize failed");
+    Err(ApiError::BadRequest(
+        "invalid request: body must be a JSON object".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -1194,7 +1744,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1215,7 +1766,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1230,7 +1781,7 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, &[]).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -1250,7 +1801,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1264,7 +1816,7 @@ mod tests {
     }
 
     /// Tool / function requests are detected so the caller omits `input_ids`
-    /// (the router's encoder doesn't render tools).
+    /// (the router's formatter doesn't render tools).
     #[test]
     fn request_has_tools_detects_tools_and_functions() {
         assert!(request_has_tools(
@@ -1277,14 +1829,25 @@ mod tests {
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
     }
 
-    /// Array (multimodal) message content is detected so the caller omits
-    /// `input_ids` (a text tokenizer can't represent image content).
+    /// Arrays, nulls, and missing content block `input_ids` forwarding.
     #[test]
-    fn request_is_multimodal_detects_array_content() {
-        assert!(request_is_multimodal(&serde_json::json!({
-            "messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]
+    fn request_has_non_text_content_detects_non_string_content() {
+        for content in [
+            serde_json::json!([{"type":"image_url","image_url":"x"}]),
+            serde_json::json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                request_has_non_text_content(&serde_json::json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":content}]
+                })),
+                "content {content} must block"
+            );
+        }
+        assert!(request_has_non_text_content(&serde_json::json!({
+            "messages":[{"role":"assistant","tool_calls":[]}]
         })));
-        assert!(!request_is_multimodal(&serde_json::json!({
+        assert!(!request_has_non_text_content(&serde_json::json!({
             "messages":[{"role":"user","content":"hello"}]
         })));
     }
@@ -1298,7 +1861,7 @@ mod tests {
     }
 
     /// Every field the engine honors on the `messages` path but which the
-    /// router's encoder does not replicate must block forwarding — otherwise
+    /// router's formatter does not replicate must block forwarding — otherwise
     /// the engine uses the router's ids verbatim and silently runs a different
     /// prompt than the request asked for.
     #[test]
@@ -1345,7 +1908,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
@@ -1354,14 +1917,14 @@ mod tests {
         assert!(parsed.get("input_ids").is_none());
     }
 
-    /// A chat request on a chat-encoder model that yields engine-equivalent
+    /// A chat request on a chat-formatter model that yields engine-equivalent
     /// ids (encode succeeded) is NOT a failure — the offload worked.
     #[test]
-    fn offload_failed_false_when_tokens_engine_equivalent() {
+    fn offload_failed_false_when_tokens_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            engine_equivalent: true,
+            rendered_from_chat: true,
         };
         assert!(!ingress_tokenize_offload_failed(
             true,
@@ -1370,24 +1933,32 @@ mod tests {
         ));
     }
 
-    /// A chat request on a chat-encoder model whose tokenization yielded NO
-    /// tokens (encode_chat returned None → request_tokens None) IS a failure:
-    /// the encoder should have fired but didn't.
+    /// Excluded requests are expected fallbacks, even without rendered tokens.
     #[test]
-    fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
+    fn offload_failed_false_for_unforwardable_request() {
+        let value = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]
+        });
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    /// Missing tokens count as a failure for an eligible chat with a formatter.
+    #[test]
+    fn offload_failed_true_when_chat_formatter_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
-    /// Encode produced ids but NOT via the chat encoder (raw fallback,
-    /// `engine_equivalent = false`) on a chat-encoder model + chat request →
+    /// Encode produced ids but NOT via the chat formatter (raw fallback,
+    /// `rendered_from_chat = false`) on a chat-formatter model + chat request →
     /// the chat-encode render/encode failed and fell through to the raw path.
     #[test]
-    fn offload_failed_true_when_tokens_not_engine_equivalent() {
+    fn offload_failed_true_when_tokens_not_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            engine_equivalent: false,
+            rendered_from_chat: false,
         };
         assert!(ingress_tokenize_offload_failed(
             true,
@@ -1396,15 +1967,15 @@ mod tests {
         ));
     }
 
-    /// Non-chat-encoder models never expected the offload → not a failure even
+    /// Non-chat-formatter models never expected the offload → not a failure even
     /// with no tokens.
     #[test]
-    fn offload_failed_false_without_chat_encoder() {
+    fn offload_failed_false_without_chat_formatter() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
     }
 
-    /// A non-chat (no `messages`) request on a chat-encoder model — e.g.
+    /// A non-chat (no `messages`) request on a chat-formatter model — e.g.
     /// `/v1/completions` `prompt` — never expected the chat-encode offload, so
     /// the absence of engine-equivalent ids is not a failure.
     #[test]
@@ -1535,5 +2106,764 @@ mod tests {
             ),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    fn probe_of(body: &str) -> RequestProbe {
+        parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
+    }
+
+    /// Build a [`SamplingOverrides`] the only way production does — through
+    /// the flag parser.
+    ///
+    /// Hand-building the struct here would re-implement `canonical_number`'s
+    /// integral normalization in the test, so a regression in the parser would
+    /// leave these assertions green while the forwarded body changed.
+    fn overrides_of(conflict: ConflictPolicy, json: &str) -> SamplingOverrides {
+        crate::config::parse_sampling_overrides(json, conflict).expect("test config must parse")
+    }
+
+    /// A throwaway registry, so the contract's rejection counter has somewhere
+    /// to land.
+    fn metrics() -> Arc<MetricsRegistry> {
+        MetricsRegistry::new()
+    }
+
+    /// With nothing configured the sampling contract is inert: no request is
+    /// ever inspected, and nothing is injected.
+    #[test]
+    fn unconfigured_sampling_overrides_inject_nothing() {
+        let overrides = SamplingOverrides::default();
+        let p = probe_of(r#"{"model":"x","temperature":0.7,"n":4}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
+            vec![]
+        );
+    }
+
+    /// The `reject` contract at the decision level: omitted -> inject the
+    /// configured value; equal to it -> pass untouched; any other numeric
+    /// value -> 400; non-numeric garbage -> forwarded for the engine's own
+    /// schema error. A band admits its range, 400s outside it, and injects
+    /// nothing.
+    #[test]
+    fn reject_mode_pins_configured_values_and_admits_a_band() {
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"top_p": 0.95, "frequency_penalty": 0.0, "presence_penalty": 0.0,
+                "n": 1, "temperature": {"min": 0, "max": 1}}"#,
+        );
+
+        // Omitted params: accepted, exact values injected, band injects nothing.
+        let p = probe_of(r#"{"model":"x","messages":[]}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert_eq!(
+            inject
+                .iter()
+                .map(|(f, v)| (f.wire_name(), v.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("top_p", "0.95".to_string()),
+                ("frequency_penalty", "0.0".to_string()),
+                ("presence_penalty", "0.0".to_string()),
+                ("n", "1".to_string()),
+            ]
+        );
+
+        for accepted in [
+            r#"{"model":"x","temperature":0.0}"#,
+            r#"{"model":"x","temperature":0.6}"#,
+            r#"{"model":"x","temperature":1.0}"#,
+            r#"{"model":"x","top_p":0.95}"#,
+            r#"{"model":"x","presence_penalty":0}"#,
+            r#"{"model":"x","frequency_penalty":0}"#,
+            r#"{"model":"x","n":1}"#,
+        ] {
+            let p = probe_of(accepted);
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap_or_else(|e| panic!("{accepted} must be accepted: {e:?}"));
+        }
+
+        // Nothing is injected over a field the client already sent.
+        let p = probe_of(r#"{"model":"x","top_p":0.95}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::TopP));
+
+        for rejected in [
+            r#"{"model":"x","temperature":1.1}"#,
+            r#"{"model":"x","temperature":2.0}"#,
+            r#"{"model":"x","temperature":-0.1}"#,
+            r#"{"model":"x","top_p":0.8}"#,
+            r#"{"model":"x","presence_penalty":0.5}"#,
+            r#"{"model":"x","frequency_penalty":0.5}"#,
+            r#"{"model":"x","n":2}"#,
+        ] {
+            let p = probe_of(rejected);
+            let err = apply_sampling_overrides(&overrides, &p, &metrics())
+                .expect_err(&format!("{rejected} must be rejected"));
+            assert!(
+                matches!(err, ApiError::SamplingContract { .. }),
+                "{rejected}: got {err:?}"
+            );
+        }
+
+        // A bool is a number to the engine, so it is judged like one: `n: true`
+        // IS the configured `n: 1` and passes.
+        let p = probe_of(r#"{"model":"x","n":true}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::N));
+
+        // Garbage this probe cannot read as a number is refused under `reject`
+        // rather than forwarded: `reject` promises the engine sees nothing but
+        // the configured value, and the engine's coercion rules are laxer than
+        // ours, so "not a number here" does not mean "not a number there".
+        let p = probe_of(r#"{"model":"x","top_p":"hot"}"#);
+        let err = apply_sampling_overrides(&overrides, &p, &metrics())
+            .expect_err("an unreadable value must not slip past a pin");
+        assert!(matches!(err, ApiError::SamplingContract { .. }), "{err:?}");
+
+        // Under `allow` it keeps flowing — `allow` makes no promise to break —
+        // and is still never injected over.
+        let allow = overrides_of(ConflictPolicy::Allow, r#"{"top_p": 0.95}"#);
+        let inject = apply_sampling_overrides(&allow, &p, &metrics()).unwrap();
+        assert!(inject.is_empty(), "a client value is never overwritten");
+
+        // Numeric strings coerce the way the engine's pydantic lax mode does:
+        // "0.95" equals the configured value, "0.8" differs and 400s here.
+        let p = probe_of(r#"{"model":"x","top_p":"0.95"}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
+        let p = probe_of(r#"{"model":"x","top_p":"0.8"}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_err());
+
+        // An exact temperature (no band) rejects differing values and injects
+        // when absent, like every other parameter.
+        let exact = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
+        assert!(apply_sampling_overrides(&exact, &p, &metrics()).is_err());
+        let p = probe_of(r#"{"model":"x"}"#);
+        assert_eq!(
+            apply_sampling_overrides(&exact, &p, &metrics()).unwrap(),
+            vec![(
+                SamplingField::Temperature,
+                serde_json::Number::from_f64(1.0).unwrap()
+            )]
+        );
+    }
+
+    /// `allow` keeps the fill-when-absent half of the contract and drops the
+    /// rejection half: a client value — right, wrong or garbage — is forwarded
+    /// untouched, so the configured values are fleet-wide defaults.
+    #[test]
+    fn allow_mode_never_rejects_and_never_masks_a_client_value() {
+        let overrides = overrides_of(
+            ConflictPolicy::Allow,
+            r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
+        );
+
+        // Omitted -> injected, exactly as under `reject`.
+        let p = probe_of(r#"{"model":"x"}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature", "top_p", "n"]
+        );
+
+        // Every value `reject` would 400 is accepted here, and nothing is
+        // injected over it — the client's value reaches the engine.
+        let p = probe_of(r#"{"model":"x","temperature":0.6,"top_p":0.8,"n":4}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
+            vec![]
+        );
+
+        // Partial overlap: the client set temperature, so only the untouched
+        // parameters are filled in.
+        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["top_p", "n"]
+        );
+    }
+
+    /// An explicit `null` is absent for the engine, so it is absent here too:
+    /// the configured value is injected rather than the field being read as a
+    /// client-supplied conflict.
+    #[test]
+    fn explicit_null_sampling_value_counts_as_omitted() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        let p = probe_of(r#"{"model":"x","temperature":null}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature"]
+        );
+    }
+
+    /// The inject-set lands in the forwarded body, and rides the same
+    /// `build_outgoing_body` serialize as the forwarded `input_ids` — so
+    /// chat-encoder traffic gets the contract too, not just the raw-prompt
+    /// path.
+    #[test]
+    fn build_outgoing_body_injects_sampling_overrides_alongside_input_ids() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [1u32, 2, 3];
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"top_p": 0.95, "top_k": 1000, "frequency_penalty": 0.0,
+                "presence_penalty": 0.0, "n": 1}"#,
+        );
+        let inject = apply_sampling_overrides(
+            &overrides,
+            &probe_of(r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#),
+            &metrics(),
+        )
+        .unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
+        // `top_k` and `n` are engine-typed `int`: the injected literals must
+        // not be `1000.0` / `1.0`.
+        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            parsed.get("frequency_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        assert_eq!(
+            parsed.get("presence_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
+        assert!(parsed.get("messages").is_some());
+    }
+    /// A repeated sampling key LAST-WINS instead of 400ing, matching the
+    /// engine's own `json.loads`: the value the contract compares against must
+    /// be the value the engine will actually sample with. Probing these fields
+    /// must not turn a body the router used to forward into a rejection.
+    #[test]
+    fn duplicate_sampling_key_takes_the_last_value_like_the_engine() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+
+        // Last value matches the contract -> accepted.
+        let p = probe_of(r#"{"model":"x","temperature":0.5,"temperature":1}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
+
+        // Last value differs -> rejected on THAT value, not the first one.
+        let p = probe_of(r#"{"model":"x","temperature":1,"temperature":0.5}"#);
+        let err = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap_err();
+        assert!(
+            format!("{err}").contains("got 0.5"),
+            "must judge the last value; got {err}"
+        );
+    }
+
+    /// The router-actionable fields keep the stricter pre-existing contract:
+    /// a body that says two different things about how to route itself is
+    /// ambiguous at the edge. See
+    /// `parse_probe_handles_duplicate_stream_keys`.
+    #[test]
+    fn duplicate_routing_key_still_rejects() {
+        for body in [
+            r#"{"model":"a","model":"b"}"#,
+            r#"{"stream":true,"stream":false}"#,
+            r#"{"max_tokens":1,"max_tokens":2}"#,
+            r#"{"max_completion_tokens":1,"max_completion_tokens":2}"#,
+            // An explicit null still counts as an occurrence, so this is a
+            // duplicate even though the first value reads as `None`.
+            r#"{"stream":null,"stream":true}"#,
+        ] {
+            let b = Bytes::copy_from_slice(body.as_bytes());
+            assert!(
+                parse_probe(&b).is_err(),
+                "{body} must be rejected as ambiguous"
+            );
+        }
+    }
+
+    /// A sampling key carrying a huge non-numeric value must cost nothing: it
+    /// is drained, not materialized, and it does not fail the probe. Probing
+    /// these keys must neither put a client-sized allocation on the request
+    /// path nor reject a body an ungoverned router forwards.
+    #[test]
+    fn oversized_non_numeric_sampling_value_is_drained_not_materialized() {
+        let big_array = format!("[{}]", "1,".repeat(50_000) + "1");
+        let big_string = format!("\"{}\"", "x".repeat(200_000));
+        let big_object = format!("{{{}\"k\":1}}", "\"j\":[[[1]]],".repeat(10_000));
+        for value in [&big_array, &big_string, &big_object] {
+            let body = format!(r#"{{"model":"x","temperature":{value}}}"#);
+            let probe = probe_of(&body);
+            assert_eq!(
+                probe.sampling_field(SamplingField::Temperature),
+                ProbedValue::Unusable,
+                "a non-numeric value must collapse to Unusable"
+            );
+            // ...and it is never injected over, in either mode: the client
+            // sent something, so there is no omission to fill.
+            let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
+            let inject = apply_sampling_overrides(&allow, &probe, &metrics()).unwrap();
+            assert!(inject.is_empty(), "must not inject over a client value");
+            let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+            assert!(
+                apply_sampling_overrides(&reject, &probe, &metrics()).is_err(),
+                "reject must refuse a value it cannot read as a number"
+            );
+        }
+    }
+
+    /// A numeric string is read the way the engine's pydantic lax mode reads
+    /// it, but is not retained as a string.
+    #[test]
+    fn probed_sampling_values_normalize_to_numbers() {
+        let p = probe_of(r#"{"model":"x","temperature":" 0.7 ","top_k":40,"min_p":0.05}"#);
+        assert_eq!(
+            p.sampling_field(SamplingField::Temperature),
+            ProbedValue::Number(0.7)
+        );
+        assert_eq!(
+            p.sampling_field(SamplingField::TopK),
+            ProbedValue::Number(40.0)
+        );
+        assert_eq!(
+            p.sampling_field(SamplingField::MinP),
+            ProbedValue::Number(0.05)
+        );
+        assert_eq!(p.sampling_field(SamplingField::N), ProbedValue::Absent);
+    }
+
+    /// A contract rejection must be distinguishable from every other 400 —
+    /// malformed JSON, a missing `model`, a bad SLO header — and must name the
+    /// parameter, since that is what an operator rolling the flag out needs.
+    #[test]
+    fn contract_rejection_has_its_own_error_code_and_counter() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"top_p": 0.95}"#);
+        let metrics = metrics();
+        let p = probe_of(r#"{"model":"x","top_p":0.5}"#);
+
+        let err = apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        let ApiError::SamplingContract { param, .. } = &err else {
+            panic!("expected SamplingContract, got {err:?}");
+        };
+        assert_eq!(*param, "top_p");
+        // The parameter and the offending value both reach the client, so a
+        // 400 is self-explanatory without an operator in the loop. The
+        // distinct `x-router-error-code` is pinned in `server::error`.
+        let msg = format!("{err}");
+        assert!(msg.contains("top_p") && msg.contains("0.5"), "got {msg}");
+
+        apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        assert!(
+            metrics
+                .render()
+                .contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 2"#),
+            "rejections must be counted per parameter:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The steady state of a governed fleet: a load-only policy on a model
+    /// with no chat encoder, so the ingress never parsed, and only sampling
+    /// scalars to add. This must NOT re-parse and re-serialize the body —
+    /// proven by the original bytes surviving verbatim, which a
+    /// `serde_json::Value` round-trip would have normalized away.
+    #[test]
+    fn build_outgoing_body_splices_sampling_without_reparsing() {
+        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0, "n": 1}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.get("model"), Some(&serde_json::json!("x")));
+    }
+
+    /// Splice edge cases: an empty object must not gain a trailing comma, and
+    /// leading whitespace before the root brace must not shift the insert.
+    #[test]
+    fn splice_top_level_handles_empty_objects_and_leading_whitespace() {
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        for (raw, want) in [
+            (r#"{}"#, r#"{"temperature":1.0}"#),
+            (r#"{ }"#, r#"{ "temperature":1.0}"#),
+            ("\n\t {\"a\":1}", "\n\t {\"a\":1,\"temperature\":1.0}"),
+            // A `}` inside a string literal is not the closing brace.
+            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0}"#),
+            // Trailing whitespace stays outside the object.
+            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
+        ] {
+            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
+            serde_json::from_slice::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
+        }
+    }
+
+    /// Nothing configured -> the body is forwarded as the same `Bytes`, with
+    /// neither a parse nor a copy.
+    #[test]
+    fn build_outgoing_body_without_injection_forwards_the_same_allocation() {
+        let body = Bytes::from_static(br#"{"model":"x"}"#);
+        let out = build_outgoing_body(&body, None, None, None, &[]).unwrap();
+        assert_eq!(
+            out.as_ptr(),
+            body.as_ptr(),
+            "must be an Arc clone, not a copy"
+        );
+    }
+
+    /// The engine reads each of these as a number, so a contract that waved
+    /// them through would pin nothing. `false` is 0 and `"0.5_0"` is 0.5 to
+    /// pydantic — a pin of 1 must refuse both, and a pin of the value they
+    /// coerce to must accept them, since the engine samples with exactly
+    /// that.
+    #[test]
+    fn values_the_engine_reads_as_numbers_are_judged_not_waved_through() {
+        for (body_value, engine_sees) in [("false", 0.0), ("true", 1.0), (r#""0.5_0""#, 0.5)] {
+            let probe = probe_of(&format!(r#"{{"model":"x","temperature":{body_value}}}"#));
+            assert_eq!(
+                probe.sampling_field(SamplingField::Temperature),
+                ProbedValue::Number(engine_sees),
+                "{body_value} must be read as the number the engine will use"
+            );
+
+            let pinned_elsewhere = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 2}"#);
+            assert!(
+                apply_sampling_overrides(&pinned_elsewhere, &probe, &metrics()).is_err(),
+                "{body_value} differs from the pin and must be rejected"
+            );
+
+            let pinned_here = overrides_of(
+                ConflictPolicy::Reject,
+                &format!(r#"{{"temperature": {engine_sees}}}"#),
+            );
+            assert!(
+                apply_sampling_overrides(&pinned_here, &probe, &metrics()).is_ok(),
+                "{body_value} IS the pinned value to the engine, so it must pass"
+            );
+        }
+    }
+
+    /// `parse_as_engine_number` against the engine's actual answers.
+    ///
+    /// Every expectation here was produced by running the value through
+    /// pydantic 2.13.5 on sglang's own field declaration
+    /// (`temperature: Optional[float] = None`, no validator, no strict
+    /// config), not derived from a reading of the rules — deriving them is
+    /// what gets this wrong. Python's numeric-literal rule, the obvious
+    /// guess, disagrees with pydantic on `1._5`, `1_.5`, `1e_5`, `1_e5` and
+    /// `-_1`.
+    #[test]
+    fn numeric_strings_are_read_the_way_the_engine_reads_them() {
+        #[rustfmt::skip]
+        let cases: &[(&str, Option<f64>)] = &[
+            ("1_0", Some(10.0_f64)),
+            ("1_000.5", Some(1000.5_f64)),
+            ("0.5_0", Some(0.5_f64)),
+            ("1_0.5_0", Some(10.5_f64)),
+            ("0.5e1_0", Some(5000000000.0_f64)),
+            ("1_2_3", Some(123.0_f64)),
+            ("1_000_000", Some(1000000.0_f64)),
+            ("0_1", Some(1.0_f64)),
+            ("1_0.0_1", Some(10.01_f64)),
+            ("-1_0", Some(-10.0_f64)),
+            ("+1_0", Some(10.0_f64)),
+            ("1_0e1_0", Some(100000000000.0_f64)),
+            ("1._5", Some(1.5_f64)),
+            ("1_.5", Some(1.5_f64)),
+            ("1e_5", Some(100000.0_f64)),
+            ("1_e5", Some(100000.0_f64)),
+            ("-_1", Some(-1.0_f64)),
+            ("+_1", Some(1.0_f64)),
+            ("._5", Some(0.5_f64)),
+            ("-_.5", Some(-0.5_f64)),
+            ("1_._5", Some(1.5_f64)),
+            ("+_.5", Some(0.5_f64)),
+            ("1_.", Some(1.0_f64)),
+            ("_1", None),
+            ("1_", None),
+            ("1__0", None),
+            ("_", None),
+            ("__", None),
+            ("._", None),
+            ("-_", None),
+            ("_.5", None),
+            ("1e5_", None),
+            ("_1.5", None),
+            ("1.5_", None),
+            ("0_x10", None),
+            ("1_0e_1_0", Some(100000000000.0_f64)),
+            (" 1_0 ", None),
+            ("_ 1", None),
+            ("1 _0", None),
+            (" __1 ", None),
+            ("\t1_0\n", None),
+            ("0.5", Some(0.5_f64)),
+            ("  1.5  ", Some(1.5_f64)),
+            ("1e-1", Some(0.1_f64)),
+            ("+1.5", Some(1.5_f64)),
+            (".5", Some(0.5_f64)),
+            ("1.", Some(1.0_f64)),
+            ("-0", Some(-0.0_f64)),
+            ("1E5", Some(100000.0_f64)),
+            ("inf", Some(f64::INFINITY)),
+            ("-inf", Some(f64::NEG_INFINITY)),
+            ("Infinity", Some(f64::INFINITY)),
+            ("nan", Some(f64::NAN)),
+            ("NaN", Some(f64::NAN)),
+            ("0x10", None),
+            ("0b101", None),
+            ("0o17", None),
+            ("1,5", None),
+            ("1.5f", None),
+            ("", None),
+            (" ", None),
+            ("abc", None),
+            ("1e400", Some(f64::INFINITY)),
+        ];
+        for &(input, want) in cases {
+            let got = parse_as_engine_number(input);
+            match (got, want) {
+                (Some(g), Some(w)) if g.is_nan() && w.is_nan() => {}
+                _ => assert_eq!(got, want, "parse_as_engine_number({input:?})"),
+            }
+        }
+    }
+
+    /// A string long enough to be worth an allocation is not normalized —
+    /// the underscore path runs in a fixed stack buffer. Under `reject` the
+    /// over-long value is refused, which is the safe direction: the contract
+    /// never silently forwards what it declined to read.
+    #[test]
+    fn overlong_numeric_string_is_not_normalized_and_is_refused() {
+        let long = format!("1{}", "_0".repeat(MAX_SAMPLING_NUMERIC_LEN));
+        assert!(long.len() > MAX_SAMPLING_NUMERIC_LEN);
+        assert_eq!(parse_as_engine_number(&long), None);
+
+        let probe = probe_of(&format!(r#"{{"model":"x","temperature":"{long}"}}"#));
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&overrides, &probe, &metrics()).is_err());
+    }
+
+    /// `allow` promises nothing, so it has nothing to fail open on: a value
+    /// the probe cannot read keeps flowing, and is still never injected over.
+    #[test]
+    fn allow_never_rejects_an_unreadable_value() {
+        let probe = probe_of(r#"{"model":"x","temperature":"abc","top_p":[1]}"#);
+        let overrides = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1, "top_p": 0.9}"#);
+        let inject = apply_sampling_overrides(&overrides, &probe, &metrics()).unwrap();
+        assert!(inject.is_empty(), "a client value is never overwritten");
+    }
+
+    /// A refused unreadable value is a contract violation like any other: same
+    /// error code, same per-parameter counter, and it names the parameter and
+    /// the expectation without echoing the client's value back.
+    #[test]
+    fn unreadable_value_rejection_is_counted_and_named() {
+        for (config, body, expected_detail) in [
+            (
+                r#"{"temperature": 1}"#,
+                r#"{"model":"x","temperature":"abc"}"#,
+                "expected 1 (or omit the field), got a non-numeric value",
+            ),
+            (
+                r#"{"temperature": {"min": 0.5, "max": 1.5}}"#,
+                r#"{"model":"x","temperature":{"a":1}}"#,
+                "must be a number between 0.5 and 1.5, got a non-numeric value",
+            ),
+        ] {
+            let overrides = overrides_of(ConflictPolicy::Reject, config);
+            let metrics = metrics();
+            let probe = probe_of(body);
+
+            let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+            match &err {
+                ApiError::SamplingContract { param, detail } => {
+                    assert_eq!(*param, "temperature");
+                    assert_eq!(detail, expected_detail);
+                }
+                other => panic!("expected SamplingContract, got {other:?}"),
+            }
+            assert!(
+                metrics.render().contains(
+                    r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 1"#
+                ),
+                "a refusal must be visible to an operator rolling the flag out:\n{}",
+                metrics.render()
+            );
+        }
+    }
+
+    /// A number literal outside `f64`'s range must not fail the probe.
+    ///
+    /// serde_json converts a literal while resolving `ProbedValue`, and errors
+    /// rather than saturating — so probing the sampling keys turned
+    /// `{"temperature": 1e400}` into a 400 whose message ("body must be a JSON
+    /// object") was not true of it, on a router with no contract configured.
+    /// An unprobed key holding the same literal was unaffected, which is the
+    /// asymmetry that gives the bug away.
+    #[test]
+    fn out_of_range_number_literal_does_not_fail_the_probe() {
+        for body in [
+            r#"{"model":"x","temperature":1e400}"#,
+            r#"{"model":"x","temperature":-1e309}"#,
+            r#"{"model":"x","top_k":1E1000,"stream":true}"#,
+        ] {
+            let probe = parse_probe(&Bytes::copy_from_slice(body.as_bytes()))
+                .unwrap_or_else(|e| panic!("{body} must still parse: {e:?}"));
+            assert_eq!(probe.model.as_deref(), Some("x"), "{body}");
+        }
+        // Routing fields still come through on the fallback pass.
+        let probe = probe_of(r#"{"model":"x","temperature":1e400,"stream":true}"#);
+        assert_eq!(probe.stream, Some(true));
+
+        // The key was PRESENT, so it is unreadable rather than absent: a
+        // contract must not inject over a value the client sent...
+        let probe = probe_of(r#"{"model":"x","temperature":1e400}"#);
+        assert_eq!(
+            probe.sampling_field(SamplingField::Temperature),
+            ProbedValue::Unusable
+        );
+        let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&allow, &probe, &metrics())
+            .unwrap()
+            .is_empty());
+        // ...and `reject` refuses it, as it does any value it cannot read.
+        let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&reject, &probe, &metrics()).is_err());
+
+        // A body that is genuinely malformed still 400s -- the fallback must
+        // not launder one.
+        for bad in [
+            r#"{"model":"x","stream":true,"stream":false}"#,
+            "[]",
+            "null",
+            "{oops",
+        ] {
+            assert!(
+                parse_probe(&Bytes::copy_from_slice(bad.as_bytes())).is_err(),
+                "{bad} must still be rejected"
+            );
+        }
+    }
+
+    /// The counter answers "how much traffic is the contract turning away, and
+    /// on which parameter". Stopping at the first violation would report zero
+    /// for every parameter sorting after it, so a fleet violating two would
+    /// look like it violates one — and the operator would roll the second out
+    /// believing it had no blast radius.
+    #[test]
+    fn every_violated_parameter_is_counted_not_just_the_first() {
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
+        );
+        let metrics = metrics();
+        let probe = probe_of(r#"{"model":"x","temperature":0.7,"top_p":0.8,"n":2}"#);
+
+        let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+        // The client still hears about one parameter.
+        let ApiError::SamplingContract { param, .. } = &err else {
+            panic!("expected SamplingContract, got {err:?}");
+        };
+        assert_eq!(*param, "temperature");
+
+        let rendered = metrics.render();
+        for name in ["temperature", "top_p", "n"] {
+            assert!(
+                rendered.contains(&format!(
+                    r#"sgl_router_sampling_contract_rejections_total{{param="{name}"}} 1"#
+                )),
+                "{name} must be counted:\n{rendered}"
+            );
+        }
+    }
+
+    /// The cap applies to the plain parse too, not only the underscore path:
+    /// the string is client-controlled and parsing one is linear in its
+    /// length, so an unbounded digit run would be free CPU amplification on
+    /// every request that carries one.
+    #[test]
+    fn overlong_plain_numeric_string_is_not_parsed() {
+        let long = "1".repeat(MAX_SAMPLING_NUMERIC_LEN + 1);
+        assert_eq!(parse_as_engine_number(&long), None);
+        assert_eq!(
+            parse_as_engine_number(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
+            "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
+            "a value at the cap is still read"
+        );
+    }
+
+    /// A request sending an explicit `null` for a governed parameter is the
+    /// one case where the inject-set and a key PRESENT in the body overlap:
+    /// the probe reads `null` as absent (the OpenAI contract), so the value is
+    /// injected even though the key is there. The injected value therefore has
+    /// to win the engine's last-wins parse — which is why members are spliced
+    /// in before the CLOSING brace. Inserting after the opening brace would
+    /// leave the client's trailing `null` authoritative and silently defeat
+    /// the contract.
+    #[test]
+    fn spliced_value_outranks_an_explicit_null_the_client_sent() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let raw = r#"{"model":"x","temperature":null}"#;
+        let body = Bytes::copy_from_slice(raw.as_bytes());
+        let inject = apply_sampling_overrides(&overrides, &probe_of(raw), &metrics()).unwrap();
+        assert_eq!(inject.len(), 1, "null must be treated as omitted");
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("temperature"),
+            Some(&serde_json::json!(1.0)),
+            "the engine must read the configured value, not the client's null: {}",
+            std::str::from_utf8(&out).unwrap()
+        );
+    }
+
+    /// The splice must also fire when the ingress ALREADY parsed the body, as
+    /// long as nothing needs overwriting — see the WHY on the unconditional
+    /// splice in `build_outgoing_body` for which configurations those are.
+    #[test]
+    fn splice_fires_even_when_a_parse_is_already_on_hand() {
+        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, Some(value), None, None, &inject).unwrap();
+        // Byte-identical to the no-parse case: the parse was dropped unused.
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,"temperature":1.0}"#
+        );
     }
 }
