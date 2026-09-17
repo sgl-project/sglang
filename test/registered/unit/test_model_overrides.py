@@ -1691,6 +1691,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
+                fp8_gemm_runner_backend="auto",
                 _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
             )
             defaults.update(kw)
@@ -1772,6 +1773,45 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _deepseek_v4_overrides(_args(), hf)["moe_runner_backend"],
                 "flashinfer_mxfp4",
+            )
+        # DeepSeek-V4.1 32-wide UE8M0 blocks use the FlashInfer MXFP8 backend
+        # native to each supported architecture.
+        hf_v41 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            model_type="deepseek_v41",
+            quantization_config={
+                "quant_method": "fp8",
+                "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0",
+            },
+        )
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.deepseek_v4.is_flashinfer_available",
+            return_value=True,
+        ):
+            with override_platform(
+                is_sm100=True, is_sm120=False, is_hip=False
+            ):
+                self.assertEqual(
+                    _deepseek_v4_overrides(_args(), hf_v41)[
+                        "fp8_gemm_runner_backend"
+                    ],
+                    "flashinfer_cutedsl",
+                )
+            with override_platform(
+                is_sm100=False, is_sm120=True, is_hip=False
+            ):
+                self.assertEqual(
+                    _deepseek_v4_overrides(_args(), hf_v41)[
+                        "fp8_gemm_runner_backend"
+                    ],
+                    "flashinfer_cutlass",
+                )
+            self.assertNotIn(
+                "fp8_gemm_runner_backend",
+                _deepseek_v4_overrides(
+                    _args(fp8_gemm_runner_backend="triton"), hf_v41
+                ),
             )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(

@@ -28,22 +28,33 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
 
-    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103;
-    # explicit backend choices, including Triton, take precedence.
+    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks. Prefer the backend
+    # native to each supported architecture; explicit user choices, including
+    # Triton, take precedence.
     quant = getattr(hf_config, "quantization_config", None) or {}
+    platform = get_platform()
     if (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
         and cfg.device == "cuda"
-        and not get_platform().is_hip
-        and get_platform().is_sm100
+        and not platform.is_hip
         and cfg.fp8_gemm_runner_backend == "auto"
         and quant.get("quant_method") == "fp8"
         and quant.get("weight_block_size") == [32, 32]
         and quant.get("scale_fmt") == "ue8m0"
         and is_flashinfer_available()
     ):
-        overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
-        logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+        backend = None
+        if platform.is_sm100:
+            backend = "flashinfer_cutedsl"
+        elif platform.is_sm120:
+            backend = "flashinfer_cutlass"
+        if backend is not None:
+            overrides["fp8_gemm_runner_backend"] = backend
+            logger.info(
+                "Use %s for DeepSeek-V4.1 MXFP8 dense GEMMs on %s.",
+                backend,
+                platform.device_sm,
+            )
 
     page_size = 256
     if cfg.device == "npu":
