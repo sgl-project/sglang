@@ -282,6 +282,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -434,6 +435,11 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    # Factor by which KV sharding widens the allocator's index space over one
+    # rank's physical pool. Resolved in init_memory_pool_and_cache; the class
+    # default keeps readers that run before the pool exists at stock 1x units.
+    kv_shard_widening: int = 1
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -612,6 +618,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.kv_shard_widening = page_interleave_shard_size(
+            self.token_to_kv_pool_allocator
+        )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -2343,8 +2352,12 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # DCP and logical-page KV sharding widen the allocator's index
+            # space; the observer's total must be in the same (logical) units
+            # as allocator.available_size() and the radix counters.
             max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            * get_parallel().attn_dcp_size
+            * self.kv_shard_widening,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2357,7 +2370,7 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2415,7 +2428,9 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # KV sharding widens the allocator's index space, so the capacity
+            # reported to the router is widened too. DCP is deliberately not.
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2529,10 +2544,24 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
+        # PrefillAdder charges one page per shard class and measures the budget
+        # with allocator.available_size(), so the sharded budget is
+        # ceil_page(input_len) + max_new_tokens + page_size * N <
+        # max_total_num_tokens * N. `max_new_tokens_for_memory` already
+        # subtracts exactly one allocator page (the PHYSICAL page under
+        # sharding), so pre-charge the remaining N - 1 pages into the capacity.
+        # Otherwise a request can be accepted into the waiting queue but never
+        # scheduled, blocking the queue and eventually failing health checks.
+        token_capacity = (
+            self.max_total_num_tokens
+            * get_parallel().attn_dcp_size
+            * self.kv_shard_widening
+            - self.page_size * (self.kv_shard_widening - 1)
+        )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
-            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
         )
