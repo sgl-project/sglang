@@ -76,6 +76,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1142,7 +1143,22 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.use_mxfp8:
+        mxfp8_view = self.use_mxfp8 or (
+            self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
+        )
+        if isinstance(x, Mxfp8SwizzledInput):
+            if not mxfp8_view or not (
+                self.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or self.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            ):
+                raise ValueError(
+                    "Mxfp8SwizzledInput needs a layer with an MXFP8 view on a "
+                    "FlashInfer CUTLASS / CuTe-DSL backend"
+                )
+        elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
+            # A legacy (q, scale) block-fp8 pair keeps the block kernel.
+            mxfp8_view = False
+        if mxfp8_view:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
