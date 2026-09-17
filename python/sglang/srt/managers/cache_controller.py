@@ -397,8 +397,15 @@ class HiCacheController:
         # host-pool registration, or storage-backend native init such as
         # mooncake) leaves a sticky CUDA error that would otherwise surface
         # here as an "invalid argument" from the first CUDA op inside
-        # all_gather_object. Consume it before creating the groups.
-        _clear_sticky_cuda_error()
+        # all_gather_object. Consume it before creating the groups, but log
+        # the code so an unrelated failure is not silently masked.
+        leftover = _clear_sticky_cuda_error()
+        if leftover:
+            logger.warning(
+                "Consumed leftover CUDA error %d before creating storage sync "
+                "groups",
+                leftover,
+            )
 
         groups: List[torch.distributed.ProcessGroup] = []
         seen_rank_sets = set()

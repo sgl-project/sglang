@@ -125,20 +125,25 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
-def _clear_sticky_cuda_error() -> None:
-    """Consume the sticky CUDA error left by failed cudart calls.
+@lru_cache(maxsize=1)
+def _get_libcudart():
+    import ctypes
 
-    A failed cudaHostRegister leaves cudaErrorInvalidValue in the context's
-    last-error slot. torch wheels statically link cudart, so the error cannot
-    be cleared via ctypes; instead run an unrelated CUDA call so torch's error
-    check reads (and clears) it. Without this, the next torch CUDA op raises
-    the leftover error and looks like the failing party.
+    return ctypes.CDLL("libcudart.so")
+
+
+def _clear_sticky_cuda_error() -> int:
+    """Read and clear the CUDA last-error slot, returning the error code.
+
+    torch links libcudart dynamically, so a ctypes cudaGetLastError call
+    operates on the same slot as the failing cudart call. Only call this
+    when the pending error is provably the expected one (same thread, no
+    intervening CUDA work); otherwise it would mask an unrelated failure.
     """
     try:
-        torch.empty(1, device="cuda")
-        torch.cuda.synchronize()
+        return int(_get_libcudart().cudaGetLastError())
     except Exception:
-        pass
+        return 0
 
 
 # Lower bound for chunk shrinking when no copy granularity is provided; keeps
