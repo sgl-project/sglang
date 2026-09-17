@@ -1208,9 +1208,6 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
-    # Deferring costs an HBM round trip of [M*top_k, hidden], so it pays only
-    # at small M; 0 disables. Measured neutral at 192 on GLM-5.2 H=6144 TP8.
-    SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,

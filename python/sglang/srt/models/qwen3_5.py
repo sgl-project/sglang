@@ -48,6 +48,7 @@ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -169,10 +170,7 @@ def _disable_shared_experts_fusion() -> bool:
     # intent through the accessor's fallback.
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
-    return bool(
-        get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
-        or is_shared_experts_fusion_disabled()
-    )
+    return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
 
 
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
@@ -206,7 +204,7 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     return bool(
         not is_nextn
         and config.model_type == "qwen3_5_moe_text"
-        and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
+        and uses_cutedsl_ar_fusion()
     )
 
 

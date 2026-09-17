@@ -84,6 +84,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -95,7 +96,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    moe_deferred_finalize_serves,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -990,7 +990,6 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
-            and moe_deferred_finalize_serves(hidden_states.shape[0])
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
@@ -2287,7 +2286,7 @@ class DeepseekV2AttentionMLA(
 
 
 def _use_mnnvl_cutedsl_fusion() -> bool:
-    return _is_cuda and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
+    return _is_cuda and uses_cutedsl_ar_fusion()
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -2506,8 +2505,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        # Deferring implies fusing, and both are published by the one scoped()
+        # block below, so the deferral has to be decided before it.
+        may_defer_moe_finalize = self.layer_communicator.should_defer_moe_finalize(
+            forward_batch
+        )
         fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            may_defer_moe_finalize
+            or self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
@@ -2530,13 +2535,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
             _mlp_ctx = nullcontext()
-
-        # should_defer_moe_finalize() implies fuse_mlp_allreduce; the cheap flag
-        # short-circuits the eligibility walk on every ineligible layer.
-        may_defer_moe_finalize = (
-            fuse_mlp_allreduce
-            and self.layer_communicator.should_defer_moe_finalize(forward_batch)
-        )
 
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
@@ -2783,6 +2781,11 @@ class DeepseekV2Model(nn.Module):
                 isinstance(layer.mlp, DeepseekV2MoE)
                 and layer.mlp.experts.supports_deferred_finalize
                 and not layer.mlp._shared_expert_tp1
+            ),
+            # A TP1-replicated shared expert is added after the layer's own
+            # all-reduce, so that reduction cannot move to the next layer.
+            requires_local_reduction=lambda layer: (
+                isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp._shared_expert_tp1
             ),
             # The final norm takes a plain tensor, not a handoff.
             final_norm_consumes_handoff=False,

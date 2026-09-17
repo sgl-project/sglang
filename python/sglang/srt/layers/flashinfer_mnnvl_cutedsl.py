@@ -37,18 +37,31 @@ def _import_kernel_backend():
 _WARP_SIZE = 32
 _VEC_BF16 = 8
 
-# The HT kernel spends two warps plus the reduction warps on non-consumer roles.
-_HT_MAX_CONSUMER_THREADS = 1024 - 3 * _WARP_SIZE
+# The HT kernel spends two warps beside its reduction warps on non-consumer
+# roles: block_threads = consumer_threads + (2 + reduction_warps) * WARP_SIZE,
+# capped at the CUDA block limit. The two halves are coupled, so the consumer
+# budget is derived per candidate reduction-warp count rather than fixed.
+_CUDA_BLOCK_THREADS = 1024
+_HT_NON_REDUCTION_WARPS = 2
+_HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
+
+# The tp widths every CuTe DSL kernel accepts.
+SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 
 
-def _ht_shard_split(hidden_size: int) -> tuple[int, int] | None:
+def _ht_shard_split(
+    hidden_size: int, max_consumer_threads: int
+) -> tuple[int, int] | None:
     """``(consumer_threads, vectors_per_thread)`` for the HT persistent kernel.
 
     The kernel shards a token into consumer_threads * 8 * vectors_per_thread
     elements, and consumer_threads must divide its 16-byte vector count.
     """
     packs = hidden_size // _VEC_BF16
-    limit = min(_HT_MAX_CONSUMER_THREADS, packs // 2)
+    # packs // 2 forces vectors_per_thread >= 2. The kernel only requires it to
+    # be positive; the floor of 2 is inherited from the shipped GB300 presets
+    # and is not otherwise justified, so it is safe to relax if measured.
+    limit = min(max_consumer_threads, packs // 2)
     for consumer_threads in range(
         limit - limit % _WARP_SIZE, _WARP_SIZE - 1, -_WARP_SIZE
     ):
@@ -57,73 +70,115 @@ def _ht_shard_split(hidden_size: int) -> tuple[int, int] | None:
     return None
 
 
-def _ht_reduction_warps(hidden_size: int, tp_size: int, preferred: int) -> int | None:
-    """Reduction warps that evenly cover one rank's slice of a token.
+def _ht_reduction_warp_order(preferred: int) -> tuple[int, ...]:
+    """Legal reduction-warp counts, the preset's own value first, then the
+    nearest alternatives -- stepping down before stepping up, because every
+    extra reduction warp is taken out of the consumers' block budget."""
+    return tuple(
+        sorted(
+            _HT_REDUCTION_WARP_CHOICES,
+            key=lambda warps: (warps > preferred, abs(warps - preferred)),
+        )
+    )
 
-    The HT reduction shard is hidden / 8 / tp vectors wide and must divide across
-    reduction_warps * 32 threads. Only ever steps down from ``preferred``.
+
+def _ht_shard_major_is_legal(
+    consumer_threads: int, rms_token_groups: int, tp_size: int
+) -> bool:
+    """Shard-major RMS needs an integer number of reduction shards per RMS warp."""
+    rms_warps_per_token = (consumer_threads // rms_token_groups) // _WARP_SIZE
+    return (
+        rms_warps_per_token > 0
+        and tp_size >= rms_warps_per_token
+        and tp_size % rms_warps_per_token == 0
+    )
+
+
+def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
+    """``preset`` re-aimed at this shape, or None when no legal split exists.
+
+    Only the shape-dependent fields move; the preset's pipeline depth and RMS
+    schedule survive, except ``rms_shard_major``, which the kernel rejects
+    unless tp is a multiple of the RMS warps per token.
     """
-    packs_per_shard = (hidden_size // _VEC_BF16) // tp_size
-    for warps in (8, 4, 2, 1):
-        if warps <= preferred and packs_per_shard % (warps * _WARP_SIZE) == 0:
-            return warps
+    packs = hidden_size // _VEC_BF16
+    if packs % tp_size:
+        # Kernel: "hidden vector count must be divisible by tp".
+        return None
+    packs_per_shard = packs // tp_size
+    for reduction_warps in _ht_reduction_warp_order(preset.reduction_warps):
+        if packs_per_shard % (reduction_warps * _WARP_SIZE):
+            continue
+        split = _ht_shard_split(
+            hidden_size,
+            _CUDA_BLOCK_THREADS
+            - (_HT_NON_REDUCTION_WARPS + reduction_warps) * _WARP_SIZE,
+        )
+        if split is None:
+            continue
+        consumer_threads, vectors_per_thread = split
+        return replace(
+            preset,
+            consumer_threads=consumer_threads,
+            vectors_per_thread=vectors_per_thread,
+            reduction_warps=reduction_warps,
+            rms_shard_major=preset.rms_shard_major
+            and _ht_shard_major_is_legal(
+                consumer_threads, preset.rms_token_groups, tp_size
+            ),
+        )
     return None
 
 
-def _ht_tunings(hidden_size: int, tp_size: int):
-    """Re-target the GB300 HT presets at ``hidden_size``; None when unreachable."""
-    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
-        HTAllReduceTuning,
-        HTFinalizeTuning,
-    )
+def _routes(bounds, ll_target, bt_targets, ht_target):
+    """The M-range dispatch for one operation, HT dropped when unroutable.
 
-    split = _ht_shard_split(hidden_size)
-    if split is None:
-        return None
-    consumer_threads, vectors_per_thread = split
+    Without HT the widest BT range takes the unbounded slot, so the profile
+    still covers the whole workspace capacity instead of being rejected.
+    """
+    from flashinfer.comm.mnnvl_cutedsl import MRangeDispatch
 
-    finalize_warps = _ht_reduction_warps(
-        hidden_size, tp_size, HTFinalizeTuning().reduction_warps
-    )
-    all_reduce_warps = _ht_reduction_warps(
-        hidden_size, tp_size, HTAllReduceTuning().reduction_warps
-    )
-    if finalize_warps is None or all_reduce_warps is None:
-        return None
-
-    return (
-        HTFinalizeTuning(
-            consumer_threads=consumer_threads,
-            vectors_per_thread=vectors_per_thread,
-            reduction_warps=finalize_warps,
-        ),
-        HTAllReduceTuning(
-            consumer_threads=consumer_threads,
-            vectors_per_thread=vectors_per_thread,
-            reduction_warps=all_reduce_warps,
-        ),
+    if ht_target is not None:
+        return MRangeDispatch(
+            upper_bounds=bounds,
+            targets=(ll_target, *bt_targets, ht_target),
+        )
+    return MRangeDispatch(
+        upper_bounds=(*bounds[: len(bt_targets)], None),
+        targets=(ll_target, *bt_targets),
     )
 
 
 def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     """A single-profile routing config for a shape FlashInfer does not ship.
 
-    Reuses the shipped presets and their GB300 crossovers, recomputing only the
-    kernel-shape parameters; the crossovers were measured at H=8192 and are
-    approximate elsewhere. None when the hidden size admits no HT shard split.
+    Reuses the shipped GB300 presets and their crossovers, re-aiming only the
+    shape-dependent kernel parameters; the crossovers were measured at tp=8/16
+    hidden=8192 top_k=10 and are unmeasured elsewhere. A shape that admits no
+    legal HT split keeps the LL and BT routes and drops HT rather than losing
+    the whole profile.
     """
     from flashinfer.comm.mnnvl_cutedsl import (
         KernelTarget,
         MNNVLCuteDSLConfig,
-        MRangeDispatch,
         ProtocolKind,
         StaticProfile,
     )
     from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
         BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
         BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1,
+        BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
+        BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
         BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
         BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+        BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_0,
+        BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
+    )
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
+        HT_ALL_REDUCE_GB300_TP8_H8192,
+        HT_ALL_REDUCE_GB300_TP16_H8192,
+        HT_FINALIZE_GB300_TP8_H8192_K10,
+        HT_FINALIZE_GB300_TP16_H8192_K10,
     )
     from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
         LL_ALL_REDUCE_GB300_TP8_H8192,
@@ -132,28 +187,57 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
         LL_FINALIZE_GB300_TP16_H8192_K10,
     )
 
-    tunings = _ht_tunings(hidden_size, tp_size)
-    if tunings is None:
+    wide_tp = tp_size >= 16
+    # FlashInfer's measured GB300 crossovers; TP16 shifts LL's window down
+    # because each rank publishes a smaller slice.
+    if wide_tp:
+        finalize_bounds = (7, 52, 703, None)
+        all_reduce_bounds = (5, 512, 959, None)
+        ll_finalize = LL_FINALIZE_GB300_TP16_H8192_K10
+        ll_all_reduce = LL_ALL_REDUCE_GB300_TP16_H8192
+        bt_finalize = (
+            BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_0,
+            BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
+        )
+        bt_all_reduce = (
+            BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
+            BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
+        )
+        ht_finalize_preset = HT_FINALIZE_GB300_TP16_H8192_K10
+        ht_all_reduce_preset = HT_ALL_REDUCE_GB300_TP16_H8192
+    else:
+        finalize_bounds = (23, 48, 703, None)
+        all_reduce_bounds = (15, 256, 1024, None)
+        ll_finalize = LL_FINALIZE_GB300_TP8_H8192_K10
+        ll_all_reduce = LL_ALL_REDUCE_GB300_TP8_H8192
+        bt_finalize = (
+            BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
+            BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+        )
+        bt_all_reduce = (
+            BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
+            BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1,
+        )
+        ht_finalize_preset = HT_FINALIZE_GB300_TP8_H8192_K10
+        ht_all_reduce_preset = HT_ALL_REDUCE_GB300_TP8_H8192
+
+    ht_finalize = _ht_retarget(
+        ht_finalize_preset, hidden_size=hidden_size, tp_size=tp_size
+    )
+    ht_all_reduce = _ht_retarget(
+        ht_all_reduce_preset, hidden_size=hidden_size, tp_size=tp_size
+    )
+    if ht_finalize is None or ht_all_reduce is None:
+        # Both operations share the HT protocol state, so one unroutable
+        # operation retires HT for the profile.
+        ht_finalize = ht_all_reduce = None
         logger.warning(
             "MNNVL CuTe DSL: hidden_size=%d admits no HT shard split at "
-            "tp_size=%d; the fusion cannot serve this model.",
+            "tp_size=%d; serving this shape with the LL and BT routes only, "
+            "which costs throughput at large token counts.",
             hidden_size,
             tp_size,
         )
-        return None
-    ht_finalize, ht_all_reduce = tunings
-
-    wide_tp = tp_size >= 16
-    ll_finalize = (
-        LL_FINALIZE_GB300_TP16_H8192_K10 if wide_tp else LL_FINALIZE_GB300_TP8_H8192_K10
-    )
-    ll_all_reduce = (
-        LL_ALL_REDUCE_GB300_TP16_H8192 if wide_tp else LL_ALL_REDUCE_GB300_TP8_H8192
-    )
-    # FlashInfer's measured GB300 crossovers; TP16 shifts LL's window down
-    # because each rank publishes a smaller slice.
-    finalize_bounds = (7, 52, 703, None) if wide_tp else (23, 48, 703, None)
-    all_reduce_bounds = (5, 512, 959, None) if wide_tp else (15, 256, 1024, None)
 
     def target(protocol, preset):
         return KernelTarget(protocol=protocol, preset=preset)
@@ -163,23 +247,17 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
         hidden_size=hidden_size,
         top_k=top_k,
         dtype=torch.bfloat16,
-        finalize_routes=MRangeDispatch(
-            upper_bounds=finalize_bounds,
-            targets=(
-                target(ProtocolKind.LL, ll_finalize),
-                target(ProtocolKind.BT, BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0),
-                target(ProtocolKind.BT, BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1),
-                target(ProtocolKind.HT, ht_finalize),
-            ),
+        finalize_routes=_routes(
+            finalize_bounds,
+            target(ProtocolKind.LL, ll_finalize),
+            tuple(target(ProtocolKind.BT, preset) for preset in bt_finalize),
+            None if ht_finalize is None else target(ProtocolKind.HT, ht_finalize),
         ),
-        all_reduce_routes=MRangeDispatch(
-            upper_bounds=all_reduce_bounds,
-            targets=(
-                target(ProtocolKind.LL, ll_all_reduce),
-                target(ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0),
-                target(ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1),
-                target(ProtocolKind.HT, ht_all_reduce),
-            ),
+        all_reduce_routes=_routes(
+            all_reduce_bounds,
+            target(ProtocolKind.LL, ll_all_reduce),
+            tuple(target(ProtocolKind.BT, preset) for preset in bt_all_reduce),
+            None if ht_all_reduce is None else target(ProtocolKind.HT, ht_all_reduce),
         ),
     )
     return MNNVLCuteDSLConfig(profiles=(profile,))
@@ -201,7 +279,10 @@ def _config_for_shape(default_config, *, tp_size: int, hidden_size: int, top_k: 
             return default_config
     logger.info(
         "MNNVL CuTe DSL: no shipped profile for tp=%d hidden=%d top_k=%d; "
-        "re-targeting the GB300 presets at this shape.",
+        "re-targeting the GB300 presets at this shape. Their M crossovers were "
+        "measured at tp=8/16 hidden=8192 top_k=10, so benchmark against "
+        "--flashinfer-allreduce-fusion-backend mnnvl before deploying a shape "
+        "that matters.",
         tp_size,
         hidden_size,
         top_k,
@@ -264,6 +345,14 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.rms_epsilon = float(rms_epsilon)
         self.weight_bias = float(weight_bias)
         self.process_group = process_group
+        # Fixed for the workspace's lifetime; supports() is on the per-layer
+        # eligibility path and must not re-enter c10d to learn it.
+        self.tp_size = dist.get_world_size(process_group)
+        if self.tp_size not in SUPPORTED_TP_SIZES:
+            raise ValueError(
+                f"MNNVL CuTe DSL fusion supports tp_size in {SUPPORTED_TP_SIZES}, "
+                f"got {self.tp_size}"
+            )
         self.device = torch.device(device)
 
         with torch.cuda.device(self.device):
@@ -292,19 +381,12 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self._patterns,
                 default_config,
             ) = _import_kernel_backend()
-            tp_size = dist.get_world_size(process_group)
             shaped_config = _config_for_shape(
                 default_config,
-                tp_size=tp_size,
+                tp_size=self.tp_size,
                 hidden_size=self.hidden_size,
                 top_k=self.top_k,
             )
-            if shaped_config is None:
-                raise RuntimeError(
-                    "MNNVL CuTe DSL fusion has no kernel routing profile for "
-                    f"tp_size={tp_size} hidden_size={self.hidden_size} "
-                    f"top_k={self.top_k}"
-                )
             # Only fused finalize launches have a completed shared-expert handoff;
             # standalone AllReduce kernels retain the safe load ordering.
 
@@ -320,7 +402,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 )
                 self.workspace_config = shaped_config
             self.workspace = workspace_type(
-                tp_size=tp_size,
+                tp_size=self.tp_size,
                 tp_rank=dist.get_rank(process_group),
                 max_token_num=self.max_m,
                 hidden_dim=self.hidden_size,
@@ -345,7 +427,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         if not 1 <= int(m) <= self.max_m:
             return False
         return self.workspace.is_buffer_size_sufficient(
-            tp_size=dist.get_world_size(self.process_group),
+            tp_size=self.tp_size,
             num_tokens=int(m),
             hidden_dim=self.hidden_size,
             dtype=torch.bfloat16,
@@ -429,17 +511,19 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
-
-    from sglang.srt.distributed.parallel_state import get_tp_group
-
+    # Checked before CUDA: a workspace already existing is a statement about
+    # process state, and reporting "requires CUDA" for it would misdirect.
     global _WORKSPACE
     if _WORKSPACE is not None:
         raise RuntimeError(
             "a second MNNVL CuTe DSL fusion workspace was requested; each one "
             "rendezvouses its own NVLS region, and a process serves one model"
         )
+    if not torch.cuda.is_available():
+        raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
+
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "creating an MNNVL CuTe DSL fusion workspace during CUDA Graph "

@@ -5,11 +5,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
+    SUPPORTED_TP_SIZES,
     FlashInferMNNVLCuteDSLARFusion,
+    _config_for_shape,
+    _ht_retarget,
+    _retargeted_config,
     _with_early_finalize_shared_load,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionLayerCommunicator,
     MoeFinalizeHandoff,
@@ -304,7 +309,7 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
     comm = _eligible_communicator(successor=True)
     comm.fusion_service = SimpleNamespace(supports=lambda m: True)
     comm._context = SimpleNamespace(tp_size=4, attn_dp_size=1)
-    comm.layer_scatter_modes = SimpleNamespace(mlp_mode=None)
+    comm.layer_scatter_modes = SimpleNamespace(mlp_mode=ScatterMode.FULL)
     forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
     def parallel(*, ep, moe_tp):
@@ -340,6 +345,79 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
             return_value=parallel(ep=1, moe_tp=4),
         ):
             assert comm._common_eligible(forward_batch, 8) is True
+
+
+def test_a_replicated_shared_expert_producer_keeps_its_own_all_reduce():
+    """A TP1 shared expert is added after the layer's own reduction, so handing
+    that reduction to the next layer would scale the shared output by tp_size."""
+    producer = _eligible_communicator(successor=True)
+    producer.owes_local_reduction = True
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8)
+    )
+
+    with (
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator,
+            "should_defer_moe_finalize",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.fused_norm_gamma",
+            return_value=torch.empty(8),
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_exec",
+            return_value=SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+        patch.object(
+            LayerCommunicator,
+            "should_fuse_mlp_allreduce_with_next_layer",
+            return_value=False,
+        ),
+    ):
+        # The publisher of fuse_mlp_allreduce, which is what skips the reduction.
+        assert (
+            producer.should_fuse_mlp_allreduce_with_next_layer(forward_batch) is False
+        )
+        assert producer._can_absorb_post_moe_all_reduce(forward_batch, 8) is False
+        # Consuming what a predecessor skipped stays independently eligible.
+        assert producer._can_consume_post_moe_all_reduce(forward_batch, 8) is True
+
+
+def test_install_records_which_producers_owe_a_local_reduction():
+    """install_cutedsl_fusion must carry the model's predicate onto the layer,
+    or a replicated shared expert silently keeps the unsafe fusion."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+
+    def _communicator():
+        comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+        # install_cutedsl_fusion() reads both norms to check the workspace epsilon.
+        comm.input_layernorm = RMSNorm(8, eps=1e-6)
+        comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+        return comm
+
+    layers = [
+        SimpleNamespace(layer_communicator=_communicator(), replicated=replicated)
+        for replicated in (True, False)
+    ]
+    install_cutedsl_fusion(
+        layers,
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: not layer.replicated,
+        requires_local_reduction=lambda layer: layer.replicated,
+        label="test",
+    )
+
+    assert layers[0].layer_communicator.owes_local_reduction is True
+    assert layers[1].layer_communicator.owes_local_reduction is False
 
 
 def _call_dual_stream_op(fusion, hidden_states, *, fuse_mlp_allreduce=True):
@@ -411,6 +489,270 @@ def test_dual_stream_op_still_republishes_its_operand_flags():
 
     assert seen["fuse"] is True
     assert seen["scatter"] is False
+
+
+# ---------------------------------------------------------------------------
+# Kernel-shape re-targeting
+# ---------------------------------------------------------------------------
+
+
+def _ht_target(routes):
+    from flashinfer.comm.mnnvl_cutedsl import ProtocolKind
+
+    targets = [t for t in routes.targets if t.protocol is ProtocolKind.HT]
+    return targets[0].preset if targets else None
+
+
+# (label, hidden_size, top_k, tp_size, HT routable). Shapes are read from the
+# checkpoint configs: Qwen3.8-2.4T-A95B is H=8192/K=10, the shape FlashInfer
+# ships a profile for, so those rows never reach the re-target; DeepSeek-V3-0324
+# is H=7168 and GLM-5.3 is H=6144, which do. A False row is a shape whose
+# vectors per reduction shard are not a warp multiple at that width -- see the
+# kernel's "the reduction shard must divide evenly across threads".
+_SHAPES = [
+    ("Qwen3.8", 8192, 10, 8, True),
+    ("Qwen3.8", 8192, 10, 16, True),
+    ("DeepSeek-V3", 7168, 8, 4, True),
+    ("DeepSeek-V3", 7168, 8, 8, False),
+    ("DeepSeek-V3", 7168, 8, 16, False),
+    ("GLM-5.3", 6144, 8, 4, True),
+    ("GLM-5.3", 6144, 8, 8, True),
+    ("GLM-5.3", 6144, 8, 16, False),
+]
+
+
+@pytest.mark.parametrize(
+    ("model", "hidden_size", "top_k", "tp_size", "ht_routable"), _SHAPES
+)
+def test_every_served_shape_builds_a_capacity_covering_profile(
+    model, hidden_size, top_k, tp_size, ht_routable
+):
+    """A shape whose HT protocol is unroutable must fall back to the LL and BT
+    routes, not lose the profile: returning None here aborted the server at
+    pre-capture for DeepSeek-V3 at TP8/TP16 and GLM-5.3 at TP16."""
+    config = _retargeted_config(tp_size, hidden_size, top_k)
+    profile = config.profiles[0]
+
+    # Raises when a route does not cover the requested workspace capacity.
+    profile.validate_capacity(4096)
+    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+        assert (_ht_target(routes) is not None) is ht_routable
+        assert routes.is_unbounded
+
+
+@pytest.mark.parametrize(
+    ("model", "hidden_size", "top_k", "tp_size", "ht_routable"), _SHAPES
+)
+def test_ht_tunings_satisfy_the_kernel_constraint_expressions(
+    model, hidden_size, top_k, tp_size, ht_routable
+):
+    """Pins the derivation against the device kernel's own validation, which is
+    the only thing standing between a wrong split and a compile-time abort on a
+    Blackwell node."""
+    if not ht_routable:
+        pytest.skip("HT is retired for this shape")
+    profile = _retargeted_config(tp_size, hidden_size, top_k).profiles[0]
+    preset = _ht_target(profile.finalize_routes)
+    packs = hidden_size // 8
+
+    # block_threads = consumer_threads + (2 + reduction_warps) * WARP_SIZE <= 1024
+    assert preset.consumer_threads + (2 + preset.reduction_warps) * 32 <= 1024
+    assert preset.consumer_threads % 32 == 0
+    assert preset.reduction_warps in (1, 2, 4, 8)
+    # hidden % (consumer_threads * VEC_BF16 * vectors_per_thread) == 0
+    assert hidden_size % (preset.consumer_threads * 8 * preset.vectors_per_thread) == 0
+    # packs_per_token must divide across tp, the consumers, and the RMS copy threads
+    assert packs % tp_size == 0
+    assert packs % preset.consumer_threads == 0
+    assert packs % (preset.consumer_threads // preset.rms_token_groups) == 0
+    # the reduction shard must divide evenly across reduction threads
+    assert (packs // tp_size) % (preset.reduction_warps * 32) == 0
+    if preset.rms_shard_major:
+        rms_warps_per_token = (preset.consumer_threads // preset.rms_token_groups) // 32
+        assert tp_size % rms_warps_per_token == 0 and tp_size >= rms_warps_per_token
+    if preset.rms_pipeline_stages > 1:
+        assert preset.rms_token_groups * preset.rms_pipeline_stages <= preset.stages
+
+
+def test_retargeting_keeps_the_shipped_preset_schedule():
+    """Only the shape-dependent fields move. Rebuilding from the dataclass
+    defaults instead silently dropped the TP16 preset's deeper pipeline."""
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import HT_FINALIZE_GB300_TP16_H8192_K10
+
+    retargeted = _ht_retarget(
+        HT_FINALIZE_GB300_TP16_H8192_K10, hidden_size=8192, tp_size=16
+    )
+
+    assert retargeted == HT_FINALIZE_GB300_TP16_H8192_K10
+
+
+def test_shard_major_is_dropped_when_tp_cannot_cover_the_rms_warps():
+    """Carrying rms_shard_major onto a shape whose RMS warps do not divide tp
+    makes the kernel raise; the re-target must downgrade it instead."""
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import HT_FINALIZE_GB300_TP16_H8192_K10
+
+    assert HT_FINALIZE_GB300_TP16_H8192_K10.rms_shard_major is True
+    # H=6144 splits into 384 consumer threads -> 6 RMS warps per token, and
+    # 8 % 6 != 0.
+    retargeted = _ht_retarget(
+        HT_FINALIZE_GB300_TP16_H8192_K10, hidden_size=6144, tp_size=8
+    )
+
+    assert retargeted.consumer_threads == 384
+    assert retargeted.rms_shard_major is False
+
+
+def test_a_shipped_shape_is_served_by_the_shipped_config():
+    """The re-target is for shapes FlashInfer does not ship; Qwen3.5's own
+    GB300 profile must reach the kernel untouched."""
+    from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+
+    assert (
+        _config_for_shape(DEFAULT_CONFIG, tp_size=8, hidden_size=8192, top_k=10)
+        is DEFAULT_CONFIG
+    )
+    assert (
+        _config_for_shape(DEFAULT_CONFIG, tp_size=8, hidden_size=7168, top_k=8)
+        is not DEFAULT_CONFIG
+    )
+
+
+def test_unsupported_tp_width_is_refused_with_the_legal_set():
+    """TP32 builds a plausible-looking profile and only fails deep inside CuTe
+    with "tp must be 2, 4, 8, or 16"; sglang must refuse it by name."""
+    assert 32 not in SUPPORTED_TP_SIZES
+    with patch(
+        "sglang.srt.layers.flashinfer_mnnvl_cutedsl.dist.get_world_size",
+        return_value=32,
+    ):
+        with pytest.raises(ValueError, match="tp_size"):
+            FlashInferMNNVLCuteDSLARFusion(
+                hidden_size=8192,
+                top_k=10,
+                max_m=128,
+                rms_epsilon=1e-6,
+                weight_bias=0.0,
+                process_group=object(),
+                device=torch.device("cuda", 0),
+            )
+
+
+def test_a_draft_model_build_installs_no_fusion():
+    """A draft is built in the target's process and each workspace rendezvouses
+    its own NVLS region, so a second install would raise at prepare time. An
+    EAGLE draft subclassing DeepseekV2Model reaches install_cutedsl_fusion with
+    is_nextn False, so the guard has to be the draft scope, not a per-model
+    attribute."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
+
+    def _layer():
+        comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+        comm.input_layernorm = RMSNorm(8, eps=1e-6)
+        comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+        return SimpleNamespace(layer_communicator=comm)
+
+    kwargs = dict(
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: True,
+        label="test",
+    )
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+    assert install_cutedsl_fusion([_layer(), _layer()], **kwargs) is not None
+    with draft_model_build_scope():
+        assert install_cutedsl_fusion([_layer(), _layer()], **kwargs) is None
+
+
+def test_a_per_layer_epsilon_is_refused_at_install():
+    """One workspace is compiled for one epsilon. A family whose norms disagree
+    would be normalized with the wrong one and never raise inside the kernel,
+    which only checks the value the service itself passes."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+
+    comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+    comm.input_layernorm = RMSNorm(8, eps=1e-6)
+    comm.post_attention_layernorm = RMSNorm(8, eps=1e-5)  # disagrees
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+    with pytest.raises(RuntimeError, match="rms_epsilon"):
+        install_cutedsl_fusion(
+            [SimpleNamespace(layer_communicator=comm)],
+            hidden_size=8,
+            top_k=2,
+            rms_epsilon=1e-6,
+            can_defer_finalize=lambda layer: True,
+            label="test",
+        )
+
+
+def test_a_model_without_the_communicator_is_refused_not_silently_unfused():
+    """Selecting cutedsl stands the legacy workspace down, so a model that
+    installed no communicator would serve with every allreduce fusion off."""
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+
+    # BaseRunner is abstract; call the method unbound with a duck-typed self.
+    check = BaseRunner._assert_model_installs_cutedsl_fusion
+    unfused = SimpleNamespace(model_runner=SimpleNamespace(model=torch.nn.Linear(2, 2)))
+
+    with pytest.raises(ValueError, match="no CuTe DSL fusion communicator"):
+        check(unfused)
+
+    layer = torch.nn.Linear(2, 2)
+    layer.layer_communicator = CuteDSLFusionLayerCommunicator.__new__(
+        CuteDSLFusionLayerCommunicator
+    )
+    fused = SimpleNamespace(
+        model_runner=SimpleNamespace(model=torch.nn.Sequential(layer))
+    )
+
+    check(fused)
+
+
+def test_a_second_workspace_in_one_process_is_refused():
+    """Each workspace rendezvouses its own NVLS region and a process serves one
+    model, so the second request must raise rather than allocate."""
+    import sglang.srt.layers.flashinfer_mnnvl_cutedsl as mod
+
+    saved = mod._WORKSPACE
+    try:
+        mod._WORKSPACE = object()
+        with pytest.raises(RuntimeError, match="second MNNVL CuTe DSL"):
+            mod.get_flashinfer_mnnvl_cutedsl_ar_fusion(
+                hidden_size=8192, top_k=10, max_m=8, rms_epsilon=1e-6, weight_bias=0.0
+            )
+    finally:
+        mod._WORKSPACE = saved
+
+
+def test_the_handoff_constructs_inside_a_dynamo_traced_region():
+    """Both producers build a handoff inside a fullgraph=True region -- qwen2_moe's
+    MoE forward, and DeepSeek's capture-mode dual stream under tc_piecewise --
+    and Dynamo cannot construct a msgspec.Struct. Migrating this container to
+    the repo's preferred one is a capture-time server failure, not a graph
+    break, so the container choice is pinned here rather than by comment.
+
+    Constructs the dataclass directly: routing through from_flashinfer() would
+    trace a stand-in producer object instead, and fail for its own reasons.
+    """
+
+    def build(x):
+        return MoeFinalizeHandoff(
+            routed_output=x,
+            expert_weights=x,
+            permuted_indices=x,
+            gated_shared_output=x,
+            m=2,
+        )
+
+    handoff = torch.compile(build, fullgraph=True, backend="eager")(torch.zeros(4, 8))
+
+    assert handoff.m == 2
+    assert tuple(handoff.routed_output.shape) == (4, 8)
 
 
 if __name__ == "__main__":

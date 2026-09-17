@@ -1489,13 +1489,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
-            gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            result = FlashInferTrtllmDeferredFinalizeOutput(
-                gemm2_out=gemm2_out,
-                expert_weights=expert_weights,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                top_k=topk_config.top_k,
-            )
+            result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:
             result = result[0]
 
