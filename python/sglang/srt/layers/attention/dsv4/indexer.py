@@ -32,16 +32,16 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import (
-    aiter_can_use_preshuffle_paged_mqa,
-    mqa_logits_row_bytes,
-    mqa_logits_rows_per_chunk,
-)
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
     iter_row_chunks,
+)
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_row_bytes,
+    mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode

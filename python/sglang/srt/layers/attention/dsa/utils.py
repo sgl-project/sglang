@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -16,18 +16,9 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
-    get_schedule,
     process_model_config,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_device_module,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-    is_xpu,
-)
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.common import ceil_div
 
 
@@ -259,64 +250,3 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
-
-
-MQA_LOGITS_BYTES_PER_ELEM = 4
-MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
-MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
-# aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
-MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
-# DeepGEMM pads the logits row stride to 1024 bytes, i.e. 256 fp32 columns.
-MQA_LOGITS_ROW_ALIGN_ELEMS = 256
-
-
-def mqa_logits_free_mem_fraction() -> float:
-    return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
-
-
-def mqa_logits_needs_budget_check(*, num_rows: int, num_cols: int) -> bool:
-    return num_rows * num_cols >= MQA_LOGITS_STATIC_SKIP_ELEMS
-
-
-def mqa_logits_row_bytes(num_cols: int) -> int:
-    aligned_cols = (
-        ceil_div(num_cols, MQA_LOGITS_ROW_ALIGN_ELEMS) * MQA_LOGITS_ROW_ALIGN_ELEMS
-    )
-    return aligned_cols * MQA_LOGITS_BYTES_PER_ELEM
-
-
-def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
-    """Budget from configuration alone (no device query); safe during graph capture."""
-    total_mem = get_device_module().get_device_properties(device_index).total_memory
-    total_mem_budget = int(total_mem * MQA_LOGITS_TOTAL_MEM_FRACTION)
-    mem_fraction_static = get_schedule().mem_fraction_static
-    if mem_fraction_static is None:
-        budget = total_mem_budget
-    else:
-        static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
-        budget = min(
-            int(static_free_mem * mqa_logits_free_mem_fraction()), total_mem_budget
-        )
-    return max(1, budget)
-
-
-def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
-    """Static budget capped by current free memory; mem_get_info syncs, so
-    callers pass allow_sync=False under CUDA graph capture."""
-    budget = mqa_logits_static_budget_bytes(device_index=device_index)
-    if allow_sync and not is_xpu():
-        free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
-    if is_hip():
-        budget = min(budget, MQA_LOGITS_MAX_BYTES_ROCM)
-    return max(1, budget)
-
-
-def mqa_logits_rows_per_chunk(
-    *, num_rows: int, row_bytes: int, budget_bytes: int
-) -> Optional[int]:
-    """Query rows per chunk so one logits chunk fits the budget; None if all rows fit."""
-    if num_rows * row_bytes <= budget_bytes:
-        return None
-    rows = max(budget_bytes // max(row_bytes, 1), 1)
-    return int(rows) if rows < num_rows else None

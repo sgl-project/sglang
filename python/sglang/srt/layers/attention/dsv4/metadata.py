@@ -8,11 +8,12 @@ from typing import Any, Iterator, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import (
+from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
     mqa_logits_needs_budget_check,
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    mqa_logits_should_chunk,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -84,10 +85,20 @@ def plan_indexer_row_chunks(
     if sm120_row_cap is not None and num_rows > sm120_row_cap:
         rows_per_chunk = sm120_row_cap
     if budget_bytes is not None:
-        by_budget = mqa_logits_rows_per_chunk(
+        need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
-            row_bytes=mqa_logits_row_bytes(num_cols),
+            num_cols=num_cols,
             budget_bytes=budget_bytes,
+            rocm=is_hip(),
+        )
+        by_budget = (
+            mqa_logits_rows_per_chunk(
+                num_rows=num_rows,
+                row_bytes=mqa_logits_row_bytes(num_cols),
+                budget_bytes=budget_bytes,
+            )
+            if need_chunk
+            else None
         )
         if by_budget is not None:
             rows_per_chunk = (

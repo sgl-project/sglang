@@ -27,19 +27,22 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    is_dsa_enable_prefill_cp,
+    is_graph_dsa_split_op_surface,
+)
+from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
-    aiter_can_use_preshuffle_paged_mqa,
-    is_dsa_enable_prefill_cp,
-    is_graph_dsa_split_op_surface,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
     mqa_logits_needs_budget_check,
+    mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
-from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -1014,21 +1017,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM,
-        and on ROCm to stay under aiter's 2 GiB logits limit
-        Return: (need_chunk, logits_budget_bytes)
-        """
+        """(need_chunk, logits_budget_bytes) for a [num_q, num_k] fp32 logits matrix."""
         if not mqa_logits_needs_budget_check(num_rows=num_q, num_cols=num_k):
             return False, 0
-
-        logits_bytes = num_q * num_k * MQA_LOGITS_BYTES_PER_ELEM
-        logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
-        if _is_hip:
-            logits_budget_bytes = min(logits_budget_bytes, MQA_LOGITS_MAX_BYTES_ROCM)
-
-        need_chunk = logits_bytes > logits_budget_bytes
-        return need_chunk, logits_budget_bytes
+        return mqa_logits_should_chunk(
+            num_rows=num_q,
+            num_cols=num_k,
+            budget_bytes=self._get_mqa_logits_budget_bytes(device_index),
+            rocm=_is_hip,
+        )
 
     def _get_topk_ragged(
         self,
