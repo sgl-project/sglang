@@ -10,7 +10,11 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -56,18 +60,28 @@ class TestHiRadixPrefetchAttribution(unittest.TestCase):
         for matched in (0, 128, 512):
             with self.subTest(matched=matched):
                 cache = self.make_completed_prefetch(matched)
-                self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (512, 256))
-                self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (0, None))
+                self.assertEqual(
+                    cache.pop_prefetch_loaded_span(CacheRequestHandle("prefetch", 0)),
+                    (512, 256),
+                )
+                self.assertEqual(
+                    cache.pop_prefetch_loaded_span(CacheRequestHandle("prefetch", 0)),
+                    (0, None),
+                )
 
     def test_legacy_pop_cleans_up_span(self):
         cache = self.make_completed_prefetch()
-        self.assertEqual(cache.pop_prefetch_loaded_tokens("prefetch"), 512)
+        self.assertEqual(
+            cache.pop_prefetch_loaded_tokens(CacheRequestHandle("prefetch", 0)), 512
+        )
         self.assertEqual(cache.prefetch_loaded_start_by_reqid, {})
 
     def test_abort_cleans_up_span(self):
         cache = self.make_completed_prefetch()
-        cache.release_aborted_request("prefetch")
-        self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (0, None))
+        cache.release_aborted_request(CacheRequestHandle("prefetch", 0))
+        self.assertEqual(
+            cache.pop_prefetch_loaded_span(CacheRequestHandle("prefetch", 0)), (0, None)
+        )
 
 
 class TestHiRadixCacheKVEvents(CustomTestCase):

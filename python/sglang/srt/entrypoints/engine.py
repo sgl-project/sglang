@@ -329,7 +329,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
@@ -1732,7 +1732,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.6.post1",
+                "0.4.7",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
