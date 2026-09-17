@@ -304,6 +304,18 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # --ple-offload-backend file: where the sparse, file-backed PLE table lives
+    # (deterministic name, reused across restarts), whether prefill-sized
+    # gathers hint the page cache first, and an escape hatch for the device
+    # attribute check (pageable host memory reachable through host page tables).
+    SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # Faulting rows in maps whole page-cache folios, so the mapping creeps
+    # towards full residency (~45 KB/token) and eats the free memory that
+    # sizes the KV pool. Cap its resident set; 0 disables the trim.
+    SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
+    SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -590,6 +602,10 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Charge the chunked-prefill compute budget in tokens, not page-ceiled
+    # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
+    # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
+    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -967,6 +983,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
+    # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
+    SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
@@ -1304,6 +1323,10 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (non-overlap schedule, no DP attention).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1348,6 +1371,8 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Currently supported by the Kimi-K2.5 image processor only.
+    SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
@@ -1456,9 +1481,27 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
+    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # unified_kv only: split the pool into an fp8 nope pool plus a parallel
+    # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
+    # dtype, so --kv-cache-dtype has no effect there and this switch is the
+    # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
+    # picks the buffer dtype and this switch is inert.
+    SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1564,6 +1607,8 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

@@ -51,6 +51,22 @@ namespace sglang {
 
 namespace host::runtime {
 
+inline void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
+  void* ptr = tensor.data_ptr();
+  const auto tensor_device_type = tensor.device().device_type;
+  if (tensor_device_type != kDLCPU && tensor_device_type != kDLGPUHost) {
+    return ptr;
+  }
+
+  void* device_ptr = nullptr;
+#ifdef USE_ROCM
+  RuntimeDeviceCheck(::hipHostGetDevicePointer(&device_ptr, ptr, 0));
+#else
+  RuntimeDeviceCheck(::cudaHostGetDevicePointer(&device_ptr, ptr, 0));
+#endif
+  return device_ptr;
+}
+
 namespace details {
 
 template <typename T, T kDefault>
