@@ -40,9 +40,14 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    build_replay_fb_view,
+)
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -62,7 +67,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    compute_local_num_token_non_padded_cpu,
+    enable_num_token_non_padded,
+)
 
 
 @contextmanager
@@ -109,6 +119,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
+        # DFLASH verify under dp attention replays through the generic DP
+        # graph machinery: the scheduler-level DP vote keeps all DP ranks on
+        # the same graph/eager decision, and load_batch pads every rank to
+        # the same global max bucket so the captured dp-gather geometry stays
+        # valid when per-rank batch sizes diverge.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
@@ -133,6 +148,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            # TARGET_VERIFY must use a Python list: graph.update can only
+            # rebind the Host-side IntArray when captured as a list.
             "TARGET_VERIFY": [],
         }
 
@@ -215,6 +232,46 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
+            # NPU skips the DFLASH verify pre-planning, so load_batch may
+            # never have recorded the padded batch shapes; recompute them on
+            # every batch (the verify batch size varies with concurrency).
+            raw_bs = forward_batch.batch_size
+            if self.require_mlp_tp_gather:
+                bs = self._pad_to_bucket(
+                    self._max_dp_batch_size(forward_batch), self.capture_bs
+                )
+            else:
+                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_bs * self.captured_req_width
+            self.bs = bs
+            # Restore the DeepEP dispatch mode recorded at capture time
+            # (mirrors load_batch); an interleaved eager extend may have
+            # switched it.
+            self.deepep_adapter.replay()
+            # Refresh the static DP token buffers bound by the captured
+            # graph (stale values misalign dp-gather segments across ranks);
+            # mirror the capture-side uniform [padded_num_tokens] * dp_size.
+            if self.require_mlp_tp_gather:
+                _padded_num_tokens = bs * self.captured_req_width
+                self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
+                self.buffers.global_num_tokens_for_logprob_gpu.fill_(_padded_num_tokens)
+            if (
+                enable_num_token_non_padded()
+                and self.require_gathered_buffer
+                and not self.enable_prefill_cp
+            ):
+                self.buffers.num_token_non_padded.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=(
+                            forward_batch.global_num_token_non_padded_cpu
+                        ),
+                        num_tokens_per_dp=bs * self.captured_req_width,
+                        sharded=self.model_runner.attn_tp_sequence_sharded(
+                            bs * self.captured_req_width
+                        ),
+                    )
+                )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -233,6 +290,42 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+            # The pre-planned path skipped init_forward_metadata_out_graph;
+            # refresh attention metadata so replay reads correct KV pages.
+            self.buffers.seq_lens[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.req_pool_indices[: self.raw_bs].copy_(
+                forward_batch.req_pool_indices[: self.raw_bs]
+            )
+            self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
+            # Refresh the static out_cache_loc bound by the captured graph
+            # for full-pool KV writes in save_kv_cache (replay would
+            # otherwise write verify KV to stale capture-time slots).
+            if forward_batch.out_cache_loc is not None:
+                _padded_num_token = self.bs * self.captured_req_width
+                _n = min(self.raw_num_token, forward_batch.out_cache_loc.shape[0])
+                self.buffers.out_cache_loc[:_n].copy_(forward_batch.out_cache_loc[:_n])
+                self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=self.buffers,
+                bs=self.bs,
+                raw_bs=self.raw_bs,
+                num_tokens=self.bs * self.captured_req_width,
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+
         graph_key = self._make_graph_key(self.bs)
 
         if not (
@@ -240,8 +333,23 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                _attn = self._replay_attn_backend()
+                _meta = getattr(_attn, "forward_metadata", None)
+                _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                if _meta_list is not None:
+                    # graph.update must carry the exact KV length already
+                    # computed in forward_metadata.seq_lens_cpu_list (it
+                    # already includes the draft block for DFlash); do not
+                    # recompute and double-add here.
+                    seq_lens = list(_meta_list)
+                else:
+                    # Wrapper backends (e.g. hybrid linear attention) keep
+                    # forward_metadata only on their children, so it stays
+                    # None here; fall back to the pre-DFlash computation.
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + self.captured_req_width
+                    )
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs

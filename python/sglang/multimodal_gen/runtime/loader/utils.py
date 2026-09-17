@@ -19,6 +19,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 from torch.nn.utils import parametrize
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
@@ -690,6 +693,8 @@ def component_residency_bytes(module) -> Dict[str, int]:
     for tensor in module.parameters():
         add(tensor)
     for tensor in module.buffers():
+        add(tensor)
+    for tensor in (weight_snapshot(module) or {}).values():
         add(tensor)
     for manager in getattr(module, "layerwise_offload_managers", None) or []:
         iter_cpu_weights = getattr(manager, "iter_cpu_weights", None)

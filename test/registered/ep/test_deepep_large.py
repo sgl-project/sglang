@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -13,6 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=569, stage="extra-b", runner_config="8-gpu-h200")
@@ -63,7 +63,7 @@ class TestDeepseek(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -132,7 +132,7 @@ class TestDeepseekMTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -190,7 +190,7 @@ class TestDeepseekV32TBO(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_a_gsm8k(
         self,
