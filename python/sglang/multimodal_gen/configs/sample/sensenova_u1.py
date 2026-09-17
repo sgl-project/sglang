@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from PIL import Image
+
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -16,6 +18,9 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
+    smart_resize,
 )
 
 _PUBLIC_OVERRIDE_FIELDS = {
@@ -76,6 +81,36 @@ class SenseNovaU1SamplingParams(SamplingParams):
         if isinstance(self.cfg_interval, list):
             self.cfg_interval = tuple(float(x) for x in self.cfg_interval)
         super().__post_init__()
+
+    def _adjust(self, server_args) -> None:
+        super()._adjust(server_args)
+        if self.image_path is None:
+            return
+        explicit_fields = set(getattr(self, "_explicit_fields", ()))
+        if explicit_fields.intersection({"width", "height"}):
+            return
+
+        if isinstance(self.image_path, list):
+            if not self.image_path:
+                return
+            image_path = self.image_path[0]
+        else:
+            image_path = self.image_path
+
+        try:
+            image = Image.open(image_path)
+        except (OSError, TypeError, ValueError):
+            return
+        with image:
+            target_pixels = int(self.width) * int(self.height)
+            resized_height, resized_width = smart_resize(
+                height=image.height,
+                width=image.width,
+                factor=RESOLUTION_ALIGNMENT,
+                min_pixels=target_pixels,
+                max_pixels=target_pixels,
+            )
+            self.width, self.height = resized_width, resized_height
 
     def _validate(self) -> None:
         super()._validate()
