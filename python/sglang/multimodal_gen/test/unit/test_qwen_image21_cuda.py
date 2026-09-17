@@ -8,6 +8,7 @@ import torch
 from diffusers.models.normalization import RMSNorm as ReferenceRMSNorm
 from safetensors.torch import save_file
 
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
     QwenImage21DitConfig,
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits import qwen_image21 as model_module
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Transformer2DModel,
     build_layout,
@@ -177,3 +179,73 @@ def test_graph_replay_uses_new_request_prefix(model, edit):
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
     finally:
         runner.reset()
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_bf16_fusions_match_eager_prefill_and_cached_steps(model, edit, monkeypatch):
+    actual_model = deepcopy(model).bfloat16()
+    kwargs = inputs(5, edit)
+    for key in (
+        "hidden_states",
+        "encoder_hidden_states",
+        "condition_latents",
+        "timestep",
+    ):
+        if kwargs[key] is not None:
+            kwargs[key] = kwargs[key].bfloat16()
+    reference_kwargs = deepcopy(kwargs)
+    expected = []
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    with monkeypatch.context() as reference, set_forward_context(None, None):
+        reference.setattr(model_module, "_SILU_MUL_FUSION", disabled)
+        reference.setattr(
+            model_module,
+            "residual_gate_add",
+            lambda residual, update, gate: residual + gate * update,
+        )
+        for timestep in (700, 300, 10):
+            reference_kwargs["timestep"].fill_(timestep)
+            expected.append(actual_model(**reference_kwargs))
+
+    gate = BitExactFusionGate("test SiLU-mul")
+    monkeypatch.setattr(model_module, "_SILU_MUL_FUSION", gate)
+    with set_forward_context(None, None):
+        for timestep, output in zip((700, 300, 10), expected, strict=True):
+            kwargs["timestep"].fill_(timestep)
+            torch.testing.assert_close(actual_model(**kwargs), output, atol=0, rtol=0)
+    assert gate.verified and not gate.disabled
+    for actual, reference in zip(
+        kwargs["prefix_caches"][0], reference_kwargs["prefix_caches"][0], strict=True
+    ):
+        for key in ("key", "value"):
+            torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+
+    runner = DiffusionBreakableCudaGraphRunner(actual_model, torch.device("cuda"))
+    try:
+        with set_forward_context(None, None):
+            assert runner.capture(**kwargs)
+            kwargs["hidden_states"].add_(0.1)
+            expected = actual_model(**kwargs)
+            torch.testing.assert_close(runner(**kwargs), expected, atol=0, rtol=0)
+    finally:
+        runner.reset()
+
+
+@torch.no_grad()
+def test_silu_fusion_mismatch_restores_eager(model, monkeypatch):
+    mlp = deepcopy(model.transformer_blocks[0].img_mlp).bfloat16()
+    x = torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16)
+    gate = BitExactFusionGate("test mismatch")
+    monkeypatch.setattr(model_module, "_SILU_MUL_FUSION", gate)
+    monkeypatch.setattr(
+        model_module, "fused_silu_mul_bitexact", lambda a, b: torch.zeros_like(a)
+    )
+    with set_forward_context(None, None):
+        expected = mlp.out(
+            torch.nn.functional.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0]
+        )[0]
+        torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+        assert gate.disabled and not gate.verified
+        torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)

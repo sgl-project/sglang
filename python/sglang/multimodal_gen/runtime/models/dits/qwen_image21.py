@@ -9,7 +9,10 @@ from torch import nn
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_complex_rope,
+    can_use_fused_silu_mul,
     fused_complex_rope,
+    fused_silu_mul_bitexact,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
@@ -36,6 +39,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
+_SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -175,7 +179,16 @@ class QwenImage21FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.out(nn.functional.silu(self.gate_layer(x)[0]) * self.proj(x)[0])[0]
+        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        fused = None
+        if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
+            fused = fused_silu_mul_bitexact(gate, value)
+            if _SILU_MUL_FUSION.verified:
+                return self.out(fused)[0]
+        hidden = nn.functional.silu(gate) * value
+        if fused is not None:
+            hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
+        return self.out(hidden)[0]
 
 
 class QwenImage21Attention(nn.Module):
@@ -291,14 +304,18 @@ class QwenImage21TransformerBlock(nn.Module):
             layout["segments"],
             cache,
         )
-        hidden_states = hidden_states + gate1.tanh() * attention
-        hidden_states = hidden_states + gate2.tanh() * self.img_mlp(
-            self.img_norm2(hidden_states) * (1 + scale2)
+        hidden_states = residual_gate_add(hidden_states, attention, gate1.tanh())
+        hidden_states = residual_gate_add(
+            hidden_states,
+            self.img_mlp(self.img_norm2(hidden_states) * (1 + scale2)),
+            gate2.tanh(),
         )
         if prefix_attention is not None:
-            prefix = prefix + pg1.tanh() * prefix_attention
-            prefix = prefix + pg2.tanh() * self.img_mlp(
-                self.img_norm2(prefix) * (1 + ps2)
+            prefix = residual_gate_add(prefix, prefix_attention, pg1.tanh())
+            prefix = residual_gate_add(
+                prefix,
+                self.img_mlp(self.img_norm2(prefix) * (1 + ps2)),
+                pg2.tanh(),
             )
         prefix_state["hidden_states"] = prefix
         return hidden_states
