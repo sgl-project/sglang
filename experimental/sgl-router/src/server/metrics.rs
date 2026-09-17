@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
@@ -65,15 +66,22 @@
 //!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
 //!   all selections: a diverted curve skewing high means the gate is trading
 //!   large cached prefixes for short waits.
-//! - `all_queued` — the queue gate removed every owner AND every worker in
-//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
-//!   is the saturation signal for traffic the gate acted on, keyed on
-//!   saturation rather than on where the request landed: usually the request
-//!   kept its prefix, but when the re-admitted owners are also out of KV
-//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
-//!   saturation in the one state where it matters most. It deliberately
-//!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
-//!   must not absorb it, or a fully saturated fleet reads as a healthy one.
+//! - `all_queued` — the queue gate removed every owner and no diversion could
+//!   dodge a wait. Two conditions draw it. Without `--saturation-queue-floor`
+//!   it means every worker in the prefill fleet is queueing at or above
+//!   `--worker-queue-limit`. With a floor set, the saturation pin also draws
+//!   it on the weaker condition the floor names: no fleet worker reads
+//!   strictly below the floor. Since the floor may be lower than the limit, a
+//!   floor well under the limit widens this label to fleets that still hold
+//!   gate-admissible workers — read it against the configured floor, not as
+//!   "every worker is over the limit". It is keyed on saturation rather than
+//!   on where the request landed: usually the request kept its prefix, but
+//!   when the owners it would keep are also out of KV capacity it lands
+//!   off-owner and still books here. Reporting that case as `cache_miss`
+//!   would hide the saturation in the one state where it matters most. It
+//!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
+//!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
+//!   healthy one.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -346,6 +354,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -726,19 +735,31 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
-    /// router's chat encoder failed: a chat request (`messages`) on a model with
-    /// a chat encoder that did not yield engine-equivalent ids. That request
-    /// silently fell back to engine-side tokenization, defeating the offload —
-    /// the actionable "offload broken" signal. It stays at ~0 in healthy
-    /// operation and climbs only on a real tokenizer problem; successful
-    /// forwards and expected omissions (tools / multimodal / thinking, whose
-    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
-    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    /// Count formatter failures only for chats eligible for `input_ids`
+    /// forwarding. Requests excluded by the guard are expected fallbacks.
+    /// Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sampling_contract_rejections_total{param}`.
+    ///
+    /// Recorded when the fleet-wide sampling contract refuses a request under
+    /// `--sampling-param-conflict reject`. This is the rollout gauge for the
+    /// flag: it answers "how much client traffic is the contract turning away,
+    /// and on which parameter" — which is otherwise unanswerable, because the
+    /// rejection reaches the client as a 400 like any other. `param` is a
+    /// wire name from a fixed enum, so the label set is bounded.
+    pub fn record_sampling_contract_rejection(&self, param: &'static str) {
+        let mut guard = self.sampling_contract_rejections_total.lock();
+        let counter = guard
+            .entry(param)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1170,7 +1191,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-formatter model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();
@@ -1183,6 +1204,26 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // sampling_contract_rejections_total
+        out.push_str(
+            "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
+        );
+        out.push_str("# TYPE sgl_router_sampling_contract_rejections_total counter\n");
+        let guard = self.sampling_contract_rejections_total.lock();
+        let mut entries: Vec<(&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        for (param, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sampling_contract_rejections_total{{param=\"{}\"}} {}\n",
+                escape_label(param),
                 value,
             ));
         }
@@ -1737,6 +1778,31 @@ mod tests {
         assert!(
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
+        );
+    }
+    /// The contract's rollout gauge: absent until a request is actually
+    /// refused, then keyed by the parameter that refused it.
+    #[test]
+    fn sampling_contract_rejections_are_keyed_by_param() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_sampling_contract_rejections_total counter"));
+        assert!(
+            !out.contains("sgl_router_sampling_contract_rejections_total{"),
+            "must emit no series before the first rejection"
+        );
+
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("top_p");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 2"#),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 1"#),
+            "got:\n{out}"
         );
     }
 }

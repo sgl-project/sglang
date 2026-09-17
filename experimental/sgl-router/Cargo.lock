@@ -3294,6 +3294,7 @@ dependencies = [
  "dynamo-tokenizers",
  "futures",
  "hf-hub",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
