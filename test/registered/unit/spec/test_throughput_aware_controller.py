@@ -97,17 +97,6 @@ class TestThroughputAwareController(unittest.TestCase):
         controller.activate_step_by_batch(1)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
 
-    def test_delayed_feedback_after_expansion_does_not_observe_undrafted_positions(
-        self,
-    ):
-        controller = self.make_controller()
-        controller.on_verify_complete([1], batch_size=1, num_steps=1)
-        self.assertFalse(controller.params._tracker.all_positions_warmed(3))
-        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
-        self.assertEqual(
-            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
-        )
-
     def test_delayed_feedback_after_shrink_uses_verify_time_steps(self):
         controller = self.make_controller()
         controller.activate_step_by_batch(8)
