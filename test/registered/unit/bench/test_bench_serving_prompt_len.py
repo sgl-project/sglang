@@ -58,7 +58,9 @@ class _SSEHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if length:
             self.rfile.read(length)
-        chunks = type(self).rounds[min(type(self).call_count, len(type(self).rounds) - 1)]
+        chunks = type(self).rounds[
+            min(type(self).call_count, len(type(self).rounds) - 1)
+        ]
         type(self).call_count += 1
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -143,7 +145,9 @@ class TestBenchServingPromptLen(CustomTestCase):
 
         port, server = self._serve(Handler)
         try:
-            out = asyncio.run(async_request_openai_chat_completions(self._request(port)))
+            out = asyncio.run(
+                async_request_openai_chat_completions(self._request(port))
+            )
         finally:
             server.shutdown()
         self.assertTrue(out.success, out.error)
@@ -158,7 +162,9 @@ class TestBenchServingPromptLen(CustomTestCase):
 
         port, server = self._serve(Handler)
         try:
-            out = asyncio.run(async_request_openai_chat_completions(self._request(port)))
+            out = asyncio.run(
+                async_request_openai_chat_completions(self._request(port))
+            )
         finally:
             server.shutdown()
         self.assertTrue(out.success, out.error)
