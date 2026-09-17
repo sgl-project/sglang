@@ -1659,6 +1659,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        """DFLASH/DSPARK target interface: same layer-entry capture as EAGLE3,
+        with the draft checkpoint's HF-style target_layer_ids (no default)."""
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH/DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.set_eagle3_layers_to_capture(list(layer_ids))
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
