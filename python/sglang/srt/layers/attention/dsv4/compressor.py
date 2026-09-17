@@ -509,7 +509,7 @@ class Compressor(BaseFusedOp):
             x = cp_materialize_global_token_order(
                 x,
                 forward_batch,
-                torch.cuda.current_stream(),
+                torch.npu.current_stream(),
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)

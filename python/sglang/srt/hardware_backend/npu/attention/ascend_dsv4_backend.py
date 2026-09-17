@@ -18,6 +18,8 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -416,6 +418,9 @@ class CompressorAscendBackendMixin:
             return
         compressor(x, forward_batch)
 
+    # The NPU fused compressor writes c4/indexer payloads identically.
+    forward_indexer_compressor = forward_core_compressor
+
     def forward_compress(
         self,
         compressor,
@@ -433,6 +438,14 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
+        # The compressor consumes the full-order gather, so it always reads
+        # full-batch cu_seqlens; under CP prefill actual_seq_lengths_q_pa holds
+        # the rank-local view instead.
+        cu_seqlens = (
+            fm.dsv4_cp_full_q_pa
+            if fm.dsv4_cp_full_q_pa is not None
+            else fm.actual_seq_lengths_q_pa
+        )
         if is_npu_arch35():
             # A5 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
@@ -449,7 +462,7 @@ class CompressorAscendBackendMixin:
                     req_to_token=self.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
                     start_pos=fm.start_pos,
-                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    cu_seqlens=cu_seqlens,
                     seqused=fm.seqused,
                     max_input_capacity=fm.dsv4_max_input_capacity,
                 )
@@ -480,7 +493,7 @@ class CompressorAscendBackendMixin:
             rope_head_dim=compressor.rope_head_dim,
             cmp_ratio=ratio,
             state_block_table=state_block_table,
-            cu_seqlens=fm.actual_seq_lengths_q_pa,
+            cu_seqlens=cu_seqlens,
             seqused=fm.seqused,
             start_pos=fm.start_pos,
             coff=coff,
@@ -623,11 +636,13 @@ class C4IndexerAscendBackendMixin:
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -647,6 +662,7 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         q_lora_ready,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.hardware_backend.npu.utils import (
             get_indexer_weight_stream,
@@ -661,7 +677,8 @@ class C4IndexerAscendBackendMixin:
         stream_w.wait_stream(cur)
 
         # route-KV write on cur; ordered before the topk read by cur's program order.
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
@@ -794,7 +811,7 @@ class C4IndexerAscendBackendMixin:
         self, c4_indexer, q_lora: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
 
-        positions = forward_batch.positions
+        positions = self._cp_local_positions(forward_batch)
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
@@ -877,23 +894,47 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert not skip_compressor, (
-            "skip_compressor=True is not supported on the NPU indexer path"
-        )
+        # skip_compressor=True is the CP full-metadata protocol: the compressor
+        # already ran via forward_indexer_compressor.
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
-                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+                c4_indexer, x, q_lora, forward_batch, q_lora_ready, skip_compressor
             )
         else:
-            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+            q, weights = self._forward_prepare(
+                c4_indexer, x, q_lora, forward_batch, skip_compressor
+            )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+
+    def _cp_local_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-rank positions under CP (set by _apply_cp_local_view at init)."""
+        local = forward_batch.dsv4_cp_local_positions
+        return local if local is not None else forward_batch.positions
 
 
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
+    # fm fields rebuilt on the rank-local view during CP prefill, mirroring the
+    # GPU backend's _CP_REINDEX_FIELDS. Every field the fused compressor
+    # touches stays full-batch for the whole forward, mirroring
+    # _CP_GLOBAL_FIELDS: seqused, start_pos, positions_cmp_padding_c4/c128,
+    # c4/c128_loc, the state block tables, and the full-batch cu_seqlens kept
+    # in dsv4_cp_full_q_pa.
+    _CP_LOCAL_VIEW_FIELDS = (
+        "actual_seq_lengths_q",
+        "actual_seq_lengths_q_pa",
+        "actual_seq_lengths_kv",
+        "block_tables",
+        "swa_page_table",
+        "c4_page_table",
+        "c128_page_table",
+        "kernel_metadata",
+        "c4_topk_indices",
+    )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1027,6 +1068,152 @@ class DeepseekV4AscendAttnBackend(
             page_index_aligned_size=128,
         )
         return ori_sparse_indices
+
+    def _apply_cp_local_view(self, forward_batch: ForwardBatch) -> None:
+        """Rebuild the attention view of forward_metadata on the rank-local shard.
+
+        Mirrors the GPU backend's core_attn_metadata.apply_cp_reindex: run
+        once at init_forward_metadata time, after every full-batch field is
+        built. Attention fields become rank-local here and stay local for the
+        whole forward; full-batch consumers (the fused compressor) read the
+        dedicated full-batch fields instead of swapping values back in.
+        """
+        if forward_batch.attn_cp_metadata is None:
+            return
+        if not forward_batch.forward_mode.is_context_parallel_extend():
+            return
+        if forward_batch.forward_mode.is_target_verify():
+            return
+
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.cp_size <= 1:
+            return
+
+        fm = self.forward_metadata
+        global_positions = forward_batch.positions
+        if global_positions is None:
+            return
+
+        device = global_positions.device
+        num_tokens = int(global_positions.shape[0])
+        local_idx = strategy.local_q_indices(num_tokens, forward_batch).to(
+            device=device, dtype=torch.long
+        )
+        if local_idx.numel() > 0:
+            # Same bound the runner uses to shard model inputs (x[:total_seq_lens]).
+            shard_bound = forward_batch.attn_cp_metadata.total_seq_lens or num_tokens
+            local_idx = local_idx[local_idx < shard_bound]
+        local_positions = global_positions.index_select(0, local_idx)
+        # Sharded model inputs are padded to per_rank_actual_token; pad rows get
+        # position 0 so per-token metadata matches the sharded q length.
+        from sglang.srt.layers.cp.padding import pad_local_rows
+
+        local_positions = pad_local_rows(
+            local_positions, forward_batch.attn_cp_metadata, dim=0
+        )
+
+        # batch_ids drive the per-local-token page-table row selection, so the
+        # per-request split must be the true extend lens: seq_lens (full
+        # context) or a uniform guess would attend every token to the wrong
+        # request's KV.
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if extend_lens is None:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            if extend_seq_lens is not None:
+                # gpu_only batches leave *_cpu unset; the device tensor
+                # carries the authoritative per-request extend lengths.
+                extend_lens = extend_seq_lens.cpu().tolist()
+            elif forward_batch.batch_size == 1:
+                extend_lens = [num_tokens]
+            else:
+                raise RuntimeError(
+                    "DSV4 CP metadata needs extend_seq_lens(_cpu) to split "
+                    f"tokens across {forward_batch.batch_size} requests."
+                )
+        extend_lens = [int(x) for x in extend_lens]
+        real_num_tokens = min(sum(extend_lens), num_tokens)
+
+        batch_ids = torch.repeat_interleave(
+            torch.arange(len(extend_lens), dtype=torch.long, device=device),
+            torch.tensor(extend_lens, dtype=torch.long, device=device),
+        )
+        if batch_ids.shape[0] < num_tokens:
+            pad_len = num_tokens - batch_ids.shape[0]
+            batch_ids = torch.cat(
+                [batch_ids, torch.zeros(pad_len, dtype=torch.long, device=device)],
+                dim=0,
+            )
+        elif batch_ids.shape[0] > num_tokens:
+            batch_ids = batch_ids[:num_tokens]
+
+        local_batch_ids = batch_ids.index_select(0, local_idx)
+        valid_rows = local_idx < real_num_tokens
+        # Pad rows reuse request 0's page table (in-bounds) and stay invalid.
+        pad_rows = local_positions.shape[0] - local_batch_ids.shape[0]
+        if pad_rows > 0:
+            local_batch_ids = torch.cat(
+                [local_batch_ids, local_batch_ids.new_zeros(pad_rows)]
+            )
+            valid_rows = torch.cat([valid_rows, valid_rows.new_zeros(pad_rows)])
+        seqused_kv = torch.where(
+            valid_rows,
+            local_positions.to(torch.int32) + 1,
+            torch.ones_like(local_positions, dtype=torch.int32),
+        ).clamp(min=1)
+
+        # The compressor consumes the full-order gather and reads full-batch
+        # cu_seqlens; keep them before the field flips to the local view.
+        fm.dsv4_cp_full_q_pa = fm.actual_seq_lengths_q_pa
+
+        def _select_rows(table: Optional[torch.Tensor]):
+            if table is None:
+                return None
+            if local_batch_ids.numel() == 0:
+                return table.new_empty((0, *table.shape[1:]))
+            return table.index_select(0, local_batch_ids)
+
+        fm.block_tables = _select_rows(fm.block_tables)
+        fm.swa_page_table = _select_rows(fm.swa_page_table)
+        if self._dsv4_has_c4:
+            fm.c4_page_table = _select_rows(fm.c4_page_table)
+        if self._dsv4_has_c128:
+            fm.c128_page_table = _select_rows(fm.c128_page_table)
+
+        local_t = int(local_positions.shape[0])
+        fm.actual_seq_lengths_q = torch.arange(
+            1, local_t + 1, dtype=torch.int32, device=device
+        )
+        fm.actual_seq_lengths_q_pa = torch.arange(
+            0, local_t + 1, dtype=torch.int32, device=device
+        )
+        fm.actual_seq_lengths_kv = seqused_kv
+        fm.kernel_metadata = self._kernel_metadata_from_parts(
+            bs=local_t,
+            actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
+            actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
+            block_tables=fm.block_tables,
+            max_seqlen_q=1,
+            is_nextn=False,
+        )
+        if self._dsv4_has_c4:
+            fm.c4_topk_indices = torch.full(
+                (local_t, self._dsv4_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        for field in self._CP_LOCAL_VIEW_FIELDS:
+            val = getattr(fm, field, None)
+            if not isinstance(val, torch.Tensor):
+                continue
+            expected = local_t + 1 if field == "actual_seq_lengths_q_pa" else local_t
+            assert val.shape[0] == expected, (
+                f"_apply_cp_local_view: {field}.shape[0]={val.shape[0]} "
+                f"!= rank-local length {expected}"
+            )
+
+        forward_batch.dsv4_cp_local_positions = local_positions
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
         device = self.device
@@ -1735,6 +1922,12 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
+
+        # After every full-batch field is built, flip the attention view to
+        # the rank-local shard (no-op without CP; init runs before the runner
+        # shards the model inputs).
+        if is_cp_active(forward_batch):
+            self._apply_cp_local_view(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata

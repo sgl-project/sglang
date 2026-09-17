@@ -163,6 +163,8 @@ class DeepseekV4ModelNextN(nn.Module):
         if _is_npu:
             # Same per-forward rope prime as DeepseekV4Model.forward: the
             # decoder layer reads the memoized gather instead of re-gathering.
+            # CP metadata localization happens in the attention backend's
+            # init_forward_metadata, same as the target model.
             prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
         hidden_states, residual, post, comb = self.decoder(
@@ -220,7 +222,6 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,

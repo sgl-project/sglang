@@ -687,6 +687,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 
+    # DSV4 NPU CP, set by the attention backend's init_forward_metadata
+    # (_apply_cp_local_view): rank-local padded positions for per-token
+    # consumers; forward_batch.positions itself stays full-batch.
+    dsv4_cp_local_positions: Optional[torch.Tensor] = None
+
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
     # import block above) — available for annotations but NOT bound at runtime in this

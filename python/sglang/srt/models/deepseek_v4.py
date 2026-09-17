@@ -67,6 +67,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1633,9 +1634,16 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            kv_for_cache = kv
+            if use_cp:
+                kv_for_cache = cp_gather_full_sequence_states(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.npu.current_stream(),
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
-                swa_k=kv,
+                swa_k=kv_for_cache,
                 forward_batch=forward_batch,
             )
             kv = None
@@ -1670,13 +1678,35 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        use_npu_cp = use_cp and _is_npu
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if use_npu_cp:
+                # The compressor write below branches on li_kv_dtype, which
+                # only _ensure_npu_c4_indexer initializes (the non-CP path
+                # gets the ordering from forward_c4_indexer). Without it the
+                # first CP forward scatters bf16 K into the int8/FP8 index
+                # cache with no dequant scale.
+                attn_backend._ensure_npu_c4_indexer(self.indexer, x.device)
+                attn_backend.forward_indexer_compressor(
+                    x,
+                    forward_batch,
+                    self.indexer.layer_id,
+                    self.indexer.compressor,
+                )
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    skip_compressor=True,
+                )
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -3209,6 +3239,7 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3217,6 +3248,9 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # The CP runner path calls model.model(...) directly, bypassing the
+        # decorated ForCausalLM wrapper: without this the sharded inputs drag
+        # the whole body into an autograd graph.
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3250,9 +3284,8 @@ class DeepseekV4Model(nn.Module):
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+
+        attn_backend = get_attn_backend()
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -3449,7 +3482,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3458,7 +3490,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
