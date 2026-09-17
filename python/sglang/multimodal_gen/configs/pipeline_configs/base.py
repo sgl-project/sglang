@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
+from operator import attrgetter
 from typing import Any, ClassVar
 
 import numpy as np
@@ -35,13 +36,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
-from sglang.multimodal_gen.utils import (
+from sglang.multimodal_gen.runtime.utils.argparse import (
     FlexibleArgumentParser,
     StoreBoolean,
-    shallow_asdict,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 
 logger = init_logger(__name__)
 
@@ -1154,7 +1154,7 @@ class PipelineConfig:
             )
 
     def dump_to_json(self, file_path: str):
-        output_dict = shallow_asdict(self)
+        output_dict = {f.name: attrgetter(f.name)(self) for f in fields(self)}
         del_keys = []
         for key, value in output_dict.items():
             if isinstance(value, ModelConfig):
