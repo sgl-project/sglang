@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
 import os
 import pickle
 import sys
@@ -756,66 +757,6 @@ def general_mm_embed_routine(
     return hidden_states
 
 
-def get_multimodal_data_bounds(
-    input_ids: torch.Tensor, pad_values: List[int], token_pairs: List[Tuple[int, int]]
-) -> torch.Tensor:
-    """
-    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
-
-    Returns:
-        [bounds_count, 2]
-    """
-    # All the multimodal data in the batch should share the same special bound token ids.
-    start_tokens = {s for s, _e in token_pairs}
-    end_tokens = {e for _s, e in token_pairs}
-
-    assert all(isinstance(t, int) for t in start_tokens)
-    assert all(isinstance(t, int) for t in end_tokens)
-
-    start_cond = torch.isin(
-        input_ids, torch.as_tensor(start_tokens, device=input_ids.device)
-    )
-    end_cond = torch.isin(
-        input_ids, torch.as_tensor(end_tokens, device=input_ids.device)
-    )
-
-    (data_start_tokens,) = torch.where(start_cond)
-    (data_end_tokens,) = torch.where(end_cond)
-
-    data_start_tokens_cpu = data_start_tokens.cpu().tolist()
-    data_end_tokens_cpu = data_end_tokens.cpu().tolist()
-
-    # the im_start_id sometimes can be cached as prefix, but it is needed for the embedding of the multimodal data
-    if len(data_start_tokens_cpu) != len(data_end_tokens_cpu):
-        if (
-            len(data_start_tokens_cpu) + 1 == len(data_end_tokens_cpu)
-            and input_ids[0].item() in pad_values
-            and data_end_tokens_cpu
-            and data_start_tokens_cpu
-            and data_end_tokens_cpu[0] < data_start_tokens_cpu[0]
-        ):
-            data_start_tokens_cpu.insert(0, 0)
-    valid_mm_data_nums = min(len(data_start_tokens_cpu), len(data_end_tokens_cpu))
-
-    if valid_mm_data_nums == 0:
-        return torch.zeros((0, 2), device=input_ids.device)
-
-    # Filter out pairs where start_token >= end_token
-    valid_pairs = []
-    for i in range(valid_mm_data_nums):
-        start_token = data_start_tokens_cpu[i]
-        end_token = data_end_tokens_cpu[i]
-        if start_token < end_token:
-            valid_pairs.append((start_token + 1, end_token - 1))
-
-    if not valid_pairs:
-        return torch.zeros((0, 2), device=input_ids.device)
-
-    # Convert valid pairs to tensor
-    valid_pairs_tensor = torch.as_tensor(valid_pairs, device=input_ids.device)
-    return valid_pairs_tensor
-
-
 def data_hash(data) -> int:
     hash_bytes = hashlib.sha256(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1354,10 +1295,28 @@ class ShmPointerMMData:
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
+        """Return independently writable storage, then release the SHM handle.
+
+        On Linux the tensor owns a private copy-on-write mapping. Reading the
+        pixels needs no clone, and writes remain local to this receiver just
+        as with the old clone. torch.frombuffer keeps the mapping alive until
+        the tensor and all derived views are released. Other platforms retain
+        the clone path.
+        """
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if sys.platform == "linux":
+                owned = mmap.mmap(
+                    self._shm_handle._fd,
+                    self.tensor.numel() * self.tensor.element_size(),
+                    access=mmap.ACCESS_COPY,
+                )
+                try:
+                    return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
+                except BaseException:
+                    owned.close()
+                    raise
             return self.tensor.clone()
         finally:
             self.close_and_unlink()

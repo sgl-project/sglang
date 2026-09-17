@@ -128,17 +128,8 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
-        # Refused only once there is something to record. A pass that declares
-        # nothing is a validation, and `check_server_args` runs those again on
-        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
-        # back the same instance while the context still holds it, and
-        # refusing on identity alone would fail that launch.
-        # Only a non-empty return is a declaration. An empty one is a
-        # validation and may run on the published instance -- see above -- so it
-        # must not reach the guard in `declare_resolution`.
-        if declared:
-            declare_resolution(server_args, fn.__qualname__, **declared)
-            validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
+        declare_resolution(server_args, fn.__qualname__, **declared)
+        validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -147,8 +138,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     The stash *is* the resolution result: the bags are projected from it,
     `resolution_result` answers from it, and no field is written. A resolver
     reading a field another resolver may have decided must read `resolving_view`
-    (or `resolved_view(server_args)`), which
-    `test_resolution_reads_the_declarations` pins.
+    (or `resolved_view(server_args)`).
 
     Every declaration goes through here, whenever it is made: inside
     ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
@@ -445,6 +435,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -486,6 +477,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
@@ -496,6 +488,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
