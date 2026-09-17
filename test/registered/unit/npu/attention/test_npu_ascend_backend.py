@@ -2,11 +2,12 @@
 Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 """
 
+import math
 import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -43,6 +44,12 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
     mask_empty_mla_dcp_shards_npu,
     merge_mla_dcp_output_npu,
 )
+from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+    build_mla_dcp_local_block_tables,
+    build_mla_dcp_mtp_mask,
+    prepare_decode_context_parallel_metadata_npu,
+)
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -133,6 +140,152 @@ class TestNormalizeMlaKRoPECache(unittest.TestCase):
     def test_rejects_wrong_rope_dimension(self):
         with self.assertRaisesRegex(RuntimeError, "Invalid MLA RoPE KV cache shape"):
             _normalize_mla_k_rope_cache(torch.empty(8, 1, 32), 64)
+
+
+class TestNpuDcpMetadata(unittest.TestCase):
+    def test_local_block_tables_map_widened_virtual_pages(self):
+        physical_page_size = 4
+        dcp_size = 4
+        widened_page_size = physical_page_size * dcp_size
+        seq_lens = torch.tensor([1, 17, 31], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
+        page_ids = [[11, 12], [21, 22], [31, 32]]
+        req_to_token = torch.zeros(3, 32, dtype=torch.int64)
+        for req_idx in range(3):
+            for pos in range(32):
+                virtual_page = pos // widened_page_size
+                req_to_token[req_idx, pos] = (
+                    page_ids[req_idx][virtual_page] * widened_page_size
+                    + pos % widened_page_size
+                )
+
+        for rank in range(dcp_size):
+            block_tables, local_lens = build_mla_dcp_local_block_tables(
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                physical_page_size,
+                dcp_size,
+                rank,
+            )
+            expected_lens = get_dcp_lens(seq_lens, dcp_size, rank).to(torch.int32)
+            torch.testing.assert_close(local_lens, expected_lens)
+            for req_idx, local_len in enumerate(expected_lens.tolist()):
+                num_pages = math.ceil(local_len / physical_page_size)
+                self.assertEqual(
+                    block_tables[req_idx, :num_pages].tolist(),
+                    page_ids[req_idx][:num_pages],
+                )
+                self.assertTrue(torch.all(block_tables[req_idx, num_pages:] == 0))
+
+    def test_graph_block_tables_keep_fixed_width_and_mask_tail(self):
+        req_to_token = torch.arange(16, dtype=torch.int64).view(1, 16) + 64
+        block_tables, local_lens = build_mla_dcp_local_block_tables(
+            req_to_token,
+            torch.tensor([0]),
+            torch.tensor([5]),
+            physical_page_size=4,
+            dcp_size=2,
+            dcp_rank=1,
+            num_pages=3,
+        )
+
+        self.assertEqual(local_lens.tolist(), [2])
+        self.assertEqual(block_tables.shape, (1, 3))
+        self.assertEqual(block_tables[0, 1:].tolist(), [0, 0])
+
+    def test_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
+        mask, local_lens = build_mla_dcp_mtp_mask(
+            torch.tensor([5, 0]),
+            torch.tensor([3, 0]),
+            dcp_size=2,
+            dcp_rank=1,
+            max_query_len=3,
+            max_local_kv_len=8,
+        )
+
+        self.assertEqual(mask.shape, (2, 3, 8))
+        self.assertEqual(local_lens.tolist(), [4, 0])
+        self.assertTrue(mask[1].all())
+
+    def test_mtp_mask_matches_global_causality(self):
+        prefix_lens = torch.tensor([0, 3, 8], dtype=torch.int32)
+        query_lens = torch.tensor([4, 2, 3], dtype=torch.int32)
+        dcp_size = 3
+
+        for rank in range(dcp_size):
+            mask, local_lens = build_mla_dcp_mtp_mask(
+                prefix_lens, query_lens, dcp_size, rank
+            )
+            expected_lens = get_dcp_lens(prefix_lens + query_lens, dcp_size, rank).to(
+                torch.int32
+            )
+            torch.testing.assert_close(local_lens, expected_lens)
+
+            for req_idx, (prefix_len, query_len, local_len) in enumerate(
+                zip(
+                    prefix_lens.tolist(),
+                    query_lens.tolist(),
+                    expected_lens.tolist(),
+                )
+            ):
+                local_positions = [
+                    pos
+                    for pos in range(prefix_len + query_len)
+                    if pos % dcp_size == rank
+                ]
+                for query_idx in range(mask.shape[1]):
+                    for local_idx in range(mask.shape[2]):
+                        expected_masked = (
+                            query_idx >= query_len
+                            or local_idx >= local_len
+                            or local_positions[local_idx] > prefix_len + query_idx
+                        )
+                        self.assertEqual(
+                            bool(mask[req_idx, query_idx, local_idx]),
+                            expected_masked,
+                            (req_idx, rank, query_idx, local_idx),
+                        )
+
+    def test_extend_metadata_matches_prefix_owner_layout(self):
+        dcp_size = 4
+        prefix_lens = torch.tensor([4, 8], dtype=torch.int32)
+        extend_lens = torch.tensor([2, 3], dtype=torch.int32)
+        seq_lens = prefix_lens + extend_lens
+        req_to_token = torch.tensor(
+            [
+                [40, 41, 42, 43, 100, 101, 0, 0],
+                [80, 81, 82, 83, 84, 85, 86, 87],
+            ],
+            dtype=torch.int32,
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        all_prefix = torch.cat([req_to_token[0, :4], req_to_token[1, :8]])
+
+        for rank in range(dcp_size):
+            with rc.get_parallel().override(
+                dcp_enabled=True,
+                dcp_size=dcp_size,
+                dcp_rank=rank,
+            ):
+                metadata = prepare_decode_context_parallel_metadata_npu(
+                    seq_lens=seq_lens,
+                    extend_prefix_lens_cpu=prefix_lens,
+                    extend_seq_lens=extend_lens,
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=req_to_token,
+                    seq_lens_sum=int(seq_lens.sum()),
+                    kv_cache_dtype=torch.bfloat16,
+                    kv_cache_device="cpu",
+                )
+            expected_local = all_prefix[rank::dcp_size] // dcp_size
+            torch.testing.assert_close(
+                metadata.dcp_local_prefix_kv_indices, expected_local
+            )
+            self.assertIsNone(metadata.dcp_kv_indptr)
+            self.assertIsNone(metadata.dcp_kv_indices)
+            self.assertIsNone(metadata.dcp_kv_buffer)
+            self.assertIsNone(metadata.dcp_extend_prefix_lens_sum)
 
 
 class TestForwardMetadata(unittest.TestCase):
@@ -279,6 +432,51 @@ class TestForwardMetadata(unittest.TestCase):
 
 
 class TestEmptyDcpTargetVerify(unittest.TestCase):
+    def test_shared_fia_helper_normalizes_heads_lse_and_empty_rows(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.kv_lora_rank = 4
+        backend.qk_rope_head_dim = 2
+        backend.page_size = 4
+        layer = SimpleNamespace(tp_q_head_num=3, tp_k_head_num=1, scaling=0.5)
+
+        q_nope = torch.randn(4, 3, 4)
+        q_rope = torch.randn(4, 3, 2)
+        kv_cache = torch.randn(2, 1, 4, 4)
+        k_rope_cache = torch.randn(2, 1, 4, 2)
+        fia_output = torch.arange(64, dtype=torch.float32).view(2, 2, 4, 4)
+        # Exercise the BHSD LSE layout returned by some FIA versions.
+        fia_lse = torch.arange(16, dtype=torch.float32).view(2, 4, 2, 1)
+
+        with patch.object(
+            torch.ops.npu,
+            "npu_fused_infer_attention_score",
+            create=True,
+            return_value=(fia_output, fia_lse),
+        ) as fia:
+            output, lse = backend._forward_mla_fia(
+                q_nope,
+                q_rope,
+                kv_cache,
+                k_rope_cache,
+                layer,
+                batch_size=2,
+                query_len=2,
+                block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+                actual_seq_lengths=[2, 2],
+                actual_seq_lengths_kv=[4, 0],
+                attn_mask=torch.zeros(2, 2, 4, dtype=torch.bool),
+                return_softmax_lse=True,
+                local_seq_lens=torch.tensor([4, 0], dtype=torch.int32),
+            )
+
+        self.assertEqual(output.shape, (4, 12))
+        self.assertEqual(lse.shape, (4, 3, 1))
+        torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+        self.assertTrue(torch.isneginf(lse[2:]).all())
+        self.assertEqual(fia.call_args.kwargs["num_heads"], 4)
+        self.assertEqual(fia.call_args.args[0].shape, (2, 2, 4, 4))
+        self.assertEqual(fia.call_args.kwargs["query_rope"].shape, (2, 2, 4, 2))
+
     def test_empty_shard_mask_is_dynamic_and_graph_padding_safe(self):
         output = torch.arange(24, dtype=torch.float32).view(4, 2, 3)
         lse = torch.arange(8, dtype=torch.float32).view(4, 2, 1)

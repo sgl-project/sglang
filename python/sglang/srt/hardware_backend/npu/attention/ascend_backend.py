@@ -18,6 +18,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.dcp import (
     mask_empty_mla_dcp_shards_npu,
 )
+from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+    build_mla_dcp_local_block_tables,
+    build_mla_dcp_mtp_mask,
+    prepare_decode_context_parallel_metadata_npu,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -29,10 +34,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import (
-    build_mla_dcp_local_block_tables,
-    build_mla_dcp_mtp_mask,
-)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -333,6 +334,8 @@ def _normalize_mla_k_rope_cache(
 
 
 class AscendAttnBackend(AttentionBackend):
+    dcp_metadata_builder = staticmethod(prepare_decode_context_parallel_metadata_npu)
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -2390,6 +2393,101 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def _forward_mla_fia(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        k_rope_cache: torch.Tensor,
+        layer: RadixAttention,
+        *,
+        batch_size: int,
+        query_len: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths_kv,
+        attn_mask: Optional[torch.Tensor] = None,
+        actual_seq_lengths=None,
+        return_softmax_lse: bool = False,
+        local_seq_lens: Optional[torch.Tensor] = None,
+    ):
+        """Run MLA FIA and normalize output/LSE to token-major DCP tensors."""
+        num_heads = layer.tp_q_head_num
+        num_tokens = batch_size * query_len
+        q_nope = q_nope.reshape(batch_size, query_len, num_heads, self.kv_lora_rank)
+        q_rope = q_rope.reshape(batch_size, query_len, num_heads, self.qk_rope_head_dim)
+
+        padded_heads = next_power_of_2(num_heads)
+        if padded_heads != num_heads:
+            q_nope = torch.cat(
+                [
+                    q_nope,
+                    q_nope.new_zeros(
+                        batch_size,
+                        query_len,
+                        padded_heads - num_heads,
+                        self.kv_lora_rank,
+                    ),
+                ],
+                dim=2,
+            )
+            q_rope = torch.cat(
+                [
+                    q_rope,
+                    q_rope.new_zeros(
+                        batch_size,
+                        query_len,
+                        padded_heads - num_heads,
+                        self.qk_rope_head_dim,
+                    ),
+                ],
+                dim=2,
+            )
+
+        fia_kwargs = {}
+        if actual_seq_lengths is not None:
+            fia_kwargs["actual_seq_lengths"] = actual_seq_lengths
+        attn_output, softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope.contiguous(),
+            kv_cache,
+            kv_cache,
+            query_rope=q_rope.contiguous(),
+            key_rope=k_rope_cache,
+            num_heads=padded_heads,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="BSND",
+            atten_mask=attn_mask,
+            sparse_mode=0,
+            scale=layer.scaling,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            block_table=block_table,
+            block_size=self.page_size,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            softmax_lse_flag=return_softmax_lse,
+            **fia_kwargs,
+        )
+        attn_output = attn_output[:, :, :num_heads, :].reshape(
+            num_tokens, num_heads, self.kv_lora_rank
+        )
+        if not return_softmax_lse:
+            return attn_output.view(num_tokens, num_heads * self.kv_lora_rank)
+
+        if softmax_lse.ndim == 4 and softmax_lse.shape[1] == padded_heads:
+            softmax_lse = softmax_lse.permute(0, 2, 1, 3)
+        softmax_lse = softmax_lse.reshape(batch_size, query_len, padded_heads, -1)[
+            :, :, :num_heads, :1
+        ].reshape(num_tokens, num_heads, 1)
+        if local_seq_lens is not None:
+            attn_output, softmax_lse = mask_empty_mla_dcp_shards_npu(
+                attn_output,
+                softmax_lse,
+                local_seq_lens,
+            )
+        return (
+            attn_output.view(num_tokens, num_heads * self.kv_lora_rank),
+            softmax_lse,
+        )
+
     def forward_mtp(
         self,
         q,
@@ -2510,71 +2608,20 @@ class AscendAttnBackend(AttentionBackend):
                     self.kv_lora_rank,
                 )
 
-            q_nope = q[:num_tokens].view(
-                batch_size, query_len, num_heads, self.kv_lora_rank
-            )
-            q_rope = q_rope[:num_tokens].view(
-                batch_size, query_len, num_heads, self.qk_rope_head_dim
-            )
-            padded_heads = next_power_of_2(num_heads)
-            if padded_heads != num_heads:
-                q_nope = torch.cat(
-                    [
-                        q_nope,
-                        q_nope.new_zeros(
-                            batch_size,
-                            query_len,
-                            padded_heads - num_heads,
-                            self.kv_lora_rank,
-                        ),
-                    ],
-                    dim=2,
-                )
-                q_rope = torch.cat(
-                    [
-                        q_rope,
-                        q_rope.new_zeros(
-                            batch_size,
-                            query_len,
-                            padded_heads - num_heads,
-                            self.qk_rope_head_dim,
-                        ),
-                    ],
-                    dim=2,
-                )
-
-            attn_output, softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
-                q_nope.contiguous(),
+            attn_output, softmax_lse = self._forward_mla_fia(
+                q[:num_tokens],
+                q_rope[:num_tokens],
                 c_kv,
-                c_kv,
-                query_rope=q_rope.contiguous(),
-                key_rope=k_rope_cache,
-                num_heads=padded_heads,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSND",
-                atten_mask=attn_mask,
-                sparse_mode=0,
-                scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                k_rope_cache,
+                layer,
+                batch_size=batch_size,
+                query_len=query_len,
                 block_table=block_table,
-                block_size=self.page_size,
                 actual_seq_lengths=[query_len] * batch_size,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-                softmax_lse_flag=True,
-            )
-            attn_output = attn_output[:, :, :num_heads, :].reshape(
-                num_tokens, num_heads, self.kv_lora_rank
-            )
-            if softmax_lse.ndim == 4 and softmax_lse.shape[1] == padded_heads:
-                softmax_lse = softmax_lse.permute(0, 2, 1, 3)
-            softmax_lse = softmax_lse.reshape(batch_size, query_len, padded_heads, -1)[
-                :, :, :num_heads, :1
-            ].reshape(num_tokens, num_heads, 1)
-            attn_output, softmax_lse = mask_empty_mla_dcp_shards_npu(
-                attn_output,
-                softmax_lse,
-                self.forward_metadata.seq_lens[:batch_size],
+                attn_mask=attn_mask,
+                return_softmax_lse=True,
+                local_seq_lens=self.forward_metadata.seq_lens[:batch_size],
             )
 
             if num_tokens != num_token_padding:
@@ -2582,7 +2629,9 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = torch.cat(
                     [
                         attn_output,
-                        attn_output.new_zeros(pad_tokens, num_heads, self.kv_lora_rank),
+                        attn_output.new_zeros(
+                            pad_tokens, num_heads * self.kv_lora_rank
+                        ),
                     ],
                     dim=0,
                 )
@@ -3461,80 +3510,29 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = k_pe.view(
                         -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                     )
-                q = q.view(
-                    forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
-                )
-                q_rope = q_rope.view(
-                    forward_batch.batch_size,
-                    -1,
-                    layer.tp_q_head_num,
-                    self.qk_rope_head_dim,
-                )
-                if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
-                    power_of_2_head = next_power_of_2(layer.tp_q_head_num)
-                    padding_head = power_of_2_head - layer.tp_q_head_num
-                    q_padding_tensor = torch.zeros(
-                        [num_tokens, q.shape[1], padding_head, q.shape[-1]],
-                        dtype=q.dtype,
-                        device=q.device,
-                    )
-                    q = torch.cat((q, q_padding_tensor), dim=-2)
-                    q_rope_padding_tensor = torch.zeros(
-                        [num_tokens, q_rope.shape[1], padding_head, q_rope.shape[-1]],
-                        dtype=q_rope.dtype,
-                        device=q_rope.device,
-                    )
-                    q_rope = torch.cat((q_rope, q_rope_padding_tensor), dim=-2)
-                    tp_q_head_num = power_of_2_head
-                else:
-                    tp_q_head_num = layer.tp_q_head_num
-
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_list
                     if self.forward_metadata.seq_lens_cpu_int is None
                     else self.forward_metadata.seq_lens_cpu_int
                 )
-                attn_output, softmax_lse = (
-                    torch.ops.npu.npu_fused_infer_attention_score(
-                        q,
-                        kv_c,
-                        kv_c,
-                        query_rope=q_rope,
-                        key_rope=k_pe,
-                        num_heads=tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",
-                        atten_mask=None,
-                        sparse_mode=0,
-                        scale=layer.scaling,
-                        antiquant_mode=0,
-                        antiquant_scale=None,
-                        block_table=self.forward_metadata.block_tables,
-                        block_size=self.page_size,
-                        actual_seq_lengths_kv=actual_seq_lengths_kv,
-                        softmax_lse_flag=return_softmax_lse,
-                    )
+                query_len = num_tokens // forward_batch.batch_size
+                attn_output = self._forward_mla_fia(
+                    q,
+                    q_rope,
+                    kv_c,
+                    k_pe,
+                    layer,
+                    batch_size=forward_batch.batch_size,
+                    query_len=query_len,
+                    block_table=self.forward_metadata.block_tables,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    return_softmax_lse=return_softmax_lse,
+                    local_seq_lens=(
+                        self.forward_metadata.seq_lens if return_softmax_lse else None
+                    ),
                 )
-                attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
                 if return_softmax_lse:
-                    attn_output = attn_output.reshape(
-                        num_tokens, layer.tp_q_head_num, self.kv_lora_rank
-                    )
-                    softmax_lse = softmax_lse.reshape(num_tokens, tp_q_head_num, -1)[
-                        :, : layer.tp_q_head_num, :1
-                    ]
-                    attn_output, softmax_lse = mask_empty_mla_dcp_shards_npu(
-                        attn_output,
-                        softmax_lse,
-                        self.forward_metadata.seq_lens,
-                    )
-                    return (
-                        attn_output.view(
-                            num_tokens,
-                            layer.tp_q_head_num * self.kv_lora_rank,
-                        ),
-                        softmax_lse,
-                    )
+                    return attn_output
             else:
                 if return_softmax_lse:
                     raise NotImplementedError(
