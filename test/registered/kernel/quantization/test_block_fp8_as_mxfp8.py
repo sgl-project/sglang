@@ -1,4 +1,4 @@
-"""Block FP8 weight loading, MXFP8 dispatch, and prefill autotune integration."""
+"""Block-FP8 weights served as MXFP8: loader output and numerics on the dense projections."""
 
 import unittest
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Fp8GemmRunnerBackend,
     can_serve_block_fp8_as_mxfp8,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,7 +111,6 @@ class TestFp8LinearMethod(_OptInCase):
             _quantize_partial,
             _wo_a_reduce,
         )
-        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 
         method = Fp8LinearMethod(_block32_config())
         w = torch.randn(5120, 2048, device=DEVICE, dtype=torch.bfloat16) / 2048**0.5
@@ -149,6 +149,42 @@ class TestFp8LinearMethod(_OptInCase):
                 amax = ref.abs().max().item()
                 error = (out.float() - ref).abs().max().item() / amax
                 self.assertLess(error, 1e-2, (n, k, m, error))
+
+    def test_loader_marks_layer_and_keeps_block_scales(self):
+        method = Fp8LinearMethod(_block32_config())
+        n, k = 512, 1024
+        q, s = _quant_block32(torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16))
+        layer = _build_layer(method, q, s)
+        self.assertTrue(method.block_fp8_as_mxfp8)
+        self.assertTrue(layer.block_fp8_mxfp8_ready)
+        self.assertEqual(tuple(layer.weight_scale_inv.shape), (n // BLOCK, k // BLOCK))
+        self.assertIsNotNone(layer.weight_scale_inv_swizzled)
+
+    def test_layout_opt_out_keeps_triton_path(self):
+        method = Fp8LinearMethod(_block32_config())
+        n, k = 512, 1024
+        q, s = _quant_block32(torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16))
+        layer = torch.nn.Module()
+        layer.keep_plain_weight_layout = True
+        method.create_weights(
+            layer=layer,
+            input_size_per_partition=k,
+            output_partition_sizes=[n],
+            input_size=k,
+            output_size=n,
+            params_dtype=torch.bfloat16,
+            skip_block_quant_check=True,
+            weight_loader=lambda *a, **kw: None,
+        )
+        layer = layer.to(DEVICE)
+        layer.weight.load_column_parallel_weight(q, tp_rank=0)
+        layer.weight_scale_inv.load_column_parallel_weight(
+            s.to(torch.float8_e8m0fnu), tp_rank=0
+        )
+        method.process_weights_after_loading(layer)
+        self.assertFalse(layer.block_fp8_mxfp8_ready)
+        with self.assertRaises(ValueError):
+            method.apply(layer, Mxfp8SwizzledInput(q[:4], s[:1]))
 
 
 class TestPrefillAutotune(_OptInCase):

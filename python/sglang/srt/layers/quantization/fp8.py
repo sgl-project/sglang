@@ -523,8 +523,13 @@ class Fp8LinearMethod(LinearMethodBase):
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
+            # Dispatch on the block size the weight will have after loading: an
+            # MXFP8 checkpoint converted to block-fp8 ends up as [128, 128].
+            effective_block_size = (
+                [128, 128] if self.convert_mxfp8_to_block else self.weight_block_size
+            )
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
-                weight_block_size=self.weight_block_size,
+                weight_block_size=effective_block_size,
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
@@ -537,8 +542,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
-        # 32-wide-K ue8m0 blocks can use FlashInfer MXFP8 on Blackwell;
-        # Triton is the fallback when no supported FlashInfer backend is selected.
+        # A 32-wide-K ue8m0 block weight is an MXFP8 operand; serve it through the
+        # FlashInfer MXFP8 GEMMs when an explicit FlashInfer backend is selected on
+        # Blackwell. Triton stays the fallback per layer (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
             self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
         )
@@ -805,11 +811,11 @@ class Fp8LinearMethod(LinearMethodBase):
         # this quant method is what consumes the weight. A layer whose weight is
         # read directly by the model (DeepSeek-V4 wo_a, whose absorb GEMM takes
         # .weight/.weight_scale_inv and runs its own batched kernel) sets
-        # skip_aiter_bpreshuffle and keeps the plain row-major layout.
+        # keep_plain_weight_layout and keeps the plain row-major layout.
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
-            and not getattr(layer, "skip_aiter_bpreshuffle", False)
+            and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
@@ -852,13 +858,11 @@ class Fp8LinearMethod(LinearMethodBase):
         """Derive the MXFP8 scale layout of a 32-wide-K ue8m0 block weight. The block
         scales stay in place for the Triton fallback and for consumers that read them."""
         layer.block_fp8_mxfp8_ready = False
-        if getattr(layer, "skip_aiter_bpreshuffle", False):
-            # The model reads .weight / .weight_scale_inv directly (DeepSeek-V4 wo_a);
-            # the trtllm backend would shuffle the weight in place.
+        if getattr(layer, "keep_plain_weight_layout", False):
+            # The model reads .weight / .weight_scale_inv directly.
             return
         n, k = layer.weight.shape
-        backend = self.mxfp8_dense_backend
-        if k % 32 != 0 or (backend.is_flashinfer_trtllm() and (k // 32) % 4 != 0):
+        if k % 32 != 0:
             return
         try:
             scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
@@ -1142,19 +1146,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.use_mxfp8 or (
-            self.block_fp8_as_mxfp8
-            and getattr(layer, "block_fp8_mxfp8_ready", False)
-            and (not isinstance(x, tuple) or isinstance(x, Mxfp8SwizzledInput))
-        ):
+        mxfp8_view = self.use_mxfp8 or (
+            self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
+        )
+        if isinstance(x, Mxfp8SwizzledInput):
+            if not mxfp8_view or not (
+                self.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or self.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            ):
+                raise ValueError(
+                    "Mxfp8SwizzledInput needs a layer with an MXFP8 view on a "
+                    "FlashInfer CUTLASS / CuTe-DSL backend"
+                )
+        elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
+            # A legacy (q, scale) block-fp8 pair keeps the block kernel.
+            mxfp8_view = False
+        if mxfp8_view:
             backend = self.mxfp8_dense_backend
-            if isinstance(x, Mxfp8SwizzledInput):
-                if not (
-                    backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
-                ):
-                    raise ValueError(
-                        "128x4 MXFP8 input requires a FlashInfer CUTLASS backend"
-                    )
             extra_kwargs = {}
             if self.mxfp8_prefill_autotune_min_tokens is not None:
                 input_tensor = x[0] if isinstance(x, tuple) else x

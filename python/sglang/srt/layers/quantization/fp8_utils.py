@@ -584,13 +584,12 @@ def dispatch_w8a8_block_fp8_linear(
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
+
+    Only the Triton kernel reads the weight block size at launch; DeepGEMM, the
+    FlashInfer groupwise kernels and CUTLASS take 128-wide K blocks only, so any
+    other block shape goes to Triton regardless of the backend setting.
     """
-    if weight_block_size is not None and weight_block_size != [128, 128]:
-        # DeepGEMM, FlashInfer groupwise and CUTLASS take 128x128 blocks only;
-        # the Triton kernel reads the block size at launch. With an explicit
-        # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
-        # blocks with ue8m0 scales to the MXFP8 dense kernels instead
-        # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
+    if weight_block_size is not None and weight_block_size[1] != 128:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()
@@ -722,15 +721,16 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
-    Requires Blackwell; unresolved auto and Triton settings keep the block kernel.
+    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on.
+
+    Only an explicit FlashInfer CUTLASS / CuTe-DSL ``--fp8-gemm-backend`` on
+    Blackwell qualifies: those kernels take a separately stored swizzled scale and
+    leave the weight untouched, so the block layout stays readable by the Triton
+    fallback and by consumers that use ``.weight`` directly. Anything else keeps
+    the block kernel.
     """
     backend = get_fp8_gemm_runner_backend()
-    if not (
-        backend.is_flashinfer_cutedsl()
-        or backend.is_flashinfer_cutlass()
-        or backend.is_flashinfer_trtllm()
-    ):
+    if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -756,12 +756,8 @@ def can_serve_block_fp8_as_mxfp8(
 
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
-    """The MXFP8 linear for the block-fp8 route, with the FlashInfer autotuner kept out
-    of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
-    if backend.is_flashinfer_trtllm():
-        return partial(
-            flashinfer_mxfp8_blockscaled_linear, backend="trtllm", pin_tactic=True
-        )
+    """The MXFP8 linear for a block-fp8 weight served as MXFP8, with the FlashInfer
+    autotuner kept out of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True

@@ -903,7 +903,7 @@ class MqaAttentionBase(nn.Module):
             # that is aiter's B-preshuffle, which silently permutes the weight
             # in place (same shape, dtype and strides) and makes this GEMM
             # return noise.
-            self.wo_a.skip_aiter_bpreshuffle = True
+            self.wo_a.keep_plain_weight_layout = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -4925,7 +4925,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
                 # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # check the linear method honoured keep_plain_weight_layout: a
                 # preshuffled weight has the same shape, dtype and strides and
                 # would only show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
