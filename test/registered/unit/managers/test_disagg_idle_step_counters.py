@@ -259,6 +259,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def run_and_check(self, scheduler, event_loop, mode, after_idle):
         observed_idle_flags = []
         observed_iters = []
+        completion_timestamps = []
 
         def run_batch(batch, pp_proxy_tensors=None):
             # Exercise the real timestamp, iteration, and flag handoff. Only
@@ -274,7 +275,21 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            scheduler._record_step_counters(batch, result)
+            # Results follow any launches already performed by the real loop;
+            # overlap and pipeline loops can have multiple batches in flight.
+            end_ts = (
+                max(
+                    LAUNCH_TIMESTAMPS[scheduler.forward_ct - 1],
+                    completion_timestamps[-1] if completion_timestamps else 0,
+                )
+                + 0.0625
+            )
+            completion_timestamps.append(end_ts)
+            with patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=end_ts,
+            ):
+                scheduler._record_step_counters(batch, result)
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
@@ -293,9 +308,13 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         expected_samples = len(expected_intervals)
         expected_busy_us = round(sum(expected_intervals) * 1_000_000)
         if mode == ForwardMode.EXTEND:
+            expected_busy = completion_timestamps[-1] - LAUNCH_TIMESTAMPS[0]
+            if after_idle:
+                expected_busy -= LAUNCH_TIMESTAMPS[2] - completion_timestamps[1]
+            expected_busy_us = round(expected_busy * 1_000_000)
             self.assertEqual(scheduler.total_prefill_busy_us, expected_busy_us)
             self.assertEqual(
-                scheduler.total_prefill_uncached_tokens, expected_samples * 1024
+                scheduler.total_prefill_uncached_tokens, len(LAUNCH_TIMESTAMPS) * 1024
             )
         else:
             self.assertEqual(scheduler.decode_moment_totals[0], expected_samples)
@@ -306,6 +325,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
+        scheduler._prev_prefill_end_ts = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE

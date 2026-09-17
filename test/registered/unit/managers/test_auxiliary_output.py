@@ -527,6 +527,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
             is_prebuilt=lambda: False,
             is_split_prefill=lambda: True,
         ),
+        split_index=0,
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
