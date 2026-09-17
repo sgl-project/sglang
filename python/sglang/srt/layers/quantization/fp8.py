@@ -1603,8 +1603,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             build_mega_moe_experts_weights(layer)
             return
 
-        # AMD FP4 experts: use aiter's native MXFP4 MoE path
-        if _use_aiter and self.is_fp4_expert:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path.
         # Skipped when dequant_fp4_to_fp8 is requested: this branch returns
         # unconditionally, so without the extra check SGLANG_DSV4_FP4_DEQUANT=1
