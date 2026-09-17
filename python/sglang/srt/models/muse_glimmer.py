@@ -303,7 +303,7 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.use_output_gate:
             gate, _ = self.output_gate_proj(hidden_states)
-            if _is_cuda or _is_cpu:
+            if _is_cuda:
                 attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
             elif _is_cpu:
                 attn_out = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(
