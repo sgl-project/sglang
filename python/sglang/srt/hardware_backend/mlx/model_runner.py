@@ -354,6 +354,12 @@ class MlxModelRunner:
             self._cache_layout.auxiliary_layer_indices,
         )
 
+    def prepare_for_kv_cache_release(self, req_id: str) -> None:
+        """Publish native KV before radix insertion and request-row reuse."""
+        if not self.disable_radix_cache:
+            self._sync_decode_kv_to_pool(req_id)
+        self.store_auxiliary_state_for_request(req_id)
+
     def store_auxiliary_state_for_request(self, req_id: str) -> None:
         """Snapshot native auxiliary state before scheduler-owned radix insert."""
         req_pool_idx = self._req_pool_idx.get(req_id)
@@ -1678,9 +1684,9 @@ class MlxModelRunner:
         """Check if a request has active state."""
         return req_id in self._req_caches
 
-    def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
+    def remove_request(self, req_id: str, *, sync_kv: bool = True):
+        """Release native request state, optionally publishing its KV first."""
+        if sync_kv and not self.disable_radix_cache:
             self._sync_decode_kv_to_pool(req_id)
 
         self._req_token_ids.pop(req_id, None)
