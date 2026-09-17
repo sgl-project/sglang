@@ -563,7 +563,7 @@ jobs:
 
         recommend-tests-from-coverage,
       ]
-    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode = true }}
+    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode == true }}
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
