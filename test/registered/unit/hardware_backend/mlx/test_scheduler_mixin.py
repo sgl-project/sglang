@@ -269,13 +269,22 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.ingest_requests.side_effect = recv_side_effect
-        # Model handle_shutdown: processing a non-empty recv batch (the
-        # ShutdownReq) flips the flag; the loop must notice at the top of the
-        # next iteration instead of polling forever.
-        scheduler.process_input_requests.side_effect = lambda reqs: (
-            setattr(scheduler, "gracefully_exit", True) if reqs else None
-        )
+        # Model handle_shutdown under unified intake (#38389): ingest_requests
+        # receives AND dispatches, so processing a non-empty recv batch (the
+        # ShutdownReq stand-in) flips the flag inside the same call; the loop
+        # must notice at the top of the next iteration instead of polling
+        # forever.
+        stream = iter(recv_side_effect)
+
+        def _ingest():
+            item = next(stream)
+            if isinstance(item, BaseException):
+                raise item
+            if item:
+                scheduler.gracefully_exit = True
+            return item
+
+        scheduler.ingest_requests.side_effect = _ingest
         plan = MagicMock()
         plan.batch_to_run = None
         scheduler.get_next_batch_to_run.return_value = plan
