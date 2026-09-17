@@ -95,6 +95,9 @@ class TestGLM53FlashH200LowLatency(
         "--speculative-num-draft-tokens",
         "6",
         "--speculative-adaptive",
+        # Leave about 13 GiB per GPU for activations and CUDA graphs.
+        "--mem-fraction-static",
+        "0.907",
     ]
 
 
