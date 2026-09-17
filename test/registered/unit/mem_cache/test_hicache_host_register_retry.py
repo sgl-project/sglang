@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _register_chunk_with_retry,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MiB = 1024**2
 

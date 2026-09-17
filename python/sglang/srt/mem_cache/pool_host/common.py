@@ -157,18 +157,11 @@ def _register_chunk_with_retry(
 ) -> int:
     """Register [ptr, ptr + size), shrinking the chunk on transient failures.
 
-    Single-shot cudaHostRegister calls of tens of GB were observed to fail
-    intermittently with cudaErrorInvalidValue in processes under heavy GPU
-    memory usage, while smaller registrations succeed. Returns the chunk size
-    that was actually registered.
-
-    When a copy granularity is given, chunks only shrink in whole granularity
-    units, so every non-final boundary stays a multiple of the granularity
-    and a logical copy unit never spans two registrations (the failure mode
-    chunked registration was aligned for). Without a granularity, chunks
-    halve down to _MIN_REGISTER_CHUNK_BYTES; such buffers do not issue
-    page_first batch copies, so page-aligned splits are safe. Raises
-    RuntimeError when the smallest allowed chunk cannot be registered either.
+    All non-final registration boundaries remain aligned to the
+    caller-provided copy granularity, so a logical copy unit never spans two
+    registrations. Without a granularity, chunks halve down to
+    _MIN_REGISTER_CHUNK_BYTES. Returns the chunk size actually registered;
+    raises RuntimeError when even the smallest allowed chunk fails.
     """
     orig_size = size
     floor = granularity if granularity is not None else _MIN_REGISTER_CHUNK_BYTES
@@ -212,9 +205,7 @@ def _cuda_host_register(
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
-    # Preserve the legacy single-call behavior unless the caller provides a
-    # copy granularity. Splitting an unknown page-first layout at an arbitrary
-    # byte offset can make one cudaMemcpyBatchAsync span two registrations.
+    # Without a copy granularity, split only at the chunk limit.
     chunk_bytes = total
     if registration_granularity_bytes is not None:
         if registration_granularity_bytes <= 0:

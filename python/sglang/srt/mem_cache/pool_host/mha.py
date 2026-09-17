@@ -197,8 +197,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                if self.layout in ("page_first", "page_first_direct", "page_head")
+                else self.token_stride_size
             ),
         )
         return buffer
@@ -812,8 +812,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                if self.layout in ("page_first", "page_first_direct", "page_head")
+                else self.token_stride_size
             ),
         )
 
