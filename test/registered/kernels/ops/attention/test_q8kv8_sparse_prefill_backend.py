@@ -298,12 +298,11 @@ def _patched_compressed_sparse_cache_paths(compress_ratio: int):
         )
 
     def fake_ensure_compressed(self, compress_ratio, page_table, extra_page_size):
-        _ = page_table
+        _ = page_table, extra_page_size
         n_compressed = 8
         device = self.swa_token_ids.device
         gather = CompressedGather(
             flat_token_ids=torch.arange(n_compressed, dtype=torch.int64, device=device),
-            page_size=extra_page_size,
             compressed_base=torch.zeros(
                 self.num_reqs, dtype=torch.int32, device=device
             ),

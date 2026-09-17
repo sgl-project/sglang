@@ -99,7 +99,7 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -1557,11 +1557,8 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        # The rows this forward runs are the extend; padding rows are never
-        # combined, so their position is irrelevant.
+        # The rows this forward runs are the extend, one per causal position.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
-        if query_pos.shape[0] < num_qo_tokens:
-            query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),

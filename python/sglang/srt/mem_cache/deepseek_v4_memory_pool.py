@@ -1358,12 +1358,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the extra cache's format from."""
-        if self.uniform_fp8:
-            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
-            _, _, compress_kv_pool = self.layer_mapping[layer_id]
-            assert compress_kv_pool is not None
-            return compress_kv_pool.kv_cache_total_dim
-        return self.get_extra_key_layout(layer_id).bytes_per_token
+        _, _, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.kv_cache_total_dim
 
     def get_swa_key_layout(self) -> KVLayout:
         return self.kv_layout
@@ -1371,10 +1368,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the SWA cache's format from."""
-        if self.uniform_fp8:
-            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
-            return self.swa_kv_pool.kv_cache_total_dim
-        return self.kv_layout.bytes_per_token
+        return self.swa_kv_pool.kv_cache_total_dim
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         self.wait_layer_transfer(layer_id)
