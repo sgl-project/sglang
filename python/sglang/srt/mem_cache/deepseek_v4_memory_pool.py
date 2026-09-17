@@ -1270,10 +1270,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         pools = [
             p for p in self.compress_state_pools if p is not None and p.request_scoped
         ]
-        # One index list addresses every request-state buffer, so the
-        # request-scoped pools must share a ring layout; today there is one.
-        assert len(pools) == 1, (
-            f"expected one request-scoped state pool, got {len(pools)}"
+        assert pools, "no request-scoped state pool"
+        # One index list addresses every request-state buffer (one per layer), so
+        # the request-scoped pools must share a ring layout.
+        layout = (pools[0].ratio, pools[0].online, pools[0].ring_size)
+        assert all((p.ratio, p.online, p.ring_size) == layout for p in pools), (
+            "request-scoped state pools must share one ring layout"
         )
         return pools[0].transfer_indices(req_pool_idx, seq_len)
 

@@ -857,10 +857,14 @@ class TestDSV4RequestStateTransfer(unittest.TestCase):
         kv.compress_state_pools = [None, *pools]
         return kv
 
-    def test_pool_delegates_to_its_request_scoped_state_pool(self):
+    def test_pool_delegates_to_its_request_scoped_state_pools(self):
+        # One state pool per compressed layer; all c128 layers share the ring layout.
         kv = self._kv(
             _make_state_pool(ratio=4, request_scoped=False),
-            _make_state_pool(ratio=128, request_scoped=True, ring_size=256),
+            *[
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=256)
+                for _ in range(20)
+            ],
         )
         np.testing.assert_array_equal(
             kv.request_state_transfer_indices(7, 129),
@@ -880,15 +884,15 @@ class TestDSV4RequestStateTransfer(unittest.TestCase):
             kv.request_state_transfer_indices(7, 257), np.array([7], dtype=np.int32)
         )
 
-    def test_requires_exactly_one_request_scoped_pool(self):
+    def test_requires_request_scoped_pools_with_one_ring_layout(self):
         with self.assertRaises(AssertionError):
             self._kv(
                 _make_state_pool(ratio=4, request_scoped=False)
             ).request_state_transfer_indices(0, 5)
         with self.assertRaises(AssertionError):
             self._kv(
-                _make_state_pool(ratio=2, request_scoped=True),
-                _make_state_pool(ratio=128, request_scoped=True),
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=128),
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=256),
             ).request_state_transfer_indices(0, 5)
 
     def test_page_scoped_pool_has_no_transfer_indices(self):
