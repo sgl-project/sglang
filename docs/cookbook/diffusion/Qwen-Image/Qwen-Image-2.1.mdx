@@ -84,6 +84,33 @@ versions can change memory use and latency. Transparent-input editing and the
 multi-reference/batched request recipes retain their separate H200 verification
 scope in the picker.
 
+### Lossless RoPE fusion
+
+The native DiT fuses the float conversion, complex rotary multiplication, and
+output cast on supported CUDA tensors. Its first eager call checks exact
+agreement with the original PyTorch operation; a mismatch disables the fusion.
+No additional command flag is needed.
+
+A separate comparison on 2026-09-17 used native revision `6b190085c48` as the
+baseline and `63ed20bbedb` with the fusion. Both used the software versions
+listed above, full-image VAE decode, eager execution, and the recommended
+placement and attention backend for each GPU:
+
+- B200: generation **3.42 → 3.27 s** (4.5% lower latency), editing
+  **4.03 → 3.89 s** (3.4% lower).
+- RTX 5090: generation **14.49 → 14.20 s** (2.0% lower), editing
+  **16.97 → 16.68 s** (1.7% lower).
+
+Each GPU ran four fresh servers in optimized/baseline/baseline/optimized order.
+Each startup used two full-size warmups followed by five generations and three
+edits. The medians pool 10 generations and six edits per variant, all at
+1024px, 40 steps, seed 42, CFG 1, CPU noise generation, and one RGBA PNG per
+request. The workload generated a red teapot and edited the same reference
+image to blue. HTTP times include PNG serialization and exclude startup.
+All corresponding output pixels were identical between revisions on each GPU.
+These measurements cover this fixed workload; other prompts and configurations
+can have different gains.
+
 ## 2. Model capabilities
 
 Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
