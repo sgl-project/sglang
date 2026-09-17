@@ -118,7 +118,13 @@ def _parallel_config_leaves() -> frozenset:
 _MISSING_READ = object()
 
 _LIVE_READS: dict = {
+    # Three widths, three questions about the WORLD group, one for each point
+    # on its timeline: what it was built at, what it has room for, and what is
+    # serving now. They are one number until an elastic scale-up moves the
+    # third one, which is why each of them has to say which it is.
     "world_size": "get_world_size",
+    "launch_world_size": "get_world_size",
+    "max_world_size": lambda self: self.max_ep_size or self.launch_world_size,
     "world_rank": "get_world_rank",
     "tp_rank": "get_tensor_model_parallel_rank",
     "pp_rank": "get_pipeline_model_parallel_rank",
@@ -139,6 +145,25 @@ _LIVE_READS: dict = {
     "attn_tp_group": "get_attn_tp_group",
     "attn_cp_group": "get_attn_cp_group",
     "dcp_group": "get_dcp_group",
+}
+
+# Docs for the names above that need one. A rank or a group handle is its own
+# explanation; the three world widths are not, because they are the same number
+# right up until the moment they are not.
+_LIVE_READ_DOCS: dict = {
+    "launch_world_size": (
+        "Width the WORLD group was built at: `len(ranks)`, frozen when the "
+        "coordinator was constructed. What every startup reader wants -- "
+        "memory accounting, KV cache sizing, graph capture, weight loading -- "
+        "and what a scale-up leaves behind rather than updates."
+    ),
+    "max_world_size": (
+        "Ranks the WORLD group has room for: `--max-ep-size` when it is set, "
+        "otherwise the launch width. This is the ceiling the process group was "
+        "pre-allocated to, which is why `init_distributed_environment` takes it "
+        "under this name. Whether the group can grow at all is a separate "
+        "question, and its answer is the leaf being set, not this width."
+    ),
 }
 
 
@@ -195,9 +220,16 @@ def derive_parallel_widths(
     the arithmetic lives here rather than being read back off the group
     coordinators.
 
-    `world_size` is not among them: it is not a quotient, and `get_world_size()`
-    answers with the live WORLD group, which stays right through an elastic
-    scale-up that a value fixed at group build would not survive.
+    The world widths are not among them: neither is a quotient, and they are
+    not one number. `launch_world_size` is what the WORLD group was built at and is
+    frozen there -- `GroupCoordinator.world_size` is `len(ranks)`, so it does
+    not move when mooncake admits ranks into an expandable WORLD;
+    `max_world_size` is what that group has room for. How much of that room is
+    serving right now is elastic-EP state, asked of the manager that owns it
+    rather than mirrored here. Deriving either from the leaves
+    would be wrong in a fourth way: on a scale joiner it would answer with the
+    joining cohort's own `tp * pp`, while that process's WORLD spans
+    `ep_join_rank_offset + tp * pp`.
     """
     return {
         "attn_dp_size": attn_dp_size,
@@ -422,8 +454,9 @@ def _install_parallel_properties() -> None:
     chain rather than one per kind of name.
     """
     docs = {name: decl.doc for name, decl in _derived_widths().items()}
+    docs.update(_LIVE_READ_DOCS)
 
-    for name in list(docs) + list(_LIVE_READS):
+    for name in list(_derived_widths()) + list(_LIVE_READS):
 
         def getter(self, _name=name):
             return self._read(_name)
