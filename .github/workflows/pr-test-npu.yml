@@ -403,27 +403,93 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Download test case map
+        env:
+          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
+          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            --retry 3 \
-            --retry-delay 5 \
-            --retry-all-errors \
-            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/test_case_map.json" \
-            -o test_case_map.json
+
+          if ! python3 -c "import obs" >/dev/null 2>&1; then
+            echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages esdk-obs-python
+          fi
+
+          python3 - <<'EOF'
+          import os
+          import time
+          from obs import ObsClient
+
+          # Bucket is private, so downloads must be signed with the same
+          # credentials as the upload in the setup-covstub job.
+          client = ObsClient(
+              access_key_id=os.environ['OBS_ACCESS_KEY'],
+              secret_access_key=os.environ['OBS_SECRET_KEY'],
+              server='https://obs.cn-southwest-2.myhuaweicloud.com'
+          )
+
+          last_error = None
+          for attempt in range(1, 4):
+              resp = client.getObject('sglang-npu', 'coverage/test_case_map.json',
+                                      downloadPath='test_case_map.json')
+              if resp.status < 300:
+                  print(f'Downloaded coverage/test_case_map.json (attempt {attempt})')
+                  break
+              last_error = f'status={resp.status}, error={resp.errorMessage}'
+              print(f'Download attempt {attempt} failed: {last_error}')
+              if attempt < 3:
+                  time.sleep(5)
+          else:
+              raise Exception(f'Download failed after 3 attempts: {last_error}')
+          EOF
+
           test -s test_case_map.json
           echo "Downloaded test_case_map.json"
           du -h test_case_map.json
 
       - name: Download coverage package and extract covstub
+        env:
+          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
+          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            --retry 3 \
-            --retry-delay 5 \
-            --retry-all-errors \
-            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/outputs.tar.gz" \
-            -o outputs.tar.gz
+
+          if ! python3 -c "import obs" >/dev/null 2>&1; then
+            echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages esdk-obs-python
+          fi
+
+          python3 - <<'EOF'
+          import os
+          import time
+          from obs import ObsClient
+
+          # Bucket is private, so downloads must be signed with the same
+          # credentials as the upload in the setup-covstub job.
+          client = ObsClient(
+              access_key_id=os.environ['OBS_ACCESS_KEY'],
+              secret_access_key=os.environ['OBS_SECRET_KEY'],
+              server='https://obs.cn-southwest-2.myhuaweicloud.com'
+          )
+
+          last_error = None
+          for attempt in range(1, 4):
+              resp = client.getObject('sglang-npu', 'coverage/outputs.tar.gz',
+                                      downloadPath='outputs.tar.gz')
+              if resp.status < 300:
+                  print(f'Downloaded coverage/outputs.tar.gz (attempt {attempt})')
+                  break
+              last_error = f'status={resp.status}, error={resp.errorMessage}'
+              print(f'Download attempt {attempt} failed: {last_error}')
+              if attempt < 3:
+                  time.sleep(5)
+          else:
+              raise Exception(f'Download failed after 3 attempts: {last_error}')
+          EOF
+
           test -s outputs.tar.gz
           echo "Downloaded outputs.tar.gz"
           du -h outputs.tar.gz
