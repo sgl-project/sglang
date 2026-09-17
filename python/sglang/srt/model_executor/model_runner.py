@@ -423,6 +423,23 @@ class ModelRunner:
             )
             raise
 
+        if current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get():
+            from sglang.srt.utils.cuda_event_pool import (
+                install_cuda_event_pool,
+                prewarm_cuda_event_pool,
+            )
+
+            pool_size = envs.SGLANG_CUDA_EVENT_POOL_SIZE.get()
+            installed = install_cuda_event_pool(pool_size=pool_size)
+            pool_state = prewarm_cuda_event_pool(ps.gpu_id)
+            if installed and pool_state is not None:
+                logger.info(
+                    "Enabled the CUDA event pool for Stream.wait_stream on "
+                    "device %d with %d events.",
+                    ps.gpu_id,
+                    pool_state["size"],
+                )
+
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
