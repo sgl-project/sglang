@@ -52,11 +52,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hip,
     is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
@@ -229,8 +231,19 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # TODO: this logic should be fixed in non-hip platform
+        self.is_hip_dspark_draft = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        )
+        if self.is_hip_dspark_draft:
+            # Drafts never join the dcp group so we ignore it
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -2205,14 +2218,15 @@ class TritonAttnBackend(AttentionBackend):
         # would never activate on the default path. There we key the bake on capture-time-known
         # signals (batch, head-tiles, is_mla) via lean_capture_policy -- Lean's fixed persistent
         # grid still adapts to raggedness on-device at replay. In eager decode, real seq_lens
-        # are known, so lean_decode_seqlen_gate uses them. An explicit True/False override is
-        # respected; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel.
+        # are known, so lean_decode_seqlen_gate uses them. Deterministic inference requires
+        # the batch-invariant standard path; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch
+        # also forces that path. Otherwise, an explicit True/False override is respected.
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
         )
 
-        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if self.enable_deterministic or envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
