@@ -421,10 +421,10 @@ class Fp8Config(QuantizationConfig):
                 and self.is_dsv4_fp4_experts
             ):
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
-                    NPUW4A4Fp4MoEMethod,
+                    NPUW4A8MXFP4FusedMoEMethod,
                 )
 
-                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
+                return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -2358,10 +2358,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
         num_experts = int(layer.num_local_experts)
         device = layer.w13_weight.device
+        clamp_limit = (
+            self.moe_runner_config.gemm1_clamp_limit
+            if self.moe_runner_config.gemm1_clamp_limit is not None
+            else self.moe_runner_config.swiglu_limit
+        )
         for name, value in (
             ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
             ("gemm1_beta", self.moe_runner_config.gemm1_beta),
-            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+            ("gemm1_clamp_limit", clamp_limit),
         ):
             tensor = (
                 None

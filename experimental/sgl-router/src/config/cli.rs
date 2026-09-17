@@ -71,6 +71,11 @@ pub struct Cli {
     /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+    /// Disable router-generated input_ids for this model. Workers tokenize messages
+    /// themselves; cache-aware routing still renders locally. Use for worker-only
+    /// thinking/effort defaults, parser/template overrides, or template stop strings.
+    #[arg(long)]
+    pub disable_input_ids_forwarding: bool,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -702,6 +707,7 @@ impl Cli {
                 // HuggingFace repo id) when --tokenizer-path is omitted.
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 id: self.model_id,
+                disable_input_ids_forwarding: self.disable_input_ids_forwarding,
                 policy: self.policy,
                 decode_policy: self.decode_policy,
                 bucket_config,
@@ -936,6 +942,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+    }
+
+    #[test]
+    fn input_ids_forwarding_can_be_disabled_for_the_model() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(!defaults.model.disable_input_ids_forwarding);
+        let disabled = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--disable-input-ids-forwarding",
+        ]))
+        .unwrap();
+        assert!(disabled.model.disable_input_ids_forwarding);
     }
 
     #[test]
