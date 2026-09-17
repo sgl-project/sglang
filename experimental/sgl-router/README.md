@@ -169,6 +169,48 @@ queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
 
+## Chat rendering
+
+The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
+HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
+for template-less models. Cache-aware routing hashes the rendered tokens so its
+prefix queries match the blocks the engine caches. Models the engine encodes in
+code but dynamo-render cannot tokenize here (Inkling, Kimi K3) route via raw prompt
+text, as does any model whose template fails to load or render.
+
+Plain text chat requests (string `content`, no tools, no template kwargs or
+reasoning controls or historical `reasoning_content`, no assistant continuation,
+no consecutive users or non-leading system turns) additionally forward the
+rendered tokens to the engine as `input_ids`, retaining the original messages,
+so the engine skips re-tokenizing. Every other request shape is rendered for
+routing only: the router renders with dynamo-render and does not replicate
+SGLang's request normalization, so forwarding is enabled shape by shape as
+parity is verified. Use matching model files on the router and workers; worker
+template overrides and default kwargs are not observable from the request.
+
+Set `--disable-input-ids-forwarding` for this router's model when worker-side
+rendering has not been verified to match. This disables router-generated IDs
+for every routing policy; cache-aware routing still renders and tokenizes
+locally, and the original messages reach the workers for engine processing.
+Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
+
+Forwarding logs its assumptions at startup. In particular, disable it for
+`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
+worker parser overrides such as `--tool-call-parser deepseekv32` that select a
+native encoder over a shipped template, or conversation templates with stop
+strings (the engine's `input_ids` path skips those template stops). These worker
+settings are not inferred from the router's environment. Disabling forwarding preserves
+engine behavior but does not establish parity for local routing hashes.
+
+Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
+string content into arrays differently from the worker. Dynamo 5.1.2 does not expose
+its conversion flag, so the router cannot automatically block these templates.
+Detailed content-format parity coverage follows in #39133.
+
+The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
+with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
 ## HTTP/2
 
 There is nothing to configure. The router negotiates per connection inbound and
