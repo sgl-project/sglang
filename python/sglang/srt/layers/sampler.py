@@ -355,8 +355,6 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
-            # sgl-kernel-xpu mirrors the flashinfer sampling API, so both share
-            # this branch.
             if backend in ("flashinfer", "intel_xpu"):
                 assert sampling_info.sampling_seed is None, (
                     f"Sampling seed is not supported for {backend} backend"
