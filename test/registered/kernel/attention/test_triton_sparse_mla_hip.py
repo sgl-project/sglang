@@ -101,9 +101,7 @@ def test_gfx950_fp8_gate_supports_tp8_prefill(monkeypatch):
         lambda _device: True,
     )
     for heads in (8, 16):
-        assert _is_gfx950_sparse_mla_fp8(
-            torch.float8_e4m3fn, heads, 512, 64, 576
-        )
+        assert _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, heads, 512, 64, 576)
     assert not _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, 4, 512, 64, 576)
 
 
