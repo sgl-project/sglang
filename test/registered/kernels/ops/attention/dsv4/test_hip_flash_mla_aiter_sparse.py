@@ -3,14 +3,16 @@
 import math
 import unittest
 from types import SimpleNamespace
-
 import torch
-
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 NOPE, ROPE, D = 448, 64, 512

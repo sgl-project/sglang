@@ -4,18 +4,21 @@ import os
 import types
 import unittest
 from unittest.mock import Mock, patch
-
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+
+
+
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# backend-specific: HIP compressor stores use packed FP8/FP4 cache layouts.
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 HIDDEN = 2048
 HEAD_DIM = 512

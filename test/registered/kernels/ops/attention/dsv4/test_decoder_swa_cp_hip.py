@@ -3,18 +3,22 @@
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-
 import torch
-
+from sglang.test.test_utils import CustomTestCase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 @unittest.skipUnless(is_hip() and torch.cuda.is_available(), "HIP attention")
-class TestDecoderSwaContextParallel(unittest.TestCase):
+class TestDecoderSwaContextParallel(CustomTestCase):
     def test_local_tail_attention_matches_unsharded(self):
         from sglang.srt.layers.cp import base as cp_base
         from sglang.srt.layers.cp.interleave import (

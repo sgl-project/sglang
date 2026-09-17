@@ -1,14 +1,11 @@
 """Single-launch replacements for the DeepSeek-V4.1 decode glue on HIP must be bitwise the torch chains they replace."""
 
 from __future__ import annotations
-
 import random
 import sys
-
 import pytest
-import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
+import sgl_kernel
 import torch
-
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
@@ -31,7 +28,12 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -67,8 +69,8 @@ def _topk_inputs(bs, width, page_size, lens):
 @pytest.mark.skipif(
     not _aot_topk_sorts_output(), reason="sgl_kernel predates sort_output"
 )
-@pytest.mark.parametrize("topk", [512, 100])
-@pytest.mark.parametrize("with_raw", [True, False])
+@pytest.mark.parametrize("topk", [512, 100], ids=['512', '100'])
+@pytest.mark.parametrize("with_raw", [True, False], ids=['True', 'False'])
 def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: bool):
     rng = _seed(topk)
     for width in (1024, 70000):
@@ -136,8 +138,8 @@ def _candidates(rng, rows, num_blocks, topk_blocks, block_size, seq_lens):
     )
 
 
-@pytest.mark.parametrize("topk", [512])
-@pytest.mark.parametrize("with_raw", [True, False])
+@pytest.mark.parametrize("topk", [512], ids=['512'])
+@pytest.mark.parametrize("with_raw", [True, False], ids=['True', 'False'])
 def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bool):
     rng = _seed(11 + topk)
     block_size, topk_blocks, page_size = 64, 16, 64
@@ -172,7 +174,7 @@ def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bo
             assert torch.equal(outs[0][1], outs[1][1])
 
 
-@pytest.mark.parametrize("bpp", [4])
+@pytest.mark.parametrize("bpp", [4], ids=['4'])
 def test_expand_index_page_table(bpp: int):
     _seed(5)
     for bs, n in ((1, 4608), (3, 17), (0, 10)):
@@ -197,8 +199,8 @@ def test_expand_index_page_table(bpp: int):
     )
 
 
-@pytest.mark.parametrize("loc_dtype", [torch.int64])
-@pytest.mark.parametrize("ratios", [(1, 2)])
+@pytest.mark.parametrize("loc_dtype", [torch.int64], ids=['torch.int64'])
+@pytest.mark.parametrize("ratios", [(1, 2)], ids=['(1, 2)'])
 def test_low_ratio_compression_metadata(loc_dtype, ratios):
     rng = _seed(7)
     for rows, nw in ((1, 1), (9, 9), (12, 5)):
@@ -235,8 +237,8 @@ def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return q_fp4, q_scale
 
 
-@pytest.mark.parametrize("heads", [32])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("heads", [32], ids=['32'])
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=['torch.bfloat16'])
 def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
     _seed(17)
     for tokens in (1, 40):
@@ -258,7 +260,7 @@ def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
     assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
 
 
-@pytest.mark.parametrize("compressed_kv", [False, True])
+@pytest.mark.parametrize("compressed_kv", [False, True], ids=['False', 'True'])
 def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
     from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
         rope_tail_fake_quant_fp4,

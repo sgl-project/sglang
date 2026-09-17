@@ -6,16 +6,39 @@ follow the decode kernel's own reference quantizer.
 """
 
 import unittest
-
 import torch
-
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
+import unittest
+import torch
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.test import dsv41_kv_quant_reference as tq
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
+import math
+import unittest
+from itertools import product
+import torch
+from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+from sglang.kernels.ops.attention.dsv4.elementwise import (
+    fused_k_norm_rope_flashmla,
+    fused_rope_inplace,
+)
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 REFERENCE = {
     KVLayout.V41: tq.quantize_k_cache_v41,
@@ -448,6 +471,232 @@ class TestV41KVStore(CustomTestCase):
                     self.assert_rows_close(
                         cache, ref, layout, page_size, out_loc[valid]
                     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CASES = {
+    KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
+    KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
+}
+
+
+def bits(t: torch.Tensor) -> torch.Tensor:
+    """bf16 as int16, so that -0.0 and NaN payloads compare exactly."""
+    return t.contiguous().view(torch.int16)
+
+
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
+class TestV41KVDequant(CustomTestCase):
+    def _gather_ref(self, dequant, pages, page_size, ids):
+        return dequant(pages, page_size).view(-1, 512)[ids.long()].unsqueeze(1)
+
+    def test_quantized_pages(self):
+        g = torch.Generator(device="cuda").manual_seed(0)
+        for layout, (quant, dequant) in CASES.items():
+            for page_size, num_pages in ((64, 9), (256, 3), (2, 50)):
+                with self.subTest(layout=layout.name, page_size=page_size):
+                    k = torch.randn(
+                        num_pages,
+                        page_size,
+                        512,
+                        generator=g,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    k = (
+                        k
+                        * torch.exp2(
+                            torch.randint(
+                                -12,
+                                6,
+                                (num_pages, page_size, 1),
+                                generator=g,
+                                device="cuda",
+                            ).float()
+                        )
+                    ).to(torch.bfloat16)
+                    k[0, 0, :32] = 0
+                    k[0, 0, 32:48] = -0.0
+                    pages = quant(k, page_bytes=layout.page_bytes(page_size))
+                    ids = torch.randint(
+                        0,
+                        num_pages * page_size,
+                        (777,),
+                        generator=g,
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    got = dequantize_k_cache_paged(pages, ids, page_size, layout=layout)
+                    self.assertEqual(got.shape, (777, 1, 512))
+                    self.assertTrue(
+                        torch.equal(
+                            bits(got),
+                            bits(self._gather_ref(dequant, pages, page_size, ids)),
+                        )
+                    )
+                    # The fp4 cache dequantizes to the model's fake-quantized value
+                    # (compared by value: the fake quant maps an exact -0.0 to +0.0).
+                    if layout is KVLayout.V41_FP4:
+                        expect = tq.fake_quant_compressed_kv(
+                            k.view(-1, 512)[ids.long()]
+                        ).unsqueeze(1)
+                        self.assertTrue(torch.equal(got, expect))
+
+    def test_random_bytes_and_workspace_slice(self):
+        """Arbitrary payload bytes (scales in the quantizer's range) and an
+        ``out`` that is a strided slice of a larger workspace."""
+        g = torch.Generator(device="cuda").manual_seed(1)
+        for layout, (_, dequant) in CASES.items():
+            page_size, num_pages = 64, 7
+            with self.subTest(layout=layout.name):
+                pages = torch.randint(
+                    0,
+                    256,
+                    (num_pages, layout.page_bytes(page_size)),
+                    generator=g,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                if layout is KVLayout.V41:
+                    lo = layout.scale_offset(page_size)
+                    hi = lo + page_size * layout.scale_bytes
+                    pages[:, lo:hi] = torch.randint(
+                        100,
+                        140,
+                        (num_pages, hi - lo),
+                        generator=g,
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                ids = torch.randint(
+                    0,
+                    num_pages * page_size,
+                    (300,),
+                    generator=g,
+                    device="cuda",
+                    dtype=torch.int64,
+                )
+                ref = self._gather_ref(dequant, pages, page_size, ids)
+                workspace = torch.zeros(
+                    305, 1, 512, dtype=torch.bfloat16, device="cuda"
+                )
+                out = dequantize_k_cache_paged(
+                    pages, ids, page_size, out=workspace[5:], layout=layout
+                )
+                # NaN payloads (fp8 0x7F / e4m3 NaN scales) compare through their bits.
+                self.assertTrue(torch.equal(bits(workspace[5:]), bits(ref)))
+                self.assertEqual(int(workspace[:5].abs().sum()), 0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+HEAD_DIM, ROPE_DIM, NOPE_DIM = 512, 64, 448
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestFusedKNormRopeFlashMLA(CustomTestCase):
+    @unittest.skipUnless(
+        is_hip() and is_gfx95_supported(),
+        "the query rope rides the HIP K launch; its bitwise parity with the flat rope"
+        " kernel is claimed on gfx950 only",
+    )
+    def test_query_rope_in_the_k_launch(self):
+        """With `q` the K launch must rope every query head's trailing ROPE_DIM bitwise
+        like the flat rope kernel, leave the cache bytes and the nope part untouched,
+        and rope rows without a slot."""
+        dev = "cuda"
+        page_size = 256
+        for layout, (num_tokens, heads, pos_dtype, seed) in product(
+            (KVLayout.V4, KVLayout.V41),
+            ((1, 16, torch.int64, 0), (300, 16, torch.int32, 2)),
+        ):
+            with self.subTest(layout=layout, num_tokens=num_tokens, heads=heads):
+                torch.manual_seed(seed)
+                kv = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16)
+                weight = (1 + 0.1 * torch.randn(HEAD_DIM, device=dev)).to(
+                    torch.bfloat16
+                )
+                angles = torch.rand(8192, ROPE_DIM // 2, device=dev) * 2 * math.pi
+                freqs_cis = torch.polar(torch.ones_like(angles), angles)
+                positions = torch.randint(0, 8192, (num_tokens,), device=dev).to(
+                    pos_dtype
+                )
+                out_loc = torch.randperm(4 * page_size, device=dev)[:num_tokens]
+                out_loc = out_loc.to(torch.int32)
+                if num_tokens > 2:
+                    out_loc[1] = -1
+                page_bytes = layout.page_bytes(page_size)
+                cache = torch.zeros(4, page_bytes, device=dev, dtype=torch.uint8)
+                cache_q = cache.clone()
+                q = (torch.randn(num_tokens, heads, HEAD_DIM, device=dev) * 3).to(
+                    torch.bfloat16
+                )
+                expected = q.clone()
+                # The model's standalone query rope (batched flat kernel).
+                set_batched_rope(True)
+                fused_rope_inplace(
+                    expected[..., -ROPE_DIM:], None, freqs_cis, positions
+                )
+                got = q.clone()
+                fused_k_norm_rope_flashmla(
+                    kv,
+                    weight,
+                    1e-6,
+                    freqs_cis,
+                    positions,
+                    out_loc,
+                    cache,
+                    page_size,
+                    layout=layout,
+                )
+                fused_k_norm_rope_flashmla(
+                    kv,
+                    weight,
+                    1e-6,
+                    freqs_cis,
+                    positions,
+                    out_loc,
+                    cache_q,
+                    page_size,
+                    q=got,
+                    layout=layout,
+                )
+                self.assertTrue(torch.equal(got, expected))
+                self.assertTrue(torch.equal(got[..., :NOPE_DIM], q[..., :NOPE_DIM]))
+                self.assertTrue(torch.equal(cache_q, cache))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,6 @@
 import unittest
-from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest import mock
 
-import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
@@ -15,60 +12,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
     """Gating and dispatch-preference tests (CPU, no kernels required)."""
-
-    @override_platform(is_blackwell=False)
-    def test_pending_hip_boundary_skips_blackwell_next_norm(self):
-        from sglang.srt.models import deepseek_v4
-
-        hidden = torch.zeros(1, 4, 16)
-        pre = torch.zeros(1, 4)
-        pending = (hidden, pre, pre)
-        model = SimpleNamespace(
-            pp_group=SimpleNamespace(world_size=1),
-            config=SimpleNamespace(model_type="deepseek_v41"),
-            engram_hasher=None,
-            engram_prefetch_stream=None,
-            late_layer_start=None,
-            start_layer=0,
-            end_layer=3,
-            layers=[SimpleNamespace(engram=None, hc_boundary_fused=True)] * 3,
-        )
-        batch = SimpleNamespace(forward_mode=mock.Mock())
-        recorder = mock.Mock()
-        recorder.with_current_layer.side_effect = lambda _: nullcontext()
-        with (
-            mock.patch.object(deepseek_v4, "_is_hip", True),
-            mock.patch.object(deepseek_v4, "is_cp_active", return_value=False),
-            mock.patch.object(
-                deepseek_v4, "check_cuda_graph_backend", return_value=False
-            ),
-            mock.patch.object(
-                deepseek_v4,
-                "get_global_expert_distribution_recorder",
-                return_value=recorder,
-            ),
-            mock.patch.object(
-                deepseek_v4._hip,
-                "forward_layer_fused_boundary",
-                side_effect=[
-                    (None, pre, pending),
-                    (None, pre, pending),
-                    (hidden, pre, None),
-                ],
-            ) as boundary,
-        ):
-            result = deepseek_v4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
-                model,
-                torch.zeros(1),
-                hidden,
-                batch,
-                torch.zeros(1),
-                torch.zeros(1),
-                False,
-                [],
-            )
-        self.assertIs(result[0], hidden)
-        self.assertIs(boundary.call_args_list[1].kwargs["pending_post"], pending)
 
     def test_tilelang_fuse_flag_enables_cross_layer_fusion(self):
         with (

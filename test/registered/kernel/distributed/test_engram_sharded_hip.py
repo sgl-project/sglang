@@ -3,10 +3,8 @@
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
-
 import pytest
 import torch
-
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -21,10 +19,14 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_amd_ci(est_time=90, suite="stage-c-test-large-8-gpu-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
     not is_hip() or "LOCAL_RANK" not in os.environ,
-    reason="run through the eight-GPU entry point",
+    reason="run through the four-GPU entry point",
 )
 
 
@@ -70,8 +72,9 @@ def table(rows):
     return embed, reference
 
 
-@pytest.mark.parametrize("rows", [1, 17, 32])
+@pytest.mark.parametrize("rows", [1, 17, 32], ids=['1', '17', '32'])
 def test_eager_and_graph_reconstruction(group, rows):
+    """Reconstructing a sharded row must retain signed zero and BF16 subnormals."""
     embed, reference = table(rows)
     ids = torch.arange(16, device="cuda", dtype=torch.int64).view(-1, 1) % rows
     with patch("sglang.srt.layers.engram.get_attention_dp_size", return_value=1):
@@ -92,8 +95,9 @@ def test_eager_and_graph_reconstruction(group, rows):
             )
 
 
-@pytest.mark.parametrize("scatter", [False, True])
+@pytest.mark.parametrize("scatter", [False, True], ids=['False', 'True'])
 def test_dp_shard_reconstruction(group, scatter):
+    """DP distribution must preserve the owning shard's BF16 payload bits."""
     embed, reference = table(17)
     rank, world = group.rank_in_group, group.world_size
     ids = torch.tensor([[rank]], device="cuda", dtype=torch.int64)
@@ -123,4 +127,4 @@ def test_dp_shard_reconstruction(group, scatter):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4,))

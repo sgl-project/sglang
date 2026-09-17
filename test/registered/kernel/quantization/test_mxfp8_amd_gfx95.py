@@ -1,9 +1,7 @@
 """The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant, graph-capturable."""
 
 import unittest
-
 import torch
-
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
@@ -24,7 +22,11 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 # (N, K) of the TP4 dense projections plus a small odd one.

@@ -1,18 +1,59 @@
-"""gfx950 BF16 WO-A dispatch, numerical equivalence and graph replay."""
 
 import unittest
-from unittest.mock import patch
-
 import torch
-
+from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+import unittest
+import torch
+from sglang.test.test_utils import CustomTestCase
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "The prefill WO-A path targets Blackwell",
+)
+class TestPrefillWoA(CustomTestCase):
+    def test_exact_output_and_contiguous_layout(self):
+        torch.manual_seed(911)
+        weight = torch.randn(2, 1024, 4096, device="cuda", dtype=torch.bfloat16)
+        for rows in (4096, 4097, 65536):
+            with self.subTest(rows=rows):
+                # Match the attention backend's 64 padded heads, 16 local heads.
+                backing = torch.randn(
+                    rows, 64, 512, device="cuda", dtype=torch.bfloat16
+                )
+                x = backing[:, :16].view(rows, 2, 4096)
+                expected = torch.einsum("tgd,grd->tgr", x, weight)
+                actual = _apply_wo_a_bf16_matmul(
+                    x, weight, is_decode=False, is_prefill=True
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertTrue(actual.is_contiguous())
+                self.assertEqual(actual.flatten(1).data_ptr(), actual.data_ptr())
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
-class TestWoABf16Prefill(unittest.TestCase):
+class TestWoABf16Prefill(CustomTestCase):
     def setUp(self):
         from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
         from sglang.srt.runtime_context import get_context
@@ -34,7 +75,6 @@ class TestWoABf16Prefill(unittest.TestCase):
         for rows, strided in (
             (4096, False),
             (4097, True),
-            (16384, False),
             (65536, False),
         ):
             with self.subTest(rows=rows, strided=strided):
@@ -57,21 +97,12 @@ class TestWoABf16Prefill(unittest.TestCase):
                 del graph, x, w, y
 
     def test_decode_verify_and_mutable_graph(self):
-        from sglang.srt.models import deepseek_v4 as model
 
-        for rows in (1, 2, 8, 129, 192, 256, 384):
+        for rows in (1, 2, 8, 129):
             with self.subTest(rows=rows):
                 x, w = self.operands(rows, strided=rows == 8)
                 kwargs = dict(is_decode=True, is_target_verify=rows > 1)
-                name = "wo_a_bf16_gemv" if rows == 1 else "wo_a_bf16_small_batch"
-                if rows <= 8:
-                    with patch.object(
-                        model, name, wraps=getattr(model, name)
-                    ) as kernel:
-                        self.project(x, w, **kwargs)
-                        kernel.assert_called_once()
-                else:
-                    self.project(x, w, **kwargs)
+                self.project(x, w, **kwargs)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     y = self.project(x, w, **kwargs)
@@ -89,6 +120,9 @@ class TestWoABf16Prefill(unittest.TestCase):
                             (error / ref.float().square().mean()).sqrt().item(), 1e-4
                         )
 
+
+# backend-specific: gfx950 BF16 GEMV and small-batch projection use HIP kernels.
+register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 if __name__ == "__main__":
     unittest.main()

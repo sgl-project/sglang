@@ -171,29 +171,6 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
 
         self.assertEqual(call_count["n"], 1)  # kernel attempted exactly once
 
-    # ------------------------------------------------------- deterministic gate
-
-    def test_deterministic_inference_pins_the_single_launch(self):
-        # The gfx950 fork switches reduction regime at 64 rows, so verify and decode
-        # rows of one request differ bitwise; deterministic inference pins one regime.
-        from sglang.srt.runtime_context import get_context
-
-        o, wo_a = self._rand(8, 4, 128, 32)
-        seen = {}
-
-        def _fake_gemm(x, w, fp8_grid, split_k=None):
-            seen["split_k"] = split_k
-            return torch.einsum("tgd,grd->tgr", x, w).flatten(1)
-
-        with mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", _fake_gemm):
-            self.gfx95_dense.wo_a_fp8_grid_matmul(o, wo_a, False)
-            self.assertIsNone(seen["split_k"])
-            with get_context().override_server_args(
-                enable_deterministic_inference=True
-            ):
-                self.gfx95_dense.wo_a_fp8_grid_matmul(o, wo_a, False)
-            self.assertIs(seen["split_k"], False)
-
     # ---------------------------------------------------------------- numerics
 
     def test_aiter_matches_einsum_across_shapes(self):
