@@ -128,6 +128,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def _make_runner(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(attn_backend=SimpleNamespace())
         runner._is_full_backend = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False

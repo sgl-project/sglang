@@ -44,7 +44,9 @@ def validate_deepseek_v4_mega_moe_token_budget(
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        # Interleave CP pads every local shard to a multiple of CP size
+        # (pad_logical_token_to_physical), including an uneven final chunk.
+        token_alignment = cfg.attn_cp_size
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size

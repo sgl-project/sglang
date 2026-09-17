@@ -302,9 +302,23 @@ def cp_shard_model_inputs(
             spec_hidden_states, forward_batch
         )
 
+    num_token_non_padded_backup = getattr(forward_batch, "num_token_non_padded", None)
+    if num_token_non_padded_backup is not None and not get_moe_a2a_backend().is_none():
+        # A2A MoE routes rank-local rows. Keep physical padding out of routing;
+        # the no-A2A path gathers rows and sets its own count inside the MoE.
+        metadata = forward_batch.attn_cp_metadata
+        logical_tokens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        forward_batch.num_token_non_padded = num_token_non_padded_backup.new_tensor(
+            logical_tokens[get_parallel().attn_cp_rank]
+        )
+
     try:
         yield sharded_hidden_states, sharded_positions, model_input_ids
     finally:
+        if num_token_non_padded_backup is not None:
+            forward_batch.num_token_non_padded = num_token_non_padded_backup
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
         if had_input_ids_global:
