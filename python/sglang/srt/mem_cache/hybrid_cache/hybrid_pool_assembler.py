@@ -849,7 +849,16 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    # Layer-mapping keys are global model layer ids and the consumers wait on
+    # ``layer_id - start_layer`` (HybridLinearKVPool._wait_for_layer,
+    # HybridReqToTokenPool.mamba2_layer_index), so the transfer index space
+    # must span the highest global id, not the number of keyed layers.
+    # NemotronH-style hybrids have MoE-only layers that are neither
+    # full-attention nor Mamba (Nemotron-3-Super: 88 layers = 8 attention +
+    # 40 Mamba + 40 MoE), so len(...) undersizes LayerDoneCounter and the
+    # per-layer load loop: IndexError on the first host hit and, without it,
+    # layers above the count would never be loaded back from host.
+    transfer_layer_num = max(full_layer_mapping | mamba_layer_mapping) + 1
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -1504,7 +1513,7 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
             register_req_to_token_counter=True,
-            transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+            transfer_layer_num=max(full_layer_mapping | mamba_layer_mapping) + 1,
             pools_desc="KV + MAMBA",
         )
 
