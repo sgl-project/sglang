@@ -12,8 +12,10 @@ from sglang.srt.models.sarvam_moe import (
     AttnForwardMethod,
     SarvamMLAForCausalLM,
     SarvamMLAModel,
+    SarvamMoEMLAAttention,
     SarvamMoEMLADecoderLayer,
     SarvamMoESparseMoeBlock,
+    _trtllm_bypass_torch_compile_forward,
     get_attn_forward_method,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -49,6 +51,32 @@ class TestSarvamDSpark(CustomTestCase):
         target.model.dspark_layers_to_capture = None
         target.capture_aux_hidden_states = False
         return target
+
+    def test_config_remap_treats_null_routing_values_as_missing(self):
+        config = SimpleNamespace(
+            n_group=None,
+            topk_group=None,
+            router_dtype=None,
+        )
+
+        SarvamMLAForCausalLM._remap_config(config)
+
+        self.assertEqual(config.n_group, 1)
+        self.assertEqual(config.topk_group, 1)
+        self.assertEqual(config.router_dtype, "bf16_fp32")
+
+    def test_config_remap_preserves_explicit_routing_values(self):
+        config = SimpleNamespace(
+            n_group=8,
+            topk_group=4,
+            router_dtype="fp32",
+        )
+
+        SarvamMLAForCausalLM._remap_config(config)
+
+        self.assertEqual(config.n_group, 8)
+        self.assertEqual(config.topk_group, 4)
+        self.assertEqual(config.router_dtype, "fp32")
 
     def test_capture_hook_uses_raw_target_layer_ids(self):
         target = self._make_target()
@@ -167,6 +195,116 @@ class TestSarvamDSpark(CustomTestCase):
                 AttnForwardMethod.MLA_CONCAT_ROPE,
             )
 
+    def test_fa4_prefill_uses_separate_rope(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with (
+            patch(
+                "sglang.srt.models.sarvam_moe.attention_backends",
+                return_value=("fa4", "trtllm_mla"),
+            ),
+            patch(
+                "sglang.srt.models.sarvam_moe.get_platform",
+                return_value=SimpleNamespace(is_sm100_or_sm110=True),
+            ),
+        ):
+            self.assertEqual(
+                get_attn_forward_method(forward_batch),
+                AttnForwardMethod.MLA_SEPARATE_ROPE,
+            )
+
+    def test_fa4_preserves_legacy_rope_path_on_older_gpus(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with (
+            patch(
+                "sglang.srt.models.sarvam_moe.attention_backends",
+                return_value=("fa4", "trtllm_mla"),
+            ),
+            patch(
+                "sglang.srt.models.sarvam_moe.get_platform",
+                return_value=SimpleNamespace(is_sm100_or_sm110=False),
+            ),
+        ):
+            self.assertEqual(
+                get_attn_forward_method(forward_batch),
+                AttnForwardMethod.MLA_CONCAT_ROPE,
+            )
+
+    def test_attention_value_projection_writes_flattened_layout_directly(self):
+        attention = SarvamMoEMLAAttention.__new__(SarvamMoEMLAAttention)
+        nn.Module.__init__(attention)
+        attention.num_local_heads = 2
+        attention.v_head_dim = 3
+        attention.w_vc = nn.Parameter(torch.randn(2, 4, 3), requires_grad=False)
+        attn_output = torch.randn(5, 2, 4)
+        expected = (
+            torch.bmm(attn_output.transpose(0, 1), attention.w_vc)
+            .transpose(0, 1)
+            .flatten(1, 2)
+        )
+
+        with (
+            patch(
+                "sglang.srt.models.sarvam_moe.is_in_tc_piecewise_cuda_graph",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.models.sarvam_moe.get_platform",
+                return_value=SimpleNamespace(is_sm100_or_sm110=True),
+            ),
+        ):
+            actual = attention._project_attention_output(attn_output)
+
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(actual.shape, (5, 6))
+
+    def test_attention_value_projection_uses_legacy_path_on_older_gpus(self):
+        attention = SarvamMoEMLAAttention.__new__(SarvamMoEMLAAttention)
+        nn.Module.__init__(attention)
+        attention.num_local_heads = 2
+        attention.v_head_dim = 3
+        attention.w_vc = nn.Parameter(torch.randn(2, 4, 3), requires_grad=False)
+        attn_output = torch.randn(5, 2, 4)
+
+        with (
+            patch.object(
+                attention,
+                "_maybe_fp8_bmm",
+                wraps=attention._maybe_fp8_bmm,
+            ) as legacy_bmm,
+            patch(
+                "sglang.srt.models.sarvam_moe.get_platform",
+                return_value=SimpleNamespace(is_sm100_or_sm110=False),
+            ),
+        ):
+            actual = attention._project_attention_output(attn_output)
+
+        self.assertEqual(legacy_bmm.call_count, 1)
+        self.assertEqual(actual.shape, (5, 6))
+
+    def test_flashinfer_bypass_keeps_piecewise_graph_wrapper(self):
+        block = SarvamMoESparseMoeBlock.__new__(SarvamMoESparseMoeBlock)
+        nn.Module.__init__(block)
+        hidden_states = torch.randn(2, 4)
+        router_logits = torch.randn(2, 8)
+        block.use_flashinfer_trtllm_bypass = True
+        block.topk = SimpleNamespace(topk_config=object())
+        block.experts = nn.Module()
+        block.experts.forward = Mock(return_value=hidden_states)
+        block.experts.forward_impl = Mock(return_value=hidden_states)
+        block._router_logits = Mock(return_value=router_logits)
+
+        with patch(
+            "sglang.srt.models.sarvam_moe.is_in_tc_piecewise_cuda_graph",
+            return_value=True,
+        ):
+            actual = block._forward_router_experts(hidden_states)
+
+        self.assertIs(actual, hidden_states)
+        block.experts.forward.assert_called_once()
+        block.experts.forward_impl.assert_not_called()
+
     def test_sparse_moe_declares_deepseek_v3_routing_contract(self):
         config = SimpleNamespace(
             hidden_size=16,
@@ -213,7 +351,65 @@ class TestSarvamDSpark(CustomTestCase):
         )
         self.assertEqual(captured_expert_kwargs["routed_scaling_factor"], 2.5)
         self.assertTrue(block.fuse_routed_scaling_in_moe)
-        self.assertEqual(block.gate.weight.dtype, torch.float32)
+        self.assertEqual(block.gate.weight.dtype, torch.bfloat16)
+        self.assertTrue(block.router_logits_fp32)
+
+    def test_flashinfer_bypass_disables_bs1_compile_swap(self):
+        config = SimpleNamespace(
+            hidden_size=16,
+            hidden_act="silu",
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=0,
+        )
+        runtime = SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=0))
+
+        class FakeExperts(nn.Module):
+            # Mirrors FusedMoE: the layer owns the quant method that the
+            # fused-op compile protocol toggles.
+            def __init__(self, **_kwargs):
+                super().__init__()
+                self.quant_method = SimpleNamespace(
+                    _torch_compile_forward=lambda num_tokens: "native-swap"
+                )
+
+        for trtllm in (True, False):
+            with (
+                patch(
+                    "sglang.srt.models.sarvam_moe.get_parallel",
+                    return_value=SimpleNamespace(tp_size=1),
+                ),
+                patch(
+                    "sglang.srt.models.sarvam_moe.get_exec",
+                    return_value=runtime,
+                ),
+                patch(
+                    "sglang.srt.models.sarvam_moe.get_moe_runner_backend",
+                    return_value=SimpleNamespace(
+                        is_flashinfer_trtllm=lambda trtllm=trtllm: trtllm,
+                        is_flashinfer_trtllm_routed=lambda: False,
+                    ),
+                ),
+                patch(
+                    "sglang.srt.models.sarvam_moe.get_moe_impl_class",
+                    return_value=FakeExperts,
+                ),
+                patch(
+                    "sglang.srt.models.sarvam_moe.TopK",
+                    side_effect=lambda **_kwargs: nn.Identity(),
+                ),
+            ):
+                block = SarvamMoESparseMoeBlock(config, layer_id=1)
+
+            self.assertEqual(block.use_flashinfer_trtllm_bypass, trtllm)
+            hook = block.experts.quant_method._torch_compile_forward
+            if trtllm:
+                self.assertIs(hook, _trtllm_bypass_torch_compile_forward)
+                self.assertIsNone(hook(num_tokens=1))
+                self.assertIsNone(hook(num_tokens=4))
+            else:
+                self.assertEqual(hook(num_tokens=1), "native-swap")
 
 
 if __name__ == "__main__":

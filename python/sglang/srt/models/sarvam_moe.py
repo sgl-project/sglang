@@ -6,7 +6,7 @@
 import math
 from contextlib import nullcontext
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -48,7 +48,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -64,6 +64,12 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -77,8 +83,8 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
-    get_stream,
 )
 from sglang.srt.utils import (
     BumpAllocator,
@@ -165,10 +171,33 @@ def _handle_concat_rope_backend(attn, forward_batch) -> AttnForwardMethod:
     return AttnForwardMethod.MLA_CONCAT_ROPE
 
 
+def _handle_fa4_backend(attn, forward_batch) -> AttnForwardMethod:
+    # FA4's absorbed-MLA qv argument is implemented only on SM100/SM110.
+    # Preserve the pre-FA4 Sarvam dispatch on older architectures instead of
+    # selecting an unsupported separate-RoPE kernel path.
+    if get_platform().is_sm100_or_sm110:
+        return AttnForwardMethod.MLA_SEPARATE_ROPE
+    return AttnForwardMethod.MLA_CONCAT_ROPE
+
+
 for backend in SEPARATE_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_separate_rope_backend)
 for backend in CONCAT_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_concat_rope_backend)
+AttentionBackendRegistry.register("fa4", _handle_fa4_backend)
+
+
+def _trtllm_bypass_torch_compile_forward(num_tokens: int) -> Optional[Callable]:
+    """Keep the FlashInfer TRT-LLM MoE runner active under torch.compile.
+
+    The fused-op compile protocol swaps the unquantized MoE layer to
+    fused_moe_forward_native at bs=1, which cannot unpack the
+    BypassedTopKOutput the bypass routing feeds it (routing is fused
+    inside the TRT-LLM kernel), and swapping MoE kernels per batch size
+    would make bs=1 numerics differ from bs>1. Returning None keeps the
+    runner's optimized dispatch at every batch size.
+    """
+    return None
 
 
 def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
@@ -267,7 +296,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
             "bfloat16": torch.bfloat16,
             "bf16_fp32": torch.bfloat16,
         }
-        router_dtype_cfg = getattr(config, "router_dtype", "fp32")
+        router_dtype_cfg = getattr(config, "router_dtype", "bf16_fp32")
         self.router_dtype = dtype_map.get(router_dtype_cfg, None)
         self.router_logits_fp32 = router_dtype_cfg == "bf16_fp32"
         self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
@@ -302,8 +331,9 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         moe_runner_backend = get_moe_runner_backend()
+        self.use_flashinfer_trtllm_bypass = moe_runner_backend.is_flashinfer_trtllm()
         self.fuse_routed_scaling_in_moe = (
-            moe_runner_backend.is_flashinfer_trtllm()
+            self.use_flashinfer_trtllm_bypass
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         )
         self.experts = get_moe_impl_class(quant_config)(
@@ -323,6 +353,16 @@ class SarvamMoESparseMoeBlock(nn.Module):
             # is bypassed and performed inside the fused MoE kernel.
             routing_method_type=RoutingMethodType.DeepSeekV3,
         )
+        if self.use_flashinfer_trtllm_bypass:
+            # The bypass routing feeds the experts BypassedTopKOutput, so the
+            # fused-op compile protocol's bs=1 swap to fused_moe_forward_native
+            # (which only unpacks a standard dispatch output) must stay disabled
+            # for these layers; see _trtllm_bypass_torch_compile_forward.
+            quant_method = getattr(self.experts, "quant_method", None)
+            if quant_method is not None:
+                quant_method._torch_compile_forward = (
+                    _trtllm_bypass_torch_compile_forward
+                )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -368,6 +408,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and self.alt_stream is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
         ):
             return self.forward_normal_dual_stream(hidden_states)
         else:
@@ -404,6 +445,15 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self._router_logits(hidden_states)
+        if self.use_flashinfer_trtllm_bypass:
+            topk_output = BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk.topk_config,
+            )
+            if is_in_tc_piecewise_cuda_graph():
+                return self.experts(hidden_states, topk_output)
+            return self.experts.forward_impl(hidden_states, topk_output)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
 
@@ -446,9 +496,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
             hidden_states.clone() if self.shared_experts is not None else hidden_states
         )
 
-        router_logits = self._router_logits(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self._forward_router_experts(hidden_states)
 
         if self.shared_experts is not None:
             shared_out = self.shared_experts(identity)
@@ -699,6 +747,36 @@ class SarvamMoEMLAAttention(nn.Module):
 
         return torch.bmm(x_bmk, w_bkn)
 
+    def _project_attention_output(
+        self,
+        attn_output: torch.Tensor,
+        zero_allocator: Optional[BumpAllocator] = None,
+    ) -> torch.Tensor:
+        if (
+            not get_platform().is_sm100_or_sm110
+            or self.w_vc.dtype == torch.float8_e4m3fn
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            output = self._maybe_fp8_bmm(
+                attn_output.transpose(0, 1), self.w_vc, zero_allocator
+            )
+            return output.transpose(0, 1).flatten(1, 2)
+
+        # Write the BMM directly into the flattened layout consumed by o_proj.
+        # Avoiding the materialized [heads, tokens, dim] output removes one
+        # transpose/clone kernel from every attention layer.
+        output = torch.empty(
+            (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
+        torch.bmm(
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            out=output.view(-1, self.num_local_heads, self.v_head_dim).transpose(0, 1),
+        )
+        return output
+
     def _run_mha_prefill(
         self,
         positions: torch.Tensor,
@@ -871,10 +949,7 @@ class SarvamMoEMLAAttention(nn.Module):
             raise ValueError(f"Unknown forward method: {forward_method}")
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        attn_bmm_output = self._maybe_fp8_bmm(
-            attn_output.transpose(0, 1), self.w_vc, zero_allocator
-        )
-        attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        attn_bmm_output = self._project_attention_output(attn_output, zero_allocator)
 
         output, _ = self.o_proj(attn_bmm_output)
         return output
@@ -906,17 +981,8 @@ class SarvamMoEMLAAttention(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
         else:
-            # For q_lora_rank path, overlap q_a_proj with kv_a_proj
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-                q_a, _ = self.q_a_proj(hidden_states)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q_a, _ = self.q_a_proj(hidden_states)
-                latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+            q_a, _ = self.q_a_proj(hidden_states)
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
             q_a = self.q_a_layernorm(q_a)
             q, _ = self.q_b_proj(q_a)
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1006,10 +1072,7 @@ class SarvamMoEMLAAttention(nn.Module):
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        attn_bmm_output = self._maybe_fp8_bmm(
-            attn_output.transpose(0, 1), self.w_vc, zero_allocator
-        )
-        attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        attn_bmm_output = self._project_attention_output(attn_output, zero_allocator)
 
         output, _ = self.o_proj(attn_bmm_output)
         return output
@@ -1055,7 +1118,11 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
+            # The fine-grained Q/KV and RoPE forks are smaller than their
+            # capture/synchronization cost and cause the full target graph to
+            # replay on the auxiliary stream. Keep MLA on the graph's main
+            # stream; reserve alt_stream for shared-expert overlap below.
+            alt_stream=None,
         )
 
         first_k_dense = getattr(config, "first_k_dense_replace", 1)
@@ -1202,7 +1269,11 @@ class SarvamMLAModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[List[int]] = None
-        self.alt_stream = get_stream("alt") if _is_cuda else None
+        # Keep target shared-expert overlap independent from the process-level
+        # side stream used by the DSpark draft and other runtime components.
+        # This mirrors DeepSeek's model-owned overlap-stream lifetime and avoids
+        # introducing cross-model stream dependencies during graph capture.
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1330,14 +1401,20 @@ class SarvamMLAForCausalLM(nn.Module):
             "tie_word_embeddings": False,
             "n_group": 1,
             "topk_group": 1,
-            "router_dtype": "fp32",
+            # Match the fast DeepSeek routing contract without changing
+            # Sarvam's native config schema: BF16 weights, FP32 logits.
+            "router_dtype": "bf16_fp32",
             "routed_scaling_factor": 2.5,
             "score_function": "sigmoid",
             "norm_topk_prob": True,
             "topk_method": "noaux_tc",
         }
         for attr, default in defaults.items():
-            if not hasattr(config, attr):
+            # HF configs can serialize omitted optional values as JSON null.
+            # Treat those exactly like absent attributes so released Sarvam
+            # checkpoints select flat routing and the BF16-weight/FP32-logit
+            # router path without requiring command-line overrides.
+            if getattr(config, attr, None) is None:
                 setattr(config, attr, default)
 
     @property
@@ -1503,7 +1580,6 @@ class SarvamMLAForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
         params_dict = dict(self.named_parameters())
-
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if layer_id is not None and (
