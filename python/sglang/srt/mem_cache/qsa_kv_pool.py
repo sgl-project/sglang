@@ -29,9 +29,7 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
-# ``--qsa-indexer-dtype`` values. The compressed indexer key cache (and the index
-# Q the scoring kernels dot against it) are stored in this dtype; the pending
-# per-request key ring stays bf16 because it is the input of the group mean.
+# ``--qsa-indexer-dtype`` choices; the pending key ring stays bf16 regardless.
 QSA_INDEXER_DTYPE_CHOICES = ("auto", "bfloat16", "fp8_e4m3")
 
 
@@ -54,8 +52,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
     # lifecycle rides the full-KV allocator and radix tree.
     # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
-    # Pending-ring dtype: the raw keys of an incomplete group, averaged by the
-    # compress kernels, so it stays bf16 whatever the compressed cache stores.
+    # Pending-ring dtype: the raw keys are averaged from here, so it stays bf16.
     index_state_dtype = torch.bfloat16
 
     @classmethod
@@ -152,8 +149,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 "QSA compressed indexer cache dtype must be bfloat16 or "
                 f"float8_e4m3fn, got {qsa_indexer_dtype}"
             )
-        # Storage dtype of the compressed keys and of the index Q handed to the
-        # scoring kernels (both operands of the fp8 GEMM must agree).
+        # Storage dtype of the compressed keys and the index Q (the GEMM operands).
         self.qsa_compressed_dtype = qsa_indexer_dtype
         logger.info(
             "QSA compressed indexer cache dtype: %s (pending ring %s)",

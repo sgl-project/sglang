@@ -693,10 +693,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_qwen4_fp8_indexer_dtype_platform_gate(self):
-        """`--qsa-indexer-dtype fp8_e4m3` scores QSA blocks with fp8 GEMMs, so
-        the qwen4_exp override admits it only on CUDA SM90/SM100 and only when
-        the checkpoint carries the compressed indexer. The bf16 spellings never
-        consult the platform: they are the pre-existing behaviour."""
+        """fp8_e4m3 is admitted only on CUDA SM90/SM100 with a compressed QSA
+        indexer; the bf16 spellings never consult the platform."""
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         compressed = {
             "indexer_n_heads": 4,
@@ -710,8 +708,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
             )
             self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
-            # The same platform without the compressed indexer fields: no QSA
-            # profile, so there is no fp8 cache to size.
+            # No compressed indexer fields: no QSA profile, nothing to store in fp8.
             with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
                 self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
         with override_platform(

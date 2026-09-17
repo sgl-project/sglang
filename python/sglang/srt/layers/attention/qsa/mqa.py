@@ -106,9 +106,7 @@ def torch_qsa_mqa_decode(
     return logits
 
 
-# Scoring-kernel operand dtypes. fp8 stores the compressed indexer keys and the
-# index Q as plain e4m3 (no scale) and dots them on the fp8 tensor-core path
-# with fp32 accumulation; the logits stay fp32 either way.
+# TileLang dtype names of the scoring-kernel operands; the logits stay fp32.
 _TILELANG_DTYPES = {
     torch.bfloat16: "bfloat16",
     torch.float8_e4m3fn: "float8_e4m3fn",
@@ -399,7 +397,7 @@ def tilelang_qsa_mqa_decode(
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_kernel.unsqueeze(1).contiguous(),
-        # No dtype copy of the whole pool: the fp8 cache is scored in place.
+        # No-op when the dtypes already match: the pool is never copied.
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),

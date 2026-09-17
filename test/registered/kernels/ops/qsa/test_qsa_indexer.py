@@ -95,9 +95,8 @@ class FakePool:
         dtype=torch.bfloat16,
         compressed_dtype=None,
     ):
-        # Same contract as QSATokenToKVPool: the pending ring keeps the
-        # compute dtype, the compressed cache (and index Q) take the
-        # configured storage dtype.
+        # Same contract as QSATokenToKVPool: ring in the compute dtype,
+        # compressed cache (and index Q) in the storage dtype.
         self.qsa_compressed_dtype = compressed_dtype or dtype
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
@@ -142,10 +141,8 @@ def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
 
 
 def assert_fp8_within_one_ulp(actual, expected):
-    """e4m3 is sign-magnitude, so within one sign the uint8 code order is the
-    value order and one ulp is one code step; a bf16 last-ulp flip before the
-    cast moves the code by at most one, and the subnormal grid (2^-9) lets the
-    group mean's summation order show up as an absolute 2^-8 difference."""
+    """One e4m3 code step (within a sign the uint8 order is the value order);
+    subnormals get an absolute 2^-8 allowance for the group-mean summation order."""
     assert actual.dtype == expected.dtype == torch.float8_e4m3fn
     code_diff = (
         actual.view(torch.uint8).int() - expected.view(torch.uint8).int()
@@ -209,9 +206,8 @@ def test_fused_compress_matches_eager(
 
 
 def test_fused_q_prep_fp8_matches_eager_cast():
-    """With an fp8 indexer cache the fused Q prep must emit e4m3 Q equal (to one
-    ulp) to the eager normed+rotated Q cast at the end; a Q left in bf16 would
-    fail the scoring kernels' same-dtype contract."""
+    """The fused Q prep must emit e4m3 Q equal (to one ulp) to the eager
+    normed+rotated Q cast at the end."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(11)
@@ -250,12 +246,9 @@ def _selected_score_multisets(logits, block_indices):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_tilelang_mqa_matches_torch_reference(dtype):
-    """The TileLang scoring kernels must reproduce the fp32 torch reference on
-    the operands they are given. fp8 operands quantize the inputs, not the
-    kernel: both paths see the same e4m3 values, so the fp32 logits agree up
-    to accumulation order, and the selected blocks agree as score multisets
-    (fp8 ties at the top-k boundary more often, so index identity is not the
-    contract)."""
+    """TileLang scoring vs the fp32 torch reference on the same operands; the
+    selected blocks are compared as score multisets (fp8 ties at the top-k
+    boundary, so index identity is not the contract)."""
     from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
@@ -309,9 +302,7 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
 
 
 def test_tilelang_mqa_rejects_mixed_operand_dtypes():
-    """fp8 scoring is only defined when both operands are fp8: a bf16 Q against
-    an fp8 cache (or the reverse) must fail loudly instead of silently
-    dequantizing the whole cache."""
+    """Mixed fp8/bf16 operands must fail loudly, not dequantize the cache."""
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
         tilelang_qsa_mqa_decode,

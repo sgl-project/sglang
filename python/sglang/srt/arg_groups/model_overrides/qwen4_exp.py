@@ -79,8 +79,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
 
     profile = parse_qsa_profile(hf_config)
     if cfg.qsa_indexer_dtype == "fp8_e4m3":
-        # The fp8 indexer scores blocks with fp8 GEMMs (TileLang / tensor
-        # cores); Hopper and datacenter Blackwell are the validated targets.
+        # fp8 scoring runs on TileLang fp8 GEMMs; validated on Hopper / Blackwell.
         platform = get_platform()
         if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100_or_sm110)):
             raise ValueError(

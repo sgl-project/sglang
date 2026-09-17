@@ -223,12 +223,9 @@ class Model(msgspec.Struct):
         str,
         Arg(
             help=(
-                "Storage dtype of the compressed QSA (Qwen4-Exp sparse attention) "
-                "indexer key cache and of the index query the block-selection "
-                'kernels score it with. "auto" keeps bf16. "fp8_e4m3" stores the '
-                "compressed indexer keys as plain e4m3 (no scale) and scores "
-                "blocks with fp8 GEMMs; it halves the indexer scoring bandwidth "
-                "and needs CUDA SM90+. The main KV cache dtype is unaffected."
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with fp8 GEMMs (CUDA SM90+); the main KV cache is unaffected."
             ),
             choices=["auto", "bfloat16", "fp8_e4m3"],
         ),

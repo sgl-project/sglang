@@ -15,9 +15,8 @@ indexer path: the eager RMSNorm (flashinfer's CuTe DSL kernel) reduces sums of
 squares in an order that cannot be reproduced exactly, so a small fraction of
 rows (~1 in 30k) may flip by one bf16 ulp on a rounding boundary.
 
-With an fp8 indexer cache the rows are computed exactly as above and cast to
-e4m3 only at the store (plain cast, no scale); a bf16 last-ulp flip can then
-move the e4m3 code by one step, so fp8 outputs are 1-ulp comparable.
+With an fp8 indexer cache the rows are cast to e4m3 at the store (no scale),
+so fp8 outputs match the eager path to one e4m3 ulp.
 """
 
 from __future__ import annotations
@@ -37,19 +36,11 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-QSA_INDEXER_STORAGE_DTYPES = (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
-
-
 @cache_once
 def _jit_qsa_indexer_module(
     dtype: torch.dtype, out_dtype: torch.dtype, head_dim: int, is_neox_style: bool
 ) -> Module:
-    """Compile and cache the JIT QSA indexer module for one specialisation.
-
-    ``dtype`` is the compute/ring dtype of the inputs; ``out_dtype`` is the
-    storage dtype of the written rows (index Q and the compressed K cache):
-    the same dtype, or fp8 e4m3 for the fp8 indexer cache.
-    """
+    """Compile and cache one specialisation; ``out_dtype`` is ``dtype`` or fp8 e4m3."""
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if out_dtype != dtype and out_dtype != torch.float8_e4m3fn:
@@ -112,9 +103,8 @@ def qsa_index_q_norm_rope_store(
     is_neox_style   : NeoX (True) or GPT-J (False) RoPE pairing
     q_heads_padded  : output head count; heads >= num_q_heads are zero-filled
                       (defaults to num_q_heads)
-    out_dtype       : dtype of the returned Q (defaults to qk.dtype); fp8 e4m3
-                      when the indexer cache is fp8, so Q matches the cache the
-                      scoring kernels dot it against
+    out_dtype       : dtype of the returned Q (default qk.dtype); fp8 e4m3 when
+                      the indexer cache is fp8
 
     Returns
     -------
@@ -178,8 +168,8 @@ def qsa_index_k_compress_store(
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
     write_locs       : CUDA int32 [groups] compressed-cache slots to write
-    compressed_k_buffer : CUDA [compressed_slots, head_dim] (written); its dtype
-                       is the storage dtype: the ring dtype, or fp8 e4m3
+    compressed_k_buffer : CUDA [compressed_slots, head_dim] (written); ring dtype
+                       or fp8 e4m3
     compress_ratio   : raw keys per compressed key
     rotary_dim       : rotated prefix of each head row
     eps              : RMSNorm epsilon
