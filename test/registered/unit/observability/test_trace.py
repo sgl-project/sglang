@@ -572,12 +572,13 @@ class TestMergedAsyncTracing(CustomTestCase):
         import pickle
         from types import SimpleNamespace
 
-        import sglang.srt.observability.req_time_stats as rts
-        import sglang.srt.observability.trace_async as async_mod
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
             InMemorySpanExporter,
         )
+
+        import sglang.srt.observability.req_time_stats as rts
+        import sglang.srt.observability.trace_async as async_mod
 
         if not async_mod._zmq_available:
             self.skipTest("pyzmq not installed")
