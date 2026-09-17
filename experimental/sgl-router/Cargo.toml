@@ -24,17 +24,12 @@ unused_qualifications = "warn"
 [dependencies]
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
 dynamo-tokenizers = "=1.8.1"
-# Prepare the Dynamo renderer dependency for the following migration.
+# Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
+# template-less models like DeepSeek-V4) so cache-aware routing hashes the same
+# tokens the engine caches.
 dynamo-renderer = "=5.1.2"
-# Chat-template rendering for cache-aware routing, retained until the
-# renderer migration replaces it: the engine caches tokens AFTER applying the
-# model's chat template, so the router must render the same template before
-# hashing or its token_ids diverge from the engine's stored blocks. `pycompat`
-# supplies the Python str/dict methods HF templates call; `chrono` backs
-# `strftime_now`.
-minijinja = { version = "2.24", features = ["loop_controls", "json"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# `OAIChatLikeRequest` speaks minijinja values.
+minijinja = "2.24"
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
