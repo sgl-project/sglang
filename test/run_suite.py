@@ -42,6 +42,8 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd-nondeterministic",
         "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-kernel-test-1-gpu-amd-mi35x",
+        "stage-c-kernel-test-4-gpu-amd-mi35x",
         "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
