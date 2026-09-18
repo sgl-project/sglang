@@ -29,8 +29,11 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.dcp.layout import (
+    DcpPackedReadPlan,
     dcp_extend_gather_buffer,
+    dcp_packed_read_plan,
     plan_dcp_extend_gather,
+    remap_topk_to_packed,
 )
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
@@ -528,6 +531,15 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
+        packed_plan = dcp_packed_read_plan(forward_batch)
+        if packed_plan is not None and topk_indices is not None:
+            # Remapped HERE, where the indexer produces it, and not at the
+            # operator. Only 21 of 78 layers run the indexer; the other 57 reuse
+            # what it returned, so this runs 21 times a forward instead of 78.
+            # A remapped top-k stays valid as it propagates because the packed
+            # layout depends on the batch's prefix and extend lengths, not on
+            # the layer -- every layer gathers into the same shape.
+            topk_indices = remap_topk_to_packed(topk_indices, packed_plan)
     else:
         topk_indices = prev_topk_indices
 
@@ -591,6 +603,91 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
         send[dst : dst + local_len] = shards[src : src + local_len]
         src += local_len
         dst += padded_len
+    return send
+
+
+def _dcp_gather_extend_kv_packed_npu(
+    m: "DeepseekV2AttentionMLA",
+    forward_batch: "ForwardBatch",
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    plan: "DcpPackedReadPlan",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """C1: leave the gathered prefix in the order the collective produced it.
+
+    The permuting path below writes the all-gather into a scratch and then
+    ``index_select``s it into a position-ordered output. This does neither: the
+    collective writes straight into the buffer the operator will read, and this
+    chunk's own KV is appended after it. What pays for that is
+    ``remap_topk_to_packed``, arithmetic on the ``[tokens, k]`` index tensor,
+    which is a few million integers against a gigabyte of KV.
+
+    Two things go away, not one. The ``index_select`` -- 784 launches x 0.275 ms
+    = **216 ms a forward** -- and the separate output buffer, so the standing
+    reservation drops from ~1.34 GiB (output + piece scratch) to ~1.04 GiB even
+    though this gathers the whole prefix in one collective rather than four.
+
+    **No pieces here, deliberately.** Pieces exist to cap the scratch held
+    beside the output, and there is no scratch now -- the buffer IS the output.
+    Piecing would also break the remap: with several pieces the buffer is
+    piece-major then rank-major, so a position's row would depend on which piece
+    its local row fell in. One collective, one layout, one formula.
+    """
+    parallel = get_parallel()
+    md = forward_batch.attn_dcp_metadata
+    if not getattr(forward_batch, "npu_dcp_packed_ready", False):
+        # Once per forward, on the first layer, and it carries the same
+        # once-per-forward duty the permuting path does in its plan-building
+        # branch. Forgetting the write plan here would not fail: the pool's
+        # identity check would simply miss and every rank would fall back to
+        # writing all 16/16 of the KV at row 0 -- correct, and 487 ms slower.
+        forward_batch.npu_dcp_packed_ready = True
+        md.dcp_kv_buffer = None
+        plan_write = getattr(get_token_to_kv_pool(), "plan_dcp_extend_write", None)
+        if plan_write is not None:
+            plan_write(forward_batch.out_cache_loc)
+        if _debug_dcp_extend_memory:
+            _log_dcp_extend_memory(plan.prefix_len, plan.extend_len)
+
+    out_nope = dcp_extend_gather_buffer("packed_latent", k_nope, plan.rows)
+    out_rope = dcp_extend_gather_buffer("packed_rope", k_pe, plan.rows)
+
+    if plan.gathered_rows:
+        send_nope, send_rope = get_token_to_kv_pool().get_mla_kv_buffer(
+            m.attn_mqa, md.dcp_local_prefix_kv_indices
+        )
+        send_nope = _pad_dcp_packed_send(send_nope, plan, parallel.dcp_rank)
+        send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
+        parallel.dcp_group.all_gather_into_tensor(
+            out_nope[: plan.gathered_rows], send_nope
+        )
+        parallel.dcp_group.all_gather_into_tensor(
+            out_rope[: plan.gathered_rows], send_rope
+        )
+    # This chunk's own KV is identical on every rank and is not gathered.
+    out_nope[plan.gathered_rows :] = k_nope
+    out_rope[plan.gathered_rows :] = k_pe
+    return out_nope, out_rope
+
+
+def _pad_dcp_packed_send(
+    shards: torch.Tensor, plan: "DcpPackedReadPlan", dcp_rank: int
+) -> torch.Tensor:
+    """This rank's send, padded to ``send_rows`` so every rank sends alike.
+
+    A served prefix is a whole number of ``page_size * dcp_size`` allocator
+    pages, so it divides by ``dcp_size`` and no padding is needed at all -- the
+    shards go to the collective untouched, which is why this checks before it
+    copies rather than always allocating. Only ranks below ``prefix_len %
+    dcp_size`` hold the extra row when a prefix is ragged.
+    """
+    local_len = plan.prefix_len // plan.dcp_size + int(
+        dcp_rank < plan.prefix_len % plan.dcp_size
+    )
+    if local_len == plan.send_rows:
+        return shards.contiguous()
+    send = shards.new_zeros((plan.send_rows, *shards.shape[1:]))
+    send[:local_len] = shards[:local_len]
     return send
 
 
@@ -669,6 +766,11 @@ def _dcp_gather_extend_kv_npu(
     """
     parallel = get_parallel()
     md = forward_batch.attn_dcp_metadata
+    packed_plan = dcp_packed_read_plan(forward_batch)
+    if packed_plan is not None:
+        return _dcp_gather_extend_kv_packed_npu(
+            m, forward_batch, k_nope, k_pe, packed_plan
+        )
     plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
     if plan is None:
         # Sized by the shared planner for the whole context, for CUDA's

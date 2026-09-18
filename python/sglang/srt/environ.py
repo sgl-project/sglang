@@ -962,10 +962,22 @@ class Envs:
     # DSA prefill: shard the whole attention block's TOKENS across the
     # attention-TP group -- every rank computes every head for its own slice,
     # instead of its own heads for every token. Consumes no ranks, so it
-    # composes with DCP. Supersedes the indexer-only sharding above, which must
-    # be off when this is on. Changes weight layout (q_b_proj and kv_b_proj go
-    # full-width), so it is read at startup, not per forward.
+    # composes with DCP, and with the indexer-only sharding above rather than
+    # replacing it. No weight is resharded: the query is redistributed across
+    # attention TP by all-to-all and put back after attention. Read at startup
+    # because it decides whether the full-head RadixAttention gets built.
     SGLANG_NPU_ENABLE_DSA_CP = EnvBool(False)
+    # DSA-CP: also shard batches that carry more than one request. Shards each
+    # request's tokens separately and drops the operator's causal crop, which
+    # the top-k already enforces -- see dsa_cp_layout.plan_dsa_cp_shard_per_req.
+    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(False)
+    # DCP extend on NPU: let the sparse operator read the gathered prefix in the
+    # rank-major order the all-gather already produced, remapping the top-k
+    # instead of permuting ~1 GiB of KV back into position order.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(False)
+    # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
+    # l computes, into the other of two slots. Requires the packed read above.
+    SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps

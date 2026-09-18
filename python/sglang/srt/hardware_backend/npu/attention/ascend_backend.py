@@ -31,6 +31,8 @@ from sglang.srt.layers.attention.dsa.dsa_cp import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_local_kv_block_table,
+    dcp_packed_kv_lens,
+    dcp_packed_read_plan,
     get_dcp_lens,
     remap_dcp_local_topk_indices,
 )
@@ -1406,21 +1408,44 @@ class AscendAttnBackend(AttentionBackend):
                 key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
-                if dsa_cp_plan is not None:
-                    # This rank's queries end partway through the request, so
-                    # they see fewer keys than the buffer holds. These lengths
-                    # are cumulative and therefore double as the request
-                    # boundaries inside the buffer -- which is exactly why
-                    # DSA-CP refuses multi-request extends: shortening one
-                    # request's entry would move where the next one starts.
-                    # With a single request the shortened length is a true
-                    # prefix of the buffer and the read is exact.
-                    seq_lengths_kv = dsa_cp_kvlen
-                layout_kv = "TND"
+                packed_plan = dcp_packed_read_plan(forward_batch)
+                if packed_plan is not None:
+                    # C1. The buffer is the all-gather's own rank-major output,
+                    # so a row's index no longer says anything about its
+                    # position -- and both of the conventions above are about
+                    # position. The top-k was remapped to rows by the model, the
+                    # whole buffer is one request, and the operator's causal
+                    # crop has to go: sparse_mode 3 aligns query i to key
+                    # K - Q + i, which is meaningless once the keys are
+                    # permuted. Causality is not lost, it moves upstream -- the
+                    # indexer selects over positions with visibility already
+                    # applied, so the set handed here is causal by construction.
+                    # This is the same trade the DCP decode branch makes above,
+                    # and for the same reason.
+                    #
+                    # Note this also makes DSA-CP's shortened key lengths
+                    # unnecessary: those exist only to make the mode-3 crop land
+                    # on the right key, and there is no crop now.
+                    seq_lengths_kv = dcp_packed_kv_lens(
+                        forward_batch, packed_plan, q.device
+                    )
+                    sparse_mode = 0
+                else:
+                    if dsa_cp_plan is not None:
+                        # This rank's queries end partway through the request, so
+                        # they see fewer keys than the buffer holds. These lengths
+                        # are cumulative and therefore double as the request
+                        # boundaries inside the buffer -- which is exactly why
+                        # DSA-CP refuses multi-request extends: shortening one
+                        # request's entry would move where the next one starts.
+                        # With a single request the shortened length is a true
+                        # prefix of the buffer and the read is exact.
+                        seq_lengths_kv = dsa_cp_kvlen
+                    sparse_mode = 3
                 # layout_kv must equal layout_query unless it is PA_BSND
                 # (sparse_flash_attention_tiling.cpp:1761), which is why this is
                 # TND and not BSND.
-                sparse_mode = 3
+                layout_kv = "TND"
             else:
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
