@@ -435,6 +435,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}
+                    if get_platform().is_sm110:
+                        allowed.add("flashinfer")
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
