@@ -1608,8 +1608,12 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
+        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
         return (
-            bool(self.low_ratios) and _has_dense_fp4_indexer() and _is_sm100_or_newer()
+            bool(self.low_ratios)
+            and _has_dense_fp4_indexer()
+            and _is_sm100_or_newer()
+            and get_parallel().attn_cp_size == 1
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
