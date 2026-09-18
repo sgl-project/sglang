@@ -2043,39 +2043,6 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-        parser.add_argument(
-            "--weight-cache-mode",
-            choices=["off", "client"],
-            default="off",
-            help="Strict single-GPU transformer cache client: Wan2.1 1.3B, original Qwen-Image or native MiniMax-H3 FL2VA.",
-        )
-        parser.add_argument(
-            "--weight-cache-components",
-            nargs="+",
-            default=["dit"],
-            help="Components to cache: dit (default), or dit text_encoder for native original H3 FL2VA. Cached components must remain GPU-resident.",
-        )
-        parser.add_argument(
-            "--weight-cache-fallback", choices=["error"], default="error"
-        )
-        parser.add_argument("--weight-cache-socket", default=None)
-        parser.add_argument(
-            "--weight-cache-timeout",
-            type=float,
-            default=1800.0,
-            help="Timeout in seconds for each cache socket exchange; not an owner readiness wait.",
-        )
-        parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
-        parser.add_argument(
-            "--weight-cache-allow-weak-checkpoint-identity",
-            action="store_true",
-            help="Development only: allow stat-only local checkpoint identity without a content manifest; not a production integrity guarantee.",
-        )
-        parser.add_argument(
-            "--weight-cache-allow-unverified-build",
-            action="store_true",
-            help="Development only: allow installed providers without RECORD (unverified native build). Complete stable Python source identity remains mandatory.",
-        )
         # Model and path configuration
         parser.add_argument(
             "--model-path",
@@ -3063,6 +3030,41 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+
+        # Weight cache
+        parser.add_argument(
+            "--weight-cache-mode",
+            choices=["off", "client"],
+            default="off",
+            help="Strict single-GPU transformer cache client: Wan2.1 1.3B, original Qwen-Image or native MiniMax-H3 FL2VA.",
+        )
+        parser.add_argument(
+            "--weight-cache-components",
+            nargs="+",
+            default=["dit"],
+            help="Components to cache: dit (default), or dit text_encoder for native original H3 FL2VA. Cached components must remain GPU-resident.",
+        )
+        parser.add_argument(
+            "--weight-cache-fallback", choices=["error"], default="error"
+        )
+        parser.add_argument("--weight-cache-socket", default=None)
+        parser.add_argument(
+            "--weight-cache-timeout",
+            type=float,
+            default=1800.0,
+            help="Timeout in seconds for each cache socket exchange; not an owner readiness wait.",
+        )
+        parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
+        parser.add_argument(
+            "--weight-cache-allow-weak-checkpoint-identity",
+            action="store_true",
+            help="Development only: allow stat-only local checkpoint identity without a content manifest; not a production integrity guarantee.",
+        )
+        parser.add_argument(
+            "--weight-cache-allow-unverified-build",
+            action="store_true",
+            help="Development only: allow installed providers without RECORD (unverified native build). Complete stable Python source identity remains mandatory.",
         )
 
         return parser
