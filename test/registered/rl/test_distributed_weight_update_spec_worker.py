@@ -102,8 +102,11 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
 
 
 def _session_manager(target_runner, draft_runner):
+    target_runner.weight_updater._m2n_receivers = {}
     return _manager(
-        tp_worker=SimpleNamespace(iter_runners=lambda: [("", target_runner)]),
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner, iter_runners=lambda: [("", target_runner)]
+        ),
         draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
     )
 

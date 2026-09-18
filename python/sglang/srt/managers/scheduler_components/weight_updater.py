@@ -230,20 +230,6 @@ class SchedulerWeightUpdaterManager:
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        if (
-            success
-            and recv_req.m2n_manifest is not None
-            and self.draft_worker is not None
-        ):
-            cleanup_success, cleanup_message = (
-                self.tp_worker.destroy_weights_update_group(
-                    DestroyWeightsUpdateGroupReqInput(group_name=recv_req.group_name)
-                )
-            )
-            success = False
-            message = "NCCL M2N does not support a draft/speculative model runner."
-            if not cleanup_success:
-                message += f" Cleanup also failed: {cleanup_message}"
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
@@ -297,6 +283,13 @@ class SchedulerWeightUpdaterManager:
                     if recv_req.selector not in ("target", "all"):
                         raise ValueError(
                             "NCCL M2N can update only the target model runner"
+                        )
+                    if self.draft_worker is not None and (
+                        recv_req.selector != "target"
+                        or self._weight_update_selector != "target"
+                    ):
+                        raise ValueError(
+                            "NCCL M2N with a draft requires a target-only weight-update session"
                         )
                     if recv_req.m2n_group_names is None:
                         self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n(
@@ -464,6 +457,16 @@ class SchedulerWeightUpdaterManager:
         transfer resets the open transaction so a reconnected sender can replay
         the complete update without exposing the partial weights. A restart must
         retain the original selector so end finalizes exactly the prepared runners."""
+        # Reject before the sender starts NCCL transfers or any draft storage changes.
+        if (
+            self.draft_worker is not None
+            and recv_req.selector != "target"
+            and self.tp_worker.model_runner.weight_updater._m2n_receivers
+        ):
+            return BeginWeightUpdateReqOutput(
+                success=False,
+                message="NCCL M2N with a draft requires selector='target'; draft weights stay frozen.",
+            )
         if self._weight_update_in_progress:
             if recv_req.selector != self._weight_update_selector:
                 return BeginWeightUpdateReqOutput(
