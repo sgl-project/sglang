@@ -85,7 +85,6 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.shared_aux_hidden import SharedAuxHiddenBuffers
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -108,6 +107,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
+from sglang.srt.model_executor.shared_aux_hidden import SharedAuxHiddenBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import (
     get_exec,

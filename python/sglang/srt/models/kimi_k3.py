@@ -3080,12 +3080,13 @@ class KimiK3LinearModel(nn.Module):
                     # the upstream tap computation and pack in execution order.
                     width = captured.shape[-1]
                     assert shared_aux.shape == (
-                        captured.shape[0], len(self.dspark_layers_to_capture) * width
+                        captured.shape[0],
+                        len(self.dspark_layers_to_capture) * width,
                     )
                     assert shared_aux.dtype == captured.dtype
-                    shared_aux[:, aux_tap_idx * width : (aux_tap_idx + 1) * width].copy_(
-                        captured
-                    )
+                    shared_aux[
+                        :, aux_tap_idx * width : (aux_tap_idx + 1) * width
+                    ].copy_(captured)
                     aux_tap_idx += 1
 
         if not self.pp_group.is_last_rank:
