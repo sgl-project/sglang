@@ -405,7 +405,18 @@ def forward_dsa_prepare_npu(
     # this is the half of the pair that receives layer_scatter_modes and the
     # gate needs it: the slice assumes this rank was handed the whole batch.
     # The result is cached on the batch and the core reads it back.
-    get_dsa_cp_plan(forward_batch, layer_scatter_modes)
+    # index_topk decides whether the multi-request lift may drop the operator's
+    # causal crop, and this is the FIRST place in a forward that can supply it.
+    # m.indexer exists only on the layers that compute a top-k
+    # (deepseek_v2.py:1828) -- layer 0 is one of them, and it is layer 0 that
+    # resolves the cached plan -- but None is answered "keep the crop" rather
+    # than trusted, so a model that ordered its layers differently degrades
+    # instead of breaking.
+    get_dsa_cp_plan(
+        forward_batch,
+        layer_scatter_modes,
+        m.indexer.index_topk if m.indexer is not None else None,
+    )
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -697,6 +708,15 @@ class _DcpGatherPrefetcher:
         """Issue one layer's prefix all-gather on the side stream."""
         slot = layer_id % 2
         out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
+        # The slot buffers are allocated by the caching allocator on the COMPUTE
+        # stream and written here on the side stream. record_stream is what stops
+        # the allocator handing that memory to something else while this stream
+        # is still writing it. The buffers are cached and long-lived, so this
+        # matters on exactly one event -- a context longer than any before it,
+        # which grows the reservation and frees the old block -- and that is the
+        # first forward of a longer prompt, not a rare one.
+        out_nope.record_stream(self.stream)
+        out_rope.record_stream(self.stream)
         # Wait for everything already issued on compute, so the slot's previous
         # reader -- layer_id - 2's attention -- is done before it is overwritten.
         self.stream.wait_stream(torch.npu.current_stream())

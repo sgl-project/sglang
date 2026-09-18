@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
     plan_dsa_cp_shard,
 )
 from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
@@ -110,11 +111,22 @@ def dsa_cp_multi_request_enabled() -> bool:
 
     So do not shorten them. Pass the full per-request lengths -- which is
     exactly what the non-DSA-CP path already passes, ``dcp_kv_indptr[1:]`` --
-    and set ``sparse_mode`` to 0 so there is no crop to align. Causality does
-    not come from the crop: the indexer selects the top-k over positions with
-    visibility already applied, so the set handed to the operator is causal by
-    construction. The DCP **decode** branch has relied on precisely that since
-    the port began, for the same reason and with the same ``sparse_mode`` 0.
+    and set ``sparse_mode`` to 0 so there is no crop to align.
+
+    **That is only safe above a bound, which the first version of this got
+    wrong.** The crop is not redundant: below ``index_topk`` the top-k selects
+    every key it is offered (dsa_indexer.py:402), so it is not causal and the
+    crop is what makes the result so. Stage A measured the cost of assuming
+    otherwise -- prefill logprobs off by up to 2.09 against a 0.354 noise floor.
+    So the lift applies only when every request in the batch has a prefix of at
+    least ``index_topk``; ``dcp_crop_free_extend`` decides that once per forward
+    and the attention backend reads the same answer. Below the bound the
+    one-request refusal stands, exactly as before this flag existed.
+
+    The DCP **decode** branch really does run with ``sparse_mode`` 0 -- but for a
+    different reason than the one this used to claim. At decode every key in the
+    buffer is already a past token, so there is nothing to mask. At extend the
+    buffer holds the chunk's own later tokens.
 
     What the rank does not touch costs nothing: a request outside its slice gets
     query length 0, its KV rows stay in the buffer, and no query names them.
@@ -162,6 +174,7 @@ def dsa_cp_enabled() -> bool:
 def get_dsa_cp_plan(
     forward_batch: "ForwardBatch",
     layer_scatter_modes=None,
+    index_topk: Optional[int] = None,
 ) -> Optional[DsaCpPlan]:
     """This forward's token slice for this rank, or None if DSA-CP is off here.
 
@@ -185,12 +198,14 @@ def get_dsa_cp_plan(
     if cached is not _MISSING:
         return cached
 
-    plan = _build_dsa_cp_plan(forward_batch, layer_scatter_modes)
+    plan = _build_dsa_cp_plan(forward_batch, layer_scatter_modes, index_topk)
     forward_batch.npu_dsa_cp_plan = plan
     return plan
 
 
-def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan]:
+def _build_dsa_cp_plan(
+    forward_batch, layer_scatter_modes, index_topk=None
+) -> Optional[DsaCpPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
         print_info_once("DSA-CP is off: attention TP size is 1, nothing to shard")
@@ -233,7 +248,16 @@ def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan
         parallel.attn_tp_size,
         parallel.attn_tp_rank,
     )
-    if not _enable_dsa_cp_multi_request and sum(1 for n in extend_lens if n > 0) > 1:
+    multi_request = sum(1 for n in extend_lens if n > 0) > 1
+    # The lift only applies where the causal crop is not load-bearing. It works
+    # by NOT shortening the per-request KV lengths and dropping the crop
+    # instead, and stage A measured what dropping that crop costs when the
+    # top-k is not causal: prefill logprobs off by up to 2.09 against a 0.354
+    # floor. Below the bound the refusal stands, exactly as before the lift.
+    lift_applies = _enable_dsa_cp_multi_request and dcp_crop_free_extend(
+        forward_batch, index_topk
+    )
+    if not lift_applies and multi_request:
         # ONE REQUEST PER EXTEND FORWARD unless the lift is enabled, and the
         # reason is the KV layout rather than the query arithmetic.
         #

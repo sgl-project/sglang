@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.dsa.dsa_cp import (
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
+    dcp_crop_free_extend,
     dcp_local_kv_block_table,
     dcp_packed_kv_lens,
     dcp_packed_read_plan,
@@ -1380,11 +1381,16 @@ class AscendAttnBackend(AttentionBackend):
                 # 0, not 3. Once the indices are rank-local, local KV length and
                 # global query length no longer share a coordinate system, so the
                 # operator must not apply its own right-down causal crop.
-                # Causality is enforced upstream instead: the replicated-view
-                # indexer selects over globally-addressed positions with
-                # visibility already applied, so the set handed here is causal by
-                # construction. vLLM-Ascend reasons identically at
-                # sfa_cp.py:1238-1249.
+                #
+                # Safe HERE because this is decode: every key in the buffer is
+                # already a past token, so there is nothing for a causal mask to
+                # remove, whatever the top-k names. That is the actual reason,
+                # and it does not carry to extend, where the buffer holds the
+                # chunk's own later tokens. This comment used to say the top-k
+                # was "causal by construction"; stage A measured that it is not
+                # below index_topk (dsa_indexer.py:402), so do not cite this
+                # branch as precedent for dropping the crop at extend.
+                # vLLM-Ascend reasons the same way at sfa_cp.py:1238-1249.
                 sparse_mode = 0
             elif dcp_extend:
                 # Every convention below was measured, not inferred, by
@@ -1437,7 +1443,14 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch, packed_plan, q.device
                     )
                     sparse_mode = 0
-                elif dsa_cp_plan is not None and dsa_cp_multi_request_enabled():
+                elif (
+                    dsa_cp_plan is not None
+                    and dsa_cp_multi_request_enabled()
+                    and dcp_crop_free_extend(
+                        forward_batch,
+                        topk_indices.shape[-1] if topk_indices is not None else None,
+                    )
+                ):
                     # The lift. Do NOT shorten the per-request KV lengths -- keep
                     # dcp_kv_indptr[1:], the same full lengths the unsharded path
                     # passes, so no request's start moves -- and drop the causal

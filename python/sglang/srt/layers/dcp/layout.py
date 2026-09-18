@@ -595,6 +595,45 @@ def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
     return prefix_len + 1 >= index_topk
 
 
+def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
+    """May this extend forward drop the operator's causal crop?
+
+    Only if EVERY request in the batch clears the bound, because the crop is set
+    once for the whole call. Decided once per forward and cached, so the model
+    and the backend cannot disagree halfway down a forward.
+
+    Three features want this answer and all three must get the same one:
+      * the packed read, which cannot use the crop at all once rows are
+        rank-major;
+      * the DSA-CP multi-request lift, which drops the crop so it can stop
+        shortening per-request KV lengths;
+      * the DSA-CP single-request path under that lift, which the lift also
+        moves onto sparse_mode 0 on purpose.
+
+    ``index_topk`` of None means the caller had no top-k to measure, which is
+    answered False -- the crop stays, which is always correct and sometimes
+    slower.
+    """
+    cached = getattr(forward_batch, "npu_dcp_crop_free", None)
+    if cached is not None:
+        return cached
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    ok = bool(
+        index_topk is not None
+        and prefix_lens
+        and all(dcp_packed_causal_crop_is_dead(p, index_topk) for p in prefix_lens)
+    )
+    if not ok and index_topk is not None and prefix_lens:
+        print_info_once(
+            f"DCP extend keeps the operator's causal crop: a request here has a "
+            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)}), "
+            "and below that the top-k selects every key it is offered, so the "
+            "crop is what makes the result causal"
+        )
+    forward_batch.npu_dcp_crop_free = ok
+    return ok
+
+
 def dcp_packed_read_plan(
     forward_batch, index_topk: Optional[int]
 ) -> Optional[DcpPackedReadPlan]:
@@ -642,15 +681,13 @@ def dcp_packed_read_plan(
             f"({len(extend_lens)} requests here); the all-gather is rank-major "
             "over the whole send, so no request is contiguous in it"
         )
-    elif not dcp_packed_causal_crop_is_dead(prefix_lens[0], index_topk):
+    elif not dcp_crop_free_extend(forward_batch, index_topk):
         # Measured, stage A, 2026-09-19: dropping the crop below this bound
         # moved prefill logprobs by up to 2.09 against a 0.354 noise floor.
-        # See dcp_packed_causal_crop_is_dead for why the bound is what it is.
+        # dcp_crop_free_extend has already logged which request fell short.
         print_info_once(
-            f"DCP packed read is off for chunks with a prefix under "
-            f"index_topk={index_topk} (this one has {prefix_lens[0]}); the "
-            "top-k selects every key it is offered there, so the operator's "
-            "causal crop is load-bearing and cannot be dropped"
+            "DCP packed read is off: this chunk needs the operator's causal "
+            "crop, and the packed layout cannot use one"
         )
     else:
         plan = plan_dcp_packed_read(
