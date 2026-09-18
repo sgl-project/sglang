@@ -1742,6 +1742,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
         running_state["topk_ids"] = None
         running_state["topk_weights"] = topk_weights
         running_state["deepep_v2_expanded"] = True
+        running_state["deepep_v2_psum"] = psum_num_recv_tokens_per_expert
+        running_state["deepep_v2_expert_alignment"] = deepep_v2_expert_alignment
 
         if deepep_v2_use_masked:
             # masked_m bounds each expert independently of buffer capacity.
@@ -1757,9 +1759,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 deepep_v2_expert_alignment,
             )
             running_state["deepep_v2_masked"] = True
-            running_state["deepep_v2_psum"] = psum_num_recv_tokens_per_expert
             running_state["deepep_v2_total_expanded"] = deepep_v2_total_expanded
-            running_state["deepep_v2_expert_alignment"] = deepep_v2_expert_alignment
             return DeepGemmRunnerInput(
                 hidden_states=input_tensor,
                 hidden_states_scale=input_tensor_scale,
@@ -1883,10 +1883,16 @@ def post_permute_deep_gemm_to_deepep_v2(
                 hidden_states=hidden_states,
                 topk_weights=topk_weights[: hidden_states.shape[0]],
                 routewise_layout=RoutewiseLayout.EXPANDED,
+                psum_num_recv_tokens_per_expert=running_state["deepep_v2_psum"],
+                expert_alignment=running_state["deepep_v2_expert_alignment"],
             )
         if return_unweighted_routes:
             return DeepEPv2CombineInput(
-                hidden_states, topk_weights, RoutewiseLayout.EXPANDED
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                routewise_layout=RoutewiseLayout.EXPANDED,
+                psum_num_recv_tokens_per_expert=running_state["deepep_v2_psum"],
+                expert_alignment=running_state["deepep_v2_expert_alignment"],
             )
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights.

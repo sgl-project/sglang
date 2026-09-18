@@ -78,6 +78,9 @@ class DeepEPv2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_weights: Optional[torch.Tensor]
     routewise_layout: Optional[RoutewiseLayout] = None
+    # GPU-resident valid expert intervals in expanded communication capacity.
+    psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
+    expert_alignment: int = _EXPERT_ALIGNMENT
 
     @property
     def format(self) -> CombineInputFormat:

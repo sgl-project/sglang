@@ -115,46 +115,63 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         self._check_expand_roundtrip([0, 0, 0, 0], torch.bfloat16, with_scale=False)
 
     def test_runner_defers_expanded_route_weighting(self):
+        """Expanded route outputs retain dispatch intervals in both GEMM layouts."""
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.deep_gemm import (
             DeepGemmRunnerOutput,
             post_permute_deep_gemm_to_deepep_v2,
+            pre_permute_deepep_v2_to_deep_gemm,
         )
         from sglang.srt.layers.moe.token_dispatcher.base import RoutewiseLayout
+        from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+            DeepEPv2DispatchOutput,
+        )
 
         counts = [3, 0, 2]
-        recv_x, _, psum, starts, total = _build_layout(
-            counts, self.ALIGN, self.HIDDEN, torch.bfloat16
-        )
-        masked_x, _, _ = expand_to_masked_slab(
-            recv_x, None, psum, len(counts), self.MAX_M, self.ALIGN
-        )
-        weights = torch.full((total,), 0.25, device=DEVICE)
-        state = {
-            "deepep_v2_expanded": True,
-            "deepep_v2_masked": True,
-            "deepep_v2_psum": psum,
-            "deepep_v2_total_expanded": total,
-            "deepep_v2_expert_alignment": self.ALIGN,
-            "topk_weights": weights,
-        }
-        rows = _real_rows(starts, counts)
-        for no_combine in (False, True):
-            with self.subTest(no_combine=no_combine):
-                output = post_permute_deep_gemm_to_deepep_v2(
-                    DeepGemmRunnerOutput(masked_x),
-                    None,
-                    MoeRunnerConfig(no_combine=no_combine),
-                    state,
-                )
-                expected = recv_x[rows] if no_combine else recv_x[rows] * 0.25
-                self.assertTrue(torch.equal(output.hidden_states[rows], expected))
-                self.assertEqual(
-                    output.routewise_layout,
-                    RoutewiseLayout.EXPANDED if no_combine else None,
-                )
-                if no_combine:
-                    self.assertTrue(torch.equal(output.topk_weights, weights))
+        for use_masked in (False, True):
+            align = self.ALIGN if use_masked else 128
+            recv_x, _, psum, starts, total = _build_layout(
+                counts, align, self.HIDDEN, torch.bfloat16
+            )
+            weights = torch.full((total,), 0.25, device=DEVICE)
+            dispatch = DeepEPv2DispatchOutput(
+                hidden_states=recv_x,
+                hidden_states_scale=None,
+                topk_ids=None,
+                topk_weights=weights,
+                psum_num_recv_tokens_per_expert=psum,
+                is_expanded=True,
+                use_masked_gemm=use_masked,
+                masked_max_m=self.MAX_M,
+                total_expanded=total,
+                expert_alignment=align,
+            )
+            rows = _real_rows(starts, counts)
+            for no_combine in (False, True):
+                with self.subTest(use_masked=use_masked, no_combine=no_combine):
+                    config = MoeRunnerConfig(no_combine=no_combine)
+                    state = {}
+                    runner_input = pre_permute_deepep_v2_to_deep_gemm(
+                        dispatch, None, config, state
+                    )
+                    output = post_permute_deep_gemm_to_deepep_v2(
+                        DeepGemmRunnerOutput(runner_input.hidden_states),
+                        None,
+                        config,
+                        state,
+                    )
+                    expected = recv_x[rows] if no_combine else recv_x[rows] * 0.25
+                    self.assertTrue(torch.equal(output.hidden_states[rows], expected))
+                    self.assertEqual(
+                        output.routewise_layout,
+                        RoutewiseLayout.EXPANDED if no_combine else None,
+                    )
+                    if no_combine:
+                        self.assertTrue(torch.equal(output.topk_weights, weights))
+                        self.assertIs(output.psum_num_recv_tokens_per_expert, psum)
+                        self.assertEqual(output.expert_alignment, align)
+                    else:
+                        self.assertIsNone(output.psum_num_recv_tokens_per_expert)
 
     def test_runner_restores_token_topk_routes_and_masks_nonlocal_slots(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
