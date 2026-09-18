@@ -48,6 +48,11 @@
 //! `KvEventIndex::remove_worker` on the service-discovery task. So
 //! [`HashTree::writer`] serialises them. Readers never take it.
 //!
+//! Which leaves a reader's own scan able to go stale the same way, so
+//! [`HashTree::descend_match_shard`] re-checks the parent it resolved under
+//! the descent's own lock and falls back to `shard_of(block_hashes[0])` —
+//! never to the nominated shard's sentinel, which would match nothing.
+//!
 //! # Reverse index
 //!
 //! `BlockRemoved` events carry only `block_hashes` and no parent context,
@@ -1271,6 +1276,10 @@ impl HashTree {
     /// for the reason [`Self::route_insert`] gives. The hot path passes
     /// `None` and never scatters. `block_hashes` is non-empty (the caller
     /// early-returns on empty).
+    ///
+    /// The result holds only for as long as no shard lock is dropped, so it
+    /// is advisory: [`Self::descend_match_shard`] re-checks it under the
+    /// descent's own lock.
     fn route_match(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> (usize, Option<i64>) {
         let root_shard = shard_of(block_hashes[0]);
         let Some(p) = parent_hash else {
@@ -1291,6 +1300,54 @@ impl HashTree {
             1 => (only_shard.unwrap_or(root_shard), Some(p)),
             _ => (root_shard, None),
         }
+    }
+
+    /// Descend the shard that can answer for `parent_hash`, re-checking
+    /// [`Self::route_match`]'s resolution under the descent's own read lock.
+    ///
+    /// The scan and the descent are separate lock scopes and readers never
+    /// take [`Self::writer`], so a write in between can prune `p` or give it
+    /// a second carrier in the chosen shard. The in-shard start resolution
+    /// would then fall back to THAT shard's sentinel — but the chain hangs
+    /// off `shard_of(block_hashes[0])`'s, so the descent matches nothing and
+    /// a caller passing `Some(p)` silently gets `matched_blocks == 0` where
+    /// the unsharded tree returns the real match. Re-checking makes the
+    /// resolution and the descent atomic, and a stale one falls back to the
+    /// chain's own root shard — which is what "fall back to root" means once
+    /// the tree is sharded, and what the ambiguous case already does.
+    ///
+    /// A carrier appearing in a DIFFERENT shard is not re-checked: that
+    /// costs a second cross-shard scan to turn a real match into a root
+    /// fall-back. `block_hashes` is non-empty (callers early-return on
+    /// empty).
+    fn descend_match_shard<R>(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        descend: impl Fn(&TreeState, Option<i64>) -> R,
+    ) -> R {
+        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
+        self.descend_routed(idx, effective_parent, block_hashes, descend)
+    }
+
+    /// The half of [`Self::descend_match_shard`] that runs after the scan,
+    /// split out so a test can hand it a resolution that has already gone
+    /// stale — the state a racing writer leaves behind, which no sequential
+    /// call can reach.
+    fn descend_routed<R>(
+        &self,
+        idx: usize,
+        effective_parent: Option<i64>,
+        block_hashes: &[i64],
+        descend: impl Fn(&TreeState, Option<i64>) -> R,
+    ) -> R {
+        if let Some(p) = effective_parent {
+            let shard = self.shards[idx].read();
+            if shard.by_hash.get(&p).is_some_and(|ids| ids.len() == 1) {
+                return descend(&shard, Some(p));
+            }
+        }
+        descend(&self.shards[shard_of(block_hashes[0])].read(), None)
     }
 
     /// Apply an untagged `BlockStored` event: a device store. See
@@ -1402,10 +1459,9 @@ impl HashTree {
         if block_hashes.is_empty() {
             return MatchResult::default();
         }
-        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
-        self.shards[idx]
-            .read()
-            .match_prefix(effective_parent, block_hashes)
+        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+            shard.match_prefix(parent, block_hashes)
+        })
     }
 
     /// How many leading blocks of `block_hashes` each worker holds
@@ -1420,10 +1476,9 @@ impl HashTree {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
-        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
-        self.shards[idx]
-            .read()
-            .prefix_depths(effective_parent, block_hashes)
+        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+            shard.prefix_depths(parent, block_hashes)
+        })
     }
 
     /// Number of non-root nodes across all shards, summed under a per-shard
@@ -2446,6 +2501,125 @@ mod tests {
             m.matched_blocks, 2,
             "1009 must NOT be attached under the shard's node carrying 5",
         );
+    }
+
+    /// Regression: [`HashTree::route_match`] drops each shard's read lock
+    /// before the descent takes one, and readers never take
+    /// [`HashTree::writer`], so its resolution can go stale. A parent pruned
+    /// in that window leaves the shard's own start resolution falling back to
+    /// the NOMINATED shard's sentinel — which carries none of the chain, so
+    /// `matched_blocks` comes back 0 where the unsharded tree returns the
+    /// real match. The fall-back has to be the chain's own root shard.
+    ///
+    /// Driven through [`HashTree::descend_routed`] with a hand-made stale
+    /// pair: sequentially, `route_match` and the re-check always agree.
+    #[test]
+    fn a_pruned_parent_falls_back_to_the_chains_root_shard() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let chain = [1i64, 2, 3];
+        // Negative so it cannot collide with the chain; stepped until it
+        // lands off the chain's shard, which is what makes descending the
+        // nominated shard observably wrong.
+        let mut p = -7i64;
+        while shard_of(p) == shard_of(chain[0]) {
+            p -= 1;
+        }
+        tree.insert(&a, None, &chain);
+        tree.insert(&a, None, &[p]);
+
+        let (idx, parent) = tree.route_match(Some(p), &chain);
+        assert_eq!(
+            (idx, parent),
+            (shard_of(p), Some(p)),
+            "test premise: `p` resolves uniquely, to a shard that is not the chain's",
+        );
+
+        // The racing writer prunes `p` — empty and childless, so the node goes.
+        tree.remove(&a, &[p]);
+
+        assert_eq!(
+            tree.shards[idx]
+                .read()
+                .match_prefix(Some(p), &chain)
+                .matched_blocks,
+            0,
+            "test premise: the nominated shard's sentinel carries no chain, \
+             so an in-shard fall-back to root matches nothing",
+        );
+
+        let m = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.match_prefix(parent, &chain)
+        });
+        assert_eq!(
+            m.matched_blocks,
+            chain.len(),
+            "a stale resolution must fall back to the chain's root shard",
+        );
+        assert_eq!(m.workers(), workers(&[&a]));
+
+        let depths = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.prefix_depths(parent, &chain)
+        });
+        assert_eq!(
+            depths.get(&a),
+            Some(&chain.len()),
+            "`prefix_depths` shares the fall-back",
+        );
+    }
+
+    /// The other shape of the same staleness: `p` gains a second carrier in
+    /// the nominated shard between the scan and the descent. Ambiguity there
+    /// means the shard starts from its own sentinel, so the fall-back must
+    /// again be the chain's root shard rather than that shard's root.
+    #[test]
+    fn a_parent_that_gained_a_carrier_falls_back_to_the_chains_root_shard() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let chain = [1i64, 2, 3];
+        let p = -7i64;
+        // Two chain roots sharing ONE shard, and not the chain's: the second
+        // carrier has to land in the shard the scan already nominated.
+        let mut h1 = 4i64;
+        while shard_of(h1) == shard_of(chain[0]) {
+            h1 += 1;
+        }
+        let mut h2 = h1 + 1;
+        while shard_of(h2) != shard_of(h1) {
+            h2 += 1;
+        }
+        tree.insert(&a, None, &chain);
+        tree.insert(&a, None, &[h1, p]);
+
+        let (idx, parent) = tree.route_match(Some(p), &chain);
+        assert_eq!(
+            (idx, parent),
+            (shard_of(h1), Some(p)),
+            "test premise: one carrier of `p`, off the chain's shard",
+        );
+
+        // The racing writer roots a second chain carrying `p` in that shard.
+        tree.insert(&a, None, &[h2, p]);
+
+        assert_eq!(
+            tree.shards[idx]
+                .read()
+                .match_prefix(Some(p), &chain)
+                .matched_blocks,
+            0,
+            "test premise: ambiguity sends the descent to the wrong sentinel",
+        );
+
+        let m = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.match_prefix(parent, &chain)
+        });
+        assert_eq!(
+            m.matched_blocks,
+            chain.len(),
+            "a resolution invalidated by a second carrier must fall back to \
+             the chain's root shard",
+        );
+        assert_eq!(m.workers(), workers(&[&a]));
     }
 
     /// Two concurrent writers must not be able to orphan a chain. A prune
