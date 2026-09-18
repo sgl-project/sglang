@@ -63,6 +63,15 @@ def test_required_provider_missing_fails_closed(publications, provider):
         fingerprint()
 
 
+@pytest.mark.parametrize(
+    "value", [None, "", "0", "1", "true", "True", "yes", "01", " 1"]
+)
+def test_fa4_identity_matches_attention_selection(publications, monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv("SGLANG_INKLING_FA4_USE_PIP", value)
+    assert fingerprint()["providers"]["fa4"] == ("pip" if value == "1" else "vendored")
+
+
 def test_fa4_selection_and_required_external_provider(publications, monkeypatch):
     before = fingerprint()
     monkeypatch.setenv("SGLANG_INKLING_FA4_USE_PIP", "1")

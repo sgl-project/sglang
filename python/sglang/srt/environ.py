@@ -1245,8 +1245,7 @@ class Envs:
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
-    # Preserve the existing exact "1" provider-selection predicate at every
-    # attention call site and in the weight-cache publication identity.
+    # Weight-cache identity must match attention's exact "1" provider selection.
     SGLANG_INKLING_FA4_USE_PIP = EnvStr(None)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
