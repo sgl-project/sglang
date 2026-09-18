@@ -51,6 +51,7 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
     forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 # Tiny dims chosen to be the minimum that satisfies MambaMixer2's TP/chunk asserts:
 #   - num_heads % tp_size == 0  (tp_size=1)
@@ -323,6 +324,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.draft_attention_backend = None
         self.gpu_id = 0
         self.ps = ParallelState.trivial()
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
