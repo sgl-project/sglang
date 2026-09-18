@@ -36,8 +36,14 @@ def dense_prefill_topk(
     selected = torch.full(
         (q[0].shape[0], topk), -1, dtype=torch.int32, device=weights.device
     )
+    compact = publish_candidates and sum(n > 0 for _, n in request_lengths) == 1 and all(
+        n == 0 or n >= 16 * candidate_topk_blocks * candidate_block_size
+        for _, n in request_lengths
+    )
     published = (
-        PrefillCandidateBlocks(request_blocks=[]) if publish_candidates else None
+        PrefillCandidateBlocks(request_blocks=[], compact=compact)
+        if publish_candidates
+        else None
     )
     request_ranges = []
     row = 0
@@ -57,6 +63,18 @@ def dense_prefill_topk(
         row += query_length
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
+        return selected, published
+    if candidates is not None and candidates.compact:
+        _select_compact(
+            q=q,
+            kv=kv,
+            weights=weights,
+            lengths=lengths,
+            request_lengths=request_lengths,
+            selected=selected,
+            block_size=candidate_block_size,
+            candidates=candidates,
+        )
         return selected, published
     row_alignment = 128 // q[0].shape[1]
     rows_per_chunk = mqa_logits_rows_per_chunk(
@@ -87,6 +105,63 @@ def dense_prefill_topk(
             consume=candidates,
         )
     return selected, published
+
+
+def _select_compact(
+    *,
+    q: tuple[torch.Tensor, torch.Tensor],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    lengths: torch.Tensor,
+    request_lengths: list[tuple[int, int]],
+    selected: torch.Tensor,
+    block_size: int,
+    candidates: PrefillCandidateBlocks,
+) -> None:
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    from sglang.kernels.ops.attention.dsv4.candidate_fp4_indexer import (
+        candidate_fp4_mqa_logits,
+    )
+
+    row_start = context_start = 0
+    for (query_length, context_length), blocks in zip(
+        request_lengths, candidates.request_blocks
+    ):
+        rows = slice(row_start, row_start + query_length)
+        row_start += query_length
+        if context_length == 0 or query_length == 0:
+            context_start += context_length
+            continue
+        logits = candidate_fp4_mqa_logits(
+            (q[0][rows], q[1][rows]),
+            (
+                kv[0][context_start : context_start + context_length],
+                kv[1][context_start : context_start + context_length],
+            ),
+            weights[rows],
+            blocks,
+            lengths[rows],
+            block_size,
+        )
+        compact_selected = torch.empty_like(selected[rows])
+        topk_transform_ragged_v2(
+            logits,
+            torch.full_like(lengths[rows], logits.shape[1]),
+            out_offsets=torch.zeros_like(lengths[rows]),
+            out_indices=compact_selected,
+        )
+        compact_selected = mask_topk_scores(logits, compact_selected)
+        columns = compact_selected.clamp_min(0).to(torch.int64)
+        logical = blocks.gather(1, columns // block_size)
+        logical = logical * block_size + columns % block_size
+        selected[rows].copy_(
+            torch.where(
+                compact_selected >= 0,
+                logical + context_start,
+                -1,
+            ).to(torch.int32)
+        )
+        context_start += context_length
 
 
 def _select_tile(

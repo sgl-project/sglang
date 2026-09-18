@@ -73,13 +73,15 @@ class CandidateMasks(CandidateMetadata):
 
 class PrefillCandidateBlocks(CandidateMetadata, msgspec.Struct):
     request_blocks: List[torch.Tensor]
+    compact: bool = False
 
     def tail(self, lengths: List[int]) -> PrefillCandidateBlocks:
         return PrefillCandidateBlocks(
             request_blocks=[
                 blocks[blocks.shape[0] - length :]
                 for blocks, length in zip(self.request_blocks, lengths)
-            ]
+            ],
+            compact=self.compact,
         )
 
 
