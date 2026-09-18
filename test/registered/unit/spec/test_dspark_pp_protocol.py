@@ -79,14 +79,17 @@ def test_identity_round_and_wire_round_trip():
 @pytest.mark.parametrize("local,remote", [(True, False), (False, True)])
 def test_pd_rejects_asymmetric_mode(local, remote):
     with pytest.raises(ValueError, match="both prefill and decode"):
-        validate_pd_contract(local, remote, 2)
+        validate_pd_contract(local, remote, 2, 1)
 
 
 def test_pd_protocol_topology():
-    validate_pd_contract(True, True, 2)
-    validate_pd_contract(False, False, 8)
-    with pytest.raises(ValueError, match="PP2"):
-        validate_pd_contract(True, True, 1)
+    validate_pd_contract(True, True, 2, 2)
+    validate_pd_contract(True, True, 2, 1)
+    validate_pd_contract(False, False, 8, 1)
+    with pytest.raises(ValueError, match="Decode PP2"):
+        validate_pd_contract(True, True, 1, 1)
+    with pytest.raises(ValueError, match="Prefill PP1 or PP2"):
+        validate_pd_contract(True, True, 2, 4)
 
 
 def test_owner_proposals_remain_flat_and_independent():

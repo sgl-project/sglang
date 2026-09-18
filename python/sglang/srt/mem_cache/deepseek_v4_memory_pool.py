@@ -859,6 +859,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
+    def _stage_layer_ids(self, ratio: Optional[int] = None) -> List[int]:
+        return [
+            layer_id
+            for layer_id in range(self._stage_start, self._stage_end)
+            if ratio is None or self.compression_ratios[layer_id] == ratio
+        ]
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with the compressed KV entry layout."""
+        c4_layer_ids = self._stage_layer_ids(4)
+        c128_layer_ids = self._stage_layer_ids(128)
+        # get_contiguous_buf_infos orders entries as C4, C4 indexer, C128.
+        return c4_layer_ids + c4_layer_ids + c128_layer_ids
+
+    def get_state_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with get_state_buf_infos."""
+        swa_layer_ids = [] if self._unified_kv else self._stage_layer_ids()
+        c4_layer_ids = self._stage_layer_ids(4)
+        return swa_layer_ids + c4_layer_ids + c4_layer_ids
+
+    def get_unified_swa_ring_layer_ids(self) -> List[int]:
+        return self._stage_layer_ids() if self._unified_kv else []
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        return self._stage_layer_ids(128)
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

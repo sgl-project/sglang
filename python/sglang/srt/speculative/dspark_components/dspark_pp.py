@@ -96,14 +96,23 @@ def validate_identities(expected, received) -> None:
         )
 
 
-def validate_pd_contract(local_mode: bool, remote_mode: bool, pp_size: int) -> None:
-    if local_mode != remote_mode:
+def validate_pd_contract(
+    decode_capable: bool,
+    prefill_capable: bool,
+    decode_pp_size: int,
+    prefill_pp_size: int,
+) -> None:
+    if decode_capable != prefill_capable:
         raise ValueError(
-            "PP DSpark requires --speculative-dspark-pp-replicated-draft "
-            "on both prefill and decode"
+            "PP DSpark requires both prefill and decode to transfer draft KV"
         )
-    if local_mode and pp_size != 2:
-        raise ValueError("PP DSpark requires PP2 on both prefill and decode")
+    if not decode_capable:
+        return
+    if decode_pp_size != 2 or prefill_pp_size not in (1, 2):
+        raise ValueError(
+            "PP DSpark requires Decode PP2 and Prefill PP1 or PP2, got "
+            f"decode PP{decode_pp_size} and prefill PP{prefill_pp_size}"
+        )
 
 
 def pack_proposal(owner: int, payload: dict) -> dict:

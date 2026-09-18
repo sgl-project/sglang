@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, PrefillServerInfo
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -66,6 +67,41 @@ class TestTransferStartLayer(CustomTestCase):
             ),
             30,
         )
+
+
+class TestAsymmetricDSparkRankMapping(CustomTestCase):
+    def test_decode_pp_stages_map_to_prefill_pp0_and_cp0(self):
+        for pp_rank in (0, 1):
+            manager = CommonKVManager.__new__(CommonKVManager)
+            manager.attn_tp_size = 4
+            manager.attn_cp_size = 1
+            manager.attn_cp_rank = 0
+            manager.pp_size = 2
+            manager.pp_rank = pp_rank
+            manager.kv_args = SimpleNamespace(engine_rank=0)
+            manager.is_mla_backend = True
+            manager.is_hybrid_mla_backend = False
+            manager.enable_all_cp_ranks_for_transfer = False
+            manager.dspark_pp_owner_version = 1
+            info = PrefillServerInfo(
+                attn_tp_size=8,
+                attn_cp_size=8,
+                dp_size=1,
+                pp_size=1,
+                page_size=256,
+                kv_cache_dtype="fp8_e4m3",
+                follow_bootstrap_room=True,
+                dspark_pp_owner_version=1,
+            )
+
+            manager._resolve_rank_mapping(info)
+
+            self.assertEqual(info.target_tp_rank, 0)
+            self.assertEqual(info.target_tp_ranks, [0, 1])
+            self.assertEqual(info.target_cp_ranks, [0])
+            self.assertEqual(info.target_pp_ranks, [0])
+            self.assertEqual(info.required_dst_info_num, 2)
+            self.assertEqual(info.required_prefill_response_num, 1)
 
 
 class _RecordingKVManager:
@@ -178,6 +214,29 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
         )
         self.assertEqual(pairs, [(0, 0), (1, 1), (2, 3), (3, 4)])
 
+    def test_full_prefill_pairs_onto_decode_stage_subset(self):
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids=[3, 7, 11, 3, 7, 11, 60, 60],
+            dst_layer_ids=[7, 11, 7, 11, 60, 60],
+            n_src=8,
+            n_dst=6,
+            allow_src_superset=True,
+        )
+        self.assertEqual(
+            pairs,
+            [(1, 0), (2, 1), (4, 2), (5, 3), (6, 4), (7, 5)],
+        )
+
+    def test_source_superset_requires_every_destination_entry(self):
+        with self.assertRaisesRegex(RuntimeError, "Prefill peer is missing"):
+            build_transfer_entry_pairs(
+                src_layer_ids=[3, 7],
+                dst_layer_ids=[3, 11],
+                n_src=2,
+                n_dst=2,
+                allow_src_superset=True,
+            )
+
 
 def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
@@ -279,6 +338,43 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
                 (2 * len(stage1) + 1, 2 * len(full) + 1),
             ],
         )
+
+
+class TestDSV4TransferLayerIds(CustomTestCase):
+    @staticmethod
+    def _pool(*, start: int, end: int, unified: bool = False):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._stage_start = start
+        pool._stage_end = end
+        pool._unified_kv = unified
+        pool.compression_ratios = [4, 128, 4, 128, 4, 128]
+        return pool
+
+    def test_compressed_kv_ids_follow_registered_buffer_groups(self):
+        full = self._pool(start=0, end=6)
+        stage = self._pool(start=3, end=6)
+
+        self.assertEqual(full.get_kv_layer_ids(), [0, 2, 4, 0, 2, 4, 1, 3, 5])
+        self.assertEqual(stage.get_kv_layer_ids(), [4, 4, 3, 5])
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                full.get_kv_layer_ids(),
+                stage.get_kv_layer_ids(),
+                9,
+                4,
+                allow_src_superset=True,
+            ),
+            [(2, 0), (5, 1), (7, 2), (8, 3)],
+        )
+
+    def test_state_ids_follow_swa_and_compressor_groups(self):
+        paged = self._pool(start=3, end=6)
+        unified = self._pool(start=3, end=6, unified=True)
+
+        self.assertEqual(paged.get_state_layer_ids(), [3, 4, 5, 4, 4])
+        self.assertEqual(unified.get_state_layer_ids(), [4, 4])
+        self.assertEqual(unified.get_unified_swa_ring_layer_ids(), [3, 4, 5])
+        self.assertEqual(unified.get_request_state_layer_ids(), [3, 5])
 
 
 if __name__ == "__main__":

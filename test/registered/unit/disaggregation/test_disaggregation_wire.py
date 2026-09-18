@@ -38,8 +38,11 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c4_state_indices,
     get_dsv4_c128_state_indices,
     get_qsa_pending_state_indices,
+    pack_state_types,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
     should_send_replicated_state,
+    unpack_state_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -61,6 +64,17 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_state_types_roundtrip_and_match_occurrences(self):
+        src = [StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA]
+        dst = [StateType.SWA, StateType.SWA]
+
+        self.assertEqual(unpack_state_types(pack_state_types(src)), src)
+        self.assertEqual(resolve_state_component_dst_index(src, dst, 0), 0)
+        self.assertEqual(resolve_state_component_dst_index(src, dst, 2), 1)
+        self.assertIsNone(
+            resolve_state_component_dst_index(src, dst, 1, allow_missing=True)
+        )
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -849,6 +863,9 @@ def _make_dsv4_target(*, unified, mapping=None):
         _buf_infos(12) if unified else ([], [], [])
     )
     pool.get_request_state_buf_infos = lambda: ([], [], [])
+    pool.get_state_layer_ids = lambda: [0]
+    pool.get_unified_swa_ring_layer_ids = lambda: [0]
+    pool.get_request_state_layer_ids = lambda: []
     return pool
 
 
