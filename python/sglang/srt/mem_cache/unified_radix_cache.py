@@ -955,22 +955,22 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
+    @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         if self.disable:
-            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(0, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         result = None
@@ -1078,7 +1078,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
 
         # Synthetic profiling requests may own KV without locking a tree node.
         if req.last_node is not None:

@@ -99,17 +99,16 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   return result;
 }
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr uint32_t kGroupSize = 128u;
-  constexpr uint32_t kWorkThreads = 16u;
+  constexpr uint32_t kWorkThreads = kGroupSize / 8u;
   // each thread will handle 8 elements
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
-  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto [expert_id, token_id, valid] = get_work(params);
@@ -250,11 +249,11 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulMaskedPostQuantKernel {
-  static_assert(kGroupSize == 128);
+  static_assert(kGroupSize == 32 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_varlen_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_varlen_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_varlen_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_varlen_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
 
   static void
   run(const tvm::ffi::TensorView input,
@@ -385,16 +384,15 @@ struct SiluMulQuantContigParams {
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
 };
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr uint32_t kGroupSize = 128u;
-  constexpr uint32_t kWorkThreads = 16u;
+  constexpr uint32_t kWorkThreads = kGroupSize / 8u;
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
-  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto token_id = blockIdx.x;
@@ -473,11 +471,11 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulContigPostQuantKernel {
-  static_assert(kGroupSize == 128);
+  static_assert(kGroupSize == 32 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
 
   static void
   run(const tvm::ffi::TensorView input,
