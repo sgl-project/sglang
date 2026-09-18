@@ -2860,7 +2860,7 @@ class DeepseekV4AttnBackend(
                 q_lora[:num_local],
                 positions[:num_local].to(torch.int64),
                 forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
+                self._move_to_device(q_lens_cpu),
                 q_lens_cpu,
             )
 
@@ -3226,7 +3226,9 @@ class DeepseekV4AttnBackend(
                 continue
             j = torch.arange(lc, device=device)
             slot_chunks.append(
-                self.req_to_token[req_pool_indices[r], j * ratio].to(torch.int64)
+                self.req_to_token[req_pool_indices[r : r + 1], j * ratio].to(
+                    torch.int64
+                )
                 // ratio
             )
             start += lc
@@ -3247,7 +3249,7 @@ class DeepseekV4AttnBackend(
         weights = indexer.head_weights(x).float()
         compress_lens = ((pos + 1) // ratio).to(torch.int32)
         ks = torch.repeat_interleave(
-            torch.tensor(starts, dtype=torch.int32, device=device),
+            self._move_to_device(starts),
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
