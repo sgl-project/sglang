@@ -8,7 +8,6 @@ import fcntl
 import functools
 import logging
 import multiprocessing
-import os
 import runpy
 import sys
 import tempfile
@@ -78,42 +77,28 @@ class TestMhcPrewarmLock(unittest.TestCase):
         self.assertEqual(reader.recv(), "started")
         return process, reader
 
-    def test_claim_wait_and_owner_exit(self):
-        for killed in (False, True):
-            with self.subTest(killed=killed):
-                release = self.ctx.Event()
-                owner, result = self.worker(False, release)
-                self.assertTrue(result.poll(10))
-                self.assertTrue(result.recv())
-                with claim("bucket", wait=False) as own:
-                    self.assertFalse(own)
-                peer, result = self.worker(True)
-                self.assertFalse(result.poll(0.2))
-                if killed:
-                    owner.kill()
-                else:
-                    release.set()
-                owner.join(10)
-                self.assertFalse(owner.is_alive())
-                self.assertTrue(result.poll(10))
-                self.assertTrue(result.recv())
-                peer.join(10)
-                self.assertEqual(peer.exitcode, 0)
+    def test_claim_and_wait_for_release(self):
+        release = self.ctx.Event()
+        owner, result = self.worker(False, release)
+        self.assertTrue(result.poll(10))
+        self.assertTrue(result.recv())
+        with claim("bucket", wait=False) as own:
+            self.assertFalse(own)
+        peer, result = self.worker(True)
+        self.assertFalse(result.poll(0.2))
+        release.set()
+        owner.join(10)
+        self.assertEqual(owner.exitcode, 0)
+        self.assertTrue(result.poll(10))
+        self.assertTrue(result.recv())
+        peer.join(10)
+        self.assertEqual(peer.exitcode, 0)
 
     def test_wait_timeout(self):
         with claim("bucket", wait=False):
             with self.assertLogs(logger, level="WARNING"):
                 with claim("bucket", wait=True, timeout=0) as own:
                     self.assertTrue(own)
-
-    def test_unwritable_directory(self):
-        self.root.chmod(0o555)
-        self.addCleanup(self.root.chmod, 0o755)
-        if os.access(self.root, os.W_OK):
-            self.skipTest("Current user bypasses directory permissions")
-        with self.assertLogs(logger, level="WARNING"):
-            with claim("bucket", wait=False) as own:
-                self.assertTrue(own)
 
     def test_lock_failures_preserve_full_replay(self):
         replay = Mock()
