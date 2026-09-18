@@ -23,6 +23,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from transformers.utils.chat_template_utils import render_jinja_template
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -270,6 +271,111 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def _use_jinja_template(self, template):
+        tokenizer = self.tokenizer_manager.tokenizer
+        tokenizer.chat_template = template
+        tokenizer.apply_chat_template.side_effect = lambda messages, **kwargs: (
+            render_jinja_template(
+                conversations=[messages], chat_template=template, **kwargs
+            )[0][0]
+        )
+
+    def test_developer_messages_silently_omitted_by_template_are_rejected(self):
+        self._use_jinja_template(
+            "{% for m in messages if m.role != 'developer' %}"
+            "{{ m.content }}{% endfor %}"
+        )
+        for prefix in ([], [{"role": "system", "content": "system instruction"}]):
+            for content in ("instruction", [{"type": "text", "text": "instruction"}]):
+                with self.subTest(prefix=prefix, content=content):
+                    messages = prefix + [
+                        {"role": "developer", "content": content},
+                        {"role": "user", "content": "Hello"},
+                    ]
+                    with self.assertRaisesRegex(ValueError, "developer message"):
+                        self._render(messages=messages)
+        self.tokenizer_manager.tokenizer.encode.assert_not_called()
+
+    def test_template_must_render_each_developer_message(self):
+        self._use_jinja_template(
+            "{% for m in messages %}"
+            "{% if m.role != 'developer' or loop.first %}"
+            "{{ m.content }}{% endif %}{% endfor %}"
+        )
+        with self.assertRaisesRegex(ValueError, "index 2"):
+            self._render(
+                messages=[
+                    {"role": "developer", "content": "first"},
+                    {"role": "user", "content": "Hello"},
+                    {"role": "developer", "content": "second"},
+                    {"role": "user", "content": "Continue"},
+                ]
+            )
+
+    def test_supported_developer_messages_preserve_prompt_input_and_cache(self):
+        self._use_jinja_template(
+            "{% for m in messages %}{{ m.role }}:{{ m.content | tojson }};{% endfor %}"
+        )
+        messages = [
+            {"role": "system", "content": "system instruction"},
+            {"role": "developer", "content": "developer instruction"},
+            {"role": "user", "content": "Hello"},
+        ]
+        original = json.dumps(messages)
+        first = self._render(messages=messages)
+        rendered_prompt = self.tokenizer_manager.tokenizer.encode.call_args.args[0]
+        self.assertIn('developer:"developer instruction";', rendered_prompt)
+        self.assertNotIn("__sglang_developer_", rendered_prompt)
+        self.assertEqual(json.dumps(messages), original)
+        render_count = self.tokenizer_manager.tokenizer.apply_chat_template.call_count
+        self.assertEqual(self._render(messages=messages), first)
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            render_count,
+        )
+
+    def test_developer_probe_preserves_direct_token_encoding_and_cache(self):
+        self.chat._prompt_text_round_trip_is_lossy = True
+        tokenizer = self.tokenizer_manager.tokenizer
+        template = "{% for m in messages %}{{ m.content }}{% endfor %}"
+        messages = [
+            {"role": "developer", "content": "instruction"},
+            {"role": "user", "content": "Hello"},
+        ]
+
+        def apply_template(conversation, *, tokenize, **kwargs):
+            if tokenize:
+                self.assertEqual(conversation, messages)
+                return [101, 11, 12]
+            return render_jinja_template(
+                conversations=[conversation], chat_template=template, **kwargs
+            )[0][0]
+
+        tokenizer.apply_chat_template.side_effect = apply_template
+        first = self._render(messages=messages)
+        self.assertEqual(first[0], [101, 11, 12])
+        self.assertEqual(self._render(messages=messages), first)
+        self.assertEqual(tokenizer.apply_chat_template.call_count, 2)
+        tokenizer.encode.assert_not_called()
+
+    def test_dropped_developer_rejected_before_direct_token_encoding(self):
+        self.chat._prompt_text_round_trip_is_lossy = True
+        self._use_jinja_template(
+            "{% for m in messages if m.role != 'developer' %}"
+            "{{ m.content }}{% endfor %}"
+        )
+        with self.assertRaisesRegex(ValueError, "developer message"):
+            self._render(
+                messages=[
+                    {"role": "developer", "content": "instruction"},
+                    {"role": "user", "content": "Hello"},
+                ]
+            )
+        tokenizer = self.tokenizer_manager.tokenizer
+        tokenizer.apply_chat_template.assert_called_once()
+        self.assertFalse(tokenizer.apply_chat_template.call_args.kwargs["tokenize"])
+        tokenizer.encode.assert_not_called()
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -583,6 +689,33 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
+
+    def test_dropped_developer_message_returns_400_before_generation(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.side_effect = lambda messages, **kwargs: (
+            render_jinja_template(
+                conversations=[messages],
+                chat_template=(
+                    "{% for m in messages if m.role != 'developer' %}"
+                    "{{ m.content }}{% endfor %}"
+                ),
+                **kwargs,
+            )[0][0]
+        )
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "developer", "content": "Follow this instruction"},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat.handle_request(request, self.fastapi_request)
+        )
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("developer message", response.body.decode())
+        self.tm.generate_request.assert_not_called()
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
