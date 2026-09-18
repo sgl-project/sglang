@@ -12,7 +12,7 @@ gates work see [ci-workflow-guide](../ci-workflow-guide/SKILL.md).
 
 ## How to use it
 
-Read [references/action-items.md](references/action-items.md) first. It is a catalog of
+Read [action-items.md](action-items.md) first. It is a catalog of
 32 patterns that have been applied to this repo, each with a way to spot it and example
 PRs. The catalog is the substance of this skill; everything below is only scaffolding.
 
@@ -38,5 +38,5 @@ since a trim and a threshold change fail for different reasons.
 ## Keeping the catalog current
 
 Example PRs age. When a pattern shows up in newer work, or a new pattern recurs, update
-`references/action-items.md`: the pattern text should stay general, the examples are
+`action-items.md`: the pattern text should stay general, the examples are
 replaceable evidence.
