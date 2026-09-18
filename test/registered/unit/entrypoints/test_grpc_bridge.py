@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ChunkStatus(enum.Enum):
@@ -41,6 +41,18 @@ def _make_runtime_handle(responses):
     handle = RuntimeHandle.__new__(RuntimeHandle)
     handle.tokenizer_manager = _FakeTokenizerManager(responses)
     return handle
+
+
+class TestNativeGrpcReadiness(CustomTestCase):
+    def test_readiness_comes_from_tokenizer_manager(self):
+        tokenizer_manager = SimpleNamespace(is_ready=lambda: True)
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = tokenizer_manager
+
+        self.assertTrue(handle.get_is_ready())
+
+        tokenizer_manager.is_ready = lambda: False
+        self.assertFalse(handle.get_is_ready())
 
 
 class TestNativeGrpcParallelResponses(CustomTestCase):

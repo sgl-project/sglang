@@ -186,6 +186,7 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        component_precisions={},
         kv_gather_degree=1,
         sp_split_auto=False,
     )
@@ -509,7 +510,9 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={},
+            component_weights_paths={},
+            component_quantizations={},
+            component_quantization_ignored_layers={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -524,11 +527,15 @@ class TestIdeogram4(unittest.TestCase):
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={
+            component_weights_paths={
                 "unconditional_transformer": (
                     "/ckpt/diffusion_models/"
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
                 )
+            },
+            component_quantizations={"unconditional_transformer": "fp8"},
+            component_quantization_ignored_layers={
+                "unconditional_transformer": ["lm_head"]
             },
         )
 
@@ -543,6 +550,8 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
+        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
 
     def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
         self.assertEqual(

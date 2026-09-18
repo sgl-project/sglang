@@ -574,6 +574,104 @@ After implementation, **you must verify that the generated output is not noise**
 2. Running the Diffusers pipeline and SGLang pipeline side-by-side with the same seed
 3. Checking each stage's output shape and value range independently
 
+### Step 10: Decide the ComfyUI Route (Optional)
+
+A model is reachable from ComfyUI two ways. Pick one deliberately — the wrong
+choice costs several hundred lines of weight-mapping code that buys nothing.
+
+**Server route.** ComfyUI sends an HTTP request and SGLang runs the whole
+pipeline. Choose this when the model needs conditioning ComfyUI cannot supply
+(audio, reference materials, task routing), produces more than one modality,
+or has its own request contract.
+
+Cost: nothing, if the request fits the existing `generate_image` /
+`generate_video` fields. If the model has extra request fields, pass them
+through `extra_fields` — the request schemas accept unknown keys, so the
+client in `apps/ComfyUI_SGLDiffusion/core/server_api.py` does **not** need a
+per-model change. Add a node in `nodes.py` only when the inputs are worth
+surfacing as ComfyUI widgets. `SGLDiffusionGenerateH3` is the worked example.
+
+**Executor route.** ComfyUI's KSampler drives the denoise loop and SGLang
+replaces the DiT forward, using ComfyUI's own text encoders and VAE. Choose
+this only when the model denoises a single latent tensor that ComfyUI already
+knows how to build and decode.
+
+Cost, per model: a `runtime/pipelines/comfyui_<model>_pipeline.py` that maps
+ComfyUI's single-file checkpoint layout onto the native module tree (350-690
+lines in the existing three), an executor in
+`apps/ComfyUI_SGLDiffusion/executors/` that adapts latent layout and
+conditioning to `Req`, and entries in both dicts in `core/generator.py`.
+
+The deciding question is not model size or modality — it is whether ComfyUI's
+sampler can drive the model's loop unchanged. If reproducing the conditioning
+inside ComfyUI would duplicate stages the server already runs, take the server
+route.
+
+### Step 11: Opt In to BCG and Quality Fast Paths Only After Eager Parity
+
+Do not put a new model behind Breakable CUDA Graph (BCG) merely because one
+forward captures. Diffusion BCG support has three independent admission paths:
+
+1. register the exact model IDs and safe basename aliases in
+   `BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS`
+2. register the resolved pipeline config class in
+   `BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS`
+3. implement or select the correct prompt padder under
+   `runtime/breakable_cuda_graph/model_padders/`
+
+The third item is model semantics, not a generic shape utility. Reuse
+`pad_masked_prompt_kwargs` only when the model already consumes a real mask and
+zero-padding every coupled text tensor leaves attention and RoPE unchanged.
+Existing special cases show the common contracts:
+
+- Qwen pads embeddings, masks, text RoPE caches, and sequence-length metadata
+  together; it synthesizes a mask when the eager path did not need one.
+- Ideogram pads the combined text-image sequence and carries replay-local
+  `DynamicVarlenMaskMeta`; stale capture-time varlen indices are incorrect.
+- Z-Image preserves native prompt length because extra tokens change its
+  semantics even when the padding looks conventional.
+- MiniMax-H3 buckets only within compatible packed-sequence alignment groups.
+- LongCat-Image and default SANA-Video already produce fixed 512- and
+  300-token contracts, respectively, so their padders are pass-through.
+
+Keep mask construction active for batch size one. A shortcut such as
+`if batch > 1` can make eager B=1 appear valid while BCG B=1 attends padded
+tokens. Any object whose values depend on live lengths must be rebuilt from
+static replay buffers once per replay; do not bake Python lists, varlen
+indices, or weakly referenced tensors from warmup into the graph.
+
+BCG validation must prove all of the following:
+
+- warmup logs `[Diffusion BCG] captured`
+- serving logs no support disable, capture failure, or
+  `serving signature MISSED`
+- lossless Eager and BCG artifacts are byte-identical for the same prompt,
+  seed, shape, steps, guidance, dtype, and topology
+- short/long prompts exercise every intended bucket and an over-limit prompt
+  falls back deliberately
+- video frame count and conditioning shapes match the captured signature;
+  `--warmup-resolutions` specifies only width and height
+- padder and support-gate unit tests cover aliases, pipeline config, fixed
+  lengths, masks, RoPE/position tensors, and replay-local metadata
+
+For a non-bit-exact optimization, integrate through the request-scoped site
+framework under `sglang.kernels.ops.diffusion.sites`. Mark sites during model
+construction and let `QualityGatedFusion` mount them for both
+`quality="extra-high"` and `quality="high"`; `quality="lossless"` must keep
+the original code path. A high-only sparse, caching, or other approximate
+path must remain outside this fusion gate.
+Eligibility must be all-or-nothing for coupled sites and fail closed on dtype,
+shape, layout, backend, BCG, or compile incompatibility. Add clean site-level
+guard/parity tests and a model wiring test instead of embedding request-policy
+branches throughout the DiT.
+
+Finally, use the benchmark/profile skill's `--quality-bcg-matrix` to run
+same-GPU ABBA pairs for Eager/BCG at lossless/extra-high/high. Report denoise and saved
+request e2e separately, require at least 1.5% repeated mean e2e improvement for
+an optimization PR, attach profile and generated-media A/B evidence, then
+delete the task-owned checkpoint cache and verify zero residual weight files
+in the cleanup ledger.
+
 ## Reference Implementations
 
 ### Hybrid Style (recommended for most new models)
@@ -638,6 +736,14 @@ Before submitting, verify:
 - [ ] Weight names match Diffusers for automatic loading
 - [ ] **TP/SP support** considered for DiT model (recommended; reference `wanvideo.py` for TP+SP, `qwen_image.py` for USPAttention)
 - [ ] **Output quality verified** — generated images/videos are not noise; compared against Diffusers reference output
+- [ ] **BCG admission is complete or intentionally absent** — model ID,
+  pipeline config, and model-specific padding contract agree
+- [ ] **BCG replay is proven when enabled** — capture marker present, no
+  signature miss/fallback, and lossless artifact hash is exact
+- [ ] **Quality fast paths are request-scoped** — lossless remains untouched;
+  high-quality sites fail closed and have guard/parity tests
+- [ ] **Performance evidence is controlled** — same-GPU repeated e2e, profile,
+  generated-media comparison, and task-owned weight cleanup ledger
 
 **Hybrid style only:**
 - [ ] **BeforeDenoisingStage** at `stages/model_specific_stages/{model_name}.py`

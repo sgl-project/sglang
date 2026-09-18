@@ -7,6 +7,7 @@
 /// 256 bits (32 bytes), matching CUDA's widest vector load.
 
 #pragma once
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cstddef>
@@ -116,6 +117,44 @@ struct AlignedVector {
  private:
   storage_t m_storage;
 };
+
+/// Sum `M` vectors element-wise into one, accumulating in fp32 regardless of
+/// the packed element type. Used by every collective that reduces peer
+/// contributions in registers.
+template <bool kFP32Acc = true, typename T2, size_t N, size_t M>
+SGL_DEVICE auto reduce_vec(device::AlignedVector<T2, N> (&vec)[M]) -> device::AlignedVector<T2, N> {
+  static_assert(DTypeTrait<T2>::kVecSize == 2, "reduce_vec only supports 2-element vectors for now");
+  static_assert(M > 0, "reduce_vec requires at least one vector to reduce");
+  if constexpr (kFP32Acc) {
+    fp32x2_t acc[N];
+#pragma unroll
+    for (size_t i = 0; i < M; ++i) {
+#pragma unroll
+      for (size_t j = 0; j < N; ++j) {
+        const auto [x, y] = cast<fp32x2_t>(vec[i][j]);
+        acc[j].x = i == 0 ? x : acc[j].x + x;
+        acc[j].y = i == 0 ? y : acc[j].y + y;
+      }
+    }
+    device::AlignedVector<T2, N> out_vec;
+#pragma unroll
+    for (size_t j = 0; j < N; ++j) {
+      out_vec[j] = cast<T2>(acc[j]);
+    }
+    return out_vec;
+  } else {
+    using SumOp = ReductionTrait<ReductionOp::SUM, T2>;
+    device::AlignedVector<T2, N> out_vec = vec[0];
+#pragma unroll
+    for (size_t i = 1; i < M; ++i) {
+#pragma unroll
+      for (size_t j = 0; j < N; ++j) {
+        out_vec[j] = SumOp::apply(out_vec[j], vec[i][j]);
+      }
+    }
+    return out_vec;
+  }
+}
 
 }  // namespace device
 

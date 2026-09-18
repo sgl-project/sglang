@@ -134,7 +134,7 @@ def _dequantize_k_cache_fast_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
@@ -181,9 +181,9 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert (
-        dim_quant == 656
-    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant == 656, (
+        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    )
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
@@ -249,8 +249,8 @@ def _dequantize_k_cache_paged_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    token_id = tl.program_id(0).to(tl.int64)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:

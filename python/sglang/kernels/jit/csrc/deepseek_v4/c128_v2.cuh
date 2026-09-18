@@ -190,7 +190,7 @@ SGL_DEVICE void c128_forward(
     float sum_product = 0.0f;
 #pragma unroll
     for (int32_t j = 0; j < kElementsPerWarp; ++j) {
-      const auto exp_score = expf(score[j] - max_value);
+      const auto exp_score = __expf(score[j] - max_value);
       sum_product += cast<float>(kv[j][i]) * exp_score;
       sum_exp_value += exp_score;
     }
@@ -238,7 +238,7 @@ SGL_DEVICE void c128_forward(
     float global_product = 0.0f;
 #pragma unroll
     for (uint32_t i = 0; i < kNumWarps; ++i) {
-      const auto exp_val = expf(local_val_max[i] - global_max);
+      const auto exp_val = __expf(local_val_max[i] - global_max);
       global_exp_sum += local_exp_sum[i] * exp_val;
       global_product += local_product[i] * exp_val;
     }
