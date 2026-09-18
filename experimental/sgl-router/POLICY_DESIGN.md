@@ -5,16 +5,24 @@ responsibilities and behavior; the interface and configuration examples are
 sketches, not a specification of the current API or CLI. Implementation status is
 listed at the end.
 
-The central idea is simple: **the resolver supplies eligible candidate groups.
-Each group's policy selects an engine using its attached admission checks, which
-run either before or after selection. A successful pick always returns an
-admitted engine.**
+## Principles
 
-Admission runs inside the policy's `pick()` operation at the configured
-placement. Before-selection admission filters candidates before the policy
-chooses an engine; after-selection admission checks the chosen engine. Migrated
-power-of-two, session-aware, cache-aware, and decode power-of-two configurations
-use before-selection admission.
+1. **Resolve model, PD role, and buckets first.** Resolution produces ordered
+   candidate groups of eligible engines.
+2. **Each bucket has an attached policy.** The bucket determines the candidate
+   set and the policy used to select an engine from it.
+3. **A policy owns its selection logic.** It reads the signals it needs—cache,
+   load, or affinity—and implements `pick()`, including its within-bucket fallback.
+4. **A policy can only return an engine from its supplied candidates.** It cannot
+   select another bucket, cross a PD role boundary, or add candidates.
+5. **Each policy has attached admission checks.** Inside `pick()`, admission
+   either filters candidates before selection or checks the chosen engine after
+   selection. A successful pick always returns an admitted engine. New explicit
+   attachments default to `AllowAll`; migrated configurations retain their
+   existing acceptance checks.
+6. **The selection loop owns fallback between groups.** It tries their policies
+   in order and returns one engine for the stage. It never relaxes admission or
+   substitutes another engine after a successful pick.
 
 An engine is represented by `Worker` in the code. A bucket is a configured group
 of engines with membership rules, request limits, and an attached policy.
@@ -24,11 +32,16 @@ Prefill/decode disaggregation (PD) runs selection separately for each stage.
 
 | Component | Owns | Returns |
 | --- | --- | --- |
-| Bucket resolver | Model, role, health, bucket membership, size limits, SLO ordering, and fallback between groups | One selected engine for a stage |
+| Bucket resolver | Model, role, health, bucket membership, size limits, and SLO ordering | Ordered candidate groups with their attached policies |
+| Selection loop | Invoking each group's policy and applying fallback between groups | One selected engine for a stage, or an error |
 | Policy | Selection and fallback within its supplied candidates; application of its attached admission | One admitted engine, or a selection error |
 | Admission | Acceptance checks, such as capacity or in-flight limits | Allow or reject, with a reason |
 | Shared state | Load reports, local request accounting, cache ownership, and affinity assignments | Observations and atomic assignment updates |
 | Request handler | Request preparation, coordination of PD stages, dispatch, and request cleanup | The HTTP response |
+
+Resolution and the selection loop are two operations of `BucketResolver`:
+`ordered_groups()` builds the groups, and `pick()` runs their policies until one
+selects an engine or selection fails.
 
 ```text
 Prepare request: model, tokens, output budget, SLO targets, affinity keys
