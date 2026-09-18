@@ -42,7 +42,7 @@ class TestPPConsensusStore(CustomTestCase):
         self.assertEqual(store0["key"], 10)
         store0.close()
 
-    def test_setitme_replicate_to_rank0(self):
+    def test_setitem_replicate_to_rank0(self):
         group = _MockPPGroup()
         store0 = PPConsensusStore(2, 0, group)
         store1 = PPConsensusStore(2, 1, group)
