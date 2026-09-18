@@ -135,7 +135,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
-        # For EAGLE3 support
+        # For EAGLE3 auxiliary hidden-state capture.
         self.capture_aux_hidden_states = False
 
     @classmethod
@@ -197,26 +197,34 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return get_video_feature(self.vision_tower, items, self.use_data_parallel)
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
     def get_embed(self):
         return self.model.embed_tokens.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        # EAGLE3 target interface: select which decoder layers' hidden states the
+        # draft consumes. Mirrors MiniMaxM3SparseForCausalLM; operates on the inner
+        # MiniMaxM3Model (self.model), whose forward returns (hidden, aux) once set.
         if not self.pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
+        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
+        # output), so to capture layer L's output we must mark layer L+1. Apply
+        # +1 on both paths so EAGLE3 works out-of-the-box even when the draft
+        # config omits ``eagle_aux_hidden_state_layer_ids`` (the upstream
+        # Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it); otherwise the
+        # default-path layers are off by one and draft accept collapses.
         if layer_ids is None:
             num_layers = self.config.text_config.num_hidden_layers
-            self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]
-        else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
+        # attribute (not ``i in layers_to_capture``); set it explicitly so the
+        # (hidden, aux) tuple is actually returned during capture-enabled forwards.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
