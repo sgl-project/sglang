@@ -3376,7 +3376,7 @@ class Scheduler(
                     else:
                         mm.release_features(mm.mm_items[own_start:])
             req.session.abort_req(req.rid)
-        elif req.multimodal_inputs is not None:
+        elif getattr(req, "multimodal_inputs", None) is not None:
             req.multimodal_inputs.release_features()
             req.multimodal_inputs = None
 
@@ -5572,8 +5572,8 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    decode_req.req.user_aborted = True
+                    prepare_abort(decode_req.req, "Aborted")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -5581,6 +5581,8 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
+                    decode_req.req.user_aborted = True
+                    prepare_abort(decode_req.req, "Aborted")
                     # Arm drain-ack accounting once the ABORT is sent, so acks
                     # arriving before this req is deferred (e.g. during the next
                     # forward step) are captured. A fresh set also drops stale acks
@@ -5596,23 +5598,28 @@ class Scheduler(
                         )
 
             # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        prepare_abort(decode_req, "Aborted")
-                        self._release_dropped_waiting_req_mm_inputs(decode_req)
-                        retraction_discard(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+            idx = 0
+            while idx < len(retracted_queue):
+                decode_req = retracted_queue[idx]
+                if not (recv_req.abort_all or decode_req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                prepare_abort(decode_req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(decode_req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(decode_req), decode_req
+                )
+                # Discard the backup only after send_output succeeds so a
+                # failed send leaves the entry queued and retryable; commit
+                # the removal in place so a retry never re-trips cleanup on
+                # an already-discarded entry.
+                retraction_discard(
+                    decode_req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                retracted_queue.pop(idx)
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
