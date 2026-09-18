@@ -416,8 +416,11 @@ def handle_model_specific_adjustments(server_args: Any):
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
             validate_deepseek_v4_mega_moe_token_budget,
+            validate_deepseek_v41_features,
         )
 
+        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
@@ -921,6 +924,13 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
     if not view.uses_mamba_radix_cache:
+        # auto is arch-gated, so only an explicit strategy reaches a non-mamba
+        # arch here, where it would arm the mamba paths and crash at prefill.
+        if mamba_extra_buffer_of(view):
+            raise ValueError(
+                f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
+                f"needs mamba state, got {model_arch}."
+            )
         return
 
     if mamba_extra_buffer_of(view):

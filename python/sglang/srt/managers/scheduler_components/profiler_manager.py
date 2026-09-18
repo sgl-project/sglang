@@ -432,7 +432,9 @@ class SchedulerProfilerManager:
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
-            elif batch.forward_mode.is_idle():
+            elif batch.forward_mode.is_idle() or batch.forward_mode.is_prebuilt():
+                # PREBUILT is the disaggregated-decode placeholder for requests
+                # whose KV just arrived; it never enters a model forward.
                 pass
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
