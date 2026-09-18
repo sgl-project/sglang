@@ -2192,11 +2192,14 @@ class Scheduler(
 
         request_errors = []
         for tokenized_req in tokenized_reqs:
+            # The request broadcast makes this skip consistent across ranks.
+            if tokenized_req.mm_inputs is None:
+                request_errors.append(None)
+                continue
+
             local_error = None
             try:
-                if tokenized_req.mm_inputs is not None and not isinstance(
-                    tokenized_req.mm_inputs, MultimodalInputs
-                ):
+                if not isinstance(tokenized_req.mm_inputs, MultimodalInputs):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
