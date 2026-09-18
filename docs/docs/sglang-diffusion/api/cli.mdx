@@ -116,6 +116,28 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 
+### Weight cache for fast recovery
+
+Weight cache imports supported GPU-resident components from a separately started
+owner. See [Weight cache](/docs/sglang-diffusion/weight_cache) for prerequisites,
+owner/client commands, H3 text encoder caching, and lifecycle requirements.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--weight-cache-mode {off,client}` | `off` | Use ordinary loading or require a compatible running cache owner. There is no automatic owner mode. |
+| `--weight-cache-components NAME [NAME ...]` | `dit` | Cache `dit` (`transformer`), optionally with `text_encoder` for original H3 FL2VA. Selected components must remain resident. |
+| `--weight-cache-fallback {error}` | `error` | Fail if cache admission or import fails; automatic disk fallback is not supported. |
+| `--weight-cache-socket PATH` | Derived from runtime directory, GPU, and compatibility identity | Override the Unix socket path. Use the same path for owner, client, and status. |
+| `--weight-cache-timeout SECONDS` | `1800.0` | Positive finite timeout for each socket exchange; not an owner-readiness wait. |
+| `--weight-cache-max-deliveries N` | `128` | Positive per-generation delivery limit used when starting the owner. Storage exports impose an additional limit. |
+| `--weight-cache-allow-weak-checkpoint-identity` | `false` | Development only: allow stat-only local checkpoint identity without a content manifest. |
+| `--weight-cache-allow-unverified-build` | `false` | Development only: allow providers without published RECORD metadata. Full Python source identity is still required. |
+
+Start or query the owner with
+`python -m sglang.multimodal_gen.runtime.weight_cache.daemon`. Its `--status`
+switch prints a read-only JSON budget/status response; it is not a `sglang serve`
+option and does not consume a delivery.
+
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`

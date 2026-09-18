@@ -9,6 +9,7 @@ import dataclasses
 import json
 import math
 import os
+import pickle
 import random
 import sys
 import tempfile
@@ -263,6 +264,18 @@ class ServerArgs(DisaggServerArgsMixin):
     model_path: str
     model_subfolder: str | None = None
     model_variant: str | None = None
+
+    weight_cache_mode: str = "off"
+    weight_cache_components: list[str] = field(default_factory=lambda: ["dit"])
+    weight_cache_fallback: str = "error"
+    weight_cache_socket: str | None = None
+    weight_cache_timeout: float = 1800.0
+    weight_cache_max_deliveries: int = 128
+    weight_cache_allow_weak_checkpoint_identity: bool = False
+    weight_cache_allow_unverified_build: bool = False
+    _weight_cache_admission: Any = field(default=None, init=False, repr=False)
+    _raw_inputs: bytes | None = field(default=None, init=False, repr=False)
+    _prepared_pipeline: Any = field(default=None, init=False, repr=False)
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
@@ -619,6 +632,11 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         self._normalize_component_residency()
         self._adjust_cpu_offload_components()
+        from sglang.multimodal_gen.runtime.weight_cache.placement import (
+            pin_requested_components,
+        )
+
+        pin_requested_components(self)
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
         if auto_tuner.could_override_server_args():
@@ -644,6 +662,11 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+        from sglang.multimodal_gen.runtime.weight_cache.placement import (
+            validate_resolved_arguments,
+        )
+
+        validate_resolved_arguments(self)
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -1897,6 +1920,28 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        # Keep a private, immutable pre-tuning snapshot. Variant resolution never
+        # reuses already cache-pinned or memory-tuned options.
+        if self.weight_cache_mode != "off":
+            # Direct dataclass callers do not pass CLI provenance. These options
+            # default to None, so a value present before tuning is user input.
+            for name in (
+                "component_residency",
+                "cpu_offload_components",
+                "dit_cpu_offload",
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+                "use_fsdp_inference",
+            ):
+                if getattr(self, name) is not None:
+                    self._explicit_arg_names.add(name)
+            self._raw_inputs = pickle.dumps(
+                {
+                    f.name: getattr(self, f.name)
+                    for f in dataclasses.fields(self)
+                    if f.init
+                }
+            )
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -2993,6 +3038,41 @@ class ServerArgs(DisaggServerArgsMixin):
             help="URL of SGLang server for PE model",
         )
 
+        # Weight cache
+        parser.add_argument(
+            "--weight-cache-mode",
+            choices=["off", "client"],
+            default="off",
+            help="Strict single-GPU transformer cache client: Wan2.1 1.3B, original Qwen-Image or native MiniMax-H3 FL2VA.",
+        )
+        parser.add_argument(
+            "--weight-cache-components",
+            nargs="+",
+            default=["dit"],
+            help="Components to cache: dit (default), or dit text_encoder for native original H3 FL2VA. Cached components must remain GPU-resident.",
+        )
+        parser.add_argument(
+            "--weight-cache-fallback", choices=["error"], default="error"
+        )
+        parser.add_argument("--weight-cache-socket", default=None)
+        parser.add_argument(
+            "--weight-cache-timeout",
+            type=float,
+            default=1800.0,
+            help="Timeout in seconds for each cache socket exchange; not an owner readiness wait.",
+        )
+        parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
+        parser.add_argument(
+            "--weight-cache-allow-weak-checkpoint-identity",
+            action="store_true",
+            help="Development only: allow stat-only local checkpoint identity without a content manifest; not a production integrity guarantee.",
+        )
+        parser.add_argument(
+            "--weight-cache-allow-unverified-build",
+            action="store_true",
+            help="Development only: allow installed providers without RECORD (unverified native build). Complete stable Python source identity remains mandatory.",
+        )
+
         return parser
 
     def url(self):
@@ -3478,6 +3558,13 @@ class ServerArgs(DisaggServerArgsMixin):
         kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
+    def resolve_variant(self, *, weight_cache_mode: str) -> "ServerArgs":
+        if self._raw_inputs is None:
+            raise ValueError("Raw cache candidate inputs are unavailable")
+        values = pickle.loads(self._raw_inputs)
+        values["weight_cache_mode"] = weight_cache_mode
+        return type(self)(**values)
+
     @staticmethod
     def get_provided_args(
         args: argparse.Namespace, unknown_args: list[str]
@@ -3864,6 +3951,11 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args, unknown_args = parser.parse_known_args(argv)
+    raw_args._sglang_explicit_arg_names = {
+        arg.split("=", 1)[0].lstrip("-").replace("-", "_")
+        for arg in argv
+        if arg.startswith("--")
+    }
     server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
 

@@ -19,6 +19,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_WEIGHT_CACHE_DIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Absolute directory for weight-cache sockets and coordination files. Defaults to <code>$XDG_RUNTIME_DIR/sglang_diffusion_weight_cache</code>, or <code>/tmp/sglang_diffusion_weight_cache</code> if <code>XDG_RUNTIME_DIR</code> is unset. Share the same directory across owner and clients. See <a href="/docs/sglang-diffusion/weight_cache">Weight cache</a>.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EXTERNAL_MODEL_PACKAGE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Installed package that registers out-of-tree diffusion pipelines and component models. The package is imported once in every process.</td>

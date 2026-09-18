@@ -5,6 +5,7 @@
 import importlib
 import os
 import pkgutil
+import time
 import traceback
 from abc import ABC
 from collections.abc import Callable, Iterator
@@ -329,6 +330,7 @@ class ComponentLoader(ABC):
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
         allow_native_fallback: bool = True,
+        prepared_load: Any = None,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -338,13 +340,16 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
+        load_started = time.perf_counter()
         self._native_load_manages_placement = False
-        self.component_load_precision(server_args, component_name)
-        component_weight_override = self.resolve_component_weight_override(
-            server_args, component_name
-        )
-        self.resolve_component_quantization_override(server_args, component_name)
-        self.resolve_component_direct_gpu_loading(server_args, component_name)
+        component_weight_override = None
+        if prepared_load is None:
+            self.component_load_precision(server_args, component_name)
+            component_weight_override = self.resolve_component_weight_override(
+                server_args, component_name
+            )
+            self.resolve_component_quantization_override(server_args, component_name)
+            self.resolve_component_direct_gpu_loading(server_args, component_name)
         fsdp_requested = server_args.should_use_fsdp_for_component(component_name)
 
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
@@ -384,14 +389,22 @@ class ComponentLoader(ABC):
                 f"matches the explicit request {requested_backend!r}"
             )
         try:
-            component = self._load_customized_with_context(
-                component_model_path,
-                server_args,
-                component_name,
-                component_attn_backend,
-                component_attn_name,
-                require_backend_selection,
-            )
+            if prepared_load is None:
+                component = self._load_customized_with_context(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    component_attn_backend,
+                    component_attn_name,
+                    require_backend_selection,
+                )
+            else:
+                with self.component_attention_backend_context(
+                    component_attn_backend,
+                    component_attn_name,
+                    require_backend_selection,
+                ):
+                    component = self.materialize_prepared(prepared_load)
             source = "sgl-diffusion"
         except (
             ComponentAttentionBackendNotAppliedError,
@@ -406,7 +419,11 @@ class ComponentLoader(ABC):
         ):
             raise
         except Exception as e:
-            if require_backend_selection or not allow_native_fallback:
+            if (
+                prepared_load is not None
+                or require_backend_selection
+                or not allow_native_fallback
+            ):
                 raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if native_loader_required and component_weight_override is not None:
@@ -496,7 +513,27 @@ class ComponentLoader(ABC):
                 format_component_residency(component),
                 current_gpu_mem,
             )
+        logger.info(
+            "[ComponentLoader] %s materialized in %.3fs",
+            component_name,
+            time.perf_counter() - load_started,
+        )
         return component, consumed
+
+    def materialize_prepared(self, prepared_load: Any) -> AutoModel:
+        """Opt-in frozen decisions; retain this loader's shared finalization."""
+        raise NotImplementedError(f"{type(self).__name__} has no prepared load")
+
+    def prepare_weight_cache(self, spec, server_args, *, planned_device=None):
+        """Explicit capability; generic/native fallback is never cache admission.
+
+        Opted-in loaders return a PreparedComponent binding their exact recipe,
+        construction methods and an audited ComponentStateContract. The ordinary
+        cache-off path does not call this method.
+        """
+        raise ValueError(
+            f"{type(self).__name__} has no audited weight-cache capability"
+        )
 
     def load_native(
         self,
@@ -658,6 +695,7 @@ class ComponentLoader(ABC):
         component_architecture: str | None = None,
         *,
         loader_cls: type["ComponentLoader"] | None = None,
+        discover_loaders: bool = True,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -665,8 +703,12 @@ class ComponentLoader(ABC):
         Args:
             component_type: Structural role (e.g. "vae" or "text_encoder")
             transformers_or_diffusers: Whether the component is from transformers or diffusers
+            discover_loaders: Import all loader modules if needed. Pure preparation
+                can resolve only already registered capabilities without triggering
+                unrelated third-party import-time model construction.
         """
-        cls._ensure_loaders_registered()
+        if discover_loaders:
+            cls._ensure_loaders_registered()
 
         # Map of component types to their loader classes and expected library
         structural_component_name = component_type
@@ -678,6 +720,8 @@ class ComponentLoader(ABC):
 
         if loader_cls is None:
             loader_cls = component_name_to_loader_cls.get(loader_type)
+        if loader_cls is None and not discover_loaders:
+            raise ValueError(f"No registered component loader for {component_type!r}")
         if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type

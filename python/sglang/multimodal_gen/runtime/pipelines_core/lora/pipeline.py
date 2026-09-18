@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.weight_cache.guards import (
+    reject_cached_weight_mutation,
+)
 
 # to avoid deadlocks when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -414,6 +417,7 @@ class LoRAPipeline(ComposedPipelineBase):
         on H3's DiT). Resident accelerator layers still retain owned CPU
         snapshots because they cannot be rebound to the CPU merge cache.
         """
+        reject_cached_weight_mutation(self, "LoRA layer conversion")
         if self.lora_initialized:
             return
         self._reject_lora_on_packed_weights()
@@ -976,6 +980,7 @@ class LoRAPipeline(ComposedPipelineBase):
         stop costing anonymous host memory; pass it only for the startup
         (static) adapter, where the merged combination is stable.
         """
+        reject_cached_weight_mutation(self, "LoRA")
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
         # Normalize inputs to lists for multi-LoRA support
@@ -1264,6 +1269,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     "transformer_2", "critic".
             strength: LoRA strength for merge, default 1.0.
         """
+        reject_cached_weight_mutation(self, "LoRA merge")
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("merge_lora_weights: %s", error)
@@ -1332,6 +1338,7 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to unmerge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
+        reject_cached_weight_mutation(self, "LoRA unmerge")
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("unmerge_lora_weights: %s", error)
