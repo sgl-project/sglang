@@ -2404,9 +2404,10 @@ def select_experts(
     # slots on the marker) and places that marker at id num_experts, which the
     # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
     # 384 routed experts on EP8, where the valid ids are 0..391.
+    # aiter appends the shared expert in _post_process_topk_ids, so the gate must not.
     num_fused_shared_experts_for_gate = (
         0
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
     if dynamic_expert_bias is not None:
