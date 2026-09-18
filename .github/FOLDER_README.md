@@ -30,5 +30,11 @@ Set a cooldown deliberately: `0` lets the holder run PR-head code on the
 self-hosted GPU runners, and raising it above `0` takes that away again along
 with their rate-limit waiver.
 
+`/rerun-test` and `/rerun-group` batch tests with matching runner and install
+settings up to 40 minutes of registered `est_time`, leaving headroom below
+the workflow's 60-minute test-step timeout. Tests with unknown estimates or
+estimates above the batch budget run alone. This does not extend the timeout
+for a single long-running test, and direct workflow dispatches bypass batching.
+
 ## Others
 - `MAINTAINER.md` defines the code maintenance model.

@@ -1,12 +1,14 @@
+import ast
 import difflib
 import glob
 import json
+import math
 import os
 import re
 import sys
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 from github import Auth, Github
@@ -33,6 +35,8 @@ PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regress
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
+# rerun-test.yml limits Run test to 60 minutes; reserve a third for variance/retries.
+RERUN_BATCH_SECONDS = 40 * 60
 # Workflow `name:` field, which is what the runs API reports (not the filename).
 EXTRA_WORKFLOW_NAME = "PR Test Extra"
 
@@ -1010,6 +1014,40 @@ def _resolve_runner_config(rc, full_path, suite):
     }
 
 
+def _extract_est_time(args_str):
+    try:
+        call = ast.parse(f"register({args_str})", mode="eval").body
+        value = next(
+            (kw.value for kw in call.keywords if kw.arg == "est_time"),
+            call.args[0] if call.args else None,
+        )
+        estimate = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return None
+    if type(estimate) in (int, float) and math.isfinite(estimate) and estimate > 0:
+        return estimate
+    return None
+
+
+def _split_rerun_batches(group):
+    batches, totals = [], []
+    for entry in group:
+        estimate = entry.get("est_time")
+        if estimate is None or estimate > RERUN_BATCH_SECONDS:
+            batches.append([entry])
+            totals.append(RERUN_BATCH_SECONDS)
+            continue
+        for idx, total in enumerate(totals):
+            if total + estimate <= RERUN_BATCH_SECONDS:
+                batches[idx].append(entry)
+                totals[idx] += estimate
+                break
+        else:
+            batches.append([entry])
+            totals.append(estimate)
+    return batches
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract dispatch info from register_cuda_ci or
@@ -1029,7 +1067,7 @@ def detect_suite(file_path_from_test):
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, rdma_devices, is_cpu, error.
+    install_timeout, rdma_devices, est_time (when available), is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -1041,12 +1079,17 @@ def detect_suite(file_path_from_test):
         for rc, args_str in cuda_calls:
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(_resolve_runner_config(rc, full_path, suite))
+            info = _resolve_runner_config(rc, full_path, suite)
+            info["est_time"] = _extract_est_time(args_str)
+            results.append(info)
         return results
 
     legacy_suites = _extract_legacy_suites(content)
 
-    if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+    cpu_call = re.search(
+        r"^[^#\n]*register_cpu_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    )
+    if cpu_call:
         return [
             {
                 "suite": "cpu",
@@ -1055,6 +1098,7 @@ def detect_suite(file_path_from_test):
                 "install_timeout": "",
                 "rdma_devices": "",
                 "is_cpu": True,
+                "est_time": _extract_est_time(cpu_call.group(1)),
                 "error": None,
             }
         ]
@@ -1100,9 +1144,9 @@ def _resolve_test_spec(test_spec):
     Resolve a single test spec into one or more dispatch entries.
 
     A file registered on N pools (multiple `register_cuda_ci(...)` calls)
-    yields N entries — handle_rerun_test's grouping then sends one workflow
-    per pool. Multimodal and CPU files yield a single entry. Resolution
-    errors yield a one-element list with {"spec","error"}.
+    yields N entries; handle_rerun_test batches each pool within a time budget.
+    Multimodal and CPU files yield a single entry. Resolution errors yield a
+    one-element list with {"spec","error"}.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -1172,6 +1216,7 @@ def _resolve_test_spec(test_spec):
                 "install_script": info["install_script"],
                 "install_timeout": info["install_timeout"],
                 "rdma_devices": info["rdma_devices"],
+                "est_time": info.get("est_time"),
                 "error": None,
             }
         )
@@ -1475,7 +1520,7 @@ def handle_rerun_test(
             )
             return False
 
-    # Phase 2: Group by dispatch shape.
+    # Phase 2: Group by dispatch shape, then split to fit the runtime budget.
     groups = {}
     for r in resolved:
         key = (
@@ -1487,17 +1532,21 @@ def handle_rerun_test(
         )
         groups.setdefault(key, []).append(r)
 
+    batches = [
+        batch for group in groups.values() for batch in _split_rerun_batches(group)
+    ]
+
     # Phase 3a: Create placeholder reply comment so we have its ID before
     # dispatching workflows. This lets each dispatched run write its
     # success/failure result back to the right line in this comment.
     dispatching = f"`{command_label}`" if command_label else "rerun-test workflow(s)"
     reply_comment = pr.create_issue_comment(f"🚀 Dispatching {dispatching}...")
 
-    # Phase 3b: Dispatch one workflow per group, with a unique per-batch
+    # Phase 3b: Dispatch one workflow per batch, with a unique per-batch
     # marker each. The marker is an HTML comment that the writeback step
     # uses to locate the line and replace 🚀 with ✅/❌.
     dispatch_results = []
-    for idx, batch in enumerate(groups.values()):
+    for idx, batch in enumerate(batches):
         marker = f"<!--rrt:{idx}-->"
         dispatch_results.append(
             _dispatch_batch(
