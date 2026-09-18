@@ -83,9 +83,6 @@ from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    supports_swa_byte_budget,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -459,47 +456,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
-    def _supports_unified_swa_reservation(self) -> bool:
-        return supports_swa_byte_budget(self.token_to_kv_pool_allocator)
-
     def _uses_swa_reservation(self) -> bool:
-        return self._uses_swa_tail_prealloc() or supports_swa_byte_budget(
-            self.token_to_kv_pool_allocator
-        )
-
-    def _unified_swa_reservation_fits(
-        self,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        full_allocatable_tokens: Optional[int] = None,
-        swa_allocatable_tokens: Optional[int] = None,
-        empty_pool: bool = False,
-    ) -> bool:
-        allocator = self.token_to_kv_pool_allocator
-        full_evictable = swa_evictable = 0
-        if not empty_pool:
-            full_evictable = self._radix_full_evictable()
-            swa_evictable = self.tree_cache.swa_evictable_size()
-            if full_allocatable_tokens is not None:
-                full_tokens += (
-                    allocator.full_available_size()
-                    + full_evictable
-                    - full_allocatable_tokens
-                )
-            if swa_allocatable_tokens is not None:
-                swa_tokens += (
-                    allocator.swa_available_size()
-                    + swa_evictable
-                    - swa_allocatable_tokens
-                )
-
-        return allocator.can_reserve(
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable,
-            swa_evictable_tokens=swa_evictable,
-            empty_pool=empty_pool,
+        return (
+            self._uses_swa_tail_prealloc()
+            or self.token_to_kv_pool_allocator.has_shared_byte_envelope()
         )
 
     def _prealloc_reservation_fits(
@@ -510,15 +470,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
     ) -> bool:
-        if self._supports_unified_swa_reservation():
-            return self._unified_swa_reservation_fits(
-                full_tokens,
-                swa_tokens,
-                full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=swa_allocatable_tokens,
-            )
-        return full_tokens <= full_allocatable_tokens and (
-            swa_allocatable_tokens is None or swa_tokens <= swa_allocatable_tokens
+        return self.token_to_kv_pool_allocator.prealloc_fits(
+            self.tree_cache,
+            full_tokens,
+            swa_tokens,
+            full_budget_tokens=full_allocatable_tokens,
+            swa_budget_tokens=swa_allocatable_tokens,
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
@@ -533,38 +490,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> Optional[str]:
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
-        if self._supports_unified_swa_reservation():
-            full_required = ceil_align(full_len, page_size)
-            swa_required = ceil_align(swa_tail_len, page_size)
-            capacity_ready = allocator.evict_to_free_tokens(
-                self.tree_cache,
-                full_required,
-                swa_num_tokens=swa_required,
-            )
-            if capacity_ready is None:
-                capacity_ready = allocator.ensure_capacity(full_required, swa_required)
-            if capacity_ready:
-                return None
-            return (
-                "Unified FULL/SWA byte reclamation insufficient: "
-                f"needed=({full_required}, {swa_required}), req={req_id}"
-            )
-
-        required = ceil_align(swa_tail_len, page_size)
-        available = allocator.swa_available_size()
-        if available < required:
-            self.tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=required - available)
-            )
-            available = allocator.swa_available_size()
-
-        if available < required:
-            return (
-                f"SWA eviction insufficient: needed={required}, "
-                f"available={available}, req={req_id}"
-            )
-
-        return None
+        shortfall = allocator.reclaim_for_prealloc(
+            self.tree_cache,
+            ceil_align(full_len, page_size),
+            ceil_align(swa_tail_len, page_size),
+        )
+        return None if shortfall is None else f"{shortfall}, req={req_id}"
 
     # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
@@ -889,13 +820,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
-        if self._supports_unified_swa_reservation():
+        allocator = self.token_to_kv_pool_allocator
+        if allocator.has_shared_byte_envelope():
             full_required, swa_required = self._prealloc_required_tokens(req)
             if not self._uses_swa_tail_prealloc():
                 swa_required = full_required
-            if not self._unified_swa_reservation_fits(
-                full_required, swa_required, empty_pool=True
-            ):
+            # The one branch left in this method: the two sides below bound a
+            # different length (`_rebootstrap_prefill_len`), so folding them
+            # together would change which requests are refused.
+            if not allocator.can_reserve(full_required, swa_required, empty_pool=True):
                 message = (
                     f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
                     f"budget: full={full_required}, swa={swa_required}"
@@ -981,7 +914,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            if self._supports_unified_swa_reservation():
+            if self.token_to_kv_pool_allocator.has_shared_byte_envelope():
                 full_len, swa_len = self._prealloc_kv_lens(req)
                 if (
                     self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
@@ -1894,13 +1827,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         allocator = self.token_to_kv_pool_allocator
-        if self._supports_unified_swa_reservation():
-            _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
-                full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
-            )
-        else:
-            swa_total = allocator.size_swa
-            swa_available = allocator.swa_available_size()
+        # The base implementation returns exactly the pair the static pools
+        # report, so the shared-envelope layouts differ only in the override.
+        _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
+            full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
+        )
         # Per-request SWA ring: cached prefixes still report swa_evictable, but
         # evicting them frees no ring space.
         swa_evictable = (

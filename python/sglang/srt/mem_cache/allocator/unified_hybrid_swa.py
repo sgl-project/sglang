@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple, TypeGuard
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -42,13 +42,6 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
-
-
-def supports_swa_byte_budget(
-    allocator: BaseTokenToKVPoolAllocator | None,
-) -> TypeGuard[UnifiedSWATokenToKVPoolAllocator]:
-    """Whether FULL/SWA demand can be checked against a two-pool byte budget."""
-    return isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
 
 
 class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
@@ -839,6 +832,60 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     def _ask_float_for_room(self, need_tokens: int) -> None:
         """No float in a two-END chain -- nothing can slide."""
         return None
+
+    def has_shared_byte_envelope(self) -> bool:
+        return True
+
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        """Reclaim both sides together: freeing FULL pages can open SWA room
+        and the reverse, so the shared envelope is the only gate worth
+        re-checking."""
+        ready = self.evict_to_free_tokens(
+            tree_cache, full_tokens, swa_num_tokens=swa_tokens
+        )
+        if ready is None:
+            ready = self.ensure_capacity(full_tokens, swa_tokens)
+        if ready:
+            return None
+        return (
+            "Unified FULL/SWA byte reclamation insufficient: "
+            f"needed=({full_tokens}, {swa_tokens})"
+        )
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Price both sides against the shared byte envelope.
+
+        There is no per-side capacity for the scheduler's budget to be
+        compared against, so the gap between that budget and what this side
+        can currently hand out is folded back into the demand; `can_reserve`
+        then prices the whole ask in bytes. Reachable only for hybrid-SWA
+        models, so the tree's `full_*` accounting is the full-attention one.
+        """
+        full_evictable_tokens = tree_cache.full_evictable_size()
+        swa_evictable_tokens = tree_cache.swa_evictable_size()
+        full_tokens += (
+            self.full_available_size() + full_evictable_tokens - full_budget_tokens
+        )
+        if swa_budget_tokens is not None:
+            swa_tokens += (
+                self.swa_available_size() + swa_evictable_tokens - swa_budget_tokens
+            )
+        return self.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+        )
 
     def reclaim_plan(
         self,

@@ -47,6 +47,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import Range
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 
 
 def _make_cache_with_pools(page_size=1):
@@ -127,6 +130,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             server_args=SimpleNamespace(),
         )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
 
         tail_len = queue._swa_tail_len(895)
 
@@ -145,6 +149,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._need_space_for_single_req = MagicMock(return_value=0)
         queue._active_req_count = MagicMock(return_value=1)
         queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.size_swa = 256
         queue.token_to_kv_pool_allocator.swa_available_size.return_value = 0
         queue.tree_cache = MagicMock()
@@ -161,6 +166,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
     def test_reclaim_swa_tail_capacity_page_rounds(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 192]
         queue.tree_cache = MagicMock()
 
@@ -174,6 +180,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
     def test_reclaim_swa_tail_capacity_fails_before_allocation(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 128]
         queue.tree_cache = MagicMock()
 
@@ -436,6 +443,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
         queue.token_to_kv_pool = MagicMock()
         queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 4
 
         running_batch = MagicMock()

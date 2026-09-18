@@ -23,6 +23,9 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -157,6 +160,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.req_to_metadata_buffer_idx_allocator.alloc.side_effect = iter(range(100))
 
         queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()

@@ -95,6 +95,39 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
+    def has_shared_byte_envelope(self) -> bool:
+        """Whether FULL and SWA are cut from ONE buffer.
+
+        Two consequences for a caller: `prealloc_fits` prices both sides
+        together rather than comparing per-side token budgets, and it answers
+        about the state reachable AFTER reclaim -- so admitting on it still
+        owes the reclaim. False where each side owns its own buffer.
+        """
+        return False
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation of this size fits.
+
+        The budgets are the scheduler's policy: what each side has left once
+        decode headroom and retraction are reserved. Separate buffers make the
+        two sides independent, so each is checked against its own budget and
+        ``tree_cache`` is never read -- what it could reclaim is already
+        inside that budget. A pool that cuts both sides from one buffer
+        overrides this to price them together, since a per-side token budget
+        cannot express a shared byte envelope.
+        """
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        )
+
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
         ``num_tokens`` or nothing evictable remains.
