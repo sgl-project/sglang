@@ -130,14 +130,17 @@ class TestFloatMovementGate(CustomTestCase):
         self.assertFalse(a.verify_byte_accounting())
 
     def test_float_movement_owners_respect_gate(self):
-        for side, method in itertools.product(
-            ("low", "high"), ("make_room", "compact_holes")
+        for side, method, gates in itertools.product(
+            ("low", "high"),
+            ("make_room", "compact_holes"),
+            ((False, True), (True, False), (False, False)),
         ):
-            with self.subTest(side=side, method=method):
+            with self.subTest(side=side, method=method, gates=gates):
                 a, kv, mk = build_geometry(1, (1, 1), True, "swa_internal", False)
                 sa = a.swa_attn_allocator
                 saved = payload(a, kv, mk)
-                sa.disagg_move_gate = lambda: False
+                sa.disagg_move_gate = lambda: gates[0]
+                sa.host_transfer_move_gate = lambda: gates[1]
                 before = snapshot(a)
                 low, high = sa._gap_pages()
                 gap = (low if side == "low" else high) * sa.entry_bytes_per_page
@@ -166,6 +169,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.assertEqual(copies.call_count, 0)
                 self.assertEqual(snapshot(a), before)
                 sa.disagg_move_gate = lambda: True
+                sa.host_transfer_move_gate = lambda: True
                 with patch.object(
                     kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
                 ) as copies:
