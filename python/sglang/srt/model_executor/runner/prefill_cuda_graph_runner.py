@@ -768,7 +768,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                input_ids = forward_batch.input_ids
+                input_ids = getattr(
+                    forward_batch, "cp_model_input_ids", forward_batch.input_ids
+                )
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -1283,6 +1285,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        # A batch too small to activate CP cannot replay a CP-local body.
+        if getattr(self, "enable_cp_bcg_capture", False) and not is_cp_active(
+            forward_batch
+        ):
             return False
 
         # Non-DP local check (sole decision for tp-only).
