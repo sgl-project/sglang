@@ -4,6 +4,7 @@ export const LTXDeployment = () => {
       name: 'hardware',
       title: 'Deployment Target',
       items: [
+        { id: 'xeon', label: 'XEON', subtitle: 'CPU mode', default: false },
         { id: 'h200', label: '1x H200', subtitle: 'resident', default: true },
         { id: 'h200-2gpu', label: '2 GPUs', subtitle: 'CFG parallel', default: false },
         { id: 'h200-4gpu', label: '4 GPUs', subtitle: 'TP2 + CFG', default: false },
@@ -16,7 +17,9 @@ export const LTXDeployment = () => {
       title: 'Model',
       items: [
         { id: 'ltx23', label: 'LTX-2.3', default: true },
-        { id: 'ltx2', label: 'LTX-2', default: false },
+        { id: 'ltx2', label: 'LTX-2', default: false,
+          disabledWhen: (v) => v.hardware === 'xeon',
+          disabledReason: 'CPU support for LTX-2 is still being fixed' },
       ],
     },
     pipeline: {
@@ -90,6 +93,11 @@ export const LTXDeployment = () => {
     setValues((prev) => {
       const next = { ...prev, [optionName]: itemId };
 
+      const modelItem = options.model.items.find((item) => item.id === next.model);
+      if (modelItem && typeof modelItem.disabledWhen === 'function' && modelItem.disabledWhen(next)) {
+        next.model = 'ltx23';
+      }
+
       const validPipeline = options.pipeline.items.some((item) => (
         item.id === next.pipeline && item.validModels.includes(next.model)
       ));
@@ -140,6 +148,9 @@ export const LTXDeployment = () => {
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --pipeline-class-name ${pipelineClass}`;
+    if (values.hardware === 'xeon') {
+      command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu ` + command;
+    }
     command += getParallelFlags();
     if (values.model === 'ltx23' && values.pipeline !== 'one-stage') {
       command += ` \\\n  --ltx2-two-stage-device-mode ${getDeviceMode()}`;
@@ -176,13 +187,15 @@ export const LTXDeployment = () => {
             <div style={itemsStyle}>
               {itemsToDisplay.map((item) => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                  <label key={item.id} title={isDisabled ? item.disabledReason : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}>
                     <input
                       type="radio"
                       name={option.name}
                       checked={isChecked}
-                      onChange={() => handleRadioChange(key, item.id)}
+                      disabled={isDisabled}
+                      onChange={() => !isDisabled && handleRadioChange(key, item.id)}
                       style={{ display: 'none' }}
                     />
                     {item.label}
