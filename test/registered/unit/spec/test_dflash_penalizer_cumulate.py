@@ -22,6 +22,7 @@ from sglang.srt.sampling.penaltylib.repetition_penalty import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import spec_utils
+from sglang.srt.speculative.dflash_utils import DFlashBlockPenaltyState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -281,6 +282,7 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
         calls = []
         batch = SimpleNamespace(
             spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+            enable_overlap=False,
             sampling_info=SimpleNamespace(
                 penalizer_orchestrator=SimpleNamespace(is_required=False)
             ),
@@ -311,6 +313,57 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
         ):
             spec_utils.spec_prepare_for_decode(batch)
         assert calls == ["cumulate", "prepare"]
+
+    def test_spec_prepare_for_decode_marks_unresolved_anchors(self):
+        batch = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+            enable_overlap=True,
+            sampling_info=SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(
+                    is_required=True, device=torch.device("cpu")
+                )
+            ),
+            spec_info=SimpleNamespace(prepare_for_decode=lambda _: None),
+            cumulate_penalty_output_tokens_since_last=lambda: None,
+            # Committed-but-unresolved anchor: committed outputs (kv minus
+            # prompt) ahead of the penalty cursor.
+            reqs=[
+                SimpleNamespace(
+                    kv=SimpleNamespace(kv_committed_len=12),
+                    origin_input_ids=[10, 42],
+                    penalty_cumulated_len=1,
+                ),
+                SimpleNamespace(
+                    kv=SimpleNamespace(kv_committed_len=12),
+                    origin_input_ids=[10, 42],
+                    penalty_cumulated_len=10,
+                ),
+            ],
+        )
+        captured = {}
+
+        def spy_from_orchestrator(orchestrator, anchor_unresolved=None):
+            captured["anchor_unresolved"] = anchor_unresolved
+            return None
+
+        with (
+            patch.object(
+                spec_utils,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                ),
+            ),
+            patch.object(
+                DFlashBlockPenaltyState,
+                "from_orchestrator",
+                side_effect=spy_from_orchestrator,
+            ),
+        ):
+            spec_utils.spec_prepare_for_decode(batch)
+
+        assert captured["anchor_unresolved"].tolist() == [True, False]
+        assert batch.sampling_info.dflash_block_penalty_state is None
 
 
 if __name__ == "__main__":

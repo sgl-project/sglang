@@ -804,6 +804,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     layout=layout,
                     draft_block_ids=draft_block_ids,
                     draft_tokens=draft_tokens,
+                    verify_ids_2d=verify_ids_2d,
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,

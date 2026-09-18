@@ -19,6 +19,15 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPenalizer
+from sglang.srt.sampling.penaltylib.min_new_tokens import (
+    BatchedMinNewTokensPenalizer,
+)
+from sglang.srt.sampling.penaltylib.presence_penalty import BatchedPresencePenalizer
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+    apply_scaling_penalties,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -216,11 +225,237 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
+@dataclass
+class DFlashBlockPenaltyState:
+    """Committed penalty state, decomposed so a verify block can roll it
+    forward one draft candidate at a time."""
+
+    # [bs] bool: rows whose verify anchor (candidates[:, 0], the last
+    # committed token) is not yet represented in this snapshot. Set under
+    # overlap scheduling, where the previous verify block's commit publishes
+    # to kv_committed_len ahead of output_ids; the block path folds the
+    # anchor into the rolled state for those rows.
+    anchor_unresolved: Optional[torch.Tensor]
+    additive_base: torch.Tensor
+    frequency_penalties: Optional[torch.Tensor]
+    presence_penalties: Optional[torch.Tensor]
+    cumulated_presence: Optional[torch.Tensor]
+    repetition_penalties: Optional[torch.Tensor]
+    scaling_base: Optional[torch.Tensor]
+    min_new_tokens: Optional[torch.Tensor]
+    len_output_tokens: Optional[torch.Tensor]
+    stop_token_penalties: Optional[torch.Tensor]
+
+    @classmethod
+    def from_orchestrator(
+        cls, orchestrator, anchor_unresolved: Optional[torch.Tensor] = None
+    ) -> Optional[DFlashBlockPenaltyState]:
+        """Return a snapshot of prepared penalties, or None if unused."""
+        orchestrator_penalizers = getattr(orchestrator, "penalizers", {})
+        penalizers = {
+            penalizer_type: orchestrator_penalizers.get(penalizer_type)
+            for penalizer_type in (
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+                BatchedMinNewTokensPenalizer,
+            )
+        }
+        prepared = {
+            penalizer_type: penalizer
+            for penalizer_type, penalizer in penalizers.items()
+            if penalizer is not None and penalizer._is_prepared
+        }
+        if not prepared:
+            return None
+
+        row_tensor = next(
+            tensor
+            for penalizer in prepared.values()
+            for tensor in (
+                getattr(penalizer, "frequency_penalties", None),
+                getattr(penalizer, "presence_penalties", None),
+                getattr(penalizer, "repetition_penalties", None),
+                getattr(penalizer, "min_new_tokens", None),
+            )
+            if tensor is not None
+        )
+        bs = row_tensor.shape[0]
+        additive_base = torch.zeros(
+            (bs, orchestrator.vocab_size),
+            dtype=torch.float32,
+            device=orchestrator.device,
+        )
+
+        frequency = prepared.get(BatchedFrequencyPenalizer)
+        if frequency is not None:
+            frequency.apply(additive_base)
+        presence = prepared.get(BatchedPresencePenalizer)
+        if presence is not None:
+            presence.apply(additive_base)
+
+        repetition = prepared.get(BatchedRepetitionPenalizer)
+        min_new_tokens = prepared.get(BatchedMinNewTokensPenalizer)
+        return cls(
+            anchor_unresolved=anchor_unresolved,
+            additive_base=additive_base,
+            frequency_penalties=(
+                getattr(frequency, "frequency_penalties", None)
+                if frequency is not None
+                else None
+            ),
+            presence_penalties=(
+                getattr(presence, "presence_penalties", None)
+                if presence is not None
+                else None
+            ),
+            cumulated_presence=(
+                presence.cumulated_presence_penalties.clone()
+                if presence is not None
+                else None
+            ),
+            repetition_penalties=(
+                getattr(repetition, "repetition_penalties", None)
+                if repetition is not None
+                else None
+            ),
+            scaling_base=(
+                repetition.cumulated_repetition_penalties.clone()
+                if repetition is not None
+                else None
+            ),
+            min_new_tokens=(
+                getattr(min_new_tokens, "min_new_tokens", None)
+                if min_new_tokens is not None
+                else None
+            ),
+            len_output_tokens=(
+                min_new_tokens.len_output_tokens.clone()
+                if min_new_tokens is not None
+                else None
+            ),
+            stop_token_penalties=(
+                getattr(min_new_tokens, "stop_token_penalties", None)
+                if min_new_tokens is not None
+                else None
+            ),
+        )
+
+
+def _apply_block_penalties(
+    logits2d: torch.Tensor,
+    state: DFlashBlockPenaltyState,
+    candidates: torch.Tensor,
+    bs: int,
+    k: int,
+) -> None:
+    """Roll the committed penalty state forward one candidate at a time.
+
+    The rolled-forward state lives in [bs, V] working buffers -- the same size
+    class as the committed penalty state itself -- and each position of the
+    verify block is adjusted through the [bs, V] view of its rows, so no
+    adjustment plane the size of the [bs * k, V] verify logits is ever
+    materialized.
+    """
+    vocab_size = logits2d.shape[1]
+    c = candidates[:, 1:]
+    logits3 = logits2d.view(bs, k, vocab_size)
+
+    # The committed additive state is position-invariant; broadcast it once.
+    logits3.add_(state.additive_base.unsqueeze(1).to(dtype=logits2d.dtype))
+
+    delta_add = (
+        torch.zeros_like(state.additive_base)
+        if state.frequency_penalties is not None or state.presence_penalties is not None
+        else None
+    )
+    seen_presence = (
+        state.cumulated_presence.clone()
+        if state.presence_penalties is not None
+        else None
+    )
+    running_scale = (
+        state.scaling_base.clone() if state.scaling_base is not None else None
+    )
+
+    anchor_len = 0
+    if state.anchor_unresolved is not None:
+        if state.anchor_unresolved.shape[0] != bs:
+            raise ValueError(
+                "anchor_unresolved rows mismatch: "
+                f"Expected {bs}, got {state.anchor_unresolved.shape[0]}."
+            )
+        # Overlap scheduling publishes the previous verify block's commit
+        # before it resolves into output_ids, so the snapshot misses the
+        # anchor (candidates[:, 0], the last committed token) on those rows.
+        # Fold it into the rolled state once; the cursor feeds it to the
+        # orchestrator after it resolves, so it is never counted twice.
+        # Masked (not data-dependent) so the hot path stays sync-free.
+        mask = state.anchor_unresolved.unsqueeze(1)
+        anchor = candidates[:, 0:1]
+        if delta_add is not None and state.frequency_penalties is not None:
+            delta_add.scatter_add_(1, anchor, -state.frequency_penalties * mask)
+        if delta_add is not None and state.presence_penalties is not None:
+            new_hits = seen_presence.gather(1, anchor).eq(0) & mask
+            delta_add.scatter_add_(1, anchor, -state.presence_penalties * new_hits)
+            seen_presence.scatter_(
+                1,
+                anchor,
+                torch.where(
+                    mask, state.presence_penalties, seen_presence.gather(1, anchor)
+                ),
+            )
+        if running_scale is not None:
+            running_scale.scatter_(
+                1,
+                anchor,
+                torch.where(
+                    mask, state.repetition_penalties, running_scale.gather(1, anchor)
+                ),
+            )
+        if state.min_new_tokens is not None:
+            anchor_len = mask.to(state.len_output_tokens.dtype)
+
+    for position in range(k):
+        position_logits = logits3[:, position]
+        # delta_add starts at zero, so applying it at position 0 is a no-op
+        # unless the anchor fold above already wrote into it.
+        if delta_add is not None:
+            position_logits.add_(delta_add.to(dtype=position_logits.dtype))
+        if state.min_new_tokens is not None:
+            under_min = (
+                state.len_output_tokens + anchor_len + position
+            ) < state.min_new_tokens
+            position_logits.add_(
+                torch.where(
+                    under_min,
+                    state.stop_token_penalties,
+                    0.0,
+                ).to(dtype=position_logits.dtype)
+            )
+        if running_scale is not None:
+            apply_scaling_penalties(position_logits, running_scale)
+        if position + 1 == k:
+            break
+        # Fold candidate `position + 1` into the rolled-forward state so later
+        # positions are penalized as if it had been committed.
+        token = c[:, position : position + 1]
+        if state.frequency_penalties is not None:
+            delta_add.scatter_add_(1, token, -state.frequency_penalties)
+        if state.presence_penalties is not None:
+            new_hits = seen_presence.gather(1, token).eq(0)
+            delta_add.scatter_add_(1, token, -state.presence_penalties * new_hits)
+            seen_presence.scatter_(1, token, state.presence_penalties)
+        if running_scale is not None:
+            running_scale.scatter_(1, token, state.repetition_penalties)
+
+
 def apply_dflash_verify_logits_adjustments(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    candidates: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
@@ -256,6 +491,16 @@ def apply_dflash_verify_logits_adjustments(
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
+    state = getattr(sampling_info, "dflash_block_penalty_state", None)
+    if state is None and penalizer is not None and penalizer.is_required:
+        state = DFlashBlockPenaltyState.from_orchestrator(penalizer)
+    if candidates is not None:
+        if tuple(candidates.shape) != (bs, draft_token_num):
+            raise ValueError(
+                "candidates shape mismatch for DFlash verify adjustments. "
+                f"Expected {(bs, draft_token_num)}, got {tuple(candidates.shape)}."
+            )
+
     logits_3d: Optional[torch.Tensor] = None
 
     def get_logits_3d() -> torch.Tensor:
@@ -263,6 +508,41 @@ def apply_dflash_verify_logits_adjustments(
         if logits_3d is None:
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
+
+    if candidates is not None and state is not None:
+        if state.additive_base.shape[0] != bs:
+            raise ValueError(
+                "penalty state rows mismatch: "
+                f"Expected {bs}, got {state.additive_base.shape[0]}."
+            )
+        # Per-position penalties rolled forward across the verify block; the
+        # grammar mask and logit bias still apply on every position below.
+        _apply_block_penalties(
+            next_token_logits,
+            state,
+            candidates,
+            bs,
+            draft_token_num,
+        )
+        if grammar_mask is not None:
+            masked = torch.zeros(
+                (bs, next_token_logits.shape[1]),
+                dtype=torch.float32,
+                device=next_token_logits.device,
+            )
+            grammar_mask.apply(masked)
+            get_logits_3d().add_(masked[:, None, :].to(dtype=next_token_logits.dtype))
+        if logit_bias is not None:
+            if (
+                logit_bias.device != next_token_logits.device
+                or logit_bias.dtype != next_token_logits.dtype
+            ):
+                logit_bias = logit_bias.to(
+                    device=next_token_logits.device,
+                    dtype=next_token_logits.dtype,
+                )
+            get_logits_3d().add_(logit_bias[:, None, :])
+        return
 
     # Dense fallback only when we need live penalizer application or a vocab mask.
     # In overlap scheduling the common path is `acc_linear_penalties`, which can be

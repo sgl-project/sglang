@@ -81,6 +81,8 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-step snapshot for DFLASH verify; built in spec_prepare_for_decode
+    dflash_block_penalty_state: Optional[Any] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
