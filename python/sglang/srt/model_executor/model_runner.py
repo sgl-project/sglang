@@ -63,6 +63,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
+    broadcast_global_expert_location_metadata_in_place,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
@@ -1001,19 +1002,13 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=global_ep_rank,
+        # Recovery updates the existing fixed-topology metadata in place.
+        # Keep the recorder too: captured graphs still write its GPU counters.
+        # Replacing it would free buffers whose addresses are held by the graph.
+        broadcast_global_expert_location_metadata_in_place(
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=True
             ),
-        )
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=global_ep_rank,
-            )
         )
 
         ElasticEPStateManager.instance().reset()
@@ -2230,8 +2225,6 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
                 self.forward_pass_id = 0
@@ -2292,6 +2285,16 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
+        state = ElasticEPStateManager.instance()
+        if (
+            get_parallel().enable_fault_tolerance
+            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+            and state is not None
+            and bool(
+                (state.last_active_ranks.bool() & ~state.active_ranks.bool()).any()
+            )
+        ):
+            raise RuntimeError("Elastic EP membership loss detected before EPLB")
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
@@ -2300,6 +2303,23 @@ class ModelRunner:
                 split_forward_count,
             )
         return output
+
+    def update_fault_tolerance_active_ranks(
+        self, active_mask: Optional[list[bool]] = None
+    ) -> None:
+        """Restore the last rank mask, or apply a new one and rebalance."""
+        state = ElasticEPStateManager.instance()
+        active_ranks = state.last_active_ranks
+        if active_mask is not None:
+            active_ranks = torch.as_tensor(
+                active_mask,
+                dtype=state.active_ranks.dtype,
+                device=state.active_ranks.device,
+            )
+        state.active_ranks.copy_(active_ranks)
+        state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
+        if active_mask is not None:
+            maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager)
 
     def update_model_fields(
         self,

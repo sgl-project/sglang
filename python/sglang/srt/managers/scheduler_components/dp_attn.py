@@ -211,6 +211,23 @@ class MLPSyncBatchInfo:
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        if (
+            get_parallel().enable_fault_tolerance
+            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+        ):
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            # PG can observe an idle failure without any EP forward running.
+            # Compare with the last installed topology so removed ranks do not
+            # trigger another pause after a successful scale-down.
+            if state is not None and bool(
+                (
+                    state.last_active_ranks.to(tp_active_ranks.device).bool()
+                    & ~tp_active_ranks.bool()
+                ).any()
+            ):
+                raise RuntimeError("PG membership loss detected after MLP sync")
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
