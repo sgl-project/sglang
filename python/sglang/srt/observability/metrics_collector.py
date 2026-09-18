@@ -1801,12 +1801,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             ).set(float(duration))
 
     def observe_finished_outcome(
-        self, *, labels: Dict[str, str], outcome: str, prompt_tokens: int, cached_tokens: int
+        self,
+        *,
+        labels: Dict[str, str],
+        outcome: str,
+        prompt_tokens: int,
+        cached_tokens: int,
     ) -> None:
         outcome_labels = {**labels, "outcome": outcome}
         self.finished_requests_by_outcome.labels(**outcome_labels).inc()
-        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(prompt_tokens)
-        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(cached_tokens)
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(
+            prompt_tokens
+        )
+        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(
+            cached_tokens
+        )
 
     def observe_one_finished_request(
         self,
