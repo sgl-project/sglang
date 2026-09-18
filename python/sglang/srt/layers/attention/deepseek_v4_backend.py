@@ -3276,6 +3276,65 @@ class DeepseekV4AttnBackend(
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
+        consume = (
+            published_masks(self.forward_metadata.candidate_metadata).request_masks
+            if indexer.uses_candidates and not indexer.is_candidate_source
+            else None
+        )
+        # Follow the source's representation, not the current tail's row counts.
+        # Small/mixed batches retain the single batched dense call below.
+        if consume is not None and any(m.dtype == torch.int32 for m in consume):
+            from sglang.kernels.ops.attention.dsv4.candidate_fp4_indexer import (
+                candidate_fp4_mqa_logits,
+            )
+
+            topk = indexer.index_topk
+            token_start = 0
+            for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
+                rows = slice(token_start, token_start + t_len)
+                token_start += t_len
+                if lc == 0 or t_len == 0:
+                    continue
+                blocks = consume[b]
+                logits = candidate_fp4_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    (
+                        k_fp4[starts[b] : starts[b] + lc],
+                        k_sf[starts[b] : starts[b] + lc],
+                    ),
+                    weights[rows],
+                    blocks,
+                    compress_lens[rows],
+                    indexer.candidate_block_size,
+                )
+                selected = torch.empty((t_len, topk), dtype=torch.int32, device=device)
+                topk_transform_ragged_v2(
+                    logits,
+                    torch.full_like(compress_lens[rows], logits.shape[1]),
+                    out_offsets=torch.zeros_like(compress_lens[rows]),
+                    out_indices=selected,
+                )
+                selected = mask_topk_scores(logits, selected)
+                columns = selected.clamp_min(0).to(torch.int64)
+                logical = blocks.gather(1, columns // indexer.candidate_block_size)
+                logical = (
+                    logical * indexer.candidate_block_size
+                    + columns % indexer.candidate_block_size
+                )
+                unselected = torch.iinfo(torch.int32).max
+                logical = logical.masked_fill(selected < 0, unselected).sort(-1).values
+                chosen = logical != unselected
+                page_indices[rows, :topk] = torch.where(
+                    chosen,
+                    k_slots[(logical + starts[b]).clamp_max(k_slots.shape[0] - 1)],
+                    -1,
+                ).to(torch.int32)
+                if raw_indices is not None:
+                    raw_indices[rows, :topk] = torch.where(chosen, logical, -1).to(
+                        torch.int32
+                    )
+            return
+
         logits = _dense_fp4_mqa_logits(
             (q_fp4, q_sf),
             (k_fp4, k_sf),
@@ -3287,7 +3346,21 @@ class DeepseekV4AttnBackend(
         )
         if indexer.is_candidate_source or indexer.uses_candidates:
             self._publish_or_consume_candidates(
-                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+                indexer,
+                logits,
+                compress_lens,
+                lc_per_req,
+                q_lens_cpu,
+                empty_mask,
+                # All nonzero contexts must qualify, including requests with no
+                # query rows. Otherwise preserve batched dense consumers.
+                return_indices=indexer.is_candidate_source
+                and all(
+                    lc == 0
+                    or lc
+                    >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
+                    for lc in lc_per_req
+                ),
             )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
@@ -3311,7 +3384,14 @@ class DeepseekV4AttnBackend(
     # TODO(candidate): dense-prefill level one / level two inline with masks; move
     # into the candidate indexer as publish_prefill / select_prefill.
     def _publish_or_consume_candidates(
-        self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+        self,
+        indexer,
+        logits,
+        compress_lens,
+        lc_per_req,
+        q_lens_cpu,
+        empty_mask,
+        return_indices=False,
     ) -> None:
         publish = [] if indexer.is_candidate_source else None
         consume = (
@@ -3343,6 +3423,7 @@ class DeepseekV4AttnBackend(
                     lens[start : start + step],
                     topk_blocks=indexer.candidate_topk_blocks,
                     block_size=indexer.candidate_block_size,
+                    return_indices=return_indices,
                 )
                 for start in range(0, t_len, step)
             ]
