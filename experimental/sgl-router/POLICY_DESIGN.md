@@ -28,7 +28,41 @@ An engine is represented by `Worker` in the code. A bucket is a configured group
 of engines with membership rules, request limits, and an attached policy.
 Prefill/decode disaggregation (PD) runs selection separately for each stage.
 
-## 1. Responsibilities and request flow
+## 1. Code organization
+
+```text
+src/
+  buckets.rs                    Group resolution, ordering, and selection loop
+  policies/
+    mod.rs                      Policy contract and construction
+    admission.rs                Acceptance checks and placement
+    pools.rs                    Model and PD pool resolution
+    cache_aware.rs              Cache selection and local/remote adapter
+    session_aware.rs             Session selection and fallback
+    sticky.rs                   Routing-key selection and fallback
+    least_load.rs               Least-load selection
+    power_of_two.rs             Pair sampling and stage-aware comparison
+    random.rs                   Random selection
+    round_robin.rs              Rotation
+    state/
+      mod.rs                    Shared exports and prefix result types
+      kv_events/                Local index, subscriptions, hashing, wire format
+      engine_load/
+        reports.rs              Engine reports and freshness
+        inflight.rs             Local request accounting
+        view.rs                 Shared load interpretation
+      affinity_store.rs         Assignments, expiry, and atomic updates
+  server/
+    app_context.rs              Shared service lifecycle and policy wiring
+    routes/chat.rs              Request preparation, PD coordination, dispatch
+```
+
+Dependencies flow from the resolver to policies, and from policies and admission
+to shared state. State does not depend on bucket ordering or concrete policy
+strategies. Small shared helpers are sufficient; no generic score-composition,
+tier executor, or separate selection framework is required.
+
+## 2. Responsibilities and request flow
 
 | Component | Owns | Returns |
 | --- | --- | --- |
@@ -82,7 +116,7 @@ cannot add an engine, change buckets, or cross a PD role boundary. The caller
 validates this contract before dispatch. There is no later substitution of a
 policy's chosen engine.
 
-## 2. Bucket resolution
+## 3. Bucket resolution
 
 The resolver builds an ordered list of **resolved engine groups**. Each group
 contains current candidates, an attached policy, and the scope and mode for this
@@ -209,7 +243,7 @@ means the resolver should continue.
 There is no second pass with relaxed capacity, and no automatic backup selection
 after a policy returns a rejection.
 
-## 3. Policy and admission contracts
+## 4. Policy and admission contracts
 
 ### Policy
 
@@ -298,7 +332,7 @@ Admission checks observe capacity; they do not reserve it. Concurrent requests
 may pass against the same observation. Strict reservations would require a
 separate mechanism.
 
-## 4. Concrete policies
+## 5. Concrete policies
 
 | Policy | Selection behavior |
 | --- | --- |
@@ -350,7 +384,7 @@ that another bucket or stage's cache selection and admission have already run.
 Any optimization that skips those steps must establish that the previous result
 applies to the current group.
 
-## 5. Shared state and construction
+## 6. Shared state and construction
 
 Application wiring starts shared services once. Policy construction validates
 configuration and passes the required handles to each policy. Policy instances
@@ -404,7 +438,7 @@ Create or replace a binding only after admission succeeds. A binding records
 preferred placement, not successful execution, so it may remain if later PD
 selection or dispatch fails. It must not increment dispatch accounting.
 
-## 6. Configuration and compatibility
+## 7. Configuration and compatibility
 
 This conceptual example shows the target attachment model. It is not copyable
 current CLI/JSON syntax; existing bucket field names need not change.
@@ -496,7 +530,7 @@ Reject these dropped options explicitly:
 - `--filter prefix_cache` and `--prefix-cache-min-share`. The removed prefix-share
   filter is not equivalent to the cache-aware minimum-hit gate.
 
-## 7. Dispatch and failure handling
+## 8. Dispatch and failure handling
 
 A successful pick means admission passed against the observed state. Health and
 capacity can change before dispatch. The handler owns network operations, retry
@@ -509,40 +543,6 @@ with a different engine after selection.
 For PD, acquire and release accounting for the actual stages and clean up
 partial setup on failure. Policy selection does not own the PD request lifetime.
 Selection metrics must not imply that dispatch or execution succeeded.
-
-## 8. Code organization
-
-```text
-src/
-  buckets.rs                    Group resolution, ordering, and selection loop
-  policies/
-    mod.rs                      Policy contract and construction
-    admission.rs                Acceptance checks and placement
-    pools.rs                    Model and PD pool resolution
-    cache_aware.rs              Cache selection and local/remote adapter
-    session_aware.rs             Session selection and fallback
-    sticky.rs                   Routing-key selection and fallback
-    least_load.rs               Least-load selection
-    power_of_two.rs             Pair sampling and stage-aware comparison
-    random.rs                   Random selection
-    round_robin.rs              Rotation
-    state/
-      mod.rs                    Shared exports and prefix result types
-      kv_events/                Local index, subscriptions, hashing, wire format
-      engine_load/
-        reports.rs              Engine reports and freshness
-        inflight.rs             Local request accounting
-        view.rs                 Shared load interpretation
-      affinity_store.rs         Assignments, expiry, and atomic updates
-  server/
-    app_context.rs              Shared service lifecycle and policy wiring
-    routes/chat.rs              Request preparation, PD coordination, dispatch
-```
-
-Dependencies flow from the resolver to policies, and from policies and admission
-to shared state. State does not depend on bucket ordering or concrete policy
-strategies. Small shared helpers are sufficient; no generic score-composition,
-tier executor, or separate selection framework is required.
 
 ## Implementation status
 
