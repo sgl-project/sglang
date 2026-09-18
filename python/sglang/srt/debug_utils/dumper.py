@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
+from sglang.srt.utils import get_device
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -179,9 +180,9 @@ class DumperConfig(_BaseConfig):
                 f"grafter_role must be 'baseline' or 'target' when grafter_enable=True, "
                 f"got {self.grafter_role!r}"
             )
-            assert (
-                self.grafter_master_address
-            ), "grafter_master_address must be set when grafter_enable=True"
+            assert self.grafter_master_address, (
+                "grafter_master_address must be set when grafter_enable=True"
+            )
             assert self.grafter_master_port > 0, (
                 f"grafter_master_port must be a positive port when grafter_enable=True, "
                 f"got {self.grafter_master_port}"
@@ -996,9 +997,9 @@ class _Grafter:
             return
 
         cfg = self._config
-        assert (
-            dist.is_initialized()
-        ), "[Grafter] default torch.distributed must be initialized"
+        assert dist.is_initialized(), (
+            "[Grafter] default torch.distributed must be initialized"
+        )
         role = _GraftRole(cfg.grafter_role)
         local_world = dist.get_world_size()
         local_rank = dist.get_rank()
@@ -1175,7 +1176,7 @@ def _get_default_exp_name(timeout_seconds: int = 60):
 
     if dist.is_initialized():
         _collective_with_timeout(
-            lambda: dist.broadcast_object_list(object_list, device="cuda"),
+            lambda: dist.broadcast_object_list(object_list, device=get_device()),
             operation_name="broadcast_object_list in _get_default_exp_name",
             timeout_seconds=timeout_seconds,
         )
@@ -1795,7 +1796,6 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-
             args = get_server_args()
             if args is None:
                 return None

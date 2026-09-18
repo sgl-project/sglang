@@ -5,7 +5,7 @@ python3 -m unittest test_pp_with_hicache.TestPPWithHiCache.test_eval_accuracy
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=138, stage="base-c", runner_config="4-gpu-h100")
 
 import os
 import subprocess
@@ -57,7 +57,11 @@ class TestPPWithHiCache(unittest.TestCase):
             if value is not True:
                 final_server_args.append(str(value))
 
-        env_vars = {**os.environ, **cls._mooncake_env()}
+        env_vars = {
+            **os.environ,
+            **cls._mooncake_env(),
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        }
 
         try:
             cls.process = popen_launch_server(

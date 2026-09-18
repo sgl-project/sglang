@@ -40,7 +40,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.runtime_context import get_flags, get_forward
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils.common import ceil_align
 
 # Architectures whose decoder layers route attention/MLP through
@@ -50,12 +54,12 @@ from sglang.srt.utils.common import ceil_align
 SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
 
 
-def initialize_layernorm_sp(*, server_args, model_config) -> None:
+def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
     get_flags().sp.enabled = bool(
-        server_args.enable_layernorm_sp
+        get_parallel().enable_layernorm_sp
         and architectures
         and architectures[0] in SP_SUPPORTED_ARCHITECTURES
     )

@@ -5,7 +5,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 NUM_LAYERS = 2
 NUM_SLOTS = 3
@@ -15,6 +15,8 @@ def _pool(temporal: torch.Tensor, num_conv: int = 2) -> MambaPool:
     """A MambaPool stub carrying only what the transfer accessors read."""
     pool = object.__new__(MambaPool)
     pool.num_mamba_layers = NUM_LAYERS
+    pool.mamba_layer_ids = list(range(NUM_LAYERS))
+    pool._slot_siblings = []
     pool.conv_slice_axis = 0
     pool.mamba_cache = MambaPool.State(
         conv=[torch.zeros(NUM_LAYERS, NUM_SLOTS, 4, 5) for _ in range(num_conv)],
@@ -53,6 +55,18 @@ class TestMambaStateTransferBuffers(unittest.TestCase):
         _, lens, _ = pool.get_contiguous_buf_infos()
 
         self.assertEqual(len(pool.get_state_dim_per_tensor()), len(lens))
+
+    def test_sibling_declares_replicated_transfer_without_field_name_coupling(self):
+        pool = _pool(torch.zeros(NUM_LAYERS, NUM_SLOTS, 6, 7, 8))
+
+        class ReplicatedSibling:
+            def iter_transfer_state_entries(self):
+                yield "future_sibling", torch.zeros(NUM_SLOTS, 9), None, 123
+
+        pool._slot_siblings = [ReplicatedSibling()]
+
+        self.assertEqual(pool.get_state_dim_per_tensor()[-1], 0)
+        self.assertEqual(pool.get_state_slice_outer_counts()[-1], 1)
 
 
 if __name__ == "__main__":
