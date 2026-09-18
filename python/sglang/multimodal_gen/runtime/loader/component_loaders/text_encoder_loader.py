@@ -3,6 +3,7 @@ import os
 import pickle
 import re
 from collections.abc import Generator
+from pathlib import Path
 
 import msgspec
 import torch
@@ -67,6 +68,8 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    _select_safetensors_index_file,
     checkpoint_bytes,
     get_param_names_mapping,
     initialize_model,
@@ -124,6 +127,7 @@ class ResolvedTextEncoderLoad(msgspec.Struct):
     dtype: str
     component_starts_on_cpu: bool | None
     weight_files: tuple[str, ...] | None = None
+    metadata_files: tuple[str, ...] = ()
 
     def freeze(self):
         return FrozenTextEncoderLoad(
@@ -462,6 +466,145 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
+
+    def prepare_weight_cache(self, spec, server_args, *, planned_device=None):
+        from sglang.multimodal_gen.runtime.loader.component_state import (
+            PreparedComponent,
+        )
+        from sglang.multimodal_gen.runtime.loader.native_encoder_state import for_model
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+        if type(self) is not TextEncoderLoader:
+            raise ValueError("Weight cache has no audited custom text encoder loader")
+        name = spec.module_name
+        if (
+            name in server_args.component_weights_paths
+            or "conditioning_projection" in server_args.component_paths
+        ):
+            raise ValueError(
+                "Text encoder cache does not support weight/projection overrides"
+            )
+        backend, _ = server_args.resolve_component_attention_backend(
+            name, spec.load_module_name
+        )
+        backend = backend or AttentionBackendEnum.FA
+        recipe = self.prepare_customized(
+            spec.component_model_path,
+            server_args,
+            name,
+            False,
+            planned_device=planned_device or torch.device("cuda", 0),
+        )
+        recipe.weight_files = tuple(
+            _list_safetensors_files(
+                recipe.weights_path, index_file=SAFE_WEIGHTS_INDEX_NAME
+            )
+        )
+        if not recipe.weight_files:
+            raise ValueError("Text encoder cache requires safetensors weights")
+        metadata_files = [str(Path(recipe.model_path) / "config.json")]
+        generation = Path(recipe.model_path) / "generation_config.json"
+        if generation.exists():
+            metadata_files.append(str(generation))
+        index = _select_safetensors_index_file(
+            recipe.weights_path, SAFE_WEIGHTS_INDEX_NAME
+        )
+        if index is not None:
+            metadata_files.append(index)
+        recipe.metadata_files = tuple(metadata_files)
+        recipe.server_args.model_paths[name] = recipe.model_path
+        frozen = recipe.freeze()
+        contract = for_model(recipe.model_cls)
+        contract.validate_supported(frozen, attention=str(backend))
+        return PreparedComponent(
+            name,
+            spec.load_module_name,
+            spec.architecture,
+            type(self),
+            frozen,
+            contract,
+            backend,
+        )
+
+    def load_prepared(self, frozen, *, attention_backend):
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+            isolated_qwen_vl_rope_cache,
+        )
+
+        recipe = frozen.thaw()
+        with isolated_qwen_vl_rope_cache():
+            return self.load(
+                recipe.model_path,
+                recipe.server_args,
+                recipe.component_name,
+                self.expected_library,
+                component_attn_backend=attention_backend,
+                component_attn_name=recipe.component_name,
+                allow_native_fallback=False,
+                prepared_load=recipe,
+            )
+
+    def build_prepared_meta(self, frozen, *, attention_backend):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            component_attn_backend_context_manager,
+        )
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+            isolated_qwen_vl_rope_cache,
+        )
+
+        recipe = frozen.thaw()
+        group = get_folding_tp_group(recipe.config)
+        with (
+            use_tensor_parallel_group(group),
+            isolated_qwen_vl_rope_cache(),
+            component_attn_backend_context_manager(
+                attention_backend, component_name=recipe.component_name
+            ),
+        ):
+            model = initialize_model(
+                recipe.model_cls,
+                {"config": recipe.config},
+                PRECISION_TO_TYPE[recipe.dtype],
+                torch.device("meta"),
+            )
+            model.bind_encoder_tp_group(group)
+        return model.eval().requires_grad_(False)
+
+    def apply_prepared_config(self, frozen, server_args):
+        recipe = frozen.thaw()
+        configs = list(server_args.pipeline_config.text_encoder_configs)
+        configs[
+            self._extract_encoder_index(
+                self.structural_component_name(recipe.component_name)
+            )
+        ] = recipe.config
+        server_args.pipeline_config.text_encoder_configs = tuple(configs)
+        server_args.model_paths[recipe.component_name] = recipe.model_path
+
+    def prepared_checkpoint_files(self, frozen):
+        recipe = frozen.thaw()
+        return tuple(
+            Path(path) for path in (*recipe.metadata_files, *recipe.weight_files)
+        )
+
+    def prepared_fingerprint(self, frozen):
+        recipe = frozen.thaw()
+        arch = recipe.config.arch_config
+        return {
+            "model_cls": f"{recipe.model_cls.__module__}.{recipe.model_cls.__qualname__}",
+            "hf_config": recipe.hf_config,
+            "text_config": arch.text_config.to_dict(),
+            "vision_config": arch.vision_config.to_dict(),
+            "generation_config": recipe.config.generation_config,
+            "selected_lm_layer": arch.num_hidden_layers,
+            "dtype": recipe.dtype,
+            "quantization": None,
+            "resident": True,
+            "fsdp": False,
+            "parallel_folding_mode": recipe.config.parallel_folding_mode,
+            "enable_image_understanding": recipe.config.enable_image_understanding,
+            "honor_cache_free_padding_mask": recipe.config.honor_cache_free_padding_mask,
+        }
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str

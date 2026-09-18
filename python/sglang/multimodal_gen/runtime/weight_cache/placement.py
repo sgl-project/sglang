@@ -4,6 +4,24 @@
 import math
 
 
+def requested_component_names(args) -> tuple[str, ...]:
+    names = tuple(
+        "transformer" if name == "dit" else name
+        for name in args.weight_cache_components
+    )
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or "transformer" not in names
+        or not set(names).issubset({"transformer", "text_encoder"})
+    ):
+        raise ValueError(
+            "Weight cache requires dit/transformer, optionally with text_encoder; duplicate selectors are not allowed"
+        )
+    # Canonical order makes aliases and CLI ordering describe the same bundle.
+    return tuple(name for name in ("transformer", "text_encoder") if name in names)
+
+
 def pin_requested_components(args) -> None:
     if args.weight_cache_mode == "off":
         return
@@ -11,11 +29,7 @@ def pin_requested_components(args) -> None:
         raise ValueError(
             "Weight cache Phase 1A supports standalone daemons and strict client mode only"
         )
-    requested = args.weight_cache_components
-    if not requested or set(requested) not in ({"dit"}, {"transformer"}):
-        raise ValueError(
-            "Weight cache Phase 1A supports only the transformer (dit) component"
-        )
+    requested = requested_component_names(args)
     if args.use_fsdp_inference:
         raise ValueError("Weight cache does not support explicit FSDP inference")
     if args.dit_cpu_offload or args.dit_layerwise_offload:
@@ -31,18 +45,20 @@ def pin_requested_components(args) -> None:
     layerwise = (
         normalize_layerwise_offload_components(args.layerwise_offload_components) or []
     )
-    if (
-        cpu_offload_component_matches("transformer", args.cpu_offload_components)
-        or {"all", "dit"}.intersection(layerwise)
-        or layerwise_component_matches_any_selection("transformer", layerwise)
-    ):
-        raise ValueError(
-            "Weight cache conflicts with an explicit transformer offload selector"
-        )
-    # This checks original canonical/group and legacy explicit controls before
-    # adding an internal requirement. It does not forge user-explicit options.
-    args.require_component_resident("transformer", feature_name="Weight cache")
-    args.disable_fsdp_for_component("transformer")
+    for name in requested:
+        if (
+            cpu_offload_component_matches(name, args.cpu_offload_components)
+            or "all" in layerwise
+            or (name == "transformer" and "dit" in layerwise)
+            or layerwise_component_matches_any_selection(name, layerwise)
+            or (name == "text_encoder" and args.text_encoder_cpu_offload)
+        ):
+            raise ValueError(
+                f"Weight cache conflicts with an explicit {name} offload selector"
+            )
+        # Check original explicit controls before adding internal requirements.
+        args.require_component_resident(name, feature_name="Weight cache")
+        args.disable_fsdp_for_component(name)
     args.use_fsdp_inference = False
     if args.lora_path is not None or any(
         name.startswith("lora_") for name in args._explicit_arg_names
@@ -83,12 +99,13 @@ def validate_resolved_arguments(args) -> None:
             raise ValueError(f"Weight cache Phase 1A requires {name}=1")
     if args.node_rank != 0:
         raise ValueError("Weight cache Phase 1A requires node_rank=0")
-    if args.residency_mode(
-        "transformer"
-    ) != "resident" or args.should_use_fsdp_for_component("transformer"):
-        raise ValueError(
-            "Auto placement violated the weight-cache resident/non-FSDP requirement"
-        )
+    for name in requested_component_names(args):
+        if args.residency_mode(
+            name
+        ) != "resident" or args.should_use_fsdp_for_component(name):
+            raise ValueError(
+                f"Auto placement violated the weight-cache resident/non-FSDP requirement for {name}"
+            )
 
 
 def local_device_index(args, local_rank: int = 0) -> int:

@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.weight_cache import policy
-from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_index
+from sglang.multimodal_gen.runtime.weight_cache.placement import (
+    local_device_index,
+    requested_component_names,
+)
 from sglang.multimodal_gen.runtime.weight_cache.plan import (
     ComponentPlan,
     PipelineExecutionPlan,
@@ -104,6 +107,13 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     args = copy.deepcopy(server_args)
     args._prepared_pipeline = None
     args._weight_cache_admission = None
+    requested = requested_component_names(args)
+    if not set(requested).issubset(component.name for component in binding.components):
+        if required:
+            raise ValueError(
+                "Requested weight-cache components have no audited binding for this pipeline"
+            )
+        return None
     if binding.supports_subfolder:
         model_path, model_index = pipeline_cls.resolve_model_config(
             args.model_path, args
@@ -161,6 +171,8 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
         if binding.validate_model_index is not None:
             binding.validate_model_index(model_index)
         for selected in binding.components:
+            if selected.name not in requested:
+                continue
             spec = next(spec for spec in specs if spec.module_name == selected.name)
             override = pipeline_cls.component_loaders.get(spec.module_name)
             if override is not None and override is not selected.loader_cls:

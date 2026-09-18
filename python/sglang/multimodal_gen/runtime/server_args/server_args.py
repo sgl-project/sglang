@@ -2049,7 +2049,12 @@ class ServerArgs(DisaggServerArgsMixin):
             default="off",
             help="Strict single-GPU transformer cache client: Wan2.1 1.3B, original Qwen-Image or native MiniMax-H3 FL2VA.",
         )
-        parser.add_argument("--weight-cache-components", nargs="+", default=["dit"])
+        parser.add_argument(
+            "--weight-cache-components",
+            nargs="+",
+            default=["dit"],
+            help="Components to cache: dit (default), or dit text_encoder for native original H3 FL2VA. Cached components must remain GPU-resident.",
+        )
         parser.add_argument(
             "--weight-cache-fallback", choices=["error"], default="error"
         )

@@ -5,6 +5,9 @@ from collections.abc import Callable
 
 import msgspec
 
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    TextEncoderLoader,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
@@ -12,6 +15,9 @@ from sglang.multimodal_gen.runtime.loader.native_dit_state import (
     MINIMAX_H3,
     QWEN_IMAGE,
     WAN,
+)
+from sglang.multimodal_gen.runtime.loader.native_encoder_state import (
+    MINIMAX_H3_TEXT_ENCODER,
 )
 
 
@@ -57,7 +63,12 @@ BINDINGS = (
         "minimax_h3_fl2va.v1",
         "sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline",
         "MiniMaxH3Pipeline",
-        (ComponentBinding("transformer", TransformerLoader, MINIMAX_H3.contract_id),),
+        (
+            ComponentBinding("transformer", TransformerLoader, MINIMAX_H3.contract_id),
+            ComponentBinding(
+                "text_encoder", TextEncoderLoader, MINIMAX_H3_TEXT_ENCODER.contract_id
+            ),
+        ),
         supports_subfolder=True,
         validate_model_index=_validate_h3_model_index,
     ),
