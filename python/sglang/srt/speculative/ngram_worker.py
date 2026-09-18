@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -33,10 +32,15 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
+
+if is_cuda():
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
