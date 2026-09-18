@@ -1694,6 +1694,14 @@ fi
 # so they must be the role totals (Oren EP16: ctx=2*8=16, gen=1*16=16, gpus=32).
 PREFILL_GPUS_TOTAL=$((PW * PTP)); DECODE_GPUS_TOTAL=$((DW * DTP))
 TOTAL_GPUS=$((PREFILL_GPUS_TOTAL + DECODE_GPUS_TOTAL))
+# Clear this leg's results from any previous run before writing new ones.
+# The filenames are a pure function of the config, so a run that produces
+# fewer concurrency points than the last one leaves the missing slots filled
+# by the old run's files and the published table silently mixes two runs.
+# Seen on kimik26-mxfp4-1k1k-2p1d-ep16-mxfp4: 2 points measured, 7 published,
+# 5 of them a day old. Deleting first means a short run looks short.
+rm -f "$GITHUB_WORKSPACE/${RESULT_FILENAME}_${MATRIX_CONFIG_NAME}_conc"*"_gpus_"*".json"
+
 PROCESSED=0
 for C in ${CONCS//,/ }; do
     RAW="$WORKDIR/raw_conc${C}.json"
