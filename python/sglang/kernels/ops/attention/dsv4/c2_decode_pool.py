@@ -14,7 +14,7 @@ from triton.language.extra import libdevice
 
 
 @triton.jit
-def _pair_pool_decode_kernel(
+def _c2_decode_pool_kernel(
     kv_ptr,  # [n, D] fp32
     score_ptr,  # [n, D] fp32
     pos_ptr,  # [n] int64
@@ -108,7 +108,7 @@ def _pair_pool_decode_kernel(
     tl.store(slots_ptr + row, tl.where(out_loc >= 0, out_loc, 0))
 
 
-def pair_pool_decode(
+def c2_decode_pool(
     kv: torch.Tensor,
     score: torch.Tensor,
     pos: torch.Tensor,
@@ -135,7 +135,7 @@ def pair_pool_decode(
     pooled = torch.empty_like(kv)
     group_pos = torch.empty_like(pos)
     slots = torch.empty(n, dtype=out_loc.dtype, device=out_loc.device)
-    _pair_pool_decode_kernel[(n,)](
+    _c2_decode_pool_kernel[(n,)](
         kv,
         score,
         pos,

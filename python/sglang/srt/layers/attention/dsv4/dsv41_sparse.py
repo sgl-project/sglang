@@ -144,12 +144,12 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             return self.wkv(x), None
         if self.use_fused_gate:
-            # Extend accepts strided column views; pair_pool_decode requires contiguous
+            # Extend accepts strided column views; c2_decode_pool requires contiguous
             # halves and is reachable only when the fused projection is disabled.
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
             return fused[..., :head_dim], fused[..., head_dim:]
-        # Two GEMMs rather than one fused [2D, K] projection: pair_pool_decode
+        # Two GEMMs rather than one fused [2D, K] projection: c2_decode_pool
         # reads kv and score as contiguous [n, D] fp32 rows, which column slices
         # of a fused output are not.
         kv = linear_bf16_fp32(x, self.wkv.weight)

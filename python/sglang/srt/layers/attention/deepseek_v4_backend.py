@@ -2997,14 +2997,12 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress_torch(layer, x, req, pos)
             return
 
-        from sglang.kernels.ops.attention.dsv4.c2_pair_pool_decode import (
-            pair_pool_decode,
-        )
+        from sglang.kernels.ops.attention.dsv4.c2_decode_pool import c2_decode_pool
 
         core = self.forward_metadata.core_metadata
         state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
         kv, score = layer.compressor.project(x)
-        pooled, group_pos, slots = pair_pool_decode(
+        pooled, group_pos, slots = c2_decode_pool(
             kv,
             score,
             pos,
