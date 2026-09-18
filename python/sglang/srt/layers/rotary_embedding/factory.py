@@ -90,7 +90,9 @@ def _aiter_rope_unsupported_arch() -> bool:
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
-def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
+def _get_live_rope_cache_entry(
+    key: Tuple, cache: Optional[Dict[Tuple, RotaryEmbedding]] = None
+) -> Optional[RotaryEmbedding]:
     """Return the cached module for ``key``, dropping it if its buffers are dead.
 
     A cached module is shared process-wide and attached as a submodule of every
@@ -104,7 +106,8 @@ def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
     built on purpose -- both are meta with no storage -- so the current device
     is what separates them.
     """
-    cached = _ROPE_DICT.get(key)
+    cache = _ROPE_DICT if cache is None else cache
+    cached = cache.get(key)
     if cached is None:
         return None
     if torch.get_default_device().type == "meta":
@@ -117,7 +120,7 @@ def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
                 key,
                 buf.device,
             )
-            del _ROPE_DICT[key]
+            del cache[key]
             return None
     return cached
 
@@ -132,7 +135,14 @@ def get_rope(
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+    *,
+    cache: Optional[Dict[Tuple, RotaryEmbedding]] = None,
 ) -> RotaryEmbedding:
+    # A caller-owned cache preserves layer aliases within one construction
+    # without sharing mutable module objects across independent model lifetimes
+    # (in particular, real and meta/IPC-imported models). Default SRT behavior is
+    # unchanged; callers never need to clear or replace the process-global cache.
+    cache = _ROPE_DICT if cache is None else cache
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
@@ -165,7 +175,7 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
     )
-    cached = _get_live_rope_cache_entry(key)
+    cached = _get_live_rope_cache_entry(key, cache)
     if cached is not None:
         return cached
 
@@ -436,7 +446,7 @@ def get_rope(
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-    _ROPE_DICT[key] = rotary_emb
+    cache[key] = rotary_emb
     return rotary_emb
 
 
