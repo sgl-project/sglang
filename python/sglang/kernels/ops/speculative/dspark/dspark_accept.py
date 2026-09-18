@@ -584,12 +584,14 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        fused_argmax: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
 
     @classmethod
@@ -600,12 +602,14 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        fused_argmax: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
 
 
@@ -615,9 +619,10 @@ def accept_greedy(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
@@ -661,15 +666,35 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
+def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
+    # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
+    # off the memory the reduction touches. The fused kernel does not reproduce
+    # torch.argmax's NaN selection, hence the opt-in.
+    if (
+        fused
+        and logits.is_cuda
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.shape[0] <= 64
+        and logits.shape[1] >= 4096
+    ):
+        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+
+        return row_argmax(logits)
+    return torch.argmax(logits, dim=-1)
+
+
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
