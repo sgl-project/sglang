@@ -207,7 +207,7 @@ def dsv41_dspark_needs_rebootstrap(
     return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
 
 
-def retraction_backup(
+def backup_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -230,11 +230,11 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
     return req.kv.retraction_backup is not None
 
 
-def retraction_restore(
+def restore_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -251,11 +251,13 @@ def retraction_restore(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
-def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+def discard_kv_cache_backup(
+    req: Req, tree_cache: BasePrefixCache, backend: str
+) -> None:
     if backend == "cpu_tensor":
         req.kv.retraction_backup = None
         return
@@ -265,7 +267,7 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.kv.retraction_backup)
+    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 

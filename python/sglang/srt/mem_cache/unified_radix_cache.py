@@ -1429,7 +1429,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+    def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
@@ -1472,11 +1472,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             completion.finish_event.synchronize()
         except Exception:
-            self.retraction_discard(backup)
+            self.discard_kv_cache_backup(backup)
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1521,9 +1521,9 @@ class UnifiedRadixCache(BasePrefixCache):
             layer_num=self.cache_controller.layer_num,
         )
         completion.finish_event.synchronize()
-        self.retraction_discard(backup)
+        self.discard_kv_cache_backup(backup)
 
-    def retraction_discard(self, backup: RetractionBackup) -> None:
+    def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 

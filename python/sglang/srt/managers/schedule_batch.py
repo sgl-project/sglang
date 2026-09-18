@@ -111,10 +111,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
+    backup_kv_cache,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     release_kv_cache,
-    retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -2227,7 +2227,7 @@ def release_req(
     backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = retraction_backup(
+        backup_saved = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,

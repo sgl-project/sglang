@@ -427,7 +427,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
             patch.object(
                 queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
             ),
-            patch("sglang.srt.disaggregation.decode.retraction_discard") as discard,
+            patch(
+                "sglang.srt.disaggregation.decode.discard_kv_cache_backup"
+            ) as discard,
         ):
             self.assertEqual(queue.pop_transferred(), [])
             discard.assert_called_once_with(req, queue.tree_cache, "host_pool")

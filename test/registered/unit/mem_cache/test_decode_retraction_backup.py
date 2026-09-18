@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import RetractionBackup, retraction_backup
+from sglang.srt.mem_cache.common import RetractionBackup, backup_kv_cache
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
@@ -171,13 +171,13 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         req, source_indices = self._admit_req(env, self.num_tokens)
         host_free_before = env.cache.host_pool_group.available_size()
 
-        self.assertIsNone(env.cache.retraction_backup(req))
+        self.assertIsNone(env.cache.backup_kv_cache(req))
         # The declined backup must not leak host slots.
         self.assertEqual(env.cache.host_pool_group.available_size(), host_free_before)
 
         # This is the signal release_req propagates so retract_decode aborts.
         self.assertFalse(
-            retraction_backup(
+            backup_kv_cache(
                 req,
                 env.cache,
                 env.req_to_token_pool,
@@ -205,7 +205,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         draft_expected = self._snapshot_pool(draft_pool, source_indices)
 
         host_free_before = cache.host_pool_group.available_size()
-        backup = cache.retraction_backup(req)
+        backup = cache.backup_kv_cache(req)
         self.assertEqual(
             {transfer.name for transfer in backup.pool_transfers or []},
             {PoolName.DRAFT},
@@ -227,7 +227,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
 
-        cache.retraction_restore(req, backup)
+        cache.restore_kv_cache(req, backup)
 
         self._assert_pool_equal(target_pool, destination_indices, target_expected)
         self._assert_pool_equal(draft_pool, destination_indices, draft_expected)
@@ -286,7 +286,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                     buffer[source_indices] = values
                     expected_retraction.append(values.clone())
 
-                backup = cache.retraction_backup(retracted)
+                backup = cache.backup_kv_cache(retracted)
                 self.assertIsNotNone(backup)
                 self.assertEqual(host.available_size(), 0)
                 restored_indices = env.allocator.alloc(reserve)
@@ -298,12 +298,12 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 env.req_to_token_pool.write(
                     (retracted.kv.req_pool_idx, slice(0, reserve)), restored_indices
                 )
-                cache.retraction_restore(retracted, backup)
+                cache.restore_kv_cache(retracted, backup)
                 self.assertEqual(host.available_size(), reserve)
 
                 receiving, received_indices = self._admit_req(env, receive_slots)
                 receiving.seqlen = receive_tokens + 1
-                cache.retraction_restore(
+                cache.restore_kv_cache(
                     receiving, RetractionBackup(host_indices=host_indices)
                 )
                 for buffer, restored, received in zip(

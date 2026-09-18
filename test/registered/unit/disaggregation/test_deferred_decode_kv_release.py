@@ -160,7 +160,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             mgr.register_deferred_abort_room(entry.req.bootstrap_room)
             q._defer_release(entry)
         with (
-            patch.object(decode_mod, "retraction_discard") as discard,
+            patch.object(decode_mod, "discard_kv_cache_backup") as discard,
             patch.object(decode_mod, "release_kv_cache") as device_release,
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,

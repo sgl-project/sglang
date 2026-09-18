@@ -90,12 +90,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
+    discard_kv_cache_backup,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
-    retraction_discard,
-    retraction_restore,
+    restore_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -865,7 +865,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
         for req in self.retracted_queue:
-            retraction_discard(
+            discard_kv_cache_backup(
                 req,
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
@@ -920,7 +920,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
-            retraction_restore(
+            restore_kv_cache(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
@@ -2522,7 +2522,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
         if self.enable_host_receive:
-            retraction_discard(decode_req.req, self.tree_cache, "host_pool")
+            discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
             if decode_req.host_staged:
                 return
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
@@ -3052,7 +3052,7 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_host_receive:
             for req in new_batch.reqs:
                 if req.kv.retraction_backup is not None:
-                    retraction_restore(
+                    restore_kv_cache(
                         req,
                         self.tree_cache,
                         self.req_to_token_pool,
