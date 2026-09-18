@@ -392,6 +392,9 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
+        # Set by the quant method when it repacks experts for MegaMoE.
+        self._mega_moe_weights_built = False
+        self._mega_moe_nvfp4 = False
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
@@ -1210,8 +1213,14 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
+        use_flashinfer_trtllm_weight_layout = (
+            method.use_flashinfer_trtllm_weight_layout
+            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
+            else self.use_flashinfer_trtllm_moe
+        )
+
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if self.use_flashinfer_trtllm_moe and (
+        if use_flashinfer_trtllm_weight_layout and (
             isinstance(method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
