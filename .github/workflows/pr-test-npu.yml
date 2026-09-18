@@ -381,14 +381,12 @@ jobs:
 
 
   # ==================== Recommend Tests from Coverage ==================== #
-  # Reads the coverage baseline from the 800t shared disk and recommends
-  # affected tests for the current PR. continue-on-error: true (non-blocking).
+  # Downloads the pre-built coverage baseline (test_case_map.json + covstub)
+  # from OBS and runs test_selector.py to recommend affected test cases for
+  # the current PR. continue-on-error: true so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
-    needs: set-image-config
-    runs-on: linux-aarch64-a3-800t-2
-    container:
-      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    runs-on: ubuntu-latest
     continue-on-error: true
     if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode == true }}
     outputs:
@@ -404,39 +402,44 @@ jobs:
             scripts
           sparse-checkout-cone-mode: false
 
-      - name: Read baseline from shared disk
-        shell: bash
+      - name: Download test case map
         run: |
           set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/test_case_map.json" \
+            -o test_case_map.json
+          test -s test_case_map.json
+          echo "Downloaded test_case_map.json"
+          du -h test_case_map.json
 
-          # Fixed baseline dir published by the setup-covstub job of the
-          # coverage-collection pipeline. Deliberately has no RUN_DIR layer:
-          # this run has a different GITHUB_RUN_ID and must still find it.
-          PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
-
-          test -s "${PUBLISH_DIR}/test_case_map.json"
-          test -s "${PUBLISH_DIR}/outputs.tar.gz"
-          cp "${PUBLISH_DIR}/test_case_map.json" test_case_map.json
-          cp "${PUBLISH_DIR}/outputs.tar.gz" outputs.tar.gz
-
-          echo "Read baseline from shared disk: ${PUBLISH_DIR}"
-          du -h test_case_map.json outputs.tar.gz
-
+      - name: Download coverage package and extract covstub
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/outputs.tar.gz" \
+            -o outputs.tar.gz
+          test -s outputs.tar.gz
+          echo "Downloaded outputs.tar.gz"
+          du -h outputs.tar.gz
           tar xzf outputs.tar.gz outputs/covstub
           test -d outputs/covstub
           echo "Extracted outputs/covstub"
           find outputs/covstub -maxdepth 2 -type d | head -20 || true
 
       - name: Recommend tests for current PR
-        shell: bash
         run: |
           set -euo pipefail
           if ! python3 -c "import regex" >/dev/null 2>&1; then
-            pip install regex \
-              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
-              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
-              --retries 3 --timeout 60 \
-              || pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages regex
           fi
           python3 -c "import regex; print('regex ok:', regex.__file__)"
           PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
