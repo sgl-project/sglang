@@ -385,7 +385,11 @@ class CommitKvProj:
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
     ) -> list[torch.Tensor]:
-        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
+        if (
+            main_x.is_cuda
+            and not main_x.is_npu
+            and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears)
+        ):
             return cls.triton(main_x=main_x, wkv_linears=wkv_linears)
         return cls.torch(main_x=main_x, wkv_linears=wkv_linears)
 

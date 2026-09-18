@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Iterable, List, Optional, Tuple
 
@@ -63,6 +64,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -527,6 +529,23 @@ def build_dspark_v4_confidence_head(
     )
 
 
+def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
+    """Apply draft expert counts and disable image routing for text-only stages."""
+    n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
+    n_active = int(getattr(config, "dspark_n_activated_experts", 0) or 0)
+    has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    if not (n_routed or n_active or has_vision):
+        return config
+    stage_config = copy.copy(config)
+    if n_routed:
+        stage_config.n_routed_experts = n_routed
+    if n_active:
+        stage_config.num_experts_per_tok = n_active
+    if has_vision:
+        stage_config.vision_n_layers = 0
+    return stage_config
+
+
 class DSparkV4Stage(DeepseekV4DecoderLayer):
     def __init__(
         self,
@@ -540,7 +559,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
     ) -> None:
         super().__init__(
-            config=config,
+            config=_dspark_stage_config(config),
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=prefix,
@@ -647,7 +666,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
 
     @classmethod
     def shared_experts_fusion_disable_reason(
@@ -655,7 +674,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if _is_npu and not is_npu_arch35():
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -674,6 +693,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+
+        dspark_n_routed = getattr(config, "dspark_n_routed_experts", None)
+        if dspark_n_routed is not None:
+            config.n_routed_experts = int(dspark_n_routed)
+        dspark_n_activated = getattr(config, "dspark_n_activated_experts", None)
+        if dspark_n_activated is not None:
+            config.num_experts_per_tok = int(dspark_n_activated)
+
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
@@ -917,7 +944,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for name, loaded_weight in weights:
             mapped = (
                 self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
