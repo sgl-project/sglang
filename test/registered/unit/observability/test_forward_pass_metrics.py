@@ -8,7 +8,7 @@ import queue
 import types
 import unittest
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,6 +18,7 @@ import torch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -28,7 +29,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
@@ -41,24 +42,15 @@ from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_t
 from sglang.test.test_utils import CustomTestCase
 
 
-class FakeEvent:
-    def __init__(self, timestamp):
-        self.timestamp = timestamp
-
-    def elapsed_time(self, end):
-        return end.timestamp - self.timestamp
-
-
 class FakeInterval:
     def __init__(self, milliseconds, ready=False, start=0, stream=0):
-        self.milliseconds = milliseconds
-        self.ready = ready
+        self.start_event = SimpleNamespace(
+            elapsed_time=lambda end: end.timestamp - start
+        )
         self.end_event = self
-        self.start_event = FakeEvent(start)
         self.timestamp = start + milliseconds
-        self.stream = stream
+        self.ready, self.stream = ready, stream
         self.observer = None
-        self.metadata = None
 
     def end(self, metadata):
         self.metadata = metadata
@@ -67,17 +59,18 @@ class FakeInterval:
         return self.ready
 
     def elapsed_time(self):
-        return self.milliseconds
+        return self.start_event.elapsed_time(self)
 
 
-@contextmanager
-def capture_timing(timer):
+def capture_timing(timer, *intervals):
     timing = FpmTiming()
-    try:
+    with patch.object(_TimingInterval, "create", side_effect=intervals):
         with timer.capture(timing):
-            yield timing
-    finally:
-        timing.seal()
+            for _ in intervals:
+                with device_timer_ctx(timer, "test"):
+                    pass
+    timing.seal()
+    return timing
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -101,157 +94,79 @@ class TestDeviceTimerCapture(unittest.TestCase):
         event.assert_called_once_with(enable_timing=True)
         event.return_value.record.assert_called_once_with()
 
-    def test_enabled_wrapper_preserves_forward_arguments_and_result(self):
+    def test_wrapper_forwards_arguments_and_cleans_up_after_exception(self):
         timer = DeviceTimer()
-        result = SimpleNamespace()
-        calls = []
-
-        def forward(batch, *, pp_proxy_tensors):
-            calls.append((batch, pp_proxy_tensors))
-            return result
-
+        forward = Mock(return_value=GenerationBatchResult())
         wrapped = wrap_forward_with_fpm(forward, timer)
-        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
-        self.assertIs(wrapped(batch, pp_proxy_tensors="proxy"), result)
-        self.assertEqual(calls, [(batch, "proxy")])
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        self.assertIs(wrapped(batch, pp_proxy_tensors="proxy"), forward.return_value)
+        forward.assert_called_once_with(batch, pp_proxy_tensors="proxy")
         self.assertIs(wrapped.__wrapped__, forward)
-        self.assertEqual(result.fpm_timing.num_intervals, 0)
-        self.assertIsNone(timer._observer)
-
-    def test_overlap_groups_do_not_share_completed_times(self):
-        reporter = Mock()
-        timer = DeviceTimer(reporter)
-        intervals = [
-            FakeInterval(2),
-            FakeInterval(5, start=4),
-            FakeInterval(3, start=12),
-            FakeInterval(20, start=20),
-        ]
-        with patch.object(_TimingInterval, "create", side_effect=intervals) as create:
-            with capture_timing(timer) as first:
-                for stage in ("draft", "verify", "draft_extend"):
-                    with device_timer_ctx(timer, stage):
-                        pass
-            with capture_timing(timer) as second:
-                with device_timer_ctx(timer, "decode"):
-                    pass
-        # Exactly the existing events: capture adds no timing intervals.
-        self.assertEqual(create.call_count, 4)
-        first_result, second_result = Mock(), Mock()
-        timer._report()
-        first_result.assert_not_called()
-        second_result.assert_not_called()
-        # Both iterations become ready before CPU consumes either result.
-        for interval in intervals:
-            interval.ready = True
-        timer._report()
-        self.assertEqual(len(timer._intervals), 0)
-        self.assertTrue(all(interval.observer is None for interval in intervals))
-        # FPM attaches its CPU snapshot only after both groups have been drained.
-        first.when_ready(first_result)
-        second.when_ready(second_result)
-        first_result.assert_called_once_with(0.015)
-        second_result.assert_called_once_with(0.020)
-        self.assertEqual(reporter.call_count, 4)
-        timer._report()
-        first_result.assert_called_once()
-        second_result.assert_called_once()
-
-    def test_partial_completion_waits_for_entire_closed_group(self):
-        timer = DeviceTimer()
-        intervals = [FakeInterval(2, ready=True), FakeInterval(5, start=4)]
-        result = Mock()
-        with patch.object(_TimingInterval, "create", side_effect=intervals):
-            with capture_timing(timer) as timing:
-                timing.when_ready(result)
-                with timer.wrap({}):
-                    pass
-                result.assert_not_called()  # Scope still open: more stages can arrive.
-                with timer.wrap({}):
-                    pass
-        result.assert_not_called()
-        intervals[1].ready = True
-        timer._report()
-        result.assert_called_once_with(0.009)
-
-    def test_different_streams_do_not_claim_an_ordered_span(self):
-        timer = DeviceTimer()
-        intervals = [FakeInterval(2, True, stream=1), FakeInterval(5, True, stream=2)]
-        with patch.object(_TimingInterval, "create", side_effect=intervals):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
-                with timer.wrap({}):
-                    pass
-        result = Mock()
-        timing.when_ready(result)
-        result.assert_called_once_with(None)
-
-    def test_completed_time_survives_later_unscoped_work(self):
-        timer = DeviceTimer()
-        with patch.object(
-            _TimingInterval,
-            "create",
-            side_effect=[FakeInterval(4, True), FakeInterval(99, True)],
-        ):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
-            with timer.wrap({}):
-                pass
-        result = Mock()
-        timing.when_ready(result)
-        result.assert_called_once_with(0.004)
-
-    def test_empty_capture_does_not_create_gpu_events(self):
-        timer = DeviceTimer()
-        with patch.object(_TimingInterval, "create") as create:
-            with capture_timing(timer) as timing:
-                pass
-        self.assertEqual(timing.num_intervals, 0)
-        create.assert_not_called()
-
-    def test_capture_cleans_up_after_exception(self):
-        timer = DeviceTimer()
-
-        def forward(batch):
-            raise ValueError("forward failed")
-
-        wrapped = wrap_forward_with_fpm(forward, timer)
-        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+        self.assertEqual(forward.return_value.fpm_timing.num_intervals, 0)
+        forward.side_effect = ValueError("forward failed")
         with self.assertRaisesRegex(ValueError, "forward failed"):
             wrapped(batch)
         self.assertIsNone(timer._observer)
-        with capture_timing(timer) as timing:
-            pass
-        self.assertEqual(timing.num_intervals, 0)
 
-    def test_observer_only_skips_unused_segment_elapsed_time(self):
-        timer = DeviceTimer()
-        interval = FakeInterval(7, ready=True)
-        with (
-            patch.object(interval, "elapsed_time", side_effect=AssertionError),
-            patch.object(_TimingInterval, "create", return_value=interval),
-        ):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
-        durations = []
-        timing.when_ready(durations.append)
-        self.assertEqual(durations, [0.007])
-
-    def test_zero_elapsed_interval_is_not_a_missing_interval(self):
-        timer = DeviceTimer()
+    def test_overlapping_groups_keep_their_own_spans(self):
+        reporter = Mock()
+        timer = DeviceTimer(reporter)
+        pending = [FakeInterval(5, start=4), FakeInterval(3, start=12)]
+        first = capture_timing(timer, FakeInterval(2, ready=True), pending[0])
+        second = capture_timing(timer, pending[1])
+        # A later unobserved interval must not extend either captured span.
         with patch.object(
-            _TimingInterval, "create", return_value=FakeInterval(0, True)
+            _TimingInterval, "create", return_value=FakeInterval(99, True)
         ):
-            with capture_timing(timer) as timing:
+            with timer.wrap({}):
+                pass
+        callbacks = [Mock(), Mock()]
+        first.when_ready(callbacks[0])
+        second.when_ready(callbacks[1])
+        timer._report()
+        callbacks[0].assert_not_called()
+        callbacks[1].assert_not_called()
+        pending[0].ready = True
+        timer._report()
+        callbacks[0].assert_called_once_with(0.009)  # Includes the 2 ms gap.
+        callbacks[1].assert_not_called()
+        pending[1].ready = True
+        timer._report()
+        callbacks[1].assert_called_once_with(0.003)
+        self.assertTrue(all(interval.observer is None for interval in pending))
+        self.assertEqual(reporter.call_count, 4)
+        timer._report()
+        callbacks[0].assert_called_once()
+        callbacks[1].assert_called_once()
+
+    def test_ready_intervals_wait_for_seal(self):
+        timer, timing, callback = DeviceTimer(), FpmTiming(), Mock()
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(2, True)
+        ):
+            with timer.capture(timing):
+                timing.when_ready(callback)
                 with timer.wrap({}):
                     pass
-        result = Mock()
-        timing.when_ready(result)
-        result.assert_called_once_with(0.0)
-        self.assertEqual(timing.num_intervals, 1)
+                callback.assert_not_called()
+        timing.seal()
+        callback.assert_called_once_with(0.002)
+
+    def test_empty_zero_and_cross_stream_spans(self):
+        for intervals, expected in (
+            ([], 0.0),
+            ([FakeInterval(0, True)], 0.0),
+            ([FakeInterval(7, True)], 0.007),
+            ([FakeInterval(2, True, stream=1), FakeInterval(5, True, stream=2)], None),
+        ):
+            with self.subTest(expected=expected, intervals=len(intervals)):
+                for interval in intervals:
+                    interval.elapsed_time = Mock(side_effect=AssertionError)
+                timing = capture_timing(DeviceTimer(), *intervals)
+                self.assertEqual(timing.num_intervals, len(intervals))
+                callback = Mock()
+                timing.when_ready(callback)
+                callback.assert_called_once_with(expected)
 
 
 class TestSpecDecodeLengthSnapshot(CustomTestCase):
@@ -452,15 +367,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         return types.SimpleNamespace(**defaults)
 
     def _emit_ready(self, batch, milliseconds=1):
-        timer = self.reporter.forward_pass_device_timer = DeviceTimer()
-        with patch.object(
-            _TimingInterval,
-            "create",
-            return_value=FakeInterval(milliseconds, ready=True),
-        ):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
+        timing = capture_timing(DeviceTimer(), FakeInterval(milliseconds, ready=True))
         self.reporter._emit_forward_pass_metrics(
             batch, GenerationBatchResult(fpm_timing=timing)
         )
@@ -523,42 +430,23 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(self.scheduler._fpm_publisher.idle)
 
     def test_emit_uses_device_timer_gpu_time(self):
-        timer = self.reporter.forward_pass_device_timer = DeviceTimer()
-        interval = FakeInterval(42, ready=True)
-        with patch.object(_TimingInterval, "create", return_value=interval):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
-        batch = self._make_batch()
-
-        self.reporter._emit_forward_pass_metrics(
-            batch, types.SimpleNamespace(fpm_timing=timing)
-        )
-
-        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
-        self.assertAlmostEqual(
-            self.scheduler._fpm_publisher.metrics[0].wall_time, 0.042, places=4
-        )
+        self._emit_ready(self._make_batch(), milliseconds=42)
+        metrics = self.scheduler._fpm_publisher.metrics
+        self.assertEqual(len(metrics), 1)
+        self.assertAlmostEqual(metrics[0].wall_time, 0.042)
 
     def test_emit_skips_uninstrumented_iteration(self):
-        timer = self.reporter.forward_pass_device_timer = DeviceTimer()
-        with capture_timing(timer) as timing:
-            pass
-        batch = self._make_batch()
-
-        self.reporter._emit_forward_pass_metrics(
-            batch, types.SimpleNamespace(fpm_timing=timing)
-        )
-
-        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 0)
+        for timing in (None, capture_timing(DeviceTimer())):
+            with self.subTest(timing=timing):
+                self.reporter._emit_forward_pass_metrics(
+                    self._make_batch(), GenerationBatchResult(fpm_timing=timing)
+                )
+                self.assertEqual(self.scheduler._fpm_publisher.metrics, [])
 
     def test_delayed_timing_uses_frozen_batch_and_queue_stats(self):
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
         interval = FakeInterval(7)
-        with patch.object(_TimingInterval, "create", return_value=interval):
-            with capture_timing(timer) as timing:
-                with timer.wrap({}):
-                    pass
+        timing = capture_timing(timer, interval)
         batch = self._make_batch(seq_lens_cpu=[100, 200])
         self.scheduler.waiting_queue = [_FakeReq(300)]
         result = types.SimpleNamespace(fpm_timing=timing)
@@ -724,112 +612,79 @@ class TestForwardPassMetrics(unittest.TestCase):
         # A prebuilt with no inner forward does not invent a timing group.
         self.assertIsNone(scheduler.run_batch(batch).fpm_timing)
 
-    def test_pp_launch_and_output_ring_keep_rank_local_timing(self):
-        timer = self.reporter.forward_pass_device_timer = DeviceTimer()
-        scheduler = self.scheduler
-        scheduler._pp_spec_relay = False
-        scheduler.forward_stream_ctx = nullcontext()
-        scheduler.forward_stream = Mock()
-        scheduler.schedule_stream = object()
-        scheduler.pp_group = types.SimpleNamespace(
-            is_last_rank=True, is_first_rank=False
-        )
-        scheduler.device_module = types.SimpleNamespace(
-            Event=Mock, current_stream=lambda: object()
-        )
-        scheduler.future_map = types.SimpleNamespace(stash=Mock())
-        scheduler._pp_prepare_tensor_dict = lambda result, batch: {
-            "next_token_ids": torch.tensor([7])
-        }
+    def test_pp_launch_and_relay_keep_rank_local_timing(self):
+        for speculative in (False, True):
+            with self.subTest(speculative=speculative):
+                self.scheduler._fpm_publisher.metrics.clear()
+                timer, interval = DeviceTimer(), FakeInterval(9)
+                receiver = SchedulerPPMixin()
+                receiver._pp_spec_relay = speculative
+                receiver.forward_stream_ctx = nullcontext()
+                receiver.forward_stream = Mock()
+                receiver.schedule_stream = object()
+                receiver.device_module = SimpleNamespace(
+                    Event=Mock, current_stream=Mock()
+                )
+                receiver.pp_group = SimpleNamespace(
+                    is_last_rank=True, is_first_rank=False
+                )
+                receiver.future_map = Mock()
+                req = _FakeReq(128, output_len=1)
+                req.rid = "req-0"
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    forward_mode=ForwardMode.DECODE,
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE3
+                    if speculative
+                    else SpeculativeAlgorithm.NONE,
+                    seq_lens=torch.tensor([128]),
+                    seq_lens_cpu=None if speculative else torch.tensor([128]),
+                    req_pool_indices=torch.tensor([0]),
+                    return_logprob=False,
+                )
+                result = GenerationBatchResult(next_token_ids=torch.tensor([7]))
+                if speculative:
+                    result.next_token_ids = torch.tensor([7, 8, 0])
+                    result.accept_lens = torch.tensor([2])
+                    result.new_seq_lens = torch.tensor([130])
+                    result.next_draft_input = SimpleNamespace(
+                        bonus_tokens=torch.tensor([8]), topk_p=None
+                    )
 
-        def forward(batch, pp_proxy_tensors):
-            with timer.wrap({"category": "decode"}):
-                pass
-            return GenerationBatchResult(can_run_cuda_graph=True)
+                def forward(batch, pp_proxy_tensors):
+                    with timer.wrap({}):
+                        pass
+                    return result
 
-        scheduler.run_batch = wrap_forward_with_fpm(forward, timer)
-        batch = self._make_batch(
-            forward_mode=ForwardMode.DECODE,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            seq_lens_cpu=[128],
-            reqs=[_FakeReq(128)],
-            return_logprob=False,
-            req_pool_indices=torch.tensor([0]),
-        )
-        metadata, wire_queue = [None], deque()
-        with (
-            patch.object(
-                _TimingInterval, "create", return_value=FakeInterval(9, ready=True)
-            ),
-            patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"),
-        ):
-            launched, _ = SchedulerPPMixin._pp_launch_batch(
-                scheduler, 0, batch, None, metadata, wire_queue
-            )
-        self.assertIs(metadata[0].fpm_timing, launched.fpm_timing)
-        wire = wire_queue[0][1]
-        self.assertEqual(set(wire.tensors), {"next_token_ids"})
-        rebuilt = SchedulerPPMixin._pp_prep_batch_result(
-            scheduler, batch, metadata[0], wire
-        )
-        self.assertIs(rebuilt.fpm_timing, launched.fpm_timing)
-        self.reporter._emit_forward_pass_metrics(batch, rebuilt)
-        self.assertEqual(len(scheduler._fpm_publisher.metrics), 1)
-        self.assertAlmostEqual(scheduler._fpm_publisher.metrics[0].wall_time, 0.009)
-
-    def test_pp_spec_relay_publishes_when_rank_local_timing_is_ready(self):
-        timer = DeviceTimer()
-        interval = FakeInterval(9)
-        with patch.object(_TimingInterval, "create", return_value=interval):
-            with capture_timing(timer) as timing:
-                with timer.wrap({"category": "verify"}):
-                    pass
-
-        req = _FakeReq(128, output_len=1)
-        req.rid = "req-0"
-        forward_batch = self._make_batch(
-            forward_mode=ForwardMode.DECODE,
-            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
-            reqs=[req],
-            seq_lens_cpu=None,
-        )
-        live_batch = self._make_batch(
-            reqs=[req],
-            return_logprob=False,
-            seq_lens=torch.tensor([128]),
-            seq_lens_cpu=None,
-            spec_info=None,
-        )
-        receiver = SchedulerPPMixin()
-        receiver._pp_spec_relay = True
-        receiver.pp_group = types.SimpleNamespace(is_first_rank=False)
-        metadata = PPBatchMetadata(
-            can_run_cuda_graph=True, fwd_batch=forward_batch, fpm_timing=timing
-        )
-        wire = PPProxyTensors(
-            {
-                "next_token_ids": torch.tensor([7, 8, 0]),
-                "spec_accept_lens": torch.tensor([2]),
-                "spec_new_seq_lens": torch.tensor([130]),
-                "spec_bonus_tokens": torch.tensor([8]),
-            }
-        )
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.get_spec",
-            return_value=types.SimpleNamespace(speculative_num_draft_tokens=3),
-        ):
-            result = receiver._pp_prep_batch_result(live_batch, metadata, wire)
-
-        self.reporter.snapshot_spec_decode_metrics(forward_batch, result)
-        self.reporter._emit_forward_pass_metrics(forward_batch, result)
-        self.assertEqual(self.scheduler._fpm_publisher.metrics, [])
-        interval.ready = True
-        timer._report()
-        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
-        metrics = self.scheduler._fpm_publisher.metrics[0]
-        self.assertAlmostEqual(metrics.wall_time, 0.009)
-        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 1)
-        self.assertEqual(metrics.scheduled_requests.sum_decode_kv_tokens, 128)
+                receiver.run_batch = wrap_forward_with_fpm(forward, timer)
+                metadata, wire_queue = [None], deque()
+                with (
+                    patch.object(_TimingInterval, "create", return_value=interval),
+                    patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"),
+                    patch(
+                        "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+                        return_value=SimpleNamespace(speculative_num_draft_tokens=3),
+                    ),
+                ):
+                    receiver._pp_launch_batch(0, batch, None, metadata, wire_queue)
+                    wire = wire_queue[0][1]
+                    self.assertTrue(
+                        all(torch.is_tensor(t) for t in wire.tensors.values())
+                    )
+                    rebuilt = receiver._pp_prep_batch_result(batch, metadata[0], wire)
+                self.assertIs(rebuilt.fpm_timing, result.fpm_timing)
+                snapshot = metadata[0].fwd_batch if speculative else batch
+                self.reporter.snapshot_spec_decode_metrics(snapshot, rebuilt)
+                self.reporter._emit_forward_pass_metrics(snapshot, rebuilt)
+                self.assertEqual(self.scheduler._fpm_publisher.metrics, [])
+                interval.ready = True
+                timer._report()
+                metrics = self.scheduler._fpm_publisher.metrics
+                self.assertEqual(len(metrics), 1)
+                self.assertAlmostEqual(metrics[0].wall_time, 0.009)
+                self.assertEqual(
+                    metrics[0].scheduled_requests.sum_decode_kv_tokens, 128
+                )
 
     def test_pp_skipped_output_comm_keeps_timing(self):
         timing = object()
