@@ -14,12 +14,14 @@ These tests pin the properties that make the drain reachable:
 """
 
 import os
+import selectors
 import signal
 import subprocess
 import sys
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.utils.common import ignore_external_stop_signals
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -48,16 +50,14 @@ class TestGracefulDrainSignals(CustomTestCase):
         group, and workers must keep running so the coordinator can drain
         in-flight requests before stopping them explicitly.
         """
-        child_src = textwrap.dedent(
-            """
+        child_src = textwrap.dedent("""
             import sys, time
             from sglang.srt.utils.common import ignore_external_stop_signals
 
             ignore_external_stop_signals()
             print("armed", flush=True)
             time.sleep(60)
-            """
-        )
+            """)
         proc = subprocess.Popen(
             [sys.executable, "-c", child_src],
             stdout=subprocess.PIPE,
@@ -65,7 +65,12 @@ class TestGracefulDrainSignals(CustomTestCase):
         )
         try:
             # Wait until the handlers are installed before signaling.
-            self.assertEqual(proc.stdout.readline().strip(), b"armed")
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                self.assertTrue(
+                    selector.select(timeout=30), "child did not become ready"
+                )
+                self.assertEqual(os.read(proc.stdout.fileno(), 64).strip(), b"armed")
             pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGTERM)
             os.killpg(pgid, signal.SIGINT)
@@ -80,6 +85,7 @@ class TestGracefulDrainSignals(CustomTestCase):
         finally:
             proc.kill()
             proc.wait(timeout=10)
+            proc.stdout.close()
 
     def test_stop_signal_sets_drain_flag_and_escalates(self):
         from sglang.srt.managers.tokenizer_manager import SignalHandler
@@ -112,8 +118,9 @@ class TestGracefulDrainSignals(CustomTestCase):
         with envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.override("not-a-float"):
             self.assertEqual(envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get(), 0.0)
         # Default (unset): no timeout.
-        os.environ.pop("SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT", None)
-        self.assertEqual(envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get(), 0.0)
+        with patch.dict(os.environ):
+            os.environ.pop("SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT", None)
+            self.assertEqual(envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get(), 0.0)
 
 
 if __name__ == "__main__":
