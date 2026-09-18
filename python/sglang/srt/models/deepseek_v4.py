@@ -233,6 +233,7 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
@@ -2055,10 +2056,23 @@ class MQALayer(MqaAttentionBase):
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
-                    wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
-                    o = _apply_wo_a_bf16_matmul(
-                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-                    )
+                    if (
+                        _NPU_BF16_WO_A_GEMM
+                        and forward_batch.forward_mode.is_decode()
+                        and self.n_local_groups == 1
+                        and o.dtype == wo_a_weight.dtype == torch.bfloat16
+                        and wo_a_weight.is_contiguous()
+                    ):
+                        # One local group needs no grouped contraction; linear
+                        # avoids materializing a transpose of the BF16 weight.
+                        o = F.linear(o, wo_a_weight)
+                    else:
+                        wo_a = wo_a_weight.view(
+                            self.n_local_groups, self.o_lora_rank, -1
+                        )
+                        o = _apply_wo_a_bf16_matmul(
+                            o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                        )
                 else:
                     o = _apply_gguf_grouped_wo_a(
                         o,
