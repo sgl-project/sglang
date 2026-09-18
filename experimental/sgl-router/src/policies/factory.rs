@@ -331,11 +331,13 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
+                disable_input_ids_forwarding: false,
                 policy,
                 decode_policy: Default::default(),
                 bucket_config: None,
