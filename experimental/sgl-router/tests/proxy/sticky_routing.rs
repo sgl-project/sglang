@@ -11,7 +11,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -54,7 +53,6 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
                 eviction_interval_secs: 3600,
             }),
             affinity: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -75,9 +73,8 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             bootstrap_port: None,
         });
     }
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 fn chat_request(header: Option<(&str, &str)>) -> Request<Body> {

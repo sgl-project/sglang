@@ -269,7 +269,6 @@ impl StaleRequestOutcome {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PolicySelectionFailureReason {
     PrefillAdmissionExhausted,
-    CacheCandidatesExhausted,
     ProposalEmpty,
 }
 
@@ -298,7 +297,6 @@ impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PrefillAdmissionExhausted => "prefill_admission_exhausted",
-            Self::CacheCandidatesExhausted => "cache_candidates_exhausted",
             Self::ProposalEmpty => "proposal_empty",
         }
     }
@@ -1658,10 +1656,6 @@ mod tests {
             PolicySelectionFailureReason::PrefillAdmissionExhausted,
         );
         reg.record_policy_selection_failure(
-            PolicyKind::CacheAware,
-            PolicySelectionFailureReason::CacheCandidatesExhausted,
-        );
-        reg.record_policy_selection_failure(
             PolicyKind::RoundRobin,
             PolicySelectionFailureReason::ProposalEmpty,
         );
@@ -1669,9 +1663,6 @@ mod tests {
         let out = reg.render();
         assert!(out.contains(
             r#"sgl_router_policy_selection_failures_total{policy="session_aware",reason="prefill_admission_exhausted"} 1"#
-        ));
-        assert!(out.contains(
-            r#"sgl_router_policy_selection_failures_total{policy="cache_aware",reason="cache_candidates_exhausted"} 1"#
         ));
         assert!(out.contains(
             r#"sgl_router_policy_selection_failures_total{policy="round_robin",reason="proposal_empty"} 1"#

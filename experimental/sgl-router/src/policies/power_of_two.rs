@@ -1,99 +1,125 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::state::engine_load::compare_prefill_pressure;
-use crate::policies::state::engine_load::EngineLoadSnapshot;
-use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+//! Two distinct random candidates; the one under less pressure wins. Serves
+//! prefill and decode, comparing by the request's stage.
+
+use super::{ready, Admission, PickRequest, PickResult, Policy, RoutingStage};
+use crate::policies::state::engine_load::{
+    compare_decode_pressure, compare_prefill_pressure, EngineLoadSnapshot,
+};
 use crate::workers::Worker;
+use futures::future::BoxFuture;
 use rand::Rng;
 use std::sync::Arc;
 
-#[derive(Debug, Default)]
-pub struct PowerOfTwoChoicesPolicy;
+#[derive(Debug)]
+pub struct PowerOfTwoPolicy {
+    admission: Admission,
+}
 
-impl PowerOfTwoChoicesPolicy {
-    pub fn new() -> Self {
-        Self
+impl PowerOfTwoPolicy {
+    pub fn new(admission: Admission) -> Self {
+        Self { admission }
     }
 }
 
-impl Policy for PowerOfTwoChoicesPolicy {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        select_with_snapshot(workers, ctx.load_snapshot())
-    }
-
-    /// Returns the primary and backup from one sample.
-    fn propose(
-        &self,
-        workers: &[Arc<Worker>],
-        ctx: &SelectionContext<'_>,
-    ) -> Option<SelectionProposal> {
-        match workers.len() {
-            0 => None,
-            1 => Some(
-                SelectionProposal::primary(workers[0].clone()).with_kind(ProposalKind::PowerOfTwo),
-            ),
-            len => {
-                let mut rng = rand::thread_rng();
-                let i = rng.gen_range(0..len);
-                let mut j = rng.gen_range(0..len - 1);
-                if j >= i {
-                    j += 1;
-                }
-                let (primary, backup) = ordered_pair(&workers[i], &workers[j], ctx);
-                Some(SelectionProposal::with_backup(primary, backup))
-            }
-        }
-    }
-
-    fn uses_shared_prefill_admission(&self) -> bool {
-        true
+impl Policy for PowerOfTwoPolicy {
+    fn pick<'a>(
+        &'a self,
+        engines: &'a [Arc<Worker>],
+        request: &'a PickRequest<'a>,
+    ) -> BoxFuture<'a, PickResult> {
+        let ctx = request.admission();
+        ready(
+            self.admission
+                .select(engines, &ctx, |admitted| choose(admitted, request).cloned()),
+        )
     }
 }
 
-pub(crate) fn select_with_snapshot(
-    workers: &[Arc<Worker>],
-    snapshot: Option<&EngineLoadSnapshot>,
-) -> Option<Arc<Worker>> {
-    match workers.len() {
-        0 => None,
-        1 => Some(workers[0].clone()),
-        len => {
-            let mut rng = rand::thread_rng();
-            let i = rng.gen_range(0..len);
-            let mut j = rng.gen_range(0..len - 1);
-            if j >= i {
-                j += 1;
-            }
-            Some(select_lower_pressure(&workers[i], &workers[j], snapshot))
-        }
+/// One power-of-two choice among `engines`; the shared fallback of affinity policies.
+pub(crate) fn choose<'e>(
+    engines: &'e [Arc<Worker>],
+    request: &PickRequest<'_>,
+) -> Option<&'e Arc<Worker>> {
+    let (left, right) = sample_pair(engines, &mut rand::thread_rng())?;
+    Some(lower_pressure(
+        left,
+        right,
+        request.stage,
+        request.load.snapshot(),
+    ))
+}
+
+/// Two distinct candidates when there are at least two; one pairs with itself.
+pub(crate) fn sample_pair<'e>(
+    engines: &'e [Arc<Worker>],
+    rng: &mut impl Rng,
+) -> Option<(&'e Arc<Worker>, &'e Arc<Worker>)> {
+    let len = engines.len();
+    let i = rng.gen_range(0..len.max(1));
+    let left = engines.get(i)?;
+    if len == 1 {
+        return Some((left, left));
     }
+    let mut j = rng.gen_range(0..len - 1);
+    if j >= i {
+        j += 1;
+    }
+    Some((left, &engines[j]))
 }
 
-fn select_lower_pressure(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
-) -> Arc<Worker> {
-    ordered_pair_with_snapshot(left, right, snapshot).0
-}
-
-fn ordered_pair(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    ctx: &SelectionContext<'_>,
-) -> (Arc<Worker>, Arc<Worker>) {
-    ordered_pair_with_snapshot(left, right, ctx.load_snapshot())
-}
-
-fn ordered_pair_with_snapshot(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
-) -> (Arc<Worker>, Arc<Worker>) {
-    if compare_prefill_pressure(left, right, snapshot).is_gt() {
-        (Arc::clone(right), Arc::clone(left))
+pub(crate) fn lower_pressure<'e>(
+    left: &'e Arc<Worker>,
+    right: &'e Arc<Worker>,
+    stage: RoutingStage,
+    snapshot: &EngineLoadSnapshot,
+) -> &'e Arc<Worker> {
+    let compare = match stage {
+        RoutingStage::Decode => compare_decode_pressure,
+        RoutingStage::Plain | RoutingStage::Prefill => compare_prefill_pressure,
+    };
+    if compare(left, right, Some(snapshot)).is_gt() {
+        right
     } else {
-        (Arc::clone(left), Arc::clone(right))
+        left
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::{id, pick, worker};
+    use super::super::PickError;
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    fn policy() -> PowerOfTwoPolicy {
+        PowerOfTwoPolicy::new(Admission::allow_all())
+    }
+
+    #[tokio::test]
+    async fn selects_lower_load_and_reaches_every_worker() {
+        let (a, b) = (worker("a"), worker("b"));
+        a.active_requests.store(10, Ordering::Relaxed);
+        b.active_requests.store(2, Ordering::Relaxed);
+        assert_eq!(id(&pick(&policy(), &[a, b]).await), "b");
+
+        let fleet: Vec<_> = ["a", "b", "c", "d", "e"].map(worker).into();
+        let mut seen = HashSet::new();
+        for _ in 0..1000 {
+            seen.insert(pick(&policy(), &fleet).await.unwrap().engine.id.0.clone());
+        }
+        assert_eq!(seen.len(), fleet.len(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_and_single_candidate_edges() {
+        assert_eq!(
+            pick(&policy(), &[]).await.unwrap_err(),
+            PickError::NoCandidates
+        );
+        assert_eq!(id(&pick(&policy(), &[worker("only")]).await), "only");
     }
 }

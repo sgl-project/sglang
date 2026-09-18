@@ -66,12 +66,6 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
-    /// Weighted sum of `--fuse` terms.
-    #[value(name = "fused_score")]
-    FusedScore,
-    /// Composes compatible scoring terms into a single routing policy.
-    #[value(name = "score_policy")]
-    ScorePolicy,
     /// Selects a worker from session affinity.
     #[value(name = "session_aware")]
     SessionAware,
@@ -83,24 +77,12 @@ pub enum PolicyKind {
     Sticky,
 }
 
-/// Which engine-selection implementation serves requests while the bucket
-/// engine replaces the legacy selection ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum SelectionEngine {
-    #[default]
-    Legacy,
-    /// Bucket-attached policies (`POLICY_DESIGN.md`).
-    Reorg,
-}
-
 /// Policy used to select decode workers for PD requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecodePolicyKind {
     #[default]
     #[value(name = "power_of_two")]
     PowerOfTwo,
-    #[value(name = "legacy_host_affinity")]
-    LegacyHostAffinity,
 }
 
 /// Role served by a static bucket.
@@ -176,37 +158,12 @@ pub enum FilterKind {
     /// Router-local in-flight capacity limit.
     #[value(name = "overloaded")]
     Overloaded,
-    /// Requires a minimum share of cached prompt blocks.
-    #[value(name = "prefix_cache")]
-    PrefixCache,
 }
 
 impl std::fmt::Display for FilterKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let v = <Self as clap::ValueEnum>::to_possible_value(self)
             .expect("FilterKind skips no variants");
-        f.write_str(v.get_name())
-    }
-}
-
-/// A soft scoring term accepted by `--fuse`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum ScoreTermKind {
-    /// Independent uniform-random preference.
-    #[value(name = "random")]
-    Random,
-    /// Prefers the least router-local active load.
-    #[value(name = "load_based")]
-    LoadBased,
-    /// Prefers the largest local prefix-cache overlap.
-    #[value(name = "prefix_cache")]
-    PrefixCache,
-}
-
-impl std::fmt::Display for ScoreTermKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let v = <Self as clap::ValueEnum>::to_possible_value(self)
-            .expect("ScoreTermKind skips no variants");
         f.write_str(v.get_name())
     }
 }
@@ -325,8 +282,6 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
     /// Session and cache-affinity tuning.
     pub affinity: Option<AffinityConfig>,
-    /// Terms for `fused_score` or `score_policy`; defaults to [`DEFAULT_FUSE`].
-    pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.
     pub eligibility: Option<EligibilityConfig>,
     /// Fleet sampling defaults and conflict behavior. See [`SamplingOverrides`].
@@ -348,45 +303,6 @@ pub struct EligibilityConfig {
     pub filters: Vec<FilterKind>,
     /// `overloaded`: in-flight count at which a worker stops being eligible.
     pub max_in_flight: Option<usize>,
-    /// `prefix_cache` minimum cached prompt share.
-    pub min_prefix_share: Option<f32>,
-}
-
-/// Default `--policy fused_score` terms.
-pub const DEFAULT_FUSE: [ScoreTermKind; 2] = [ScoreTermKind::PrefixCache, ScoreTermKind::LoadBased];
-
-/// One `--fuse` policy and optional weight.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FusedTerm {
-    pub kind: ScoreTermKind,
-    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
-    pub weight: Option<f32>,
-}
-
-impl std::str::FromStr for FusedTerm {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        let (name, weight) = match s.split_once('=') {
-            Some((n, w)) => (n, Some(parse_fuse_weight(n, w)?)),
-            None => (s, None),
-        };
-        let kind = <ScoreTermKind as clap::ValueEnum>::from_str(name, false)
-            .map_err(|_| format!("--fuse: `{name}` is not a score term"))?;
-        Ok(FusedTerm { kind, weight })
-    }
-}
-
-/// Parses a finite, non-negative term weight.
-fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
-    let w: f32 = raw
-        .parse()
-        .map_err(|_| format!("--fuse: `{name}` weight `{raw}` is not a number"))?;
-    if !w.is_finite() || w < 0.0 {
-        return Err(format!(
-            "--fuse: `{name}` weight `{raw}` must be finite and >= 0"
-        ));
-    }
-    Ok(w)
 }
 
 /// Cache-Aware prefix-match source.
@@ -417,16 +333,13 @@ pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
 /// Default external-indexer request limits.
 pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
-/// Controls whether admission may select a session-affinity backup.
+/// Session admission mode. Only `strict` remains: an admitted session
+/// binding is reused, never escaped to a backup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
-    /// Keep the primary after it passes admission.
+    #[default]
     #[value(name = "strict")]
     Strict,
-    /// Allow the admitted backup to relieve pressure.
-    #[default]
-    #[value(name = "soft")]
-    Soft,
 }
 
 /// Controls the session-affinity lookup and fallback behavior.
@@ -450,8 +363,6 @@ pub struct AffinityConfig {
     pub session_id_header: String,
     pub session_idle_secs: u64,
     pub session_eviction_interval_secs: u64,
-    pub stable_pair: bool,
-    pub mode: AffinityMode,
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
@@ -485,8 +396,6 @@ impl Default for AffinityConfig {
             session_id_header: DEFAULT_SESSION_ID_HEADER.to_string(),
             session_idle_secs: default_sticky_idle_secs(),
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
-            stable_pair: false,
-            mode: AffinityMode::Soft,
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,

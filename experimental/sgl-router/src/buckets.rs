@@ -5,20 +5,20 @@
 //! policy until one picks an engine. Cache and session preference live in the
 //! policies; this layer only owns membership, ordering and fallback.
 
-use super::cache_aware::PrefixMemo;
-use super::{
-    build_decode_policy, build_policy, AffinityScope, BuildError, Pick, PickError, PickMode,
-    PickRequest, Policy, PolicyDependencies, RoutingStage,
-};
 use crate::config::{
     BucketConfig, BucketSpec, BucketStage, ModelConfig, PolicyKind, SessionAffinityMode,
     SloBucketPolicy,
 };
 use crate::discovery::{ModelId, WorkerId};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::cache_aware::PrefixMemo;
+use crate::policies::pools::{PdPoolResolver, PdResolveError};
 use crate::policies::state::engine_load::{EngineLoadTable, LoadView};
+use crate::policies::{
+    build_decode_policy, build_policy, AffinityScope, BuildError, Pick, PickError, PickMode,
+    PickRequest, Policy, PolicyDependencies, RoutingStage,
+};
 use crate::server::metrics::MetricsRegistry;
-use crate::workers::{Worker, WorkerRegistry};
+use crate::workers::Worker;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -78,7 +78,7 @@ pub struct BucketResolver {
 impl BucketResolver {
     pub fn from_config(
         model: &ModelConfig,
-        workers: Arc<WorkerRegistry>,
+        pools: PdPoolResolver,
         load: Arc<EngineLoadTable>,
         deps: &PolicyDependencies,
     ) -> Result<Self, BuildError> {
@@ -90,7 +90,7 @@ impl BucketResolver {
                 let kind = spec.policy.unwrap_or(model.policy);
                 let policy = match spec.stage {
                     BucketStage::Decode if spec.policy.is_none() => {
-                        build_decode_policy(model.decode_policy)?
+                        build_decode_policy(model.decode_policy)
                     }
                     _ => build_policy(kind, model, deps)?,
                 };
@@ -112,14 +112,14 @@ impl BucketResolver {
             || (model.policy == PolicyKind::SessionAware
                 && session_mode != SessionAffinityMode::Bucket);
         Ok(Self {
-            pools: PdPoolResolver::new(workers),
+            pools,
             load,
             metrics: Arc::clone(&deps.metrics),
             config: model.bucket_config.clone(),
             buckets,
             kind: model.policy,
             model_policy: build_policy(model.policy, model, deps)?,
-            decode_policy: build_decode_policy(model.decode_policy)?,
+            decode_policy: build_decode_policy(model.decode_policy),
             scope: if global_affinity {
                 AffinityScope::Global
             } else {
@@ -374,12 +374,12 @@ fn tps_eligible(spec: &BucketSpec, slo: Option<f64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::worker;
-    use super::super::{ready, AdmissionReason, AffinityScope, EngineRejection, PickResult};
     use super::*;
     use crate::config::{AffinityConfig, SamplingOverrides};
     use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex};
     use crate::policies::state::AffinityStore;
+    use crate::policies::testing::worker;
+    use crate::policies::{ready, AdmissionReason, AffinityScope, EngineRejection, PickResult};
     use futures::future::BoxFuture;
     use std::time::Duration;
 
@@ -423,7 +423,6 @@ mod tests {
                 session_affinity_mode: SessionAffinityMode::GlobalPreserve,
                 ..AffinityConfig::default()
             }),
-            fused: None,
             eligibility: None,
             sampling_overrides: SamplingOverrides::default(),
         };
@@ -434,7 +433,13 @@ mod tests {
             remote_cache: None,
             block_size: BlockSizeOracle::new(),
         };
-        BucketResolver::from_config(&model, Arc::default(), EngineLoadTable::new(), &deps).unwrap()
+        BucketResolver::from_config(
+            &model,
+            PdPoolResolver::new(Arc::default()),
+            EngineLoadTable::new(),
+            &deps,
+        )
+        .unwrap()
     }
 
     fn request<'a>(

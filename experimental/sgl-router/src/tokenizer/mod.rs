@@ -4,6 +4,9 @@
 pub mod adapter;
 pub mod chat_template;
 pub mod dsv4;
+pub mod request;
+
+pub use request::{request_tokens_for, RequestTokens};
 
 use anyhow::Result;
 use chat_template::ChatTemplate;
@@ -243,7 +246,6 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 affinity: None,
-                fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
             },

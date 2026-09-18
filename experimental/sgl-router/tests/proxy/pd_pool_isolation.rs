@@ -24,7 +24,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -52,7 +51,6 @@ fn config() -> Config {
             cache_aware: None,
             sticky: None,
             affinity: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -71,9 +69,8 @@ fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     for s in specs {
         let _ = registry.add(s);
     }
-    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 fn chat_request() -> Request<Body> {

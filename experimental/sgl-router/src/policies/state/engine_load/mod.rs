@@ -11,4 +11,5 @@ pub mod view;
 
 pub use inflight::*;
 pub use reports::*;
+pub use view::LoadView;
 pub(crate) use view::*;

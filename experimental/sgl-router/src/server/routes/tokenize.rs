@@ -125,7 +125,6 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 affinity: None,
-                fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
             },
@@ -142,14 +141,7 @@ mod tests {
             crate::proxy::Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy"),
         );
         let worker_registry = Arc::new(crate::workers::WorkerRegistry::default());
-        let policies = Arc::new(crate::policies::PolicyRegistry::default());
-        Arc::new(AppContext::new(
-            cfg,
-            Arc::new(registry),
-            proxy,
-            worker_registry,
-            policies,
-        ))
+        Arc::new(AppContext::new(cfg, Arc::new(registry), proxy, worker_registry).unwrap())
     }
 
     #[tokio::test]

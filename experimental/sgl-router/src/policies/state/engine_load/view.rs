@@ -103,25 +103,9 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
-    pub(crate) fn compare_prefill_keys(
-        &self,
-        left: &PressureKey<'a>,
-        right: &PressureKey<'a>,
-    ) -> Ordering {
+    fn compare_prefill_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
         match (left.load, right.load) {
             (Some(left_load), Some(right_load)) => compare_prefill_load(left_load, right_load)
-                .then_with(|| left.local_active.cmp(&right.local_active)),
-            _ => left.local_active.cmp(&right.local_active),
-        }
-    }
-
-    pub(crate) fn compare_decode_keys(
-        &self,
-        left: &PressureKey<'a>,
-        right: &PressureKey<'a>,
-    ) -> Ordering {
-        match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
             _ => left.local_active.cmp(&right.local_active),
         }
@@ -177,26 +161,9 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
-    pub(crate) fn min_by_pressure_key(
-        &self,
-        candidates: Vec<Arc<Worker>>,
-        compare: impl Fn(&Self, &PressureKey<'a>, &PressureKey<'a>) -> Ordering,
-    ) -> Option<Arc<Worker>> {
-        let mut candidates = candidates.into_iter();
-        let mut best = candidates.next()?;
-        let mut best_key = self.pressure_key(&best);
-        for candidate in candidates {
-            let key = self.pressure_key(&candidate);
-            if compare(self, &key, &best_key).is_lt() {
-                best = candidate;
-                best_key = key;
-            }
-        }
-        Some(best)
-    }
 }
 
-pub(crate) struct PressureKey<'a> {
+struct PressureKey<'a> {
     load: Option<&'a NativeCacheWorkerLoad>,
     local_active: usize,
 }
