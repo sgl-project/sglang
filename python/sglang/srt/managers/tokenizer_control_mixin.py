@@ -509,7 +509,11 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         pending = dict(self._pending_lora_publications)
         # fail closed: without a full manifest a lost bucket would publish an incomplete adapter
-        missing = set() if obj.abort else set(pending) - set(obj.expected_lora_checksums or {})
+        missing = (
+            set()
+            if obj.abort
+            else set(pending) - set(obj.expected_lora_checksums or {})
+        )
         obj.abort = obj.abort or bool(missing)
         success, message = await self._weight_update_session_call(
             self.end_weight_update_communicator,
@@ -526,7 +530,10 @@ class TokenizerControlMixin:
         elif pending:
             await self._publish_pending_adapters()
         if missing:
-            return False, f"deferred adapters {sorted(missing)} have no checksum manifest; session aborted"
+            return (
+                False,
+                f"deferred adapters {sorted(missing)} have no checksum manifest; session aborted",
+            )
         return success, message
 
     async def _discard_pending_publications(self: TokenizerManager) -> None:

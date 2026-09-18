@@ -33,7 +33,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _reply(success=True):
-    return SimpleNamespace(success=success, message="ok" if success else "worker failed")
+    return SimpleNamespace(
+        success=success, message="ok" if success else "worker failed"
+    )
 
 
 def _manager():
@@ -130,7 +132,9 @@ class TestStagedPublication(unittest.IsolatedAsyncioTestCase):
                     )
                 )[0]
             )
-            self.assertTrue((await asyncio.wait_for(tm.end_weight_update(_end()), 1))[0])
+            self.assertTrue(
+                (await asyncio.wait_for(tm.end_weight_update(_end()), 1))[0]
+            )
         self.assertIsNotNone(await tm.lora_registry.get_lora_id("A@2"))
 
     async def test_base_and_fixed_name_sessions_still_wait_for_readers(self):
@@ -138,7 +142,9 @@ class TestStagedPublication(unittest.IsolatedAsyncioTestCase):
             tm = _manager()  # no pending publications: not a staged session
             async with tm.model_update_lock.reader_lock:
                 task = asyncio.create_task(
-                    tm.begin_weight_update(BeginWeightUpdateReqInput(sync_base=sync_base))
+                    tm.begin_weight_update(
+                        BeginWeightUpdateReqInput(sync_base=sync_base)
+                    )
                 )
                 await asyncio.sleep(0)
                 self.assertFalse(task.done())
@@ -274,7 +280,9 @@ class TestRequestCarriedBackfill(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_version_without_a_path_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "never been loaded"):
-            await self.tm._resolve_lora_path(GenerateReqInput(text="x", lora_path="A@7"))
+            await self.tm._resolve_lora_path(
+                GenerateReqInput(text="x", lora_path="A@7")
+            )
 
     async def test_pending_name_is_not_servable_or_backfillable(self):
         self.tm._pending_lora_publications["A@7"] = LoRARef(
@@ -296,7 +304,9 @@ class TestStashCopiesIPCBuckets(unittest.TestCase):
         bucket = torch.ones(4)
         manager._stash_lora_tensors([("A@2:q_proj", bucket)], copy_tensors=True)
         bucket.zero_()
-        self.assertTrue(torch.equal(manager._lora_stash["A@2"]["q_proj"], torch.ones(4)))
+        self.assertTrue(
+            torch.equal(manager._lora_stash["A@2"]["q_proj"], torch.ones(4))
+        )
 
 
 if __name__ == "__main__":
