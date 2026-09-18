@@ -17,13 +17,15 @@ class AuxHiddenStatePacker:
     Assumes all captures share leading shape and feature size.
     """
 
-    # ``append`` copies, so producers need not clone a tensor they later mutate.
     copies_on_append = True
 
-    def __init__(self, num_captures: int) -> None:
+    def __init__(
+        self, num_captures: int, *, dtype: Optional[torch.dtype] = None
+    ) -> None:
         self._num_captures = int(num_captures)
         self._buffer: Optional[torch.Tensor] = None
         self._feature_size: Optional[int] = None
+        self._dtype = dtype
         self._idx = 0
 
     def append(self, hidden: torch.Tensor) -> None:
@@ -31,7 +33,8 @@ class AuxHiddenStatePacker:
         if self._buffer is None:
             self._feature_size = feature_size
             self._buffer = hidden.new_empty(
-                (*hidden.shape[:-1], feature_size * self._num_captures)
+                (*hidden.shape[:-1], feature_size * self._num_captures),
+                dtype=self._dtype if self._dtype is not None else hidden.dtype,
             )
         start = self._idx * self._feature_size
         self._buffer[..., start : start + self._feature_size].copy_(hidden)
