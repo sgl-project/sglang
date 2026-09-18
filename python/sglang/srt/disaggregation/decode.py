@@ -37,6 +37,12 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.checksum import (
+    KvChecksumComputer,
+    is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -55,10 +61,10 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
     get_kv_class,
-    is_dsv4_c128_online_enabled,
+    get_qsa_pending_state_indices,
     is_mla_backend,
+    is_unadmitted_reject,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -111,6 +117,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +258,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -298,6 +309,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def clear(self):
@@ -419,6 +434,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+        if get_disagg().disaggregation_enable_kv_checksum:
+            kv_args = self.kv_manager.kv_args
+            self.scheduler.kv_checksum_computer = KvChecksumComputer(
+                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                kv_data_ptrs=kv_args.kv_data_ptrs,
+                kv_item_lens=kv_args.kv_item_lens,
+                state_data_ptrs=kv_args.state_data_ptrs,
+                state_item_lens=kv_args.state_item_lens,
+            )
+        else:
+            self.scheduler.kv_checksum_computer = None
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -567,6 +594,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -639,6 +667,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        # See `PrefillBootstrapQueue.add`. A retracted or rebootstrapping
+        # request owns a host KV backup that `retracted_queue` releases, and by
+        # this point carries none of the markers `is_unadmitted_reject` reads,
+        # so take the caller's word for it rather than sniffing.
+        if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
+            self.scheduler.retire_unadmitted_request(req)
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -1178,6 +1213,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        if self.scheduler.enable_lora:
+            running_batches = (
+                self.scheduler.running_mbs
+                if is_pp_mode
+                else (self.scheduler.running_batch,)
+            )
+            # Include finished requests; GPU work may still use their adapters.
+            running_loras = {
+                req.lora_id for batch in running_batches for req in batch.reqs
+            }
+            running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
+            running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1197,6 +1245,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if hisparse_req_budget <= 0:
                 break
+
+            if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
+                decode_req.req, running_loras
+            ):
+                continue
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
@@ -1406,7 +1459,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
                     )
                 )
@@ -1427,6 +1480,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     seq_len,
                 )
 
+            def _qsa_pending_payload():
+                # Match the prefill request-pool row positionally; the two
+                # req_pool_idx values need not be equal.
+                return get_qsa_pending_state_indices(decode_req.req)
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1438,31 +1496,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
-                    int(decode_req.req.kv.req_pool_idx),
-                    seq_len,
-                    online=online,
-                    ring_size=ring_size,
+            def _request_state_payload():
+                return self.token_to_kv_pool.request_state_transfer_indices(
+                    int(decode_req.req.kv.req_pool_idx), seq_len
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            if StateType.C128_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
+            if StateType.DSV4_REQUEST_STATE in state_types:
+                clear_request_state = getattr(
+                    self.token_to_kv_pool, "clear_request_scoped_state", None
                 )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.kv.req_pool_idx))
+                if clear_request_state is not None:
+                    clear_request_state(int(decode_req.req.kv.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
+                StateType.QSA_PENDING: _qsa_pending_payload,
+                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1542,6 +1597,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            if self.scheduler.enable_lora:
+                running_loras.add(decode_req.req.lora_id)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         if failed_reqs:
@@ -2092,7 +2149,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        # Preserve the checksum before the metadata slot is freed so it can be
+        # re-verified when the request enters a batch, including after retraction.
         idx = decode_req.metadata_buffer_index
+        if self.scheduler.kv_checksum_computer is not None:
+            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
+                idx
+            )
         (
             output_id,
             cached_tokens,
@@ -2640,6 +2703,57 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        if computer is None:
+            return self._get_new_prebuilt_batch(running_batch)
+
+        verified: List[Req] = []
+        for req in self.waiting_queue:
+            if is_health_check_req(req):
+                verified.append(req)
+                continue
+            expected = req.expected_kv_checksum
+            if expected == 0:
+                verified.append(req)
+                continue
+            seq_len = len(req.origin_input_ids)
+            page_indices_gpu = page_indices_for_request(self, req, seq_len)
+            state_indices = state_indices_for_request(self, req, seq_len)
+            actual = computer.compute(page_indices_gpu, state_indices)
+            if actual == expected:
+                verified.append(req)
+                continue
+            msg = (
+                f"KV checksum mismatch req={req.rid} "
+                f"bootstrap_room={req.bootstrap_room} "
+                f"expected={expected:#x} got={actual:#x}"
+            )
+            logger.error(msg)
+            self._handle_kv_checksum_mismatch(req, msg)
+        self.waiting_queue = verified
+
+        return self._get_new_prebuilt_batch(running_batch)
+
+    def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
+        # A mismatch means the KV this worker received is not what prefill sent,
+        # so the cause is hardware or transport rather than the request. Serving
+        # keeps going and drops just this request; CI fails instead, because a
+        # single aborted request is easy to miss in a passing run.
+        if is_in_ci():
+            raise RuntimeError(msg)
+        prepare_abort(
+            req,
+            "KV checksum mismatch",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        self.output_streamer.stream_output([req], req.return_logprob)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_transfer_failed_reqs()
+
+    def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
