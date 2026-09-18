@@ -3633,7 +3633,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             if envs.SGLANG_TRUST_SMG_ADMISSION_TIMING.get() and request:
-                from sglang.srt.observability.admission_timing import parse_admission_wait
+                from sglang.srt.observability.admission_timing import (
+                    parse_admission_wait,
+                )
 
                 state.admission_wait_seconds = parse_admission_wait(
                     request.headers.get("x-smg-admission-wait-seconds")
