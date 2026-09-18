@@ -10,5 +10,6 @@
 mod discovery;
 mod health;
 mod policies;
+mod policies_reorg;
 mod tokenizer;
 mod workers;
