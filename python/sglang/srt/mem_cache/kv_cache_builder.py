@@ -66,6 +66,60 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def prepare_hicache_staging(
+    *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
+) -> None:
+    """Materialize MHA transfer buffers before the final KV budget is measured."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+    from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+    memory = get_memory()
+    page_size = get_schedule().page_size
+    if memory.hicache_mem_layout != "page_first" or not (
+        memory.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        return
+
+    def prepare(pool, packed_drafts=(), *, sidecar=False):
+        if isinstance(pool, SWAKVPool):
+            prepare(pool.full_kv_pool)
+            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
+        elif isinstance(pool, HybridLinearKVPool):
+            prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
+        elif isinstance(pool, MHATokenToKVPool):
+            # Ratio-based host pools can only shrink with post-capture KV sizing.
+            # Sidecars instead inherit their target host pool's capacity.
+            page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
+            if memory.hicache_size <= 0 and not sidecar:
+                page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
+            staging = prepare_mha_write_back_staging(
+                pool,
+                layer_num=pool.layer_num + len(packed_drafts),
+                page_size=page_size,
+                page_capacity=page_capacity,
+            )
+            if staging is not None:
+                logger.info(
+                    "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
+                    staging.nbytes / (1 << 20),
+                    pool.layer_num + len(packed_drafts),
+                )
+
+    runner = tp_worker.model_runner
+    prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
+    if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
+        for pool in draft_plan.device_pools:
+            # SWA sidecars follow only the draft's SWA component.
+            prepare(
+                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
+                sidecar=True,
+            )
+
+
 def get_draft_kv_pool(
     *,
     draft_worker: BaseTpWorker,
