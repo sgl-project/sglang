@@ -1,33 +1,15 @@
 """Top-p / top-k probability renormalization with deterministic output.
 
-Why this module exists
-----------------------
-flashinfer's default ``top_p_renorm_probs`` (AIR radix, flashinfer >= 0.6.7)
-and ``top_k_renorm_probs`` (radix multi-CTA) pool partial sums across thread
-blocks with float ``atomicAdd``. Float addition is not associative, so two
-calls on byte-identical input can return probabilities that differ in the
-last bits (measured: 99 of 99 repeated calls differ on a 256 x 128256 flat
-distribution; for top-k even on peaky rows).
+flashinfer's default ``top_p_renorm_probs`` (AIR radix) and
+``top_k_renorm_probs`` (radix multi-CTA) pool partial sums with float
+``atomicAdd``, so byte-identical input can return probabilities differing in
+the last bits (measured: 99 of 99 repeated calls on a 256 x 128256 flat
+distribution; for top-k even on peaky rows). Each TP rank renormalizes
+independently, and the output decides committed tokens and speculative accept
+lengths, so a last-bit gap desynchronizes the ranks (#33549, #33289).
 
-Every tensor-parallel rank runs these kernels independently on the same
-logits, and the output feeds decisions that are committed to per-rank state:
-sampled tokens (the ``min_p`` path of the sampler) and speculative-decoding
-accept lengths / bonus tokens (DFlash, DSpark, EAGLE verify). A last-bit gap
-between ranks flips a rejection-sampling coin on one rank only, the per-rank
-radix/KV caches drift apart, and a later prefix match deadlocks an NCCL
-collective (#33549, #33289; #33614 is the broadcast that papers over it).
-
-So by default this module routes to kernels whose output is bit-identical
-call to call:
-
-* top-p: flashinfer's integer-histogram AIR variant (``is_deterministic=True``);
-  without flashinfer (MUSA), the single-CTA kernel compiled into ``sgl_kernel``.
-* top-k: the single-CTA kernel compiled into ``sgl_kernel`` (fixed-order block
-  reductions). flashinfer has no deterministic option for its radix top-k.
-
-Set ``SGLANG_RENORM_DETERMINISTIC=0`` (or pass ``deterministic=False``) to opt
-back into the faster non-deterministic kernels, e.g. on a single rank without
-speculative decoding.
+``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC``; the top-k
+fallback goes away once the flashinfer pin includes flashinfer-ai/flashinfer#5034.
 """
 
 from __future__ import annotations
@@ -93,11 +75,6 @@ def top_p_renorm_prob(
     top_p: Union[torch.Tensor, float],
     deterministic: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Zero every token outside the top-p nucleus and renormalize.
-
-    ``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC`` (on). When on,
-    repeated calls on identical input return bit-identical output.
-    """
     if not _resolve(deterministic):
         return _sgl_kernel.top_p_renorm_prob(probs, top_p)
     if _HAS_FLASHINFER and probs.is_cuda:
@@ -114,11 +91,6 @@ def top_k_renorm_prob(
     top_k: Union[torch.Tensor, int],
     deterministic: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Zero every token outside the top-k set and renormalize.
-
-    ``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC`` (on). When on,
-    repeated calls on identical input return bit-identical output.
-    """
     if not _resolve(deterministic):
         return _sgl_kernel.top_k_renorm_prob(probs, top_k)
     return _single_cta_top_k(probs, top_k)

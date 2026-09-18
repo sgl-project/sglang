@@ -97,10 +97,8 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
 
 def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
-    """A heavy-tailed, high-entropy distribution: thousands of tokens survive a
-    top-p 0.95 cutoff, so the renorm kernels' histogram sums have many terms.
-    This is the regime in which the flashinfer float-atomic kernels return
-    different bytes call to call (see SGLANG_RENORM_DETERMINISTIC)."""
+    """High-entropy rows: thousands of tokens survive a top-p 0.95 cutoff, which
+    is the regime where the float-atomic kernels return different bytes."""
     gen = torch.Generator(device="cuda:0").manual_seed(7)
     ranks = torch.arange(1, vocab_size + 1, device="cuda:0", dtype=torch.float32)
     zipf = -1.1 * torch.log(ranks)
@@ -116,13 +114,8 @@ def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
 @pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
 @pytest.mark.parametrize("batch_size,vocab_size", [(256, 128256)])
 def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
-    """Repeated calls on the same input must return bit-identical output.
-
-    Every TP rank runs this kernel independently on the same logits, and its
-    output feeds sampled tokens and speculative accept decisions that are
-    committed to per-rank KV/radix state. A last-bit difference between ranks
-    desynchronizes them and eventually deadlocks a collective (#33549, #33289).
-    """
+    """Repeated calls on the same input must return bit-identical output; a
+    last-bit difference desynchronizes TP ranks (#33549, #33289)."""
     probs = _flat_distribution(batch_size, vocab_size)
     top_p = torch.full((batch_size,), 0.95, device="cuda:0")
     ref = top_p_renorm_prob(probs, top_p, deterministic=True)
