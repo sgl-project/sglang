@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -125,9 +126,11 @@ class DsparkDraftSampler:
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
         # through to the block sampler below.
         draft_tokens = None
-        if not self.folded_sampling and getattr(
-            self.markov_head, "supports_sharded_greedy", False
-        ):
+        fused_greedy = getattr(self.markov_head, "supports_sharded_greedy", False) or (
+            envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
+            and isinstance(self.markov_head, VanillaMarkov)
+        )
+        if not self.folded_sampling and fused_greedy:
             draft_tokens = self.markov_head.sample_block_greedy_fused(
                 base_logits, first_prev_tokens=anchor
             )

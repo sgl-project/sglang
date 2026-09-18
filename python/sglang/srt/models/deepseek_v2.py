@@ -1062,10 +1062,12 @@ class DeepseekV2MoE(nn.Module):
             )
         elif use_flashinfer_trtllm_bypass:
             final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        else:
+        elif routed_pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
             )
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             not _is_cuda
             and not _is_musa

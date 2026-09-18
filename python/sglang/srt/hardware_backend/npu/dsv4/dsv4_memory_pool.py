@@ -386,6 +386,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Main PD buffers addressed by the full KV page id."""
+        if self.c4_kv_pool is None:
+            # A draft pool whose layers are all uncompressed has no c4 buffers.
+            return [], [], []
         indexer_pool = self._indexer_pool(4)
         buffers = (
             self.c4_kv_pool.kv_buffer

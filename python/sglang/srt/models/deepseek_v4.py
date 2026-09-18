@@ -2893,7 +2893,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             if (
-                get_platform().is_sm90
+                self.hc_pre_from_prev_sublayer
+                and get_platform().is_sm90
                 and x.is_cuda
                 and 1 <= x.shape[0] <= 64
                 and x.shape[1] == 5120
