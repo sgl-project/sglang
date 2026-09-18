@@ -29,6 +29,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
+    SpawnRanks,
     attention_backends,
     get_context,
     get_device,
@@ -5921,6 +5922,20 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
+def resolve_spawn_dp_rank(dp_rank: Optional[int]) -> Optional[int]:
+    """The `dp_rank` this process was spawned with, in either of its two forms.
+
+    A router does not pass it as an argument, it sets `SGLANG_DP_RANK`. Both
+    forms are the launcher naming this process's place, so both have to be in
+    hand before `publish` records the placement -- resolving one of them after
+    would leave the context answering `None` for a process that has a rank.
+    """
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+        return int(os.environ["SGLANG_DP_RANK"])
+    return dp_rank
+
+
 def configure_scheduler_process(
     server_args: ServerArgs,
     gpu_id: int,
@@ -5933,18 +5948,15 @@ def configure_scheduler_process(
     display_tp_rank: Optional[int] = None,
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
-) -> Optional[int]:
+) -> None:
     """Configure scheduler worker logging and process title.
 
-    display_* ranks are cosmetic; runtime ranks stay local.
+    display_* ranks are cosmetic; runtime ranks stay local. `dp_rank` arrives
+    already resolved -- see `resolve_spawn_dp_rank`.
     """
     kill_itself_when_parent_died()
 
     # Generate the logger prefix
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
-
     shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
     shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
     shown_moe_ep = (
@@ -5986,8 +5998,6 @@ def configure_scheduler_process(
         if numa_node is not None:
             numa_bind_to_node(numa_node)
 
-    return dp_rank
-
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -6006,9 +6016,25 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
-    # Publish before anything in this process reads configuration.
-    publish(server_args, role="scheduler")
-    dp_rank = configure_scheduler_process(
+    dp_rank = resolve_spawn_dp_rank(dp_rank)
+    # Publish before anything in this process reads configuration, with the
+    # placement the launcher decided: from here on a rank read is answered
+    # without a process group, which is what every reader needs before
+    # `init_torch_distributed` has run.
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
+            moe_ep_rank=moe_ep_rank,
+        ),
+    )
+    configure_scheduler_process(
         server_args,
         gpu_id,
         tp_rank,
