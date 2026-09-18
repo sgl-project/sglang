@@ -347,8 +347,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
+        target_is_dsv41 = (
+            getattr(
+                self.target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
+        static_epilogue_supported = (
+            target_is_dsv41
+            and self._verify_planner.mode_value == "static"
+            and self._draft_is_moe
+            and not get_parallel().enable_dp_attention
+            and self.ps.pp_size == 1
+        )
         if (
-            self._verify_planner.is_compact_mode
+            (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
             and is_cuda()
         ):
@@ -357,6 +372,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
+                fused_argmax=target_is_dsv41,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -364,6 +380,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    kv_injector=self._kv_injector,
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -678,6 +695,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        *,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if pp_proxy_tensors is None:
@@ -807,6 +825,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
+        cache_loc = batch.out_cache_loc
+        token_indices = (
+            logits_output.hidden_states_token_indices
+            if logits_output is not None
+            else None
+        )
+        if token_indices is not None:
+            cache_loc = cache_loc[token_indices]
+            positions = positions[token_indices]
+            if state_slot is not None:
+                state_slot = state_slot[token_indices]
+                final_pos = final_pos[token_indices]
+
         if self._use_full_projection_prefill:
             if not has_local_target_hidden or output_pp_proxy_tensors is not None:
                 raise RuntimeError(
@@ -815,7 +846,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             self._kv_injector.inject_target_hidden(
                 target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
+                cache_loc=cache_loc,
                 positions=positions,
                 state_slot=state_slot,
                 final_pos=final_pos,
@@ -827,6 +858,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if pp_proxy_tensors is not None
                 else None
             )
+            if incoming_ctx is not None and token_indices is not None:
+                incoming_ctx = incoming_ctx[token_indices]
             local_ctx = None
             if (
                 self.ps.pp_size > 1
@@ -855,7 +888,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             elif ctx_acc is not None:
                 self._kv_injector.inject_projected_context(
                     projected_context=ctx_acc,
-                    cache_loc=batch.out_cache_loc,
+                    cache_loc=cache_loc,
                     positions=positions,
                     state_slot=state_slot,
                     final_pos=final_pos,
@@ -865,7 +898,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ):
                 self._kv_injector.inject_target_hidden(
                     target_hidden=target_hidden,
-                    cache_loc=batch.out_cache_loc,
+                    cache_loc=cache_loc,
                     positions=positions,
                     state_slot=state_slot,
                     final_pos=final_pos,
@@ -874,6 +907,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         if logits_output is not None:
             logits_output.hidden_states = None
+            logits_output.hidden_states_token_indices = None
 
         if next_token_ids is not None:
             batch_output.next_draft_input = make_next_draft_input(
@@ -1073,6 +1107,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
+                if (
+                    self._verify_epilogue is not None
+                    and self._verify_planner.mode_value == "static"
+                ):
+                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -1097,7 +1136,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 grammar_mask.apply(logits_output.next_token_logits)
 
         epilogue = self._verify_executor.verify_epilogue
-        folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        folded_accept = (
+            fold_eligible
+            and can_run_cuda_graph
+            and (run_compact or self._verify_planner.mode_value == "static")
+        )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -1109,6 +1152,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        self.model_runner.ngram_embedding_manager.update_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=batch.req_pool_indices,
+            commit_lens=accept.commit_lens,
         )
         if batch.return_logprob:
             compute_spec_logprobs(
@@ -1206,9 +1254,32 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
+        mamba_track_indices = batch.mamba_track_indices
 
-        if batch.mamba_track_indices is not None:
+        if mamba_track_indices is not None:
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+            seq_lens_cpu = batch.seq_lens_cpu
+            if (
+                _is_npu
+                and seq_lens_cpu is not None
+                and seq_lens_cpu.device.type == "cpu"
+                and seq_lens_cpu.ndim == 1
+                and seq_lens_cpu.numel() == seq_lens_pre_verify.numel()
+                and seq_lens_cpu.dtype in (torch.int32, torch.int64)
+            ):
+                # Verify restores the CPU prefix lengths before the forward.
+                # Acceptance can commit at most this many tokens, so this
+                # check needs no device readback. Passing None also avoids
+                # the NPU backend's conv-state self-copy for untracked rows.
+                if all(
+                    seq_len >= 0
+                    and seq_len // mamba_track_interval
+                    == (seq_len + self.verify_num_draft_tokens) // mamba_track_interval
+                    for seq_len in seq_lens_cpu.tolist()
+                ):
+                    mamba_track_indices = None
+
+        if mamba_track_indices is not None:
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -1228,7 +1299,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
             req_pool_indices=batch.req_pool_indices,

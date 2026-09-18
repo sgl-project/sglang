@@ -72,6 +72,8 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub worker_queue_limit: Option<u64>,
     /// `--saturation-queue-floor`. `None` disables the saturation pin.
     pub saturation_queue_floor: Option<u64>,
+    /// `--min-load-choices`: sample size for the min-load capacity fallback.
+    pub min_load_choices: usize,
 }
 
 /// The queue-gate blind warn is sampled: it fires on a per-request path, and
@@ -481,6 +483,7 @@ impl<'a> Selector<'a> {
                     inputs.request_input_tokens,
                     snapshot,
                     inputs.worker_queue_limit,
+                    inputs.min_load_choices,
                 )
             } else {
                 resolve_prefill_admitted(
@@ -827,6 +830,7 @@ mod tests {
             workers,
             worker_queue_limit: None,
             saturation_queue_floor: None,
+            min_load_choices: 2,
             ttft_slo_ms: None,
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
