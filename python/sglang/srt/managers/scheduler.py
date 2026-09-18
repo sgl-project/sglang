@@ -5522,15 +5522,51 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
+            # Reqs whose forward result is still queued (overlap) must be
+            # finished by process_batch_result_dllm, which releases KV once.
+            pending_result_reqs = (
+                {r for b, _ in self.result_queue for r in b.reqs}
+                if self.enable_overlap
+                else set()
+            )
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # A req that finished in the last forward stays queued until
+                # filter_finished_reqs(); its result is already committed.
+                if req.finished():
+                    continue
+                if req in pending_result_reqs:
+                    if recv_req.abort_message:
+                        # Keep the running-timeout message + 503 on the
+                        # deferred finish; a bare abort would lose both.
+                        req.to_finish = FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
+                    else:
+                        req.to_finish = FINISH_ABORT()
+                    self.dllm_manager.add_staging_reqs(req)
+                    continue
+                if recv_req.abort_message:
+                    # Keep the running-timeout message + 503; a generic stamp
+                    # would stream a statusless abort to the client.
+                    prepare_abort(
+                        req,
+                        recv_req.abort_message,
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                else:
+                    prepare_abort(req, "Aborted")
                 self._release_aborted_request(req)
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                # After KV release so a session slot is never reusable while
+                # the turn's KV is still held; before the IPC send so a send
+                # failure cannot strand already-popped requests.
+                self._release_dropped_waiting_req_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
