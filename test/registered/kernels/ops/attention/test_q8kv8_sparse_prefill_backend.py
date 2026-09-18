@@ -175,7 +175,9 @@ def _make_backend(
     dsv4_prefill_backend: str = "auto",
 ) -> DeepseekV4AttnBackend:
     backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
-    backend.forward_metadata = SimpleNamespace(sparse_prefill_cache=None)
+    backend.forward_metadata = SimpleNamespace(
+        sparse_prefill_cache=None, late_layer_tail=None
+    )
     backend.req_to_token = req_to_token
     backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
     backend.softmax_scale = 512**-0.5
