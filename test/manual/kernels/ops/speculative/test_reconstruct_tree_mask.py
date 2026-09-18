@@ -31,11 +31,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 try:
     from sglang.kernels.ops.speculative.reconstruct_tree import (
