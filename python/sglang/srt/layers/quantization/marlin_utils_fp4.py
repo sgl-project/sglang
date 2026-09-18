@@ -12,6 +12,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -257,7 +258,25 @@ def _get_optional_param(layer: torch.nn.Module, *names: str) -> torch.Tensor | N
     return None
 
 
-def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
+def _view_tensor_storage(
+    tensor: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor:
+    if not tensor.is_contiguous():
+        raise ValueError("MXFP4 Marlin in-place reload requires contiguous parameters.")
+    expected_nbytes = torch.empty((), dtype=dtype).element_size()
+    for dim in shape:
+        expected_nbytes *= dim
+    if tensor.nbytes != expected_nbytes:
+        raise ValueError(
+            f"Cannot reuse {tensor.nbytes} bytes as shape={shape}, dtype={dtype} "
+            f"({expected_nbytes} bytes)."
+        )
+    return tensor.view(torch.uint8).reshape(-1).view(dtype).reshape(shape)
+
+
+def deinterleave_moe_mxfp4_w13_for_marlin(
+    layer: torch.nn.Module, reuse_parameter_storage: bool = False
+) -> None:
     """Convert GPT-OSS interleaved w13 rows to Marlin's contiguous halves.
 
     GPT-OSS stores gate/up rows as [gate0, up0, gate1, up1, ...]. The Marlin
@@ -272,9 +291,21 @@ def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
         raise ValueError(f"Expected even w13 row dimension, got {w13.shape}.")
 
     e, n, k = w13.shape
-    layer.w13_weight.data = (
-        w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
-    )
+    # in-place reload works one expert at a time so the scratch stays one expert wide
+    if reuse_parameter_storage:
+        for expert_idx in range(e):
+            deinterleaved = (
+                w13[expert_idx]
+                .view(n // 2, 2, k)
+                .permute(1, 0, 2)
+                .contiguous()
+                .view(n, k)
+            )
+            w13[expert_idx].copy_(deinterleaved)
+    else:
+        layer.w13_weight.data = (
+            w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+        )
 
     if w13_scale is not None:
         scale = w13_scale.data
@@ -282,21 +313,43 @@ def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
             raise ValueError(
                 f"Expected w13 scale row dimension {n}, got {scale.shape}."
             )
-        w13_scale.data = (
-            scale.view(e, n // 2, 2, scale.shape[-1])
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .view(e, n, scale.shape[-1])
-        )
+        if reuse_parameter_storage:
+            for expert_idx in range(e):
+                deinterleaved = (
+                    scale[expert_idx]
+                    .view(n // 2, 2, scale.shape[-1])
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .view(n, scale.shape[-1])
+                )
+                scale[expert_idx].copy_(deinterleaved)
+        else:
+            w13_scale.data = (
+                scale.view(e, n // 2, 2, scale.shape[-1])
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, scale.shape[-1])
+            )
 
     if w13_bias is not None:
         bias = w13_bias.data
         if bias.shape[1] != n:
             raise ValueError(f"Expected w13 bias row dimension {n}, got {bias.shape}.")
-        w13_bias.data = bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
+        if reuse_parameter_storage:
+            for expert_idx in range(e):
+                deinterleaved = (
+                    bias[expert_idx].view(n // 2, 2).permute(1, 0).contiguous().view(n)
+                )
+                bias[expert_idx].copy_(deinterleaved)
+        else:
+            w13_bias.data = (
+                bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
+            )
 
 
-def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+def prepare_moe_mxfp4_layer_for_marlin(
+    layer: torch.nn.Module, reuse_parameter_storage: bool = False
+) -> None:
     group_size = 32
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
@@ -332,7 +385,13 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
 
     device = w13.device
-    layer.workspace = marlin_make_workspace(device, 4)
+    if reuse_parameter_storage:
+        if not hasattr(layer, "workspace"):
+            raise ValueError(
+                "MXFP4 Marlin workspace is missing during in-place reload."
+            )
+    else:
+        layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     def _pad_w13(x: torch.Tensor) -> torch.Tensor:
@@ -351,85 +410,131 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             x, (0, (padded_intermediate_size - intermediate_size) // packing)
         )
 
+    # a padded reload would need storage the checkpoint-shaped parameters do not have
+    if reuse_parameter_storage and padded_intermediate_size != intermediate_size:
+        raise ValueError(
+            "MXFP4 Marlin in-place reload requires checkpoint parameters "
+            "to include Marlin padding."
+        )
+
     w13 = _pad_w13(w13)
     w2 = _pad_w2(w2, packing=2)
-    w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
-    w2_scale_data = _pad_w2(
-        _normalize_scale_tensor(w2_scale_data, param_dtype),
-        packing=group_size,
-    )
-    if w13_bias_data is not None:
-        w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
+    if not reuse_parameter_storage:
+        w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
+        w2_scale_data = _pad_w2(
+            _normalize_scale_tensor(w2_scale_data, param_dtype),
+            packing=group_size,
+        )
+        if w13_bias_data is not None:
+            w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
+
+    def _repack_expert(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
+        if is_w13:
+            size_n, size_k = padded_intermediate_size * 2, hidden_size
+        else:
+            size_n, size_k = hidden_size, padded_intermediate_size
+        assert weight.shape == (size_n, size_k // 2)
+        qweight = weight.view(torch.int32).T.contiguous()
+        return gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+        )
 
     def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
+        return torch.stack(
+            [_repack_expert(weight[i], is_w13) for i in range(num_experts)]
+        )
+
+    def _permute_scale_expert(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
             size_n, size_k = padded_intermediate_size * 2, hidden_size
         else:
             size_n, size_k = hidden_size, padded_intermediate_size
-        assert weight.shape == (num_experts, size_n, size_k // 2)
-
-        tensor_list = []
-        for i in range(num_experts):
-            qweight = weight[i].view(torch.int32).T.contiguous()
-            marlin_qweight = gptq_marlin_repack(
-                b_q_weight=qweight,
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=4,
-            )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+        scale = _normalize_scale_tensor(scales, param_dtype).T.contiguous()
+        marlin_scales = marlin_permute_scales(
+            s=scale,
+            size_k=size_k,
+            size_n=size_n,
+            group_size=group_size,
+        )
+        return mxfp4_marlin_process_scales(
+            marlin_scales,
+            input_dtype=param_dtype,
+        )
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
-        if is_w13:
-            size_n, size_k = padded_intermediate_size * 2, hidden_size
-        else:
-            size_n, size_k = hidden_size, padded_intermediate_size
-
-        tensor_list = []
-        for i in range(num_experts):
-            scale = scales[i].T.contiguous()
-            marlin_scales = marlin_permute_scales(
-                s=scale,
-                size_k=size_k,
-                size_n=size_n,
-                group_size=group_size,
-            )
-            tensor_list.append(
-                mxfp4_marlin_process_scales(
-                    marlin_scales,
-                    input_dtype=param_dtype,
-                )
-            )
-        return torch.stack(tensor_list)
+        return torch.stack(
+            [_permute_scale_expert(scales[i], is_w13) for i in range(num_experts)]
+        )
 
     def _permute_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
         if bias is None:
             return None
-        tensor_list = []
-        for i in range(num_experts):
-            tensor_list.append(marlin_permute_bias(bias[i].to(param_dtype)))
-        return torch.stack(tensor_list)
+        return torch.stack(
+            [marlin_permute_bias(bias[i].to(param_dtype)) for i in range(num_experts)]
+        )
+
+    def _transform_parameter_in_place(name: str, transform) -> None:
+        param = getattr(layer, name)
+        source = param.data
+        if source.shape[0] != num_experts:
+            raise ValueError(
+                f"Expected {num_experts} experts in {name}, got {source.shape}."
+            )
+
+        # expert i occupies the same byte range before and after, so writing
+        # expert i only overwrites bytes already consumed by its own transform
+        first = transform(source[0])
+        output_shape = (num_experts, *first.shape)
+        output = _view_tensor_storage(source, output_shape, first.dtype)
+        output[0].copy_(first)
+        for expert_idx in range(1, num_experts):
+            output[expert_idx].copy_(transform(source[expert_idx]))
+        param.data = output
+
+    if reuse_parameter_storage:
+        _transform_parameter_in_place(
+            "w13_weight", lambda weight: _repack_expert(weight, True)
+        )
+        _transform_parameter_in_place(
+            "w2_weight", lambda weight: _repack_expert(weight, False)
+        )
+        _transform_parameter_in_place(
+            "w13_weight_scale", lambda scale: _permute_scale_expert(scale, True)
+        )
+        _transform_parameter_in_place(
+            "w2_weight_scale", lambda scale: _permute_scale_expert(scale, False)
+        )
+        if w13_bias_data is not None:
+            _transform_parameter_in_place(
+                "w13_weight_bias",
+                lambda bias: marlin_permute_bias(bias.to(param_dtype)),
+            )
+        if w2_bias_data is not None:
+            _transform_parameter_in_place(
+                "w2_weight_bias",
+                lambda bias: marlin_permute_bias(bias.to(param_dtype)),
+            )
+        return
 
     w13_marlin = _repack_weight(w13, True)
     w2_marlin = _repack_weight(w2, False)
     w13_scale_marlin = _permute_scales(w13_scale_data, True)
     w2_scale_marlin = _permute_scales(w2_scale_data, False)
 
-    layer.w13_weight = torch.nn.Parameter(w13_marlin, requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
-    layer.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
-    layer.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
+    # rebinding keeps the Parameter objects, and with them the weight_loader a reload needs
+    copy_or_rebind_param(layer, "w13_weight", w13_marlin)
+    copy_or_rebind_param(layer, "w2_weight", w2_marlin)
+    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale_marlin)
+    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale_marlin)
 
     if w13_bias_data is not None:
-        layer.w13_weight_bias = torch.nn.Parameter(
-            _permute_bias(w13_bias_data), requires_grad=False
-        )
+        copy_or_rebind_param(layer, "w13_weight_bias", _permute_bias(w13_bias_data))
     if w2_bias_data is not None:
-        layer.w2_weight_bias = torch.nn.Parameter(
-            _permute_bias(w2_bias_data), requires_grad=False
-        )
+        copy_or_rebind_param(layer, "w2_weight_bias", _permute_bias(w2_bias_data))
 
     # Marlin uses the repacked scales; release the loader-format parameters.
     for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
