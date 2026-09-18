@@ -151,7 +151,7 @@ class QwenImage21VAEArchConfig(VAEArchConfig):
     out_channels: int = 4
     patch_size: int | None = None
     scale_factor_temporal: int = 8
-    scale_factor_spatial: int = 8
+    scale_factor_spatial: int = 16
     spatial_compression_ratio: int = 16
     temporal_compression_ratio: int = 1
     vae_scale_factor: int = 16

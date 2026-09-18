@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
+    QwenImage21RMS_norm,
     _patchify,
     _unpatchify,
 )
@@ -43,7 +44,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
 )
 
 
-def test_prompt_conditioning_uses_pre_final_norm_hidden_state():
+@pytest.mark.parametrize("prompt", ["edit", ""])
+@pytest.mark.parametrize("image_count", [0, 1, 2])
+def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_count):
     hidden = torch.arange(24).reshape(1, 6, 4).float()
     inputs = BatchFeature(
         data={
@@ -57,11 +60,31 @@ def test_prompt_conditioning_uses_pre_final_norm_hidden_state():
     encoder = Mock(return_value=SimpleNamespace(hidden_states=(hidden,)))
     stage = QwenImage21EncodingStage(encoder, processor, None, None)
     stage.use_declared_component = Mock(return_value=nullcontext(encoder))
-    actual, slots = stage.encode_prompt("edit", [], "cpu")
+    images = [Image.new("RGBA", (2, 1), (12, 34, 56, 0)) for _ in range(image_count)]
+    for image in images:
+        image.putpixel((1, 0), (12, 34, 56, 255))
+    actual, slots = stage.encode_prompt(prompt, images, "cpu")
     torch.testing.assert_close(actual, hidden[0, [1, 2, 4]])
     assert slots.tolist() == [False, True, False]
     encoder.model.language_model.norm.assert_not_called()
     assert encoder.model.visual.fp32_position_interpolation is False
+    kwargs = processor.call_args.kwargs
+    prefix = " ".join(
+        f"<image{i + 1}><|vision_start|><|image_pad|><|vision_end|>"
+        for i in range(image_count)
+    )
+    assert kwargs["text"] == [
+        "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+        f"<|im_start|>user\n{prefix}{prompt or ' '}<|im_end|>\n<|im_start|>assistant\n"
+    ]
+    assert kwargs["padding_side"] == "left"
+    for image in kwargs.get("images", []):
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (255, 255, 255)
+        assert image.getpixel((1, 0)) == (12, 34, 56)
+    for image in images:
+        assert image.mode == "RGBA"
+        assert image.getpixel((0, 0)) == (12, 34, 56, 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -152,7 +175,8 @@ def test_latent_pack_decode_contract():
 
 
 @pytest.mark.parametrize("channels", [3, 4])
-def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels):
+@pytest.mark.parametrize("tiling", [False, True])
+def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
     ac = QwenImage21VAEArchConfig(
         base_dim=4,
         decoder_base_dim=4,
@@ -165,14 +189,30 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels):
     )
     model = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac)).eval()
     assert not model.use_tiling
+    assert ac.scale_factor_spatial == ac.spatial_compression_ratio == 16
+    model.use_tiling = tiling
+    model.tile_sample_min_height = model.tile_sample_min_width = 32
+    model.tile_sample_stride_height = model.tile_sample_stride_width = 16
     with torch.no_grad():
-        moments = model._encode(torch.randn(1, channels, 1, 32, 64))
-        assert moments.shape == (1, 8, 1, 2, 4)
-        output = model._decode(moments[:, :4])
+        latent = model.encode(torch.randn(1, channels, 1, 32, 64)).mode()
+        assert latent.shape == (1, 4, 1, 2, 4)
+        output = model.decode(latent)
         assert output.shape == (1, channels, 1, 32, 64)
     assert model.state_dict()["encoder.conv_in.weight"].ndim == 4
     x = torch.randn(2, 3, 1, 8, 12)
     torch.testing.assert_close(_unpatchify(_patchify(x, 2), 2), x)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_vae_rms_norm_normalizes_in_float32(dtype):
+    norm = QwenImage21RMS_norm(8, images=False).to(dtype)
+    x = torch.linspace(-60000, 60000, 256).reshape(1, 8, 1, 4, 8).to(dtype)
+    expected = (
+        torch.nn.functional.normalize(x.float(), dim=1).to(dtype)
+        * norm.scale
+        * norm.gamma
+    )
+    torch.testing.assert_close(norm(x), expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("tiling", [False, True])

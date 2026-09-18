@@ -164,6 +164,14 @@ def test_cached_prefix_matches_full_recomputation(model, edit):
     kwargs = inputs(5, edit)
     with torch.no_grad(), set_forward_context(None, None):
         model(**kwargs)
+        prefix_length = kwargs["layouts"][0]["prefix_rope"].shape[0]
+        for cache in kwargs["prefix_caches"][0]:
+            for tensor in cache.values():
+                assert tensor.shape[1] == prefix_length
+                assert (
+                    tensor.untyped_storage().nbytes()
+                    == tensor.numel() * tensor.element_size()
+                )
         keys = [layer["key"].clone() for layer in kwargs["prefix_caches"][0]]
         kwargs["timestep"].fill_(300.0)
         actual = model(**kwargs)

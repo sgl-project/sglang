@@ -83,16 +83,26 @@ class QwenImage21EncodingStage(PipelineStage):
 
     def encode_prompt(self, prompt, images, device):
         prefix = " ".join(
-            f"Picture {i + 1}: <|vision_start|><|image_pad|><|vision_end|>"
+            f"<image{i + 1}><|vision_start|><|image_pad|><|vision_end|>"
             for i in range(len(images))
         )
         text = (
             SYSTEM_TEMPLATE
-            + f"<|im_start|>user\n{prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            + f"<|im_start|>user\n{prefix}{prompt or ' '}<|im_end|>\n<|im_start|>assistant\n"
         )
-        kwargs = dict(text=[text], padding=True, return_tensors="pt")
+        kwargs = dict(
+            text=[text], padding=True, padding_side="left", return_tensors="pt"
+        )
         if images:
-            kwargs["images"] = images
+            vision_images = []
+            for image in images:
+                if image.mode == "RGBA":
+                    # vision conditioning uses white compositing; the VAE keeps RGBA
+                    white = Image.new("RGB", image.size, (255, 255, 255))
+                    white.paste(image, mask=image.getchannel("A"))
+                    image = white
+                vision_images.append(image)
+            kwargs["images"] = vision_images
         inputs = self.processor(**kwargs).to(device)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
