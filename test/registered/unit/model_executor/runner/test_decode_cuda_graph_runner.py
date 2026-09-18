@@ -25,12 +25,16 @@ server is constructed.
 import os
 import tempfile
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+    _StagedTokenInputs,
 )
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -291,6 +295,33 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestStagedTokenInputs(CustomTestCase):
+    def test_reuse_requires_same_batch_and_tensor_objects(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        fb = ForwardBatch.__new__(ForwardBatch)
+        fb.input_ids = torch.zeros(4, dtype=torch.int64)
+        fb.positions = torch.arange(4)
+        runner = SimpleNamespace(_staged_token_inputs=None)
+        staged = DecodeCudaGraphRunner._token_inputs_staged
+        self.assertFalse(staged(runner, fb))
+        runner._staged_token_inputs = _StagedTokenInputs(
+            weakref.ref(fb), fb.input_ids, fb.positions
+        )
+        self.assertTrue(staged(runner, fb))
+        for name in ("input_ids", "positions"):
+            original = getattr(fb, name)
+            setattr(fb, name, original.clone())
+            self.assertFalse(staged(runner, fb))
+            setattr(fb, name, original)
+        other = ForwardBatch.__new__(ForwardBatch)
+        other.input_ids, other.positions = fb.input_ids, fb.positions
+        self.assertFalse(staged(runner, other))
+        del fb
+        self.assertIsNone(runner._staged_token_inputs.forward_batch())
+        self.assertFalse(staged(runner, other))
 
 
 if __name__ == "__main__":

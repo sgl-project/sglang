@@ -29,8 +29,9 @@ import contextlib
 import inspect
 import logging
 import os
+import weakref
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, Union
 
 import torch
 import tqdm
@@ -210,6 +211,12 @@ def build_replay_fb_view(
         ),
         spec_info=forward_batch.spec_info,
     )
+
+
+class _StagedTokenInputs(NamedTuple):
+    forward_batch: weakref.ref[ForwardBatch]
+    input_ids: torch.Tensor
+    positions: torch.Tensor
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -452,6 +459,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "metadata glue graph."
             )
             enable_metadata_glue = False
+        self._staged_token_inputs: Optional[_StagedTokenInputs] = None
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
@@ -1263,8 +1271,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if not self._token_inputs_staged(forward_batch):
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
+                )
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1333,6 +1346,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_token,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
+        )
+        self._staged_token_inputs = _StagedTokenInputs(
+            forward_batch=weakref.ref(forward_batch),
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
         )
 
         if (
@@ -1412,6 +1430,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    def _token_inputs_staged(self, forward_batch: ForwardBatch) -> bool:
+        staged = self._staged_token_inputs
+        return (
+            staged is not None
+            and staged.forward_batch() is forward_batch
+            and staged.input_ids is forward_batch.input_ids
+            and staged.positions is forward_batch.positions
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

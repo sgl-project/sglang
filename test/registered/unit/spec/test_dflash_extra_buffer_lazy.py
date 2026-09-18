@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -99,28 +99,33 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
             draft_token_num=4,
         )
 
-    def _run(self, forward_mode):
+    def _run(self, forward_mode, *, cuda_graph=False):
         calls = []
         batch = SimpleNamespace(forward_mode=forward_mode)
         attn_backend = SimpleNamespace(
             init_forward_metadata=lambda fb: calls.append("init_forward_metadata")
         )
+        graph_runner = SimpleNamespace(
+            can_run_graph=lambda fb: cuda_graph,
+            load_batch=lambda fb: calls.append("load_batch"),
+        )
         target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
-                decode_cuda_graph_runner=None, attn_backend=attn_backend
+                decode_cuda_graph_runner=graph_runner, attn_backend=attn_backend
             )
         )
 
         def fake_hook(hook_batch):
             calls.append(("hook", hook_batch.forward_mode))
 
-        fake_forward_batch = SimpleNamespace()
+        fake_forward_batch = ForwardBatch.__new__(ForwardBatch)
+        fake_forward_batch.batch_size = 1
+        fake_forward_batch.input_ids = self._spec_input().draft_token
 
         def fake_init_new(*args, **kwargs):
             calls.append("init_new")
             return fake_forward_batch
 
-        # This test covers the generic/CUDA hook ordering, not NPU DSV4 bundle setup.
         with (
             mock.patch.object(dflash_info, "_is_npu", False),
             mock.patch(
@@ -135,21 +140,33 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
                 batch, target_worker
             )
         self.assertIs(out, fake_forward_batch)
-        self.assertFalse(can_run_cuda_graph)
-        return calls, batch
+        self.assertEqual(can_run_cuda_graph, cuda_graph)
+        return calls, batch, out
 
     def test_hook_runs_before_init_new_on_verify(self):
-        calls, batch = self._run(ForwardMode.DECODE)
+        calls, batch, forward_batch = self._run(ForwardMode.DECODE)
         self.assertEqual(
             calls,
-            [("hook", ForwardMode.TARGET_VERIFY), "init_new", "init_forward_metadata"],
+            [("hook", ForwardMode.TARGET_VERIFY), "init_new"],
         )
         self.assertEqual(batch.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertTrue(forward_batch.needs_forward_metadata_init())
+
+    def test_graph_plan_is_reused_until_padding_changes_the_batch(self):
+        calls, _, forward_batch = self._run(ForwardMode.DECODE, cuda_graph=True)
+        self.assertEqual(
+            calls,
+            [("hook", ForwardMode.TARGET_VERIFY), "init_new", "load_batch"],
+        )
+        self.assertFalse(forward_batch.needs_forward_metadata_init())
+        forward_batch.input_ids = torch.zeros(8, dtype=torch.long)
+        self.assertTrue(forward_batch.needs_forward_metadata_init())
 
     def test_idle_batch_skips_hook(self):
-        calls, batch = self._run(ForwardMode.IDLE)
+        calls, batch, forward_batch = self._run(ForwardMode.IDLE)
         self.assertEqual(calls, ["init_new"])
         self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertTrue(forward_batch.needs_forward_metadata_init())
 
 
 if __name__ == "__main__":
