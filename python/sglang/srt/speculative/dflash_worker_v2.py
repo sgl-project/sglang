@@ -76,18 +76,14 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
-from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
-    publish_anchor,
-    target_input_embeddings,
-)
-from sglang.srt.speculative.lilicorr_components.lilicorr_config import (
+from sglang.srt.speculative.lilicorr_utils import (
     SAMPLING_ENABLED as _LILICORR_SAMPLING_ENABLED,
 )
-from sglang.srt.speculative.lilicorr_components.lilicorr_draft_sampler import (
+from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
-)
-from sglang.srt.speculative.lilicorr_components.lilicorr_select import (
     propose_lilicorr_block,
+    publish_anchor,
+    target_input_embeddings,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -434,8 +430,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
         # The sampled LiLiCorr commit rides the selector's accept path, so it is
-        # available exactly where that path is. Requesting it elsewhere falls back to
-        # the argmax commit and the existing verify, with the warning below.
+        # available exactly where that path is.
         self._lilicorr_sampling_enabled = (
             _LILICORR_SAMPLING_ENABLED and self._selector_sampling_enabled
         )
@@ -2194,12 +2189,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._warned_sampling_fallback = True
             return
 
-        # Under LILICORR_SAMPLING the head proposes from the request's own temperature
-        # and hands verify the q it drew from, so this batch needs no warning and no
-        # fallback. With sampling off it falls through to the chain check below, which
-        # is correct: the argmax draft is still verified losslessly, just target-only.
-        # Checked after the selector branch because the two heads are mutually
-        # exclusive: a selector worker returns above and never reads `lilicorr`.
+        # Under LILICORR_SAMPLING the head hands verify the q it drew from, so this
+        # batch needs no fallback. With sampling off it falls through to the chain check
+        # below and the argmax draft is verified target-only, which is lossless.
         if self.lilicorr is not None and self._lilicorr_sampling_enabled:
             return
 
@@ -2535,11 +2527,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
         )
 
-        # LiLiCorr joins this arm under LILICORR_SAMPLING: it too proposes from a
-        # per-row temperature and greedy_mask that the replay consumes, and it too
-        # publishes a sparse q the accept path reads. With sampling off its
-        # stage_sampling_params is a no-op and _selector_sample stays None, so the
-        # clearing below is the only thing that runs.
+        # LiLiCorr joins this arm under LILICORR_SAMPLING: it stages the same per-row
+        # temperature and greedy_mask and publishes the same sparse q. With sampling off
+        # stage_sampling_params is a no-op and only the clearing below runs.
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             if self._draft_sampler is not None:
@@ -2613,10 +2603,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 and self._lilicorr_sampling_enabled
                 and not _is_all_greedy(batch.sampling_info)
             ):
-                # Same buffers, same shapes, same accept path as the selector: the
-                # sparse q over each slot's candidates plus the ids it is indexed
-                # against. An all-greedy batch deliberately publishes nothing, so it
-                # takes the target-only verify it takes today.
+                # Same buffers and same accept path as the selector. An all-greedy
+                # batch publishes nothing and takes the target-only verify.
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
@@ -2631,12 +2619,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     sampling_info=batch.sampling_info,
                 )
         elif self.lilicorr is not None:
-            # The eager head exists to serve the steps the draft graph cannot, but a
-            # decode step landing here while sampling is on is a throughput cliff of
-            # roughly 17%, and it is invisible in the results: acceptance is identical
-            # on both paths, so only the tokens/s move. build_lilicorr_draft_sampler
-            # already warns when it refuses to fold; this covers the other half of
-            # `folded`, where the sampler exists but the graph could not run the step.
+            # A decode step landing on the eager head costs roughly 17% of throughput
+            # and is invisible in the results, since acceptance is identical on both
+            # paths. build_lilicorr_draft_sampler warns when it refuses to fold; this
+            # covers the case where the sampler exists but the graph could not run.
             if (
                 self._lilicorr_sampling_enabled
                 and not self._warned_lilicorr_eager

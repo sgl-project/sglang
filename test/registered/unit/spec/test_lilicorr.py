@@ -16,14 +16,12 @@ from sglang.srt.models.lilicorr import (
     check_conv_weight_coverage,
     check_head_weight_coverage,
 )
-from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
+from sglang.srt.speculative.lilicorr_utils import (
     lilicorr_candidates,
+    parse_lilicorr_draft_config,
     per_request_last_row,
     publish_anchor,
     resolve_vocab_shard,
-)
-from sglang.srt.speculative.lilicorr_components.lilicorr_config import (
-    parse_lilicorr_draft_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -85,9 +83,8 @@ def _lattice(head, *, bs=3, model_hidden_size=16):
 
 
 class _FakeShardedHead(VocabParallelEmbedding):
-    """A vocab-parallel head carrying only the fields the shard resolver reads.
-
-    ``VocabParallelEmbedding.__init__`` needs an initialized distributed group.
+    """A vocab-parallel head carrying only the fields the shard resolver reads;
+    VocabParallelEmbedding.__init__ needs an initialized distributed group.
     """
 
     def __init__(self, *, num_org, start, added=0):
@@ -106,9 +103,10 @@ class _FakeShardedHead(VocabParallelEmbedding):
     "dflash_config", [{}, {"lilicorr_enabled": False}], ids=["absent", "disabled"]
 )
 def test_no_head_geometry_is_reported_against_the_architecture_string(dflash_config):
-    """Absence and an explicit disable are the same case, and neither is a
-    per-field error: the checkpoint asked for this head by declaring the
-    architecture and then did not say which head."""
+    """Absence and an explicit disable are the same case, and neither is a per-field error:
+    the checkpoint asked for this head by declaring the architecture and then did not
+    say which head.
+    """
     with pytest.raises(ValueError, match="LiLiCorrDraftModel"):
         parse_lilicorr_draft_config(
             draft_hf_config={
@@ -120,28 +118,25 @@ def test_no_head_geometry_is_reported_against_the_architecture_string(dflash_con
 
 @pytest.mark.parametrize("dropped", sorted(set(_GEOMETRY) - {"lilicorr_enabled"}))
 def test_every_geometry_field_is_required(dropped):
-    """No field may acquire a default. Most change a tensor shape and would be
-    caught at weight load, but logit_scale and vector_eps would not: a guessed
-    value builds a head that loads cleanly and scores a different function."""
+    """No field may acquire a default."""
     with pytest.raises(ValueError, match=dropped):
         _lilicorr_config(**{dropped: None})
 
 
 @pytest.mark.parametrize("topk", [3, 6])
 def test_a_candidate_topk_that_is_not_a_power_of_two_is_refused(topk):
-    """The tiled candidate top-k holds its selected tiles in one Triton lane
-    group, and tl.arange needs a power-of-two extent. Refusing at load beats
-    silently falling back to the far slower reference path."""
+    """The tiled candidate top-k holds its selected tiles in one Triton lane group, and tl.
+    arange needs a power-of-two extent.
+    """
     with pytest.raises(ValueError, match="power of two"):
         _lilicorr_config(lilicorr_candidate_topk=topk)
 
 
 @pytest.mark.parametrize("topk", [32, 64])
 def test_a_candidate_topk_wider_than_the_fused_kernel_is_refused(topk):
-    """A wider pool is a power of two and loads fine, but falls off the fused
-    greedy commit onto the torch path at roughly three launches per slot. Config
-    parse is where that gets refused, for the same reason as the power-of-two
-    case: silently deoptimized is worse than not served."""
+    """A wider pool is a power of two and loads fine, but falls off the fused greedy commit
+    onto the torch path at roughly three launches per slot.
+    """
     with pytest.raises(ValueError, match="fused greedy commit"):
         _lilicorr_config(lilicorr_candidate_topk=topk)
 
@@ -158,9 +153,7 @@ def test_zero_head_width_means_as_wide_as_the_draft():
 
 
 def test_head_parameter_names_match_the_exported_checkpoint_subtree():
-    """Pins weight compatibility with the training export. A renamed submodule
-    loads nothing under that name, and the base loader ignores what it cannot
-    resolve, so the head would serve its construction values."""
+    """Pins weight compatibility with the training export."""
     head = _head()
     names = set(dict(head.named_parameters()))
     expected_leaves = {
@@ -237,10 +230,9 @@ def test_select_commits_candidates_from_the_lattice():
 
 
 def test_an_invalid_anchor_ignores_whatever_is_in_the_buffer():
-    """An invalid anchor is zeroed by multiplication rather than by a branch, so
-    the captured graph needs no host sync. The graph replays at the padded bucket
-    batch size, so rows past the live batch read stale anchor memory and their
-    scores must not depend on it."""
+    """An invalid anchor is zeroed by multiplication rather than by a branch, so the
+    captured graph needs no host sync.
+    """
     head = _head()
     lattice = _lattice(head)
     invalid = {**lattice, "anchor_valid": torch.zeros(3, dtype=torch.bool)}
@@ -252,9 +244,9 @@ def test_an_invalid_anchor_ignores_whatever_is_in_the_buffer():
 
 
 def test_a_precomputed_projected_table_scores_like_raw_embeddings():
-    """The folded path gathers rows of embed_tokens.weight @ token_proj.weight.T
-    + bias instead of embedding then projecting. token_proj is affine, so this
-    must be the same function of the token."""
+    """The folded path gathers rows of embed_tokens.weight @ token_proj.weight.T + bias
+    instead of embedding then projecting.
+    """
     head = _head()
     lattice = _lattice(head)
     embed_tokens = nn.Embedding(64, 16)
@@ -272,9 +264,9 @@ def test_a_precomputed_projected_table_scores_like_raw_embeddings():
 
 
 def test_head_weight_coverage_is_required_in_both_directions():
-    """The base loader ignores what it cannot resolve, so both a missing tensor
-    and a surplus one are silent, and either produces a low but believable
-    acceptance length."""
+    """The base loader ignores what it cannot resolve, so both a missing tensor and a
+    surplus one are silent, and either produces a low but believable acceptance length.
+    """
     head = _head()
     names = {f"lilicorr.{name}" for name, _ in head.named_parameters()}
     check_head_weight_coverage(head, set(names))
@@ -286,9 +278,10 @@ def test_head_weight_coverage_is_required_in_both_directions():
 
 
 def test_an_identity_token_proj_would_drop_the_checkpoints_projection():
-    """The live case for the surplus direction: at head width == draft width the
-    head builds token_proj as an Identity, so a checkpoint trained with a real
-    projection has those tensors dropped and scores without them."""
+    """The live case for the surplus direction: at head width == draft width the head
+    builds token_proj as an Identity, so a checkpoint trained with a real projection has
+    those tensors dropped and scores without them.
+    """
     wide = _head(lilicorr_hidden_size=0)
     names = {f"lilicorr.{name}" for name, _ in wide.named_parameters()}
     assert not any(name.startswith("lilicorr.token_proj") for name in names)
@@ -380,9 +373,7 @@ def test_chunking_cannot_change_a_candidate():
 
 
 def test_candidates_combine_across_vocab_shards():
-    """Pins the TP contract: the global top-k, the global log-partition and the
-    id offset. Getting any of them wrong returns plausible candidates normalized
-    by one shard's partition, which no single-rank test observes."""
+    """Pins the TP contract: the global top-k, the global log-partition and the id offset."""
     torch.manual_seed(0)
     hidden = torch.randn(4, 8)
     full_weight = torch.randn(24, 8)
@@ -430,10 +421,9 @@ def test_vocab_shard_resolution_and_added_vocab_refusal():
 
 
 def test_verify_anchor_rows_follow_the_padded_block_stride():
-    """The verify buffer is [bs, block_size] flattened, so requests sit at a
-    constant stride and only the first commit_lens[i] rows of each are live.
-    Reading it as packed picks another request's row for every request after the
-    first, which costs acceptance and raises nothing."""
+    """The verify buffer is [bs, block_size] flattened, so requests sit at a constant
+    stride and only the first commit_lens[i] rows of each are live.
+    """
     # bs=2, block_size=16: request 1 starts at row 16 however much request 0 committed.
     torch.testing.assert_close(
         per_request_last_row(
@@ -452,10 +442,7 @@ def test_verify_anchor_rows_follow_the_padded_block_stride():
 
 
 def test_prefill_anchor_rows_come_from_extend_lens_not_from_positions():
-    """Prefill rows are packed request-major. The lengths are passed in rather
-    than inferred from positions, because with a cached prefix a request's
-    positions start mid-sequence and never reset -- [0, 1, 10, 11] is two
-    requests of two tokens, which no reset detector can see."""
+    """Prefill rows are packed request-major."""
     torch.testing.assert_close(
         per_request_last_row(
             num_rows=6, extend_lens=torch.tensor([3, 2, 1]), commit_lens=None
@@ -518,9 +505,7 @@ def test_publishing_the_anchor_selects_the_padded_rows():
 def test_draft_graph_batch_sizes_reads_the_capture_buckets(monkeypatch):
     """The folded head is captured once per bucket and the compile prewarm has to
     cover every one, so this must be the list the engine actually captures."""
-    from sglang.srt.speculative.lilicorr_components import (
-        lilicorr_draft_sampler as sampler_mod,
-    )
+    from sglang.srt.speculative import lilicorr_utils as sampler_mod
 
     monkeypatch.setattr(
         sampler_mod,
@@ -537,12 +522,10 @@ def test_draft_graph_batch_sizes_reads_the_capture_buckets(monkeypatch):
 
 
 def test_an_engine_that_captures_no_buckets_keeps_the_head_eager(monkeypatch):
-    """The static buffers are sized from the largest bucket, so with no buckets
-    there is nothing to size them from. Building against a guessed size would
-    serve a head whose buffers do not match the replay."""
-    from sglang.srt.speculative.lilicorr_components import (
-        lilicorr_draft_sampler as sampler_mod,
-    )
+    """The static buffers are sized from the largest bucket, so with no buckets there is
+    nothing to size them from.
+    """
+    from sglang.srt.speculative import lilicorr_utils as sampler_mod
 
     monkeypatch.setattr(
         sampler_mod, "get_tp_group", lambda: SimpleNamespace(world_size=1)
@@ -561,9 +544,10 @@ def test_an_engine_that_captures_no_buckets_keeps_the_head_eager(monkeypatch):
 
 
 def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
-    """The head must reach the graph fold rather than the eager fallback: eager
-    costs a large fraction of throughput, so a silent demotion would read as a
-    believable but wrong throughput number."""
+    """The head must reach the graph fold rather than the eager fallback: eager costs a
+    large fraction of throughput, so a silent demotion would read as a believable but
+    wrong throughput number.
+    """
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     lm_head = SimpleNamespace(weight=torch.empty(16, 4))
@@ -648,10 +632,10 @@ def test_matched_conv_checkpoint_and_conv_free_parent_both_pass():
 
 
 def test_conv_tensors_with_no_conv_built_raises():
-    """The silent one: dflash_config defaults both geometry keys to 0, so a
-    checkpoint whose config lost them builds no convolution at all and every
-    tensor is dropped without a word. The draft then serves as its conv-free
-    parent at a lower but entirely believable acceptance length."""
+    """The silent one: dflash_config defaults both geometry keys to 0, so a checkpoint
+    whose config lost them builds no convolution at all and every tensor is dropped
+    without a word.
+    """
     with pytest.raises(ValueError, match="built no convolution modules"):
         check_conv_weight_coverage(_FakeDraft(conv=False), _FakeDraft().conv_names())
 
@@ -669,10 +653,6 @@ def test_a_partial_conv_checkpoint_raises():
         check_conv_weight_coverage(draft, _FakeDraft(n_layers=4).conv_names())
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 # --- sampled commit --------------------------------------------------------
 
 
@@ -686,9 +666,10 @@ def _sampled_lattice(bs=2, slots=3, k=4, seed=0):
 
 
 def test_a_greedy_masked_row_walks_the_greedy_path_bit_identically():
-    """The claim every published acceptance number rests on: with the mask set the
-    sampled kernel must commit the same tokens as ``lilicorr_greedy_path``, not
-    merely similar ones."""
+    """The claim every published acceptance number rests on: with the mask set the sampled
+    kernel must commit the same tokens as lilicorr_greedy_path, not merely similar
+    ones.
+    """
     log_start, log_pair, tokens = _sampled_lattice()
     picked, _ = lilicorr_sample_path(
         log_start,
@@ -702,9 +683,9 @@ def test_a_greedy_masked_row_walks_the_greedy_path_bit_identically():
 
 
 def test_the_sampled_commit_converges_on_the_greedy_path_as_temperature_vanishes():
-    """Same claim by the other route, with the mask off: the proposal is
-    ``softmax(psi / T)``, so a vanishing temperature must reproduce the argmax. This
-    is what makes the sampled path a superset rather than a different drafter."""
+    """Same claim by the other route, with the mask off: the proposal is ``softmax(psi /
+    T)``, so a vanishing temperature must reproduce the argmax.
+    """
     log_start, log_pair, tokens = _sampled_lattice(seed=1)
     picked, _ = lilicorr_sample_path(
         log_start,
@@ -718,9 +699,7 @@ def test_the_sampled_commit_converges_on_the_greedy_path_as_temperature_vanishes
 
 
 def test_a_greedy_row_reports_a_point_mass_on_the_token_it_committed():
-    """Verify computes ``min(1, p/q)``. Handing a greedy row its temperature softmax
-    instead of a point mass would make that the wrong test for that row and would
-    perturb the output distribution."""
+    """Verify computes min(1, p/q)."""
     log_start, log_pair, tokens = _sampled_lattice(bs=1, seed=2)
     picked, q = lilicorr_sample_path(
         log_start,
@@ -739,9 +718,9 @@ def test_a_greedy_row_reports_a_point_mass_on_the_token_it_committed():
 
 
 def test_the_proposal_is_a_distribution_over_that_slots_candidates():
-    """Rejection sampling is only lossless if ``q`` is the distribution the token was
-    actually drawn from. A ``q`` correct only up to a renormalization would accept at
-    the wrong rate, silently and in the flattering direction."""
+    """Rejection sampling is only lossless if q is the distribution the token was
+    actually drawn from.
+    """
     log_start, log_pair, tokens = _sampled_lattice(bs=3, slots=4, seed=3)
     _, q = lilicorr_sample_path(
         log_start,
@@ -780,13 +759,8 @@ def test_a_sampling_row_leaves_a_greedy_row_in_the_same_batch_unchanged():
 
 
 def test_the_eager_seam_obeys_the_device_gate_and_not_the_module_flag(monkeypatch):
-    """The worker's gate has to reach the eager seam, not only the folded sampler.
-
-    A decode step lands here whenever the draft graph cannot run the batch, and a
-    proposal published from here goes to the same accept kernel the folded path was
-    gated away from. So the module constant must not be what decides it: the flag is
-    forced on below and the gate still has to win."""
-    from sglang.srt.speculative.lilicorr_components import lilicorr_select
+    """The worker's gate has to reach the eager seam, not only the folded sampler."""
+    from sglang.srt.speculative import lilicorr_utils as lilicorr_select
 
     monkeypatch.setattr(lilicorr_select, "SAMPLING_ENABLED", True)
     monkeypatch.setattr(
@@ -825,3 +799,7 @@ def test_the_eager_seam_obeys_the_device_gate_and_not_the_module_flag(monkeypatc
     )
     assert gated_candidates.shape == (bs, head.num_candidate_slots, head.candidate_topk)
     assert gated_q.shape == gated_candidates.shape
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

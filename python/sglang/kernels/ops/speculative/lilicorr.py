@@ -1,17 +1,12 @@
 """Triton kernels for the LiLiCorr candidate-lattice reranker.
 
-``lilicorr_topk_lse`` returns an exact per-row top-k over the candidate vocab
-logits and the full-vocab log-partition from one pass over ``[n, V]``; a separate
-``topk`` plus a ``logsumexp`` epilogue reads the vocabulary three times and
-materializes two more ``[n, V]`` temporaries, and that read is the single largest
-cost in the block. ``lilicorr_greedy_path`` folds the whole left-to-right commit
-into one launch, where the torch form issues roughly three kernels per slot over
-``[bs, k]`` tensors and is pure launch overhead rather than arithmetic.
-``lilicorr_sample_path`` is that same walk with a sampled commit, emitting the
-per-slot proposal the verify needs to accept it by rejection sampling.
+lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits and
+the full-vocab log-partition from one pass over [n, V]. lilicorr_greedy_path folds the
+whole left-to-right commit into one launch; lilicorr_sample_path is that same walk with
+a sampled commit, emitting the per-slot proposal verify needs to accept it by rejection
+sampling.
 
-Both dispatch to a value-identical torch implementation off CUDA, which is also
-what makes the head exercisable in a CPU unit test.
+All three dispatch to a value-identical torch implementation off CUDA.
 """
 
 from __future__ import annotations
@@ -56,8 +51,8 @@ def _tiled_scan(
 ):
     """One pass over [N, V]: per-tile maxima plus one (m, s) partial per program.
 
-    grid = (N, cdiv(T, TPP)). Each program covers TPP contiguous tiles, so the
-    block is [TPP, TILE] and the tile maxima are a single axis-1 reduction.
+    grid = (N, cdiv(T, TPP)). Each program covers TPP contiguous tiles, so the block is
+    [TPP, TILE] and the tile maxima are a single axis-1 reduction.
     """
     neg = -3.0e38
     row = tl.program_id(0)
@@ -139,10 +134,10 @@ def _greedy_path_kernel(
 ):
     """The whole greedy path for one batch row, tokens included.
 
-    ``c_0 = argmax(log_start)``, then ``c_s = argmax_c pair[s-1, c_{s-1}, c]``.
-    ``tl.argmax`` breaks ties toward the lower index as ``Tensor.argmax`` does, so
-    the committed path matches the torch reference. ``pair`` layout: dim -2
-    ("from") has stride ``lp_sp``, dim -1 ("to") is unit-stride.
+    c_0 = argmax(log_start), then c_s = argmax_c pair[s-1, c_{s-1}, c]. tl.argmax breaks
+    ties toward the lower index as Tensor.argmax does, so the committed path matches the
+    torch reference. pair layout: dim -2 ("from") has stride lp_sp, dim -1 ("to") is
+    unit-stride.
     """
     b = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
@@ -186,25 +181,22 @@ def _topk_lse_torch(
 def lilicorr_topk_lse(
     logits: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact per-row top-k and full-vocab logsumexp from one ``[N, V]`` read.
+    """Exact per-row top-k and full-vocab logsumexp from one [N, V] read.
 
-    Returns ``(vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32)``.
-    The candidate log-prob the head consumes is ``val - lse``.
+    Returns (vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32). The
+    candidate log-prob the head consumes is val - lse.
 
-    The tile pre-selection is exact, not approximate. Let ``e`` be a member of the
-    row's true top-k, lying in tile ``T``; then ``max(T) >= e``. If ``T`` were not
-    among the k tiles with the largest max, k other tiles would each hold an
-    element ``>= max(T) >= e``, so ``e`` has rank > k -- a contradiction.
+    The tile pre-selection is exact, not approximate. Let e be a member of the row's true
+    top-k, lying in tile T; then max(T) >= e. If T were not among the k tiles with the
+    largest max, k other tiles would each hold an element >= max(T) >= e, so e has rank
+    > k, a contradiction.
 
-    Exactness is about the returned *values*. Which of an exactly-tied set of
-    values is returned is unspecified here and in CUDA ``torch.topk`` alike, so
-    the two can select different token ids for the same row -- reachable on bf16
-    logits, where a wide vocabulary rounds several entries together. The tied
-    candidates carry equal log-probs, so the head scores an equally-ranked
-    alternative rather than a wrong one.
+    Exactness is about the returned values. Which of an exactly-tied set is returned is
+    unspecified here and in CUDA torch.topk alike, so the two can select different token
+    ids for the same row; the tied candidates carry equal log-probs.
 
-    ``k`` must be a power of two to take the tiled path, which is enforced at
-    config parse on ``lilicorr_candidate_topk``.
+    k must be a power of two to take the tiled path, enforced at config parse on
+    lilicorr_candidate_topk.
     """
     if not logits.is_cuda:
         return _topk_lse_torch(logits, k)
@@ -301,15 +293,11 @@ def lilicorr_greedy_path(
 ) -> torch.Tensor:
     """Locally-optimal left-to-right decode of the candidate lattice.
 
-    Shapes (single block): ``log_start [bs, k]``, ``log_pair [bs, slots-1, k,
-    k]``, ``candidate_tokens [bs, slots, k]``. Returns the selected tokens ``[bs,
-    slots]``.
+    Shapes (single block): log_start [bs, k], log_pair [bs, slots-1, k, k],
+    candidate_tokens [bs, slots, k]. Returns the selected tokens [bs, slots].
 
-    Commits the argmax candidate at each slot conditioned on the previously
-    committed pick, which matches the locally-normalized training objective:
-    under prefix acceptance, once a slot is wrong nothing after it is accepted,
-    so the global MAP's freedom to trade an early slot for a richer tail has no
-    value. Fixed trip count and no host syncs, so it is CUDA-graph safe.
+    Commits the argmax candidate at each slot conditioned on the previously committed
+    pick. Fixed trip count and no host syncs, so it is CUDA-graph safe.
     """
     if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
         return _greedy_path_torch(log_start, log_pair, candidate_tokens)
@@ -364,17 +352,16 @@ def _sample_path_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """``_greedy_path_kernel`` plus the proposal it sampled from.
+    """_greedy_path_kernel plus the proposal it sampled from.
 
-    Same recurrence and the same loads; the only additions are the per-slot draw and
-    the ``q`` row the verify needs to run rejection sampling. A row with
-    ``greedy_mask`` set takes ``tl.argmax`` on the same fp32 node values as the greedy
-    kernel, so one captured graph serves greedy and sampling batches and the greedy
+    Same recurrence and the same loads, plus the per-slot draw and the q row verify needs
+    for rejection sampling. A row with greedy_mask set takes tl.argmax on the same fp32
+    node values as the greedy kernel, so one captured graph serves both and the greedy
     rows walk a bit-identical path.
 
-    ``q`` for a greedy row is the point mass at its pick, not the temperature softmax:
-    that row's token was chosen deterministically, and telling verify anything else
-    would make ``min(1, p/q)`` the wrong acceptance test for it.
+    q for a greedy row is the point mass at its pick, not the temperature softmax: that
+    token was chosen deterministically, so anything else makes min(1, p/q) the wrong
+    acceptance test for it.
     """
     b = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
@@ -476,23 +463,19 @@ def lilicorr_sample_path(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``lilicorr_greedy_path`` with a sampled commit, plus the proposal it used.
+    """lilicorr_greedy_path with a sampled commit, plus the proposal it used.
 
-    Returns ``(tokens [bs, slots], q_rows [bs, slots, k] fp32)``. ``q_rows[b, s]`` is
-    the distribution slot ``s`` was drawn from, over that slot's ``k`` candidates and
-    zero everywhere else; the caller scatters it into the dense ``q`` the verify
-    kernel reads.
+    Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32). q_rows[b, s] is the
+    distribution slot s was drawn from, over that slot's k candidates and zero elsewhere;
+    the caller scatters it into the dense q the verify kernel reads.
 
-    The proposal is ``softmax(psi_s / T)`` where ``psi_s`` is the head's own log-factor
-    row -- the start factor at slot 0 and the transition row out of the committed
-    predecessor after it. There is deliberately no other term: the shipped
-    configuration ablates the unary factor away and carries no log-prob prior, so
-    adding either here would serve a scoring function the head was not trained with.
+    The proposal is softmax(psi_s / T), psi_s being the head's own log-factor row: the
+    start factor at slot 0 and the transition row out of the committed predecessor after
+    it. No other term, because the head was trained with no unary factor and no log-prob
+    prior.
 
-    Rows with ``greedy_mask`` set take the argmax and report a point mass, so a mixed
-    batch is one launch and the greedy rows are unchanged. As ``T -> 0`` the sampled
-    rows converge on that same argmax, which is what makes this a superset of the
-    greedy path rather than a different drafter.
+    Rows with greedy_mask set take the argmax and report a point mass, so a mixed batch
+    is one launch and the greedy rows are unchanged.
     """
     if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
         return _sample_path_torch(

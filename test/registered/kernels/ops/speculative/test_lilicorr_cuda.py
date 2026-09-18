@@ -1,7 +1,7 @@
 """GPU parity tests for the LiLiCorr Triton kernels.
 
 Both kernel entry points return a value-identical torch implementation for
-non-CUDA input, so on a CPU runner ``test_lilicorr.py`` only ever exercises the
+non-CUDA input, so on a CPU runner test_lilicorr.py only ever exercises the
 reference path and the Triton code is never compiled. These tests pin the two
 against each other on device, which is the only place "value-identical" is
 actually checked.
@@ -49,9 +49,9 @@ def test_tiled_topk_lse_is_exact_against_the_reference(vocab):
 
 
 def test_tiled_topk_lse_is_the_full_vocabulary_log_softmax():
-    """The head consumes ``val - lse``, which must be log_softmax over the whole
-    vocabulary. The tiling is exactly where the partition could silently become
-    partial."""
+    """The head consumes val - lse, which must be log_softmax over the whole
+    vocabulary. The tiling is exactly where the partition could silently become partial.
+    """
     torch.manual_seed(1)
     logits = torch.randn(4, 151936, device="cuda", dtype=torch.float32)
 
@@ -67,12 +67,8 @@ def test_tiled_topk_lse_is_the_full_vocabulary_log_softmax():
 
 
 def test_tiled_topk_lse_survives_bf16_logits():
-    """Production logits are bf16, because they come off the target lm_head.
-
-    Asserted on the selected values, not the tokens: bf16 spacing near the
-    maximum of a 151936-wide row is coarse enough that several entries can round
-    to the same value, and which of an exactly-tied set is returned is
-    unspecified in both implementations.
+    """Production logits are bf16. Asserted on values, not tokens: bf16 spacing near
+    the maximum of a 151936-wide row rounds several entries together.
     """
     torch.manual_seed(2)
     logits = torch.randn(4, 151936, device="cuda", dtype=torch.bfloat16)
@@ -95,10 +91,7 @@ def test_tiled_topk_lse_survives_bf16_logits():
 
 def test_tied_bf16_logits_return_a_valid_selection():
     """Which of an exactly-tied set is returned is unspecified here and in CUDA
-    ``torch.topk`` alike, so the two can name different tokens for the same row.
-    The invariant that does hold, and that the head depends on, is that every
-    returned id really carries the value reported for it and that the values
-    match the reference. Built with deliberate ties rather than hoping for them.
+    torch.topk alike, so the two can name different tokens for the same row.
     """
     torch.manual_seed(6)
     # 64 distinct values over a wide row: every value recurs many times, so the
@@ -115,9 +108,9 @@ def test_tied_bf16_logits_return_a_valid_selection():
 
 
 def test_a_vocabulary_narrower_than_k_tiles_takes_the_exact_reference_path():
-    """When the vocabulary spans fewer than k tiles the lane group cannot be
-    expressed as a power of two, so that case must fall back rather than fail to
-    compile."""
+    """When the vocabulary spans fewer than k tiles the lane group cannot be expressed as a
+    power of two, so that case must fall back rather than fail to compile.
+    """
     torch.manual_seed(3)
     logits = torch.randn(3, 3072, device="cuda", dtype=torch.float32)
 
@@ -162,9 +155,10 @@ def test_fused_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
 
 
 def test_fused_greedy_path_accepts_a_non_unit_stride_last_dim():
-    """The kernel reads the candidate dim contiguously and takes every other dim
-    through a passed stride, so a factor tensor whose last dim is not unit-stride
-    has to be copied first. This pins that copy rather than trusting it."""
+    """The kernel reads the candidate dim contiguously and takes every other dim through a
+    passed stride, so a factor tensor whose last dim is not unit-stride has to be copied
+    first.
+    """
     torch.manual_seed(5)
     bs, slots, topk = 3, 15, 8
     log_start = torch.randn(bs, topk, device="cuda")
@@ -181,10 +175,6 @@ def test_fused_greedy_path_accepts_a_non_unit_stride_last_dim():
     torch.testing.assert_close(actual.cpu(), expected)
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 def _sampled_inputs(bs, slots, k, *, seed=0):
     torch.manual_seed(seed)
     return dict(
@@ -198,9 +188,10 @@ def _sampled_inputs(bs, slots, k, *, seed=0):
 
 
 def test_sampled_path_commits_the_same_ids_as_the_reference():
-    """The committed ids are integers, so there is no tolerance to hide in: the
-    Triton draw and the torch draw must consume the uniforms identically or the two
-    walk different paths from the same random numbers."""
+    """The committed ids are integers, so there is no tolerance to hide in: the Triton draw
+    and the torch draw must consume the uniforms identically or the two walk different
+    paths from the same random numbers.
+    """
     a = _sampled_inputs(6, 5, 8, seed=0)
     tokens, q = lilicorr_sample_path(**a)
     ref_tokens, ref_q = _sample_path_torch(**{k: v.cpu() for k, v in a.items()})
@@ -211,7 +202,7 @@ def test_sampled_path_commits_the_same_ids_as_the_reference():
 
 @pytest.mark.parametrize("k", [1, 2, 4, 16])
 def test_sampled_path_matches_the_reference_at_the_lane_group_edges(k):
-    """``k`` is the Triton lane group, so 1 and 16 are the degenerate and full cases
+    """k is the Triton lane group, so 1 and 16 are the degenerate and full cases
     where an off-by-one in the cumulative-sum draw would show up."""
     a = _sampled_inputs(4, 4, k, seed=k)
     tokens, q = lilicorr_sample_path(**a)
@@ -219,3 +210,7 @@ def test_sampled_path_matches_the_reference_at_the_lane_group_edges(k):
 
     assert torch.equal(tokens.cpu(), ref_tokens)
     torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
