@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
+    init_unified_mamba_pools,
     init_unified_mamba_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1038,6 +1039,84 @@ class TestTriFactorySizing(unittest.TestCase):
         )
         kw.update(over)
         return kw
+
+    def test_mamba_lazy_checkpoint_cleanup(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_parallel
+
+        for tri_pool in (False, True):
+            for lazy in (False, True):
+                for keep_checkpoint in (False, True):
+                    with self.subTest(
+                        tri_pool=tri_pool, lazy=lazy, keep=keep_checkpoint
+                    ):
+                        kw = self._factory_kwargs(
+                            enable_mamba_extra_buffer=True,
+                            enable_mamba_extra_buffer_lazy=lazy,
+                            disable_overlap_schedule=False,
+                            lazy_compaction=True,
+                        )
+                        factory = init_unified_mamba_swa_pools
+                        if not tri_pool:
+                            factory = init_unified_mamba_pools
+                            kw["max_total_num_tokens"] = kw.pop(
+                                "full_max_total_num_tokens"
+                            )
+                            for name in (
+                                "v_head_dim",
+                                "swa_head_num",
+                                "swa_head_dim",
+                                "swa_v_head_dim",
+                                "swa_attention_layer_ids",
+                                "swa_max_total_num_tokens",
+                            ):
+                                kw.pop(name)
+                            kw.update(
+                                is_draft_worker=False,
+                                use_mla_backend=False,
+                                speculative_num_draft_tokens=None,
+                            )
+                        with get_parallel().override(attn_dcp_size=1):
+                            pool = factory(**kw).req_to_token_pool
+                        self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
+                        allocator = pool.mamba_allocator
+                        initial_available = allocator.available_size()
+                        req = SimpleNamespace(
+                            kv=SimpleNamespace(
+                                req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
+                            )
+                        )
+                        pool._alloc_ping_pong_buffer(req)
+                        buf = req.kv.mamba_ping_pong_track_buffer
+                        self.assertEqual(int((buf != -1).sum()), 1 if lazy else 2)
+                        if lazy:
+                            # A decode boundary replaces the old checkpoint and
+                            # leaves its ping-pong entry unallocated (-1).
+                            replacement = allocator.alloc(1)
+                            allocator.free(buf[:1].clone())
+                            pool.set_mamba_ping_pong_slot(req, 0, -1)
+                            pool.set_mamba_ping_pong_slot(req, 1, replacement[0])
+                        else:
+                            pool.set_mamba_ping_pong_slot(req, 1, buf[1])
+                        retained = buf[1:2].clone()
+                        with patch.object(
+                            allocator, "free", wraps=allocator.free
+                        ) as free:
+                            pool.free_mamba_cache(req, 1 if keep_checkpoint else None)
+                            for call in free.call_args_list:
+                                self.assertTrue(bool((call.args[0] >= 0).all()))
+                        self.assertEqual(
+                            allocator.available_size(),
+                            initial_available - int(keep_checkpoint),
+                        )
+                        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+                        if keep_checkpoint:
+                            self.assertTrue(
+                                bool((allocator.translate(retained) >= 0).all())
+                            )
+                            allocator.free(retained)
+                        self.assertEqual(allocator.available_size(), initial_available)
 
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
