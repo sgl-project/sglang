@@ -324,6 +324,7 @@ class TestBuildDsv4KvPoolPassesGate(CustomTestCase):
             qk_nope_head_dim=NOPE_DIM,
             qk_rope_head_dim=ROPE_DIM,
             index_head_dim=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[]),
         )
         kvc.kv_cache_dtype = torch.bfloat16
         kvc.device = "cpu"
@@ -372,6 +373,7 @@ class TestBuildDsv4KvPoolPassesGate(CustomTestCase):
         ):
             kvc._build_dsv4_kv_pool(
                 max_running_requests=2,
+                full_max_total_num_tokens=256,
                 swa_max_total_num_tokens=256,
                 c4_max_total_num_tokens=0,
                 c128_max_total_num_tokens=1,
