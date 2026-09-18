@@ -25,9 +25,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -40,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -61,6 +65,7 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
             moe_quant_config_override = Fp8Config(
@@ -215,6 +220,28 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
                     hidden_states = self.eh_proj(eh_input)
+
+            # Prefill CP + NEXTN: the draft forward calls self.decoder directly and
+            # bypasses DeepseekV2Model.forward, so prepare the DSA CP metadata for
+            # the draft runner's backend here (same pattern as deepseek_v4_nextn.py).
+            use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+            if (
+                use_prefill_cp
+                and is_cp_active(forward_batch)
+                and _is_npu
+                and is_deepseek_dsa(self.config)
+            ):
+                attn_backend = get_attn_backend()
+                if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
+                    attn_backend.prepare_dsa_cp_metadata(forward_batch)
+                    local_positions = getattr(
+                        forward_batch, "dsa_cp_local_positions", None
+                    )
+                    if (
+                        local_positions is not None
+                        and positions.shape[0] == local_positions.shape[0]
+                    ):
+                        forward_batch.positions = positions
 
             residual_batch.start(forward_batch)
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
