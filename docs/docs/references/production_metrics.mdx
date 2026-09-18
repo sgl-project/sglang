@@ -7,65 +7,6 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
-## Diffusion metrics
-
-Enable metrics on an NVIDIA CUDA deployment, for example:
-
-```bash
-sglang serve --model-path black-forest-labs/FLUX.2-klein-4B \
-  --num-gpus 1 --enable-metrics --port 30000
-curl http://localhost:30000/metrics
-```
-
-All diffusion metrics carry `role` and `replica` labels. `replica` is the
-scheduler endpoint; only each DP replica's leader publishes, so TP/SP ranks do
-not multiply request counts. The table lists additional labels.
-
-Metrics are opt-in. Disabled metrics do not scan queues or collect LoRA status.
-Enabled metrics add host-side bookkeeping, not GPU synchronization or collectives.
-
-| Metric | Type | Labels | Description |
-| --- | --- | --- | --- |
-| `sglang:diffusion_num_queue_reqs` | Gauge | none | Original generation requests waiting for their first dispatch. |
-| `sglang:diffusion_num_running_reqs` | Gauge | none | Number of diffusion generation requests dispatched by the scheduler and not yet finished. |
-| `sglang:diffusion_requests_total` | Counter | `status`, `is_warmup` | Completed diffusion generation requests. Dynamic batches are counted per original scheduler request after the merged output is split. |
-| `sglang:diffusion_request_latency_seconds` | Histogram | `status`, `is_warmup` | Scheduler acceptance to completion, excluding HTTP preprocessing, media encoding and response delivery. |
-| `sglang:diffusion_queue_time_seconds` | Histogram | `is_warmup` | Time spent waiting in the diffusion scheduler queue. |
-| `sglang:diffusion_generation_batch_size` | Histogram | `stop_reason` | Generation batch size selected by the diffusion scheduler at dispatch time. |
-| `sglang:diffusion_stage_host_latency_seconds` | Histogram | `stage` | Host wall time around a stage, not GPU kernel execution time. Step labels are normalized to `DenoisingStep`. |
-| `sglang:diffusion_lora_loaded_adapters` | Gauge | none | Number of loaded diffusion LoRA adapters. |
-| `sglang:diffusion_lora_active_modules` | Gauge | none | Number of diffusion modules with active LoRA adapters. |
-| `sglang:diffusion_lora_active_adapters` | Gauge | none | Number of unique active diffusion LoRA adapters. |
-| `sglang:diffusion_lora_module_active` | Gauge | `module` | Whether a diffusion module currently has an active LoRA adapter. |
-
-Request counts refer to original scheduler requests, not generated images,
-denoising steps or distributed shards. `status` is `success` or `error`;
-`is_warmup` is `true` or `false`. Queue and running gauges include warmup.
-Stage observations include warmup and count stage invocations, not requests;
-asynchronous GPU work can complete in a later stage. For synchronized diagnostic
-timings, use `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` separately, accepting its
-synchronization overhead. LoRA gauges update at startup and after LoRA control operations.
-
-In disaggregated serving, the head (`role="server"`) records the original request
-lifecycle, including role handoffs and errors. Queue time ends at the first
-encoder dispatch; intermediate waits remain part of request latency. Workers
-report their own stage and LoRA metrics, not duplicate completed requests.
-The generation-batch histogram currently describes monolithic scheduling only.
-
-Single-host pool mode exposes all child metrics through the head's `/metrics`.
-A scrape aggregates only processes sharing that host's metrics directory.
-For standalone remote roles, pass `--enable-metrics` to each process and scrape
-its `--host`/`--port` as well as the head. Each role serves a metrics-only HTTP
-endpoint. Use a separate, empty `PROMETHEUS_MULTIPROC_DIR` per server launch if
-you set it yourself; otherwise SGLang creates and owns a temporary directory.
-Do not share this directory between independent servers or reuse stale files.
-
-Successful, non-warmup request throughput:
-
-```promql
-sum(rate(sglang:diffusion_requests_total{status="success",is_warmup="false"}[5m]))
-```
-
 ## Language model metrics
 
 Here is an example of the metrics:
@@ -194,6 +135,12 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 # TYPE sglang:spec_num_draft_tokens gauge
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
+
+## Diffusion metrics
+
+SGLang Diffusion exposes request, queue, stage and LoRA metrics with
+`--enable-metrics`. See [Diffusion production metrics](/docs/sglang-diffusion/production_metrics)
+for the metric reference, counting semantics and disaggregated scraping setup.
 
 ## Setup Guide
 
