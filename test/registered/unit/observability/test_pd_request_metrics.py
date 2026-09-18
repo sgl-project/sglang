@@ -1,91 +1,39 @@
 """CPU regression tests executing real metrics methods with Prometheus collectors."""
 
-import ast
 import sys
-from pathlib import Path
-from types import MethodType
+from functools import partial
 from types import SimpleNamespace as NS
 
 import pytest
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-ROOT = Path(__file__).resolve().parents[4]
-SRT = ROOT / "python/sglang/srt"
+COLLECT = TokenizerManager.collect_metrics
 
 
-def load_node(path, class_name, method=None, **symbols):
-    tree = ast.parse(path.read_text())
-    node = next(
-        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
+@pytest.fixture(autouse=True)
+def observability_config(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.observability.metrics_collector.get_observability",
+        lambda: NS(prompt_tokens_buckets=None, generation_tokens_buckets=None),
     )
-    if method:
-        node = next(
-            n
-            for n in node.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and n.name == method
-        )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            node,
-        ],
-        type_ignores=[],
-    )
-    ast.fix_missing_locations(module)
-    namespace = {"__name__": __name__, **symbols}
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace[method or class_name]
-
-
-COLLECT = load_node(
-    SRT / "managers/tokenizer_manager.py",
-    "TokenizerManager",
-    "collect_metrics",
-    DisaggregationMode=NS(PREFILL="prefill"),
-)
-METRICS = SRT / "observability/metrics_collector.py"
 
 
 def collector(role):
     registry = CollectorRegistry()
-    obj = NS(
-        _gauge_cls=lambda **kw: Gauge(registry=registry, **kw),
-        _counter_cls=lambda **kw: Counter(registry=registry, **kw),
-        _histogram_cls=lambda **kw: Histogram(registry=registry, **kw),
-    )
-    init = load_node(
-        METRICS,
-        "TokenizerMetricsCollector",
-        "__init__",
-        generate_buckets=lambda supplied, default: supplied or default,
-        get_observability=lambda: NS(
-            prompt_tokens_buckets=None, generation_tokens_buckets=None
-        ),
-    )
-    init(
-        obj,
-        server_args=NS(prompt_tokens_buckets=None, generation_tokens_buckets=None),
-        labels={"engine_type": role},
-    )
-    for method in (
-        "observe_time_to_first_token",
-        "observe_inter_token_latency",
-        "observe_finished_outcome",
-        "observe_one_finished_request",
-    ):
-        setattr(
-            obj,
-            method,
-            MethodType(load_node(METRICS, "TokenizerMetricsCollector", method), obj),
-        )
-    return registry, obj
+
+    class Collector(TokenizerMetricsCollector):
+        _counter_cls = staticmethod(partial(Counter, registry=registry))
+        _gauge_cls = staticmethod(partial(Gauge, registry=registry))
+        _histogram_cls = staticmethod(partial(Histogram, registry=registry))
+
+    return registry, Collector(labels={"engine_type": role})
 
 
 def request(role, *, stream=False, tokens=101, reason="length", finished=True):
@@ -104,7 +52,7 @@ def request(role, *, stream=False, tokens=101, reason="length", finished=True):
     )
     manager = NS(
         metrics_collector=metrics,
-        disaggregation_mode=role,
+        disaggregation_mode=DisaggregationMode(role),
         enable_priority_scheduling=False,
         _request_has_grammar=lambda obj: False,
     )
