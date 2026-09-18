@@ -134,6 +134,13 @@ class GigaChat35Detector(BaseFormatDetector):
         self._emitted_invokes = len(matches)
         return StreamingParseResult(calls=calls)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        result = self.parse_streaming_increment("", tools)
+        leftover, self._buffer = self._buffer, ""
+        if leftover and not self._tool_region_started:
+            result.normal_text += leftover
+        return result
+
     def supports_structural_tag(self) -> bool:
         """GigaChat 3.5 GCML does not use structural tags."""
         return False
