@@ -2088,20 +2088,40 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        # Must equal self.pool_page_size, the page_size the
-                        # actual tensor (_build_hybrid_linear_kv_pool et al.)
-                        # was built with -- see pool_page_size's own docstring
-                        # ("a pool must page as its allocator does, or its
-                        # last page falls short"). That property only widens
-                        # by dcp_size for draft workers; using
-                        # attn_dcp_size unconditionally here paged the
-                        # allocator wider than the underlying buffer for
-                        # target workers, so alloc() eventually returned rows
-                        # past the buffer's last valid index (caught by the
-                        # external-cache-linker's own bounds check).
+                        # DCP-WIDENED on purpose. This allocator hands out
+                        # virtual locs, not rows: every consumer that turns a
+                        # loc into a row collapses it by attn_dcp_size
+                        # (`rebind_write_loc`, `translate_dcp_read_ids`,
+                        # `set_mla_kv_buffer_dcp_sharded_triton`), and the
+                        # radix tree pages at the widened page_size too.
+                        #
+                        # Do NOT narrow this to (max_total_num_tokens,
+                        # pool_page_size) to silence an out-of-bounds row: the
+                        # page count is identical either way, so narrowing only
+                        # shrinks the loc space by dcp_size and strands 7/8 of
+                        # the KV tensor -- measured at conc=48 as gpu_cache_hit
+                        # 0.154 -> 0.033 with the deficit pushed onto the host
+                        # tier, and input throughput 43k -> 17k tok/s. The
+                        # widened top row lands exactly on the buffer's last
+                        # valid index: (max_total*dcp + page*dcp - 1) // dcp ==
+                        # max_total + page - 1, and the pool is padded by
+                        # pool_page_size == page. An out-of-bounds row here
+                        # means a consumer skipped the collapse, not that this
+                        # geometry is wrong.
+                        #
+                        # Both worker kinds share ONE allocator and so one loc
+                        # space, but `_derive_pool_sizes` has already applied
+                        # loc_space_scale (dcp_size for a replicated draft, 1
+                        # for the sharded target). Make up only the remaining
+                        # factor: multiplying by attn_dcp_size unconditionally
+                        # double-scales a draft worker to dcp_size**2, which is
+                        # what the pre-fix code did.
+                        loc_span = (
+                            get_parallel().attn_dcp_size // self.loc_space_scale
+                        )
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens,
-                            page_size=self.pool_page_size,
+                            sizes.max_total_num_tokens * loc_span,
+                            page_size=self.pool_page_size * loc_span,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
