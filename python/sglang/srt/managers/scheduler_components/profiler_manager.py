@@ -469,7 +469,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_stages,
                 )
             else:
-                self._init_profile(
+                result = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -482,6 +482,8 @@ class SchedulerProfilerManager:
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
                 )
+                if not result.success:
+                    return result
                 return self._start_profile()
         else:
             return self._stop_profile()
