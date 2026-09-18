@@ -10,6 +10,8 @@ the llama3 parser, e2e and offline).
 
 import json
 
+import pytest
+
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -54,7 +56,9 @@ WEATHER_PARAMS = {
 class TestNamedToolChoiceConstraint(CustomTestCase):
     def _named_constraint(self, tools, name):
         parser = FunctionCallParser(tools, "llama3")
-        tool_choice = ToolChoice(type="function", function=ToolChoiceFuncName(name=name))
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name=name)
+        )
         constraint = parser.get_structure_constraint(
             tool_choice, parallel_tool_calls=False
         )
@@ -113,6 +117,6 @@ class TestNamedToolChoiceConstraint(CustomTestCase):
 
 
 if __name__ == "__main__":
-    from unittest import main
+    import sys
 
-    main()
+    sys.exit(pytest.main([__file__]))
