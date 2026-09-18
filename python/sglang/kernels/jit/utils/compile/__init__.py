@@ -29,7 +29,7 @@ from sglang.kernels.jit.utils.compile.paths import (
     KERNEL_PATH,
 )
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
-from sglang.kernels.jit.utils.compile.toolchain import cuda_home, cuda_stubs_dir
+from sglang.kernels.jit.utils.compile.toolchain import cuda_stubs_dir
 
 __all__ = [
     "BuildSpec",
@@ -40,7 +40,6 @@ __all__ = [
     "DEFAULT_INCLUDE",
     "DEFAULT_LDFLAGS",
     "KERNEL_PATH",
-    "cuda_home",
     "cuda_stubs_dir",
     "load_jit",
     "make_cpp_args",

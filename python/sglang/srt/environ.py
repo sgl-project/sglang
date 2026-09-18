@@ -1536,7 +1536,7 @@ class Envs:
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
-    # Requires the mxfp8 wo_b epilogue; see MQALayer.use_fused_wo_a.
+    # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py

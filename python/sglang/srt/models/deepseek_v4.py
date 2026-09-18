@@ -1181,8 +1181,8 @@ class MQALayer(MqaAttentionBase):
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
-        # Everything the megakernel needs except the token count and the mxfp8
-        # wo_b epilogue, which only reports ready after its weights are loaded.
+        # Static eligibility; token count and wo_b's output format are checked
+        # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
             and envs.SGLANG_DSV41_FUSED_WO_A.get()

@@ -16,7 +16,6 @@ from sglang.kernels.jit.utils.common import (
 )
 from sglang.kernels.jit.utils.compile import (
     KERNEL_PATH,
-    cuda_home,
     cuda_stubs_dir,
     load_jit,
     make_cpp_args,
@@ -32,7 +31,6 @@ __all__ = [
     "is_musa_runtime",
     "make_cpp_args",
     "load_jit",
-    "cuda_home",
     "cuda_stubs_dir",
     "override_jit_cuda_arch",
     "get_jit_cuda_arch",

@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 GROUPS = 2
-GROUP_K = 4096
 RANK = 1024
 N_OUT = GROUPS * RANK
 SCALE_BYTES = 8192
@@ -39,7 +38,7 @@ def fused_rope_wo_a_bf16(
     *,
     out_mxfp8: bool = True,
 ) -> Sequence[torch.Tensor]:
-    """Apply inverse rope + bf16 wo_a"""
+    """Inverse RoPE + BF16 WO-A, returning BF16 or FlashInfer-swizzled MXFP8."""
     num_tokens = x.shape[0]
     assert num_tokens <= MAX_M
     max_tokens = 16 if num_tokens <= 16 else 32

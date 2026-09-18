@@ -60,29 +60,12 @@ cp_async_bulk_tensor_2d(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, i
       : "memory");
 }
 
-// smem -> peer smem, crediting the peer's mbarrier transaction count. This is
-// the split-K reduction hop: producers push and leave, and the consumer waits
-// on bytes rather than on peers, so no cluster.sync() is needed.
-SGL_DEVICE void cp_async_bulk_to_peer(uint32_t dst_dsmem, uint32_t src_smem, uint32_t bytes, uint32_t dst_bar) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes"
-      " [%0], [%1], %2, [%3];" ::"r"(dst_dsmem),
-      "r"(src_smem),
-      "r"(bytes),
-      "r"(dst_bar)
-      : "memory");
-}
-
+// Push partial sums into a peer's inbox and credit its mbarrier byte count.
 SGL_DEVICE void st_async_b32(uint32_t dst_dsmem, float value, uint32_t dst_bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(dst_dsmem),
                "f"(value),
                "r"(dst_bar)
                : "memory");
-}
-
-SGL_DEVICE void bulk_commit_and_drain() {
-  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-  asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 
 // Generic stores land in a different proxy than the one the MMA and the bulk
@@ -311,7 +294,6 @@ struct WoATrait {
   static constexpr int kTokPerRank = (kMMax + kSplitK - 1) / kSplitK;
   static constexpr int kEpiWarps = kTokPerRank;
   static constexpr int kCleanupWarp = kWarps / 2;
-  static constexpr int kInboxBytes = kSplitK * kTokPerRank * kNTile * 4;
 
   // The RoPE window is a head's trailing 64 lanes == that head's last K-tile.
   static constexpr bool is_rope_stage(int s) {
@@ -409,7 +391,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
   extern __shared__ Smem smem_raw[];
   Smem& smem = smem_raw[0];
   enum Warp : uint32_t { TMA_W = 0, TMA_X = 1, TMA_ROPE = 2, MMA = 3, ROPE = 4 };
-  enum Barrier : uint32_t { BAR_ROPE = 1, BAR_MBAR = 2, BAR_MBAR_MMA = 3 };
+  enum Barrier : uint32_t { BAR_MBAR = 2, BAR_MBAR_MMA = 3 };
   constexpr int kRopeWarps = kWarps - ROPE;
   constexpr int kRopeThreads = kRopeWarps * device::kWarpThreads;
 
@@ -554,7 +536,6 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
       }
       // The MMA reads smem through the async proxy; the rope wrote it generically.
       ptx::fence_proxy_async_shared();
-      // ptx::bar_sync(BAR_ROPE, kRopeThreads);
       ptx::mbar_arrive(&smem.x_ready[s]);
     }
   }
