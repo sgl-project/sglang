@@ -89,9 +89,7 @@ class PagedKVManager(ParamsBase):
             order=(1, 0),
         )
         val_layout = cute.make_layout((1, async_copy_elems))
-        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(
-            atom_async_copy, thr_layout, val_layout
-        )
+        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         page_entry_per_thread = n_block_size // num_threads
 
@@ -181,13 +179,10 @@ class PagedKVManager(ParamsBase):
             )
             row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = divmod(
-                row_idx + self.leftpad_k, self.page_size_divmod
-            )
+            page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
 
             is_valid = (
-                (i + 1) * self.num_threads <= self.n_block_size
-                or row < self.n_block_size
+                (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
             ) and row_idx < self.seqlen_k
             page = self.mPageTable[page_idx] if is_valid else 0
 
@@ -205,13 +200,9 @@ class PagedKVManager(ParamsBase):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(transposed):
-                tPrXPtr[i] = utils.elem_pointer(
-                    mX, (d_offset, page_offset, page)
-                ).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (d_offset, page_offset, page)).toint()
             else:
-                tPrXPtr[i] = utils.elem_pointer(
-                    mX, (page_offset, d_offset, page)
-                ).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (page_offset, d_offset, page)).toint()
         return tPrXPtr
 
     @cute.jit
@@ -225,9 +216,7 @@ class PagedKVManager(ParamsBase):
             ),
         )
         if const_expr(K_or_V == "V"):
-            sX_pi = cute.make_tensor(
-                sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0])
-            )
+            sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
         return sX_pi
 
     @cute.jit
@@ -244,9 +233,7 @@ class PagedKVManager(ParamsBase):
             ki = tXcX[0, 0, k][1] // self.async_copy_elems
             mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
             tXsX_k = tXsX[None, m, k]
-            mX_paged_cur_copy_ki = cute.make_tensor(
-                mX_paged_cur_copy_ki.iterator, tXsX_k.layout
-            )
+            mX_paged_cur_copy_ki = cute.make_tensor(mX_paged_cur_copy_ki.iterator, tXsX_k.layout)
             cute.copy(
                 self.gmem_tiled_copy_KV,
                 mX_paged_cur_copy_ki,
@@ -261,13 +248,9 @@ class PagedKVManager(ParamsBase):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(K_or_V == "K"):
-                tPrXPtr[i] = utils.elem_pointer(
-                    self.mSFK_paged, (page_offset, 0, page)
-                ).toint()
+                tPrXPtr[i] = utils.elem_pointer(self.mSFK_paged, (page_offset, 0, page)).toint()
             else:
-                tPrXPtr[i] = utils.elem_pointer(
-                    self.mSFV_paged, (0, page_offset, page)
-                ).toint()
+                tPrXPtr[i] = utils.elem_pointer(self.mSFV_paged, (0, page_offset, page)).toint()
         return tPrXPtr
 
     @cute.jit
@@ -284,20 +267,14 @@ class PagedKVManager(ParamsBase):
         else:
             sX_pi = self._flatten_smem_sm100(sX, K_or_V)
 
-        head_dim = (
-            self.head_dim_v_padded
-            if const_expr(K_or_V == "V")
-            else self.head_dim_padded
-        )
+        head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
         tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
 
         seqlenk_row_limit = (
-            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
-            if n_block >= 0
-            else 0
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
         )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
@@ -316,26 +293,20 @@ class PagedKVManager(ParamsBase):
                 assumed_align=16,
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
-            mX_paged_cur_copy = cute.tiled_divide(
-                mX_paged_cur, (self.async_copy_elems,)
-            )
+            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
             self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
 
     @cute.jit
     def load_sf_KV(self, n_block: Int32, sSFX: cute.Tensor, K_or_V: str):
         # sSFX expected as SFK or SFV
-        assert (
-            cute.rank(sSFX) == 3
-        ), f"mismatched rank for sSFX, expected 3 but got {cute.rank(sSFX)}"
+        assert cute.rank(sSFX) == 3, (
+            f"mismatched rank for sSFX, expected 3 but got {cute.rank(sSFX)}"
+        )
         assert self.gmem_thr_copy_sf_KV is not None
         # sSFK:  tensor<ptr<f8E8M0FNU, smem, align<1024>> o ((((32,4),1),(32,1)),1,4,2):((((16,4),0),(0,0)),0,1,512)>
         # sSFV:  tensor<ptr<f8E8M0FNU, smem, align<1024>> o ((((32,4),1),(32,1)),1,4,2):((((16,4),0),(0,0)),0,1,512)>
 
-        head_dim = (
-            self.head_dim_v_padded
-            if const_expr(K_or_V == "V")
-            else self.head_dim_padded
-        )
+        head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
 
         sSFX_cpt = cute.filter_zeros(sSFX)
         sSFX_cpt_shape_nd = (self.n_block_size, head_dim // 32)
@@ -353,22 +324,16 @@ class PagedKVManager(ParamsBase):
         tXc0X = self.gmem_thr_copy_sf_KV.get_slice(0).partition_S(cX)
 
         seqlenk_row_limit = (
-            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
-            if n_block >= 0
-            else 0
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
         )
 
         tPrSFXPtr = self.compute_sf_X_ptr(K_or_V)
-        assert cute.size(tPrSFXPtr) == cute.size(
-            tXsX, mode=[1]
-        ), "SFX pointer size mismatch"
+        assert cute.size(tPrSFXPtr) == cute.size(tXsX, mode=[1]), "SFX pointer size mismatch"
 
         # loop over rows
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
-            should_load = cute.make_fragment_like(
-                tXsX[(0, None), m, None], cute.Boolean
-            )
+            should_load = cute.make_fragment_like(tXsX[(0, None), m, None], cute.Boolean)
             should_load.fill(row_valid)
 
             # Make gmem tensor of size (4,) using tPrSFXPtr
@@ -382,9 +347,9 @@ class PagedKVManager(ParamsBase):
             )
             sf_frg_layout = cute.make_layout(((head_dim // 32, 1), 1))
             mSFX_paged_cur = cute.make_tensor(sfx_gmem_ptr, sf_frg_layout)
-            assert cute.size(mSFX_paged_cur) == cute.size(
-                tXsX[None, 0, None]
-            ), "SFX gmem-smem tensor size mismatch"
+            assert cute.size(mSFX_paged_cur) == cute.size(tXsX[None, 0, None]), (
+                "SFX gmem-smem tensor size mismatch"
+            )
             cute.copy(
                 self.gmem_tiled_copy_sf_KV,
                 mSFX_paged_cur,

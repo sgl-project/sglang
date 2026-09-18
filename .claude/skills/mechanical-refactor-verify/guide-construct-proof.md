@@ -143,10 +143,18 @@ r = Repro(base="<base_sha>", target="<commit>")
 # Adapt call sites / repath imports BEFORE moving, so a call to a moved method from inside
 # another moved method is lowered while still in the source and travels with the body.
 r.lower_call_sites("update_weights_from_ipc", "ModelRunner", paths=["a.py", "b.py"])
-r.remove_import("a.py", "from x import ModelRunner", in_function="update_weights_from_ipc")
-r.move_symbol("update_weights_from_ipc", src="a.py", dst="dst.py", into_class="WeightUpdater", dedent=0)
+r.remove_import(
+    "a.py", "from x import ModelRunner", in_function="update_weights_from_ipc"
+)
+r.move_symbol(
+    "update_weights_from_ipc",
+    src="a.py",
+    dst="dst.py",
+    into_class="WeightUpdater",
+    dedent=0,
+)
 r.add_import("dst.py", "import gc")
-r.run()   # PASS = byte-identical; otherwise prints the residual
+r.run()  # PASS = byte-identical; otherwise prints the residual
 ```
 
 ### 2.4 A hand-written transform for a non-relocation mechanical change
@@ -160,10 +168,14 @@ import sys
 from pathlib import Path
 
 sys.path.append(".claude/skills/mechanical-refactor-verify/scripts")
-from mechanical_refactor_reproduction_utils import verify_mechanical_refactor, git_add_and_commit
+from mechanical_refactor_reproduction_utils import (
+    verify_mechanical_refactor,
+    git_add_and_commit,
+)
 
 BASE_COMMIT = "<base_sha>"
 TARGET_COMMIT = "<final_sha>"
+
 
 def transform(dir_root: Path) -> None:
     source = dir_root / "path/to/source.py"
@@ -175,6 +187,7 @@ def transform(dir_root: Path) -> None:
     source.unlink()
     git_add_and_commit("split source.py", cwd=str(dir_root))
     # A rename is just: for each file, write content.replace(OLD, NEW); commit.
+
 
 if __name__ == "__main__":
     verify_mechanical_refactor(BASE_COMMIT, TARGET_COMMIT, transform)

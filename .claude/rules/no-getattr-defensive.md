@@ -23,7 +23,7 @@ it defensively is confusing and masks real bugs. Prefer:
    field should always exist, so a `None` / non-`None` check is enough:
 
    ```python
-   obj.field = None   # in __init__ / construction
+   obj.field = None  # in __init__ / construction
    ...
    if obj.field is not None:
        ...
@@ -33,7 +33,7 @@ Bad — `server_args` always has `revision`, so `getattr` is misleading and swal
 a real `AttributeError` if the field is ever renamed:
 
 ```python
-revision=getattr(server_args, "revision", None),   # BAD
-revision=server_args.revision,                     # GOOD
+revision = (getattr(server_args, "revision", None),)  # BAD
+revision = (server_args.revision,)  # GOOD
 ```
 (see `python/sglang/srt/managers/template_detection.py`)

@@ -24,10 +24,7 @@ def cvt_copy(
     ip=None,
     **kwargs,
 ) -> None:
-    assert (
-        isinstance(src.iterator, cute.Pointer)
-        and src.memspace == cute.AddressSpace.rmem
-    )
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
         src_cvt = cute.make_fragment_like(src, dst.element_type, loc=loc, ip=ip)
         src_cvt.store(src.load().to(dst.element_type))
@@ -244,9 +241,7 @@ def cpasync_bulk_s2cluster(
     smem_dst_ptr_i32 = set_block_rank(
         smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
     ).ir_value()
-    mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
+    mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
         [
@@ -359,15 +354,9 @@ def tma_get_copy_fn(
         isinstance(src_tensor.iterator, cute.Pointer)
         and src_tensor.memspace == cute.AddressSpace.smem
     )
-    smem_tensor, gmem_tensor = (
-        (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
-    )
-    group_rank_smem = const_expr(
-        cute.rank(smem_tensor) - (1 if not single_stage else 0)
-    )
-    group_rank_gmem = const_expr(
-        cute.rank(gmem_tensor) - (1 if not single_stage else 0)
-    )
+    smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
+    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     s, g = cpasync.tma_partition(
         atom,

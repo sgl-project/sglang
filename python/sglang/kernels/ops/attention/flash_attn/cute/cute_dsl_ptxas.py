@@ -140,17 +140,15 @@ def patch():
     global _original_load_cuda_library, _user_wanted_ptx
 
     assert CUTE_DSL_PTXAS_PATH is not None
-    if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(
-        CUTE_DSL_PTXAS_PATH, os.X_OK
-    ):
+    if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
         raise RuntimeError(f"ptxas not found: {CUTE_DSL_PTXAS_PATH}")
 
     # Track if user originally wanted PTX kept
     _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
     # os.environ['CUTE_DSL_KEEP_PTX'] = '1'
-    assert (
-        os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
-    ), "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
+    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", (
+        "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
+    )
 
     cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction
     _original_load_cuda_library = cls._load_cuda_library

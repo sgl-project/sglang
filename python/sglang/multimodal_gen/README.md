@@ -47,6 +47,7 @@ Here's a minimal example to generate a video using the default settings:
 ```python
 from sglang.multimodal_gen import DiffGenerator
 
+
 def main():
     # Create a diff generator from a pre-trained model
     generator = DiffGenerator.from_pretrained(
@@ -60,11 +61,12 @@ def main():
             prompt="A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest.",
             return_frames=True,  # Also return frames from this call (defaults to False)
             output_path="my_videos/",  # Controls where videos are saved
-            save_output=True
+            save_output=True,
         )
     )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
 ```
 

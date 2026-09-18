@@ -834,9 +834,9 @@ def moba_attn_varlen(
         dim=0,
     ).to(torch.int32)
 
-    assert (
-        moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape
-    ), f"Mismatch between moba_cu_seqlen_kv.shape and moba_cu_seqlen_q.shape: {moba_cu_seqlen_kv.shape} vs {moba_cu_seqlen_q.shape}"
+    assert moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape, (
+        f"Mismatch between moba_cu_seqlen_kv.shape and moba_cu_seqlen_q.shape: {moba_cu_seqlen_kv.shape} vs {moba_cu_seqlen_q.shape}"
+    )
 
     return MixedAttention.apply(
         q,
@@ -872,14 +872,16 @@ def process_moba_input(
     if isinstance(chunk_size, float) or isinstance(chunk_size, int):
         moba_chunk_size = int(chunk_size * patch_resolution[1] * patch_resolution[2])
     else:
-        assert isinstance(
-            chunk_size, (Tuple, list)
-        ), f"chunk_size should be a tuple, list, or int, now it is: {type(chunk_size)}"
+        assert isinstance(chunk_size, (Tuple, list)), (
+            f"chunk_size should be a tuple, list, or int, now it is: {type(chunk_size)}"
+        )
         if len(chunk_size) == 2:
             assert (
                 patch_resolution[1] % chunk_size[0] == 0
                 and patch_resolution[2] % chunk_size[1] == 0
-            ), f"spatial patch_resolution {patch_resolution[1:]} should be divisible by 2d chunk_size {chunk_size}"
+            ), (
+                f"spatial patch_resolution {patch_resolution[1:]} should be divisible by 2d chunk_size {chunk_size}"
+            )
             nch, ncw = (
                 patch_resolution[1] // chunk_size[0],
                 patch_resolution[2] // chunk_size[1],
@@ -899,7 +901,9 @@ def process_moba_input(
                 patch_resolution[0] % chunk_size[0] == 0
                 and patch_resolution[1] % chunk_size[1] == 0
                 and patch_resolution[2] % chunk_size[2] == 0
-            ), f"patch_resolution {patch_resolution} should be divisible by 3d chunk_size {chunk_size}"
+            ), (
+                f"patch_resolution {patch_resolution} should be divisible by 3d chunk_size {chunk_size}"
+            )
             nct, nch, ncw = (
                 patch_resolution[0] // chunk_size[0],
                 patch_resolution[1] // chunk_size[1],

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
+
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -528,10 +529,18 @@ def capture_prefill_graph(
         head_dim = getattr(model_runner.model_config, "head_dim", 128)
         tp_size = get_parallel().tp_size
         # Rough transient budget: tokens * heads * dim * 2 (K,V) * 2 bytes * num_attention_layers
-        num_attention_layers = sum(layer is not None for layer in model_runner.attention_layers)
-        transient_bytes = max_capture_tokens * (num_kv_heads // tp_size) * head_dim * 4 * num_attention_layers
-        transient_gb = transient_bytes / (1024 ** 3)
-        
+        num_attention_layers = sum(
+            layer is not None for layer in model_runner.attention_layers
+        )
+        transient_bytes = (
+            max_capture_tokens
+            * (num_kv_heads // tp_size)
+            * head_dim
+            * 4
+            * num_attention_layers
+        )
+        transient_gb = transient_bytes / (1024**3)
+
         if after_mem < transient_gb:
             logger.warning(
                 f"Auto-disabling {capture_name} CUDA graph: free VRAM ({after_mem:.2f} GB) "
@@ -541,9 +550,10 @@ def capture_prefill_graph(
             del prefill_runner
             if model_runner.device == "cuda":
                 import gc
+
                 gc.collect()
                 torch.cuda.empty_cache()
-            
+
             return result(eager_runner, mem_usage, capture_time)
 
     return result(prefill_runner, mem_usage, capture_time)

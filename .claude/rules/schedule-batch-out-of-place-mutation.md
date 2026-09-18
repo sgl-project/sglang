@@ -18,7 +18,9 @@ self.extend_lens[i] -= encoder_len
 # Good
 self.reqs = self.reqs + other.reqs
 self.seq_lens = self.seq_lens + 1
-lens = self.extend_lens[:]; lens[i] -= encoder_len; self.extend_lens = lens  # loop a copy, rebind once
+lens = self.extend_lens[:]
+lens[i] -= encoder_len
+self.extend_lens = lens  # loop a copy, rebind once
 ```
 
 Why: `copy()` snapshots and the overlap scheduler's queued references rely on old

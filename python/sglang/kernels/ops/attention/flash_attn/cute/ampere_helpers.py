@@ -5,20 +5,14 @@ import cutlass
 import cutlass.cute as cute
 
 
-def get_smem_layout_atom(
-    dtype: Type[cutlass.Numeric], k_dim: int
-) -> cute.ComposedLayout:
+def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int) -> cute.ComposedLayout:
     dtype_byte = cutlass.const_expr(dtype.width // 8)
     bytes_per_row = cutlass.const_expr(k_dim * dtype_byte)
     smem_k_block_size = (
         cutlass.const_expr(
             128
             if bytes_per_row % 128 == 0
-            else (
-                64
-                if bytes_per_row % 64 == 0
-                else (32 if bytes_per_row % 32 == 0 else 16)
-            )
+            else (64 if bytes_per_row % 64 == 0 else (32 if bytes_per_row % 32 == 0 else 16))
         )
         // dtype_byte
     )
@@ -72,13 +66,9 @@ def gemm(
         tCrA_copy_view = smem_thr_copy_A.retile(tCrA)
         tCrB_copy_view = smem_thr_copy_B.retile(tCrB)
         if cutlass.const_expr(not A_in_regs):
-            cute.copy(
-                smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0]
-            )
+            cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
         if cutlass.const_expr(not B_in_regs):
-            cute.copy(
-                smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0]
-            )
+            cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
         for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
             if k < cute.size(tCsA.shape[2]) - 1:
                 if cutlass.const_expr(not A_in_regs):

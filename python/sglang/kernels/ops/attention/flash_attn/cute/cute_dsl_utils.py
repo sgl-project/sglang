@@ -33,9 +33,7 @@ torch2cute_dtype_map = {
 
 @lru_cache
 def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(
-        cluster_size=cluster_size
-    )
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
 @lru_cache
@@ -51,9 +49,7 @@ def assume_strides_aligned(t, align=16):
     since they're static and don't need alignment assumptions.
     """
     divby = (align * 8) // t.element_type.width
-    strides = tuple(
-        s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1]
-    )
+    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
     return (*strides, t.stride[-1])
 
 
@@ -67,9 +63,7 @@ def assume_tensor_aligned(t, align=16):
     )
 
 
-def to_cute_tensor(
-    t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True
-):
+def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
@@ -83,14 +77,10 @@ def to_cute_tensor(
             enable_tvm_ffi=enable_tvm_ffi,
         )
         tensor.element_type = (
-            cutlass.Float8E4M3FN
-            if t.dtype == torch.float8_e4m3fn
-            else cutlass.Float8E5M2
+            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
         )
     else:
-        tensor = from_dlpack(
-            t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi
-        )
+        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -146,15 +136,11 @@ def dump_kernel_attributes(compiled_kernel):
     device_id = torch.cuda.current_device()
     hardware_info = HardwareInfo(device_id=device_id)
     cubin_data = compiled_kernel.artifacts.CUBIN
-    assert (
-        cubin_data is not None
-    ), "cubin_data is None, need '--keep-cubin' option when compiling"
+    assert cubin_data is not None, "cubin_data is None, need '--keep-cubin' option when compiling"
     cuda_library = hardware_info._checkCudaErrors(
         driver.cuLibraryLoadData(cubin_data, None, None, 0, None, None, 0)
     )
-    kernels = hardware_info._checkCudaErrors(
-        driver.cuLibraryEnumerateKernels(1, cuda_library)
-    )
+    kernels = hardware_info._checkCudaErrors(driver.cuLibraryEnumerateKernels(1, cuda_library))
     kernel = hardware_info._checkCudaErrors(driver.cuKernelGetFunction(kernels[0]))
     # more metrics: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g5e92a1b0d8d1b82cb00dcfb2de15961b
     local_size_bytes = hardware_info._checkCudaErrors(

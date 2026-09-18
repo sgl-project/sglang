@@ -226,12 +226,14 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 
 @dataclass
 class MyModelDitConfig(DiTConfig):
-    arch_config: dict = field(default_factory=lambda: {
-        "in_channels": 16,
-        "num_layers": 24,
-        "patch_size": 2,
-        # ... model-specific architecture params ...
-    })
+    arch_config: dict = field(
+        default_factory=lambda: {
+            "in_channels": 16,
+            "num_layers": 24,
+            "patch_size": 2,
+            # ... model-specific architecture params ...
+        }
+    )
 ```
 
 **VAE Config** (`configs/models/vaes/{model_name}.py`):
@@ -442,9 +444,7 @@ class MyModelBeforeDenoisingStage(PipelineStage):
         )
 
         # 3. Prepare timesteps
-        timesteps, sigmas = self._prepare_timesteps(
-            batch.num_inference_steps, device
-        )
+        timesteps, sigmas = self._prepare_timesteps(batch.num_inference_steps, device)
 
         # 4. Populate batch with everything DenoisingStage needs
         batch.prompt_embeds = [prompt_embeds]

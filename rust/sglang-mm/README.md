@@ -120,10 +120,10 @@ from sglang.srt.rust_extensions._multimodal import common, inkling
 # Common (model-agnostic)
 common.resize_rgb(arr, out_w, out_h)
 common.scaled_dims(w, h, rescale_frac, rescale_cap)
-common.image_decode_rgb(bytes)          # -> (h, w, ndarray)
-common.content_hash(bytes)              # -> u64 (blake3, truncated)
-common.fetch_bytes(source)              # -> bytes (data:/base64/file/http)
-common.base64_decode(str)               # -> bytes
+common.image_decode_rgb(bytes)  # -> (h, w, ndarray)
+common.content_hash(bytes)  # -> u64 (blake3, truncated)
+common.fetch_bytes(source)  # -> bytes (data:/base64/file/http)
+common.base64_decode(str)  # -> bytes
 
 # Model-specific
 inkling.preprocess_images(list[bytes], ps, frac, cap)  # -> [(h, w, bits, hash), ...]

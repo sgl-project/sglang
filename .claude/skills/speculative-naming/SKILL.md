@@ -93,12 +93,12 @@ The semantic differs by scope:
 Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.).
 
 ```python
-accept_tokens: torch.Tensor     # [total_accepted] flat - plural
-accept_indices: torch.Tensor    # [bs, num_draft_tokens] - plural
-draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - plural
-bonus_tokens: torch.Tensor      # [bs] - plural
-accept_token = tl.load(...)     # int32 scalar in a kernel iteration - singular
-bonus_token = tl.load(...)      # int32 scalar inside a kernel - singular
+accept_tokens: torch.Tensor  # [total_accepted] flat - plural
+accept_indices: torch.Tensor  # [bs, num_draft_tokens] - plural
+draft_tokens: torch.Tensor  # [bs * num_draft_tokens] flat - plural
+bonus_tokens: torch.Tensor  # [bs] - plural
+accept_token = tl.load(...)  # int32 scalar in a kernel iteration - singular
+bonus_token = tl.load(...)  # int32 scalar inside a kernel - singular
 ```
 
 ## Out of scope (these names stay as is)

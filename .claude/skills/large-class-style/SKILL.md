@@ -39,15 +39,16 @@ Every statement refers to a collaborator and is one of:
 
 ```python
 # model_runner.py — orchestration only.
-def init_foo(self):                        # construct
+def init_foo(self):  # construct
     self.foo = FooManager(server_args=self.server_args, device=self.device)
 
-self.init_foo()                            # wire (in __init__)
 
-if self.server_args.enable_bar:            # coordinate: select
-    self.bar.prepare(forward_batch)        # delegate
-out = self.foo.run(forward_batch)          # delegate
-self.baz.consume(out)                      # coordinate: thread result into next delegate
+self.init_foo()  # wire (in __init__)
+
+if self.server_args.enable_bar:  # coordinate: select
+    self.bar.prepare(forward_batch)  # delegate
+out = self.foo.run(forward_batch)  # delegate
+self.baz.consume(out)  # coordinate: thread result into next delegate
 ```
 
 ### 1.4 Not allowed: domain logic
@@ -59,9 +60,11 @@ self.baz.consume(out)                      # coordinate: thread result into next
 # NOT allowed in a frozen file: domain logic inlined.
 self.foo = None
 if self.server_args.enable_foo:
-    config = build_foo_config(self.model_config, self.device)   # config logic in frozen file
-    self.foo = FooManager(config)                               # inline construction, not via (maybe_)init_foo
-    out = [step(x) for x in batch]                              # computation, not coordination
+    config = build_foo_config(
+        self.model_config, self.device
+    )  # config logic in frozen file
+    self.foo = FooManager(config)  # inline construction, not via (maybe_)init_foo
+    out = [step(x) for x in batch]  # computation, not coordination
 ```
 
 - Fix: move that body into `FooManager` (its `__init__` or a factory) plus a `(maybe_)init_foo` helper.
@@ -96,15 +99,18 @@ class ModelRunner:
     def bar(self):
         self.foo_result = foo(self)
 
+
 # another_file.py
 def foo(model_runner) -> FooResult:
     return FooResult(a=xx, b=yy, c=zz)
+
 
 # Avoid — callee reaches back in and writes the runner's fields.
 # model_runner.py
 class ModelRunner:
     def bar(self):
         foo(self)
+
 
 # another_file.py
 def foo(model_runner):

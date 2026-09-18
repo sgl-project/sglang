@@ -12,9 +12,12 @@ don't translate cleanly for multi-language support (e.g. the planned Rust migrat
 ```python
 import msgspec
 
-class LoadSnapshot(msgspec.Struct):   # prefer frozen= and omit_defaults=; kw_only= as needed
+
+class LoadSnapshot(
+    msgspec.Struct
+):  # prefer frozen= and omit_defaults=; kw_only= as needed
     dp_rank: int = 0
-    tokens: list[int] = []            # mutable defaults are safe
+    tokens: list[int] = []  # mutable defaults are safe
 ```
 
 - Methods / `@classmethod` constructors go on the `Struct`; see

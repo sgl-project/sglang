@@ -190,9 +190,7 @@ class FlashAttentionMLAForwardSm100:
             or self.cluster_tile_m % qhead_per_kvhead == 0
             or qhead_per_kvhead % self.cluster_tile_m == 0
         )
-        self.num_hdimv_splits = (
-            2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
-        )
+        self.num_hdimv_splits = 2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
         assert hdimv % 32 == 0
         assert self.topk_length % self.tile_n == 0 or not self.is_topk_gather
         self.epi_tile = (self.cta_tile_m, self.hdimv // self.num_hdimv_splits)
@@ -252,9 +250,9 @@ class FlashAttentionMLAForwardSm100:
         self.tmem_offset_O1 = self.tmem_offset_O0 + self.tmem_cols_Oi
         self.tmem_offsets_O = [self.tmem_offset_O0, self.tmem_offset_O1]
         self.total_tmem = self.tmem_offset_O1 + self.tmem_cols_Oi
-        assert (
-            self.total_tmem <= self.tmem_alloc_cols
-        ), f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
+        assert self.total_tmem <= self.tmem_alloc_cols, (
+            f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
+        )
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -282,9 +280,7 @@ class FlashAttentionMLAForwardSm100:
         )
         sStats_struct = cute.struct.MemRange[Float32, cute.cosize(self.sStats_layout)]
         sScale_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
-        sBitmask_struct = cute.struct.MemRange[
-            Uint32, cute.cosize(self.sBitmask_layout)
-        ]
+        sBitmask_struct = cute.struct.MemRange[Uint32, cute.cosize(self.sBitmask_layout)]
 
         (
             mbar_ptr_Q_struct,
@@ -3178,18 +3174,10 @@ def test_mla_kernel(
         total_k_dummy = batch * seqlen_k
 
         if varlen_q:
-            Q = torch.randn(
-                total_q_dummy, nheads, hdim, dtype=torch.bfloat16, device="cuda"
-            )
-            Qv = torch.randn(
-                total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
-            O = torch.empty(
-                total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
-            P = torch.empty(
-                total_q_dummy, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-            )
+            Q = torch.randn(total_q_dummy, nheads, hdim, dtype=torch.bfloat16, device="cuda")
+            Qv = torch.randn(total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+            O = torch.empty(total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+            P = torch.empty(total_q_dummy, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
             lse = torch.empty(total_q_dummy, nheads, dtype=torch.float32, device="cuda")
             row_max = torch.empty(
                 total_q_dummy,
@@ -3207,21 +3195,13 @@ def test_mla_kernel(
                 0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device="cuda"
             )
         else:
-            Q = torch.randn(
-                batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda"
-            )
-            Qv = torch.randn(
-                batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
-            O = torch.empty(
-                batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
+            Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
+            Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+            O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
             P = torch.empty(
                 batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
             )
-            lse = torch.empty(
-                batch, seqlen_q, nheads, dtype=torch.float32, device="cuda"
-            )
+            lse = torch.empty(batch, seqlen_q, nheads, dtype=torch.float32, device="cuda")
             row_max = torch.empty(
                 batch,
                 seqlen_q,
@@ -3237,44 +3217,22 @@ def test_mla_kernel(
             )
 
         if varlen_k:
-            K = torch.randn(
-                total_k_dummy, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda"
-            )
-            V = torch.randn(
-                total_k_dummy, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
+            K = torch.randn(total_k_dummy, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
+            V = torch.randn(total_k_dummy, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
             cu_seqlens_k_dummy = torch.arange(
                 0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device="cuda"
             )
         else:
-            K = torch.randn(
-                batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda"
-            )
-            V = torch.randn(
-                batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda"
-            )
+            K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
+            V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
 
-        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(
-            leading_dim=Q.ndim - 1
-        )
-        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(
-            leading_dim=Qv.ndim - 1
-        )
-        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(
-            leading_dim=K.ndim - 1
-        )
-        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(
-            leading_dim=V.ndim - 1
-        )
-        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(
-            leading_dim=O.ndim - 1
-        )
-        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(
-            leading_dim=P.ndim - 1
-        )
-        mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(
-            leading_dim=lse.ndim - 1
-        )
+        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
+        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
+        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
+        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
+        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
+        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
+        mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
         mRowMax = from_dlpack(row_max, assumed_align=4).mark_layout_dynamic(
             leading_dim=row_max.ndim - 1
         )
@@ -3287,13 +3245,9 @@ def test_mla_kernel(
 
         compile_kwargs = dict(mIndexTopk=mIndexTopk)
         if varlen_q:
-            compile_kwargs["mCuSeqlensQ"] = from_dlpack(
-                cu_seqlens_q_dummy, assumed_align=4
-            )
+            compile_kwargs["mCuSeqlensQ"] = from_dlpack(cu_seqlens_q_dummy, assumed_align=4)
         if varlen_k:
-            compile_kwargs["mCuSeqlensK"] = from_dlpack(
-                cu_seqlens_k_dummy, assumed_align=4
-            )
+            compile_kwargs["mCuSeqlensK"] = from_dlpack(cu_seqlens_k_dummy, assumed_align=4)
 
         if not has_qk:
             mQ = mK = None
@@ -3348,9 +3302,7 @@ def test_mla_kernel(
         torch.manual_seed(seed + 2000)
         # Each batch item must have at least topk_length keys so topk gather is valid.
         min_seqlen_k = topk_length if gather_kv else 1
-        seqlens_k = torch.randint(
-            min_seqlen_k, seqlen_k + 1, (batch,), dtype=torch.int32
-        )
+        seqlens_k = torch.randint(min_seqlen_k, seqlen_k + 1, (batch,), dtype=torch.int32)
         # When causal, every batch item needs seqlens_k[b] >= seqlens_q[b].
         if is_causal:
             seqlens_k = torch.maximum(seqlens_k, seqlens_q)
@@ -3368,26 +3320,16 @@ def test_mla_kernel(
         Q = torch.randn(total_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
         Qv = torch.randn(total_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
         O = torch.empty(total_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        P = torch.empty(
-            total_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-        )
+        P = torch.empty(total_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
         lse = torch.empty(total_q, nheads, dtype=torch.float32, device="cuda")
         row_max = torch.empty(
             total_q_dummy, P_k_length // 128, nheads, dtype=torch.float32, device="cuda"
         )
     else:
-        Q = torch.randn(
-            batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda"
-        )
-        Qv = torch.randn(
-            batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
-        O = torch.empty(
-            batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
-        P = torch.empty(
-            batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-        )
+        Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
+        Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+        O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+        P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
         lse = torch.empty(batch, seqlen_q, nheads, dtype=torch.float32, device="cuda")
         row_max = torch.empty(
             batch,
@@ -3403,12 +3345,8 @@ def test_mla_kernel(
         K = torch.randn(total_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
         V = torch.randn(total_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
     else:
-        K = torch.randn(
-            batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda"
-        )
-        V = torch.randn(
-            batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
+        K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
+        V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
 
     # ---- Generate index_topk with per-batch valid ranges when varlen_k ----
     # index_topk shape: (total_q, topk_length) if varlen_q else (batch, seqlen_q, topk_length)
@@ -3428,9 +3366,7 @@ def test_mla_kernel(
         if varlen_q:
             index_topk = torch.cat(topk_parts, dim=0)  # (total_q, topk_length)
         else:
-            index_topk = torch.stack(
-                topk_parts, dim=0
-            )  # (batch, seqlen_q, topk_length)
+            index_topk = torch.stack(topk_parts, dim=0)  # (batch, seqlen_q, topk_length)
     else:
         index_topk = None
 
@@ -3442,22 +3378,12 @@ def test_mla_kernel(
         ks = cu_seqlens_k[b].item() if varlen_k else b * seqlen_k
         ke = cu_seqlens_k[b + 1].item() if varlen_k else (b + 1) * seqlen_k
 
-        Q_b = (
-            Q[qs:qe].unsqueeze(0) if varlen_q else Q[b : b + 1]
-        )  # (1, sl_q, nheads, hdim)
-        Qv_b = (
-            Qv[qs:qe].unsqueeze(0) if varlen_q else Qv[b : b + 1]
-        )  # (1, sl_q, nheads, hdimv)
-        K_b = (
-            K[ks:ke].unsqueeze(0) if varlen_k else K[b : b + 1]
-        )  # (1, sl_k, nheads_kv, hdim)
-        V_b = (
-            V[ks:ke].unsqueeze(0) if varlen_k else V[b : b + 1]
-        )  # (1, sl_k, nheads_kv, hdimv)
+        Q_b = Q[qs:qe].unsqueeze(0) if varlen_q else Q[b : b + 1]  # (1, sl_q, nheads, hdim)
+        Qv_b = Qv[qs:qe].unsqueeze(0) if varlen_q else Qv[b : b + 1]  # (1, sl_q, nheads, hdimv)
+        K_b = K[ks:ke].unsqueeze(0) if varlen_k else K[b : b + 1]  # (1, sl_k, nheads_kv, hdim)
+        V_b = V[ks:ke].unsqueeze(0) if varlen_k else V[b : b + 1]  # (1, sl_k, nheads_kv, hdimv)
         if gather_kv:
-            topk_b = (
-                index_topk[qs:qe].unsqueeze(0) if varlen_q else index_topk[b : b + 1]
-            )
+            topk_b = index_topk[qs:qe].unsqueeze(0) if varlen_q else index_topk[b : b + 1]
         else:
             topk_b = None
 
@@ -3510,9 +3436,7 @@ def test_mla_kernel(
     mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
     mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
     mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
-    mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(
-        leading_dim=lse.ndim - 1
-    )
+    mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     mRowMax = from_dlpack(row_max, assumed_align=4).mark_layout_dynamic(
         leading_dim=row_max.ndim - 1
     )
@@ -3568,9 +3492,7 @@ def test_mla_kernel(
     print(f"Mean abs diff LSE: {(lse - lse_ref).abs().mean().item()}")
 
     if validate:
-        assert (O - O_ref).abs().max().item() <= rtol * (
-            O_pt - O_ref
-        ).abs().max().item() + atol
+        assert (O - O_ref).abs().max().item() <= rtol * (O_pt - O_ref).abs().max().item() + atol
         varlen_tag = ""
         if varlen_q:
             varlen_tag += f", total_q:{total_q}"
@@ -3649,48 +3571,22 @@ def benchmark_mla_kernel(
         disable_bitmask,
     )
     if compile_key not in compile_cache:
-        Q = torch.randn(
-            batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda"
-        )
-        Qv = torch.randn(
-            batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
-        K = torch.randn(
-            batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda"
-        )
-        V = torch.randn(
-            batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
-        O = torch.empty(
-            batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-        )
-        P = torch.empty(
-            batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-        )
+        Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
+        Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+        K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
+        V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
+        O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+        P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
         index_topk = (
-            torch.rand(batch, seqlen_q, topk_length, device="cuda")
-            .argsort(dim=-1)
-            .to(torch.int32)
+            torch.rand(batch, seqlen_q, topk_length, device="cuda").argsort(dim=-1).to(torch.int32)
         )
 
-        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(
-            leading_dim=Q.ndim - 1
-        )
-        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(
-            leading_dim=Qv.ndim - 1
-        )
-        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(
-            leading_dim=K.ndim - 1
-        )
-        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(
-            leading_dim=V.ndim - 1
-        )
-        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(
-            leading_dim=O.ndim - 1
-        )
-        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(
-            leading_dim=P.ndim - 1
-        )
+        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
+        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
+        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
+        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
+        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
+        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
         if gather_kv:
             mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(
                 leading_dim=index_topk.ndim - 1
@@ -3728,24 +3624,14 @@ def benchmark_mla_kernel(
         compile_cache[compile_key] = kernel
 
     Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-    Qv = torch.randn(
-        batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
-    )
-    K = torch.randn(
-        batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda"
-    )
-    V = torch.randn(
-        batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda"
-    )
+    Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+    K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
+    V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
     O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-    P = torch.empty(
-        batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-    )
+    P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
 
     index_topk = (
-        torch.rand(batch, seqlen_q, topk_length, device="cuda")
-        .argsort(dim=-1)
-        .to(torch.int32)
+        torch.rand(batch, seqlen_q, topk_length, device="cuda").argsort(dim=-1).to(torch.int32)
     )
 
     mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)

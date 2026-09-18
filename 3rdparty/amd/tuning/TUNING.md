@@ -13,20 +13,23 @@ To maximize Triton kernel efficiency, several strategies can be employed:
 - **matrix_instr_nonkdim**: Optimizes the usage of Matrix-Fused Multiply-Add (MFMA) instructions for specific kernel types, such as Flash Attention.
 - **OPTIMIZE_EPILOGUE**: An environment variable that can be set to `1` to enhance performance by eliminating the `convert_layout` operation in the kernel's epilogue.
 ```python
-@triton.autotune(configs=[
-        triton.Config({'waves_per_eu': 1}, num_warps=4, num_stages=1),
-        triton.Config({'waves_per_eu': 1}, num_warps=8, num_stages=1),
-        triton.Config({'waves_per_eu': 1}, num_warps=16, num_stages=1),
-        triton.Config({'waves_per_eu': 2}, num_warps=4, num_stages=1),
-        triton.Config({'waves_per_eu': 2}, num_warps=8, num_stages=1),
-        triton.Config({'waves_per_eu': 2}, num_warps=16, num_stages=1),
-        triton.Config({'waves_per_eu': 4}, num_warps=4, num_stages=1),
-        triton.Config({'waves_per_eu': 4}, num_warps=8, num_stages=1),
-        triton.Config({'waves_per_eu': 4}, num_warps=16, num_stages=1),
-    ], key=['BLOCK_N', 'NUM_TOKEN_BLKS'], use_cuda_graph=True)
+@triton.autotune(
+    configs=[
+        triton.Config({"waves_per_eu": 1}, num_warps=4, num_stages=1),
+        triton.Config({"waves_per_eu": 1}, num_warps=8, num_stages=1),
+        triton.Config({"waves_per_eu": 1}, num_warps=16, num_stages=1),
+        triton.Config({"waves_per_eu": 2}, num_warps=4, num_stages=1),
+        triton.Config({"waves_per_eu": 2}, num_warps=8, num_stages=1),
+        triton.Config({"waves_per_eu": 2}, num_warps=16, num_stages=1),
+        triton.Config({"waves_per_eu": 4}, num_warps=4, num_stages=1),
+        triton.Config({"waves_per_eu": 4}, num_warps=8, num_stages=1),
+        triton.Config({"waves_per_eu": 4}, num_warps=16, num_stages=1),
+    ],
+    key=["BLOCK_N", "NUM_TOKEN_BLKS"],
+    use_cuda_graph=True,
+)
 @triton.jit
-def _triton_kernel_function():
-    ...
+def _triton_kernel_function(): ...
 ```
 ## 2. Torch Tunable Operations
 **TunableOp** is a feature in PyTorch that allows for the definition and optimization of custom kernels with tunable parameters. This feature is particularly useful for enhancing the performance of kernels by experimenting with different configurations.

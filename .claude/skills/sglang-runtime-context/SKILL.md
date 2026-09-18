@@ -364,7 +364,7 @@ entered or installed — the bare call just builds the override:
 ```python
 override = get_context().override_server_args(field=...)
 override.install()
-self.addCleanup(override.restore)      # or: with get_context().override_server_args(...):
+self.addCleanup(override.restore)  # or: with get_context().override_server_args(...):
 ```
 
 Five separate test files learned this the hard way during the sweep.

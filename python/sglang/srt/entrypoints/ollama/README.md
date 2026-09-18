@@ -72,11 +72,9 @@ router = SmartRouter(
     # Local Ollama
     local_host="http://localhost:11434",
     local_model="llama3.2",  # or any Ollama model
-
     # Remote SGLang
     remote_host="http://localhost:30001",
     remote_model="Qwen/Qwen2.5-1.5B-Instruct",  # or any HuggingFace model
-
     # LLM Judge (optional, defaults to local_model)
     judge_model="llama3.2",
 )
@@ -100,7 +98,7 @@ response = router.chat("question", force_remote=True)
 
 # Streaming
 for chunk in router.chat_stream("Tell me a story"):
-    print(chunk['message']['content'], end='')
+    print(chunk["message"]["content"], end="")
 ```
 
 ---

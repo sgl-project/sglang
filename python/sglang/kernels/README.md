@@ -60,6 +60,7 @@ explicitly, e.g.:
 
 ```python
 from sglang.kernels import select_kernel, KernelBackend
+
 jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
 ```
 

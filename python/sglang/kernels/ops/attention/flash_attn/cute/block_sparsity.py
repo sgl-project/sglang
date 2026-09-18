@@ -73,9 +73,7 @@ def _ordered_to_dense_simple(
     col_range = torch.arange(max_entries, device=device)
     valid = col_range[None, None, None, :] < num_blocks[:, :, :, None]
     safe_indices = torch.where(valid, indices.long(), num_cols)
-    row_idx = torch.arange(num_rows, device=device)[None, None, :, None].expand_as(
-        indices
-    )
+    row_idx = torch.arange(num_rows, device=device)[None, None, :, None].expand_as(indices)
     b_idx = torch.arange(B, device=device)[:, None, None, None].expand_as(indices)
     h_idx = torch.arange(H, device=device)[None, :, None, None].expand_as(indices)
     dense[b_idx, h_idx, row_idx, safe_indices] = 1
@@ -140,9 +138,7 @@ def compute_dq_write_order(
     def _gather_write_order(bwd_idx, bwd_cnt):
         b_i = torch.arange(B, device=device)[:, None, None, None].expand_as(bwd_idx)
         h_i = torch.arange(H, device=device)[None, :, None, None].expand_as(bwd_idx)
-        n_i = torch.arange(bwd_idx.shape[2], device=device)[
-            None, None, :, None
-        ].expand_as(bwd_idx)
+        n_i = torch.arange(bwd_idx.shape[2], device=device)[None, None, :, None].expand_as(bwd_idx)
         m_vals = bwd_idx.long().clamp(0, num_m - 1)
         return rank_table[b_i, h_i, m_vals, n_i].to(torch.int32)
 
@@ -196,9 +192,7 @@ def get_sparse_q_block_size(
         return tensors.block_size[0]
     num_m_blocks = tensors.mask_block_idx.shape[2]
     min_block_size = ceildiv(seqlen_q, num_m_blocks)
-    max_block_size = (
-        seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)
-    )
+    max_block_size = seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)
     if min_block_size != max_block_size:
         return None
     return min_block_size
@@ -215,9 +209,7 @@ def _expand_sparsity_tensor(
     needs_expand = tensor.shape != expected_shape
     if not needs_expand:
         return tensor
-    can_expand = all(
-        map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape)
-    )
+    can_expand = all(map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape))
     if not can_expand:
         context_clause = f" ({context})" if context else ""
         resolved_hint = hint() if callable(hint) else hint
@@ -247,9 +239,7 @@ def _check_and_expand_block(
     if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
         raise ValueError(f"{name}_block tensors must have dtype torch.int32")
     if cnt.device != idx.device:
-        raise ValueError(
-            f"{name}_block_cnt and {name}_block_idx must be on the same device"
-        )
+        raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
     if not cnt.is_cuda or not idx.is_cuda:
         raise ValueError(f"{name}_block tensors must live on CUDA")
     expanded_cnt = _expand_sparsity_tensor(
@@ -333,13 +323,9 @@ def infer_block_sparse_expected_shapes(
     if sparse_block_size_kv is None:
         sparse_block_size_kv = base_n_block
     if sparse_block_size_kv != base_n_block:
-        raise ValueError(
-            f"Block sparse tensors{context} require BLOCK_SIZE_KV={base_n_block}."
-        )
+        raise ValueError(f"Block sparse tensors{context} require BLOCK_SIZE_KV={base_n_block}.")
     if tensors.mask_block_idx is None:
-        raise ValueError(
-            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
-        )
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
     num_m_blocks = tensors.mask_block_idx.shape[2]
 
     if sparse_block_size_q is None:
@@ -367,9 +353,7 @@ def infer_block_sparse_expected_shapes(
     mask_block_cnt = tensors.mask_block_cnt
     mask_block_idx = tensors.mask_block_idx
     if mask_block_cnt is None or mask_block_idx is None:
-        raise ValueError(
-            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
-        )
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
     if mask_block_cnt.ndim != 3 or mask_block_idx.ndim != 4:
         raise ValueError(
             f"Block sparse tensors{context} must have shapes (B, H, M) and (B, H, M, N)."
@@ -379,21 +363,15 @@ def infer_block_sparse_expected_shapes(
         ("head", mask_block_cnt.shape[1], expected_count_shape[1]),
     ):
         if cur != tgt and cur != 1:
-            raise ValueError(
-                f"Block sparse tensors{context} {dim_name} dim must be {tgt} or 1."
-            )
+            raise ValueError(f"Block sparse tensors{context} {dim_name} dim must be {tgt} or 1.")
     for dim_name, cur, tgt in (
         ("batch", mask_block_idx.shape[0], expected_index_shape[0]),
         ("head", mask_block_idx.shape[1], expected_index_shape[1]),
     ):
         if cur != tgt and cur != 1:
-            raise ValueError(
-                f"Block sparse tensors{context} {dim_name} dim must be {tgt} or 1."
-            )
+            raise ValueError(f"Block sparse tensors{context} {dim_name} dim must be {tgt} or 1.")
     if mask_block_cnt.shape[2] != mask_block_idx.shape[2]:
-        raise ValueError(
-            f"Block sparse tensors{context} must share the same m-block dimension."
-        )
+        raise ValueError(f"Block sparse tensors{context} must share the same m-block dimension.")
     # [Note] Allow Compact block sparse indices: FA4 only accesses indices 0..cnt-1
     # per query tile, so idx.shape[3] can be <= expected_n_blocks.
     if mask_block_idx.shape[3] > expected_n_blocks:
@@ -441,9 +419,7 @@ def normalize_block_sparse_tensors(
     hint: str | Callable[[], str] | None = None,
 ) -> BlockSparseTensorsTorch:
     if tensors.mask_block_cnt is None or tensors.mask_block_idx is None:
-        raise ValueError(
-            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
-        )
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
 
     mask_cnt, mask_idx = _check_and_expand_block(
         "mask",
@@ -455,9 +431,7 @@ def normalize_block_sparse_tensors(
         hint,
     )
     if mask_cnt is None or mask_idx is None:
-        raise ValueError(
-            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
-        )
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
 
     full_cnt, full_idx = _check_and_expand_block(
         "full",
@@ -668,16 +642,12 @@ def to_cute_block_sparse_tensors(
     if not is_block_sparsity_enabled(tensors):
         return None
     mask_block_cnt_tensor, mask_block_idx_tensor = [
-        to_cute_tensor(
-            t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi
-        )
+        to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
         for t in (tensors.mask_block_cnt, tensors.mask_block_idx)
     ]
     full_block_cnt_tensor, full_block_idx_tensor = [
         (
-            to_cute_tensor(
-                t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi
-            )
+            to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
             if t is not None
             else None
         )
@@ -685,9 +655,7 @@ def to_cute_block_sparse_tensors(
     ]
     cu_total_m_blocks_tensor, cu_block_idx_offsets_tensor = [
         (
-            to_cute_tensor(
-                t, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
-            )
+            to_cute_tensor(t, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
             if t is not None
             else None
         )
@@ -695,9 +663,7 @@ def to_cute_block_sparse_tensors(
     ]
     dq_write_order_tensor, dq_write_order_full_tensor = [
         (
-            to_cute_tensor(
-                t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi
-            )
+            to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
             if t is not None
             else None
         )

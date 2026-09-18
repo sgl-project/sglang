@@ -268,12 +268,12 @@ For tests that only need a standard server, inherit from `DefaultServerBase` and
 ```python
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
+
 class TestMyFeature(DefaultServerBase):
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     other_args = ["--enable-my-feature"]
 
-    def test_something(self):
-        ...
+    def test_something(self): ...
 ```
 
 Available fixtures in `python/sglang/test/server_fixtures/`:
@@ -315,7 +315,10 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
 register_cuda_ci(
-    est_time=80, stage="base-b", runner_config="1-gpu-small", disabled="flaky - see #12345"
+    est_time=80,
+    stage="base-b",
+    runner_config="1-gpu-small",
+    disabled="flaky - see #12345",
 )
 ```
 
@@ -342,7 +345,9 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/kernel/jit/benchmark/
-register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 # Optional nightly registration — same form, stage is just "nightly"
 register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
@@ -403,13 +408,13 @@ class TestMyFeature(CustomTestCase, MMLUMixin):
 
 ```python
 from sglang.test.test_utils import (
-    CustomTestCase,              # base class with retry logic
-    popen_launch_server,         # launch server subprocess
-    terminate_and_kill_process_tree,    # SIGTERM, then SIGKILL, then wait for
-                                        # the GPU memory to come back
-    DEFAULT_URL_FOR_TEST,        # auto-configured base URL
+    CustomTestCase,  # base class with retry logic
+    popen_launch_server,  # launch server subprocess
+    terminate_and_kill_process_tree,  # SIGTERM, then SIGKILL, then wait for
+    # the GPU memory to come back
+    DEFAULT_URL_FOR_TEST,  # auto-configured base URL
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,  # 600s default
-    run_bench_serving,           # benchmark helper (launch + bench)
+    run_bench_serving,  # benchmark helper (launch + bench)
 )
 ```
 

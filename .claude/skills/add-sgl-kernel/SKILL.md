@@ -168,6 +168,7 @@ For example, in `python/sglang/kernels/aot/python/sgl_kernel/elementwise.py`, ad
 ```python
 import torch
 
+
 def scale(
     input: torch.Tensor,
     factor: float,
@@ -203,12 +204,13 @@ import pytest
 import torch
 import sgl_kernel
 
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("size", [128, 1024, 4096, 65536])
 @pytest.mark.parametrize("factor", [0.5, 1.0, 2.0])
 def test_scale_correctness(dtype, size, factor):
     input = torch.randn(size, dtype=dtype, device="cuda")
-    out   = torch.empty_like(input)
+    out = torch.empty_like(input)
 
     result = sgl_kernel.scale(input, factor, out=out)
     assert result is out
@@ -220,20 +222,21 @@ def test_scale_correctness(dtype, size, factor):
 
 def test_scale_shape_mismatch():
     input = torch.randn(128, dtype=torch.float16, device="cuda")
-    out   = torch.empty(256, dtype=torch.float16, device="cuda")
+    out = torch.empty(256, dtype=torch.float16, device="cuda")
     with pytest.raises(RuntimeError, match="same shape"):
         sgl_kernel.scale(input, 2.0, out=out)
 
 
 def test_scale_cpu_input():
     input = torch.randn(128, dtype=torch.float16)  # CPU
-    out   = torch.empty_like(input)
+    out = torch.empty_like(input)
     with pytest.raises(RuntimeError, match="CUDA"):
         sgl_kernel.scale(input, 2.0, out=out)
 
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-q"]))
 ```
 
@@ -255,8 +258,8 @@ from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
 
-dtypes  = [torch.float16] if IS_CI else [torch.float16, torch.bfloat16, torch.float32]
-sizes   = [4096] if IS_CI else [2**n for n in range(10, 20)]  # 1K … 512K
+dtypes = [torch.float16] if IS_CI else [torch.float16, torch.bfloat16, torch.float32]
+sizes = [4096] if IS_CI else [2**n for n in range(10, 20)]  # 1K … 512K
 factors = [2.0]
 
 configs = list(itertools.product(dtypes, sizes))
@@ -280,8 +283,8 @@ def torch_scale(input: torch.Tensor, factor: float) -> torch.Tensor:
     )
 )
 def benchmark(dtype, size, provider):
-    input  = torch.randn(size, dtype=dtype, device="cuda")
-    out    = torch.empty_like(input)
+    input = torch.randn(size, dtype=dtype, device="cuda")
+    out = torch.empty_like(input)
     factor = 2.0
 
     if provider == "sglang":

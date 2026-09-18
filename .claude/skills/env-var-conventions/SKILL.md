@@ -51,6 +51,7 @@ class ToolStrictLevel(IntEnum):
     FUNCTION = 1
     PARAMETER = 2
 
+
 SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
 # At the call site:
@@ -118,13 +119,16 @@ The module-level `temp_set_env(**env_vars)` helper exists for overriding **non-s
 
 ```python
 # Wrong — raises ValueError
-with temp_set_env(SGLANG_TEST_RETRACT="true"): ...
+with temp_set_env(SGLANG_TEST_RETRACT="true"):
+    ...
 
 # Right — sglang keys go through the descriptor
-with envs.SGLANG_TEST_RETRACT.override(True): ...
+with envs.SGLANG_TEST_RETRACT.override(True):
+    ...
 
 # Right — non-sglang keys go through temp_set_env
-with temp_set_env(CUDA_LAUNCH_BLOCKING="1"): ...
+with temp_set_env(CUDA_LAUNCH_BLOCKING="1"):
+    ...
 ```
 
 The `allow_sglang=True` escape hatch exists for the rare case where you must bypass `Envs` (e.g. setting an env var **name** that's only constructed at runtime); don't use it just to skip writing a descriptor.
@@ -171,7 +175,7 @@ For a full removal where the env var is going away, add to `_convert_SGL_to_SGLA
 
 ```python
 _print_deprecated_env("SGLANG_OLD_NAME", "SGLANG_NEW_NAME")  # mapped to a replacement
-_print_deprecated_env("SGLANG_OLD_NAME")                     # no replacement, gone
+_print_deprecated_env("SGLANG_OLD_NAME")  # no replacement, gone
 ```
 
 For env-var to CLI-flag migration, add at module top-level:

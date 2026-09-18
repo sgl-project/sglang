@@ -50,8 +50,8 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 **`UnifiedTreeNode`** — Each node stores per-component data independently:
 
 ```python
-node.component_data[ComponentType.FULL]   # FullComponent data
-node.component_data[ComponentType.SWA]    # SWAComponent data
+node.component_data[ComponentType.FULL]  # FullComponent data
+node.component_data[ComponentType.SWA]  # SWAComponent data
 node.component_data[ComponentType.MAMBA]  # MambaComponent data
 ```
 

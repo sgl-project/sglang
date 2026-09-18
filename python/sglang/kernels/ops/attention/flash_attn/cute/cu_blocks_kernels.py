@@ -69,9 +69,7 @@ class CuSeqlensToBlocksKernel:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        warp_block_count = storage.warp_block_count.get_tensor(
-            cute.make_layout(self.num_warps)
-        )
+        warp_block_count = storage.warp_block_count.get_tensor(cute.make_layout(self.num_warps))
         sCuBlocks = storage.cu_blocks.get_tensor(cute.make_layout(self.num_threads + 1))
 
         if batch_idx == 0:
@@ -86,9 +84,7 @@ class CuSeqlensToBlocksKernel:
 
         total_blocks_for_batch = num_blocks
         for delta in (1, 2, 4, 8, 16):
-            other = cute.arch.shuffle_sync_up(
-                total_blocks_for_batch, delta, mask_and_clamp=0
-            )
+            other = cute.arch.shuffle_sync_up(total_blocks_for_batch, delta, mask_and_clamp=0)
             if lane_idx >= delta:
                 total_blocks_for_batch += other
 

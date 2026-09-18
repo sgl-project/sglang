@@ -107,6 +107,7 @@ import os
 
 _debug_files = {}
 
+
 def get_debug_file(rank):
     key = f"rank{rank}"
     if key not in _debug_files:
@@ -141,6 +142,7 @@ For tensor values, compute a hash instead of dumping raw data:
 
 ```python
 import hashlib
+
 h = hashlib.md5(tensor.cpu().numpy().tobytes()).hexdigest()[:8]
 f.write(f"LOGITS logits_hash={h}\n")
 ```

@@ -40,12 +40,13 @@ python3 -m venv /tmp/logo-venv && /tmp/logo-venv/bin/pip install -q Pillow
 
 ```python
 from PIL import Image
-src = Image.open("SOURCE").convert("RGBA")        # icon-only, already transparent
+
+src = Image.open("SOURCE").convert("RGBA")  # icon-only, already transparent
 W, H = 940, 525
-target_h = round(H * 0.50)                         # glyph ≈ half the canvas height
+target_h = round(H * 0.50)  # glyph ≈ half the canvas height
 scale = target_h / src.height
 glyph = src.resize((round(src.width * scale), target_h), Image.LANCZOS)
-canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))   # transparent
+canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # transparent
 canvas.paste(glyph, ((W - glyph.width) // 2, (H - glyph.height) // 2), glyph)
 canvas.save("docs/cards/logos/<org-slug>.png")
 ```

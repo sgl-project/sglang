@@ -174,8 +174,7 @@ marks the whole block as moved.
        component: Target
 
        @staticmethod
-       def foo(self: Target) -> None:
-           ...  # body still reads self.field_a / self.field_b
+       def foo(self: Target) -> None: ...  # body still reads self.field_a / self.field_b
    ```
 
 4. Caller: `self.foo(...)` → `Source.foo(self.component, ...)`.
@@ -206,7 +205,7 @@ Boundaries:
 
       @staticmethod
       def check(self: "Target") -> None:
-          running = self.get_running_state()   # was self.running_state
+          running = self.get_running_state()  # was self.running_state
           ...
   ```
 

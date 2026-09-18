@@ -46,9 +46,9 @@ class ShearingBias:
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         if self.pack_gqa:
-            assert (
-                128 % self.qhead_per_kvhead == 0
-            ), "pack_gqa only supported when qhead_per_kvhead divides 128"
+            assert 128 % self.qhead_per_kvhead == 0, (
+                "pack_gqa only supported when qhead_per_kvhead divides 128"
+            )
         self.qhead_per_kvhead_packgqa = qhead_per_kvhead if self.pack_gqa else 1
         self.rel_extent = rel_extent
         assert rel_extent % 128 == 0
@@ -100,9 +100,7 @@ class ShearingBias:
         self.bias_dtype = mBias.element_type
 
         right_pad_value = -Float32.inf
-        left_pad_value = (
-            -Float32.inf if const_expr(window_size_left is not None) else 0.0
-        )
+        left_pad_value = -Float32.inf if const_expr(window_size_left is not None) else 0.0
 
         self.vec_size = 32 // self.bias_dtype.width
         self.cols_per_iter = 32 * self.vec_size
@@ -117,9 +115,7 @@ class ShearingBias:
 
         mPreBias, mBias = [assume_tensor_aligned(t) for t in (mPreBias, mBias)]
         # (s_q, rel_extent, h, b) or (total_q, rel_extent, h)
-        Q_layout_transpose = (
-            [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        )
+        Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mPreBias, mBias = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=Q_layout_transpose))
             for t in (mPreBias, mBias)
@@ -195,9 +191,7 @@ class ShearingBias:
             else cute.size(mCuSeqlensQ.shape[0] - 1)
         )
         eff_seqlen_q = (
-            max_seqlen_q
-            if const_expr(not self.pack_gqa)
-            else max_seqlen_q * self.qhead_per_kvhead
+            max_seqlen_q if const_expr(not self.pack_gqa) else max_seqlen_q * self.qhead_per_kvhead
         )
         total_q = (
             cute.size(mPreBias.shape[0])
@@ -217,9 +211,7 @@ class ShearingBias:
         elif const_expr(self.clamp_subtiles):
             # A block covers at most min(tile_m, eff_seqlen_q) valid rows; subtiles
             # past that would fail the per-row seqlen guards and exit immediately.
-            batch_size_for_sched = cute.ceil_div(
-                min(self.tile_m, eff_seqlen_q), self.rows_per_cta
-            )
+            batch_size_for_sched = cute.ceil_div(min(self.tile_m, eff_seqlen_q), self.rows_per_cta)
         else:
             batch_size_for_sched = self.tile_m // self.rows_per_cta
 
@@ -330,9 +322,7 @@ class ShearingBias:
             seqlen_info = SeqlenInfoQK.create(
                 batch_idx=batch_idx,
                 seqlen_q_static=(
-                    mPreBias.shape[0]
-                    if const_expr(not self.pack_gqa)
-                    else mPreBias.shape[0][1]
+                    mPreBias.shape[0] if const_expr(not self.pack_gqa) else mPreBias.shape[0][1]
                 ),
                 seqlen_k_static=max_seqlen_k,
                 mCuSeqlensQ=mCuSeqlensQ,
@@ -375,12 +365,10 @@ class ShearingBias:
                     local_m_idx = tBcPreBias[0, m, 0][0]
                     load_m_idx = local_m_idx + m_block * self.rows_per_cta
                     local_m_idx_in_bounds = (
-                        const_expr(self.rows_per_cta % 8 == 0)
-                        or local_m_idx < self.rows_per_cta
+                        const_expr(self.rows_per_cta % 8 == 0) or local_m_idx < self.rows_per_cta
                     )
                     load_m_idx_in_bounds = (
-                        load_m_idx // self.qhead_per_kvhead_packgqa
-                        < seqlen_info.seqlen_q
+                        load_m_idx // self.qhead_per_kvhead_packgqa < seqlen_info.seqlen_q
                     )
                     if local_m_idx_in_bounds and load_m_idx_in_bounds:
                         cute.copy(
@@ -400,9 +388,7 @@ class ShearingBias:
                 attn_m_block,
             )
 
-            n_idx_left, n_idx_right = block_info.get_n_idx_left_right(
-                seqlen_info, m_idx
-            )
+            n_idx_left, n_idx_right = block_info.get_n_idx_left_right(seqlen_info, m_idx)
             num_bias_vals = n_idx_right - max(n_idx_left, n_idx_right - self.rel_extent)
             is_even = n_idx_right % 2 == 0
 
@@ -411,16 +397,12 @@ class ShearingBias:
             bias_block_idx_right = 1 + max(
                 self.rel_extent_padded // 128 - (attn_n_block_max - n_block_for_rel0), 0
             )
-            bias_idx_right = (
-                (bias_block_idx_right - 1) * 128 + ((n_idx_right - 1) % 128) + 1
-            )
+            bias_idx_right = (bias_block_idx_right - 1) * 128 + ((n_idx_right - 1) % 128) + 1
             bias_idx_left = max(0, bias_idx_right - num_bias_vals)
             bias_block_idx_left = bias_idx_left // 128
             # num_bias_blocks = self.num_bias_blocks_padded - bias_block_idx_left
             # num_right_padding_blocks = 0
-            num_bias_blocks = (
-                bias_block_idx_right - bias_block_idx_left if num_bias_vals > 0 else 0
-            )
+            num_bias_blocks = bias_block_idx_right - bias_block_idx_left if num_bias_vals > 0 else 0
             num_right_padding_blocks = (
                 self.num_bias_blocks_padded - bias_block_idx_right
                 if num_bias_vals > 0
@@ -428,19 +410,13 @@ class ShearingBias:
             )
             # might help compiler unroll loops
             num_bias_blocks = min(num_bias_blocks, self.num_bias_blocks_padded)
-            num_right_padding_blocks = min(
-                num_right_padding_blocks, self.num_bias_blocks_padded
-            )
+            num_right_padding_blocks = min(num_right_padding_blocks, self.num_bias_blocks_padded)
 
-            sPreBias_row = cute.flat_divide(
-                sPreBias[(warp_idx, None)], (self.vec_size,)
-            )
+            sPreBias_row = cute.flat_divide(sPreBias[(warp_idx, None)], (self.vec_size,))
             sBias_row = cute.flat_divide(sBias[(warp_idx, None)], (self.vec_size,))
             sBias_row_vec4 = cute.flat_divide(sBias[(warp_idx, None)], (4,))
 
-            bias_idx = (
-                self.rel_extent_padded + lane_idx * self.vec_size - self.cols_per_iter
-            )
+            bias_idx = self.rel_extent_padded + lane_idx * self.vec_size - self.cols_per_iter
 
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
@@ -450,12 +426,8 @@ class ShearingBias:
                 for i in cutlass.range(num_right_padding_blocks, unroll_full=True):
                     bias_frg = cute.make_rmem_tensor((4,), dtype=self.bias_dtype)
                     bias_frg.fill(self.bias_dtype(right_pad_value))
-                    bias_right_pad_idx = (
-                        self.num_bias_blocks_padded - 1 - i
-                    ) * 32 + lane_idx
-                    cute.autovec_copy(
-                        bias_frg, sBias_row_vec4[None, bias_right_pad_idx]
-                    )
+                    bias_right_pad_idx = (self.num_bias_blocks_padded - 1 - i) * 32 + lane_idx
+                    cute.autovec_copy(bias_frg, sBias_row_vec4[None, bias_right_pad_idx])
                     bias_idx -= 128
 
                 for _ in cutlass.range(num_bias_blocks, unroll_full=True):
@@ -469,16 +441,11 @@ class ShearingBias:
                         )
 
                         in_bounds = (
-                            prebias_idx >= 0
-                            and prebias_idx - self.vec_size + 1 < num_bias_vals
+                            prebias_idx >= 0 and prebias_idx - self.vec_size + 1 < num_bias_vals
                         )
-                        prebias_idx_lower = (
-                            prebias_idx - 1 if is_even else max(prebias_idx - 2, 0)
-                        )
+                        prebias_idx_lower = prebias_idx - 1 if is_even else max(prebias_idx - 2, 0)
                         prebias_idx_upper = (
-                            prebias_idx - 1
-                            if is_even
-                            else min(prebias_idx, self.rel_extent - 2)
+                            prebias_idx - 1 if is_even else min(prebias_idx, self.rel_extent - 2)
                         )
 
                         if in_bounds:
@@ -492,9 +459,7 @@ class ShearingBias:
                                     prebias_frg[None, 1],
                                 )
 
-                        bias_frg = cute.make_rmem_tensor(
-                            (self.vec_size,), dtype=self.bias_dtype
-                        )
+                        bias_frg = cute.make_rmem_tensor((self.vec_size,), dtype=self.bias_dtype)
                         bias_frg.fill(self.bias_dtype(left_pad_value))
 
                         if const_expr(self.vec_size == 1):
@@ -525,14 +490,10 @@ class ShearingBias:
                 if not is_even and num_bias_vals > 0:
                     sBias[(warp_idx, bias_idx_right)] = self.bias_dtype(right_pad_value)
                     if bias_idx_left - 1 >= 0:
-                        sBias[(warp_idx, bias_idx_left - 1)] = self.bias_dtype(
-                            left_pad_value
-                        )
+                        sBias[(warp_idx, bias_idx_left - 1)] = self.bias_dtype(left_pad_value)
 
                 num_left_padding_blocks = min(
-                    self.num_bias_blocks_padded
-                    - num_bias_blocks
-                    - num_right_padding_blocks,
+                    self.num_bias_blocks_padded - num_bias_blocks - num_right_padding_blocks,
                     self.num_bias_blocks_padded,
                 )
                 for i in cutlass.range(num_left_padding_blocks, unroll_full=True):
@@ -546,9 +507,7 @@ class ShearingBias:
             s2g_thr_copy = s2g_tiled_copy.get_slice(tidx)
 
             # (seqlen, rel_extent_padded)
-            mBias_cur = seqlen_info.offset_batch_Q(mBias, batch_idx, dim=3)[
-                None, None, head_idx
-            ]
+            mBias_cur = seqlen_info.offset_batch_Q(mBias, batch_idx, dim=3)[None, None, head_idx]
             # (rows_per_cta, rel_extent_padded)
             gBias = cute.local_tile(mBias_cur, self.cta_out_tiler, (m_block, 0))
             cBias = cute.make_identity_tensor(self.cta_out_tiler)
@@ -567,12 +526,10 @@ class ShearingBias:
                     local_m_idx = tBcBias[0, m, 0][0]
                     store_m_idx = local_m_idx + m_block * self.rows_per_cta
                     local_m_idx_in_bounds = (
-                        const_expr(self.rows_per_cta % 8 == 0)
-                        or local_m_idx < self.rows_per_cta
+                        const_expr(self.rows_per_cta % 8 == 0) or local_m_idx < self.rows_per_cta
                     )
                     store_m_idx_in_bounds = (
-                        store_m_idx // self.qhead_per_kvhead_packgqa
-                        < seqlen_info.seqlen_q
+                        store_m_idx // self.qhead_per_kvhead_packgqa < seqlen_info.seqlen_q
                     )
                     if local_m_idx_in_bounds and store_m_idx_in_bounds:
                         cute.copy(

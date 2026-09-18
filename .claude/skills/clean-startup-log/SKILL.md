@@ -205,26 +205,36 @@ Any `logger.info()` or `logger.warning()` in `ModelConfig.__init__()` or `get_to
 ### Trace what triggers an import
 ```python
 import sys
+
 _real_import = __builtins__.__import__
+
+
 def _tracing_import(name, *args, **kwargs):
-    if 'TARGET_MODULE' in name:
+    if "TARGET_MODULE" in name:
         import traceback
-        print(f'=== Importing {name} ===')
+
+        print(f"=== Importing {name} ===")
         traceback.print_stack()
     return _real_import(name, *args, **kwargs)
+
+
 __builtins__.__import__ = _tracing_import
 ```
 
 ### Trace what triggers a logger warning
 ```python
 import logging, traceback
+
+
 class TraceHandler(logging.Handler):
     def emit(self, record):
-        if 'SEARCH_STRING' in record.getMessage():
+        if "SEARCH_STRING" in record.getMessage():
             traceback.print_stack()
+
+
 h = TraceHandler()
 h.setLevel(logging.WARNING)
-logging.getLogger('TARGET_LOGGER_NAME').addHandler(h)
+logging.getLogger("TARGET_LOGGER_NAME").addHandler(h)
 ```
 
 ### Find C-level prints in .so files

@@ -156,7 +156,7 @@ Once every kernel on the path is batch-invariant, prefill and decode agree **bit
 bit** and the honest assertion is a stray-ulp floor, not a tolerance:
 
 ```python
-KL_DIV_THRESHOLD = 1e-9   # measured 0; anything a state bug produces is orders above
+KL_DIV_THRESHOLD = 1e-9  # measured 0; anything a state bug produces is orders above
 ```
 
 A loose threshold tolerates float noise and small logic errors alike, which is how a

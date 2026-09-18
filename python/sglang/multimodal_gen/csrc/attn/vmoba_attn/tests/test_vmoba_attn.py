@@ -124,14 +124,14 @@ def test_moba_attn_varlen_forward(
         pytest.fail(f"moba_attn_varlen forward pass failed with exception: {e}")
 
     # 1. Check output shape
-    assert (
-        output.shape == q.shape
-    ), f"Expected output shape {q.shape}, but got {output.shape}"
+    assert output.shape == q.shape, (
+        f"Expected output shape {q.shape}, but got {output.shape}"
+    )
 
     # 2. Check output dtype
-    assert (
-        output.dtype == q.dtype
-    ), f"Expected output dtype {q.dtype}, but got {output.dtype}"
+    assert output.dtype == q.dtype, (
+        f"Expected output dtype {q.dtype}, but got {output.dtype}"
+    )
 
     # 3. Check for NaNs or Infs in the output
     assert torch.all(torch.isfinite(output)), "Output contains NaN or Inf values"

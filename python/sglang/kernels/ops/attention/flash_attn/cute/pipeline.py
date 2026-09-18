@@ -92,9 +92,7 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert (
-            False
-        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
+        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
@@ -318,21 +316,15 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(
-                state.index, state.phase, loc=loc, ip=ip
-            ),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
             loc=loc,
             ip=ip,
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(
-                state.index, self.producer_mask, loc=loc, ip=ip
-            )
+            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(
-                state.index, tx_count, loc=loc, ip=ip
-            )
+            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
@@ -360,9 +352,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(
-                state.index, state.phase, loc=loc, ip=ip
-            ),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
             loc=loc,
             ip=ip,
         )
