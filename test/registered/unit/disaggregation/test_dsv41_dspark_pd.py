@@ -62,6 +62,9 @@ class TestDSV41DSparkPD(CustomTestCase):
                 manager.kv_cache_dtype_str = "fp8_e4m3"
                 manager.dsv41_spec_layout = local
                 manager.attn_tp_size = 4
+                manager.attn_cp_size = 1
+                manager.is_mla_backend = False
+                manager.is_hybrid_mla_backend = False
                 manager.dcp_size = 1
                 manager._resolve_rank_mapping = Mock()
                 response = Mock(status_code=200)
@@ -263,12 +266,49 @@ class TestDSV41CPPDHandshake(CustomTestCase):
         self.assertEqual(info.target_tp_ranks, [3])
         self.assertEqual(info.target_cp_ranks, [0])
 
-    def test_unequal_model_tp_rejected(self):
-        for tp, cp in [(2, 1), (1, 2), (1, 8)]:
+    def test_unequal_model_tp_with_cp_rejected(self):
+        for tp, cp in [(1, 2), (1, 8), (4, 2)]:
             m = self.make()
             with self.assertRaisesRegex(RuntimeError, "same TP size"):
                 self.fetch(m, tp, cp)
             self.assertFalse(m.prefill_info_table)
+
+    def test_dp_only_unequal_attention_tp(self):
+        for mla in (True, False):
+            for prefill_tp, decode_tp in ((4, 1), (4, 2), (2, 4)):
+                for rank in range(decode_tp):
+                    with self.subTest(
+                        mla=mla, prefill_tp=prefill_tp, decode_tp=decode_tp, rank=rank
+                    ):
+                        m = self.make(rank, hybrid=not mla)
+                        m.is_mla_backend = mla
+                        m.attn_tp_size = decode_tp
+                        self.assertTrue(self.fetch(m, prefill_tp, 1))
+                        info = m.prefill_info_table["prefill:8761"]
+                        self.assertEqual(info.target_cp_ranks, [0])
+                        if decode_tp >= prefill_tp:
+                            self.assertEqual(
+                                info.target_tp_ranks, [rank // (decode_tp // prefill_tp)]
+                            )
+                        else:
+                            width = prefill_tp // decode_tp
+                            self.assertEqual(
+                                info.target_tp_ranks,
+                                list(range(rank * width, (rank + 1) * width)),
+                            )
+
+    def test_dp_only_non_mla_tp_mismatch_rejected(self):
+        m = self.make(hybrid=False)
+        with self.assertRaisesRegex(RuntimeError, "same TP size"):
+            self.fetch(m, 2, 1)
+        self.assertFalse(m.prefill_info_table)
+
+    def test_decode_cp_rejected(self):
+        m = self.make()
+        m.attn_cp_size = 2
+        with self.assertRaisesRegex(RuntimeError, "Decode CP"):
+            self.fetch(m, 4, 1)
+        self.assertFalse(m.prefill_info_table)
 
     def test_nonhybrid_cp_mismatch_rejected(self):
         m = self.make(hybrid=False)
@@ -280,6 +320,83 @@ class TestDSV41CPPDHandshake(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "layout mismatch"):
             self.fetch(m, 1, 4, {"kv_item_lens": [1024], "state_item_lens": [[32768]]})
         self.assertFalse(m.prefill_info_table)
+
+
+class TestDSV41PDFeatureValidation(CustomTestCase):
+    def test_cp_and_dp_feature_matrix(self):
+        from sglang.srt.arg_groups import deepseek_v4_hook as hook
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        defaults = dict(
+            enable_encoder_swa_bounded_replay=False,
+            enable_decoder_swa_bounded_replay=False,
+            speculative_algorithm="DSPARK",
+            enable_hisparse=False,
+            dsv4_attn_backend="auto",
+            enable_two_batch_overlap=False,
+            pp_size=1,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            enable_prefill_cp=False,
+            enable_dp_attention=False,
+            cp_strategy="interleave",
+            tp_size=4,
+            dp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED, max_seq_len=None)
+            ),
+        )
+        prefill_cp = dict(disaggregation_mode="prefill", enable_prefill_cp=True)
+        cases = [
+            ("plain_tp", {}, True),
+            ("decode_dp", dict(enable_dp_attention=True, dp_size=4), True),
+            (
+                "prefill_dp",
+                dict(disaggregation_mode="prefill", enable_dp_attention=True, dp_size=4),
+                True,
+            ),
+            ("prefill_cp_before_resolution", prefill_cp, True),
+            (
+                "prefill_cp_after_resolution",
+                dict(prefill_cp, attn_cp_size=4, enable_dp_attention=True),
+                True,
+            ),
+            ("cp_plus_dp", dict(prefill_cp, dp_size=2), False),
+            ("cp_zigzag", dict(prefill_cp, cp_strategy="zigzag"), False),
+            ("decode_prefill_cp_flag", dict(enable_prefill_cp=True), False),
+            ("decode_attention_cp", dict(attn_cp_size=2), False),
+            ("decode_dcp", dict(dcp_size=2), False),
+            ("unsupported_transfer", dict(disaggregation_transfer_backend="nixl"), False),
+        ]
+        for name, changes, supported in cases:
+            cfg = SimpleNamespace(**(defaults | changes))
+            with (
+                self.subTest(name=name),
+                patch.object(hook, "resolving_view", return_value=cfg),
+                patch.object(
+                    hook,
+                    "model_config_of",
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(model_type="deepseek_v41")
+                    ),
+                ),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.speculative.ragged_verify.read_ragged_verify_mode",
+                    return_value=RaggedVerifyMode.STATIC,
+                ),
+            ):
+                if supported:
+                    hook.validate_deepseek_v41_features(cfg)
+                else:
+                    with self.assertRaisesRegex(ValueError, "DeepSeek-V4.1 DSpark PD"):
+                        hook.validate_deepseek_v41_features(cfg)
 
 
 if __name__ == "__main__":
