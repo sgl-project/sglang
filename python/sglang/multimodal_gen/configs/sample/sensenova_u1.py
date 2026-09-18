@@ -15,12 +15,12 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    MIN_INPUT_MAX_PIXELS,
     RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
-    smart_resize,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 
 _PUBLIC_OVERRIDE_FIELDS = {
@@ -40,8 +40,6 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_compression",
     "quality",
 }
-
-MIN_INPUT_MAX_PIXELS = 512 * 512
 
 
 @dataclass
@@ -86,8 +84,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
         super()._adjust(server_args)
         if self.image_path is None:
             return
-        explicit_fields = set(getattr(self, "_explicit_fields", ()))
-        if explicit_fields.intersection({"width", "height"}):
+        if has_sensenova_u1_explicit_size(getattr(self, "_explicit_fields", ())):
             return
 
         if isinstance(self.image_path, list):
@@ -102,15 +99,9 @@ class SenseNovaU1SamplingParams(SamplingParams):
         except (OSError, TypeError, ValueError):
             return
         with image:
-            target_pixels = int(self.width) * int(self.height)
-            resized_height, resized_width = smart_resize(
-                height=image.height,
-                width=image.width,
-                factor=RESOLUTION_ALIGNMENT,
-                min_pixels=target_pixels,
-                max_pixels=target_pixels,
+            self.width, self.height = resolve_sensenova_u1_edit_auto_size(
+                image.width, image.height
             )
-            self.width, self.height = resized_width, resized_height
 
     def _validate(self) -> None:
         super()._validate()

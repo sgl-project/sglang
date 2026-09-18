@@ -14,9 +14,12 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    MIN_INPUT_MAX_PIXELS,
     RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
     _flatten_rgba_to_rgb,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
@@ -34,7 +37,6 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 logger = init_logger(__name__)
 
 DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048
-MIN_INPUT_MAX_PIXELS = 512 * 512
 
 
 def _denorm_sensenova_output(x: torch.Tensor) -> torch.Tensor:
@@ -104,15 +106,16 @@ def _image_input_to_list(image_input: Any) -> list[Image.Image]:
     return images
 
 
-def _prepare_edit_images(
-    batch: Req, options: SenseNovaU1GenerationOptions
-) -> list[Image.Image]:
+def _load_edit_images(batch: Req) -> list[Image.Image]:
     images = _image_input_to_list(getattr(batch, "condition_image", None))
     if not images:
         images = _image_input_to_list(getattr(batch, "image_path", None))
-    if not images:
-        return []
+    return images
 
+
+def _prepare_edit_images(
+    images: list[Image.Image], options: SenseNovaU1GenerationOptions
+) -> list[Image.Image]:
     input_max_pixels = options.input_max_pixels
     if input_max_pixels is None:
         input_max_pixels = _auto_input_max_pixels(len(images))
@@ -128,8 +131,7 @@ def _prepare_edit_images(
 
 def _has_explicit_output_size(batch: Req) -> bool:
     extra = getattr(batch, "extra", {}) or {}
-    explicit_fields = set(extra.get("explicit_fields", ()))
-    return bool(explicit_fields.intersection({"size", "width", "height"}))
+    return has_sensenova_u1_explicit_size(extra.get("explicit_fields", ()))
 
 
 def _resolve_edit_output_size(
@@ -139,15 +141,9 @@ def _resolve_edit_output_size(
     if not edit_images or _has_explicit_output_size(batch):
         return int(batch.width), int(batch.height)
 
-    target_pixels = int(batch.width) * int(batch.height)
-    resized_height, resized_width = smart_resize(
-        height=edit_images[0].height,
-        width=edit_images[0].width,
-        factor=RESOLUTION_ALIGNMENT,
-        min_pixels=target_pixels,
-        max_pixels=target_pixels,
+    return resolve_sensenova_u1_edit_auto_size(
+        edit_images[0].width, edit_images[0].height
     )
-    return resized_width, resized_height
 
 
 @dataclass(frozen=True)
@@ -237,9 +233,12 @@ class SenseNovaU1GenerationStage(PipelineStage):
             )
         seed = seeds[0] if batch_size == 1 else seeds
 
-        edit_images = _prepare_edit_images(batch, options)
+        raw_edit_images = _load_edit_images(batch)
+        edit_images = (
+            _prepare_edit_images(raw_edit_images, options) if raw_edit_images else []
+        )
         image_size = (
-            _resolve_edit_output_size(batch, edit_images)
+            _resolve_edit_output_size(batch, raw_edit_images)
             if edit_images
             else (int(batch.width), int(batch.height))
         )

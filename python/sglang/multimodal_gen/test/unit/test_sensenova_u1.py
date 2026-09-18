@@ -20,6 +20,8 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -693,6 +695,63 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
     assert params.data_type == DataType.IMAGE
 
 
+def test_sensenova_u1_resolves_edit_auto_size_from_first_input_ratio():
+    assert resolve_sensenova_u1_edit_auto_size(416, 608) == (1408, 2048)
+    assert resolve_sensenova_u1_edit_auto_size(1600, 800) == (2048, 1024)
+    assert resolve_sensenova_u1_edit_auto_size(100, 1000) == (512, 2048)
+
+
+def test_sensenova_u1_detects_explicit_size_fields():
+    assert has_sensenova_u1_explicit_size({"size"})
+    assert has_sensenova_u1_explicit_size({"width"})
+    assert has_sensenova_u1_explicit_size({"height"})
+    assert not has_sensenova_u1_explicit_size({"prompt", "image_path"})
+
+
+def test_sensenova_u1_sampling_adjust_scales_first_input_to_2k_long_side(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (2048, 1024)
+
+
+def test_sensenova_u1_sampling_adjust_preserves_explicit_size(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=1024,
+        height=1024,
+    )
+    params._explicit_fields = {"prompt", "image_path", "size"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 1024)
+
+
 def test_sensenova_u1_scheduler_capabilities():
     config = SenseNovaU1PipelineConfig()
 
@@ -1221,7 +1280,7 @@ def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
     call = model.it2i_calls[0]
     assert call["tokenizer"] == "tok"
     assert call["prompt"] == "make the sky orange"
-    assert call["image_size"] == (2848, 1504)
+    assert call["image_size"] == (2048, 1024)
     assert call["cfg_scale"] == 3.5
     assert call["img_cfg_scale"] == 1.25
     assert call["cfg_norm"] == "channel"
@@ -1258,7 +1317,7 @@ def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
     )
 
     out_width, out_height = model.it2i_calls[0]["image_size"]
-    assert out_width * out_height <= 1024 * 1024
+    assert (out_width, out_height) == (2048, 1024)
     assert out_width % 32 == 0
     assert out_height % 32 == 0
     assert abs((out_width / out_height) - 2.0) < 0.05
