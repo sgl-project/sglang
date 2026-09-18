@@ -79,8 +79,11 @@ The EFA wheel expects a compatible AWS EFA userspace installation on the host an
 
 The current libfabric EFA provider cannot transfer CUDA VMM-backed buffers. Until [libfabric issue #12853](https://github.com/ofiwg/libfabric/issues/12853) is resolved, apply these settings to both prefill and decode workers:
 
-- Do not set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL`.
+- Do not set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` to `NVLINK` or `BAREX`.
+  `INTRA_NODE_NVLINK` is supported because it uses the default CUDA allocator.
 - Do not enable `expandable_segments:True` in `PYTORCH_CUDA_ALLOC_CONF` or `PYTORCH_ALLOC_CONF`.
+- Post-capture KV sizing is automatically disabled for the EFA protocol because
+  its KV cache uses CUDA VMM allocations.
 - Do not set `MC_FORCE_MNNVL` or `NCCL_MNNVL_ENABLE`; EFA is not an MNNVL transport.
 
 SGLang validates the first two constraints at startup to avoid a later `fi_read` or `fi_write` failure from libfabric.

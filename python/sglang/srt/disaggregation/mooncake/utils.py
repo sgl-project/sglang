@@ -44,7 +44,7 @@ def _validate_efa_allocator_compatibility(
     if envs.MOONCAKE_PROTOCOL.get().lower() != "efa":
         return
 
-    if enable_custom_mem_pool:
+    if enable_custom_mem_pool and custom_mem_pool_type in ("NVLINK", "BAREX"):
         raise ValueError(
             f"SGLANG_MOONCAKE_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
             "incompatible with MOONCAKE_PROTOCOL=efa. Mooncake custom memory "
@@ -144,7 +144,5 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
     else:
         enable_custom_mem_pool = False
         custom_mem_pool_type = None
-
-    _validate_efa_allocator_compatibility(enable_custom_mem_pool, custom_mem_pool_type)
 
     return enable_custom_mem_pool, custom_mem_pool_type
