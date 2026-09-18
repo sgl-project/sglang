@@ -55,11 +55,12 @@ def _token_indices_for_pages(
     pages: torch.Tensor,
     device: str = DEVICE,
     dtype: torch.dtype = torch.int64,
+    page_size: int = PAGE_SIZE,
 ) -> torch.Tensor:
     parts = [
         torch.arange(
-            int(page) * PAGE_SIZE,
-            (int(page) + 1) * PAGE_SIZE,
+            int(page) * page_size,
+            (int(page) + 1) * page_size,
             device=device,
             dtype=dtype,
         )
@@ -68,14 +69,14 @@ def _token_indices_for_pages(
     return torch.cat(parts, dim=0)
 
 
-def _pinned_host_pool(host_pool_cls, **kwargs):
+def _pinned_host_pool(host_pool_cls, page_size: int = PAGE_SIZE, **kwargs):
     original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
         return host_pool_cls(
             host_to_device_ratio=2.0,
             host_size=0,
-            page_size=PAGE_SIZE,
+            page_size=page_size,
             pin_memory=True,
             device="cpu",
             **kwargs,
@@ -84,11 +85,11 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
         ALLOC_MEMORY_FUNCS[DEVICE] = original_alloc
 
 
-def _registered_host_pool(host_pool_cls, **kwargs):
+def _registered_host_pool(host_pool_cls, page_size: int = PAGE_SIZE, **kwargs):
     return host_pool_cls(
         host_to_device_ratio=2.0,
         host_size=0,
-        page_size=PAGE_SIZE,
+        page_size=page_size,
         pin_memory=True,
         device="cpu",
         allocator_type="default",
@@ -103,13 +104,15 @@ def _fill_with_offset(tensor: torch.Tensor, offset: int) -> None:
     tensor.copy_(data + offset)
 
 
-def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
+def _assert_pages_equal(
+    host_ref, device_ref, host_pages, device_pages, page_size: int = PAGE_SIZE
+) -> None:
     for host_page, device_page in zip(host_pages.tolist(), device_pages.tolist()):
-        host_start = host_page * PAGE_SIZE
-        device_start = device_page * PAGE_SIZE
+        host_start = host_page * page_size
+        device_start = device_page * page_size
         assert torch.equal(
-            host_ref[host_start : host_start + PAGE_SIZE].cpu(),
-            device_ref[device_start : device_start + PAGE_SIZE].cpu(),
+            host_ref[host_start : host_start + page_size].cpu(),
+            device_ref[device_start : device_start + page_size].cpu(),
         )
 
 
@@ -449,6 +452,106 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
     finally:
         torch.cuda.synchronize()
         del graph
+        host_pool.destroy()
+
+
+# `try_copy_page_first_pages_batch` only takes its cudaMemcpyBatchAsync path once
+# one page's copy reaches this many bytes (staged_write_back.cuh,
+# kLargeCopyThresholdBytes). Below it every platform uses the per-page
+# cudaMemcpyAsync fallback, which is why this needs its own page size.
+BATCH_PATH_THRESHOLD_BYTES = 128 * 1024
+
+
+def _page_size_reaching_batch_path(
+    layer_num: int, element_dim: int, dtype: torch.dtype
+) -> int:
+    """Smallest page size whose copy granularity crosses the batch threshold.
+
+    The kernel measures a page as ``page_size * src_stride(0) * element_size``,
+    which for an MHA page of ``layer_num`` layers with ``element_dim`` values per
+    token is ``page_size * layer_num * element_dim * element_size``.
+    """
+    per_token_bytes = (
+        layer_num * element_dim * torch.empty([], dtype=dtype).element_size()
+    )
+    return -(-BATCH_PATH_THRESHOLD_BYTES // per_token_bytes)
+
+
+def test_registered_mmap_staged_write_back_batch_path() -> None:
+    """The staged write-back's batch path must copy into the *registered* host pool.
+
+    The default host pool is mmap-backed memory registered with
+    ``cudaHostRegister`` (``alloc_with_host_register``). ``cudaMemcpyBatchAsync``
+    takes pointer-to-pointer copies, so its destinations have to be device
+    addresses, but registered host memory can live at a device address distinct
+    from its host VA: always on ROCm, and on any CUDA platform reporting
+    ``cudaDevAttrCanUseHostPointerForRegisteredMem == 0`` (WSL2's GPU-PV memory
+    model, for example). Passing the host VA there fails with an asynchronous
+    illegal access that surfaces at the next stream sync.
+
+    The page size is raised until the copy crosses ``kLargeCopyThresholdBytes`` so
+    the batch path is really taken — with the per-page fallback this test passes
+    on every platform, which is why it would not have caught the bug.
+    """
+    element_dim, layer_num, page_count = 512, 2, 4
+    page_size = _page_size_reaching_batch_path(layer_num, element_dim, torch.bfloat16)
+    assert page_size * layer_num * element_dim * 2 >= BATCH_PATH_THRESHOLD_BYTES
+
+    device_pool = MHATokenToKVPool(
+        size=page_size * (page_count + 8),
+        page_size=page_size,
+        head_num=element_dim // 128,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        layer_num=layer_num,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+    host_pool = _registered_host_pool(
+        MHATokenToKVPoolHost,
+        page_size=page_size,
+        device_pool=device_pool,
+        layout="page_first",
+    )
+    try:
+        assert can_use_write_back_jit_kernel(
+            element_size=element_dim * host_pool.dtype.itemsize,
+        )
+        assert host_pool.can_use_write_back_jit
+
+        for layer_id in range(layer_num):
+            _fill_with_offset(device_pool.k_buffer[layer_id], layer_id)
+            _fill_with_offset(device_pool.v_buffer[layer_id], layer_id + 100)
+
+        device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
+        host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+        device_indices = _token_indices_for_pages(device_pages, page_size=page_size)
+        host_indices = _token_indices_for_pages(
+            host_pages, device="cpu", page_size=page_size
+        )
+        assert not host_indices.is_cuda
+
+        host_pool.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, "kernel"
+        )
+        torch.cuda.synchronize()
+
+        for layer_id in range(layer_num):
+            _assert_pages_equal(
+                host_pool.k_data_refs[layer_id],
+                device_pool.k_buffer[layer_id],
+                host_pages,
+                device_pages,
+                page_size=page_size,
+            )
+            _assert_pages_equal(
+                host_pool.v_data_refs[layer_id],
+                device_pool.v_buffer[layer_id],
+                host_pages,
+                device_pages,
+                page_size=page_size,
+            )
+    finally:
         host_pool.destroy()
 
 
