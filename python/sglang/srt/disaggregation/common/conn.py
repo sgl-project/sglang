@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    get_dsv41_spec_layout,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
@@ -102,6 +103,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -152,6 +154,8 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    dsv41_spec_layout: Optional[dict] = None
+
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
         "Failed to get kvcache from prefill instance, it might be dead"
@@ -166,6 +170,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -287,6 +292,9 @@ class CommonKVManager(BaseKVManager):
             self.max_failures = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
+            # Event used to signal the heartbeat checker thread to exit
+            # during teardown (e.g. runtime P<->D role switch).
+            self._heartbeat_shutdown = threading.Event()
             # If a timeout happens on the decode side, it means decode instances
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
@@ -707,6 +715,25 @@ class CommonKVManager(BaseKVManager):
             return
         self._kv_replica_factor = info.required_dst_info_num
 
+    def _make_worker_recv(self, socket, timeout_ms: int = 500):
+        """Build the blocking multipart recv used by a worker thread.
+
+        Plain blocking recv unless role switching is enabled: teardown flips a
+        stop flag that a blocked recv can never observe, so in that mode poll
+        with a timeout and return None when it expires. Deployments without
+        --enable-pd-role-switch keep the original blocking recv and pay nothing.
+        """
+        if not self.server_args.enable_pd_role_switch:
+            return socket.recv_multipart
+
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+
+        def recv():
+            return socket.recv_multipart() if poller.poll(timeout_ms) else None
+
+        return recv
+
     def _ensure_prefill_recompute_executor(
         self,
     ) -> concurrent.futures.ThreadPoolExecutor:
@@ -896,6 +923,27 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        local_layout = self.dsv41_spec_layout
+        if local_layout is not None or info.dsv41_spec_layout is not None:
+            if local_layout != info.dsv41_spec_layout:
+                mismatched_fields = sorted(
+                    key
+                    for key in (local_layout or {}).keys()
+                    | (info.dsv41_spec_layout or {}).keys()
+                    if (local_layout or {}).get(key)
+                    != (info.dsv41_spec_layout or {}).get(key)
+                )
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD layout mismatch "
+                    f"({', '.join(mismatched_fields)}): both servers must "
+                    "enable DSpark with the same block size and target/draft KV "
+                    "layout. Upgrade both servers together."
+                )
+            if info.attn_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                )
+
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
@@ -1057,6 +1105,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -1314,12 +1363,18 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
-    def _start_heartbeat_checker_thread(self):
-        """Start the heartbeat checker thread for Decode worker."""
+    def _start_heartbeat_checker_thread(self) -> threading.Thread:
+        """Start the heartbeat checker thread for Decode worker.
+
+        Returns the thread object so callers can track/join it during teardown.
+        """
 
         def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
+            while not self._heartbeat_shutdown.is_set():
+                # Use Event.wait() instead of time.sleep() so teardown can
+                # wake this thread immediately by setting the event.
+                if self._heartbeat_shutdown.wait(self.heartbeat_interval):
+                    break
                 with self.connection_lock:
                     addresses = list(self.prefill_info_table.keys())
 
@@ -1358,7 +1413,13 @@ class CommonKVManager(BaseKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
+        t = threading.Thread(
+            target=heartbeat_checker,
+            name="HeartbeatChecker",
+            daemon=True,
+        )
+        t.start()
+        return t
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
@@ -1807,6 +1868,31 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
+    def close_all_sockets(cls):
+        """Close all cached PUSH sockets on role switch, keeping ``_ctx`` reusable."""
+        with cls._global_lock:
+            entries = list(cls._socket_cache.items())
+            locks = cls._socket_locks.copy()
+            cls._socket_cache.clear()
+            cls._socket_locks.clear()
+
+        # Close outside _global_lock: _connect drops it before the per-endpoint lock.
+        for endpoint, sock in entries:
+            lock = locks.get(endpoint)
+            try:
+                if lock:
+                    with lock:
+                        sock.close(linger=0)
+                else:
+                    sock.close(linger=0)
+            except Exception:
+                logger.exception(
+                    f"Failed to close ZMQ PUSH socket (receiver): {endpoint}"
+                )
+        if entries:
+            logger.debug(f"Closed {len(entries)} receiver ZMQ PUSH socket(s)")
+
+    @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
@@ -1916,6 +2002,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -1986,6 +2073,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        dsv41_spec_layout = data.get("dsv41_spec_layout")
+
+        if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
+            return web.Response(
+                text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+                status=400,
+            )
+        self.dsv41_spec_layout = dsv41_spec_layout
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2077,6 +2172,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -2085,7 +2181,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if info.dsv41_spec_layout is None:
+                payload.pop("dsv41_spec_layout")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(
