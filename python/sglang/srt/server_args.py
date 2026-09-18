@@ -75,8 +75,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
     human_readable_int,
     json_list_type,
     nullable_str,
@@ -2976,9 +2974,12 @@ class ServerArgs:
     lora_target_modules: A[
         Optional[Union[set[str], List[str]]],
         Arg(
-            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted.",
+            help=(
+                "HF module names or paths where LoRA should be applied; fused names are "
+                "resolved by the loaded model. If not specified, infer targets from "
+                "--lora-paths. Use 'all' to target all supported modules."
+            ),
             nargs="*",
-            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
         ),
         NS("lora"),
     ] = None
