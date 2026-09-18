@@ -503,8 +503,8 @@ def test_publishing_the_anchor_selects_the_padded_rows():
 
 
 def test_draft_graph_batch_sizes_reads_the_capture_buckets(monkeypatch):
-    """The folded head is captured once per bucket and the compile prewarm has to
-    cover every one, so this must be the list the engine actually captures."""
+    """The folded head is captured once per bucket, so this must be the list the engine
+    actually captures."""
     from sglang.srt.speculative import lilicorr_utils as sampler_mod
 
     monkeypatch.setattr(
@@ -585,7 +585,7 @@ def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
     # and would load, run, and score the wrong function.
     assert built["kwargs"]["embed_tokens"] is embed_tokens
     # The device gate reaches the sampler rather than only the publish site: with it
-    # off the sampler must compile the argmax body, or the draft would sample while
+    # off the sampler must take the argmax body, or the draft would sample while
     # verify treated the drawn token as a point mass.
     assert built["kwargs"]["sampling_enabled"] is True
 

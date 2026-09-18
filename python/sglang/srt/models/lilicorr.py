@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 class LiLiCorrRMSNorm(nn.Module):
-    # Not sglang.srt.layers.layernorm.RMSNorm: a custom-op norm is opaque to inductor
-    # and splits the compiled decode body at every norm. Same math, same weight key.
+    # Not sglang.srt.layers.layernorm.RMSNorm: its custom op is not capturable here.
+    # Same math, same weight key.
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -353,8 +353,8 @@ class LiLiCorrHead(nn.Module):
 
         anchor_state = self._project_anchor(anchor_hidden, anchor_valid)
         # Materialized rather than handed to SDPA as a batch-broadcast view: the
-        # broadcast form is identical math, but a stride-0 mask measured -1.75pp on the
-        # compiled body. Measure before changing it back.
+        # broadcast form is identical math but a stride-0 mask measured -1.75pp.
+        # Measure before changing it back.
         lattice = self._attn_bias.shape[-1]
         attention_bias = (
             self._attn_bias.unsqueeze(0)
@@ -457,8 +457,8 @@ class LiLiCorrHead(nn.Module):
         temperatures / greedy_mask are [bs].
 
         Duplicates `select`'s prologue rather than sharing it so that with
-        LILICORR_SAMPLING off the served code is the same function, not an equivalent of
-        it. Exactly one of the two is compiled per process.
+        LILICORR_SAMPLING off the served code is the same function, not an equivalent
+        of it.
         """
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),

@@ -618,7 +618,7 @@ A checkpoint carrying head weights but declaring `architectures: ["DFlashDraftMo
 
 Above temperature 0 the target samples, but a deterministic draft is paid `p(argmax)` per slot because verify is handed a point mass. `LILICORR_SAMPLING=1` draws each slot from `softmax(scores / T)` over that slot's candidates at the request's own temperature and publishes the proposal it drew from, so rejection sampling is paid the overlap of the two distributions instead. Verify stays exact. Greedy requests sharing the batch take the argmax and report a one-hot proposal.
 
-Off by default; with it unset the compiled body is `select` itself, so temperature-0 output is unchanged bit for bit. On Qwen3-8B it is worth about 6% acceptance and 6% end-to-end at temperature 1, at under 1% of the per-block wall.
+Off by default; with it unset the captured body is `select` itself, so temperature-0 output is unchanged bit for bit. On Qwen3-8B it is worth about 6% acceptance and 6% end-to-end at temperature 1, at under 1% of the per-block wall.
 
 **Only enable it on the folded path.** The eager fallback that serves the steps the draft CUDA graph cannot is correct but costs a large fraction of throughput, and because acceptance is identical either way that regression shows up only in tokens/s. `build_lilicorr_draft_sampler` warns with a reason when it declines to fold, and the worker warns once if a decode step lands on the eager head.
 

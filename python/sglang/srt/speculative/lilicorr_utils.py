@@ -36,8 +36,8 @@ def _env_bool(name: str, message: str) -> bool:
 # Off is byte-identical to the greedy commit: same kernel, same argmax, no proposal. On
 # samples each slot from softmax(scores / T) and publishes the row it drew from, so verify
 # pays sum_c min(p, q) rather than p(argmax).
-# Read at import, not per call: `select` is torch.compiled and replayed from a captured
-# CUDA graph, so an os.environ read in the body is a graph break.
+# Read at import, not per call: the sampler is replayed from a captured CUDA graph,
+# so a per-call os.environ read would be a host-side branch inside a replay.
 SAMPLING_ENABLED = _env_bool(
     "LILICORR_SAMPLING",
     "Refusing rather than defaulting: a typo would report the greedy number under the "
@@ -414,32 +414,6 @@ def propose_lilicorr_block(
 # ===== The graph-folded draft sampler =====
 
 
-class _RecompileLimitWatcher(logging.Handler):
-    # Past a recompile limit dynamo permanently runs the original function and only logs a
-    # warning, so the run would be a mixture of compiled and eager buckets.
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self.hits: list[str] = []
-
-    def emit(self, record) -> None:
-        try:
-            message = record.getMessage()
-        except Exception:
-            return
-        if "recompile_limit" in message or "cache_size_limit" in message:
-            self.hits.append(message.strip().splitlines()[0][:200])
-
-
-def _pin_inductor_to_eager_numerics() -> None:
-    # Fused intermediates stay in fp32 where eager rounds to bf16 between ops, and split
-    # reductions are a different summation order; both move an argmax over near-ties.
-    import torch._inductor.config as inductor_config
-
-    inductor_config.emulate_precision_casts = True
-    inductor_config.split_reductions = False
-
-
 class LiLiCorrDraftSampler:
     """LiLiCorr select, run inside the draft CUDA graph.
 
@@ -503,28 +477,13 @@ class LiLiCorrDraftSampler:
         self.q_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.float32, device=device
         )
-        # Verify needs the ids q is indexed against, and the candidate tensor is an
-        # intermediate inside the compiled region, so it is copied to a fixed address.
+        # Verify needs the ids q is indexed against, and the candidate tensor is a
+        # graph-internal intermediate, so it is copied to a fixed address.
         self.candidate_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.int64, device=device
         )
 
-        self._warmed_bs: set[int] = set()
-        self._prewarming = False
-        _pin_inductor_to_eager_numerics()
-        self._select = torch.compile(
-            head.select_with_proposal if sampling_enabled else head.select,
-            # The head's GEMMs already go to cuBLAS; the gap being closed is pointwise
-            # fusion, which default mode does.
-            mode="default",
-            # The greedy commit is a Triton kernel, hence a graph break.
-            fullgraph=False,
-            # One static shape per bucket. Measured on an H100 at the served geometry:
-            # dynamic=True costs +6.9% head time at bs=1 and +13.8% at bs=30.
-            dynamic=False,
-        )
-        self._watcher = _RecompileLimitWatcher()
-        logging.getLogger("torch._dynamo").addHandler(self._watcher)
+        self._select = head.select_with_proposal if sampling_enabled else head.select
 
     def set_anchor(self, rows: Optional[torch.Tensor], bs: int) -> None:
         """Publish this step's anchor into the buffer the graph reads.
@@ -572,66 +531,6 @@ class LiLiCorrDraftSampler:
             )
         )
 
-    def _raise_if_recompile_limit_hit(self, where: str) -> None:
-        if not self._watcher.hits:
-            return
-        hits, self._watcher.hits = list(self._watcher.hits), []
-        raise RuntimeError(
-            f"dynamo hit a recompile limit during {where}, so some capture buckets run "
-            "eager inside a graph labelled 'compiled' and any throughput delta is a "
-            f"mixture rather than a fusion result: {hits[:3]}."
-        )
-
-    def prewarm_compile(self, bs_list, hidden_dtype: torch.dtype) -> None:
-        """Trace and compile the body at every bucket, before any capture.
-
-        Compiling under capture is illegal, so inductor has to do its codegen here. The
-        synthetic inputs are junk; only their shape matters, and self.out is
-        overwritten by the first real replay.
-        """
-        buckets = sorted({int(b) for b in bs_list if 0 < int(b) <= self.max_bs})
-        if not buckets:
-            raise RuntimeError(
-                "LiLiCorr compile prewarm has no buckets to warm, so capture would raise. "
-                f"Resolved max_bs={self.max_bs} against bs_list={sorted(bs_list)}."
-            )
-
-        # Guards key on strides and alignment as well as shape, so the variant count is
-        # not predictable: size the limit so it cannot bind and let the watcher report if
-        # it somehow still does.
-        needed = max(256, 16 * len(buckets))
-        torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit, needed
-        )
-        torch._dynamo.config.accumulated_recompile_limit = max(
-            torch._dynamo.config.accumulated_recompile_limit, 8 * needed
-        )
-
-        hidden_size = int(self.weight.shape[1])
-        self._prewarming = True
-        try:
-            with torch.no_grad():
-                for bs in buckets:
-                    self(
-                        torch.zeros(
-                            (bs * self.block_size, hidden_size),
-                            dtype=hidden_dtype,
-                            device=self.weight.device,
-                        )
-                    )
-                    self._warmed_bs.add(bs)
-        finally:
-            self._prewarming = False
-        self._raise_if_recompile_limit_hit("prewarm")
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        logger.info(
-            "LiLiCorr in-graph select compiled and prewarmed for %d buckets %s (dtype=%s).",
-            len(buckets),
-            buckets,
-            hidden_dtype,
-        )
-
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids  # the lattice is scored from hidden states and the anchor
         bs = hidden_states.shape[0] // self.block_size
@@ -644,16 +543,6 @@ class LiLiCorrDraftSampler:
                 f"LiLiCorrDraftSampler was built for max_bs={self.max_bs} but the draft "
                 f"graph replayed at bs={bs}; its static buffers are undersized."
             )
-        if not self._prewarming:
-            if bs not in self._warmed_bs and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"the draft graph is capturing bs={bs}, which the compile prewarm "
-                    f"never covered (warmed: {sorted(self._warmed_bs)}). Compiling under "
-                    "capture is illegal, so fix the bucket list rather than widening the "
-                    "prewarm."
-                )
-            self._raise_if_recompile_limit_hit("cuda-graph capture or decode")
-
         hidden_size = hidden_states.shape[-1]
         pass_hidden = hidden_states.view(bs, self.block_size, hidden_size)[:, 1:, :]
         log_probs, candidate_tokens = lilicorr_candidates(
@@ -684,7 +573,6 @@ class LiLiCorrDraftSampler:
         if self.sampling_enabled:
             selected, q_rows = self._select(
                 # In-graph philox draw: each replay advances the generator and redraws.
-                # Drawn here because an RNG op in the compiled body is a graph break.
                 uniforms=self.uniforms[:bs].uniform_(),
                 temperatures=self.temperatures[:bs],
                 greedy_mask=self.greedy_mask[:bs],
@@ -698,8 +586,7 @@ class LiLiCorrDraftSampler:
 
 
 def draft_graph_batch_sizes() -> list[int]:
-    # Every bucket, not just the max: the folded head is captured once per bucket and the
-    # compile prewarm has to cover all of them.
+    """Every batch size the draft decode graph is captured for, ascending."""
     return sorted(
         {int(bs) for bs in get_exec().graph.cuda_graph_config.decode.bs if bs > 0}
     )
@@ -766,11 +653,4 @@ def build_lilicorr_draft_sampler(
         int(draft_model.fc.out_features),
         sampler.logits.numel() * sampler.logits.element_size() / 2**20,
     )
-    # Prewarm with the dtype the draft forward will hand us: a prewarm at the wrong dtype
-    # compiles a graph the capture then misses.
-    try:
-        hidden_dtype = next(draft_model.parameters()).dtype
-    except StopIteration:
-        hidden_dtype = dtype
-    sampler.prewarm_compile(batch_sizes, hidden_dtype)
     return sampler
