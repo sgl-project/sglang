@@ -75,6 +75,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
         runner.max_num_tokens = 4
+        runner.min_replay_bucket = 0
         return runner
 
     @staticmethod

@@ -478,6 +478,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.enable_lora = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 32
+        runner.min_replay_bucket = 0
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
         runner.backend = SimpleNamespace()

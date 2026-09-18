@@ -137,6 +137,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_num_tokens = [2048, 2304]
         runner.max_context_size = None
         runner.max_num_tokens = 2304
+        runner.min_replay_bucket = 0
         runner.enable_cp_bcg_capture = True
         return runner
 
@@ -212,6 +213,36 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 capture_num_tokens=runner.capture_num_tokens,
                 max_padding_factor=2,
             )
+        )
+
+    def test_bucket_search_min_replay_bucket_relaxes_padding_limit(self):
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512},
+        )
+
+        # 1000 tokens pad to the 2048 bucket: beyond the 2x padding-factor
+        # limit, admitted only once the bucket sits at/below the min replay
+        # bucket.
+        self.assertIsNone(
+            runner.prefill_cp_bcg_input.select_replay_bucket(
+                num_tokens=1000,
+                required_local_tokens=512,
+                capture_num_tokens=runner.capture_num_tokens,
+                max_padding_factor=2,
+            )
+        )
+        self.assertEqual(
+            runner.prefill_cp_bcg_input.select_replay_bucket(
+                num_tokens=1000,
+                required_local_tokens=512,
+                capture_num_tokens=runner.capture_num_tokens,
+                max_padding_factor=2,
+                min_replay_bucket=2048,
+            ),
+            2048,
         )
 
     def test_bucket_search_falls_back_when_no_capture_has_capacity(self):

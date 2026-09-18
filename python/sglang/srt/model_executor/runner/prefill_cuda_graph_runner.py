@@ -53,6 +53,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -326,6 +327,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
+        self.min_replay_bucket = envs.SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET.get()
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
         self._validate_max_context_capacity(
@@ -1273,7 +1275,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+        if (
+            padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
+            and padded_num_tokens > self.min_replay_bucket
+        ):
             return False
         return True
 
@@ -1334,6 +1339,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     extend_seq_lens=forward_batch.extend_seq_lens_cpu,
                     capture_num_tokens=self.capture_num_tokens,
                     max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                    min_replay_bucket=self.min_replay_bucket,
                 )
                 is None
             ):
@@ -1686,6 +1692,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     extend_seq_lens=forward_batch.extend_seq_lens_cpu,
                     capture_num_tokens=self.capture_num_tokens,
                     max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                    min_replay_bucket=self.min_replay_bucket,
                 )
             )
             if static_num_tokens is None:
