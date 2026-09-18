@@ -111,6 +111,10 @@ for _hq, _hkv in ((16, 1), (16, 2)):  # GQA ratios 16 and 8, the two the kernel 
 
 class TestHipRuntimeBinding(CustomTestCase):
     def test_unidentified_runtime_disables_asm_before_routing(self):
+        # The availability check has to resolve the runtime, not just the first
+        # launch: the caller's fallback for a GQA ratio of 8 lands on a Triton
+        # kernel that asserts 16:1, so an asm path that is selected and only
+        # then turns out to be unusable aborts instead of falling back.
         import sglang.kernels.ops.attention.vattn_asm_gfx950 as V
 
         with (
@@ -121,7 +125,7 @@ class TestHipRuntimeBinding(CustomTestCase):
         ):
             self.assertFalse(V.asm_kernel_available())
             self.assertIsNone(V._hip)
-            self.assertIn("exactly one libamdhip64", V._disabled_reason)
+            self.assertIn("no libamdhip64 mapped", V._disabled_reason)
 
 
 @unittest.skipUnless(_asm_available(), "needs a gfx950 device with ROCm clang")

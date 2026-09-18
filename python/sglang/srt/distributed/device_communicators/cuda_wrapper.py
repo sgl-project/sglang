@@ -41,13 +41,12 @@ class Function:
     argtypes: List[Any]
 
 
-def find_loaded_library(lib_name, *, require_unique: bool = False) -> Optional[str]:
+def find_loaded_library(lib_name) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
     the file `/proc/self/maps` contains the memory maps of the process, which includes the
     shared libraries loaded by the process. We can use this file to find the path of the
-    a loaded library. When require_unique is true, return a library only when all matching
-    non-stub mappings resolve to one real path.
+    a loaded library.
     """  # noqa
     candidates = []
     with open("/proc/self/maps") as f:
@@ -69,16 +68,9 @@ def find_loaded_library(lib_name, *, require_unique: bool = False) -> Optional[s
     # JIT loader.  It can precede the actual CUDA runtime in /proc/self/maps;
     # choosing it makes CUDA IPC and FlashInfer all-reduce fail when resolving
     # symbols such as cudaDeviceReset.
-    non_stub_candidates = [
-        path for path in candidates if "stub" not in os.path.basename(path)
-    ]
-    if non_stub_candidates:
-        candidates = non_stub_candidates
-
-    if require_unique:
-        candidates = list(dict.fromkeys(os.path.realpath(path) for path in candidates))
-        if len(candidates) != 1:
-            return None
+    for path in candidates:
+        if "stub" not in os.path.basename(path):
+            return path
     return candidates[0]
 
 

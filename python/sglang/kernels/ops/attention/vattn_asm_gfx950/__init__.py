@@ -110,7 +110,7 @@ def _torch_hip_runtime():
     against everything torch does and fail outright under graph capture.
     """
     torch.cuda.current_device()  # map torch's copy before looking for it
-    return find_loaded_library("libamdhip64", require_unique=True)
+    return find_loaded_library("libamdhip64")
 
 
 def _hip_lib():
@@ -118,7 +118,10 @@ def _hip_lib():
     if _hip is None:
         path = _torch_hip_runtime()
         if path is None:
-            _disable("torch does not have exactly one libamdhip64 mapped")
+            # Never fall back to the SONAME: it is what bound the wrong runtime
+            # in the first place, and a wrong binding does not raise, it just
+            # returns unordered attention output. Triton is the safe loss.
+            _disable("torch has no libamdhip64 mapped to launch through")
         _hip = ctypes.CDLL(path)
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -203,8 +206,8 @@ def _clang():
 
 
 def asm_kernel_available() -> bool:
-    """True on gfx950 with ROCm clang and an unambiguous torch HIP runtime,
-    until a build or load failure disables the kernel for the process."""
+    """True on gfx950 with ROCm clang and torch's HIP runtime in hand, until a
+    build or load failure disables the kernel for the rest of the process."""
     global _available
     if _available is None:
         arch = ""
