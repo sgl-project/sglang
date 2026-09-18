@@ -1559,6 +1559,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             multiprocess_mode="mostrecent",
         )
 
+        self.finished_requests_by_outcome = Counter(
+            name="sglang:finished_requests_by_outcome_total",
+            documentation="Terminal request outcomes, including aborts with no output.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_prompt_tokens_by_outcome = Counter(
+            name="sglang:finished_prompt_tokens_by_outcome_total",
+            documentation="Reported prompt tokens at completion by outcome; not executed prefill work.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_cached_tokens_by_outcome = Counter(
+            name="sglang:finished_cached_tokens_by_outcome_total",
+            documentation="Reported cached prompt tokens at completion by outcome.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
@@ -1795,6 +1810,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 **self.labels,
                 phase=phase,
             ).set(float(duration))
+
+    def observe_finished_outcome(
+        self, *, labels: Dict[str, str], outcome: str, prompt_tokens: int, cached_tokens: int
+    ) -> None:
+        outcome_labels = {**labels, "outcome": outcome}
+        self.finished_requests_by_outcome.labels(**outcome_labels).inc()
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(prompt_tokens)
+        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(cached_tokens)
 
     def observe_one_finished_request(
         self,
