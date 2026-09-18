@@ -80,6 +80,19 @@ class SchedulerDllmMixin:
         )
 
         # FDFO also commits unresolved blocks so their KV can be reused.
+        if not fdfo_mode and not result.next_token_ids:
+            # A non-FDFO algorithm can produce a globally empty result;
+            # deferred aborts must still finalize, or their KV and session
+            # state stay held.
+            finished = []
+            for req in batch.reqs:
+                if req.to_finish is not None:
+                    req.update_finish_state(new_accepted_len=0)
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    finished.append(req)
+            if finished:
+                self.output_streamer.stream_output(finished, batch.return_logprob)
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
@@ -92,6 +105,10 @@ class SchedulerDllmMixin:
                     next_token_ids = result.next_token_ids[idx].tolist()
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
+                        if req.to_finish is not None:
+                            req.update_finish_state(new_accepted_len=0)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
                         continue
 
                     req.full_untruncated_fill_ids[
@@ -111,6 +128,11 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
+                    if req.to_finish is not None:
+                        req.update_finish_state(new_accepted_len=0)
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
+                        continue
                     # Unresolved: keep partial state and KV for the next FDFO round.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (

@@ -2,6 +2,7 @@ import dataclasses
 import types
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -254,6 +255,8 @@ def _scheduler_stub(cache):
         disagg_prefill_pending_chunk_rids=set(),
         enable_hicache_storage=False,
         dllm_config=None,
+        enable_overlap=False,
+        result_queue=deque(),
         grammar_manager=SimpleNamespace(abort_requests=Mock()),
         ps=SimpleNamespace(pp_size=1),
         running_batch=SimpleNamespace(reqs=[]),
@@ -1362,6 +1365,275 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         self._assert_idle(observer, checker)
 
+    def test_dllm_queue_abort_stamps_finish_abort_and_clears_session(self):
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertTrue(session.has_unfinished_request())
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.dllm_config = object()
+        scheduler.dllm_manager = SimpleNamespace(
+            pop_aborted_reqs=lambda abort_all, rid: [req]
+        )
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertFalse(session.has_unfinished_request())
+        send_output.assert_called_once()
+        self.assertIsInstance(send_output.call_args[0][0], AbortReq)
+        self.assertEqual(send_output.call_args[0][0].rid, req.rid)
+        self._assert_idle(observer, checker)
+
+    def test_dllm_queue_abort_skips_already_finished_req(self):
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        # Finished in the last forward but not yet dropped by
+        # filter_finished_reqs(); the abort must not restamp it.
+        req.finished_reason = FINISH_LENGTH(length=1)
+        req.multimodal_inputs = Mock()
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.dllm_config = object()
+        scheduler.dllm_manager = SimpleNamespace(
+            pop_aborted_reqs=lambda abort_all, rid: [req]
+        )
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertIsNotNone(req.multimodal_inputs)
+        send_output.assert_not_called()
+
+    def test_dllm_abort_defers_req_with_pending_overlap_result(self):
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        self.assertTrue(session.has_unfinished_request())
+
+        from sglang.srt.dllm.mixin.scheduler import DllmManager
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.enable_overlap = True
+        scheduler.result_queue = deque([(SimpleNamespace(reqs=[req]), None)])
+        scheduler.dllm_config = object()
+        scheduler.dllm_manager = DllmManager()
+        scheduler.dllm_manager.staging_queue = [req]
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertFalse(req.finished())
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(scheduler.dllm_manager.staging_queue, [req])
+        self.assertTrue(session.has_unfinished_request())
+        send_output.assert_not_called()
+        self.assertIsNotNone(req.kv.req_pool_idx)
+
+        # The same req with no pending result takes the direct abort path.
+        req.to_finish = None
+        scheduler.enable_overlap = False
+        scheduler.result_queue = deque()
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertFalse(session.has_unfinished_request())
+        send_output.assert_called_once()
+
+    def test_dllm_deferred_abort_keeps_timeout_reason(self):
+        """A running-timeout abort deferred for a pending overlap result must
+        keep its message + 503 on to_finish; a bare FINISH_ABORT would stream
+        a generic statusless abort to the client."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+
+        from sglang.srt.dllm.mixin.scheduler import DllmManager
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.enable_overlap = True
+        scheduler.result_queue = deque([(SimpleNamespace(reqs=[req]), None)])
+        scheduler.dllm_config = object()
+        scheduler.dllm_manager = DllmManager()
+        scheduler.dllm_manager.staging_queue = [req]
+
+        Scheduler.abort_request(
+            scheduler,
+            AbortReq(rid=req.rid, abort_message="Request running timeout reached."),
+        )
+
+        self.assertFalse(req.finished())
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.message, "Request running timeout reached.")
+        self.assertEqual(req.to_finish.status_code, 503)
+        self.assertEqual(scheduler.dllm_manager.staging_queue, [req])
+
+    def test_dllm_direct_abort_keeps_timeout_reason(self):
+        """A running-timeout abort on a dLLM queued req with no pending
+        overlap result takes the direct branch; the streamed abort must keep
+        the timeout message + 503 rather than a generic statusless stamp."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+
+        from sglang.srt.dllm.mixin.scheduler import DllmManager
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.dllm_config = object()
+        scheduler.dllm_manager = DllmManager()
+        scheduler.dllm_manager.staging_queue = [req]
+
+        Scheduler.abort_request(
+            scheduler,
+            AbortReq(rid=req.rid, abort_message="Request running timeout reached."),
+        )
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(
+            req.finished_reason.message, "Request running timeout reached."
+        )
+        self.assertEqual(req.finished_reason.status_code, 503)
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+
+    def _dllm_result_stub(self, fdfo, empty=True):
+        return SimpleNamespace(
+            copy_done=None,
+            next_token_ids=(
+                [torch.zeros(4, dtype=torch.long)]
+                if fdfo
+                else [torch.tensor([], dtype=torch.long)]
+            ),
+            accept_length_per_req_cpu=[0] if fdfo else None,
+            dllm_algo_state=None,
+            can_run_cuda_graph=False,
+        )
+
+    def _run_process_batch_result_dllm(self, session, cache, req, fdfo):
+        from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.dllm_config = SimpleNamespace(
+            first_done_first_out_mode=fdfo, block_size=4
+        )
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            free_group_begin=Mock(), free_group_end=Mock()
+        )
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(
+            num_generated_tokens=0, report_prefill_stats=Mock()
+        )
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release_mock:
+            SchedulerDllmMixin.process_batch_result_dllm(
+                scheduler, batch, self._dllm_result_stub(fdfo)
+            )
+        return scheduler, release_mock
+
+    def test_dllm_process_result_finalizes_to_finish_on_empty_result(self):
+        for fdfo in (False, True):
+            with self.subTest(fdfo=fdfo):
+                (
+                    _server_args,
+                    cache,
+                    _allocator,
+                    _req_to_token_pool,
+                    _observer,
+                    _checker,
+                    session,
+                ) = self._setup_first_turn()
+                req = session.create_req(
+                    _recv("turn-2", list(range(32, 48))),
+                    tokenizer=None,
+                    vocab_size=VOCAB_SIZE,
+                )
+                req.to_finish = FINISH_ABORT()
+                req.time_stats = SimpleNamespace(
+                    set_completion_time=Mock(), set_first_token_time=Mock()
+                )
+
+                scheduler, release_mock = self._run_process_batch_result_dllm(
+                    session, cache, req, fdfo
+                )
+
+                self.assertTrue(req.finished())
+                self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+                self.assertIsNone(req.to_finish)
+                release_mock.assert_called_once()
+                scheduler.output_streamer.stream_output.assert_called_once_with(
+                    [req], False
+                )
 
     def test_dllm_process_result_finalizes_deferred_abort_on_empty_token_list(self):
         """A non-FDFO algorithm can return a globally empty token list; a
@@ -1420,6 +1692,7 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertTrue(req.finished())
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         release_mock.assert_called_once_with(req, cache)
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_first_turn_drop_releases_own_mm_inputs(self):
         """A first turn dropped before ever committing owns its multimodal
