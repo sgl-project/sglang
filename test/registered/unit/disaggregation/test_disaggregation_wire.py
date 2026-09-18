@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    get_dsv41_spec_layout,
     get_qsa_pending_state_indices,
     pack_state_component_types,
     resolve_state_component_dst_index_by_type,
@@ -68,6 +69,45 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_dsv41_dspark_layout_is_independent_of_rank_local_buffers(self):
+        common = dict(
+            mla_compression_ratios=[0, 2, 1],
+            state_types=[StateType.SWA],
+        )
+        pp_rank = SimpleNamespace(
+            **common,
+            kv_layer_ids=[0, 2],
+            kv_item_lens=[512, 1024],
+            state_item_lens=[[512]],
+        )
+        decode_rank = SimpleNamespace(
+            **common,
+            kv_layer_ids=[0, 1, 2, 3, 40],
+            kv_item_lens=[256, 256, 512, 512, 256],
+            state_item_lens=[[256, 256, 256]],
+        )
+
+        with get_context().override_server_args(
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+        ):
+            self.assertEqual(
+                get_dsv41_spec_layout(pp_rank),
+                get_dsv41_spec_layout(decode_rank),
+            )
+
+    def test_dsv41_dspark_layout_requires_swa_component(self):
+        args = SimpleNamespace(
+            mla_compression_ratios=[0, 2, 1],
+            state_types=[StateType.DSV4_REQUEST_STATE],
+        )
+        with get_context().override_server_args(
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SWA state component"):
+                get_dsv41_spec_layout(args)
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
