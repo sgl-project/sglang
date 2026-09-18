@@ -278,12 +278,25 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
 
     Padding: ``num_tokens`` is rounded up to ``num_tokens_pad`` with zero rows
     so every rank sends the same width, which is what makes a *single*
-    all-to-all enough. The padded rows produce attention output that
-    ``dsa_cp_restore_tokens`` trims off again.
+    all-to-all enough.
+
+    **The batch usually arrives already padded to exactly that width.** SGLang
+    rounds the token count up to a multiple of ``attn_tp_size``
+    (``forward_batch_info.py:1454``, ``ceil_align``), which is the same
+    arithmetic as ``num_tokens_pad``, so ``missing`` is normally 0 and the rows
+    past ``num_tokens`` are SGLang's padding rather than ours. Either way the
+    caller must be handed back the width it gave -- see
+    ``dsa_cp_restore_tokens``.
     """
     parallel = get_parallel()
     tp = parallel.attn_tp_size
     h, d = x.shape[1], x.shape[2]
+    assert x.shape[0] <= plan.num_tokens_pad, (
+        f"DSA-CP was handed {x.shape[0]} rows but planned for at most "
+        f"{plan.num_tokens_pad} ({plan.num_tokens} tokens aligned to {tp}). "
+        "The batch is padded by a wider rule than attn_tp_size; the plan must "
+        "be built from the padded width, not from extend_seq_lens_cpu."
+    )
     missing = plan.num_tokens_pad - x.shape[0]
     if missing > 0:
         x = torch.cat([x, x.new_zeros((missing, h, d))], dim=0)
@@ -296,14 +309,38 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
 
 
-def dsa_cp_restore_tokens(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
-    """``[rows, h * tp_size, d]`` -> ``[num_tokens, h, d]``. Inverse of the above.
+def dsa_cp_restore_tokens(
+    x: torch.Tensor, plan: DsaCpPlan, num_rows: int
+) -> torch.Tensor:
+    """``[rows, h * tp_size, d]`` -> ``[num_rows, h, d]``. Inverse of the above.
 
     Everything downstream of attention -- the ``w_vc`` batch-matmul, o_proj,
     the layer communicator -- expects this rank's own heads for the whole
     batch, exactly as it gets them without DSA-CP. So the sharding is undone
     here rather than propagated, which is what keeps the change contained to
     the attention call itself.
+
+    ``num_rows`` MUST be the width handed to ``dsa_cp_redistribute_heads``, and
+    it is a required argument because defaulting it is what broke this. SGLang
+    pads the batch to ``ceil_align(tokens, attn_tp_size)``
+    (``forward_batch_info.py:1454``), so on a ragged chunk the real tensors
+    carry **more** rows than ``extend_seq_lens_cpu`` sums to -- 12,912 against
+    12,911 in the crash that found this. Returning ``plan.num_tokens`` rows
+    silently narrowed every layer's output by one row, while
+    ``out_cache_loc`` kept its padded length; the next layer's KV write then
+    indexed a 12,911-row tensor with an index built from a 12,912-entry slot
+    map and the gather asserted on device.
+
+    This is the same lesson as the indexer's ``gather()``, which takes
+    ``num_tokens`` and returns that many rows for exactly this reason
+    (``63adee22a5``). A width that arrives padded must leave padded.
+
+    The rows past ``plan.num_tokens`` are zeroed rather than left as the
+    all-to-all delivered them. The operator was told to process only
+    ``query_lens`` queries, so its output there is untouched device memory,
+    which can be NaN; the unsharded path leaves the same rows equally
+    undefined, but there it never travels through a collective. Zero is
+    finite, deterministic, and costs at most ``tp_size - 1`` rows.
     """
     parallel = get_parallel()
     tp = parallel.attn_tp_size
@@ -311,7 +348,14 @@ def dsa_cp_restore_tokens(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     assert x.shape[1] == h * tp, (
         f"DSA-CP restore expects a full head set, got {x.shape[1]} for tp_size {tp}"
     )
+    assert plan.num_tokens <= num_rows <= plan.num_tokens_pad, (
+        f"DSA-CP restore asked for {num_rows} rows, outside "
+        f"[{plan.num_tokens}, {plan.num_tokens_pad}]"
+    )
     send = x.reshape(plan.rows, tp, h, d).permute(1, 0, 2, 3).contiguous()
     recv = torch.empty_like(send)
     parallel.attn_tp_group.all_to_all_single(recv, send)
-    return recv.reshape(plan.num_tokens_pad, h, d)[: plan.num_tokens]
+    out = recv.reshape(plan.num_tokens_pad, h, d)[:num_rows]
+    if num_rows > plan.num_tokens:
+        out[plan.num_tokens :].zero_()
+    return out

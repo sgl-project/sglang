@@ -872,6 +872,12 @@ def forward_dsa_core_npu(
             #
             # k_nope and k_pe stay full width and are NOT touched: the KV cache
             # write and the DCP context gather below both address every token.
+            # The width the batch actually carries, which is NOT always
+            # plan.num_tokens: SGLang pads the token count up to a multiple of
+            # attn_tp_size before the model runs. Everything sized by that
+            # padded width -- out_cache_loc above all -- keeps it, so attention
+            # has to give it back, not the unpadded count.
+            dsa_cp_rows = q_nope_out.shape[0]
             q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
             q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
             # The indexer ran at full width, so its top-k is full width too;
@@ -897,6 +903,7 @@ def forward_dsa_core_npu(
             attn_output = dsa_cp_restore_tokens(
                 attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank),
                 dsa_cp_plan,
+                dsa_cp_rows,
             )
     if dcp_extend:
         # Dropped here, before the MoE, not at the end of the forward. The
