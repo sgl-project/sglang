@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paired RoPE preserving PyTorch CUDA complex64 multiplication rounding."""
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -17,6 +19,7 @@ def _complex_rope_kernel(
     SEQ: tl.constexpr,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
+    FUSE_REAL_SIN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pair = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -27,11 +30,24 @@ def _complex_rope_kernel(
     imag = tl.load(x_ptr + 2 * pair + 1, mask, 0).to(tl.float32)
     cos = tl.load(rope_ptr + token * DIM + 2 * column, mask, 0)
     sin = tl.load(rope_ptr + token * DIM + 2 * column + 1, mask, 0)
-    # c10::complex rounds b*d and a*d before the respective fused multiply-add
+    # CUDA builds differ in which imaginary product is contracted into the FMA
     out_real = tl.fma(real, cos, -imag * sin)
-    out_imag = tl.fma(imag, cos, real * sin)
+    if FUSE_REAL_SIN:
+        out_imag = tl.fma(real, sin, imag * cos)
+    else:
+        out_imag = tl.fma(imag, cos, real * sin)
     tl.store(out_ptr + 2 * pair, out_real, mask)
     tl.store(out_ptr + 2 * pair + 1, out_imag, mask)
+
+
+@lru_cache
+def _fuse_real_sin(device: torch.device) -> bool:
+    # cancellation distinguishes the two orders without depending on the GPU name
+    values = torch.tensor(
+        [[1 + 2**-23, -1], [1, 1 - 2**-24]], device=device, dtype=torch.float32
+    )
+    z = torch.view_as_complex(values)
+    return (z[0] * z[1]).imag.item() != 0
 
 
 def can_use_fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> bool:
@@ -73,6 +89,8 @@ def fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
             x.shape[1],
             x.shape[2],
             x.shape[3],
+            _fuse_real_sin(x.device),
             256,
+            enable_fp_fusion=False,
         )
     return out
