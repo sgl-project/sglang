@@ -680,7 +680,7 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
 
-class StreamOwnershipTestCase(unittest.IsolatedAsyncioTestCase):
+class StreamOwnershipTestCase(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_close_propagates_before_generation_and_after_content(self):
         for harmony in (False, True):
             for after_content in (False, True):
