@@ -12,6 +12,7 @@ import requests
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_npu
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -507,6 +508,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
+
+                # On NPU, set the device before store.setup() so that the
+                # underlying AscendDirectTransport can call ACL successfully.
+                # Without this, ACL fails with "Call acl failed" because the
+                # current thread has no NPU device context set.
+                if is_npu():
+                    tp_rank = (
+                        storage_config.tp_rank if storage_config is not None else 0
+                    )
+                    torch.npu.set_device(tp_rank)
 
                 while True:
                     try:
