@@ -15,6 +15,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    configure_metrics,
+    start_role_metrics_server,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -137,6 +141,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     configure_logger(server_args)
 
     # Start a new server with multiple worker processes
+    if server_args.enable_metrics:
+        configure_metrics()
     logger.info("Starting server...")
 
     # num_gpus is the total world size across every node; each node runs
@@ -268,6 +274,8 @@ def launch_pool_disagg_server(
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)
+    if server_args.enable_metrics:
+        configure_metrics()
     num_denoisers = len(denoiser_gpus)
     num_decoders = len(decoder_gpus)
     logger.info(
@@ -423,6 +431,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
     )
     diffusion_server.start()
 
@@ -504,6 +513,9 @@ def launch_disagg_server(server_args: ServerArgs):
     """
     configure_logger(server_args)
     set_global_server_args(server_args)
+
+    if server_args.enable_metrics:
+        configure_metrics()
 
     glm_distributed_mode_enabled = (
         type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
@@ -597,6 +609,8 @@ def launch_disagg_role(server_args: ServerArgs):
     configure_logger(server_args)
 
     role_type = server_args.disagg_role
+    if server_args.enable_metrics:
+        configure_metrics()
     if server_args.disagg_server_addr is None:
         raise ValueError(
             f"--disagg-server-addr is required for --disagg-role {role_type.value}"
@@ -738,6 +752,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
     # Block until interrupted
     try:
+        if server_args.enable_metrics:
+            start_role_metrics_server(server_args)
         for p in processes:
             p.join()
     except KeyboardInterrupt:

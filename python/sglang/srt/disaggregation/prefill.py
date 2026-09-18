@@ -31,6 +31,12 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.checksum import (
+    KvChecksumComputer,
+    is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
@@ -46,11 +52,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
     is_aborted,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -205,6 +209,17 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        if get_disagg().disaggregation_enable_kv_checksum:
+            kv_args = self.kv_manager.kv_args
+            self.scheduler.kv_checksum_computer = KvChecksumComputer(
+                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                kv_data_ptrs=kv_args.kv_data_ptrs,
+                kv_item_lens=kv_args.kv_item_lens,
+                state_data_ptrs=kv_args.state_data_ptrs,
+                state_item_lens=kv_args.state_item_lens,
+            )
+        else:
+            self.scheduler.kv_checksum_computer = None
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -240,7 +255,6 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -298,13 +312,6 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
-
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            # V4's KVCache is organized by compression-ratio
-            # buckets rather than by layer.
-            kv_args.mla_compression_ratios = list(
-                self.token_to_kv_pool.compression_ratios
-            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -1273,6 +1280,25 @@ class SchedulerDisaggregationPrefillMixin:
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
+        self,
+        req: Req,
+        last_chunk: bool = False,
+        end_idx: Optional[int] = None,
+    ) -> None:
+        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        if last_chunk and computer is not None:
+            if is_health_check_req(req):
+                value = 0
+            else:
+                if end_idx is None:
+                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                page_indices_gpu = page_indices_for_request(self, req, end_idx)
+                state_indices = state_indices_for_request(self, req, end_idx)
+                value = computer.compute(page_indices_gpu, state_indices)
+            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+
+    def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
@@ -1379,20 +1405,10 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = (
-                    1
-                    if online
-                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
-                        128
-                    )
-                )
-                return get_dsv4_c128_state_indices(
-                    int(req.kv.req_pool_idx),
-                    c128_seq_len,
-                    online=online,
-                    ring_size=ring_size,
+            def _request_state_payload():
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                return kvcache.request_state_transfer_indices(
+                    int(req.kv.req_pool_idx), c128_seq_len
                 )
 
             state_types = (
@@ -1407,7 +1423,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }

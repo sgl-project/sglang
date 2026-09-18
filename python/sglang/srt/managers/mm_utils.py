@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
 import os
 import pickle
 import sys
@@ -1294,10 +1295,28 @@ class ShmPointerMMData:
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
+        """Return independently writable storage, then release the SHM handle.
+
+        On Linux the tensor owns a private copy-on-write mapping. Reading the
+        pixels needs no clone, and writes remain local to this receiver just
+        as with the old clone. torch.frombuffer keeps the mapping alive until
+        the tensor and all derived views are released. Other platforms retain
+        the clone path.
+        """
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if sys.platform == "linux":
+                owned = mmap.mmap(
+                    self._shm_handle._fd,
+                    self.tensor.numel() * self.tensor.element_size(),
+                    access=mmap.ACCESS_COPY,
+                )
+                try:
+                    return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
+                except BaseException:
+                    owned.close()
+                    raise
             return self.tensor.clone()
         finally:
             self.close_and_unlink()
