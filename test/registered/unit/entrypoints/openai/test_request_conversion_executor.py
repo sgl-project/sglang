@@ -57,6 +57,9 @@ class TestRequestConversionExecutor(unittest.IsolatedAsyncioTestCase):
             first_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await first_task
+            # Check the permit before submitting another thread: thread startup
+            # alone cannot tell us whether cancellation released the slot early.
+            self.assertTrue(executor._slots.locked())
             second = asyncio.create_task(
                 executor.run(lambda: second_started.set() or 2)
             )
