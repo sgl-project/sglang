@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    SessionReapPlan,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
@@ -96,6 +97,7 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        self._inflight_rid: Optional[str] = None
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -107,6 +109,11 @@ class Session:
         if self.timeout is None:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
+
+    def has_unfinished_request(self) -> bool:
+        if self.streaming and self._inflight:
+            return True
+        return any(not node.req.finished() for node in self.req_nodes.values())
 
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -341,6 +348,7 @@ class Session:
             self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
+            self._inflight_rid = req.rid
         else:
             self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
@@ -351,6 +359,7 @@ class Session:
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
+        self._inflight_rid = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
@@ -361,9 +370,12 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
-    def abort_req(self):
+    def abort_req(self, rid: Optional[str] = None):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
+        if rid is not None and self._inflight_rid != rid:
+            return
         self._inflight = False
+        self._inflight_rid = None
 
 
 class SessionController:
@@ -408,17 +420,12 @@ class SessionController:
     def _close(self, session_id: str):
         session = self.sessions[session_id]
         req = None
-        has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
+        if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             [last_node] = session.req_nodes.values()
             req = last_node.req
-            if not req.finished():
-                has_unfinished_request = True
 
-        if has_unfinished_request:
+        if session.streaming and session.has_unfinished_request():
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
@@ -455,30 +462,45 @@ class SessionController:
         )
 
     def maybe_reap(self, now: float, interval: float = 1.0):
+        plan = self.plan_reap(now, interval)
+        if plan is not None:
+            self.apply_reap(plan)
+
+    def plan_reap(self, now: float, interval: float = 1.0) -> Optional[SessionReapPlan]:
         # reap sessions every second
-        if now - self._last_reap_time > interval:
-            self._last_reap_time = now
+        if now - self._last_reap_time <= interval:
+            return None
+        self._last_reap_time = now
 
-            # Finish deferred closes for sessions whose requests completed.
-            pending = [
-                sid
-                for sid, session in self.sessions.items()
-                if session.close_on_finish and self._all_requests_finished(session)
-            ]
-            for sid in pending:
-                log_info_on_rank0(
-                    logger, f"Deferred close ready for session {sid}, releasing."
-                )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
-                self._close(sid)
+        # Finish deferred closes for sessions whose requests completed.
+        deferred = [
+            sid
+            for sid, session in self.sessions.items()
+            if session.close_on_finish and not session.has_unfinished_request()
+        ]
+        timed_out = [
+            sid for sid, session in self.sessions.items() if session.is_timed_out()
+        ]
+        if not deferred and not timed_out:
+            return None
+        return SessionReapPlan(deferred=deferred, timed_out=timed_out)
 
-            timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
-            ]
-            for sid in timed_out:
-                log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
-                self._close(sid)
+    def apply_reap(self, plan: SessionReapPlan) -> None:
+        for sid in plan.deferred:
+            session = self.sessions.get(sid)
+            if session is None or not session.close_on_finish:
+                continue
+            log_info_on_rank0(
+                logger, f"Deferred close ready for session {sid}, releasing."
+            )
+            # Reset close_on_finish so _close proceeds with the release.
+            session.close_on_finish = False
+            self._close(sid)
+        for sid in plan.timed_out:
+            if sid not in self.sessions:
+                continue
+            log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
+            self._close(sid)
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:
