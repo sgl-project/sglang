@@ -21,17 +21,14 @@ class JSONConstrainedMixin:
     def _run_decode_json(
         self, json_schema, return_logprob=False, top_logprobs_num=0, n=1
     ):
+        # Keep this raw completion prompt: the compact JSON chat prompt made
+        # Llama-2 with EAGLE repeat newlines until the token limit.
         response = requests.post(
             self.base_url + "/generate",
             json={
                 "text": (
-                    "Introduce the capital of France. Return a single compact JSON object. "
-                    "The JSON Schema is: "
-                    + (
-                        json_schema
-                        if isinstance(json_schema, str)
-                        else json.dumps(json_schema)
-                    )
+                    "Introduce the capital of France. Return in a JSON format. The JSON Schema is: "
+                    + json.dumps(json_schema)
                 ),
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
