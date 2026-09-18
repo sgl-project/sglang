@@ -2967,16 +2967,38 @@ def normalize_serialized_named_tensor_payloads(
 
 
 class SafeUnpickler(pickle.Unpickler):
-    ALLOWED_MODULE_PREFIXES = {
+    # Standard-library modules expose powerful callables alongside harmless data
+    # types. Keep these globals exact so a newly added callable is denied by
+    # default instead of silently expanding the unpickling attack surface.
+    ALLOWED_GLOBALS = {
         # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
+        ("builtins", "bool"),
+        ("builtins", "bytearray"),
+        ("builtins", "bytes"),
+        ("builtins", "complex"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "range"),
+        ("builtins", "set"),
+        ("builtins", "slice"),
+        ("builtins", "str"),
+        ("builtins", "tuple"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("functools", "partial"),
+        ("itertools", "chain"),
+        ("itertools", "repeat"),
+        ("multiprocessing.reduction", "_rebuild_partial"),
+        ("multiprocessing.reduction", "_rebuild_socket"),
+        ("multiprocessing.resource_sharer", "DupFd"),
+        ("types", "SimpleNamespace"),
+    }
+
+    ALLOWED_MODULE_PREFIXES = {
         # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
@@ -2990,10 +3012,6 @@ class SafeUnpickler(pickle.Unpickler):
         "torch._C._distributed_c10d.",
         "torch._C._distributed_fsdp.",
         "torch.distributed.optim.",
-        # --- multiprocessing ---
-        "multiprocessing.resource_sharer.",
-        "multiprocessing.reduction.",
-        "pickletools.",
         # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
@@ -3009,35 +3027,14 @@ class SafeUnpickler(pickle.Unpickler):
         "torch_npu.",
     }
 
-    DENY_CLASSES = {
-        ("builtins", "eval"),
-        ("builtins", "exec"),
-        ("builtins", "compile"),
-        ("os", "system"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("codecs", "decode"),
-        ("types", "CodeType"),
-        ("types", "FunctionType"),
-    }
-
     def find_class(self, module, name):
-        # Block deterministic attacks
-        if (module, name) in self.DENY_CLASSES:
-            raise RuntimeError(
-                f"Blocked unsafe class loading ({module}.{name}), "
-                f"to prevent exploitation of CVE-2025-10164"
-            )
-        # Allowlist of safe-to-load modules.
-        if any(
+        if (module, name) in self.ALLOWED_GLOBALS or any(
             (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
         ):
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(
-            f"Blocked unsafe class loading ({module}.{name}), "
-            f"to prevent exploitation of CVE-2025-10164"
+            f"Blocked unsafe global ({module}.{name}) during pickle deserialization"
         )
 
 
