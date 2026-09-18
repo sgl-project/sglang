@@ -46,12 +46,31 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes requests for routing, preferring chat rendering over raw text.
+/// Whether the caller pre-tokenized the prompt (`input_ids` present and not
+/// null). Such a request is never re-rendered: its ids drive routing and the
+/// body is forwarded untouched, malformed values included, for the engine to
+/// validate.
+pub fn has_caller_input_ids(value: &serde_json::Value) -> bool {
+    value.get("input_ids").is_some_and(|v| !v.is_null())
+}
+
+/// Tokenizes a request for routing. Caller `input_ids` win; chat-rendered
+/// tokens may also be forwarded to the engine (the chat route decides); raw
+/// prompt tokens are routing-only.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
+    if has_caller_input_ids(value) {
+        // A flat u32 array (empty included) supplies routing tokens; anything
+        // else yields none, leaving validation to the engine.
+        let ids = serde::Deserialize::deserialize(&value["input_ids"]).ok()?;
+        return Some(RequestTokens {
+            ids,
+            rendered_from_chat: false,
+        });
+    }
     if tokenizers.has_chat_formatter(&model_id.0)
         && value.get("messages").is_some_and(|m| m.is_array())
     {
@@ -791,6 +810,7 @@ mod tests {
             32,
             &loads,
             None,
+            2,
         )
         .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
@@ -1585,7 +1605,7 @@ mod tests {
         let range = CandidateRange::global(&workers);
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
-        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None)
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None, 2)
             .expect("an admitted backup must be selected");
 
         assert_eq!(decision.selected.id, backup.id);
@@ -1604,6 +1624,7 @@ mod tests {
             1_000_000,
             &snapshot,
             None,
+            2,
         )
         .expect("disabled reporting must preserve the healthy registry candidate");
 
@@ -1642,6 +1663,7 @@ mod tests {
             80,
             &snapshot,
             None,
+            2,
         )
         .expect("both candidates fit capacity");
 
@@ -1692,6 +1714,7 @@ mod tests {
             32,
             &snapshot,
             None,
+            2,
         )
         .expect("an admitted range fallback must be selected");
 
