@@ -1232,13 +1232,20 @@ class CommonKVManager(BaseKVManager):
                 and self.attn_cp_size == 1
                 and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
-            if (
-                info.attn_tp_size != self.attn_tp_size
-                and not decode_tp_size_aligns_prefill_world_size
+            non_cp_layout = info.attn_cp_size == self.attn_cp_size == 1
+            non_cp_mla_layout = non_cp_layout and (
+                self.is_mla_backend or self.is_hybrid_mla_backend
+            )
+            if not (
+                decode_tp_size_aligns_prefill_world_size
+                or non_cp_mla_layout
+                or (non_cp_layout and info.attn_tp_size == self.attn_tp_size)
             ):
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "servers (including prefill CP ranks for MLA), or CP=1 on "
+                    "both servers with an MLA KV layout for unequal attention TP. "
+                    "Decode CP is not supported."
                 )
 
         # Every send path rejects head-sharded MXFP8 block scales across
