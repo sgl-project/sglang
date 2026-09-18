@@ -53,12 +53,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.get()
-        and not cfg.disaggregation_decode_enable_host_cache
+        and not cfg.disaggregation_decode_enable_host_receive
     ):
         raise ValueError(
-            "SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER requires decode host cache"
+            "SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER requires "
+            "--disaggregation-decode-enable-host-receive"
         )
-    if cfg.disaggregation_decode_enable_host_cache:
+    if cfg.disaggregation_decode_enable_host_receive:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(
                 "Decode host KV buffering requires disaggregation decode mode"

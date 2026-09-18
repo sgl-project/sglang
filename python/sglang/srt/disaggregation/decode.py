@@ -1650,7 +1650,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         if (
-            not get_disagg().disaggregation_decode_enable_host_cache
+            not get_disagg().disaggregation_decode_enable_host_receive
             or decode_req.is_rebootstrap
             or _is_fake_transfer(decode_req.req)
         ):

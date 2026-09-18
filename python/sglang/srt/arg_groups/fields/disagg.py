@@ -90,7 +90,7 @@ class Disagg(msgspec.Struct):
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False
-    disaggregation_decode_enable_host_cache: A[
+    disaggregation_decode_enable_host_receive: A[
         bool,
         "Receive KV in the decode retraction host pool when device admission is blocked. Size with --hicache-size or --hicache-ratio; requires Mooncake and dense MHA/MLA with matching TP layouts.",
     ] = False

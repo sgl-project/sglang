@@ -633,7 +633,7 @@ class Scheduler(
         self.init_hisparse_coordinator()
 
         self.decode_host_cache = None
-        if get_disagg().disaggregation_decode_enable_host_cache:
+        if get_disagg().disaggregation_decode_enable_host_receive:
             from sglang.srt.disaggregation.decode_host_cache import DecodeHostCache
             from sglang.srt.mem_cache.hicache_storage import PoolName
 

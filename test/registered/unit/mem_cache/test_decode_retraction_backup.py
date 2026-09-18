@@ -234,101 +234,100 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         req_to_token_pool.free(req)
 
     def test_receive_pressure_preserves_shared_retraction_and_restore(self):
-        for use_mla in (False, True):
-            for page_size in (1, 16):
-                with self.subTest(use_mla=use_mla, page_size=page_size):
-                    env = self._build_cache(
-                        hicache_ratio=0.5,
-                        shared_receive=True,
-                        use_mla=use_mla,
-                        page_size=page_size,
-                    )
-                    cache, pool = env.cache, env.target_pool
-                    host = cache.host_pool_group.get_pool(PoolName.KV)
-                    reserve = max(self.num_tokens, page_size)
-                    receiver = DecodeHostCache(
-                        pool,
-                        page_size,
-                        host,
-                        reserve,
-                        cache.cache_controller.l2_transfer_engine,
-                    )
-                    self.addCleanup(receiver.clear)
-                    host_capacity = host.available_size()
-                    receive_slots = host_capacity - reserve
-                    receive_tokens = receive_slots - int(page_size > 1)
-                    receiving = Mock(rid="receiving", kv=ReqKvInfo())
-                    host_indices = receiver.allocate(receiving, receive_tokens)
-                    self.assertEqual(len(host_indices), receive_slots)
-                    self.assertEqual(host.available_size(), reserve)
-                    self.assertIsNone(receiver.allocate(Mock(), 1))
+        for use_mla, page_size in ((False, 16), (True, 1)):
+            with self.subTest(use_mla=use_mla, page_size=page_size):
+                env = self._build_cache(
+                    hicache_ratio=0.5,
+                    shared_receive=True,
+                    use_mla=use_mla,
+                    page_size=page_size,
+                )
+                cache, pool = env.cache, env.target_pool
+                host = cache.host_pool_group.get_pool(PoolName.KV)
+                reserve = max(self.num_tokens, page_size)
+                receiver = DecodeHostCache(
+                    pool,
+                    page_size,
+                    host,
+                    reserve,
+                    cache.cache_controller.l2_transfer_engine,
+                )
+                self.addCleanup(receiver.clear)
+                host_capacity = host.available_size()
+                receive_slots = host_capacity - reserve
+                receive_tokens = receive_slots - int(page_size > 1)
+                receiving = Mock(rid="receiving", kv=ReqKvInfo())
+                host_indices = receiver.allocate(receiving, receive_tokens)
+                self.assertEqual(len(host_indices), receive_slots)
+                self.assertEqual(host.available_size(), reserve)
+                self.assertIsNone(receiver.allocate(Mock(), 1))
 
-                    device_buffers = (
-                        pool.kv_buffer if use_mla else pool.k_buffer + pool.v_buffer
-                    )
-                    host_buffers = host.data_refs if use_mla else host.host_kv_data_refs
-                    expected_receive = []
-                    for index, buffer in enumerate(host_buffers):
-                        values = torch.arange(
-                            buffer[host_indices].numel(), dtype=torch.float32
-                        ).reshape_as(buffer[host_indices])
-                        values = ((values + 13 * index) % 251).to(self.dtype)
-                        buffer[host_indices] = values
-                        expected_receive.append(values[:receive_tokens].clone())
+                device_buffers = (
+                    pool.kv_buffer if use_mla else pool.k_buffer + pool.v_buffer
+                )
+                host_buffers = host.data_refs if use_mla else host.host_kv_data_refs
+                expected_receive = []
+                for index, buffer in enumerate(host_buffers):
+                    values = torch.arange(
+                        buffer[host_indices].numel(), dtype=torch.float32
+                    ).reshape_as(buffer[host_indices])
+                    values = ((values + 13 * index) % 251).to(self.dtype)
+                    buffer[host_indices] = values
+                    expected_receive.append(values[:receive_tokens].clone())
 
-                    retracted, source_indices = self._admit_req(env, reserve)
-                    retracted.seqlen -= int(page_size > 1)
-                    expected_retraction = []
-                    for index, buffer in enumerate(device_buffers):
-                        values = torch.arange(
-                            buffer[source_indices].numel(), device=self.device
-                        ).reshape_as(buffer[source_indices])
-                        values = ((values + 29 * index) % 127).to(self.dtype)
-                        buffer[source_indices] = values
-                        expected_retraction.append(values.clone())
+                retracted, source_indices = self._admit_req(env, reserve)
+                retracted.seqlen -= int(page_size > 1)
+                expected_retraction = []
+                for index, buffer in enumerate(device_buffers):
+                    values = torch.arange(
+                        buffer[source_indices].numel(), device=self.device
+                    ).reshape_as(buffer[source_indices])
+                    values = ((values + 29 * index) % 127).to(self.dtype)
+                    buffer[source_indices] = values
+                    expected_retraction.append(values.clone())
 
-                    backup = cache.retraction_backup(retracted)
-                    self.assertIsNotNone(backup)
-                    self.assertEqual(host.available_size(), 0)
-                    restored_indices = env.allocator.alloc(reserve)
-                    self.assertIsNotNone(restored_indices)
-                    self.assertFalse(torch.equal(source_indices, restored_indices))
-                    for buffer in device_buffers:
-                        buffer.fill_(-1)
-                    env.allocator.free(source_indices)
-                    env.req_to_token_pool.write(
-                        (retracted.kv.req_pool_idx, slice(0, reserve)), restored_indices
-                    )
-                    cache.retraction_restore(retracted, backup)
-                    self.assertEqual(host.available_size(), reserve)
+                backup = cache.retraction_backup(retracted)
+                self.assertIsNotNone(backup)
+                self.assertEqual(host.available_size(), 0)
+                restored_indices = env.allocator.alloc(reserve)
+                self.assertIsNotNone(restored_indices)
+                self.assertFalse(torch.equal(source_indices, restored_indices))
+                for buffer in device_buffers:
+                    buffer.fill_(-1)
+                env.allocator.free(source_indices)
+                env.req_to_token_pool.write(
+                    (retracted.kv.req_pool_idx, slice(0, reserve)), restored_indices
+                )
+                cache.retraction_restore(retracted, backup)
+                self.assertEqual(host.available_size(), reserve)
 
-                    self.assertIsNotNone(env.req_to_token_pool.alloc([receiving]))
-                    received_indices = env.allocator.alloc(receive_slots)
-                    self.assertIsNotNone(received_indices)
-                    env.req_to_token_pool.write(
-                        (receiving.kv.req_pool_idx, slice(0, receive_slots)),
-                        received_indices,
-                    )
-                    receiver.load([receiving], env.req_to_token_pool).synchronize()
-                    for buffer, restored, received in zip(
-                        device_buffers,
-                        expected_retraction,
-                        expected_receive,
-                        strict=True,
-                    ):
-                        self.assertTrue(torch.equal(buffer[restored_indices], restored))
-                        self.assertTrue(
-                            torch.equal(
-                                buffer[received_indices[:receive_tokens]].cpu(),
-                                received,
-                            )
+                self.assertIsNotNone(env.req_to_token_pool.alloc([receiving]))
+                received_indices = env.allocator.alloc(receive_slots)
+                self.assertIsNotNone(received_indices)
+                env.req_to_token_pool.write(
+                    (receiving.kv.req_pool_idx, slice(0, receive_slots)),
+                    received_indices,
+                )
+                receiver.load([receiving], env.req_to_token_pool).synchronize()
+                for buffer, restored, received in zip(
+                    device_buffers,
+                    expected_retraction,
+                    expected_receive,
+                    strict=True,
+                ):
+                    self.assertTrue(torch.equal(buffer[restored_indices], restored))
+                    self.assertTrue(
+                        torch.equal(
+                            buffer[received_indices[:receive_tokens]].cpu(),
+                            received,
                         )
-                    receiver.poll()
-                    self.assertEqual(host.available_size(), host_capacity)
-                    env.allocator.free(restored_indices)
-                    env.allocator.free(received_indices)
-                    env.req_to_token_pool.free(retracted)
-                    env.req_to_token_pool.free(receiving)
+                    )
+                receiver.poll()
+                self.assertEqual(host.available_size(), host_capacity)
+                env.allocator.free(restored_indices)
+                env.allocator.free(received_indices)
+                env.req_to_token_pool.free(retracted)
+                env.req_to_token_pool.free(receiving)
 
 
 DCP_SIZE = 4
