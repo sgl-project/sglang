@@ -73,7 +73,7 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
             [None, None],
             target="transformer",
             strength=[0.5, 0.5],
-            merge_mode="dynamic",
+            merge_mode="merge",
         )
     assert (
         registry.get_sample_value(
