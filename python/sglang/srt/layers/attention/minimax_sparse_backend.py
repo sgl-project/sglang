@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_sm90_supported
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -243,6 +243,30 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
+        _native_q8kv8_requested = envs.SGLANG_ENABLE_MINIMAX_NATIVE_Q8KV8_DECODE.get()
+        self.native_q8kv8_decode_strict = (
+            envs.SGLANG_MINIMAX_NATIVE_Q8KV8_DECODE_STRICT.get()
+        )
+        _native_q8kv8_contract = (
+            not self.is_npu
+            and is_sm90_supported()
+            and self.fp8_attn_gemm
+            and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
+            and self.block_size_k == 128
+            and self.page_size == 128
+        )
+        self.use_sgl_native_q8kv8_decode = (
+            _native_q8kv8_requested and _native_q8kv8_contract
+        )
+        if (
+            _native_q8kv8_requested
+            and self.native_q8kv8_decode_strict
+            and not _native_q8kv8_contract
+        ):
+            raise RuntimeError(
+                "strict SGL native Q8KV8 decode requires SM90, fp8 attn-GEMM, "
+                "FP8 E4M3 main KV, and page_size=block_size_k=128"
+            )
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
@@ -320,7 +344,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"main_attn={'native_q8kv8_decode' if self.use_sgl_native_q8kv8_decode else ('MSA' if self.use_msa else 'triton')}, "
             f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
@@ -1735,6 +1759,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_scale=layer.idx_v_scale_float,
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
+                use_sgl_native_q8kv8_decode=self.use_sgl_native_q8kv8_decode,
+                sgl_native_q8kv8_decode_strict=self.native_q8kv8_decode_strict,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
