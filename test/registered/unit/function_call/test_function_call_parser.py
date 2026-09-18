@@ -6004,6 +6004,46 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
 
+
+    def test_qwen3_coder_duplicate_parameter(self):
+        detector = Qwen3CoderDetector()
+        text = (
+            "<tool_call>\n"
+            "<function=edit>\n"
+            "<parameter=edits>\n"
+            '[{"a": 1}, <parameter=edits>{"b": 2}]\n'
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="edit",
+                parameters={"type": "object", "properties": {"edits": {"type": "array"}}},
+            ),
+        )
+        # Test normal parsing
+        result = detector.detect_and_parse(text, [tool])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"edits": [{"a": 1}, {"b": 2}]})
+
+        # Test streaming
+        detector2 = Qwen3CoderDetector()
+        calls = []
+        for i in range(1, len(text) + 1):
+            chunk = text[:i]
+            res = detector2.parse_streaming_increment(chunk, [tool])
+            calls.extend(res.calls)
+        
+        # Merge streaming fragments
+        merged_args = ""
+        for call in calls:
+            if call.parameters:
+                merged_args += call.parameters
+        self.assertTrue('"edits":' in merged_args)
+        self.assertFalse(merged_args.count('"edits":') > 1)
+
     def test_qwen3_coder_streaming(self):
         detector = Qwen3CoderDetector()
         name, arguments = self._stream_arguments(

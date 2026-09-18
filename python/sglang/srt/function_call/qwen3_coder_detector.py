@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import Any
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -56,13 +56,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.is_inside_tool_call: bool = False
 
         # Initialize attributes that were missing in the original PR
-        self.current_func_name: Optional[str] = None
+        self.current_func_name: str | None = None
+        self.seen_params: set = set()
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
     def _get_arguments_config(
-        self, func_name: str, tools: Optional[list[Tool]]
+        self, func_name: str, tools: list[Tool] | None
     ) -> dict:
         """Extract argument configuration for a function."""
         if tools is None:
@@ -175,7 +176,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
         if self.tool_call_start_token not in text:
             return StreamingParseResult(normal_text=text)
@@ -206,17 +207,23 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_config = self._get_arguments_config(func_name, tools)
                     parsed_params = {}
 
+                    raw_params = {}
                     for p_match in self.tool_call_parameter_regex.findall(params_str):
                         if ">" not in p_match:
                             continue
                         p_idx = p_match.index(">")
                         p_name = p_match[:p_idx]
                         p_val = p_match[p_idx + 1 :]
+                        
+                        if p_name in raw_params:
+                            raw_params[p_name] += p_val
+                        else:
+                            raw_params[p_name] = p_val
+                            
+                    for p_name, p_val in raw_params.items():
                         # Remove prefixing and trailing \n
-                        if p_val.startswith("\n"):
-                            p_val = p_val[1:]
-                        if p_val.endswith("\n"):
-                            p_val = p_val[:-1]
+                        p_val = p_val.removeprefix("\n")
+                        p_val = p_val.removesuffix("\n")
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
@@ -244,7 +251,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
         """
         Robust cursor-based streaming parser.
@@ -287,6 +294,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self.seen_params = set()
 
                     calls.append(
                         ToolCallItem(
@@ -341,10 +349,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         raw_value = rest_of_slice[:end_pos]
 
                         # Cleanup value
-                        if raw_value.startswith("\n"):
-                            raw_value = raw_value[1:]
-                        if raw_value.endswith("\n"):
-                            raw_value = raw_value[:-1]
+                        raw_value = raw_value.removeprefix("\n")
+                        raw_value = raw_value.removesuffix("\n")
+                            
+                        if param_name in self.seen_params:
+                            total_len = (name_end + 1) + end_pos + end_token_len
+                            self.parsed_pos += total_len
+                            continue
+                        self.seen_params.add(param_name)
 
                         # JSON Construction
                         if not self.json_started:
