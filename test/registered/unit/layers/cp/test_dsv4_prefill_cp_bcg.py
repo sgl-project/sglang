@@ -62,16 +62,20 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             DeepseekV4AttnBackend,
         )
 
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(late_layer_tail=None)
+        )
         for lengths in ([32768], [8192, 24576]):
             batch = SimpleNamespace(
                 seq_lens_cpu=torch.tensor(lengths),
+                extend_seq_lens=torch.tensor(lengths, dtype=torch.int32),
                 extend_seq_lens_cpu=lengths,
             )
-            # No device metadata or pool is present: the invariant must fail
-            # before reading those fields or launching the index combiner.
+            # No core attention metadata or pool is present: the invariant
+            # must fail before accessing either or launching the index combiner.
             with self.assertRaisesRegex(AssertionError, "allocated 16384.*32768"):
                 DeepseekV4AttnBackend._build_sparse_prefill_chunk_cache(
-                    None, batch, num_qo_tokens=16384
+                    backend, batch, core_attn_metadata=None, num_qo_tokens=16384
                 )
 
     def test_inactive_cp_batch_cannot_replay_cp_body(self):
@@ -108,6 +112,8 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
         for use_graph, write_tokens in ((False, 11), (True, 16)):
             core = Mock()
             backend = SimpleNamespace(
+                has_c4=True,
+                has_c128=True,
                 expand_prefill_casually=Mock(
                     return_value=(torch.ones(16), torch.zeros(16))
                 ),
@@ -118,7 +124,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
             out_loc = torch.arange(write_tokens)
             batch = SimpleNamespace(
-                attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[8, 8])
+                attn_cp_metadata=SimpleNamespace(
+                    per_rank_actual_token=[8, 8], local_index=None
+                )
             )
             with (
                 patch(
@@ -156,7 +164,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                 backend.make_core_attn_metadata.call_args.kwargs["num_tokens"],
                 write_tokens,
             )
-            core.apply_cp_reindex.assert_called_once_with(num_tokens=write_tokens)
+            core.apply_cp_reindex.assert_called_once_with(
+                num_tokens=write_tokens, local_index=batch.attn_cp_metadata.local_index
+            )
             if use_graph:
                 for call in planner.call_args_list:
                     self.assertEqual(call.kwargs["num_q_tokens"], 16)
