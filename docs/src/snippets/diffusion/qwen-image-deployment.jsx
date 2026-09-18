@@ -11,6 +11,7 @@ export const QwenImageDeployment = () => {
           { id: 'b300', label: 'B300', default: false },
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
+          { id: 'xeon', label: 'XEON', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi355x', label: 'MI355X', default: false },
@@ -35,6 +36,11 @@ export const QwenImageDeployment = () => {
     },
 
     generateCommand: function(values) {
+      if (values.hardware === 'xeon') {
+        return `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve \\
+  --model-path Qwen/Qwen-Image`;
+      }
+
       if (values.hardware === 'a2') {
         return `sglang serve \\
   --model-path Qwen/Qwen-Image \\

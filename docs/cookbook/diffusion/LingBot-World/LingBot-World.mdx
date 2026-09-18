@@ -27,6 +27,14 @@ sglang serve \
   --text-encoder-cpu-offload false
 ```
 
+
+Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only parallel and offload flags.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path robbyant/lingbot-world-fast-diffusers  --pipeline-class-name LingBotWorldCausalDMDPipeline
+```
+
+
 ### Optional KV-Cache Compression
 
 Long-running sessions can enable lossy int4 PRQ compression for completed

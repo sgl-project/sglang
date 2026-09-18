@@ -5,6 +5,7 @@ export const LTX25Deployment = () => {
       title: 'Deployment Target',
       items: [
         { id: 'h200', label: '1x H200', subtitle: 'no extra flags', default: true },
+        { id: 'xeon', label: 'XEON', subtitle: 'CPU mode', default: false },
         { id: 'tight', label: '1 GPU, tight VRAM', subtitle: 'layerwise offload', default: false },
         { id: 'sp2', label: '2 GPUs', subtitle: 'sequence parallel', default: false },
         { id: 'tp2', label: '2 GPUs', subtitle: 'tensor parallel', default: false },
@@ -99,6 +100,9 @@ export const LTX25Deployment = () => {
 
   const generateCommand = () => {
     let command = `sglang serve \\\n  --model-path ${REPO_ID}`;
+    if (values.hardware === 'xeon') {
+      command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu ` + command;
+    }
     command += ` \\\n  --pipeline-class-name ${PIPELINE_CLASSES[values.pipeline]}`;
     if (values.weights === 'dev') {
       command += ` \\\n  --model-variant dev`;

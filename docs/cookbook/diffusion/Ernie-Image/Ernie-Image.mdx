@@ -29,6 +29,8 @@ pip install -e "python[diffusion]"
 
 For full installation options, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Serve the model
 
 The commands below target a single supported NVIDIA CUDA or AMD ROCm GPU. Start with `--performance-mode auto`; use `speed` only when the full pipeline fits comfortably on the selected GPU(s), and use `memory` when you need lower peak GPU memory.
@@ -51,6 +53,21 @@ sglang serve \
   --num-gpus 1 \
   --performance-mode auto \
   --port 30010
+```
+
+
+Xeon CPU deployment is supported by prefixing the server command with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and omitting GPU-only flags.
+
+Serve ERNIE-Image:
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path baidu/ERNIE-Image --port 30010
+```
+
+Serve ERNIE-Image-Turbo:
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path baidu/ERNIE-Image-Turbo --port 30010
 ```
 
 ## 4. Generate an image
