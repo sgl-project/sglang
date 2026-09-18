@@ -22,6 +22,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -52,7 +53,7 @@ _IS_HIP = is_hip()
 
 def pp_sync_polls(
     polls: Optional[List[int]],
-    pp_group,
+    pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
@@ -110,7 +111,7 @@ def poll_and_all_reduce_pp2(
     pollers: List[CommonKVSender],
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
-    pp_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
     pp_poll_sync_work_list: List[torch.distributed.Work],
