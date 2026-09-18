@@ -13,7 +13,12 @@ import msgspec
 import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
+from sglang.srt.arg_groups import (
+    parallel_hook,
+    pd_disaggregation_hook,
+    serving_hook,
+    validation_hook,
+)
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
@@ -2158,23 +2163,44 @@ class TestPipelineParallelCompat(CustomTestCase):
                     )
 
     def test_eagle_is_rejected_for_unsupported_model(self):
-        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM models"):
+        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM/Qwen3.5 models"):
             check_pipeline_parallel_compat(
                 self._cfg(speculative_algorithm="EAGLE"),
                 model_architecture="LlamaForCausalLM",
             )
 
-    def test_supported_deepseek_architectures(self):
+    def test_supported_architectures(self):
         for architecture in (
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
         ):
             with self.subTest(architecture=architecture):
                 check_pipeline_parallel_compat(
                     self._cfg(speculative_algorithm="EAGLE"),
                     model_architecture=architecture,
+                )
+
+    def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
+        cfg = self._cfg(
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="null",
+            speculative_adaptive=False,
+            enable_dp_attention=False,
+        )
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            check_pipeline_parallel_compat(cfg, model_architecture="LlamaForCausalLM")
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=self._SUPPORTED_ARCH,
                 )
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
