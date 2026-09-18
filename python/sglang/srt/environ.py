@@ -549,6 +549,11 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
+    # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
+    # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
+    # the NCCL ring. Only taken when the group's communicator has a multicast
+    # plane; off, or no such plane, keeps the NCCL all-gather.
+    SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
@@ -948,8 +953,17 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
+    # routed front / DeepEP dispatch / routed GEMMs, respectively.
+    SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
+    # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
+    SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
+    # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
+    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
     # BF16 wo_a: use F.linear for single-local-group decode (Flash TP8),
     # retaining the original weight layout. Opt-in for A/B.
     SGLANG_OPT_NPU_BF16_WO_A_GEMM = EnvBool(False)
@@ -1470,6 +1484,13 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
+    # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
+    # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
+    SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
+    # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
+    # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
+    SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
     # unified_kv only: split the pool into an fp8 nope pool plus a parallel
     # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
     # dtype, so --kv-cache-dtype has no effect there and this switch is the
@@ -1501,6 +1522,9 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
