@@ -1748,3 +1748,17 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+def is_user_abort(req: Req) -> bool:
+    """True when the abort came from the client (AbortReq), not an internal failure.
+
+    Scheduler.abort_request marks every req it stamps, and only those stamps:
+    FINISH_ABORT alone cannot encode origin -- client cancels stamp it
+    statusless, and so do internal failures (e.g. grammar accept errors),
+    so neither the type nor the missing status identifies a client cancel.
+    Telemetry and restamping decisions must key off the recorded origin: an
+    internal abort must not suppress failure logging or metrics as though
+    the client cancelled.
+    """
+    return getattr(req, "user_aborted", False)

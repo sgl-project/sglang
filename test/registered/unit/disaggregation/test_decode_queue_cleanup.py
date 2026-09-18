@@ -359,6 +359,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="failed-transfer",
             bootstrap_room=7,
             return_logprob=False,
+            finished_reason=None,
         )
         decode_req = SimpleNamespace(
             req=req,

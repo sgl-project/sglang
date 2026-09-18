@@ -2,7 +2,7 @@ import types
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -12,6 +12,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    DecodeTransferQueue,
+    HiCacheRestoreResult,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -21,6 +27,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    Req,
     release_req,
 )
 from sglang.srt.managers.scheduler import Scheduler
@@ -436,6 +443,527 @@ class TestSessionQueueAbort(CustomTestCase):
             vocab_size=VOCAB_SIZE,
         )
         self.assertIsNone(follow_up.finished_reason)
+
+    def test_prealloc_queue_abort_in_decode_mode_finishes_session_turn(self):
+        """PD decode: a prealloc-queue req has no KV yet, so release_kv_cache
+        never runs and nothing clears the session inflight turn. The abort
+        path must stamp FINISH_ABORT and the queue finish must clear the
+        turn."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[decode_req], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        decode_req.kv_receiver.abort.assert_called_once()
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(req.finished_reason.message, "Aborted")
+        # The session stays inflight until the queue actually finishes the
+        # request — a follow-up must not be admitted before that.
+        self.assertTrue(session.has_unfinished_request())
+        # Removal + output streaming are pop_preallocated's job, not abort's.
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.queue, [decode_req])
+        send_output.assert_not_called()
+
+        # Drive the prealloc queue's abort-scan: it finishes the req, clears
+        # the receiver, and unblocks the session.
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.queue = [decode_req]
+        prealloc_queue.pending_reqs = []
+        prealloc_queue.retracted_queue = []
+        prealloc_queue.pp_size = 1
+        prealloc_queue._resolve_pending_reqs = MagicMock()
+        prealloc_queue._update_handshake_waiters = MagicMock()
+        prealloc_queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        prealloc_queue._uses_swa_reservation = MagicMock(return_value=False)
+        prealloc_queue._allocatable_token_budgets = MagicMock(return_value=0)
+        prealloc_queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        prealloc_queue.scheduler = scheduler
+
+        preallocated, failed = prealloc_queue.pop_preallocated()
+
+        self.assertEqual(failed, [decode_req])
+        self.assertEqual(prealloc_queue.queue, [])
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+        follow_up = session.create_req(
+            _recv("turn-3", [99]),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(follow_up.finished_reason)
+
+    def test_prealloc_handshake_failure_of_user_aborted_req_still_cleans_up(self):
+        """PD decode: a user-aborted prealloc-queue req that polls Failed must
+        still run failure_exception() -- the receiver's transfer-record cleanup
+        -- while keeping the FINISH_ABORT stamp (no 500 restamp, no failure
+        metric)."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[decode_req], retracted_queue=[], held_rebootstrap_reqs=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        decode_req.kv_receiver.failure_exception.side_effect = RuntimeError("aborted")
+
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.queue = [decode_req]
+        prealloc_queue.pp_size = 1
+        prealloc_queue.gloo_group = MagicMock()
+        prealloc_queue.tp_rank = 0
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        prealloc_queue.scheduler = scheduler
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Failed],
+        ):
+            prealloc_queue._update_handshake_waiters()
+
+        decode_req.kv_receiver.failure_exception.assert_called_once_with()
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.finished_reason.status_code)
+        scheduler.metrics_collector.increment_bootstrap_failed_reqs.assert_not_called()
+
+    def test_transfer_queue_abort_in_decode_mode_finishes_session_turn(self):
+        """PD decode: a transfer-queue req holds real KV; abort must stamp
+        FINISH_ABORT and clear the session turn while leaving the KV for
+        pop_transferred's Failed branch to release."""
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[decode_req])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        decode_req.kv_receiver.abort.assert_called_once()
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(req.finished_reason.message, "Aborted")
+        # The session stays inflight until pop_transferred finishes the req
+        # and releases its KV.
+        self.assertTrue(session.has_unfinished_request())
+        self.assertEqual(scheduler.disagg_decode_transfer_queue.queue, [decode_req])
+        send_output.assert_not_called()
+        self.assertIsNotNone(req.kv.req_pool_idx)
+
+        # Drive the transfer queue's Failed branch (the aborted receiver
+        # polls Failed): releases KV, unblocks the session, and must NOT
+        # count a user abort as a transfer failure.
+        # failure_exception() is also the receiver's transfer-record cleanup,
+        # so it must still run for a user abort, with its exception swallowed.
+        # (pop_transferred clears decode_req.kv_receiver, so keep a reference.)
+        receiver = decode_req.kv_receiver
+        receiver.failure_exception.side_effect = RuntimeError("aborted")
+        decode_req.metadata_buffer_index = 3
+        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = [decode_req]
+        transfer_queue.enable_staging = False
+        transfer_queue.enable_deferred_kv_release = False
+        transfer_queue.gloo_group = MagicMock()
+        transfer_queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        transfer_queue.tp_rank = 0
+        transfer_queue.tree_cache = cache
+        transfer_queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        transfer_queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        transfer_queue._clean_hicache_prefetch_resources = MagicMock()
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        transfer_queue.scheduler = scheduler
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Failed],
+        ):
+            transferred = transfer_queue.pop_transferred()
+
+        self.assertEqual(transferred, [])
+        self.assertEqual(transfer_queue.queue, [])
+        receiver.failure_exception.assert_called_once_with()
+        self.assertIsNone(req.finished_reason.status_code)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
+        self.assertFalse(session.has_unfinished_request())
+        self.assertIsNone(req.kv.req_pool_idx)
+        self._assert_idle(observer, checker)
+        follow_up = session.create_req(
+            _recv("turn-3", [99]),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(follow_up.finished_reason)
+
+    def test_transfer_failure_of_statusless_internal_abort_counts_as_failure(self):
+        """A statusless internal FINISH_ABORT (e.g. a grammar accept error)
+        is not a client cancel either: abort_request records the client
+        origin explicitly, so a bare stamp must still log, restamp, and
+        count the transfer failure."""
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+        # An internal failure already stamped a statusless abort.
+        req.finished_reason = FINISH_ABORT()
+
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        receiver = decode_req.kv_receiver
+        receiver.failure_exception.side_effect = RuntimeError("boom")
+        decode_req.metadata_buffer_index = 3
+        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = [decode_req]
+        transfer_queue.enable_staging = False
+        transfer_queue.enable_deferred_kv_release = False
+        transfer_queue.gloo_group = MagicMock()
+        transfer_queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        transfer_queue.tp_rank = 0
+        transfer_queue.tree_cache = cache
+        transfer_queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        transfer_queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        transfer_queue._clean_hicache_prefetch_resources = MagicMock()
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        transfer_queue.scheduler = scheduler
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Failed],
+        ):
+            transferred = transfer_queue.pop_transferred()
+
+        self.assertEqual(transferred, [])
+        self.assertEqual(transfer_queue.queue, [])
+        receiver.failure_exception.assert_called_once_with()
+        self.assertEqual(req.finished_reason.status_code, 500)
+        self.assertIn("Decode transfer failed", req.finished_reason.message)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_transfer_failure_of_internally_aborted_req_counts_as_failure(self):
+        """An internal 500 FINISH_ABORT (e.g. corruption) is not a user
+        cancel: when the receiver then polls Failed, the transfer error log,
+        the restamp with the transfer error, and the failure metric must
+        still fire -- treating it as a user abort would underreport real
+        transfer failures."""
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+        # An internal failure already stamped a 500 abort.
+        req.finished_reason = FINISH_ABORT("corruption detected", 500)
+
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        receiver = decode_req.kv_receiver
+        receiver.failure_exception.side_effect = RuntimeError("boom")
+        decode_req.metadata_buffer_index = 3
+        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = [decode_req]
+        transfer_queue.enable_staging = False
+        transfer_queue.enable_deferred_kv_release = False
+        transfer_queue.gloo_group = MagicMock()
+        transfer_queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        transfer_queue.tp_rank = 0
+        transfer_queue.tree_cache = cache
+        transfer_queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        transfer_queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        transfer_queue._clean_hicache_prefetch_resources = MagicMock()
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        transfer_queue.scheduler = scheduler
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Failed],
+        ):
+            transferred = transfer_queue.pop_transferred()
+
+        self.assertEqual(transferred, [])
+        self.assertEqual(transfer_queue.queue, [])
+        receiver.failure_exception.assert_called_once_with()
+        self.assertEqual(req.finished_reason.status_code, 500)
+        self.assertIn("Decode transfer failed", req.finished_reason.message)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_abort_all_over_multiple_retracted_and_queued_decode_reqs(self):
+        """abort_all must hit retracted, prealloc, and transfer reqs in one
+        pass, tolerating plain Reqs with no session attached."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            _session,
+        ) = self._setup_first_turn()
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        def _plain_req(rid):
+            return Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2, 3]),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+                vocab_size=VOCAB_SIZE,
+            )
+
+        retracted_req = _plain_req("retracted-1")
+        retracted_req.kv.retraction_backup = RetractionBackup(
+            cpu_tensors=torch.empty(0)
+        )
+        prealloc_req = _plain_req("prealloc-1")
+        transfer_req = _plain_req("transfer-1")
+        prealloc_decode_req = SimpleNamespace(req=prealloc_req, kv_receiver=Mock())
+        transfer_decode_req = SimpleNamespace(req=transfer_req, kv_receiver=Mock())
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[prealloc_decode_req], retracted_queue=[retracted_req]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[transfer_decode_req]
+        )
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        Scheduler.abort_request(scheduler, AbortReq(rid="", abort_all=True))
+
+        for req in (retracted_req, prealloc_req, transfer_req):
+            self.assertTrue(req.finished())
+            self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.retracted_queue, [])
+        self.assertIsNone(retracted_req.kv.retraction_backup)
+        send_output.assert_called_once()
+        self.assertIsInstance(send_output.call_args[0][0], AbortReq)
+        self.assertEqual(send_output.call_args[0][0].rid, "retracted-1")
+        prealloc_decode_req.kv_receiver.abort.assert_called_once()
+        transfer_decode_req.kv_receiver.abort.assert_called_once()
+
+    def test_retracted_queue_abort_retry_after_send_failure(self):
+        """If send_output raises, the req must stay fully intact in
+        retracted_queue so a retry re-runs idempotent steps: the backup
+        discard happens only after a successful send."""
+        (
+            server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        release_req(
+            req=req,
+            remaing_req_count=1,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=cache,
+            hisparse_coordinator=None,
+            offload_kv=False,
+        )
+        req.kv.retraction_backup = RetractionBackup(cpu_tensors=torch.empty(0))
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[req]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        send_output.side_effect = [RuntimeError("ipc"), None]
+
+        with self.assertRaises(RuntimeError):
+            Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+        self.assertIsNotNone(req.kv.retraction_backup)
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.retracted_queue, [req])
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.retracted_queue, [])
+        self.assertIsNone(req.kv.retraction_backup)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_abort_all_partial_retracted_failure_keeps_failed_entry_retryable(self):
+        """A multi-entry retracted abort must commit each removal in place:
+        if send_output raises for entry B after A succeeded, the queue must
+        already hold only [B] so a retry does not re-run A's cleanup."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            _session,
+        ) = self._setup_first_turn()
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        def _plain_req(rid):
+            req = Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2, 3]),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+                vocab_size=VOCAB_SIZE,
+            )
+            req.kv.retraction_backup = RetractionBackup(cpu_tensors=torch.empty(0))
+            return req
+
+        req_a = _plain_req("retracted-a")
+        req_b = _plain_req("retracted-b")
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[req_a, req_b]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        send_output.side_effect = [None, RuntimeError("ipc down")]
+
+        with self.assertRaises(RuntimeError):
+            Scheduler.abort_request(scheduler, AbortReq(rid="", abort_all=True))
+        self.assertEqual(
+            scheduler.disagg_decode_prealloc_queue.retracted_queue, [req_b]
+        )
+        self.assertIsNone(req_a.kv.retraction_backup)
+        self.assertIsNotNone(req_b.kv.retraction_backup)
+
+        send_output.side_effect = None
+        Scheduler.abort_request(scheduler, AbortReq(rid="", abort_all=True))
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.retracted_queue, [])
+        self.assertIsNone(req_b.kv.retraction_backup)
+        self.assertTrue(req_a.finished())
+        self.assertTrue(req_b.finished())
+        self.assertEqual(send_output.call_count, 3)
 
 
 
