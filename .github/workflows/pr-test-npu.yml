@@ -380,7 +380,7 @@ jobs:
 #      upload_test_logs: ${{ inputs.coverage_mode != true }}
 
 
-  # ==================== Recommend Tests from Coverage ==================== #
+  # ==================== Recommend Tests from Coverage ====================
   # Downloads the pre-built coverage baseline (test_case_map.json + covstub)
   # from OBS and runs test_selector.py to recommend affected test cases for
   # the current PR. continue-on-error: true so it never blocks the PR gate.
