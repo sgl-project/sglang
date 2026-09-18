@@ -112,6 +112,11 @@ class SchedulerMlxOverlapMixin:
         self.last_batch = pending.schedule_batch
         self.process_batch_result(pending.batch_copy, result)
 
+    def _cleanup_mlx_state_if_fully_idle(self: Scheduler) -> None:
+        """Release worker-owned state only after scheduler lifecycle confirms idle."""
+        if self.is_fully_idle():
+            self.tp_worker.cleanup_idle_request_state()
+
     @DynamicGradMode()
     def event_loop_overlap_mlx(self: Scheduler):
         """MLX-specific overlap loop modelled on ``mlx_lm.generate.generate_step``.
@@ -273,6 +278,7 @@ class SchedulerMlxOverlapMixin:
                 pending_curr = _launch_fresh(next_batch)
                 self.result_queue.append(pending_curr)
             else:
+                self._cleanup_mlx_state_if_fully_idle()
                 self.on_idle()
 
             self.last_batch = next_batch
