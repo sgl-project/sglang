@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import inspect
 import logging
@@ -147,6 +148,35 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 
     return ragged_verify_compact_enabled()
+
+
+def build_padded_capture_fb_view(
+    forward_batch: ForwardBatch,
+    buffer_registry: CudaGraphBufferRegistry,
+    bs: int,
+    req_width: int,
+    forward_mode: ForwardMode,
+) -> ForwardBatch:
+    """Use captured padding without mutating the live batch or speculative metadata."""
+    replay_batch = copy.copy(forward_batch)
+    replay_batch.batch_size = bs
+    if replay_batch.spec_info is not None:
+        replay_batch.spec_info = copy.copy(replay_batch.spec_info)
+        replay_batch.spec_info.draft_token_num = req_width
+        if hasattr(replay_batch.spec_info, "num_tokens_per_req"):
+            replay_batch.spec_info.num_tokens_per_req = req_width
+    num_tokens = bs * req_width
+    for name in ("input_ids", "req_pool_indices", "out_cache_loc"):
+        setattr(
+            replay_batch, name, buffer_registry.get_slot(name).slice_for(bs, num_tokens)
+        )
+    # PLE preparation must use the graph's padded layout, including idle slots.
+    replay_batch.forward_mode = forward_mode
+    replay_batch._original_forward_mode = None
+    replay_batch.global_num_token_non_padded_cpu = None
+    replay_batch.extend_seq_lens = None
+    replay_batch.extend_seq_lens_cpu = None
+    return replay_batch
 
 
 def build_replay_fb_view(
@@ -464,7 +494,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
-
+        self._init_model_hooks()
         # --- capture --------------------------------------------------
         try:
             with model_capture_mode():
@@ -477,6 +507,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
         return max_num_tokens
+
+    def _init_model_hooks(self):
+        self.validate_model_support()
+        self._replay_prepare_hook = (
+            getattr(self.model_runner.model, "prepare_cuda_graph_replay", None)
+            if getattr(self.model_runner.model, "needs_replay_prepare", False)
+            else None
+        )
 
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
@@ -1454,6 +1492,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         if self.ragged_verify_mode
                         else ""
                     ),
+                )
+            if self._replay_prepare_hook is not None:
+                self._replay_prepare_hook(
+                    build_padded_capture_fb_view(
+                        forward_batch,
+                        self.buffer_registry,
+                        self.bs,
+                        self.captured_req_width,
+                        self.capture_forward_mode,
+                    )
                 )
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)

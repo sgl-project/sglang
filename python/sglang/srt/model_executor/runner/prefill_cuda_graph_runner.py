@@ -614,6 +614,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
+        self.validate_model_support()
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
