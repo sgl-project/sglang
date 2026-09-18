@@ -1,4 +1,4 @@
-"""Native SM90 split-K sparse decode for FP8 E4M3 Q/K/V."""
+"""Native SM90 split-K sparse decode for BF16 Q and FP8 E4M3 K/V."""
 
 from __future__ import annotations
 
@@ -77,8 +77,8 @@ def _validate_contract(
             raise ValueError(f"{name} must be contiguous")
     if q.stride(-1) != 1:
         raise ValueError("q last dimension must be contiguous")
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"q must have dtype torch.float8_e4m3fn, got {q.dtype}")
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"q must have dtype torch.bfloat16, got {q.dtype}")
     if k_cache.dtype != torch.float8_e4m3fn:
         raise ValueError(
             f"k_cache must have dtype torch.float8_e4m3fn, got {k_cache.dtype}"

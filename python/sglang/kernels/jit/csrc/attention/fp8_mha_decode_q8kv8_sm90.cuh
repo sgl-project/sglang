@@ -98,14 +98,10 @@ tma_load_3d(fp8_t* dst, const CUtensorMap* tensor_map, int32_t x, int32_t y, int
       : "memory");
 }
 
-__device__ __forceinline__ void copy_q_16B(fp8_t* dst, const fp8_t* src, bool pred) {
-  if (pred && (reinterpret_cast<uintptr_t>(src) & 0xf) == 0) {
-    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-    return;
-  }
+__device__ __forceinline__ void quantize_q_16(fp8_t* dst, const bf16_t* src, bool pred, float inv_q_scale) {
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
-    dst[i] = pred ? src[i] : fp8_t(0.0f);
+    dst[i] = pred ? fp8_t(static_cast<float>(src[i]) * inv_q_scale) : fp8_t(0.0f);
   }
 }
 
@@ -155,7 +151,7 @@ __device__ __forceinline__ void load_kv_tile(
 __global__ void fp8_mha_decode_q8kv8_splitk_kernel(
     bf16_t* __restrict__ partial,
     float* __restrict__ lse,
-    const fp8_t* __restrict__ q,
+    const bf16_t* __restrict__ q,
     const fp8_t* __restrict__ k_cache,
     const fp8_t* __restrict__ v_cache,
     const int32_t* __restrict__ req_to_token,
@@ -173,6 +169,7 @@ __global__ void fp8_mha_decode_q8kv8_splitk_kernel(
     int64_t q_stride_0,
     int64_t q_stride_1,
     int64_t q_stride_2,
+    float inv_q_scale,
     float effective_sm_scale,
     float v_scale) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
@@ -206,9 +203,9 @@ __global__ void fp8_mha_decode_q8kv8_splitk_kernel(
       const int q_head = kv_head * group_size + row;
       const int64_t q_offset = static_cast<int64_t>(batch) * q_stride_0 + static_cast<int64_t>(q_head) * q_stride_1 +
                                static_cast<int64_t>(col) * q_stride_2;
-      copy_q_16B(dst, q + q_offset, true);
+      quantize_q_16(dst, q + q_offset, true, inv_q_scale);
     } else {
-      copy_q_16B(dst, nullptr, false);
+      quantize_q_16(dst, nullptr, false, inv_q_scale);
     }
   }
   warpgroup_sync();
@@ -378,7 +375,7 @@ inline void launch_fp8_mha_decode_q8kv8_sm90(
     bf16_t* output,
     bf16_t* partial,
     float* lse,
-    const fp8_t* q,
+    const bf16_t* q,
     const fp8_t* k_cache,
     const fp8_t* v_cache,
     const int32_t* req_to_token,
@@ -395,6 +392,7 @@ inline void launch_fp8_mha_decode_q8kv8_sm90(
     int64_t q_stride_0,
     int64_t q_stride_1,
     int64_t q_stride_2,
+    float q_scale,
     float effective_sm_scale,
     float v_scale,
     cudaStream_t stream) {
@@ -449,6 +447,7 @@ inline void launch_fp8_mha_decode_q8kv8_sm90(
       q_stride_0,
       q_stride_1,
       q_stride_2,
+      1.0f / q_scale,
       effective_sm_scale,
       v_scale);
   merge_decode_splits_kernel<<<dim3(batch_size, num_q_heads), kHeadDim, 0, stream>>>(

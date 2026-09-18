@@ -45,7 +45,7 @@ void minimax_sparse_decode_q8kv8_sm90(
       static_cast<q8kv8_decode_sm90::bf16_t*>(output.data_ptr()),
       static_cast<q8kv8_decode_sm90::bf16_t*>(partial.data_ptr()),
       static_cast<float*>(lse.data_ptr()),
-      static_cast<const q8kv8_decode_sm90::fp8_t*>(q.data_ptr()),
+      static_cast<const q8kv8_decode_sm90::bf16_t*>(q.data_ptr()),
       static_cast<const q8kv8_decode_sm90::fp8_t*>(k_cache.data_ptr()),
       static_cast<const q8kv8_decode_sm90::fp8_t*>(v_cache.data_ptr()),
       static_cast<const int32_t*>(req_to_token.data_ptr()),
@@ -62,6 +62,7 @@ void minimax_sparse_decode_q8kv8_sm90(
       q_stride_0,
       q_stride_1,
       q_stride_2,
+      static_cast<float>(q_scale),
       static_cast<float>(sm_scale * q_scale * k_scale),
       static_cast<float>(v_scale),
       stream);

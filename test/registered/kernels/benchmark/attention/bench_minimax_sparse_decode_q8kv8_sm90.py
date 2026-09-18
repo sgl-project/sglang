@@ -23,9 +23,7 @@ def make_case(batch: int, seq_len: int, topk: int):
     num_q_heads, num_kv_heads, head_dim, block_size = 8, 1, 128, 128
     num_blocks = (seq_len + block_size - 1) // block_size
     max_slots = num_blocks * block_size
-    q = (torch.randn(batch, num_q_heads, head_dim, device=device) * 0.2).to(
-        torch.float8_e4m3fn
-    )
+    q = (torch.randn(batch, num_q_heads, head_dim, device=device) * 0.2).bfloat16()
     k = (torch.randn(max_slots, num_kv_heads, head_dim, device=device) * 0.2).to(
         torch.float8_e4m3fn
     )
@@ -36,7 +34,7 @@ def make_case(batch: int, seq_len: int, topk: int):
         .contiguous()
     )
     slot_ids = torch.arange(batch, dtype=torch.int64, device=device)
-    seq_lens = torch.full((batch,), seq_len, dtype=torch.int32, device=device)
+    seq_lens = torch.full((batch,), seq_len, dtype=torch.int64, device=device)
     selected = torch.randperm(num_blocks, device=device)[:topk].sort().values.int()
     topk_idx = selected.view(1, 1, topk).expand(num_kv_heads, batch, topk).contiguous()
     return q, k, v, req_to_token, slot_ids, seq_lens, topk_idx
@@ -55,6 +53,8 @@ def main():
             batch, args.seq_len, args.topk
         )
 
+        q_scale = 0.75
+        q_fp8 = (q / q_scale).to(torch.float8_e4m3fn)
         native = partial(
             sgl_native_q8kv8_sparse_decode,
             q,
@@ -66,10 +66,11 @@ def main():
             topk_idx,
             128,
             128,
+            q_scale=q_scale,
         )
         triton_step3 = partial(
             flash_decode_with_gqa_share_sparse,
-            q=q,
+            q=q_fp8,
             sink=None,
             k_cache=k,
             v_cache=v,
@@ -78,6 +79,7 @@ def main():
             slot_ids=slot_ids,
             block_size=128,
             topk_idx=topk_idx,
+            q_scale=q_scale,
         )
 
         native_out = native()

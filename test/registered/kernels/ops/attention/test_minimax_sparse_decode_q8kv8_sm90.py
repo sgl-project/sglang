@@ -48,7 +48,7 @@ def _reference(q, k, v, req_to_token, slot_ids, seq_lens, topk_idx, scales):
     out = torch.zeros(
         batch, num_q_heads, head_dim, dtype=torch.float32, device=q.device
     )
-    qf = q.float() * q_scale
+    qf = (q.float() / q_scale).to(FP8).float() * q_scale
     kf = k.float() * k_scale
     vf = v.float() * v_scale
     for b in range(batch):
@@ -80,7 +80,7 @@ def _case(batch=3, num_q_heads=8, num_kv_heads=1, topk=32):
     page_size = 128
     max_len = max_blocks * page_size
     pages = batch * max_blocks
-    q = (torch.randn(batch, num_q_heads, 128, device="cuda") * 0.2).to(FP8)
+    q = (torch.randn(batch, num_q_heads, 128, device="cuda") * 0.2).bfloat16()
     k = (torch.randn(pages * page_size, num_kv_heads, 128, device="cuda") * 0.2).to(FP8)
     v = (torch.randn_like(k.float()) * 0.2).to(FP8)
     req_to_token = torch.empty(batch, max_len, dtype=torch.int32, device="cuda")
@@ -139,7 +139,7 @@ def test_native_decode_matches_reference_with_minus_one_and_empty_splits(
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="requires SM90 CUDA")
-def test_native_decode_cuda_graph_replay_uses_updated_indices_and_scales():
+def test_native_decode_cuda_graph_replay_uses_updated_bf16_query_and_indices():
     native = importlib.import_module(MODULE)
     q, k, v, req_to_token, slot_ids, seq_lens, topk_idx = _case(
         batch=1, num_q_heads=8, num_kv_heads=1
@@ -180,6 +180,7 @@ def test_native_decode_cuda_graph_replay_uses_updated_indices_and_scales():
             scales[2],
         )
 
+    q.copy_((torch.randn_like(q.float()) * 0.2).bfloat16())
     topk_idx.fill_(-1)
     topk_idx[..., :3] = torch.tensor([1, 7, 13], device="cuda")
     graph.replay()
@@ -207,21 +208,10 @@ def test_native_decode_uses_consistent_fail_closed_provider_contract():
     )
 
 
-def test_native_decode_quantizes_only_main_query_without_full_fp8_mode():
-    from sglang.srt.layers.attention.minimax_sparse_backend import (
-        _quantize_sgl_native_decode_query,
-    )
-
-    q = torch.tensor([1.0, -0.5], dtype=torch.bfloat16)
-    actual = _quantize_sgl_native_decode_query(q, enabled=True, q_scale=0.5)
-    assert actual.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(actual.float(), torch.tensor([2.0, -1.0]))
-
-
-def test_forward_decode_routes_main_query_through_native_fp8_quantization():
+def test_forward_decode_leaves_native_step3_query_in_bf16():
     from sglang.srt.layers.attention.minimax_sparse_backend import (
         MiniMaxSparseAttnBackend,
     )
 
     source = inspect.getsource(MiniMaxSparseAttnBackend.forward_decode)
-    assert "_quantize_sgl_native_decode_query(" in source
+    assert "_quantize_sgl_native_decode_query" not in source
