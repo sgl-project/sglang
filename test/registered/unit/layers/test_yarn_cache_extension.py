@@ -1,16 +1,20 @@
 """YaRN cache growth must continue the initialization formula."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.factory import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import YaRNScalingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +37,8 @@ class TestYaRNCacheExtension(CustomTestCase):
     def make_rope(self, cls, dim=64, factor=1.0, dtype=torch.float32, **kwargs):
         if cls is DeepseekScalingRotaryEmbedding:
             kwargs["device"] = "cpu"
+        if cls is YaRNScalingMRotaryEmbedding:
+            kwargs["mrope_section"] = [dim // 4, dim // 8, dim // 8]
         return cls(dim, dim, 4096, 10000, True, factor, dtype, **kwargs)
 
     def expected_cache(self, rope, length):
@@ -42,7 +48,11 @@ class TestYaRNCacheExtension(CustomTestCase):
         return torch.cat((phase.cos(), phase.sin()), dim=-1) * rope.mscale
 
     def test_extension(self):
-        for cls in (YaRNScalingRotaryEmbedding, DeepseekScalingRotaryEmbedding):
+        for cls in (
+            YaRNScalingRotaryEmbedding,
+            DeepseekScalingRotaryEmbedding,
+            YaRNScalingMRotaryEmbedding,
+        ):
             for dim in (64, 128):
                 for factor in (1.0, 2.0):
                     with self.subTest(cls=cls.__name__, dim=dim, factor=factor):
@@ -78,12 +88,17 @@ class TestYaRNCacheExtension(CustomTestCase):
                             )
 
     def test_nondefault_amplitude_and_cache_dtype(self):
-        for cls in (YaRNScalingRotaryEmbedding, DeepseekScalingRotaryEmbedding):
+        for cls in (
+            YaRNScalingRotaryEmbedding,
+            DeepseekScalingRotaryEmbedding,
+            YaRNScalingMRotaryEmbedding,
+        ):
             for dtype in (torch.float16, torch.bfloat16):
                 with self.subTest(cls=cls.__name__, dtype=dtype):
-                    rope = self.make_rope(
-                        cls, factor=2.0, attn_factor=1.3, mscale=1.2, mscale_all_dim=0.4
-                    )
+                    amplitude_kwargs = {"attn_factor": 1.3}
+                    if cls is not YaRNScalingMRotaryEmbedding:
+                        amplitude_kwargs.update(mscale=1.2, mscale_all_dim=0.4)
+                    rope = self.make_rope(cls, factor=2.0, **amplitude_kwargs)
                     # Match the runtime path that casts/moves an existing cache.
                     rope.cos_sin_cache = rope.cos_sin_cache.to(dtype)
                     prefix = rope.cos_sin_cache.clone()
@@ -99,6 +114,126 @@ class TestYaRNCacheExtension(CustomTestCase):
                         rtol=0,
                         atol=0,
                     )
+
+    def test_mrope_factory_startup_reservation(self):
+        for factor in (1.0, 2.0):
+            for interleaved in (False, True):
+                for steps, draft in ((0, 0), (3, 5)):
+                    with self.subTest(
+                        factor=factor, interleaved=interleaved, steps=steps
+                    ):
+                        context = int(4096 * factor)
+                        with patch.dict(
+                            "sglang.srt.layers.rotary_embedding.factory._ROPE_DICT",
+                            {},
+                            clear=True,
+                        ):
+                            rope = get_rope(
+                                64,
+                                64,
+                                context,
+                                10000,
+                                dtype=torch.float32,
+                                rope_scaling={
+                                    "rope_type": "yarn",
+                                    "factor": factor,
+                                    "original_max_position_embeddings": 4096,
+                                    "mrope_section": [16, 8, 8],
+                                    "mrope_interleaved": interleaved,
+                                    "attn_factor": 1.3,
+                                },
+                            )
+                        self.assertIsInstance(rope, YaRNScalingMRotaryEmbedding)
+                        self.assertEqual(rope.mrope_interleaved, interleaved)
+                        prefix = rope.cos_sin_cache.clone()
+                        self.assertEqual(len(prefix), context)
+                        model = torch.nn.Sequential(torch.nn.Sequential(rope))
+                        with (
+                            patch(
+                                "sglang.srt.utils.common.get_model",
+                                return_value=SimpleNamespace(context_length=context),
+                            ),
+                            patch(
+                                "sglang.srt.utils.common.get_spec",
+                                return_value=SimpleNamespace(
+                                    speculative_num_steps=steps,
+                                    speculative_num_draft_tokens=draft,
+                                ),
+                            ),
+                            envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.override(2),
+                            envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.override(256),
+                            envs.SGLANG_ROPE_CACHE_ALIGN.override(128),
+                        ):
+                            reserve_rope_cache_for_long_sequences(model, None)
+                        expected_length = (
+                            (context + steps * draft * 2 + 256 + 127) // 128 * 128
+                        )
+                        self.assertEqual(len(rope.cos_sin_cache), expected_length)
+                        self.assertTrue(
+                            torch.equal(prefix, rope.cos_sin_cache[:context])
+                        )
+                        self.assertEqual(rope.max_position_embeddings, 4096)
+                        torch.testing.assert_close(
+                            rope.cos_sin_cache,
+                            self.expected_cache(rope, expected_length),
+                            rtol=0,
+                            atol=2e-7,
+                        )
+
+    def test_mrope_forward_across_extension_boundary(self):
+        generator = torch.Generator().manual_seed(38786)
+        for factor in (1.0, 2.0):
+            for interleaved in (False, True):
+                with self.subTest(factor=factor, interleaved=interleaved):
+                    rope = YaRNScalingMRotaryEmbedding(
+                        80,
+                        64,
+                        4096,
+                        10000,
+                        True,
+                        factor,
+                        torch.float32,
+                        mrope_section=[16, 8, 8],
+                        mrope_interleaved=interleaved,
+                        attn_factor=1.3,
+                    )
+                    n = len(rope.cos_sin_cache)
+                    positions = torch.tensor(
+                        [
+                            [0, n - 1, n, n + 2],
+                            [1, n, n + 1, n - 1],
+                            [2, n + 1, n - 1, n],
+                        ]
+                    )
+                    rope._ensure_cos_sin_cache_length(n + 2)
+                    # Reference phases come directly from each lane's position,
+                    # independent of the extension helper and cached rows.
+                    axes = torch.tensor([0] * 16 + [1] * 8 + [2] * 8)
+                    if interleaved:
+                        axes = torch.tensor([0, 1, 2] * 8 + [0] * 8)
+                    phase = positions[axes].T.float() * rope._compute_inv_freq(factor)
+                    cos = phase.cos()[:, None, :] * rope.mscale
+                    sin = phase.sin()[:, None, :] * rope.mscale
+                    query = torch.randn(4, 160, generator=generator)
+                    key = torch.randn(4, 80, generator=generator)
+                    outputs = rope.forward_native(positions, query, key)
+                    for original, actual in zip((query, key), outputs):
+                        original = original.reshape(4, -1, 80)
+                        first, second = original[..., :32], original[..., 32:64]
+                        expected = torch.cat(
+                            (
+                                first * cos - second * sin,
+                                second * cos + first * sin,
+                                original[..., 64:],
+                            ),
+                            dim=-1,
+                        ).reshape(actual.shape)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=2e-7)
+                        self.assertTrue(
+                            torch.equal(
+                                actual.reshape(4, -1, 80)[..., 64:], original[..., 64:]
+                            )
+                        )
 
     def test_deepseek_npu_auxiliary_tables(self):
         # Emulate table creation only; this does not exercise an NPU kernel.
