@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import triton
@@ -318,6 +318,17 @@ def _router_triton_kernel(
         tl.store(out_p_ptr, packed, mask=store_mask)
 
 
+_DUMMY_I32: Dict[torch.device, torch.Tensor] = {}
+
+
+def _dummy_i32(device: torch.device) -> torch.Tensor:
+    # Placeholder pointer for kernel args whose constexpr flag is off.
+    t = _DUMMY_I32.get(device)
+    if t is None:
+        t = _DUMMY_I32[device] = torch.empty(1, dtype=torch.int32, device=device)
+    return t
+
+
 @debug_kernel_api
 def moe_fused_gate(
     scores: torch.Tensor,
@@ -454,7 +465,7 @@ def moe_fused_gate(
     extra = {"launch_pdl": True} if use_pdl else {}
     # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
     # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
-    _unused_i32 = torch.empty(1, dtype=torch.int32, device=scores.device)
+    _unused_i32 = _dummy_i32(scores.device)
     _router_triton_kernel[grid](
         scores,
         bias if bias is not None else scores,

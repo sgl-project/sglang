@@ -612,7 +612,10 @@ class DeepseekV2MoE(nn.Module):
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self._fuse_finalize_all_reduce = (
-            is_deepseek_v4 and get_platform().is_blackwell and self.tp_size == 4
+            is_deepseek_v4
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            and get_platform().is_blackwell
+            and self.tp_size == 4
         )
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
@@ -711,6 +714,9 @@ class DeepseekV2MoE(nn.Module):
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
                     sqrtsoftplus_log1p=(
+                        getattr(config, "model_type", None) == "deepseek_v41"
+                    ),
+                    fused_gate_packed_ids=(
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),

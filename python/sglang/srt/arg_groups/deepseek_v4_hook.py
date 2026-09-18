@@ -245,6 +245,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+            "context parallelism is enabled."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"strategy={cfg.cp_strategy}, "

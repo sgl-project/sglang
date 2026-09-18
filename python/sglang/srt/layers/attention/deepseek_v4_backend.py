@@ -3918,14 +3918,15 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                _maybe_precompute_flashmla_sched_meta(
-                    flashmla_metadata,
-                    q=q,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    extra_indices=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )
+                if self.is_dsv41:
+                    _maybe_precompute_flashmla_sched_meta(
+                        flashmla_metadata,
+                        q=q,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )
                 o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,

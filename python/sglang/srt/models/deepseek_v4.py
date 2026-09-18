@@ -1958,6 +1958,18 @@ class MQALayer(MqaAttentionBase):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+            elif use_cp and not self.is_dsv41:
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = cp_materialize_global_token_order(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
             elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
                 if qkv_a is not None:
@@ -3996,7 +4008,9 @@ class DeepseekV4Model(nn.Module):
         # shared-expert streams.
         self.moe_routed_quant_stream = (
             device_module.Stream()
-            if _is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            if _is_cuda
+            and config.hc_pre_from_prev_sublayer
+            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             else None
         )
         # One shared stream for all layers; every sublayer joins it before

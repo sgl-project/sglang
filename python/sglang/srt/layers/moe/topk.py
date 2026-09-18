@@ -238,6 +238,8 @@ class TopKConfig:
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
+    # Let the fused router also emit FlashInfer routed-MoE packed ids.
+    fused_gate_packed_ids: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -539,6 +541,7 @@ class TopK(BaseFusedOp):
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
+        fused_gate_packed_ids: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -578,6 +581,7 @@ class TopK(BaseFusedOp):
             output_format=output_format,
             scoring_func=scoring_func,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
+            fused_gate_packed_ids=fused_gate_packed_ids,
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
@@ -1602,11 +1606,13 @@ def _fused_gate_emits_packed_ids(
     num_fused_shared_experts: int,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
+    enabled: bool,
 ) -> bool:
     # The pack is taken from the router's final values, so every condition here
     # rules out a later rewrite of ids or weights.
     return (
-        _fused_gate_masks_padded_rows(scoring_func)
+        enabled
+        and _fused_gate_masks_padded_rows(scoring_func)
         and get_moe_runner_backend().is_flashinfer_mxfp4()
         and expert_location_dispatch_info is None
         and num_fused_shared_experts == 0
@@ -2535,6 +2541,7 @@ def select_experts(
                 num_fused_shared_experts,
                 expert_location_dispatch_info,
                 routing_overridden,
+                topk_config.fused_gate_packed_ids,
             ):
                 packed_topk = torch.empty(
                     (hidden_states.shape[0], top_k),

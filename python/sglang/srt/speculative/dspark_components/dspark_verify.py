@@ -116,6 +116,15 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
+        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
+        self._target_is_dsv41 = (
+            getattr(
+                target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -320,7 +329,7 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
-        if verify_input.live_seq_lens_cpu is None:
+        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
