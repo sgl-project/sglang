@@ -93,8 +93,7 @@ def fused_low_ratio_compress_supported() -> bool:
     """Whether the fused c1 / c2 / index-K decode kernels can serve this process.
 
     They pack fp4 with `cvt.rn.satfinite.e2m1x2`, a Blackwell (sm100+) CUDA
-    instruction, so HIP and pre-Blackwell parts keep the split projection and the
-    unfused write. Decided once at load time: the choice also fixes the weight
+    instruction. Decided once at load time: the answer also fixes the weight
     layout of the ratio-2 projection (one `wkv_gate` or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available() or torch.version.hip is not None:
         return False
@@ -104,9 +103,8 @@ def fused_low_ratio_compress_supported() -> bool:
 class DeepseekV41Compressor(nn.Module):
     """Pool consecutive tokens into one pre-RoPE KV latent.
 
-    Ratio 1 uses a bf16 projection. Ratio 2 keeps checkpoint weights in bf16 but
-    accumulates projections and softmax pooling in fp32; finish rounds to bf16
-    before RMSNorm. The fp32 reference can differ in GEMM reduction order.
+    Ratio 2 keeps checkpoint weights in bf16 but accumulates projections and
+    softmax pooling in fp32; finish rounds to bf16 before RMSNorm.
     """
 
     def __init__(
@@ -151,9 +149,9 @@ class DeepseekV41Compressor(nn.Module):
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
             return fused[..., :head_dim], fused[..., head_dim:]
-        # Two GEMMs rather than one fused [2D, K] projection: the decode epilogue
-        # kernel (pair_pool_decode) reads kv and score as contiguous [n, D] fp32
-        # rows, which column slices of a fused output are not.
+        # Two GEMMs rather than one fused [2D, K] projection: pair_pool_decode
+        # reads kv and score as contiguous [n, D] fp32 rows, which column slices
+        # of a fused output are not.
         kv = linear_bf16_fp32(x, self.wkv.weight)
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
@@ -187,8 +185,7 @@ class DeepseekV41Indexer(nn.Module):
     kv_source layer owns index keys; the other index sources read the source's.
 
     The projections are replicated across TP, as in the c4 indexer: every rank
-    scores with all heads, so the decode kernel path needs no cross-rank
-    reduction and every rank selects the same top-k."""
+    scores with all heads, so the top-k needs no cross-rank reduction."""
 
     def __init__(
         self,

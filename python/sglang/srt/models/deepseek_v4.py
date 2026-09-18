@@ -454,10 +454,9 @@ def _apply_wo_a_bf16_matmul(
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
-    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
-    verify batches up to 384 rows and large prefill batches write token-major
-    output directly to avoid the layout copy before wo_b. ROCm decode can use
-    aiter batched GEMM; other cases use torch.einsum.
+    The fast paths below are gated on the exact validated TP4 shapes and write
+    token-major output directly, avoiding the layout copy before wo_b; anything
+    else falls back to torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -740,7 +739,7 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 
 class MqaAttentionBase(nn.Module):
-    # Read on paths main's fixtures reach without running __init__.
+    # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
 
     def __init__(
@@ -1461,12 +1460,10 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Decode / target-verify prepare of a compress-ratio 1/2 layer: the
-        compressor and indexer (``forward_low_ratio_sources``) run on one side
-        stream, the fused KV-cache write on another, and only the Q chain stays
-        on the current stream. Both side streams are joined before returning;
-        attention is the first reader of anything written on them, and no
-        tensor they read is released before the join."""
+        """Decode / target-verify prepare of a compress-ratio 1/2 layer, with the
+        compressor and indexer on one side stream and the fused KV-cache write on
+        another. Both are joined before returning; attention is the first reader
+        of what they write, and nothing they read is released before the join."""
         assert self.alt_streams is not None
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
@@ -2201,10 +2198,10 @@ class MQALayer(MqaAttentionBase):
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
-                    # The V4.1 kernels read all padded heads, so the padding must be zero.
-                    # Each layer overwrites real heads and leaves padding zero. Reuse requires
-                    # all consumers on the layer's stream and no retained reference after return;
-                    # a side-stream consumer would need an event before the next layer writes.
+                    # The V4.1 kernels read all padded heads, so the padding
+                    # must be zero. The buffer is reused per layer: every
+                    # consumer must be on the layer's stream and hold no
+                    # reference to it after returning.
                     want = (x.shape[0], kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
                     q_padded = getattr(meta, "q_pad_buffer", None)
@@ -3143,11 +3140,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         normalized: Optional[torch.Tensor] = None,
         precomputed: Optional[tuple] = None,
     ) -> torch.Tensor:
-        """Collapse and normalize on the main stream, then fork tiny-row stats.
-
-        Preserve the fused quantization and cross-layer precomputed inputs.
-        Record the stats themselves immediately before their consuming join.
-        """
+        """Collapse and normalize on the main stream, then fork tiny-row stats."""
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         quantize = quantized is not None
@@ -3186,9 +3179,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                # The fused scale writer supports the small decode/verify
-                # tile only. Large prefill keeps its one-CTA-per-row norm and
-                # lets the projection quantize the full activation layout.
+                # The fused scale writer supports the small decode/verify tile
+                # only; large prefill lets the projection quantize instead.
                 if quantize and x.shape[0] <= 8:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
@@ -4676,11 +4668,11 @@ class DeepseekV4ForCausalLM(nn.Module):
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
         """Tune resident MXFP8 linears without touching request/KV/draft state.
 
-        FlashInfer covers all M buckets through ``num_tokens`` from one call.
-        Decode/verify warmup only covers small M; the untuned large-M heuristic
-        can be substantially slower. Tune each distinct weight layout once and
-        call the quantization method directly to avoid TP collectives and model
-        side effects. The runner owns the synchronized autotune context.
+        One call covers every M bucket up to ``num_tokens``; decode/verify warmup
+        only reaches small M, and the untuned large-M heuristic can be much
+        slower. The quantization method is called directly to avoid TP
+        collectives and model side effects; the runner owns the synchronized
+        autotune context.
         """
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0

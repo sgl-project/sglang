@@ -805,12 +805,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
 
 def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -> int:
-    """Worst-case SWA slots the scheduler holds live at max_running_requests.
-
-    Per request: the trailing window the eviction interval lets grow past it,
-    plus what the next decode step allocates. On top of that the prefill chunks
-    in flight, or on a PD decode rank the pre-allocated extra slots.
-    """
+    """Worst-case SWA slots the scheduler holds live at max_running_requests."""
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
@@ -1192,12 +1187,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _resolve_swa_prefix_tails(self) -> int:
-        """Cached prefix tails cap mode keeps addressable in the SWA pool.
-
-        A radix-cached prefix is reusable only while its last sliding_window
-        tokens still hold SWA slots, so SWA capacity bounds how many cached
-        prefixes stay hot. --swa-prefix-tails overrides the count.
-        """
+        """Cached prefix tails cap mode keeps addressable in the SWA pool: a
+        radix-cached prefix is reusable only while its last sliding_window
+        tokens still hold SWA slots."""
         prefix_tails = get_schedule().swa_prefix_tails
         if prefix_tails is not None:
             return prefix_tails
@@ -1208,12 +1200,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return 4 * max_running_requests if max_running_requests is not None else 0
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
-        """SWA slots to reserve in cap mode, or None to keep ratio sizing.
-
-        Cap mode replaces "swa_tokens = full_tokens * ratio" with a request-cap
+        """SWA slots to reserve in cap mode, or None to keep ratio sizing. Cap
+        mode replaces "swa_tokens = full_tokens * ratio" with a request-cap
         budget plus radix headroom, so the SWA pool stops growing with the KV
-        budget. An explicit --swa-full-tokens-ratio opts back into ratio sizing.
-        """
+        budget."""
         if self.operator_swa_ratio is not None:
             return None
         if self._unified:
@@ -1238,11 +1228,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_bytes_per_swa_token(self) -> float:
-        """Bytes one SWA slot costs across the whole stage.
-
-        The c4 compress state follows swa_tokens (c4_state_pool_size =
-        swa_tokens / swa_page_size * ring), so it is priced per SWA slot too.
-        """
+        """Bytes one SWA slot costs across the whole stage. The c4 compress
+        state follows swa_tokens (c4_state_pool_size = swa_tokens /
+        swa_page_size * ring), so it is priced per SWA slot too."""
         if self.encoder_replay:
             # Target SWA lives in the fixed request window; only the draft owns
             # paged SWA bytes. DSpark's draft layers have no compressed state.

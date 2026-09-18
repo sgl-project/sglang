@@ -517,7 +517,6 @@ class Fp8LinearMethod(LinearMethodBase):
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
         # Set by a model-owned startup hook after opting into prefill tuning.
-        # Other block-FP8 models retain their fixed tactic at every batch size.
         self.mxfp8_prefill_autotune_min_tokens = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()

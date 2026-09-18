@@ -125,8 +125,8 @@ def partial_gluon(
         gl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=16),
         value=p_hi,
     )
-    # Four native M=128 tiles cover all 512 V channels. The N dimension remains
-    # exactly 16 heads; this is the swapAB orientation from the source template.
+    # Four native M=128 tiles cover all 512 V channels; the N dimension remains
+    # exactly 16 heads.
     out_tmem = allocate_tensor_memory(
         gl.float32, [512, H], TensorMemoryLayout(block=(128, H), col_stride=1)
     )

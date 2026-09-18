@@ -90,13 +90,11 @@ def resolve_compressed_kv_layout(
     """Layout of the compressed-attention cache of one compress ratio next to a
     main (SWA) cache of ``kv_layout``.
 
-    With the V4 main cache every cache is V4 (the only pair that layout forms).
-    With the V4.1 main cache the default follows the model's own numerics: the
-    ratio-1 / ratio-2 latents are rounded to e2m1 with per-16 e4m3 scales by
-    the model, so storing them as ``V41_FP4`` is lossless and drops today's
-    second fp8 rounding; the ratio-4 / ratio-128 latents are not fp4-rounded,
-    so they stay fp8 (``V41``). ``option`` ``"fp8"`` / ``"fp4"`` forces one
-    layout for all compressed caches.
+    Under V4.1 the default follows the model's own numerics: the ratio-1 /
+    ratio-2 latents are already rounded to e2m1 with per-16 e4m3 scales, so
+    ``V41_FP4`` stores them losslessly; ratios 4 / 128 are not fp4-rounded and
+    stay fp8 (``V41``). ``option`` ``"fp8"`` / ``"fp4"`` forces one layout for
+    all compressed caches.
     """
     if option is not None:
         option = option.lower()
@@ -134,10 +132,8 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     family pool, from ``SGLANG_DSV4_KV_LAYOUT`` (``v4`` | ``v41`` | ``auto``) and
     ``SGLANG_DSV4_COMPRESSED_KV_LAYOUT`` (``auto`` | ``fp8`` | ``fp4``).
 
-    The V4.1 layouts exist only in the SM100 / SM103 FlashMLA decode kernels:
-    ``v41`` raises elsewhere, ``auto`` picks them on SM100 / SM103 when the
-    installed FlashMLA advertises them and stays on ``v4`` otherwise (SM90 and
-    SM120 always keep the 584-byte V4 layout).
+    The V4.1 layouts exist only in the SM100 / SM103 FlashMLA decode kernels;
+    SM90 and SM120 always keep the 584-byte V4 layout.
     """
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
@@ -1019,9 +1015,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.request_window = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # Note(Oasis-Git): Keep DSpark's paged SWA cache because removing its
-        # history hurts speculative decoding acceptance length. The draft shares
-        # the target's full-to-SWA mapping, so the target still needs the allocator.
+        # Keep DSpark's paged SWA cache: dropping its history costs speculative
+        # acceptance length, and the draft shares the target's full-to-SWA
+        # mapping, so the target still needs the allocator.
         self.needs_paged_swa_allocator = (
             not encoder_replay
             or is_draft_worker
@@ -2092,7 +2088,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, with
         ``freqs_cis`` if it is not rotated yet: the kernel rounds to e2m1 once.
         For the fp8 layouts ``cache_k`` is the finished (fake-quantized, rotated)
-        value, as today."""
+        value."""
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:

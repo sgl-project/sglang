@@ -744,8 +744,7 @@ def can_serve_block_fp8_as_mxfp8(
 
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
-    """The MXFP8 linear for a block-fp8 weight served as MXFP8, with the FlashInfer
-    autotuner kept out of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
+    """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True

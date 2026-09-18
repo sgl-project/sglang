@@ -1,5 +1,5 @@
-"""A DeepSeek-V4 family KV pool in the V4.1 layouts hands the attention kernel
-buffers that satisfy its host checks, and its fused writers round-trip."""
+"""A DeepSeek-V4 KV pool in the V4.1 layouts hands the attention kernel buffers
+that satisfy its host checks: alignment, page stride, and int32 TMA bounds."""
 
 import unittest
 
@@ -22,7 +22,7 @@ HEAD_DIM = 512
 ROPE_DIM = 64
 PAGE_SIZE = 256
 FULL_SIZE = 4 * PAGE_SIZE
-# The reader's page-stride unit, and the int32 budget of its TMA coordinates.
+# The int32 budget of the decode kernel's TMA coordinates.
 INT32_MAX = 2**31 - 1
 
 
@@ -68,9 +68,7 @@ class TestV41KVPool(CustomTestCase):
         )
 
     def assert_kernel_requirements(self, pool, layout):
-        """What the decode kernel asserts on a paged cache: 16-byte base, contiguous
-        rows, a page stride that is a multiple of its TMA row stride and an int32
-        TMA row count."""
+        """The paged-cache preconditions the decode kernel checks on the host."""
         self.assertIs(pool.kv_layout, layout)
         self.assertEqual(pool.get_bytes_per_token(), layout.bytes_per_token)
         self.assertEqual(pool.kv_cache_total_dim, layout.bytes_per_token)

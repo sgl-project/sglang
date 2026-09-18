@@ -106,12 +106,11 @@ def routed_hidden_size(layer: Module) -> int:
 class Mxfp8RoutedInputPreQuant(NamedTuple):
     """MXFP8 linear-layout quant of the routed MoE input, produced ahead of
     :meth:`Mxfp4FlashinferTrtllmMoEMethod.apply` by
-    :meth:`Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input` -- e.g. on a
-    side stream while the gate GEMM and the router run on the main stream.
-    ``ready`` is the event recorded on the producing stream after the quant;
-    ``apply`` makes its stream wait on it right before the routed MoE op, whose
-    first kernel (routing) precedes the GEMM that reads ``x_q``/``x_sf``.
-    Carried in ``StandardDispatchOutput.hidden_states_pre_quant``."""
+    :meth:`Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input`. ``ready`` is
+    recorded on the producing stream after the quant; ``apply`` waits on it
+    before the routed MoE op, whose first kernel (routing) precedes the GEMM
+    that reads ``x_q``/``x_sf``. Carried in
+    ``StandardDispatchOutput.hidden_states_pre_quant``."""
 
     x_q: torch.Tensor
     x_sf: torch.Tensor
@@ -337,10 +336,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """MXFP8 quant of the routed input in the linear scale layout the
         routed MoE op requires (``hidden_states_scale`` [tokens, hidden // 32]),
-        on the current stream. This is the only front-end kernel that depends
-        on ``hidden_states`` alone, so callers may run it on a side stream and
-        hand the result to :meth:`apply` as :class:`Mxfp8RoutedInputPreQuant`;
-        ``apply`` runs the identical call inline otherwise."""
+        on the current stream. It depends on ``hidden_states`` alone, so a
+        caller may run it on a side stream and hand the result to :meth:`apply`
+        as :class:`Mxfp8RoutedInputPreQuant`."""
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
         x_quant, x_scale = flashinfer_mxfp8_quantize(
@@ -406,8 +404,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 )
         elif precision == "default":
             if isinstance(pre_quant, Mxfp8RoutedInputPreQuant):
-                # Quantized ahead of time (on a side stream) by the caller via
-                # quantize_routed_input on the same hidden_states.
                 assert pre_quant.x_q.shape[0] == hidden_states.shape[0]
                 x_quant, x_scale, input_ready = pre_quant
             else:
@@ -424,11 +420,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         num_tokens = x_quant.shape[0]
-        # Deferred finalize (flashinfer_trtllm_deferred_finalize_context): hand
-        # back FlashInfer's permuted GEMM2 output + routing triple instead of
-        # the finalized [T, hidden] tensor, for a caller that fuses the
-        # finalize into its shared add / all-reduce
-        # (kernels.ops.communication.all_reduce_fusion).
+        # Deferred finalize: hand back the permuted GEMM2 output plus the
+        # routing triple instead of the finalized [T, hidden] tensor, for a
+        # caller that fuses the finalize into its shared add / all-reduce.
         defer_finalize = is_deferred_finalize_enabled()
         symm_output = None
         if not defer_finalize:
@@ -567,12 +561,9 @@ def should_use_fuse_finalize_all_reduce(
     """Whether ``moe_finalize_all_reduce`` can replace finalize + shared add +
     TP all-reduce for this layer and batch.
 
-    Capability only, no routing policy (the batch-size cap lives at the call
-    site): this MXFP4 TRT-LLM method (its deferred-finalize
-    ABI, expert weights already carrying the routed scaling factor -- the
-    kernel never rescales), a hidden width the kernel has a geometry for, a
-    CustomAllReduceV2 push plane on the TP group, and a batch that fits one of
-    its push slots.
+    Capability only, no routing policy: the batch-size cap lives at the call
+    site. The expert weights must already carry the routed scaling factor,
+    since the kernel never rescales.
     """
     if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
         return False

@@ -1121,9 +1121,9 @@ def prepare_dsv4_runner_inputs(
 def _seed_c4_if_needed(
     fixture: DSV4AttentionFixture, *, num_entries: int | None = None
 ) -> None:
-    """For compress_ratio=4, seed the C4 metadata the exercised path consumes
-    (the C4Indexer would normally populate it; the compact fixture skips the
-    indexer): `c4_sparse_page_indices` for the dense extend path,
+    """For compress_ratio in (1, 2, 4), seed the C4 metadata the exercised path
+    consumes (the indexer would normally populate it; the compact fixture skips
+    it): `c4_sparse_page_indices` for the dense extend path,
     `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
     if fixture.case.compress_ratio not in (1, 2, 4):
@@ -1624,8 +1624,8 @@ def run_dsv4_compress_attention_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> None:
-    """Math-faithful test for the SWA + C4 (compress_ratio=4) / SWA + C128
-    (compress_ratio=128) path through `DeepseekV4AttnBackend.forward`.
+    """Math-faithful test for the SWA + compressed-cache path (compress ratios
+    1, 2, 4, 128) through `DeepseekV4AttnBackend.forward`.
 
     Pre-writes random packed K into both the SWA cache and the extra
     (C4/C128) cache via the production pack+set paths, lets

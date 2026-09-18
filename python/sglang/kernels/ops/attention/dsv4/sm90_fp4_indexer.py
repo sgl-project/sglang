@@ -6,9 +6,8 @@ request's visible compressed positions read straight out of the fp4 indexer
 pool (e2m1 payload + e8m0 per-32 block scales, page layout of
 store_fp4_index_k_cache), summed over heads with relu and the per-head weights.
 
-Numerics follow the torch reference path (bf16 dot, bf16 relu/weight product,
-bf16 head reduction); the caller runs the same masking / candidate / top-k
-logic on the returned fp32 logits as the per-request torch loop.
+Numerics follow the torch reference path: bf16 dot, bf16 relu/weight product,
+bf16 head reduction, fp32 logits out.
 """
 
 import torch

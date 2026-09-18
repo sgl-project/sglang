@@ -85,9 +85,9 @@ def candidate_request_length_bound(
 
     The overlap loop can have one unprocessed result, which may overshoot the
     output budget. Reserve its full width here; the runner adds the current
-    verify width as well. Neither bound depends on CPU acceptance results.
-    Aborted/embedding/multimodal requests keep the general graph because their
-    visible token IDs may not represent the actual cache position space.
+    verify width as well. Aborted/embedding/multimodal requests keep the
+    general graph because their visible token IDs may not represent the
+    actual cache position space.
     """
     if not reqs:
         return None

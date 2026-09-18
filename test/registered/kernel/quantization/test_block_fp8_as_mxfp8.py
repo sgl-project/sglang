@@ -62,8 +62,8 @@ def _block32_config():
 
 
 def _build_layer(method: Fp8LinearMethod, q: torch.Tensor, scale: torch.Tensor):
-    """Create the layer through the linear method and load the checkpoint tensors through
-    the parameters' own loaders (the scale arrives as e8m0, the way the checkpoint stores it)."""
+    """Load through the parameters' own loaders; the scale arrives as e8m0, the
+    way the checkpoint stores it."""
     n, k = q.shape
     layer = torch.nn.Module()
     method.create_weights(
