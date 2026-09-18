@@ -516,9 +516,12 @@ class KimiDeltaAttention(nn.Module):
 
         # Prefill passes raw gates to chunk KDA; decode and target-verify kernels
         # apply the activation internally.
+        # Read through the logical mode to handle the case where DP may treat a
+        # decode batch as a 1-token extend batch but linear attention still needs
+        # to handle it as decode.
         if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
+            not forward_batch.logical_forward_mode.is_decode()
+            and not forward_batch.logical_forward_mode.is_target_verify()
         ):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)

@@ -2299,7 +2299,7 @@ class KVCacheConfigurator:
 
         max_num_reqs = get_schedule().max_running_requests
         if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
+            requested_per_worker = max(1, max_num_reqs // self.ps.attn_dp_size)
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
             requested_per_worker = None
@@ -2472,7 +2472,7 @@ class KVCacheConfigurator:
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    max(1, get_schedule().max_running_requests // self.ps.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -2488,8 +2488,9 @@ class KVCacheConfigurator:
             # Use explicitly set max_running_requests when radix cache is disabled
             get_context().override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=get_schedule().max_running_requests
-                // self.ps.attn_dp_size,
+                max_mamba_cache_size=max(
+                    1, get_schedule().max_running_requests // self.ps.attn_dp_size
+                ),
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
@@ -2529,7 +2530,7 @@ class KVCacheConfigurator:
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    max(1, get_schedule().max_running_requests // self.ps.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D
