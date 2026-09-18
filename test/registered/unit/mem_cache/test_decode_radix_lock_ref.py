@@ -346,6 +346,57 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Prefix tokens should still be in tree and evictable
         self.assertEqual(cache.evictable_size(), len(prefix))
 
+    def test_insert_releases_committed_slot_without_token_id(self):
+        """The insert path must release up to owned_kv_end, not len(token_ids).
+
+        Pins the ownership contract in BasePrefixCache.cache_finished_req:
+        [cache_protected_len, owned_kv_end) is the request's own KV and every
+        slot in it is this call's to account for. Slicing the kv row by the
+        token-id count instead strands the slots in between -- the radix key
+        cannot name them, and no caller releases them either.
+        """
+        cache, req_to_token = _make_cache_with_pools()
+
+        prefix = [1, 2, 3]
+        prefix_vals = [10, 20, 30]
+        self._populate_prefix(cache, prefix, prefix_vals)
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        matched_node = result.last_device_node
+        prefix_len = len(result.device_indices)
+        cache.inc_lock_ref(matched_node)
+
+        # Token sequence is 5 long; a 6th KV slot is committed with no token id.
+        full_ids = [1, 2, 3, 4, 5]
+        row_vals = [10, 20, 30, 40, 50, 60]
+        req_to_token[0, : len(row_vals)] = torch.tensor(row_vals, dtype=torch.int64)
+
+        req = _make_req(
+            fill_ids=full_ids,
+            req_pool_idx=0,
+            cache_protected_len=prefix_len,
+            last_node=matched_node,
+        )
+        req.kv.kv_committed_len = len(row_vals)
+        req.kv.kv_allocated_len = len(row_vals)
+
+        cache.token_to_kv_pool_allocator.reset_mock()
+        cache.cache_finished_req(
+            req, is_insert=True, owned_kv_end=req.kv.kv_committed_len
+        )
+
+        # The unnamed tail slot is freed as the segment past the radix key.
+        segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
+        freed = {
+            int(start_pos) + i: int(v)
+            for indices, start_pos in segments
+            for i, v in enumerate(indices.tolist())
+        }
+        self.assertIn(
+            len(full_ids), freed, "committed slot with no token id was not freed"
+        )
+        self.assertEqual(freed[len(full_ids)], row_vals[-1])
+
     def test_full_transfer_failure(self):
         """Scenario 4: no prefix match, transfer fails.
 
