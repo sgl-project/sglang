@@ -296,9 +296,10 @@ def build_kv_cache(
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
         if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
+            logger.warning(
+                "--disaggregation-decode-enable-radix-cache with a hybrid "
+                "SSM/KDA model uses UnifiedRadixCache's Mamba component; "
+                "prefix-match-and-lock of recurrent state is experimental."
             )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
