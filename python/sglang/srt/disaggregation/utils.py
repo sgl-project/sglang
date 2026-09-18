@@ -1527,7 +1527,12 @@ def setup_state_kv_args(
                 )
             else:
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    layer_ids=kv_args.kv_layer_ids,
                 )
                 if tail_ptrs:
                     append_state_component(

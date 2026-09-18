@@ -926,6 +926,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             dsa_prefill_backend=None,
             dsa_decode_backend=None,
             enable_hisparse=True,
+            dcp_size=1,
         )
         defaults.update(kw)
         view = ResolvedView(

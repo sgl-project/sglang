@@ -64,3 +64,74 @@ def copy_mla_rows_into_pack(
         n,
         BLOCK_SIZE=1024,
     )
+
+
+@triton.jit(do_not_specialize=["num_tokens", "dcp_size", "dcp_rank"])
+def _copy_dsa_pages_into_pack_kernel(
+    metadata,
+    pack,
+    num_tokens,
+    dcp_size,
+    dcp_rank,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Runtime DCP values and sizes share one specialization across peers/tails.
+    source = tl.load(metadata).to(pack.dtype)
+    offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    page = offset // 8448
+    byte = offset % 8448
+    is_key = byte < 8192
+    slot = tl.where(is_key, byte // 128, (byte - 8192) // 4)
+    field_byte = tl.where(is_key, byte % 128, (byte - 8192) % 4)
+    local_token = page * 64 + slot
+    valid = local_token < num_tokens
+    source_token = local_token * dcp_size + dcp_rank
+    source_page = tl.load(metadata + 1 + source_token // 64, mask=valid, other=0)
+    source_byte = (
+        source_page * 8448
+        + tl.where(is_key, (source_token % 64) * 128, 8192 + (source_token % 64) * 4)
+        + field_byte
+    )
+    value = tl.load(source + source_byte, mask=valid, other=0)
+    packed_bytes = tl.cdiv(num_tokens, 64) * 8448
+    tl.store(pack + offset, value, mask=offset < packed_bytes)
+
+
+def copy_dsa_pages_into_pack(
+    metadata: torch.Tensor,
+    pack: torch.Tensor,
+    num_tokens: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    """Gather [source pointer, source page IDs] into native DSA target pages.
+
+    metadata is a small int64 tensor. The uint8 output aliases a registered
+    pack buffer; no context-sized intermediate or output tensor is allocated.
+    """
+    if (
+        metadata.dtype != torch.int64
+        or metadata.ndim != 1
+        or not metadata.is_contiguous()
+    ):
+        raise ValueError("DSA pack metadata must be contiguous int64")
+    if pack.dtype != torch.uint8 or pack.ndim != 1 or not pack.is_contiguous():
+        raise ValueError("DSA pack output must be contiguous uint8")
+    if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size or num_tokens < 0:
+        raise ValueError("Invalid DSA DCP pack geometry")
+    if num_tokens == 0:
+        return
+    required = triton.cdiv(num_tokens, 64) * 8448
+    if required > pack.numel():
+        raise ValueError("DSA pack output is too small")
+    max_source_token = (num_tokens - 1) * dcp_size + dcp_rank
+    if metadata.numel() < 2 + max_source_token // 64:
+        raise ValueError("DSA pack source page list is too short")
+    _copy_dsa_pages_into_pack_kernel[(triton.cdiv(required, 1024),)](
+        metadata,
+        pack,
+        num_tokens,
+        dcp_size,
+        dcp_rank,
+        BLOCK_SIZE=1024,
+    )
