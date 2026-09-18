@@ -3319,12 +3319,24 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
+            message = (
+                "Using priority is disabled for this server. Please send a "
+                "new request without a priority."
+            )
+            # This rejection never reaches a queue, so run the same
+            # dropped-request cleanup as a queue-full reject or the session
+            # stays busy and the early mamba alloc leaks; then stamp the req
+            # terminal so a non-streaming session node unblocks appends/close.
+            self._release_dropped_waiting_req_mm_inputs(req)
+            self._release_dropped_waiting_req_mamba_slot(req)
+            self.beam_coordinator.retire_group(req)
+            prepare_abort(req, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
             abort_req = _make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                    "message": message,
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
@@ -3380,6 +3392,18 @@ class Scheduler(
             req.multimodal_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _release_dropped_waiting_req_mamba_slot(self, req: Req) -> None:
+        """Return a req-owned early Mamba alloc (init_next_round_input on a
+        req that was then refused admission) when the req leaves the waiting
+        queue for good. Slot-owned state (req_pool_idx set) stays with the
+        session."""
+        kv = getattr(req, "kv", None)
+        if kv is None or kv.mamba_pool_idx is None or kv.req_pool_idx is not None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -3408,9 +3432,32 @@ class Scheduler(
             if abort_existing_req:
                 self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
+                self._release_dropped_waiting_req_mm_inputs(candidate_req)
+                self._release_dropped_waiting_req_mamba_slot(candidate_req)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+
+        if req_to_abort is recv_req:
+            # The incoming request is the one dropped: it never entered the
+            # queue, but its session turn and any early mamba alloc are still
+            # live, so run the same dropped-request cleanup or the session
+            # stays busy and the alloc leaks.
+            self._release_dropped_waiting_req_mm_inputs(recv_req)
+            self._release_dropped_waiting_req_mamba_slot(recv_req)
+
+        if req_to_abort.finished_reason is None:
+            # A queue drop never reaches prepare_abort, but a non-streaming
+            # session node only goes terminal when its req is finished --
+            # abort_req() alone clears just the streaming inflight marker, so
+            # an unstamped drop leaves the node unfinished forever (later
+            # appends rejected, close deferred). Stamp after the cleanup
+            # helpers so their pre-stamp ownership checks are unchanged. A
+            # req already stamped (e.g. by a racing AbortReq) keeps its
+            # original reason.
+            prepare_abort(
+                req_to_abort, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+            )
 
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
@@ -4080,16 +4127,18 @@ class Scheduler(
                     else:
                         running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
+                # A slot restored from a session (req_pool_idx set) is slot-owned
+                # and freed with the session; a fresh early alloc from
+                # init_next_round_input (req_pool_idx is None) is req-owned and
+                # must be returned here. Non-session reqs always have
+                # req_pool_idx None when rejected here.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
+                    if req.kv.holds_mamba and req.kv.req_pool_idx is None:
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )

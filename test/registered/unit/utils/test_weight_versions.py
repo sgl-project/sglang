@@ -1,7 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
@@ -471,10 +471,16 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
+        req.return_logprob = False
         sent = []
         scheduler = SimpleNamespace(
             enable_priority_scheduling=False,
             abort_on_priority_when_disabled=True,
+            # The rejection path runs the dropped-request cleanup and retires
+            # the beam group; the fixture must provide those dependencies.
+            beam_coordinator=MagicMock(),
+            _release_dropped_waiting_req_mm_inputs=MagicMock(),
+            _release_dropped_waiting_req_mamba_slot=MagicMock(),
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda obj, req_arg: sent.append(obj)

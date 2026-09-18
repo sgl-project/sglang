@@ -39,6 +39,8 @@ class _FakeReq:
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
+        self.finished_reason = None
+        self.return_logprob = False
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
