@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+
 from sglang.benchmark.tracelab import TraceRound, send_generate
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -226,8 +227,9 @@ def test_cli_flushes_failed_or_cancelled_request(tmp_path, monkeypatch, cancel):
     from argparse import Namespace
 
     from aiohttp import web
-    from sglang.benchmark.tracelab import run_trace
     from transformers import AutoTokenizer
+
+    from sglang.benchmark.tracelab import run_trace
 
     class Tokenizer:
         all_special_ids = []
