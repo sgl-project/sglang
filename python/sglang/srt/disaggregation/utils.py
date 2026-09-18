@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -15,6 +16,7 @@ from typing import (
     overload,
 )
 
+import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -27,6 +29,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.msgpack_utils import enc_hook, ext_hook
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -301,6 +304,19 @@ class MetadataBuffers:
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
+        customized_info_capacity_env = envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES
+        customized_info_capacity = (
+            customized_info_capacity_env.parse(
+                os.environ[customized_info_capacity_env.name]
+            )
+            if customized_info_capacity_env.is_set()
+            else customized_info_capacity_env.get()
+        )
+        if customized_info_capacity <= 0:
+            raise ValueError(
+                f"{customized_info_capacity_env.name} must be positive "
+                f"(got {customized_info_capacity})"
+            )
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -337,6 +353,12 @@ class MetadataBuffers:
             )
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
+            )
+            self.output_customized_info = torch.zeros(
+                (size, customized_info_capacity), dtype=torch.uint8, device=device
+            )
+            self.output_customized_info_len = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
             )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
@@ -403,6 +425,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx,
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
+            self.output_customized_info,
+            self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
             self.output_token_sampling_logprobs,
@@ -455,7 +479,42 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
+    def get_customized_info(self, idx: int) -> dict[str, list[object]] | None:
+        length = int(self.output_customized_info_len[idx, 0].item())
+        if not 0 <= length <= self.output_customized_info.shape[1]:
+            raise ValueError(f"Invalid disaggregation customized_info length: {length}")
+        if length == 0:
+            return None
+        payload = self.output_customized_info[idx, :length].cpu().numpy().tobytes()
+        return msgspec.msgpack.decode(
+            payload, type=dict[str, list[object]], ext_hook=ext_hook
+        )
+
     def set_buf(self, req: Req):
+        payload = (
+            b""
+            if req.customized_info is None
+            else msgspec.msgpack.encode(
+                req.customized_info,
+                # Do not carry the sender's GPU ordinal to the decode host.
+                enc_hook=lambda obj: enc_hook(
+                    obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
+                ),
+            )
+        )
+        if len(payload) > self.output_customized_info.shape[1]:
+            raise ValueError(
+                f"customized_info payload ({len(payload)} bytes) exceeds "
+                "disaggregation metadata capacity "
+                f"({self.output_customized_info.shape[1]} bytes). Increase "
+                "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES on both prefill and decode."
+            )
+        idx = req.metadata_buffer_index
+        if payload:
+            self.output_customized_info[idx, : len(payload)].copy_(
+                torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
+            )
+        self.output_customized_info_len[idx, 0] = len(payload)
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
