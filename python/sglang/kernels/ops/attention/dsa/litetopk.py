@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -46,24 +46,23 @@ def dsa_litetopk_is_supported() -> bool:
 
 @cache_once
 def _jit_dsa_litetopk_module() -> Module:
-    with override_jit_cuda_arch(10, 0, "a"):
-        return load_jit(
-            "dsa_litetopk",
-            cuda_files=["dsa_litetopk/entry.cuh"],
-            cuda_wrappers=[
-                ("seed_prep", "dsa_litetopk_seed_prep"),
-                ("scan", "dsa_litetopk_scan"),
-                ("select", "dsa_litetopk_select"),
-            ],
-            extra_cuda_cflags=[
-                "-O3",
-                "-DNDEBUG",
-                "-DCUTE_USE_PACKED_TUPLE=1",
-                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-            ],
-            # Also supplies the deep_gemm headers the kernel includes.
-            extra_dependencies=["cutlass"],
-        )
+    return load_jit(
+        "dsa_litetopk",
+        cuda_files=["dsa_litetopk/entry.cuh"],
+        cuda_wrappers=[
+            ("seed_prep", "dsa_litetopk_seed_prep"),
+            ("scan", "dsa_litetopk_scan"),
+            ("select", "dsa_litetopk_select"),
+        ],
+        extra_cuda_cflags=[
+            "-O3",
+            "-DNDEBUG",
+            "-DCUTE_USE_PACKED_TUPLE=1",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+        ],
+        # Also supplies the deep_gemm headers the kernel includes.
+        extra_dependencies=["cutlass"],
+    )
 
 
 def _pad_scales_for_tma(kv_scales: torch.Tensor) -> torch.Tensor:
