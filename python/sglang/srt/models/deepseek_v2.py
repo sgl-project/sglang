@@ -552,9 +552,9 @@ class MoEGate(nn.Module):
         return logits
 
 
-# 96 rows of 5120 bf16 fit the 1 MiB CustomAllReduceV2 push slot the whole
-# [T, hidden] view is staged through.
-_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 96
+# The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
+# The dispatch gate also checks slot capacity and available counters.
+_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1129,7 +1129,17 @@ class DeepseekV2MoE(nn.Module):
                         mhc.post,
                         mhc.comb,
                     )
-                    if mhc.norm_weight is not None:
+                    if mhc.combine_only:
+                        from sglang.kernels.ops.communication.all_reduce_mhc_combine import (
+                            moe_finalize_all_reduce_mhc_combine,
+                        )
+
+                        final_hidden_states, mhc.output, mhc.combined = (
+                            moe_finalize_all_reduce_mhc_combine(
+                                *args, mhc.pre, world_size=self.tp_size
+                            )
+                        )
+                    elif mhc.norm_weight is not None:
                         from sglang.kernels.ops.communication.all_reduce_mhc import (
                             moe_finalize_all_reduce_mhc_quant,
                         )
@@ -1175,6 +1185,16 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not all_reduce_done:
+            if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=True
+            ):
+                from sglang.srt.layers.moe.mhc_post_fusion import (
+                    current_mhc_post_fusion,
+                )
+
+                mhc = current_mhc_post_fusion()
+                if mhc is not None:
+                    mhc.start_stats_before_all_reduce()
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
@@ -1321,6 +1341,14 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
+            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
+
+            mhc = current_mhc_post_fusion()
+            if mhc is not None:
+                mhc.start_stats_before_all_reduce()
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
