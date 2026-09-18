@@ -54,7 +54,7 @@ def _make_pool(ratios, kv_source_layers, kv_layout, compressed_kv_layout=None, *
 
 
 def flashmla_view(buf: torch.Tensor, page_size: int, layout: KVLayout) -> torch.Tensor:
-    """The ``(num_pages, page_size, 1, bytes_per_token)`` view the backend hands the kernel."""
+    """The (num_pages, page_size, 1, bytes_per_token) view handed to the kernel."""
     bpt = layout.bytes_per_token
     return buf[:, : page_size * bpt].view(buf.shape[0], page_size, 1, bpt)
 
@@ -68,7 +68,6 @@ class TestV41KVPool(CustomTestCase):
         )
 
     def assert_kernel_requirements(self, pool, layout):
-        """The paged-cache preconditions the decode kernel checks on the host."""
         self.assertIs(pool.kv_layout, layout)
         self.assertEqual(pool.get_bytes_per_token(), layout.bytes_per_token)
         self.assertEqual(pool.kv_cache_total_dim, layout.bytes_per_token)

@@ -272,8 +272,6 @@ class TopKConfig:
 class TopKOutputChecker:
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        # StandardTopKOutputPacked is the standard triple plus packed ids; every
-        # standard-format consumer reads its fields by name.
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
@@ -320,11 +318,8 @@ class StandardTopKOutput(NamedTuple):
         return TopKOutputFormat.STANDARD
 
 
-# Standard top-k output plus the FlashInfer routed-MoE packed topk
-# ``(id << 16) | bf16_bits(weight)`` the gating kernel produced in the same
-# launch. A SEPARATE type rather than a 4th StandardTopKOutput field so the
-# `a, b, _ = topk_output` 3-tuple unpack stays valid in runners that never see
-# it; consumers read .packed_topk_ids via getattr.
+# Standard top-k output plus the FlashInfer routed-MoE packed ids that
+# ``moe_fused_gate`` writes; a separate type keeps the 3-tuple unpack valid.
 class StandardTopKOutputPacked(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -1423,8 +1418,6 @@ def biased_topk_jit_kernel_impl(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            # The router masks rows >= num_token_non_padded itself (id -1,
-            # weight 0), saving the post-process mask launch.
             num_token_non_padded=(
                 num_token_non_padded
                 if _fused_gate_masks_padded_rows(scoring_func)
@@ -1590,14 +1583,8 @@ def _eplb_remap_enabled() -> bool:
 
 
 def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
-    """Whether the CUDA sqrtsoftplus router masks its own padded rows.
-
-    ``moe_fused_gate``'s Triton kernel implements ``num_token_non_padded`` itself
-    (rows >= it get id -1 and weight 0), so :func:`_post_process_topk_ids` skips
-    the separate ``mask_topk_ids_padded_region`` launch; live rows are bitwise
-    unchanged. Sigmoid is excluded because a padding count would bypass the radix
-    fast path, which does not take one, and HIP fills padded ids with 0, not -1.
-    """
+    # Sigmoid is excluded: a padding count bypasses moe_fused_gate's radix fast
+    # path, and HIP fills padded ids with 0, not -1.
     return _is_cuda and not _use_aiter and scoring_func == "sqrtsoftplus"
 
 
@@ -1607,15 +1594,8 @@ def _fused_gate_emits_packed_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
 ) -> bool:
-    """Whether the sqrtsoftplus router also writes the FlashInfer routed-MoE
-    packed ids ``(id << 16) | bf16_bits(weight)``, replacing the separate
-    ``PackTopkIds`` launch in ``Mxfp4FlashinferTrtllmMoEMethod.apply``.
-
-    The pack is taken from the router's final (renormalized, scaled,
-    padding-masked) values, so nothing may rewrite ids or weights afterwards:
-    no EPLB logical->physical remap, no fused shared-expert slots, no benchmark
-    routing override.
-    """
+    # The pack is taken from the router's final values, so every condition here
+    # rules out a later rewrite of ids or weights.
     return (
         _fused_gate_masks_padded_rows(scoring_func)
         and get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -2203,10 +2183,6 @@ def _post_process_topk_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``padded_rows_masked``: the router already wrote id -1 / weight 0 into the
-    padded rows, so the identity-remap branch skips its mask launch. A remap
-    table indexed by -1 aliases its last entry, so every remapping branch keeps
-    the mask."""
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
         num_fused_shared_experts
@@ -2248,6 +2224,8 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
+            # A remap table indexed by -1 aliases its last entry, so only the
+            # identity-remap branch may drop the padded-row mask.
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 expert_location_dispatch_info,

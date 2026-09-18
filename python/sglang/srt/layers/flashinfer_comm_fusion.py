@@ -925,8 +925,8 @@ def can_use_flashinfer_allreduce(
     # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
 
-    # MNNVL requires float4-aligned widths and hard-fails instead of falling back
-    # (FlashInfer csrc/trtllm_mnnvl_allreduce.cu). Shape and dtype are rank-invariant.
+    # MNNVL hard-fails instead of falling back when the width is not float4-aligned
+    # (FlashInfer csrc/trtllm_mnnvl_allreduce.cu).
     if (
         workspace_manager.backend == "mnnvl"
         and hidden_dim % (16 // input_.element_size()) != 0

@@ -96,7 +96,7 @@ def _router_triton_kernel(
     num_token_non_padded_ptr,
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
-    out_packed_ptr,  # [M, K] int32, (id << 16) | bf16 bits of weight (HAS_PACKED)
+    out_packed_ptr,  # [M, K] int32 (HAS_PACKED)
     M,
     routed_scaling_factor,
     moe_softcapping,
@@ -298,9 +298,7 @@ def _router_triton_kernel(
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
     if HAS_PACKED:
-        # FlashInfer routed-MoE packed entry, bitwise identical to
-        # _pack_topk_ids_triton_kernel: same fp32 -> bf16 rounding, same -1
-        # sentinel on padded rows.
+        # Must stay bitwise identical to fused_pack_topk.
         w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
         packed = (selected_idx << 16) | (w_bits & 0xFFFF)
         out_p_ptr = (
@@ -337,12 +335,10 @@ def moe_fused_gate(
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). ``scores`` contains raw GEMM logits.
 
-    Rows with ``input_ids == bias_alt_token_id`` use ``bias_alt`` instead of ``bias``.
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
-    ``packed_out`` ([M, topk] int32, optional) additionally receives the FlashInfer
-    routed-MoE form ``(id << 16) | bf16_bits(weight)`` of the returned pair, computed
-    in-register and bitwise identical to the separate ``PackTopkIds`` kernel.
+    ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
+    ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (
@@ -441,9 +437,8 @@ def moe_fused_gate(
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
-    # Never alias an output as the fallback for an unused pointer arg: when
-    # Dynamo cannot analyze the kernel (PDL inline asm) it treats every pointer
-    # as mutated and writes both aliases back, clobbering `indices`.
+    # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
+    # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
     _unused_i32 = torch.empty(1, dtype=torch.int32, device=scores.device)
     _router_triton_kernel[grid](
         scores,

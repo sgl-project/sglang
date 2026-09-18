@@ -1,8 +1,5 @@
-"""SM100 small-batch paged attention with KQ and VP transposed matrix products.
-
-The head dimension is the N dimension of both products. No dummy heads are
-computed. Partials stay FP32; inverse RoPE is performed by the existing caller.
-"""
+"""SM100 small-batch paged attention with the heads on the MMA N dimension; the
+caller applies the inverse RoPE to the result."""
 
 from typing import Optional
 
@@ -27,8 +24,7 @@ def can_use_swapab_attention(
     head_dim_v: int,
     softmax_scale: float,
 ) -> bool:
-    """Shape, dtype and cache-layout admission for `swapab_attention`. The caller
-    adds the SM100 and single-query forward-mode gates."""
+    """The caller adds the SM100 and single-query forward-mode gates."""
     return (
         0 < q.shape[0] <= MAX_BATCH
         and num_heads == NUM_HEADS
@@ -83,13 +79,8 @@ def swapab_attention(
     extra_indices=None,
     extra_lengths=None,
 ):
-    """SM100 small-batch V4-layout attention on 16 actual TP4 heads.
-
-    Each CTA computes one 64-token split with the real heads on the MMA N
-    dimension. The second kernel merges FP32 partials and adds the attention
-    sink exactly once. Probability residual compensation keeps the PV product
-    close to FP32 probabilities while using BF16 Tensor Core operands.
-    """
+    """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
+    to each request's keys, and the attention sink is folded in exactly once."""
     from .decode_attention_sm100_gluon import partial_gluon
 
     block = 64

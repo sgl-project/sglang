@@ -254,7 +254,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    """Reject the server features DeepSeek-V4.1 cannot serve yet."""
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
@@ -307,8 +306,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        # The trtllm-gen path serves swa/c4/c128 only; V4.1's ratio-1/2 layers
-        # and the encoder replay request window have no uniform-FP8 pool.
+        # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
         ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
@@ -361,15 +359,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     if cfg.enable_decoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
-        # The late layers see a per-request tail slice, so their token count is
-        # no longer the captured prefill shape.
+        # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
+            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
             ("DP attention", cfg.enable_dp_attention),
         )
         for feature, enabled in incompatible:

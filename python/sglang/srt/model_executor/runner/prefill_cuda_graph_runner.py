@@ -1923,8 +1923,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return static_forward_batch
 
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
-        """Refresh the captured input_embeds slot; a text-only batch would
-        otherwise replay the previous batch's embeddings."""
+        """A text-only batch would otherwise replay the captured input_embeds."""
         ie_idx = self._input_embeds_arg_idx
         ie = layer_kwargs.get("input_embeds")
         if ie is None and ie_idx is not None and len(args) > ie_idx:

@@ -429,11 +429,10 @@ def fp4_index_logits_decode(
     table: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Decode index logits read straight from the fp4 index-K pool (Triton; any
-    CUDA arch). q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B]
-    int64, table = the layer's index-K page buffer (uint8, 2D). Returns [B, L]
-    fp32 logits, -inf at positions >= lens. Rounding follows the torch reference:
-    bf16 dot, bf16 relu * weight, bf16 head sum."""
+    """Decode index logits from the fp4 index-K pool. q [B, H, 128] bf16, weights
+    [B, H], slots [B, L] int64, lens [B] int64, table = the layer's index-K page
+    buffer (uint8, 2D). Returns [B, L] fp32 logits, -inf at positions >= lens,
+    rounded as the torch reference does."""
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     B, H, _ = q.shape
     L = slots.shape[1]

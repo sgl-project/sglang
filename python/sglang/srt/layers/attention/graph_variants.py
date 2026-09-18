@@ -64,12 +64,8 @@ DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 
 @dataclass(frozen=True)
 class Dsv41CandidateGraphVariants:
-    """DeepSeek-V4.1 candidate-indexer decode and DSpark verify graphs.
-
-    Selected by the longest request in the batch: while every request's
-    positions fit a limit, the captured variant skips the low-ratio scoring or
-    the candidate filtering that longer histories need.
-    """
+    """Candidate-indexer graphs keyed by the batch's longest request; a variant
+    below its limit skips low-ratio scoring or candidate filtering."""
 
     # (label, max_seq_len it serves), ascending; the last label is the fallback.
     graph_limits: tuple[tuple[str, int], ...]
@@ -99,7 +95,6 @@ class Dsv41CandidateGraphVariants:
 def create_dsv41_candidate_graph_variants(
     model_runner, capture_forward_mode, captured_req_width: int = 0
 ) -> Optional[Dsv41CandidateGraphVariants]:
-    """DeepSeek-V4.1 candidate graphs for decode/DSpark verify on SM100+ CUDA."""
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -127,8 +122,7 @@ def create_dsv41_candidate_graph_variants(
     ratios = set(text_config.compress_ratios) & {1, 2}
     topk = text_config.index_topk
     variants = []
-    # Verify still needs per-query causal top-k. Only remove candidate filtering
-    # when every possible block fits its budget; keep the low-ratio indexer.
+    # Verify needs per-query causal top-k, so it always keeps candidate filtering.
     if topk > 0 and ratios and not dspark_target_verify:
         variants.append(("candidate_all", topk * min(ratios)))
         if ratios == {1, 2}:

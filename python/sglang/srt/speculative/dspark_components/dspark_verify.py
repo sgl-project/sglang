@@ -82,13 +82,9 @@ def candidate_request_length_bound(
     reqs, pending_verify_tokens: int = 0
 ) -> Optional[int]:
     """Bound committed positions without reading asynchronous acceptance results.
-
-    The overlap loop can have one unprocessed result, which may overshoot the
-    output budget. Reserve its full width here; the runner adds the current
-    verify width as well. Aborted/embedding/multimodal requests keep the
-    general graph because their visible token IDs may not represent the
-    actual cache position space.
-    """
+    The overlap loop can hold one unprocessed result, so reserve its full width;
+    the runner adds the current verify width. Aborted/embedding/multimodal requests
+    return None: their visible token IDs may not track cache positions."""
     if not reqs:
         return None
     longest = 0
@@ -621,8 +617,7 @@ class DsparkVerifyEpilogue:
         )
         if not self.folds_commit:
             return
-        # Consume the same staged locations as target verify, not a second
-        # lookup through req_to_token. Padded and fallback rows never write KV.
+        # Same staged locations as target verify; padded and fallback rows skip KV.
         gated_commit_lens = (
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf

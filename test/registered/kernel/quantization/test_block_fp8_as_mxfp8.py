@@ -25,7 +25,7 @@ SKIP_MSG = "MXFP8 dense kernels unavailable (needs Blackwell + FlashInfer)"
 
 
 def _opt_in():
-    """Select the FlashInfer cute-dsl MXFP8 kernel the way `--fp8-gemm-backend` would."""
+    """Select the cute-dsl MXFP8 kernel the way `--fp8-gemm-backend` would."""
     return patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", OPT_IN)
 
 
@@ -35,7 +35,7 @@ def _mxfp8_available():
 
 
 def _quant_block32(w: torch.Tensor):
-    """fp8 e4m3 weight with one ue8m0 scale per 32x32 block (ceil rule), like the checkpoint."""
+    """fp8 e4m3, one ue8m0 scale per 32x32 block (ceil rule), like the checkpoint."""
     n, k = w.shape
     blocks = w.float().view(n // BLOCK, BLOCK, k // BLOCK, BLOCK)
     amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-30)
@@ -62,8 +62,6 @@ def _block32_config():
 
 
 def _build_layer(method: Fp8LinearMethod, q: torch.Tensor, scale: torch.Tensor):
-    """Load through the parameters' own loaders; the scale arrives as e8m0, the
-    way the checkpoint stores it."""
     n, k = q.shape
     layer = torch.nn.Module()
     method.create_weights(

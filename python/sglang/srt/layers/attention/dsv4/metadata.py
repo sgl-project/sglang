@@ -116,11 +116,10 @@ class PagedIndexerMetadata:
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
-    # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
-    # low-ratio sources. Drives the compressed-domain page size and seq lens.
+    # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
     compress_ratio: int = 4
     # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
-    # all rows at once. Chunk plans are stacked so replay can copy them in place.
+    # all rows at once.
     row_chunk: int = 0
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
@@ -203,7 +202,6 @@ class PagedIndexerMetadata:
         return self.page_table.shape[1] * self.compressed_page_size
 
     def row_chunks(self):
-        """(rows, plan) per logits chunk; one chunk when row_chunk is 0."""
         num_rows = self.compressed_seq_lens.shape[0]
         if self.row_chunk <= 0:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]

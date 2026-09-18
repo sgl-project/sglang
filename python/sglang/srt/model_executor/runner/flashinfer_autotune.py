@@ -357,8 +357,7 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    # A model may warm up its prefill kernels directly: DSpark's dummy forward
-    # is TARGET_VERIFY-shaped and cannot cover large prefill GEMMs.
+    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):

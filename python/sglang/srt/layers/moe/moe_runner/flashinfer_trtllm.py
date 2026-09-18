@@ -76,7 +76,6 @@ def flashinfer_trtllm_deferred_finalize_context(
 
 
 def is_deferred_finalize_enabled() -> bool:
-    """Whether the caller asked for the ``do_finalize=False`` output ABI."""
     return _deferred_finalize_enabled.get()
 
 

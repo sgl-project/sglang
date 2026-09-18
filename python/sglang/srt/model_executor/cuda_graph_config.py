@@ -114,9 +114,8 @@ class PhaseConfig:
     # chunk variants and chooses the smallest one covering a batch. None uses
     # the scheduler's aggregate chunked_prefill_size token budget.
     full_prefill_prefix_chunk_tokens: Optional[int] = None
-    # Prefill only: a batch whose longest sequence exceeds this replays eagerly,
-    # and a backend that captures context-wide work sizes it by this. None
-    # leaves the admission to the token buckets.
+    # Prefill only: a batch whose longest sequence exceeds this replays eagerly, and
+    # backends that capture context-wide work size it. None defers to token buckets.
     max_seq_len: Optional[int] = None
 
 

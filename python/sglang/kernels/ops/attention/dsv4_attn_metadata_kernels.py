@@ -442,10 +442,9 @@ def late_layer_tail_layout(
     tail_len: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    """Rows of a prefill extend that the late layers run over under decoder SWA
-    bounded replay: the last min(tail_len, extend_len) tokens of each request.
-    Returns (token indices into the extend, per-request tail lengths, and one
-    absolute window floor per tail row: the tail's first position)."""
+    """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
+    Returns (token indices into the extend, per-request tail lengths, per-row
+    absolute window floor)."""
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]

@@ -25,8 +25,8 @@ def _load_v4(
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
 ):
-    # V4 row: 448 fp8 nope + 64 bf16 rope = DATA_BYTES, one ue8m0 scale per TILE
-    # values in the page's scale rows; the wrapper derives the sizes from KVLayout.V4.
+    # V4 row: 448 fp8 nope + 64 bf16 rope = DATA_BYTES, plus one ue8m0 scale per
+    # TILE values in the page's scale rows.
     d = gl.arange(0, 512, gl.SliceLayout(0, KV_LAYOUT))
     base = (ids // PAGE).to(gl.int64)[:, None] * STRIDE
     slot = (ids % PAGE)[:, None]
@@ -160,8 +160,6 @@ def partial_gluon(
         gl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=16),
         value=p_hi,
     )
-    # Four native M=128 tiles cover all 512 V channels; the N dimension remains
-    # exactly 16 heads.
     out_tmem = allocate_tensor_memory(
         gl.float32, [512, H], TensorMemoryLayout(block=(128, H), col_stride=1)
     )

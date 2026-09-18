@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Attention, page and MoE defaults; KV-cache dtype, NPU split-backend setup,
-    request limits and validation remain in deepseek_v4_hook.
-    """
+    """Attention, page and MoE defaults; the rest lives in deepseek_v4_hook."""
     cfg = resolving_view(server_args)
 
     model_arch = hf_config.architectures[0]

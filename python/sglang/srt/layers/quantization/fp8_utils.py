@@ -1482,8 +1482,8 @@ def flashinfer_mxfp8_blockscaled_linear(
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
-    pin_tactic skips autotuning and uses the backend heuristic to preserve row-wise
-    batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
+    pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
+    reduction order, breaking row-wise batch invariance.
     """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]

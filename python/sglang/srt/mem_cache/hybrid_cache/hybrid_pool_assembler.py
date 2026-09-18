@@ -484,12 +484,8 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
 
 
 def _dsv4_page_aligned_only(pool: Any) -> bool:
-    """
-    Whether a DeepSeek V4 paged pool may only move whole pages: the
-    token-granular copy (``transfer_cache_dsv4_mla``) splits a token into the
-    576-byte data row and 8-byte scale row of the V4 layout, so pools in the
-    V4.1 fp8 / fp4 layouts (512 + 16 and 256 + 32 bytes) must stay page aligned.
-    """
+    """Whether a pool may only move whole pages: the token-granular copy
+    (``transfer_cache_dsv4_mla``) hardcodes the V4 data/scale row split."""
     layout = getattr(pool, "kv_layout", None)
     return layout is not None and layout.value != "v4"
 
@@ -592,11 +588,8 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
 def _dsv4_low_ratio_entries(
     kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_num: int
 ):
-    """Mirror each shared source once, in FULL-page units, before its first use.
-
-    Prefixes end at an even page boundary. Ratio-2 compression starts a new
-    pair there, so its request-scoped ring is rebuilt rather than cached.
-    """
+    """Mirror each shared source once, in FULL-page units. Prefixes end on an even
+    page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
     import torch
 
     entries = []
@@ -639,8 +632,7 @@ def _dsv4_low_ratio_entries(
                 (names[2], index_pool.index_k_scale_buffer),
             ]
         for name, buffers in index_regions:
-            # A FULL page contains several contiguous 64-slot FP4 index pages.
-            # Drop only the extra partial padding row beyond the FULL address space.
+            # Drop only the padding rows past the FULL page address space.
             rows = []
             for buffer in buffers:
                 full_pages = buffer.shape[0] // index_pages_per_full_page
@@ -748,8 +740,7 @@ def build_deepseek_v4_hicache_stack(
     has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
     mtp_swa_device_buffers = []
     if not has_paged_swa:
-        # Unified KV and encoder replay rebuild request-local SWA state;
-        # only the persistent main/indexer pages belong in the host cache.
+        # Unified KV and encoder replay rebuild SWA state; keep it out of host cache.
         swa_layer_mapping = {}
     else:
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:

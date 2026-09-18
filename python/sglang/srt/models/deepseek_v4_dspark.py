@@ -584,7 +584,6 @@ def build_dspark_v4_confidence_head(
 
 
 def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
-    """Apply draft expert counts and disable image routing for text-only stages."""
     n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
     n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
     has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
@@ -938,8 +937,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
-            # The FlashMLA writer reads an explicit KV row stride. Keep the
-            # stacked projection's views and avoid a copy for every draft stage.
+            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
             allow_strided_output=(
                 get_platform().is_blackwell
                 and not is_unified_kv_triton()

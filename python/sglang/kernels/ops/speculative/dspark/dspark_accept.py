@@ -648,9 +648,8 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 
 def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
-    """``logits.argmax(-1)``; at the speculative shape (few rows, wide vocab)
-    ``torch.argmax``'s single-block-per-row reduction is ~7x off the memory
-    the reduction touches."""
+    # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
+    # off the memory the reduction touches.
     if (
         logits.is_cuda
         and logits.dim() == 2
