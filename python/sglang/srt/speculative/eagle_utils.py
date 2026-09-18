@@ -913,9 +913,6 @@ def eagle_sample(
             from sglang.kernels.ops.sampling.renorm_triton import (
                 top_p_renorm_probs_triton as top_p_renorm_prob,
             )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
         elif not _is_npu:
             from sglang.srt.layers.sampling_renorm import (
                 top_k_renorm_prob,
