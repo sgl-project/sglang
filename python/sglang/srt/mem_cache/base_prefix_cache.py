@@ -443,8 +443,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
         call's to account for: insert what can be keyed, release the rest.
         Slicing the kv row by the token-id count instead strands whatever
-        lies between -- no caller releases those. Past ``owned_kv_len`` is
-        ``release_kv_cache``'s.
+        lies between -- no caller releases those. ``release_kv_cache`` frees
+        everything past ``owned_kv_len``.
         """
 
     @abstractmethod
