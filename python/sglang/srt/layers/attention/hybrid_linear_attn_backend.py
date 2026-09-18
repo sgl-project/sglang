@@ -16,6 +16,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.srt.disaggregation.layer_progress import LayerProgress
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -33,7 +34,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -1096,6 +1097,77 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        self._layerwise_progress = self._init_layerwise_progress()
+
+    def _init_layerwise_progress(self) -> Optional[LayerProgress]:
+        if not envs.SGLANG_DISAGG_LAYERWISE_NIXL.get():
+            return None
+        disagg = get_disagg()
+        if (
+            disagg.disaggregation_mode != "prefill"
+            or disagg.disaggregation_transfer_backend != "nixl"
+        ):
+            logger.warning(
+                "SGLANG_DISAGG_LAYERWISE_NIXL is enabled outside NIXL prefill; "
+                "layer-wise transfer is disabled"
+            )
+            return None
+
+        mamba_map = getattr(self.req_to_token_pool, "mamba_map", None)
+        full_map = getattr(
+            self.token_to_kv_pool, "full_attention_layer_id_mapping", None
+        )
+        if not mamba_map or not full_map:
+            logger.warning(
+                "Layer-wise NIXL requires Hybrid Attention compact layer mappings"
+            )
+            return None
+
+        device = torch.device(self.linear_attn_backend.device)
+        if device.type != "cuda":
+            logger.warning("Layer-wise NIXL requires CUDA, got %s", device)
+            return None
+
+        num_layers = (
+            self.linear_attn_backend._model_runner.model_config.num_hidden_layers
+        )
+        all_layer_ids = set(mamba_map) | set(full_map)
+        invalid_layer_ids = sorted(
+            layer_id
+            for layer_id in all_layer_ids
+            if layer_id < 0 or layer_id >= num_layers
+        )
+        if invalid_layer_ids:
+            raise ValueError(
+                "Hybrid layer mappings contain out-of-range global layer ids: "
+                f"{invalid_layer_ids}"
+            )
+        state_batch_size = envs.SGLANG_DISAGG_LAYERWISE_STATE_BATCH_SIZE.get()
+        if state_batch_size <= 0:
+            raise ValueError(
+                "SGLANG_DISAGG_LAYERWISE_STATE_BATCH_SIZE must be positive"
+            )
+
+        ring_layers = set(full_map)
+        ordered_mamba_layers = [
+            layer_id
+            for layer_id, _ in sorted(mamba_map.items(), key=lambda item: item[1])
+        ]
+        ring_layers.update(
+            ordered_mamba_layers[state_batch_size - 1 :: state_batch_size]
+        )
+        ring_layers.add(ordered_mamba_layers[-1])
+        progress = LayerProgress(num_layers, device, ring_layers=ring_layers)
+        # Scheduler and attention backend share this request pool in one process.
+        # Storing the explicitly owned object here avoids a process-global singleton.
+        self.req_to_token_pool.layerwise_progress = progress
+        logger.info(
+            "Initialized CUDA-graph-compatible layer progress for %d global "
+            "layers with %d ring points",
+            num_layers,
+            progress.num_ring_points,
+        )
+        return progress
 
     @property
     def data_type(self):
@@ -1324,7 +1396,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            output = self.forward_extend(
                 layer,
                 forward_batch,
                 save_kv_cache,
@@ -1336,6 +1408,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 b,
                 **kwargs,
             )
+            if self._layerwise_progress is not None and save_kv_cache:
+                layer_id = layer.layer_id if layer is not None else kwargs["layer_id"]
+                self._layerwise_progress.record(int(layer_id))
+            return output
 
     def update_mamba_state_after_mtp_verify(
         self,
