@@ -347,13 +347,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertEqual(cache.evictable_size(), len(prefix))
 
     def test_insert_releases_committed_slot_without_token_id(self):
-        """The insert path must release up to owned_kv_len, not len(token_ids).
+        """The insert path releases up to owned_kv_len, not len(token_ids).
 
-        Pins the ownership contract in BasePrefixCache.cache_finished_req:
-        [cache_protected_len, owned_kv_len) is the request's own KV and every
-        slot in it is this call's to account for. Slicing the kv row by the
-        token-id count instead strands the slots in between -- the radix key
-        cannot name them, and no caller releases them either.
+        Pins the ownership contract on BasePrefixCache.cache_finished_req.
         """
         cache, req_to_token = _make_cache_with_pools()
 

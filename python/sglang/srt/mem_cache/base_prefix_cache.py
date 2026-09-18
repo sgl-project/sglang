@@ -440,12 +440,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Dispose of a finished request's KV.
 
         ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
-        ``[req.kv.cache_protected_len, owned_kv_len)`` is the request's own
-        committed KV: an implementation inserts what it can key and releases
-        the rest, but every slot in that range must be accounted for. Slicing
-        the kv row by anything else -- the token-id count in particular --
-        strands the slots in between, which no caller releases.
-        Anything past ``owned_kv_len`` is released by ``release_kv_cache``.
+        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
+        call's to account for: insert what can be keyed, release the rest.
+        Slicing the kv row by the token-id count instead strands whatever
+        lies between -- no caller releases those. Past ``owned_kv_len`` is
+        ``release_kv_cache``'s.
         """
 
     @abstractmethod

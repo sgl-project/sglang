@@ -508,8 +508,6 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        # Slice by the owned-KV bound, not by len(token_ids): a committed slot
-        # past the token sequence still has to be released by the tail below.
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :owned_kv_len
         ]
