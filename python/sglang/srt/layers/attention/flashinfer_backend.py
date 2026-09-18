@@ -352,13 +352,30 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
-        # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
-        self.flashinfer_kv_cache_dtype = (
-            torch.float8_e4m3fn
-            if (
-                self.prefill_uses_dequant_workspace
-                or self.decode_uses_dequant_workspace
+        # Resolve the dtype actually presented to FlashInfer, rather than the
+        # pool's storage tag. Quantized PLAIN reads (MXFP4) materialize BF16,
+        # while DEQUANT_WORKSPACE reads (NVFP4) materialize FP8.
+        active_flashinfer_accesses = [
+            access
+            for backend, access in (
+                (prefill_backend, self.prefill_kv_access),
+                (decode_backend, self.decode_kv_access),
             )
+            if backend == "flashinfer" and access is not None
+        ]
+        effective_kv_dtypes = {
+            access.attention_kv_dtype
+            for access in active_flashinfer_accesses
+            if access.attention_kv_dtype is not None
+        }
+        if len(effective_kv_dtypes) > 1:
+            raise ValueError(
+                "FlashInfer prefill/decode resolved different attention KV dtypes: "
+                f"{sorted(str(dtype) for dtype in effective_kv_dtypes)}."
+            )
+        self.flashinfer_kv_cache_dtype = (
+            next(iter(effective_kv_dtypes))
+            if effective_kv_dtypes
             else model_runner.kv_cache_dtype
         )
 
