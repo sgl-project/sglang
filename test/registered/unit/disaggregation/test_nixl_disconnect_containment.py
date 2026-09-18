@@ -107,3 +107,7 @@ class TestNixlDisconnectContainment(unittest.TestCase):
                 manager._await_handles([object()], failure_seen=False), (False, True)
             )
             kill.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
