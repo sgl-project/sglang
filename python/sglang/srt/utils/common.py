@@ -748,7 +748,7 @@ def get_available_cpu_memory():
         with open("/sys/fs/cgroup/memory.max", "r") as f:
             content = f.read().strip().lower()
             # Match a number followed optionally by a unit (e.g., "512m", "2gb", "1024", "512b", "1024bytes")
-            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content) 
+            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content)
             # "max" or other non memory size content will be skipped
             if not match:
                 raise ValueError
