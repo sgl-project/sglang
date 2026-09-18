@@ -7,6 +7,44 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Request-level time per output token
+
+`sglang:request_time_per_output_token_seconds` is a histogram of one mean decode latency per successfully completed request:
+
+```text
+TPOT = (finished_time - first_token_time) / (completion_tokens - 1)
+     = 1 / decode_throughput
+```
+
+The first output token is excluded from the denominator because its latency belongs to TTFT. Requests with fewer than two output tokens, aborted requests, invalid/nonpositive throughput, and PD prefill workers do not contribute observations. Both streaming and nonstreaming requests are included, with the `is_streaming` label.
+
+Each qualifying request contributes one observation, regardless of output length. This differs from the existing `inter_token_latency_seconds` histogram, which records output-message intervals with token weights. TPOT summarizes a request's decode period; it does not expose within-request pauses.
+
+For p95 TPOT across streaming modes and workers of each model:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (model_name, le) (
+    rate(sglang:request_time_per_output_token_seconds_bucket[5m])
+  )
+)
+```
+
+Use `0.50` or `0.99` for p50 or p99. Filter the deployment/job before aggregating when multiple deployments serve the same model. A window without completed observations has no percentile; do not replace missing values with zero.
+
+The request-weighted mean TPOT is:
+
+```promql
+sum by (model_name) (rate(sglang:request_time_per_output_token_seconds_sum[5m]))
+/
+sum by (model_name) (rate(sglang:request_time_per_output_token_seconds_count[5m]))
+```
+
+A request's decode TPS is the reciprocal of its TPOT. Reciprocation reverses percentile order: p5 TPS corresponds to `1 / p95 TPOT`, while p95 TPS corresponds to `1 / p5 TPOT` (approximately when estimated from histogram buckets). The reciprocal of mean TPOT is not mean request TPS, and neither is aggregate server output tokens per second.
+
+TPOT uses engine timestamps. This metric does not measure time waiting before the first token, upstream proxy queueing, or network delivery. Nonstreaming accuracy depends on correct engine first-token timing; the histogram does not independently correct it.
+
 Here is an example of the metrics:
 
 ```text Output
