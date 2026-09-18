@@ -32,4 +32,5 @@ def test_parse_dflash_draft_config_raises_on_query_zero_predicts_next():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__]))
