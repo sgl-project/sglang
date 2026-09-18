@@ -11,9 +11,9 @@ Providers:
 Usage::
 
     # Benchmark on the default world sizes (2, 4, 8 GPUs):
-    python test/registered/jit/benchmark/bench_symm_mem_all_gather.py
+    python test/registered/kernels/benchmark/communication/bench_symm_mem_all_gather.py
     # Pick a specific world size (or comma-separated list):
-    python test/registered/jit/benchmark/bench_symm_mem_all_gather.py --num-gpu 8
+    python test/registered/kernels/benchmark/communication/bench_symm_mem_all_gather.py --num-gpu 8
 """
 
 from __future__ import annotations
