@@ -18,13 +18,14 @@ use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    classify_stream_end, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
-    StaleRequestOutcome, WorkerModeLabel,
+    classify_stream_end, outcome_from_status, MetricsRegistry, PolicySelectionFailureReason,
+    RequestLogContext, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -35,9 +36,7 @@ use std::sync::Arc;
 /// bootstrap-injected request body to BOTH the prefill and the decode
 /// worker concurrently; this header lets the prefill log the chosen
 /// peer, and is mirrored onto the response so sidecars / tests can
-/// observe affinity without sniffing the proxy hop. The `x-sgl-`
-/// prefix matches `x-sgl-router-error-code` so router-emitted metadata
-/// stays grouped.
+/// observe affinity without sniffing the proxy hop.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 /// Optional caller requirement consumed only when a static P Bucket config is enabled.
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
@@ -770,11 +769,22 @@ pub async fn chat_completions(
 
     // Snapshot the labels we need for metrics BEFORE moving the worker
     // / model_str values into the per-branch fetch futures.
-    let metrics_worker_url = worker.url.clone();
-    let metrics_mode = match worker.mode() {
-        WorkerMode::Prefill => WorkerModeLabel::Prefill,
-        WorkerMode::Decode => WorkerModeLabel::Decode,
-        WorkerMode::Plain => WorkerModeLabel::Plain,
+    // The peer that answers is the one the outcome belongs to: in PD mode the
+    // client-visible response comes from the decode peer, not the prefill peer
+    // the policy selected, so charging prefill for a decode fault blames the
+    // wrong engine. Keeps this metric and the `RequestLogContext` below naming
+    // the same worker.
+    let metrics_worker_url = decode_hint_url
+        .clone()
+        .unwrap_or_else(|| worker.url.clone());
+    let metrics_mode = if decode_hint_url.is_some() {
+        WorkerModeLabel::Decode
+    } else {
+        match worker.mode() {
+            WorkerMode::Prefill => WorkerModeLabel::Prefill,
+            WorkerMode::Decode => WorkerModeLabel::Decode,
+            WorkerMode::Plain => WorkerModeLabel::Plain,
+        }
     };
     let metrics_model = model_str.clone();
 
@@ -1038,74 +1048,60 @@ pub async fn chat_completions(
         }
     };
 
-    // Record the dispatch outcome AFTER we know whether the upstream
-    // accepted the request. A 504 from the stale-request branch counts as
-    // `cancelled` — semantically distinct from upstream errors that bubble
-    // through as `error`. The metric is per-worker so convergence tests
-    // can scrape `/metrics` and assert that ≥N requests landed on a
-    // single prefill worker.
-    let outcome = match &result {
-        Ok(_) => RequestOutcome::Success,
-        Err(ApiError::StaleRequestExpired { .. }) => {
-            // The janitor fired the stale-cancel and we observed it
-            // user-side; record both the per-request `cancelled` outcome
-            // AND the global `expired` count. The two views are useful for
-            // different alerts: per-worker request_total{cancelled} flags a
-            // worker that's hanging, while stale_requests_total{expired}
-            // tracks the global health of the janitor.
-            ctx.metrics
-                .record_stale_request(StaleRequestOutcome::Expired);
-            RequestOutcome::Cancelled
-        }
-        Err(_) => RequestOutcome::Error,
-    };
-    ctx.metrics
-        .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
-
-    // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+    // Record the dispatch outcome AFTER we know the client-visible status.
+    //
+    // The status decides success-vs-failure, NOT `Result::Ok`/`Err`: a response
+    // the router forwards from a worker with a 4xx/5xx status is an
+    // `Ok(Response)` here, so keying off `Ok` would credit a forwarded engine
+    // error as a success.
+    //
+    // The `Err` VARIANT decides `Cancelled`, because a status cannot: the stale
+    // deadline, the router's own upstream timeout, and a worker's forwarded 504
+    // all surface as 504, and only `StaleRequestExpired` is a router-side
+    // cancellation. Reading `Cancelled` off the status instead would quietly
+    // move every hung worker out of `outcome="error"` and blind the per-worker
+    // error ratio to the most common hard worker failure there is.
+    //
+    // The metric is per-worker so convergence tests can scrape `/metrics` and
+    // assert that ≥N requests landed on a single prefill worker.
     let http_status = match &result {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.status_code().as_u16(),
     };
+    let outcome = match &result {
+        Err(ApiError::StaleRequestExpired { .. }) => {
+            // Also record the global `expired` count. The two views drive
+            // different alerts: per-worker worker_requests_total{cancelled}
+            // flags a worker that is hanging, while stale_requests_total
+            // {expired} tracks how often the deadline fires at all.
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            RequestOutcome::Cancelled
+        }
+        // A 503 the ROUTER produced -- the breaker was open, or the worker URL
+        // would not parse -- not backpressure the worker reported; it was never
+        // asked. `outcome_from_status` cannot tell those from an engine's own
+        // 503, the same reason `Cancelled` is matched on the variant above.
+        Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
+            RequestOutcome::Error
+        }
+        _ => outcome_from_status(http_status),
+    };
+    ctx.metrics
+        .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     // Record end-to-end latency now that the outcome is known. Non-streaming:
     // body is buffered here, so `start.elapsed()` is true e2e — record directly.
     // Streaming: body still pending, so the `RecordDurationOnDrop` guard in
     // `stream_guards` records it at stream completion (not just time-to-headers).
-    // `elapsed` still feeds the access-log `latency_ms` for both.
     //
-    // HTTP status is counted into `responses_total` by the edge middleware
-    // (app.rs), not here — the old per-handler site skipped early exits.
-    let elapsed = start.elapsed();
+    // The access-log line and the edge counters are emitted once, centrally, by
+    // the `access_log_and_record` middleware (app.rs) — a per-handler site
+    // cannot see the early exits that never reach a handler.
     if !streaming {
         ctx.metrics
-            .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
+            .observe_request_duration(&metrics_model, start.elapsed().as_secs_f64());
     }
-    let outcome_str = match outcome {
-        RequestOutcome::Success => "success",
-        RequestOutcome::Error => "error",
-        RequestOutcome::Cancelled => "cancelled",
-    };
-    tracing::info!(
-        request_id = %request_id,
-        method = "POST",
-        path = "/v1/chat/completions",
-        model = %metrics_model,
-        worker = %metrics_worker_url,
-        outcome = outcome_str,
-        http_status,
-        stream = streaming,
-        latency_ms = elapsed.as_millis() as u64,
-        "chat_completions",
-    );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe the final PD Decode selection without
@@ -1115,7 +1111,7 @@ pub async fn chat_completions(
     // resolved). A malformed URL was already rejected at the
     // request-side parse — we only reach this branch when the URL was
     // header-valid, so the second parse is safe.
-    match (result, decode_hint_url) {
+    let mut response = match (result, decode_hint_url) {
         (Ok(mut response), Some(url)) => {
             match HeaderValue::from_str(&url) {
                 Ok(v) => {
@@ -1130,10 +1126,32 @@ pub async fn chat_completions(
                     );
                 }
             }
-            Ok(response)
+            response
         }
-        (other, _) => other,
-    }
+        (Ok(response), None) => response,
+        // Post-dispatch error (a worker WAS selected). Materialize it here
+        // instead of returning `Err` so it can carry the routing context below:
+        // an `Err` reaches the middleware as a bare response with no worker to
+        // name, and "which engine failed" is exactly what an operator wants from
+        // this line.
+        //
+        // The remaining `?` short-circuits return `Err` and are logged with no
+        // worker. All but one run before a worker is selected; the exception is
+        // `build_outgoing_body`, a router-side serialization failure that is not
+        // attributable to the worker it would have been sent to.
+        (Err(e), _) => e.into_response(),
+    };
+    // Tag the routed response so the access-log middleware can describe the
+    // dispatch. `worker` names where the client-visible response came from — in
+    // PD mode the decode worker, which is the peer whose failure the client
+    // actually saw, not the prefill worker the policy selected.
+    response.extensions_mut().insert(RequestLogContext {
+        worker_url: metrics_worker_url,
+        model_id: metrics_model,
+        streaming,
+        outcome,
+    });
+    Ok(response)
 }
 
 fn resolve_prefix_query(

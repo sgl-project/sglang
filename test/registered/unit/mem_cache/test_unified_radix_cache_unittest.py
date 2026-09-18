@@ -3704,7 +3704,7 @@ class UnifiedRadixCacheSuite:
         # Simulate polling check_hicache_events.
         # There will be a sequence of events populated from queue:
         # 1. a storage hit notification (from cc.prefetch_hit_queue).
-        # 2. a HiCacheAck, indicating the copmletion of KV pool read.
+        # 2. a HiCacheAck, indicating the completion of KV pool read.
         # 3. a HiCacheAck, indicating the completion of SWA pool read.
         # 4. a HiCacheACk, idnicating the completion of entire prefetch request.
         # We are going to stop at the exact timing-window between 3 and 4.  So we have to
