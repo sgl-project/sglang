@@ -5,9 +5,9 @@
 
 use crate::config::{AffinityConfig, SessionAffinityMode};
 use crate::discovery::WorkerId;
-use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+use crate::policies::state::engine_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use dashmap::DashMap;
@@ -308,7 +308,7 @@ fn stable_backup(
 mod lifecycle_tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerMode, WorkerSpec};
-    use crate::policies::active_load::MockClock;
+    use crate::policies::state::engine_load::MockClock;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 

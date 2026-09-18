@@ -4,7 +4,7 @@
 //! Prefix-cache scores from the KV-event [`HashTree`].
 
 use super::{EligibilityFilter, ScoringPolicy};
-use crate::policies::kv_events::{
+use crate::policies::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
 use crate::policies::SelectionContext;
@@ -122,7 +122,7 @@ impl EligibilityFilter for PrefixCachePolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::kv_events::KvWorkerId;
+    use crate::policies::state::kv_events::KvWorkerId;
 
     const BLOCK: usize = 4;
 

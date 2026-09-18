@@ -4,8 +4,8 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::policies::active_load::ActiveLoadRegistry;
-use crate::policies::kv_events::KvEventIndex;
+use crate::policies::state::engine_load::ActiveLoadRegistry;
+use crate::policies::state::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;

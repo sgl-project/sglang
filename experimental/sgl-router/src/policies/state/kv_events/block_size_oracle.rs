@@ -8,7 +8,7 @@
 //! `compute_block_hashes` must hash with the **same** block size the
 //! worker uses to publish KV-cache events; otherwise every cache-aware
 //! lookup misses silently. The worker advertises its `page_size` via
-//! `/server_info` (parsed into [`crate::policies::kv_events::EventConfig::block_size`]).
+//! `/server_info` (parsed into [`crate::policies::state::kv_events::EventConfig::block_size`]).
 //! Dynamo's design treats `kv_cache_block_size` as a property of the
 //! `ModelDeploymentCard` populated by the worker registrar (see
 //! `~/dynamo/components/src/dynamo/sglang/register.py`); a mismatch

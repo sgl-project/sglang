@@ -10,11 +10,11 @@ use serde_json::json;
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::kv_events::{
-    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
-};
 use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies::request_tokens_for;
+use sgl_router::policies::state::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;

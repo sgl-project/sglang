@@ -35,7 +35,7 @@ use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
-use crate::policies::engine_load::EngineLoadSnapshot;
+use crate::policies::state::engine_load::EngineLoadSnapshot;
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
@@ -696,8 +696,8 @@ mod tests {
     use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::state::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,

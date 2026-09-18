@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod active_load;
 pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
-pub mod engine_load;
 pub mod factory;
-pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
 pub mod prefix_provider;
@@ -18,12 +15,13 @@ pub mod round_robin;
 pub mod scoring;
 pub mod selection;
 pub mod session_aware;
+pub mod state;
 pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
+use crate::policies::state::engine_load::EngineLoadSnapshot;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -577,10 +575,10 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::policies::state::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
 
