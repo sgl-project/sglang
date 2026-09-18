@@ -36,6 +36,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  # Match CUDA test workflows: shared H100 runners can fail NVLS allocation.
+  NCCL_NVLS_ENABLE: "0"
 
 jobs:
   build-wheel:
