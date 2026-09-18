@@ -57,6 +57,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _target_verify_draft_token_num(
+    forward_batch: ForwardBatch, fallback: Optional[int]
+) -> int:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    draft_token_num = getattr(spec_info, "draft_token_num", None)
+    if draft_token_num is None:
+        draft_token_num = fallback
+    if draft_token_num is None:
+        raise ValueError("TARGET_VERIFY requires a positive draft_token_num")
+    draft_token_num = int(draft_token_num)
+    if draft_token_num <= 0:
+        raise ValueError(
+            f"TARGET_VERIFY requires a positive draft_token_num, got {draft_token_num}"
+        )
+    return draft_token_num
+
+
 def _kv_cache_to_bnsd(
     k_cache: torch.Tensor, v_cache: torch.Tensor, page_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
@@ -115,6 +132,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
+        self.is_eagle3 = runner.spec_algorithm.is_eagle3()
         self.kv_pool = runner.token_to_kv_pool
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
@@ -394,20 +412,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._prefill_meta = None
             self._extend_meta = None
             self._extend_meta_key = None
+        is_eagle3_target_verify = (
+            not self.is_npu
+            and self.is_eagle3
+            and forward_batch.forward_mode.is_target_verify()
+        )
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
+        elif is_eagle3_target_verify:
+            self._max_seqlen_q = _target_verify_draft_token_num(
+                forward_batch, self.speculative_num_draft_tokens
+            )
         else:
             self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or is_eagle3_target_verify
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            if is_eagle3_target_verify:
+                self._max_seqlen_k += _target_verify_draft_token_num(
+                    forward_batch, self.speculative_num_draft_tokens
+                )
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -1338,6 +1370,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch.seq_lens.to(torch.int32) - int(_ndt)
                 ).clamp(min=0)
 
+        # EAGLE3 TARGET_VERIFY keeps seq_lens at the committed prefix and omits
+        # regular extend metadata. Reconstruct its uniform verify width; the
+        # total KV length is prefix + draft_token_num.
+        if (
+            not self.is_npu
+            and self.is_eagle3
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.extend_seq_lens is None
+        ):
+            _bs = forward_batch.seq_lens.shape[0]
+            _ndt = _target_verify_draft_token_num(
+                forward_batch,
+                self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1)),
+            )
+            forward_batch.extend_seq_lens = torch.full(
+                (_bs,),
+                int(_ndt),
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
+            if forward_batch.extend_prefix_lens is None:
+                forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(
+                    torch.int32
+                )
+
         # NPU cache hit (same forward_batch).
         if (
             self.is_npu
@@ -1355,10 +1413,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
+        committed_seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if (
+            not self.is_npu
+            and self.is_eagle3
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            prefix_lens = committed_seq_lens
+            seq_lens = committed_seq_lens + forward_batch.extend_seq_lens.to(
+                torch.int32
+            )
+        elif forward_batch.extend_prefix_lens is not None:
+            seq_lens = committed_seq_lens
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
+            seq_lens = committed_seq_lens
             prefix_lens = torch.zeros_like(seq_lens)
 
         # NPU cache write.
