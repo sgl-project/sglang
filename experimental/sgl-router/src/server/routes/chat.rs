@@ -769,11 +769,22 @@ pub async fn chat_completions(
 
     // Snapshot the labels we need for metrics BEFORE moving the worker
     // / model_str values into the per-branch fetch futures.
-    let metrics_worker_url = worker.url.clone();
-    let metrics_mode = match worker.mode() {
-        WorkerMode::Prefill => WorkerModeLabel::Prefill,
-        WorkerMode::Decode => WorkerModeLabel::Decode,
-        WorkerMode::Plain => WorkerModeLabel::Plain,
+    // The peer that answers is the one the outcome belongs to: in PD mode the
+    // client-visible response comes from the decode peer, not the prefill peer
+    // the policy selected, so charging prefill for a decode fault blames the
+    // wrong engine. Keeps this metric and the `RequestLogContext` below naming
+    // the same worker.
+    let metrics_worker_url = decode_hint_url
+        .clone()
+        .unwrap_or_else(|| worker.url.clone());
+    let metrics_mode = if decode_hint_url.is_some() {
+        WorkerModeLabel::Decode
+    } else {
+        match worker.mode() {
+            WorkerMode::Prefill => WorkerModeLabel::Prefill,
+            WorkerMode::Decode => WorkerModeLabel::Decode,
+            WorkerMode::Plain => WorkerModeLabel::Plain,
+        }
     };
     let metrics_model = model_str.clone();
 
@@ -1067,6 +1078,13 @@ pub async fn chat_completions(
                 .record_stale_request(StaleRequestOutcome::Expired);
             RequestOutcome::Cancelled
         }
+        // A 503 the ROUTER produced -- the breaker was open, or the worker URL
+        // would not parse -- not backpressure the worker reported; it was never
+        // asked. `outcome_from_status` cannot tell those from an engine's own
+        // 503, the same reason `Cancelled` is matched on the variant above.
+        Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
+            RequestOutcome::Error
+        }
         _ => outcome_from_status(http_status),
     };
     ctx.metrics
@@ -1093,11 +1111,6 @@ pub async fn chat_completions(
     // resolved). A malformed URL was already rejected at the
     // request-side parse — we only reach this branch when the URL was
     // header-valid, so the second parse is safe.
-    // In PD mode the response the client sees comes from the decode peer; in
-    // plain mode there is only the one worker.
-    let dispatched_worker_url = decode_hint_url
-        .clone()
-        .unwrap_or_else(|| metrics_worker_url.clone());
     let mut response = match (result, decode_hint_url) {
         (Ok(mut response), Some(url)) => {
             match HeaderValue::from_str(&url) {
@@ -1133,7 +1146,7 @@ pub async fn chat_completions(
     // PD mode the decode worker, which is the peer whose failure the client
     // actually saw, not the prefill worker the policy selected.
     response.extensions_mut().insert(RequestLogContext {
-        worker_url: dispatched_worker_url,
+        worker_url: metrics_worker_url,
         model_id: metrics_model,
         streaming,
         outcome,
