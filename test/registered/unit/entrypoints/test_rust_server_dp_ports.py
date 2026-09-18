@@ -13,23 +13,31 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
-    "nnodes,tp_size,dp_size,ep_join_mode,ranks,expected",
+    "nnodes,tp_size,dp_size,enable_dp_attention,ep_join_mode,ranks,expected",
     [
-        (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
-        (4, 4, 2, None, (0, 2), [0, 0]),
-        (2, 2, 2, "scale", (0, 1), [0, 1]),
+        (2, 4, 4, True, None, (0, 1, 2, 3), [0, 1, 0, 1]),
+        (4, 4, 2, True, None, (0, 2), [0, 0]),
+        (2, 2, 2, True, "scale", (0, 1), [0, 1]),
+        (1, 1, 2, False, None, (0, 0), [0, 1]),
+        (1, 2, 2, False, None, (0, 0), [0, 1]),
     ],
-    ids=["multiple-listeners-per-node", "dp-spans-nodes", "scale-joiner"],
+    ids=[
+        "multiple-listeners-per-node",
+        "dp-spans-nodes",
+        "scale-joiner",
+        "system-dp",
+        "system-dp-with-tp",
+    ],
 )
 def test_dp_leaders_reuse_node_local_ports(
-    nnodes, tp_size, dp_size, ep_join_mode, ranks, expected
+    nnodes, tp_size, dp_size, enable_dp_attention, ep_join_mode, ranks, expected
 ):
     with (
         get_context().override_server_args(
             nnodes=nnodes,
             tp_size=tp_size,
             dp_size=dp_size,
-            enable_dp_attention=True,
+            enable_dp_attention=enable_dp_attention,
             ep_join_mode=ep_join_mode,
             host="0.0.0.0",
             port=30000,
@@ -49,7 +57,8 @@ def test_dp_leaders_reuse_node_local_ports(
                     pp_size=parallel.pp_size,
                     attn_tp_size=parallel.attn_tp_size,
                     attn_cp_size=parallel.attn_cp_size,
-                    attn_dp_rank=dp_rank,
+                    attn_dp_rank=dp_rank if enable_dp_attention else 0,
+                    dp_rank=dp_rank,
                     dp_size=dp_size,
                 ),
                 model_config=SimpleNamespace(is_multimodal=False),
