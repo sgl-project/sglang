@@ -949,12 +949,6 @@ def assert_metrics(self, metrics):
         and spec_num_draft_tokens
     ):
         accept_rate = float(metrics["accept_length"]) / spec_num_draft_tokens
-        logger.info(
-            f"accept_rate: {accept_rate:.4f} "
-            f"(accept_length={metrics['accept_length']}, "
-            f"spec_num_draft_tokens={spec_num_draft_tokens}, "
-            f"baseline={self.accept_rate})"
-        )
         dump_metric(
             "accept_rate",
             accept_rate,
