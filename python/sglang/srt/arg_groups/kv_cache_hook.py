@@ -66,7 +66,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -87,7 +86,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -165,6 +163,24 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
 
+    if cfg.radix_eviction_policy == "tlru":
+        tlru_config = cfg.radix_eviction_policy_config or {}
+        threshold = tlru_config.get("threshold", 0)
+        next_prompt_estimate = tlru_config.get("next_prompt_estimate", 0)
+        if threshold < 0 or next_prompt_estimate < 0:
+            raise ValueError(
+                "--radix-eviction-policy tlru requires non-negative 'threshold' and "
+                "'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} and {next_prompt_estimate}."
+            )
+        if threshold <= next_prompt_estimate:
+            raise ValueError(
+                "--radix-eviction-policy tlru needs 'threshold' greater than "
+                f"'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
+                "ever TEL-safe and T-LRU is exactly LRU."
+            )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -187,6 +203,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg._swa_full_tokens_ratio_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
@@ -194,6 +217,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # claimed the field, and the value to range-check is the effective one.
     if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    prefix_tails = resolved_view(server_args).swa_prefix_tails
+    if prefix_tails is not None and prefix_tails < 0:
+        raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
@@ -264,25 +290,34 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
-    # Only monolithic decode cuda-graph capture is wired; piecewise prefill
-    # capture is not. Guard when the user opts into it.
+    # Prefill cuda-graph capture IS wired for the unified pool: the captured
+    # batch reads `out_cache_loc` out of the registry slot, which
+    # `populate_from_forward_batch` refills from the already-rebound (kernel-
+    # facing) loc before every replay, and the read tables are refilled
+    # out-of-graph from the live v2p.
+    #
+    # The FULL backend is the one exception, and not for a unified reason: its
+    # metadata path (`_init_full_cg_prefill_metadata`) exists only on the
+    # fa3/fa4 family. Any other backend lands in the decode-shaped
+    # `_apply_cuda_graph_metadata`, which has no EXTEND branch at all. Inkling
+    # declares FULL as a MODEL default, indistinguishable here from a flag the
+    # user typed, so warn and fall back rather than refuse to boot.
     _cg_cfg = cfg.cuda_graph_config
-    if _cg_cfg is not None and _cg_cfg.prefill.backend != Backend.DISABLED:
-        if cfg.cuda_graph_backend_prefill is not None:
-            raise ValueError(
-                "--enable-unified-memory supports decode cuda-graph "
-                "capture only; prefill capture is not wired (the prefill "
-                "graph runner bypasses the unified virtual->physical loc "
-                "rebind). Got --cuda-graph-backend-prefill="
-                f"{cfg.cuda_graph_backend_prefill!r}; pass "
-                "--cuda-graph-backend-prefill=disabled."
+    if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.FULL:
+        full_cg_backends = {"fa3", "fa4"}
+        backends = set(attention_backends_of(resolved_view(server_args)))
+        backends.discard(None)
+        if not backends <= full_cg_backends:
+            _cg_cfg.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "--enable-unified-memory: disabling the FULL prefill "
+                "cuda-graph backend. It builds its block table in "
+                "_init_full_cg_prefill_metadata, which only %s implement; the "
+                "resolved attention backends are %s. Decode capture and the "
+                "other prefill backends are unaffected.",
+                sorted(full_cg_backends),
+                sorted(backends),
             )
-        _cg_cfg.prefill.backend = Backend.DISABLED
-        logger.warning(
-            "--enable-unified-memory: disabling prefill cuda-graph "
-            "capture (not wired for the unified pool's loc rebind); "
-            "decode capture is unaffected."
-        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:
@@ -371,7 +406,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap). cutlass_mla stays rejected (never exercised).
+    #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
     #   * Without the unified pool, plain page-major stays Triton-only.

@@ -112,6 +112,7 @@ jobs:
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"

@@ -100,6 +100,54 @@ class TestSamplingBatchInfoLen(CustomTestCase):
         self.assertEqual(len(info), 5)
 
 
+class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
+        info = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_mask_batch_indices)
+        other = _make_info(
+            batch_size=1,
+            return_sampling_masks=[True],
+            sampling_mask_batch_indices=torch.tensor([0]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.return_sampling_masks, [False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
+
+    def test_filter_rebuilds_row_indices(self):
+        info = _make_info(
+            batch_size=4,
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor([1, 3]),
+        )
+
+        info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
+
+        self.assertEqual(info.return_sampling_masks, [True, False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+
+    def test_merge_offsets_rhs_row_indices(self):
+        lhs = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        rhs = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 2]),
+        )
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
+        self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
+
+
 class TestMergeCustomLogitProcessor(CustomTestCase):
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""
@@ -444,18 +492,21 @@ class TestMergeBatch(CustomTestCase):
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,
+            npu_top_k_top_p_eligible=True,
         )
         info2 = _make_info(
             is_all_greedy=False,
             need_top_p_sampling=True,
             need_top_k_sampling=True,
             need_min_p_sampling=True,
+            npu_top_k_top_p_eligible=False,
         )
         info1.merge_batch(info2)
         self.assertFalse(info1.is_all_greedy)  # AND semantics
         self.assertTrue(info1.need_top_p_sampling)  # OR semantics
         self.assertTrue(info1.need_top_k_sampling)  # OR semantics
         self.assertTrue(info1.need_min_p_sampling)  # OR semantics
+        self.assertFalse(info1.npu_top_k_top_p_eligible)  # AND semantics
 
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
@@ -626,6 +677,22 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_top_k_sampling)  # 50 != TOP_K_ALL
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
+
+    def test_npu_top_k_top_p_eligibility_uses_request_params(self):
+        cases = (
+            ((1, 1024), True),
+            ((1, 1025), False),
+            ((4, TOP_K_ALL), False),
+        )
+        for top_ks, expected in cases:
+            with self.subTest(top_ks=top_ks):
+                batch = MagicMock()
+                batch.reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
+                batch.device = DEVICE
+
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+                self.assertEqual(info.npu_top_k_top_p_eligible, expected)
 
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    FalconMambaConfig,
     GraniteMoeHybridConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -15,6 +16,8 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -23,6 +26,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     ZayaConfig,
 )
+from sglang.srt.utils.hf_transformers.common import get_hf_text_config
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -78,7 +82,10 @@ def mamba2_config(model_config: ModelConfig):
         | Lfm2Config
         | Lfm2MoeConfig
         | Lfm2VlConfig
-        | ZayaConfig,
+        | ZayaConfig
+        | Mamba2Config
+        | MambaConfig
+        | FalconMambaConfig,
     ):
         return config
     if isinstance(config, InklingModelConfig):
@@ -107,6 +114,9 @@ def kimi_linear_config(model_config: ModelConfig):
         return config
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
+    text_config = get_hf_text_config(config)
+    if isinstance(text_config, BailingHybridConfig) and text_config.use_kda:
+        return text_config
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):
         return text_config

@@ -89,17 +89,19 @@ export const Qwen38MambaRatioCalculator = () => {
     // reported as out of range rather than silently mis-computed.
     const tp = Number(flagArg("--tp")) || Number(flagArg("--tp-size")) || 1;
 
-    // The NVFP4 checkpoint declares kv_cache_quant_algo: FP8, so the default
-    // --kv-cache-dtype auto lands on fp8_e4m3 there with no flag present; the
-    // BF16 / FP8 checkpoints keep a bf16 KV pool under the same default. An
-    // explicit flag always wins over the checkpoint's declaration.
+    // The two RadixArk NVFP4 exports declare kv_cache_quant_algo: FP8, so the
+    // default --kv-cache-dtype auto lands on fp8_e4m3 there with no flag
+    // present. The BF16 / FP8 checkpoints keep a bf16 KV pool under the same
+    // default, and so does NVIDIA's NVFP4 export — it is the same W4A4 body,
+    // but it ships no kv_cache_scheme, so this cannot key off the `nvfp4`
+    // prefix. An explicit flag always wins over the checkpoint's declaration.
     const kvFlag = flagArg("--kv-cache-dtype");
     const kvDtype =
       kvFlag === "fp8_e4m3"
         ? "fp8_e4m3"
         : kvFlag === "bfloat16" || kvFlag === "bf16"
           ? "bfloat16"
-          : String(quant).startsWith("nvfp4")
+          : quant === "nvfp4-bf16-head" || quant === "nvfp4-fp4-head"
             ? "fp8_e4m3"
             : "bfloat16";
 

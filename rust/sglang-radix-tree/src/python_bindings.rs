@@ -241,6 +241,14 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
         PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
         PoolName::DeepseekV4C128 => "deepseek_v4_c128",
+        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
+        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
+        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
+        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
+        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
+        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
+        PoolName::DeepseekV4C4Rope => "deepseek_v4_c4_rope",
+        PoolName::DeepseekV4C128Rope => "deepseek_v4_c128_rope",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
@@ -261,6 +269,14 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
         "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
         "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
+        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
+        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
+        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
+        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
+        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
+        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
+        "deepseek_v4_c4_rope" => Ok(PoolName::DeepseekV4C4Rope),
+        "deepseek_v4_c128_rope" => Ok(PoolName::DeepseekV4C128Rope),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
@@ -300,6 +316,8 @@ struct InspectionMatchResultInput {
     host_hit_length: usize,
     #[pyo3(attribute)]
     swa_host_hit_length: usize,
+    #[pyo3(attribute)]
+    swa_branching_seqlen: Option<usize>,
     #[pyo3(attribute)]
     mamba_host_hit_length: usize,
     #[pyo3(attribute)]
@@ -512,9 +530,11 @@ pub struct InsertParamsBinding {
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
+    pub swa_branching_seqlen: Option<usize>,
     pub chunked: bool,
     pub priority: i64,
     pub track_adopted_ranges: bool,
@@ -523,15 +543,17 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
+        swa_branching_seqlen: Option<usize>,
         chunked: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
@@ -542,9 +564,11 @@ impl InsertParamsBinding {
             value,
             extra_key,
             cache_salt,
+            session_id,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
+            swa_branching_seqlen,
             chunked,
             priority,
             track_adopted_ranges,
@@ -561,6 +585,7 @@ pub struct MatchResultBinding {
     best_match_node_id: NodeId,
     host_hit_length: usize,
     swa_host_hit_length: usize,
+    swa_branching_seqlen: Option<usize>,
     mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     full_kv_hit_length: usize,
@@ -577,6 +602,7 @@ impl MatchResultBinding {
             best_match_node_id: result.best_match_node_id,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
+            swa_branching_seqlen: result.swa_branching_seqlen,
             mamba_host_hit_length: result.mamba_host_hit_length,
             mamba_branching_seqlen: result.mamba_branching_seqlen,
             full_kv_hit_length: result.full_kv_hit_length,
@@ -594,6 +620,7 @@ pub struct InsertResultBinding {
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
     mamba_exist: bool,
+    swa_branch_inserted: bool,
     adopted_ranges: Option<HashMap<u8, Vec<(usize, usize)>>>,
     cache_actions: Py<PyList>,
 }
@@ -633,6 +660,7 @@ impl InsertResultBinding {
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,
+            swa_branch_inserted: result.swa_branch_inserted,
             adopted_ranges: result.adopted_ranges.map(|ranges| {
                 ranges
                     .into_iter()
@@ -987,6 +1015,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         MatchResultBinding::from_match_result(py, result)
     }
 
+    /// Read-only FULL-device match, independent of auxiliary components.
+    fn match_full_device_prefix(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+    ) -> (usize, NodeId, usize) {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = key.as_ref();
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        py.allow_threads(|| self.core().match_full_device_prefix(key, namespace))
+    }
+
     /// The empty match result anchored at the root.
     fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
         let result = py.allow_threads(|| self.core().empty_match_result());
@@ -1014,10 +1055,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -1049,10 +1092,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -1095,6 +1140,18 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .allow_threads(|| self.core().inc_lock_ref(node_id, skip))
             .map_err(node_access_error)?;
         Ok(IncLockRefResultBinding::from_result(result))
+    }
+
+    /// Pin only the FULL device values on a node's root path.
+    fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().inc_full_pin(node_id))
+            .map_err(node_access_error)
+    }
+
+    /// Release a FULL-only root-path pin.
+    fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().dec_full_pin(node_id))
+            .map_err(node_access_error)
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -1355,6 +1412,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
+    fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().set_host_memory_buffer_only());
+    }
+
+    /// Whether the host tier runs as a storage staging buffer, not a cache.
+    fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_host_memory_buffer_only)
+    }
+
     /// Mark the host tier (HiCache) as wired.
     fn set_hicache_enabled(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().set_hicache_enabled());
@@ -1460,6 +1527,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         host_indices: Option<PyTensor>,
         token_ids: Option<Vec<i64>>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<String>,
     ) -> PyResult<Option<Vec<Py<PyAny>>>> {
         let component_type = parse_component_type(component_type)?;
@@ -1474,6 +1542,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     host_indices,
                     token_ids.as_deref(),
                     prefetch_tokens,
+                    staging_tokens,
                     last_hash.as_deref(),
                 )
             })
@@ -1775,6 +1844,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().enable_storage)
     }
 
+    /// Enable or disable the direct external-cache linker.
+    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        py.allow_threads(|| self.core().set_enable_external_cache_linker(value))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Whether the direct external-cache linker is wired.
+    fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().enable_external_cache_linker)
+    }
+
     /// Queue the all-cleared placement event.
     fn record_all_cleared_event(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().record_all_cleared_event());
@@ -1796,6 +1876,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1805,6 +1886,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         block_size,
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
+                        session_id.map(|session_id| session_id.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;
@@ -1870,6 +1952,64 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
         py.allow_threads(|| self.core().finish_load_back(anchor_node_id))
             .map_err(node_access_error)
+    }
+
+    /// Build transfers for a node with no stored or pending external copy.
+    fn build_external_linker_offload_transfers(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        let transfers = py
+            .allow_threads(|| self.core().build_external_linker_offload_transfers(node_id))
+            .map_err(node_access_error)?;
+        transfers
+            .map(|transfers| {
+                transfers
+                    .into_iter()
+                    .map(|transfer| transfer_to_py(py, transfer))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()
+    }
+
+    /// Mark an externally restored path, excluding its existing anchor.
+    fn mark_external_cache_stored_path(
+        &self,
+        py: Python<'_>,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .mark_external_cache_stored_path(from_node_id, until_node_id)
+        })
+        .map_err(tree_core_runtime_error)
+    }
+
+    /// Publish an accepted external offload as pending.
+    fn mark_external_linker_offload_pending(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| self.core().mark_external_linker_offload_pending(node_id))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Finalize external-store state for an offload and its split fragments.
+    fn finish_external_linker_offload(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+        success: bool,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .finish_external_linker_offload(&node_ids, ack_id, success)
+        })
+        .map_err(tree_core_assertion_error)
     }
 
     /// Order-sensitive digest of reclaimed coexisting host values.
@@ -1965,6 +2105,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
     ) -> PyResult<Option<usize>> {
         py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+            .map_err(node_access_error)
+    }
+
+    fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().inspect_is_external_cache_stored(node_id))
             .map_err(node_access_error)
     }
 
@@ -2226,6 +2371,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node: best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2237,6 +2383,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2319,6 +2466,15 @@ macro_rules! tree_core_binding {
                 self.inner.match_prefix(py, params)
             }
 
+            /// Read-only FULL-device match, independent of auxiliary components.
+            fn match_full_device_prefix(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+            ) -> (usize, NodeId, usize) {
+                self.inner.match_full_device_prefix(py, params)
+            }
+
             /// The empty match result anchored at the root.
             fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
                 self.inner.empty_match_result(py)
@@ -2366,6 +2522,16 @@ macro_rules! tree_core_binding {
                 skip_lock_components: Vec<u8>,
             ) -> PyResult<IncLockRefResultBinding> {
                 self.inner.inc_lock_ref(py, node_id, skip_lock_components)
+            }
+
+            /// Pin only the FULL device values on a node's root path.
+            fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                self.inner.inc_full_pin(py, node_id)
+            }
+
+            /// Release a FULL-only root-path pin.
+            fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                self.inner.dec_full_pin(py, node_id)
             }
 
             /// Decrease the reference count on a node's component locks. The
@@ -2539,6 +2705,16 @@ macro_rules! tree_core_binding {
                 self.inner.is_full_device_evicted(py, node_id)
             }
 
+            /// Mark the host tier as buffer-only; wired after the host pools are built.
+            fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+                self.inner.set_host_memory_buffer_only(py)
+            }
+
+            /// Whether the host tier runs as a storage staging buffer, not a cache.
+            fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+                self.inner.is_host_memory_buffer_only(py)
+            }
+
             /// Mark the host tier (HiCache) as wired.
             fn set_hicache_enabled(&self, py: Python<'_>) {
                 self.inner.set_hicache_enabled(py)
@@ -2604,7 +2780,7 @@ macro_rules! tree_core_binding {
 
             /// Route a build_hicache_transfers call to the component for the given type.
             #[allow(clippy::too_many_arguments)]
-            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, last_hash = None))]
+            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, staging_tokens = 0, last_hash = None))]
             fn build_hicache_transfers(
                 &self,
                 py: Python<'_>,
@@ -2614,6 +2790,7 @@ macro_rules! tree_core_binding {
                 host_indices: Option<PyTensor>,
                 token_ids: Option<Vec<i64>>,
                 prefetch_tokens: usize,
+                staging_tokens: usize,
                 last_hash: Option<String>,
             ) -> PyResult<Option<Vec<Py<PyAny>>>> {
                 self.inner.build_hicache_transfers(
@@ -2624,6 +2801,7 @@ macro_rules! tree_core_binding {
                     host_indices,
                     token_ids,
                     prefetch_tokens,
+                    staging_tokens,
                     last_hash,
                 )
             }
@@ -2839,6 +3017,20 @@ macro_rules! tree_core_binding {
                 self.inner.enable_storage(py)
             }
 
+            /// Enable or disable the direct external-cache linker.
+            fn set_enable_external_cache_linker(
+                &self,
+                py: Python<'_>,
+                value: bool,
+            ) -> PyResult<()> {
+                self.inner.set_enable_external_cache_linker(py, value)
+            }
+
+            /// Whether the direct external-cache linker is wired.
+            fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+                self.inner.enable_external_cache_linker(py)
+            }
+
             /// Queue the all-cleared placement event.
             fn record_all_cleared_event(&self, py: Python<'_>) {
                 self.inner.record_all_cleared_event(py)
@@ -2882,6 +3074,53 @@ macro_rules! tree_core_binding {
             /// Clear the in-flight H->D marks on the anchor's root path at ack time.
             fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
                 self.inner.finish_load_back(py, anchor_node_id)
+            }
+
+            /// Build transfers for a node with no stored or pending external copy.
+            fn build_external_linker_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+                self.inner
+                    .build_external_linker_offload_transfers(py, node_id)
+            }
+
+            /// Mark an externally restored path, excluding its existing anchor.
+            fn mark_external_cache_stored_path(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<()> {
+                self.inner.mark_external_cache_stored_path(
+                    py,
+                    from_node_id,
+                    until_node_id,
+                )
+            }
+
+            /// Publish an accepted external offload as pending.
+            fn mark_external_linker_offload_pending(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<()> {
+                self.inner
+                    .mark_external_linker_offload_pending(py, node_id)
+            }
+
+            /// Finalize external-store state for an offload and its split fragments.
+            fn finish_external_linker_offload(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+                success: bool,
+            ) -> PyResult<()> {
+                self.inner.finish_external_linker_offload(
+                    py, node_ids, ack_id, success,
+                )
             }
 
             /// Order-sensitive digest of reclaimed coexisting host values.
@@ -2992,6 +3231,15 @@ macro_rules! tree_core_binding {
             ) -> PyResult<Option<usize>> {
                 self.inner
                     .inspect_get_write_through_pending_id(py, node_id)
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_is_external_cache_stored(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                self.inner.inspect_is_external_cache_stored(py, node_id)
             }
 
             #[cfg(feature = "inspection")]
