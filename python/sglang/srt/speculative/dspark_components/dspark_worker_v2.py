@@ -83,6 +83,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 logger = logging.getLogger(__name__)
 
@@ -411,14 +412,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        if _is_npu and self._draft_is_moe:
+        if is_npu_arch35() and self._draft_is_moe:
             from sglang.srt.hardware_backend.npu.extra_ops_loader import (
                 initialize_dspark_a5_sparse_attn_ops,
             )
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-            if is_npu_arch35():
-                initialize_dspark_a5_sparse_attn_ops()
+            initialize_dspark_a5_sparse_attn_ops()
 
         with self._draft_context():
             self._draft_worker.init_attention_backends()

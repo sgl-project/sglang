@@ -459,14 +459,6 @@ class TpModelWorker(BaseTpWorker):
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
-        from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-            initialize_dspark_a5_sparse_attn_ops,
-        )
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            initialize_dspark_a5_sparse_attn_ops()
-
         self.model_runner.init_attention_backends()
         for mr in self.model_runner_list[1:]:
             mr.init_attention_backends()

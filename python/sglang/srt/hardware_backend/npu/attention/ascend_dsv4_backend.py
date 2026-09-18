@@ -38,13 +38,18 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
     A5 reads a quantized KV cache, which is a different kernel rather than a
     flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            return (
+                torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_v2_metadata,
+                torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_v2,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
@@ -1000,7 +1005,6 @@ class DeepseekV4AscendAttnBackend(
         [T, N_kv, K], where K must be 128-aligned.
         """
         fm = self.forward_metadata
-        fm.ori_sparse_indices = None
         fm.ori_win_left = self._dsv4_sliding_window_size - 1
         fm.ori_win_right = 0
 
@@ -1961,7 +1965,6 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         fm = self.forward_metadata
-        metadata_op, _ = _sparse_attn_ops()
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -1985,7 +1988,7 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -1999,7 +2002,7 @@ class DeepseekV4AscendAttnBackend(
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
                 "seqused_kv": actual_seq_lengths_kv,
             }
-            metadata_op, _ = _sparse_attn_ops()
+            metadata_op, _ = _sparse_attn_ops(self._is_dspark_draft_worker)
         c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
@@ -2074,127 +2077,6 @@ class DeepseekV4AscendAttnBackend(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
-    @staticmethod
-    def _unpack_a5_packed_kv(pages_u8, kv_len):
-        """Unpack A5 FP8 packed KV pages to bf16 (kv_len, 512).
-
-        A5 kernel expected layout per token (640 bytes):
-        [0:128]   BF16 rope key (64 dims x 2 bytes)
-        [128:576] FP8 e4m3fn nope key (448 dims)
-        [576:590] BF16 scales (7 scales x 2 bytes, one per 64 dims)
-        [590:640] padding
-        """
-        NOPE = DeepseekV4AscendAttnBackend._A5_NOPE_DIM
-        ROPE = DeepseekV4AscendAttnBackend._A5_ROPE_DIM
-        NS = DeepseekV4AscendAttnBackend._A5_NUM_SCALES
-        GS = DeepseekV4AscendAttnBackend._A5_GROUP_SIZE
-
-        raw = pages_u8.reshape(-1, 1, pages_u8.shape[-1])[:kv_len].contiguous()
-        rope_bf16 = raw[..., : ROPE * 2].view(torch.bfloat16)
-        fp8_nope = raw[..., ROPE * 2 : ROPE * 2 + NOPE].view(
-            torch.float8_e4m3fn
-        ).to(torch.float32)
-        scales_bf16 = raw[..., ROPE * 2 + NOPE : ROPE * 2 + NOPE + NS * 2].view(
-            torch.bfloat16
-        ).to(torch.float32)
-        scales_exp = scales_bf16.repeat_interleave(GS, dim=-1)
-        nope_bf16 = (fp8_nope * scales_exp).to(torch.bfloat16)
-        kv = torch.cat([nope_bf16, rope_bf16], dim=-1).squeeze(1)
-        return kv
-
-    @staticmethod
-    def _gather_paged_kv(kv_buffer, block_table_row, kv_len, D):
-        """Gather KV from PA_ND paged buffer: (num_pages, page_size, 1, dim).
-
-        If A5 FP8 packed (float8_e4m3fn), view as uint8 for NPU index
-        compatibility, then unpack to bf16 (kv_len, 512).
-        """
-        page_size = kv_buffer.shape[1]
-        num_pages = (kv_len + page_size - 1) // page_size
-        page_ids = block_table_row[:num_pages].to(torch.int64).reshape(-1)
-
-        if kv_buffer.dtype == torch.float8_e4m3fn:
-            buf_u8 = kv_buffer.view(torch.uint8)
-            pages_u8 = buf_u8[page_ids]
-            return DeepseekV4AscendAttnBackend._unpack_a5_packed_kv(pages_u8, kv_len)
-
-        pages = kv_buffer[page_ids]
-        return pages.reshape(-1, D)[:kv_len]
-
-    def _forward_swa_native(
-        self,
-        q: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        attn_sink: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Pure PyTorch SWA attention — no NPU sparse kernel."""
-        fm = self.forward_metadata
-        pool = self.token_to_kv_pool
-        ori_kv = pool.get_swa_buffer(layer.layer_id)
-        cu_seqlens = fm.actual_seq_lengths_q_pa
-        kv_lens = fm.actual_seq_lengths_kv
-        block_table = fm.swa_page_table
-        swa_window = self._dsv4_sliding_window_size
-        T, H, D = q.shape
-        B = cu_seqlens.shape[0] - 1
-        scale = layer.scaling
-        # Pre-allocate (T, H, D) result; padding region stays zero
-        result = q.new_zeros(T, H, D)
-        for i in range(B):
-            q_start = int(cu_seqlens[i])
-            q_end = int(cu_seqlens[i + 1])
-            q_len_i = q_end - q_start
-            kv_len_i = int(kv_lens[i])
-            if q_len_i == 0:
-                continue
-            if kv_len_i == 0:
-                continue
-            kv_seq = self._gather_paged_kv(ori_kv, block_table[i], kv_len_i, D)
-            q_i = q[q_start:q_end]
-            scores = torch.matmul(
-                q_i.transpose(0, 1), kv_seq.transpose(0, 1)
-            ) * scale
-            q_pos = torch.arange(q_len_i, device=q.device)
-            k_pos = torch.arange(kv_len_i, device=q.device)
-            q_global = q_pos + (kv_len_i - q_len_i)
-            causal = k_pos[None, :] <= q_global[:, None]
-            swa_m = k_pos[None, :] >= (q_global[:, None] - swa_window + 1)
-            mask = causal & swa_m
-            if attn_sink is not None:
-                n_heads_eff = min(H, attn_sink.shape[0])
-                sink_bias = (
-                    attn_sink[:n_heads_eff]
-                    .float()
-                    .view(n_heads_eff, 1, 1)
-                    .expand(n_heads_eff, q_len_i, 1)
-                )
-                if n_heads_eff < H:
-                    pad = torch.zeros(
-                        H - n_heads_eff, q_len_i, 1, device=q.device
-                    )
-                    sink_bias = torch.cat([sink_bias, pad], dim=0)
-                scores = torch.cat([sink_bias, scores.float()], dim=-1)
-                sink_mask = torch.ones(
-                    q_len_i, 1, dtype=torch.bool, device=q.device
-                )
-                mask = torch.cat([sink_mask, mask], dim=-1)
-            else:
-                scores = scores.float()
-            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-            attn = torch.softmax(scores, dim=-1).to(q.dtype)
-            del scores
-            if attn_sink is not None:
-                attn_kv = attn[..., 1:]
-            else:
-                attn_kv = attn
-            out_i = torch.matmul(
-                attn_kv, kv_seq.unsqueeze(0)
-            ).squeeze(0)
-            del attn_kv, kv_seq
-            result[q_start:q_end] = out_i.transpose(0, 1)
-        return result
-
     def _forward_swa(
         self,
         q: torch.Tensor,
@@ -2202,10 +2084,6 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self._is_dspark_draft_worker:
-            return self._forward_swa_native(
-                q, layer, forward_batch, attn_sink
-            )
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
@@ -2229,13 +2107,13 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        _, attn_op = _sparse_attn_ops()
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
