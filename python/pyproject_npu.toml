@@ -67,7 +67,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.2",
+  "xgrammar==0.2.7",
 ]
 
 [project.optional-dependencies]

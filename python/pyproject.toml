@@ -96,7 +96,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.2.2",
+  "xgrammar==0.2.7",
   "xxhash",
   "zstandard",
 ]
