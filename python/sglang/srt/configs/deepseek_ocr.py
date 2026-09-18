@@ -294,6 +294,24 @@ class DeepseekOCRProcessor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        config, _ = PretrainedConfig.get_config_dict(
+            pretrained_model_name_or_path, **kwargs
+        )
+        if config.get("mtp_num_heads", 0):
+            # Jina OCR uses the same encoder, but ships a different processor
+            # schema: its reference processor omits BOS and uses up to 9 tiles.
+            for key, value in dict(
+                candidate_resolutions=config["candidate_resolutions"],
+                patch_size=16,
+                downsample_ratio=4,
+                max_crops=9,
+                add_bos_token=False,
+            ).items():
+                kwargs.setdefault(key, value)
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
     def __init__(
         self,
         tokenizer: LlamaTokenizerFast,
@@ -310,6 +328,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
         mask_prompt: bool = True,
         ignore_id: int = -100,
         ocr2_mode: bool = False,
+        max_crops: int = MAX_CROPS,
+        add_bos_token: bool = True,
         **kwargs,
     ):
 
@@ -360,6 +380,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
         self.ocr2_mode = ocr2_mode
+        self.max_crops = max_crops
+        self.add_bos_token = add_bos_token
 
         super().__init__(
             tokenizer,
@@ -387,7 +409,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ) = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
-            bos=True,
+            bos=self.add_bos_token,
             eos=True,
             cropping=len(pil_images) <= 2,
         )
@@ -579,7 +601,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=self.image_size
+                        image, image_size=self.image_size, max_num=self.max_crops
                     )
                 else:
                     crop_ratio = [1, 1]

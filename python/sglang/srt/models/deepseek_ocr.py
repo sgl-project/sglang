@@ -1801,6 +1801,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            # Jina OCR checkpoints also contain a separate FastMTP draft head.
+            # The autoregressive target only loads the DeepSeek-OCR backbone.
+            if name.startswith(("mtp_module.", "mtp_embed_tokens.")):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             is_qwen2_weight = "qwen2_model." in name
