@@ -147,7 +147,6 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     timeout = 6000
     seed = 1
 
-
     @classmethod
     def setUpClass(cls):
         """Launch server via `python3 -m sglang.launch_server` instead of `sglang serve`."""
