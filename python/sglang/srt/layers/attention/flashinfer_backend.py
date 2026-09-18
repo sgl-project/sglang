@@ -698,6 +698,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._reset_dequant_workspace_metadata()
+        self._reject_dequant_workspace_speculative_forward(forward_batch.forward_mode)
+
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -865,9 +868,7 @@ class FlashInferAttnBackend(AttentionBackend):
         lengths, and CPU request ids needed to populate that workspace before
         the prefill kernel runs.
         """
-        self.dq_page_table = None
-        self.dq_paged_kernel_lens = None
-        self.cpu_req_pool_indices = None
+        self._reset_dequant_workspace_metadata()
         if not (
             self.prefill_uses_dequant_workspace
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -930,12 +931,33 @@ class FlashInferAttnBackend(AttentionBackend):
             "cpu", non_blocking=True
         )
 
+    def _reset_dequant_workspace_metadata(self) -> None:
+        self.dq_page_table = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+
+    def _reject_dequant_workspace_speculative_forward(
+        self, forward_mode: ForwardMode
+    ) -> None:
+        if self.prefill_uses_dequant_workspace and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            raise RuntimeError(
+                "FlashInfer's NVFP4 dequant workspace cannot run speculative "
+                "verify or draft-extend. Use --prefill-attention-backend "
+                "flashinfer --decode-attention-backend trtllm_mha; NVFP4 "
+                "speculative attention is then routed through native FP4 decode."
+            )
+
     def _kv_write_scales(self, layer: RadixAttention):
         if self.kv_cache_quant_method.needs_global_scale():
             return None, None
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._reset_dequant_workspace_metadata()
+        self._reject_dequant_workspace_speculative_forward(forward_batch.forward_mode)
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
