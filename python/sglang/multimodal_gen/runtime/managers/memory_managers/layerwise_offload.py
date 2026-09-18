@@ -1,6 +1,7 @@
 import bisect
 import ctypes
 import ctypes.util
+import math
 import mmap
 import os
 import queue
@@ -8,7 +9,8 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+import weakref
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
 from typing import (
@@ -39,6 +41,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
+    page_cache_cannot_hold,
     pin_benefit_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -395,6 +398,92 @@ _DIRECT_CHUNK = 64 << 20
 MAPPED_DIRECT_READ_MIN_BYTES = 8 * 1024**3
 
 
+def _pin_in_place(tensor: torch.Tensor) -> bool:
+    """Page-lock an allocated CPU tensor in place, at exactly its size.
+
+    torch's pinned pool rounds each block up to a power of two (a 1.20 GiB
+    layer store costs 2 GiB), which the pin budget never charged for.
+    """
+    if not torch.cuda.is_available():
+        return False
+    storage = tensor.untyped_storage()
+    nbytes = storage.nbytes()
+    if nbytes == 0:
+        return False
+    try:
+        cudart = torch.cuda.cudart()
+        if int(cudart.cudaHostRegister(storage.data_ptr(), nbytes, 0)) != 0:
+            return False
+    except Exception:
+        return False
+    weakref.finalize(storage, _unpin_in_place, storage.data_ptr())
+    return True
+
+
+def _unpin_in_place(data_ptr: int) -> None:
+    try:
+        torch.cuda.cudart().cudaHostUnregister(data_ptr)
+    except Exception:
+        pass
+
+
+def _shared_storage(nbytes: int) -> Optional[torch.UntypedStorage]:
+    """Anonymous shared memory (memfd) of exactly `nbytes`, or None off Linux.
+
+    Shared rather than private anonymous memory so the locked pages stay on
+    the shmem side of the process's accounting, where cudaHostAlloc kept
+    them: the host-anon figures (and the forced-host-view budget that
+    subtracts them) keep meaning "pageable copies".
+    """
+    if not hasattr(os, "memfd_create"):
+        return None
+    try:
+        fd = os.memfd_create("sglang-pinned-store", 0)
+    except OSError:
+        return None
+    try:
+        os.ftruncate(fd, nbytes)
+        return torch.UntypedStorage.from_file(
+            f"/proc/self/fd/{fd}", shared=True, nbytes=nbytes
+        )
+    except Exception:
+        return None
+    finally:
+        os.close(fd)
+
+
+# Below this, torch's own pinned pool: its power-of-two rounding costs little on
+# small blocks, and two small blocks can share a page, which cudaHostRegister
+# refuses to lock twice.
+_REGISTER_MIN_BYTES = 64 << 20
+
+
+def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
+    """A pinned CPU tensor of exactly this size; torch's pinned pool as fallback."""
+    shape = size[0] if stride is not None else size
+    if stride is None:
+        storage_numel = math.prod(shape)
+    else:
+        storage_numel = 1 + sum((d - 1) * st for d, st in zip(shape, stride) if d > 0)
+        storage_numel = storage_numel if math.prod(shape) else 0
+    nbytes = storage_numel * dtype.itemsize
+    if nbytes >= _REGISTER_MIN_BYTES:
+        storage = _shared_storage(nbytes)
+        tensor = torch.empty(0, dtype=dtype)
+        if storage is not None:
+            tensor.set_(storage, 0, shape, stride or tensor.stride())
+        elif stride is None:
+            tensor = torch.empty(*size, dtype=dtype)
+        else:
+            tensor = torch.empty_strided(size=shape, stride=stride, dtype=dtype)
+        if _pin_in_place(tensor):
+            return tensor
+        del tensor, storage
+    if stride is None:
+        return torch.empty(*size, dtype=dtype, pin_memory=True)
+    return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
+
+
 class _DirectReader:
     """Read a mapped tensor's bytes from its checkpoint file with O_DIRECT.
 
@@ -477,6 +566,36 @@ class _DirectReader:
             except OSError:
                 pass
         self._fds.clear()
+
+
+_LSB = bytes(b & 1 for b in range(256))
+
+
+def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float:
+    """Share of a mapping's pages the page cache holds, sampled in 4 MiB windows.
+
+    -1.0 when it cannot be asked (no libc, mincore failed).
+    """
+    if _libc is None or nbytes <= 0:
+        return -1.0
+    page = mmap.PAGESIZE
+    window = 4 << 20
+    start = data_ptr & ~(page - 1)
+    total = data_ptr + nbytes - start
+    # mincore wants a page-aligned address: step in whole pages
+    step = max(total // samples, window) & ~(page - 1)
+    resident = checked = 0
+    offset = 0
+    while offset < total:
+        length = min(window, total - offset)
+        pages = (length + page - 1) // page
+        vec = (ctypes.c_ubyte * pages)()
+        if _libc.mincore(ctypes.c_void_p(start + offset), ctypes.c_size_t(length), vec):
+            return -1.0
+        resident += bytes(vec).translate(_LSB).count(1)
+        checked += pages
+        offset += step
+    return resident / checked if checked else -1.0
 
 
 def _aligned_span(file_offset: int, nbytes: int) -> tuple[int, int]:
@@ -592,11 +711,15 @@ class MappedLayerCourier:
         await_populated: Optional[Callable[[int], bool]] = None,
         direct_copy: bool = False,
         direct_read: bool = False,
+        direct_read_always: bool = False,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
         # Read each layer's bytes from the checkpoint file with O_DIRECT into the
         # pinned slot instead of copying them out of the page cache.
         self.direct_read = bool(direct_read) and hasattr(os, "O_DIRECT")
+        # On a shared pool every read goes to the drive anyway; elsewhere a
+        # layer the page cache already holds is a memcpy, not a re-read.
+        self._direct_read_always = bool(direct_read_always)
         self._reader: Optional[_DirectReader] = (
             _DirectReader() if self.direct_read else None
         )
@@ -615,6 +738,9 @@ class MappedLayerCourier:
             "h2d_issue_s": 0.0,
             "direct_read_s": 0.0,
             "direct_read_bytes": 0,
+            "cached_layers": 0,
+            "probes": 0,
+            "probe_fraction_sum": 0.0,
         }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
@@ -646,7 +772,11 @@ class MappedLayerCourier:
             []
             if direct_copy
             else [
-                torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin_slots)
+                (
+                    _pinned_empty(slot_bytes, dtype=torch.uint8)
+                    if pin_slots
+                    else torch.empty(slot_bytes, dtype=torch.uint8)
+                )
                 for _ in range(self._NUM_SLOTS)
             ]
         )
@@ -772,6 +902,16 @@ class MappedLayerCourier:
                     located = (
                         self._reader.locate(cpu_tensor) if self.direct_read else None
                     )
+                    if located is not None and not self._direct_read_always:
+                        # a layer the cache holds -- or one we cannot ask about --
+                        # keeps the memcpy path; only pages known to be cold go
+                        # to the drive
+                        fraction = _resident_fraction(cpu_tensor.data_ptr(), nbytes)
+                        stats["probes"] += 1
+                        stats["probe_fraction_sum"] += max(fraction, 0.0)
+                        if fraction < 0 or fraction >= 0.5:
+                            located = None
+                            stats["cached_layers"] += 1
                     if located is not None:
                         path, file_offset, _ = located
                         aligned_start, span = _aligned_span(file_offset, nbytes)
@@ -1073,24 +1213,40 @@ class LayerwiseOffloadManager:
     def _layer_byte_totals(
         self, layer_groups: Dict
     ) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Per layer: (all weight bytes, the subset that are checkpoint views)."""
+        """Per layer: (host allocation bytes, checkpoint-view bytes)."""
         totals: Dict[int, int] = {}
         mapped: Dict[int, int] = {}
         for layer_idx, dtype_to_params in layer_groups.items():
             total = 0
             from_mapping = 0
-            for weights in dtype_to_params.values():
+            for dtype, weights in dtype_to_params.items():
+                offset = 0
                 for _, weight in weights:
                     tensor = self._to_local_tensor(weight)
-                    nbytes = tensor.untyped_storage().nbytes()
-                    total += nbytes
+                    if tensor.is_contiguous():
+                        offset = (
+                            self._align_numel_offset(offset, dtype) + tensor.numel()
+                        )
+                    else:
+                        # match empty_strided's allocation, including view holes
+                        total += (
+                            torch.empty_strided(
+                                tensor.shape,
+                                tensor.stride(),
+                                dtype=dtype,
+                                device="meta",
+                            )
+                            .untyped_storage()
+                            .nbytes()
+                        )
                     if self._mapped_regions.holds(tensor):
-                        from_mapping += nbytes
+                        from_mapping += tensor.untyped_storage().nbytes()
+                total += offset * dtype.itemsize
             totals[layer_idx] = total
             mapped[layer_idx] = from_mapping
         return totals, mapped
 
-    def _plan_layer_hosting(self, layer_groups: Dict) -> Dict[int, str]:
+    def _plan_layer_hosting(self, layer_groups: Dict) -> Tuple[Dict[int, str], int]:
         """Where each layer's weights live on the host: pinned, pageable or mapped.
 
         Pinning is what lets the copy stream run ahead of compute; a pageable
@@ -1128,7 +1284,7 @@ class LayerwiseOffloadManager:
                 len(totals),
                 sum(1 for where in hosting.values() if where == "pageable"),
             )
-            return hosting
+            return hosting, 0
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         pin_order: List[int] = []
@@ -1203,7 +1359,7 @@ class LayerwiseOffloadManager:
                 counts["mapped"],
                 sum(totals.values()) / 1024**3,
             )
-        return hosting
+        return hosting, pinned_bytes
 
     def _initialize_layer_weights(self) -> None:
         self._named_parameters = dict(self.model.named_parameters())
@@ -1224,8 +1380,19 @@ class LayerwiseOffloadManager:
                 local_tensor.dtype, []
             ).append((name, tensor))
 
-        layer_hosting = self._plan_layer_hosting(layer_groups)
+        layer_hosting, untracked_bytes = self._plan_layer_hosting(layer_groups)
+        try:
+            for storage in self._initialize_host_stores(layer_groups, layer_hosting):
+                self._pin_budget.track_storage(storage)
+                untracked_bytes -= storage.nbytes()
+        finally:
+            # failed allocations have no storage finalizer to return their allowance
+            self._pin_budget.release(untracked_bytes)
 
+    def _initialize_host_stores(
+        self, layer_groups: Dict, layer_hosting: Dict[int, str]
+    ) -> Iterator[torch.UntypedStorage]:
+        """Yield each pinned allocation before copying weights to transfer its lease."""
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
@@ -1277,12 +1444,20 @@ class LayerwiseOffloadManager:
 
                     # Preserve non-contiguous layouts such as the transposed FP8
                     # weight views expected by CUTLASS kernels.
-                    cpu_tensor = torch.empty_strided(
-                        size=local_weight.shape,
-                        stride=local_weight.stride(),
-                        dtype=dtype,
-                        pin_memory=pin_this_layer,
-                    )
+                    if pin_this_layer:
+                        cpu_tensor = _pinned_empty(
+                            local_weight.shape,
+                            dtype=dtype,
+                            stride=local_weight.stride(),
+                        )
+                    else:
+                        cpu_tensor = torch.empty_strided(
+                            size=local_weight.shape,
+                            stride=local_weight.stride(),
+                            dtype=dtype,
+                        )
+                    if pin_this_layer:
+                        yield cpu_tensor.untyped_storage()
                     cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
@@ -1312,9 +1487,12 @@ class LayerwiseOffloadManager:
                 total_numel = current_offset
 
                 # create concatenated CPU buffer (in pinned memory)
-                cpu_buffer = torch.empty(
-                    total_numel, dtype=dtype, pin_memory=pin_this_layer
-                )
+                if pin_this_layer:
+                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
+                else:
+                    cpu_buffer = torch.empty(total_numel, dtype=dtype)
+                if pin_this_layer:
+                    yield cpu_buffer.untyped_storage()
 
                 # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
@@ -1539,6 +1717,40 @@ class LayerwiseOffloadManager:
                 continue
             populator.submit(ahead, self._mapped_cpu_weights.get(ahead, {}).values())
 
+    def _log_direct_read_summary(self) -> None:
+        """One line per pass that went to the drive: how much, and what the probe saw."""
+        courier = self._mapped_courier
+        if courier is None:
+            return
+        stats = courier.stats
+        seen = getattr(
+            self,
+            "_direct_read_seen",
+            {"bytes": 0, "cached": 0, "probes": 0, "fraction_sum": 0.0},
+        )
+        direct_bytes = stats["direct_read_bytes"] - seen["bytes"]
+        cached = stats["cached_layers"] - seen["cached"]
+        probes = stats["probes"] - seen["probes"]
+        fraction_sum = stats["probe_fraction_sum"] - seen["fraction_sum"]
+        self._direct_read_seen = {
+            "bytes": stats["direct_read_bytes"],
+            "cached": stats["cached_layers"],
+            "probes": stats["probes"],
+            "fraction_sum": stats["probe_fraction_sum"],
+        }
+        if direct_bytes <= 0:
+            return
+        logger.info(
+            "Layerwise offload: %s read %.1f GiB straight from the drive this pass "
+            "(%d tensors served from the page cache; mean sampled residency %.2f "
+            "over %d probes).",
+            self.layers_attr_str,
+            direct_bytes / 1024**3,
+            cached,
+            fraction_sum / probes if probes else -1.0,
+            probes,
+        )
+
     def _log_debug_timing(self) -> None:
         """Debug: where this stage's layer traffic spent its time."""
         if not envs.SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING:
@@ -1659,13 +1871,16 @@ class LayerwiseOffloadManager:
         # this layer's transfer with the previous layer's compute. Blocking
         # callers keep the direct path: they need the weights now.
         ship_mapped = False
-        if non_blocking and self._mapped_cpu_weights.get(layer_idx):
+        if self._mapped_cpu_weights.get(layer_idx) and (
+            non_blocking or self._blocking_load_via_courier()
+        ):
             courier = self._ensure_mapped_courier()
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
                 if (
-                    not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
+                    non_blocking
+                    and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
                     and not courier.direct_read
                 ):
                     # Schedule the disk read for this layer's pages now, in
@@ -1754,12 +1969,29 @@ class LayerwiseOffloadManager:
 
         if not ship_mapped:
             self._gpu_layers.add(layer_idx)
+        elif not non_blocking:
+            self._collect_mapped_layer(layer_idx)
+
+    def _blocking_load_via_courier(self) -> bool:
+        """Whether a blocking load should still go through the courier.
+
+        A caller that needs the layer now (arming a resident set, the
+        materialization of a permanent placement) otherwise faults the
+        mapping in on this thread; when the courier reads directly, cold
+        pages arrive at the drive's rate instead (measured 4.7 s vs 12 s for
+        the same 47 GiB on one NVMe).
+        """
+        courier = self._ensure_mapped_courier()
+        return courier is not None and courier.direct_read
 
     def _ensure_mapped_courier(self) -> Optional[MappedLayerCourier]:
         """The courier, built on first use; None where it cannot help."""
         if self._mapped_courier is not None:
             return self._mapped_courier
         if envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
+            return None
+        if getattr(self, "_courier_retired", False):
+            # a courier that failed stays retired: its layers keep the synchronous copy
             return None
         if self.copy_stream is None or self._synchronous_mps:
             return None
@@ -1776,11 +2008,25 @@ class LayerwiseOffloadManager:
                 # page) and the process's anonymous memory grew past 100 GiB;
                 # the pinned slots stay even on a shared pool.
                 direct_copy=False,
+                # A host that cannot cache the mapping re-reads it from the
+                # drive every pass anyway, through 4 KiB faults at the mercy
+                # of readahead; O_DIRECT into the slots reads at the drive's
+                # sequential rate (9.4 vs ~1.1 GiB/s on a GB10 NVMe).
                 direct_read=(
-                    host_copies_are_redundant()
+                    (
+                        host_copies_are_redundant()
+                        or page_cache_cannot_hold(self._mapped_bytes)
+                    )
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
-                    and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                    # the size floor guards components re-streamed many times
+                    # per request; one armed once (every layer resident) has
+                    # no such pass to protect
+                    and (
+                        self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                        or not self._streamed_order
+                    )
                 ),
+                direct_read_always=host_copies_are_redundant(),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,
@@ -1799,6 +2045,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
@@ -1818,6 +2065,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
@@ -1877,6 +2125,7 @@ class LayerwiseOffloadManager:
     def release_all(self) -> None:
         """Release every layer, including the resident ones: this ends the
         denoise stage that the resident set is scoped to."""
+        self._log_direct_read_summary()
         self._log_debug_timing()
         if self._mapped_populator is not None:
             self._mapped_populator.reset()
@@ -1942,13 +2191,11 @@ class LayerwiseOffloadManager:
                 "cannot release host stores with mapped copies in flight"
             )
 
-        self._pin_budget.release(self.pinned_host_weight_bytes())
         self._consolidated_cpu_weights.clear()
         self._strided_cpu_weights.clear()
         self._mapped_cpu_weights.clear()
         self._mps_cpu_weights.clear()
         self._weight_metadata.clear()
-        self._layer_hosting.clear()
         self._prefetch_events.clear()
         self._mapped_bytes = 0
         self._configured = False
@@ -2730,6 +2977,8 @@ def configure_layerwise_offload_modules(
     server_args: ServerArgs,
     component_names: Sequence[str] | None = None,
     warn_missing: bool = True,
+    *,
+    pin_budget: HostPinBudget | None = None,
 ) -> list[str]:
     """Configure layerwise offload for the given modules, from the given component_names
 
@@ -2907,7 +3156,8 @@ def configure_layerwise_offload_modules(
         key=_h2d_bytes_a_pin_would_save,
         reverse=True,
     )
-    pin_budget = HostPinBudget()
+    if pin_budget is None:
+        pin_budget = HostPinBudget()
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:

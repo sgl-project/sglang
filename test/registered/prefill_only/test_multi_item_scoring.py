@@ -21,6 +21,7 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.server_args import _declared_default
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -56,9 +57,8 @@ class TestMISServerArgsValidation(unittest.TestCase):
 
     def test_enable_mis_default(self):
         """Test that enable_mis defaults to False."""
-        from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(ServerArgs.enable_mis, False)
+        self.assertEqual(_declared_default("enable_mis"), False)
 
 
 class TestMultiItemScoringOptimization(CustomTestCase):
