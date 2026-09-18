@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    _infer_dsa_dims,
     dequantize_k_cache,
     dequantize_k_cache_paged,
 )
@@ -16,6 +17,21 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+class TestDSADimInference(unittest.TestCase):
+    def test_all_quantized_layouts_round_trip(self):
+        resolved_widths = {}
+        for dim_nope in range(128, 1025, 128):
+            for dim_rope in (0, 64):
+                packed_width = dim_nope + dim_nope // 128 * 4 + dim_rope * 2
+                self.assertNotIn(packed_width, resolved_widths)
+                resolved_widths[packed_width] = (dim_nope, dim_rope)
+                self.assertEqual(_infer_dsa_dims(packed_width), (dim_nope, dim_rope))
+
+    def test_invalid_packed_width_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported packed DSA KV row width"):
+            _infer_dsa_dims(265)
 
 
 def _torch_sparse_attention(q, kv, indices, scale, d_v):

@@ -5,11 +5,15 @@ import triton
 import triton.language as tl
 
 
-def _infer_dsa_dims(dim_quant: int) -> tuple[int, int]:
-    if dim_quant == 264:
-        return 256, 0
-    if dim_quant == 656:
-        return 512, 64
+def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
+    """Recover the NoPE and RoPE widths from a packed DSA cache row."""
+    for dim_rope in (0, 64):
+        scaled_width = (dim_quant - 2 * dim_rope) * tile_size
+        if scaled_width % (tile_size + 4):
+            continue
+        dim_nope = scaled_width // (tile_size + 4)
+        if dim_nope > 0 and dim_nope % tile_size == 0:
+            return dim_nope, dim_rope
     raise ValueError(f"Unsupported packed DSA KV row width: {dim_quant}")
 
 
@@ -313,8 +317,9 @@ def gather_dequant_requant_fp8_paged(
 ) -> torch.Tensor:
     """Gather paged FP8 KV tokens and re-pack into a flat raw FP8 layout.
 
-    The paged KV cache stores 656 bytes per token:
-        [512 nope_fp8 | 16 scales_f32 (4 groups) | 128 rope_bf16_bytes]
+    Each packed cache row stores:
+        [dim_nope FP8 bytes | 4 scale bytes per group | 2 bytes per RoPE element]
+    For example, 256+0 uses 264 bytes and 512+64 uses 656 bytes.
     This kernel gathers the requested tokens, de-quantises nope with the
     per-group scales, and re-quantises to per-tensor fp8 (scale=1.0).
     Rope is cast bf16->fp8.  The whole operation is fused into a single
@@ -328,7 +333,7 @@ def gather_dequant_requant_fp8_paged(
     persistent (dirty) buffer via ``out``.
 
     Args:
-        quant_k_cache: [total_num_tokens, 1, 656] fp8_e4m3fn
+        quant_k_cache: [total_num_tokens, 1, dim_quant] fp8_e4m3fn
         page_table_1_flattened: [num_tokens] int32
         group_size: per-group dequant tile size (default 128)
         extra_rows: number of zero-filled landing-pad rows to append at
@@ -336,10 +341,11 @@ def gather_dequant_requant_fp8_paged(
             kernel which over-reads past end-of-buffer for masked
             indices)
         out: optional pre-allocated destination of shape
-            [num_tokens + extra_rows, 1, 576] (or [.., 576]) fp8_e4m3fn,
-            contiguous.  Contents may be arbitrary (fully overwritten).
+            [num_tokens + extra_rows, 1, dim_nope + dim_rope] (or the
+            equivalent 2D shape) fp8_e4m3fn, contiguous. Contents may be
+            arbitrary (fully overwritten).
     Returns:
-        output: [num_tokens + extra_rows, 1, 576] fp8_e4m3fn
+        output: [num_tokens + extra_rows, 1, dim_nope + dim_rope] fp8_e4m3fn
     """
     dim_quant = quant_k_cache.shape[-1]
     dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
