@@ -136,7 +136,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
-      partitions: '{"size":2,"arr":[0, 1]}'
     secrets: inherit
 
   base-b-test-8-npu-a3:
@@ -166,7 +165,7 @@ jobs:
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
-    runs-on: linux-aarch64-a3-800t-2
+    runs-on: linux-aarch64-a3-2-
     strategy:
       fail-fast: false
       matrix:
@@ -231,7 +230,7 @@ jobs:
   multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
-    runs-on: linux-aarch64-a3-800t-4
+    runs-on: linux-aarch64-a3-4-
     strategy:
       fail-fast: false
       matrix:
@@ -305,7 +304,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      partitions: '{"size":2,"arr":[0,1]}'
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
