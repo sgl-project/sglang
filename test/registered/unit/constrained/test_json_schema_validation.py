@@ -45,11 +45,13 @@ class TestXGrammarJSONSchemaValidation(unittest.TestCase):
             "then",
             "uniqueItems",
         ):
-            with self.subTest(keyword=keyword):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(keyword=keyword),
+                self.assertRaisesRegex(
                     UnsupportedJSONSchemaFeature, rf"keyword\(s\) {keyword}"
-                ):
-                    validate_xgrammar_json_schema({keyword: {}})
+                ),
+            ):
+                validate_xgrammar_json_schema({keyword: {}})
 
     def test_rejects_unknown_format(self):
         with self.assertRaisesRegex(
@@ -67,12 +69,14 @@ class TestXGrammarJSONSchemaValidation(unittest.TestCase):
             {"format": "markdown"},
             {"type": ["string", "null"], "format": "markdown"},
         ):
-            with self.subTest(schema=schema):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(schema=schema),
+                self.assertRaisesRegex(
                     UnsupportedJSONSchemaFeature,
                     "format 'markdown' is not implemented",
-                ):
-                    validate_xgrammar_json_schema(schema)
+                ),
+            ):
+                validate_xgrammar_json_schema(schema)
 
     def test_rejects_lossy_string_constraint_combinations(self):
         cases = (
@@ -81,11 +85,13 @@ class TestXGrammarJSONSchemaValidation(unittest.TestCase):
             {"type": "string", "format": "uuid", "pattern": "^a"},
         )
         for schema in cases:
-            with self.subTest(schema=schema):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(schema=schema),
+                self.assertRaisesRegex(
                     UnsupportedJSONSchemaFeature, "cannot be enforced together"
-                ):
-                    validate_xgrammar_json_schema(schema)
+                ),
+            ):
+                validate_xgrammar_json_schema(schema)
 
     def test_checks_nested_schema_without_walking_instance_data(self):
         schema = {
@@ -140,11 +146,13 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
             {"oneOf": [{"type": "number"}, {"minimum": 0}]},
         )
         for schema in cases:
-            with self.subTest(schema=schema):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(schema=schema),
+                self.assertRaisesRegex(
                     UnsupportedJSONSchemaFeature, "not supported by outlines"
-                ):
-                    validate_outlines_json_schema(schema)
+                ),
+            ):
+                validate_outlines_json_schema(schema)
 
     def test_rejects_constraints_shadowed_by_outlines_dispatch_order(self):
         cases = (
@@ -166,9 +174,11 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
             {"type": "object", "required": ["name"]},
         )
         for schema in cases:
-            with self.subTest(schema=schema):
-                with self.assertRaises(UnsupportedJSONSchemaFeature):
-                    validate_outlines_json_schema(schema)
+            with (
+                self.subTest(schema=schema),
+                self.assertRaises(UnsupportedJSONSchemaFeature),
+            ):
+                validate_outlines_json_schema(schema)
 
     def test_accepts_non_string_format_and_string_keywords(self):
         validate_outlines_json_schema(
@@ -213,3 +223,31 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_issue_40083_regression(self):
+        # Ensure uniqueItems and multipleOf correctly trigger UnsupportedJSONSchemaFeature
+        schema1 = {
+            "type": "object",
+            "properties": {
+                "xs": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "uniqueItems": True,
+                    "minItems": 3,
+                    "maxItems": 3,
+                }
+            },
+            "required": ["xs"],
+            "additionalProperties": False,
+        }
+        with self.assertRaisesRegex(UnsupportedJSONSchemaFeature, "uniqueItems"):
+            validate_xgrammar_json_schema(schema1)
+
+        schema2 = {
+            "type": "object",
+            "properties": {"n": {"type": "integer", "multipleOf": 7}},
+            "required": ["n"],
+            "additionalProperties": False,
+        }
+        with self.assertRaisesRegex(UnsupportedJSONSchemaFeature, "multipleOf"):
+            validate_xgrammar_json_schema(schema2)
