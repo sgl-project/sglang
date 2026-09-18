@@ -4545,6 +4545,83 @@ class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
                     {"city": "SF"},
                 )
 
+    def test_http_response_body_is_clean(self):
+        """The raw HTTP body a client receives must never carry DSML markup.
+
+        Goes through real routing, ChatCompletionRequest validation,
+        handle_request and JSON rendering. Only the GPU boundary
+        (tokenizer_manager.generate_request) is substituted.
+        """
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        # The full server module imports hardware-specific schedulers, so mount
+        # the same route body used by http_server.py's /v1/chat/completions.
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(  # noqa: ANN202
+            request: ChatCompletionRequest, raw_request: Request
+        ):
+            serving = raw_request.app.state.openai_serving_chat
+            return await serving.handle_request(request, raw_request)
+
+        generated = {"text": ""}
+
+        async def fake_generate(adapted_request, raw_request):  # noqa: ANN202
+            yield {
+                "text": generated["text"],
+                "meta_info": {
+                    "id": "req-1",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "cached_tokens": 0,
+                    "weight_version": "v1",
+                },
+            }
+
+        self.chat.tokenizer_manager.generate_request = fake_generate
+        self.chat.template_manager.chat_template_name = "chatml"
+        app.state.openai_serving_chat = self.chat
+        client = TestClient(app)
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                generated["text"] = text
+
+                response = client.post("/v1/chat/completions", json=body)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn(self.DSML, response.text)
+                choice = response.json()["choices"][0]
+                self.assertEqual(choice["finish_reason"], "tool_calls")
+                self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+
 
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
