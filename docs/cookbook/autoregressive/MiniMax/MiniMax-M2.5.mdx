@@ -1,5 +1,6 @@
 ---
 title: MiniMax-M2.5
+description: "Deploy MiniMax-M2.5 with SGLang on NVIDIA, AMD, and Ascend A3 hardware."
 metatags:
     description: "Deploy MiniMax-M2.5 with SGLang - community contribution guide for MiniMax M2.5 model deployment."
 ---
@@ -23,7 +24,7 @@ For more details, please refer to the [official MiniMax-M2.5 announcement](https
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+Please refer to the [official SGLang installation guide](/docs/get-started/install) for installation instructions.
 
 **For AMD MI300X/MI325X/MI355X GPUs:**
 
@@ -35,19 +36,59 @@ docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
 ```
 
+### Ascend A3 prerequisites
+
+The A3 selector provides **one Ascend A3 node with 8 cards / 16 NPU dies**, running prefill and decode together (PD co-located). It uses W8A8 weights and EAGLE3 speculative decoding. Each A3 card contains two dies; a cloud allocation labelled "1 NPU" is not a full node. The [minimum recommended W8A8 configuration](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#model-weights) is 4 cards / 8 dies with 64 GB per die, while this preset requires all 16 dies.
+
+<Note>
+This recipe is based on the upstream Ascend best practice. Hardware validation of the generated cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe.
+</Note>
+
+1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.0.0 and `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
+2. Check device health and allocation with `npu-smi info` inside the container. Confirm that all 16 dies are visible. For source builds, follow [installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation), keep the CANN, TorchNPU, and kernel versions compatible, and record the SGLang commit you install.
+3. Reserve space for the **230.82 GB** main weights, the draft model, download cache, and at least **30 GB** for the container image. Download both models below, or reuse complete copies from shared storage.
+
+| Role | Model | Directory inside the container |
+| --- | --- | --- |
+| W8A8 main model | [Eco-Tech/MiniMax-M2.5-w8a8-QuaRot](https://www.modelscope.cn/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot) | `/models/MiniMax-M2.5-w8a8-QuaRot` |
+| EAGLE3 draft model | [sgl-npu/MiniMax-M2.5-eagel-model-0318](https://www.modelscope.cn/models/sgl-npu/MiniMax-M2.5-eagel-model-0318) | `/models/MiniMax-M2.5-eagel-model-0318` |
+
+The draft repository identifier contains `eagel`; use that exact spelling. Keep its `custom_eagle3` Python package alongside the draft weights. The generated command adds this directory to `PYTHONPATH` and sets `SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3`.
+
+You can download the weights with the [ModelScope CLI](https://github.com/modelscope/modelscope/blob/master/docs/source/command.md#download):
+
+```bash Command
+python3 -m pip install modelscope
+modelscope download --model Eco-Tech/MiniMax-M2.5-w8a8-QuaRot \
+  --local_dir /models/MiniMax-M2.5-w8a8-QuaRot
+modelscope download --model sgl-npu/MiniMax-M2.5-eagel-model-0318 \
+  --local_dir /models/MiniMax-M2.5-eagel-model-0318
+```
+
+Before launching, run `ip -brief address` and select an interface available inside the container for both HCCL and Gloo. The selector defaults to `lo` for this single-node setup.
+
+For comparable performance, use the host settings from the [selected 8-card reference](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms). These affect the whole host; apply them on the dedicated benchmark server before running the generated command:
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+```
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and feature capabilities.
+**Interactive Command Generator**: Select your hardware to generate the deployment command. For **Ascend A3**, complete the prerequisites above, enter both model directories as absolute paths inside the container, and set the HCCL / Gloo interface. The A3 preset uses 3,500 input and 1,500 output tokens as its reference workload.
 
 <MiniMaxM25Deployment />
 
 ### 3.2 Configuration Tips
 
-**Key Parameters:**
+**GPU parameters:** The following recommendations apply to the NVIDIA and AMD recipes. The Ascend preset uses the separate settings described below.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -117,13 +158,31 @@ This section provides deployment configurations optimized for different hardware
 - **4-GPU deployment**: Requires 4× GPUs (e.g., MI300X, MI325X, MI355X) with TP=4, EP=4
 - **8-GPU deployment**: Requires 8× GPUs (e.g., MI300X, MI325X, MI355X) with TP=8, EP=8
 
+### 3.3 Ascend A3 configuration
+
+The generated A3 command follows the [8-card throughput reference](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms). Keep the environment variables and server arguments together when reproducing that workload.
+
+| Setting | A3 preset | Purpose |
+| --- | --- | --- |
+| Device and parallelism | `--device npu --tp-size 16 --dp-size 16 --enable-dp-attention` | Use 16 dies on one node with DP attention. |
+| Quantization and communication | `--quantization modelslim --moe-a2a-backend ascend_fuseep --fuseep-mode 2` | Run the Ascend W8A8 weights with FuseEP. |
+| Speculative decoding | EAGLE3, 3 steps, top-k 1, 4 draft tokens, unquantized draft | Load the custom draft model from the supplied directory. |
+| Static memory and concurrency | `--mem-fraction-static 0.75 --max-running-requests 320` | Use the memory and request limits of the reference workload. |
+| Prefill | Chunk size 196608, maximum prefill tokens 8192, prefill delayer enabled | Match the reference scheduling configuration. |
+| NPU graph batches | `--cuda-graph-bs-decode 1 2 4 8 12 16 20` | Set capture sizes; the argument retains `cuda` in its name on NPU. |
+| API | `127.0.0.1:6688` | Send requests from the same host or container network. |
+
+The A3 preset fixes the reasoning parser to `minimax-append-think` and the tool parser to `minimax-m2`. It does not use the GPU count or parser toggles. To use fewer A3 cards or a different workload, follow the corresponding [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) with its complete configuration.
+
 ## 4. Model Invocation
+
+For the **Ascend A3** preset, use [the A3 service checks](#4-3-verify-the-ascend-a3-service), which target port 6688 and read the deployed model identifier from `/v1/models`. The GPU examples below use their own model identifier and endpoints.
 
 ### 4.1 Basic Usage
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang Basic Usage Guide](/docs/basic_usage/send_request)
 
 **Testing Deployment:**
 
@@ -427,7 +486,46 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
+### 4.3 Verify the Ascend A3 service
+
+Wait for the server to finish loading the weights and capturing graphs. Keep the generated command running, then open another terminal in the same container. The A3 preset listens on port **6688**.
+
+```bash Command
+curl --fail --silent --show-error --max-time 30 http://127.0.0.1:6688/health
+curl --fail --silent --show-error --max-time 30 http://127.0.0.1:6688/v1/models
+
+python3 - <<'PY'
+import json
+from urllib.request import Request, urlopen
+
+base = "http://127.0.0.1:6688"
+with urlopen(f"{base}/v1/models", timeout=30) as response:
+    model = json.load(response)["data"][0]["id"]
+payload = {
+    "model": model,
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "temperature": 0,
+    "max_tokens": 2048,
+}
+request = Request(
+    f"{base}/v1/chat/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urlopen(request, timeout=300) as response:
+    result = json.load(response)
+print(json.dumps(result, indent=2, ensure_ascii=False))
+choice = result["choices"][0]
+assert (choice["message"].get("content") or "").strip(), "No final answer returned"
+assert choice["finish_reason"] != "length", "Increase the token budget and retry"
+PY
+```
+
+Check that the final answer identifies Paris. Repeat requests and check the server logs for runtime errors. After any concurrent test, check `/health` again. A successful HTTP response alone does not establish model accuracy; use the evaluation below for that.
+
 ## 5. Benchmark
+
+For **Ascend A3**, use [the A3 throughput and accuracy benchmarks](#5-3-ascend-a3-benchmarks) with the command generated in section 3.
 
 This section uses **industry-standard configurations** for comparable benchmark results.
 
@@ -1038,3 +1136,60 @@ subject: world_religions, #q:171, acc: 0.895
 Total latency: 81.468
 Average accuracy: 0.825
 ```
+
+### 5.3 Ascend A3 benchmarks
+
+Use the A3 command generated in section 3 for both accuracy and performance evaluation. Record the SGLang commit, container image digest, CANN / TorchNPU / kernel versions, model revisions, visible dies, and host tuning with your logs. When testing `main`, record the installed source commit separately from the base container tag.
+
+#### 5.3.1 Throughput workload
+
+The [Ascend reference](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) lists **50 ms TPOT** for 8 A3 cards, W8A8, PD co-located, and 3.5k input / 1.5k output tokens. This is a reference value, not a measurement from a different allocation or software build. The reference table does not specify the TPOT percentile.
+
+After warm-up, run the reference workload from the same container:
+
+```bash Command
+set -o pipefail
+python3 -m sglang.bench_serving \
+  --dataset-name random \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 6688 \
+  --max-concurrency 320 \
+  --num-prompts 1280 \
+  --random-input-len 3500 \
+  --random-output-len 1500 \
+  --random-range-ratio 1 \
+  --seed 1 2>&1 | tee minimax-a3-throughput.log
+```
+
+Keep the request success and failure counts, actual token counts, output and total token throughput, TTFT, TPOT, and end-to-end latency. Report mean, median, and P99 separately. Repeat the measurement with separate logs and check server health afterwards. Changes to concurrency, quantization, speculative decoding, or token lengths define a different benchmark configuration.
+
+#### 5.3.2 GPQA Diamond accuracy
+
+Install EvalScope in a separate environment following [Ascend accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation). Keep the SGLang server running with the generated A3 command. The following request configuration follows the [upstream 8-card GPQA test](https://github.com/sgl-project/sglang/blob/c389dd086340878934bf96bc209534f1fbb8440c/test/registered/npu/accuracy/minimax_m2_5/test_npu_minimax_m2_5_w8a8_8p_in3k5_out1k5_50ms_gpqa.py):
+
+```python evaluate_minimax_a3.py
+import json
+from urllib.request import urlopen
+
+from evalscope import TaskConfig, run_task
+
+with urlopen("http://127.0.0.1:6688/v1/models", timeout=30) as response:
+    model = json.load(response)["data"][0]["id"]
+
+run_task(task_cfg=TaskConfig(
+    model=model,
+    api_url="http://127.0.0.1:6688/v1/chat/completions",
+    eval_type="openai_api",
+    datasets=["gpqa_diamond"],
+    eval_batch_size=64,
+    generation_config={"max_tokens": 65536, "temperature": 1.0},
+    timeout=60000,
+    stream=True,
+    work_dir="./minimax-a3-gpqa",
+))
+```
+
+Run the full **198-question** dataset and retain the EvalScope version, dataset revision, generation settings, reports, and all attempt scores. The upstream test declares an accuracy baseline of **0.852**; its [comparison utility](https://github.com/sgl-project/sglang/blob/c389dd086340878934bf96bc209534f1fbb8440c/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py) allows a fluctuation of 5 questions, giving a threshold of `0.852 - 5/198`, approximately **0.8267**, with up to 3 attempts. These are upstream validation criteria, not measured accuracy for this cookbook command.
+
+{/* TODO: Add A3 startup, accuracy, and performance evidence after validating the generated command on the target hardware. */}
