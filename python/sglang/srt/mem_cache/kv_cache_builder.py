@@ -38,9 +38,12 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -52,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -70,12 +74,6 @@ def prepare_hicache_staging(
     *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
 ) -> None:
     """Materialize MHA transfer buffers before the final KV budget is measured."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-    from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
-    from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
-    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-
     memory = get_memory()
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
@@ -148,8 +146,6 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
-    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
