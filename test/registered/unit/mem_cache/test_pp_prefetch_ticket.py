@@ -4,7 +4,7 @@ import pickle
 import threading
 import unittest
 from array import array
-from queue import Queue
+from queue import Empty, Queue
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -58,6 +58,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = patch.object(
+            torch.distributed, "get_rank", side_effect=lambda: c.pp_rank * 2 + c.tp_rank
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.pp_rank = 1
         cache.tree_core = Mock(enable_storage=True)
@@ -90,11 +95,10 @@ class TestPPPrefetchTicket(unittest.TestCase):
         commands = iter((*tickets, None))
         self.c.pp_prefetch_command_queue.put(None)
 
-        def broadcast(objects, **kwargs):
-            if self.c.pp_rank:
-                objects[0] = next(commands)
+        def broadcast(objects, *args, **kwargs):
+            return [next(commands)] if self.c.pp_rank else objects
 
-        with patch.object(torch.distributed, "broadcast_object_list", broadcast):
+        with patch(f"{HybridCacheController.__module__}.broadcast_pyobj", broadcast):
             self.c.pp_prefetch_command_thread_func()
 
     def sync_acks(self, *acks):
@@ -329,9 +333,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def test_command_failure_finishes_queue_task_and_is_reported_on_poll(self):
         c = self.c
         with (
-            patch.object(
-                torch.distributed,
-                "broadcast_object_list",
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
                 side_effect=RuntimeError("broken"),
             ),
             self.assertLogs(level="ERROR"),
@@ -350,6 +353,61 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.submit(rid)
             with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
                 c.is_pp_prefetch_ready(rid)
+
+    def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
+        c = self.c
+        c.tp_rank = 1  # The source is a global rank, not pp_rank=0.
+        operation = self.submit().operation
+        c.pp_prefetch_command_queue.put(None)
+        get = c.pp_prefetch_command_queue.get
+        idle_polls = [True, True]
+
+        def get_after_idle(*, timeout):
+            self.assertEqual(timeout, 60)
+            if idle_polls:
+                idle_polls.pop()
+                raise Empty
+            return get(block=False)
+
+        with (
+            patch.object(c.pp_prefetch_command_queue, "get", get_after_idle),
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[1, 3, 5, 7]
+            ),
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
+                side_effect=lambda objects, *args, **kwargs: objects,
+            ) as broadcast,
+        ):
+            c.pp_prefetch_command_thread_func()
+        calls = broadcast.call_args_list
+        self.assertEqual([len(c.args[0]) for c in calls], [0, 0, 1, 1])
+        for invocation in calls:
+            self.assertEqual(invocation.args[1:], (1, "command"))
+            self.assertEqual(invocation.kwargs, {"src": 1})
+        self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
+        self.assertTrue(c.pp_prefetch_command_queue.empty())
+        self.assertIs(c.prefetch_buffer.get_nowait(), operation)
+        self.assertTrue(c.prefetch_buffer.empty())
+        c.mem_pool_host.alloc.assert_called_once()
+
+    def test_idle_downstream_skips_empty_broadcasts_before_ticket_and_stop(self):
+        c = self.c
+        self.submit()
+        ticket = c.pp_prefetch_states.pop("hit").ticket
+        c.pp_rank = 1
+        with (
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
+                side_effect=[[], [], [ticket], [None]],
+            ),
+            patch.object(c.pp_prefetch_command_queue, "task_done") as task_done,
+        ):
+            c.pp_prefetch_command_thread_func()
+        self.assertEqual(c.prefetch_buffer.get_nowait().request_id, "hit")
+        self.assertTrue(c.prefetch_buffer.empty())
+        c.mem_pool_host.alloc.assert_called_once()
+        task_done.assert_not_called()
 
 
 if __name__ == "__main__":

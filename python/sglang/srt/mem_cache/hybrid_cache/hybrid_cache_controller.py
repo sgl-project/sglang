@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -933,17 +934,22 @@ class HybridCacheController(BaseHiCacheController):
     def pp_prefetch_command_thread_func(self) -> None:
         group = self.pp_prefetch_command_group
         assert group is not None
+        rank = torch.distributed.get_rank()
         source = torch.distributed.get_process_group_ranks(group)[0]
         is_source = self.pp_rank == 0
 
         while True:
-            command = self.pp_prefetch_command_queue.get() if is_source else None
+            objects = []
+            if is_source:
+                try:
+                    objects = [self.pp_prefetch_command_queue.get(timeout=60)]
+                except Empty:
+                    pass  # Complete idle broadcasts before the group times out.
             operation = None
             try:
-                objects = [command]
-                torch.distributed.broadcast_object_list(
-                    objects, src=source, group=group
-                )
+                objects = broadcast_pyobj(objects, rank, group, src=source)
+                if not objects:
+                    continue
                 ticket = objects[0]
                 if ticket is None:
                     return
@@ -1002,7 +1008,7 @@ class HybridCacheController(BaseHiCacheController):
                 # Preserve every KV/sidecar ACK even when local allocation fails.
                 self.prefetch_buffer.put(operation)
             finally:
-                if is_source:
+                if is_source and objects:
                     self.pp_prefetch_command_queue.task_done()
 
     def write_storage(
