@@ -130,6 +130,10 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+class _L2StagingShortfall(Exception):
+    """Host staging could not be carved despite the admission gate passing."""
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -336,6 +340,14 @@ class DecodeRequest:
     hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    hicache_l3_drained: bool = False
+    l2_host_lock_node: Optional[int] = None
+    l2_host_lock_params: Optional[Any] = None
+
+    l2_only_host_indices: Optional[torch.Tensor] = None
+    l2_only_delta_len: int = 0
+    l2_only_tail_used_len: int = 0
+    l2_only_tail_device_indices: Optional[torch.Tensor] = None
 
     @property
     def seqlen(self) -> int:
