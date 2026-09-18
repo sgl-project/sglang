@@ -88,15 +88,26 @@ def _get_last_loc_safe_kernel(
     tl.store(result_i32 + offset, tokens, mask=mask)
 
 
-def get_last_loc_triton_safe(
+def get_last_loc_triton_safe_i32(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused `last_loc` Triton kernel whose in-kernel result buffer is int32
-    (the dtype of req_to_token). The consumer-dtype promotion happens in
-    torch after the kernel returns, so Triton never issues a mixed-width
-    store -- avoiding the HIP int32->int64 store bug hit by the legacy kernel.
+    """`last_loc` in a SINGLE Triton launch, left in req_to_token's own int32
+    dtype with no trailing promotion kernel.
+
+    This is the no-promotion core of `get_last_loc_triton_safe`. Its result is
+    bit-identical to what plain advanced indexing
+    ``req_to_token[req_pool_indices, prefix_lens - 1]`` returns (that
+    expression also yields req_to_token's int32 dtype), except that rows with
+    ``prefix_lens == 0`` yield -1 here instead of wrapping around to the last
+    column -- strictly the safer of the two.
+
+    Prefer this over the torch expression on per-decode-step paths: the torch
+    form costs two launches (an elementwise `sub` on a [bs] tensor, then an
+    advanced-index gather) and decode on tiny [bs] tensors is bound by launch
+    count, not arithmetic. Use `get_last_loc_triton_safe` instead when the
+    caller needs the result in the index dtype rather than int32.
     """
     num_tokens = prefix_lens_tensor.shape[0]
     BLOCK_SIZE = 256
@@ -114,7 +125,24 @@ def get_last_loc_triton_safe(
         BLOCK_SIZE=BLOCK_SIZE,
         PREFIX_DTYPE_IS_I64=(prefix_lens_tensor.dtype == torch.int64),
     )
-    return result_i32.to(prefix_lens_tensor.dtype)
+    return result_i32
+
+
+def get_last_loc_triton_safe(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Fused `last_loc` Triton kernel whose in-kernel result buffer is int32
+    (the dtype of req_to_token). The consumer-dtype promotion happens in
+    torch after the kernel returns, so Triton never issues a mixed-width
+    store -- avoiding the HIP int32->int64 store bug hit by the legacy kernel.
+    """
+    # `.to()` is a no-op returning self when the dtypes already match, so this
+    # only costs a launch for callers that genuinely need a wider index dtype.
+    return get_last_loc_triton_safe_i32(
+        req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+    ).to(prefix_lens_tensor.dtype)
 
 
 @triton.jit
