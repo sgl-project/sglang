@@ -9,7 +9,7 @@ pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 
 # Bounds on key dependencies to prevent the pip resolver from degrading to ancient, incompatible versions (e.g. aiohttp 1.0.5).
 EVALSCOPE_CONSTRAINTS=(
-    "aiohttp>=3.8,<4"
+    "aiohttp>=3.11,<4"
     "httpx>=0.28,<1"
 )
 
