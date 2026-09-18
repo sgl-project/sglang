@@ -1012,6 +1012,9 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
+                self.batch_result_processor._maybe_collect_customized_info(
+                    i, req, logits_output
+                )
                 self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -1698,6 +1701,7 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
+        req.customized_info = None
         req.start_send_idx = 0
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
