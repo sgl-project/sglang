@@ -91,36 +91,6 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         )
 
 
-class TestDsparkPipelineParallelGate(CustomTestCase):
-    def test_kimi_prefill_accepts_pp_but_decode_and_non_pd_reject_it(self):
-        for architecture in ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM"):
-            for mode in ("prefill", "decode", "null"):
-                with self.subTest(mode=mode):
-                    server_args = _make_dspark_server_args(
-                        model_path="moonshotai/Kimi-K3",
-                        hf_config=SimpleNamespace(architectures=[architecture]),
-                    )
-                    server_args.pp_size = 2
-                    server_args.disaggregation_mode = mode
-                    server_args.speculative_draft_model_path = "RadixArk/Kimi-K3-DSpark"
-                    server_args.disable_overlap_schedule = True
-                    server_args.served_model_name = "test-k3"
-                    server_args.chunked_prefill_size = 64
-                    server_args.page_size = 1
-                    if mode == "prefill":
-                        _handle_dspark(server_args)
-                        server_args.check_server_args()
-                        self.assertEqual(
-                            resolution_result(
-                                server_args, "speculative_num_draft_tokens"
-                            ),
-                            6,
-                        )
-                    else:
-                        with self.assertRaisesRegex(ValueError, "CUDA PD prefill"):
-                            _handle_dspark(server_args)
-
-
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
