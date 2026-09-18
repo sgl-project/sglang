@@ -682,6 +682,7 @@ class _DcpGatherPrefetcher:
         # Which layer each slot currently holds the PREFIX for, per forward.
         self.filled: list = [None, None]
         self.prev_layer: Optional[int] = None
+        self._max_layer: Optional[int] = None
 
     def _note_layer(self, layer_id: int) -> None:
         """Drop both slots when a new forward starts.
@@ -737,7 +738,31 @@ class _DcpGatherPrefetcher:
             self.ready[slot] = self.stream.record_event()
         self.filled[slot] = layer_id
 
-    def take(self, m, md, plan, k_nope, k_pe, layer_id: int, last_layer: int):
+    def _max_servable_layer(self) -> int:
+        """Highest layer id the KV pool can serve, from the list it indexes.
+
+        NOT from ``pool.end_layer``. That field is inconsistent: the pool's own
+        constructor defaults it to ``layer_num - 1`` (inclusive) while
+        model_runner passes ``layer_info.end_layer``, which is EXCLUSIVE -- 78
+        on a 78-layer model. Stage B asked to prefetch layer 78 and got
+        ``IndexError: index 78 is out of bounds for dimension 0 with size 78``.
+
+        ``get_key_buffer`` reads ``k_buffer[layer_id - start_layer]``, so that
+        buffer's length is the only statement of the bound that cannot disagree
+        with the read it guards. ``len`` covers both shapes it takes here, a
+        list of per-layer tensors and one stacked tensor whose first dimension
+        is the layer.
+        """
+        if self._max_layer is None:
+            pool = get_token_to_kv_pool()
+            k = getattr(pool, "k_buffer", None)
+            start = getattr(pool, "start_layer", 0)
+            # -1 disables prefetching entirely, which costs the overlap and
+            # nothing else: every layer then gathers its own prefix inline.
+            self._max_layer = -1 if k is None else start + len(k) - 1
+        return self._max_layer
+
+    def take(self, m, md, plan, k_nope, k_pe, layer_id: int):
         """This layer's KV buffer, with next layer's gather already in flight."""
         self._note_layer(layer_id)
         slot = layer_id % 2
@@ -759,7 +784,7 @@ class _DcpGatherPrefetcher:
         torch.npu.current_stream().wait_event(self.ready[slot])
         # The one part that could not be prefetched: this chunk's own KV.
         _write_packed_extend_tail(out_nope, out_rope, k_nope, k_pe, plan)
-        if layer_id < last_layer:
+        if layer_id < self._max_servable_layer():
             self._gather_prefix(m, md, plan, k_nope, k_pe, layer_id + 1)
         return out_nope, out_rope
 
@@ -814,18 +839,7 @@ def _dcp_gather_extend_kv_packed_npu(
         global _dcp_gather_prefetcher
         if _dcp_gather_prefetcher is None:
             _dcp_gather_prefetcher = _DcpGatherPrefetcher()
-        last_layer = getattr(get_token_to_kv_pool(), "end_layer", None)
-        # Asserted rather than defaulted. A default of m.layer_id would make
-        # `layer_id < last_layer` false on every layer, so nothing would ever be
-        # prefetched and the flag would look enabled while doing nothing --
-        # which is the failure mode this port has already paid for once.
-        assert last_layer is not None, (
-            "DCP gather prefetch needs the KV pool's end_layer to know when to "
-            "stop prefetching; this pool does not expose one"
-        )
-        return _dcp_gather_prefetcher.take(
-            m, md, plan, k_nope, k_pe, m.layer_id, last_layer
-        )
+        return _dcp_gather_prefetcher.take(m, md, plan, k_nope, k_pe, m.layer_id)
 
     out_nope = dcp_extend_gather_buffer("packed_latent", k_nope, plan.rows)
     out_rope = dcp_extend_gather_buffer("packed_rope", k_pe, plan.rows)
