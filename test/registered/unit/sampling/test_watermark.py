@@ -1,13 +1,16 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.srt.sampling.watermark import (
     build_watermark_batch_config,
     normalize_watermark_request,
     resolve_watermark_request,
 )
+from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -117,7 +120,7 @@ def test_per_request_batch_config_and_admission():
         ),
     ]
 
-    keys, context_windows, enabled = build_watermark_batch_config(
+    config = build_watermark_batch_config(
         requests,
         default_key=_DEFAULT_KEY,
         default_context_window=4,
@@ -126,16 +129,18 @@ def test_per_request_batch_config_and_admission():
         device="cpu",
     )
 
-    assert keys.tolist() == [
+    assert config.keys.tolist() == [
         0xFEDCBA9876543210 - (1 << 64),
         0,
         0,
         0x0123456789ABCDEF,
     ]
-    assert context_windows.tolist() == [2, 4, 4, 4]
-    assert enabled.tolist() == [True, False, False, True]
+    assert config.context_windows.tolist() == [2, 4, 4, 4]
+    assert config.enabled.tolist() == [True, False, False, True]
+    assert config.candidates_host == [True, False, False, True]
+    assert config.has_candidates
 
-    keys, context_windows, enabled = build_watermark_batch_config(
+    config = build_watermark_batch_config(
         requests[:3],
         default_key=_DEFAULT_KEY,
         default_context_window=4,
@@ -143,13 +148,15 @@ def test_per_request_batch_config_and_admission():
         enforce_all=False,
         device="cpu",
     )
-    assert keys.tolist() == [
+    assert config.keys.tolist() == [
         0xFEDCBA9876543210 - (1 << 64),
         0x0123456789ABCDEF,
         0,
     ]
-    assert context_windows.tolist() == [2, 4, 4]
-    assert enabled.tolist() == [True, True, False]
+    assert config.context_windows.tolist() == [2, 4, 4]
+    assert config.enabled.tolist() == [True, True, False]
+    assert config.candidates_host == [True, True, False]
+    assert config.has_candidates
 
     with pytest.raises(ValueError, match="unknown fields"):
         normalize_watermark_request({"key": secret, "provider": "textseal"})
@@ -173,6 +180,74 @@ def test_per_request_batch_config_and_admission():
             default_enabled=False,
             enforce_all=False,
         )
+
+
+def test_disabled_speculative_batch_skips_watermark_state():
+    def fake_sampling(**kwargs):
+        kwargs["predicts"].fill_(3)
+        kwargs["accept_index"].fill_(0)
+        kwargs["accept_token_num"].fill_(1)
+
+    verify_input = SimpleNamespace(
+        draft_token_num=2,
+        draft_token=torch.tensor([1, 2], dtype=torch.int32),
+        max_tree_depth=2,
+        tree_topk=1,
+        retrieve_index=torch.zeros((1, 2), dtype=torch.int32),
+        retrieve_next_token=torch.zeros((1, 2), dtype=torch.int32),
+        retrieve_next_sibling=torch.zeros((1, 2), dtype=torch.int32),
+        draft_probs=None,
+        custom_mask=torch.zeros((1, 2), dtype=torch.bool),
+        positions=torch.zeros(2, dtype=torch.int32),
+    )
+    sampling_info = SimpleNamespace(
+        acc_additive_penalties=None,
+        acc_scaling_penalties=None,
+        logit_bias=None,
+        is_all_greedy=False,
+        temperatures=torch.ones((1, 1)),
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+        sampling_seed=None,
+        has_watermark_candidates=False,
+    )
+    batch = SimpleNamespace(
+        device="cpu",
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        sampling_info=sampling_info,
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+    )
+    logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+    watermark_state = Mock()
+    spec_config = SimpleNamespace(
+        speculative_use_rejection_sampling=False,
+        speculative_accept_threshold_single=1.0,
+        speculative_accept_threshold_acc=1.0,
+    )
+    tp_group = SimpleNamespace(world_size=1)
+
+    with (
+        patch.object(eagle_utils, "get_spec", return_value=spec_config),
+        patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        patch(
+            "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
+        ),
+        patch(
+            "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
+            side_effect=fake_sampling,
+        ),
+    ):
+        eagle_utils.eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            watermark_state=watermark_state,
+        )
+
+    watermark_state.speculative_contexts.assert_not_called()
+    watermark_state.force_speculative.assert_not_called()
+    watermark_state.record_speculative.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -941,11 +941,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             watermark_prompt_tail_ids=(
                 model_runner.watermark_state.prompt_tails(batch)
                 if model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
                 else None
             ),
             watermark_context_hash_history=(
                 model_runner.watermark_state.retracted_context_hashes(batch)
                 if model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
                 else None
             ),
             # Compound (carry their own device tensors)

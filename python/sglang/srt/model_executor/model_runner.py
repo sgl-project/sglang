@@ -2010,7 +2010,10 @@ class ModelRunner:
             )
 
         watermark_state = getattr(self, "watermark_state", None)
-        if watermark_state is not None:
+        if (
+            watermark_state is not None
+            and forward_batch.sampling_info.has_watermark_candidates
+        ):
             req_pool_indices = forward_batch.req_pool_indices[
                 : logits_output.next_token_logits.shape[0]
             ]
@@ -2018,6 +2021,7 @@ class ModelRunner:
                 req_pool_indices,
                 forward_batch.watermark_prompt_tail_ids,
                 forward_batch.watermark_context_hash_history,
+                active=forward_batch.sampling_info.has_watermark_candidates,
             )
             watermark_state.force(
                 logits_output.next_token_logits,
@@ -2048,8 +2052,15 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if watermark_state is not None:
-            watermark_state.append(req_pool_indices, next_token_ids)
+        if (
+            watermark_state is not None
+            and forward_batch.sampling_info.has_watermark_candidates
+        ):
+            watermark_state.append(
+                req_pool_indices,
+                next_token_ids,
+                active=forward_batch.sampling_info.has_watermark_candidates,
+            )
         return next_token_ids
 
     def compute_logprobs_only(

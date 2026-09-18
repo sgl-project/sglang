@@ -503,9 +503,15 @@ class NGRAMWorker(BaseSpecWorker):
                 self.draft_token_num,
             )
             accept_tokens = predict[accept_index]
-            if self.model_runner.watermark_state is not None:
+            if (
+                self.model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+            ):
                 self.model_runner.watermark_state.append_speculative(
-                    batch.req_pool_indices, accept_tokens, accept_lens
+                    batch.req_pool_indices,
+                    accept_tokens,
+                    accept_lens,
+                    active=batch.sampling_info.has_watermark_candidates,
                 )
             next_token_ids = accept_tokens.flatten()
 

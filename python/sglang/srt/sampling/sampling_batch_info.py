@@ -84,6 +84,8 @@ class SamplingBatchInfo:
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
     watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
 
     # Device
     device: str = "cuda"
@@ -162,11 +164,7 @@ class SamplingBatchInfo:
         )
         features = get_exec().features
         if getattr(features, "enable_watermark", False):
-            (
-                watermark_keys,
-                watermark_context_windows,
-                watermark_enabled,
-            ) = build_watermark_batch_config(
+            watermark_config = build_watermark_batch_config(
                 reqs,
                 default_key=features.watermark_key,
                 default_context_window=features.watermark_context_window,
@@ -174,10 +172,17 @@ class SamplingBatchInfo:
                 enforce_all=features.watermark_enforce_all,
                 device=device,
             )
+            watermark_keys = watermark_config.keys
+            watermark_context_windows = watermark_config.context_windows
+            watermark_enabled = watermark_config.enabled
+            watermark_candidates_host = watermark_config.candidates_host
+            has_watermark_candidates = watermark_config.has_candidates
         else:
             watermark_keys = None
             watermark_context_windows = None
             watermark_enabled = None
+            watermark_candidates_host = None
+            has_watermark_candidates = False
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -251,6 +256,8 @@ class SamplingBatchInfo:
             watermark_keys=watermark_keys,
             watermark_context_windows=watermark_context_windows,
             watermark_enabled=watermark_enabled,
+            watermark_candidates_host=watermark_candidates_host,
+            has_watermark_candidates=has_watermark_candidates,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -391,6 +398,12 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        if self.watermark_candidates_host is not None:
+            self.watermark_candidates_host = [
+                self.watermark_candidates_host[index] for index in keep_indices
+            ]
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -537,6 +550,13 @@ class SamplingBatchInfo:
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
+
+        if (
+            self.watermark_candidates_host is not None
+            and other.watermark_candidates_host is not None
+        ):
+            self.watermark_candidates_host.extend(other.watermark_candidates_host)
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy

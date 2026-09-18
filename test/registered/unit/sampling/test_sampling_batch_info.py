@@ -148,6 +148,28 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
 
 
+def test_watermark_host_enablement_tracks_filter_and_merge():
+    info = _make_info(
+        batch_size=2,
+        watermark_enabled=torch.tensor([False, True]),
+        watermark_candidates_host=[False, True],
+        has_watermark_candidates=True,
+    )
+    info.filter_batch([0], torch.tensor([0]))
+    assert info.watermark_candidates_host == [False]
+    assert not info.has_watermark_candidates
+
+    other = _make_info(
+        batch_size=1,
+        watermark_enabled=torch.tensor([True]),
+        watermark_candidates_host=[True],
+        has_watermark_candidates=True,
+    )
+    info.merge_batch(other)
+    assert info.watermark_candidates_host == [False, True]
+    assert info.has_watermark_candidates
+
+
 class TestMergeCustomLogitProcessor(CustomTestCase):
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""

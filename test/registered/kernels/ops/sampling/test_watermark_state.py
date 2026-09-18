@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -56,6 +57,41 @@ def test_repeated_context_and_greedy_bypass():
 
     assert torch.equal(repeated_logits, torch.zeros_like(repeated_logits))
     assert state.num_watermarked_contexts.tolist() == [1, 0]
+
+
+@pytest.mark.parametrize("enabled,top_k", [(False, 64), (True, 1)])
+def test_inactive_batch_skips_watermark_state(monkeypatch, enabled, top_k):
+    state = WatermarkState(
+        max_num_reqs=1,
+        context_window=2,
+        max_contexts_per_req=8,
+        key="0123456789abcdef",
+        device="cuda",
+        default_enabled=True,
+    )
+    req_pool_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    kernel_activity = Mock()
+    monkeypatch.setattr(state, "_ensure_selection_buffers", kernel_activity)
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((1, 1), device="cuda"),
+        top_ks=torch.tensor([top_k], device="cuda", dtype=torch.int32),
+        top_ps=torch.ones(1, device="cuda"),
+        min_ps=torch.zeros(1, device="cuda"),
+        max_top_k=top_k,
+        watermark_enabled=torch.tensor([enabled], device="cuda"),
+        has_watermark_candidates=False,
+    )
+
+    state.init_from_prompt(req_pool_indices, [[10, 11]], active=False)
+    state.force(torch.zeros((1, 64), device="cuda"), req_pool_indices, sampling_info)
+    state.append(
+        req_pool_indices,
+        torch.tensor([12], device="cuda", dtype=torch.int32),
+        active=False,
+    )
+
+    kernel_activity.assert_not_called()
+    assert state.lengths[0].item() == 0
 
 
 def test_retracted_request_restores_context_history():

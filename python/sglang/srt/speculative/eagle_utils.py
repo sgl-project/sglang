@@ -802,7 +802,7 @@ def eagle_sample(
 
     watermark_context_hashes = None
     watermark_selected = None
-    if watermark_state is not None:
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
         next_token_logits = next_token_logits.clone()
         contexts, context_lengths = watermark_state.speculative_contexts(
             req_pool_indices=batch.req_pool_indices,
@@ -1070,7 +1070,7 @@ def eagle_sample(
         )
 
     accept_lens = num_correct_drafts + 1
-    if watermark_state is not None:
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,
             watermark_context_hashes,

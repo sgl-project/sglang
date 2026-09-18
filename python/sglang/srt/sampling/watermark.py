@@ -135,6 +135,20 @@ class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+class WatermarkBatchConfig(msgspec.Struct, frozen=True):
+    keys: torch.Tensor
+    context_windows: torch.Tensor
+    enabled: torch.Tensor
+    candidates_host: list[bool]
+    has_candidates: bool
+
+    def __repr__(self) -> str:
+        return (
+            f"WatermarkBatchConfig(rows={len(self.candidates_host)!r}, "
+            f"has_candidates={self.has_candidates!r})"
+        )
+
+
 def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
     if value is None:
         return None
@@ -232,10 +246,11 @@ def build_watermark_batch_config(
     default_enabled: bool,
     enforce_all: bool,
     device: torch.device | str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> WatermarkBatchConfig:
     keys = []
     context_windows = []
     enabled = []
+    candidates = []
     for request in requests:
         config = request.sampling_params.watermark
         key, context_window, request_enabled = resolve_watermark_request(
@@ -249,10 +264,15 @@ def build_watermark_batch_config(
         keys.append(parse_watermark_key(key) if key is not None else 0)
         context_windows.append(context_window)
         enabled.append(request_enabled)
-    return (
-        torch.tensor(keys, dtype=torch.int64, device=device),
-        torch.tensor(context_windows, dtype=torch.int32, device=device),
-        torch.tensor(enabled, dtype=torch.bool, device=device),
+        candidates.append(
+            request_enabled and getattr(request.sampling_params, "top_k", 2) > 1
+        )
+    return WatermarkBatchConfig(
+        keys=torch.tensor(keys, dtype=torch.int64, device=device),
+        context_windows=torch.tensor(context_windows, dtype=torch.int32, device=device),
+        enabled=torch.tensor(enabled, dtype=torch.bool, device=device),
+        candidates_host=candidates,
+        has_candidates=any(candidates),
     )
 
 
@@ -669,8 +689,10 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         prompt_tail_ids: Optional[Sequence[Optional[Sequence[int]]]],
         context_hash_history: Optional[Sequence[Optional[Sequence[int]]]] = None,
+        *,
+        active: bool = True,
     ) -> None:
-        if prompt_tail_ids is None:
+        if not active or prompt_tail_ids is None:
             return
         assert len(prompt_tail_ids) == req_pool_indices.shape[0]
 
@@ -1012,10 +1034,16 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         accept_tokens: torch.Tensor,
         accept_lens: torch.Tensor,
+        *,
+        active: bool = True,
     ) -> None:
+        if not active:
+            return
         for position in range(accept_tokens.shape[1]):
             valid = position < accept_lens
-            self.append(req_pool_indices[valid], accept_tokens[valid, position])
+            self.append(
+                req_pool_indices[valid], accept_tokens[valid, position], active=active
+            )
 
     def force(
         self,
@@ -1023,6 +1051,8 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> None:
+        if not getattr(sampling_info, "has_watermark_candidates", True):
+            return
         keys, context_windows, watermark_enabled = self._watermark_batch_config(
             sampling_info
         )
@@ -1147,7 +1177,15 @@ class WatermarkState:
         )
         self._record_contexts(req_pool_indices, context_hashes, selected)
 
-    def append(self, req_pool_indices: torch.Tensor, token_ids: torch.Tensor) -> None:
+    def append(
+        self,
+        req_pool_indices: torch.Tensor,
+        token_ids: torch.Tensor,
+        *,
+        active: bool = True,
+    ) -> None:
+        if not active:
+            return
         if self.token_ids.is_cuda:
             try:
                 from sglang.kernels.ops.sampling.textseal_selector import (
