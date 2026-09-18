@@ -731,8 +731,7 @@ class _DcpGatherPrefetcher:
         out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
         torch.npu.current_stream().wait_event(self.ready[slot])
         # The one part that could not be prefetched: this chunk's own KV.
-        out_nope[plan.gathered_rows :] = k_nope
-        out_rope[plan.gathered_rows :] = k_pe
+        _write_packed_extend_tail(out_nope, out_rope, k_nope, k_pe, plan)
         if layer_id < last_layer:
             self._gather_prefix(m, md, plan, k_nope, k_pe, layer_id + 1)
         return out_nope, out_rope
@@ -816,10 +815,41 @@ def _dcp_gather_extend_kv_packed_npu(
         parallel.dcp_group.all_gather_into_tensor(
             out_rope[: plan.gathered_rows], send_rope
         )
-    # This chunk's own KV is identical on every rank and is not gathered.
-    out_nope[plan.gathered_rows :] = k_nope
-    out_rope[plan.gathered_rows :] = k_pe
+    _write_packed_extend_tail(out_nope, out_rope, k_nope, k_pe, plan)
     return out_nope, out_rope
+
+
+def _write_packed_extend_tail(
+    out_nope: torch.Tensor,
+    out_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    plan: "DcpPackedReadPlan",
+) -> None:
+    """This chunk's own KV, after the gathered prefix. Not gathered: identical
+    on every rank.
+
+    ``k_nope`` can be WIDER than the request's token count. Every batch is
+    padded to a multiple of ``attn_tp_size`` before the model runs
+    (``ceil_align``, forward_batch_info.py:1454), so the server's own 6-token
+    warm-up arrives as 16 rows. The plan is built from ``extend_seq_lens_cpu``,
+    which is the true count, so the two disagree by exactly the padding.
+
+    Drop it, which is what the permuting path already does -- ``scratch[
+    gathered:] = own[piece.extend_start : piece.extend_end]``. Safe because the
+    operator is given true query lengths as well (``actual_seq_qlen`` comes from
+    ``extend_seq_lens``), so it never reads a padded query row, and a real
+    query's top-k only names positions below ``prefix_len + extend_len``.
+    """
+    n = plan.extend_len
+    assert k_nope.shape[0] >= n, (
+        f"DCP packed read: this chunk's KV has {k_nope.shape[0]} rows but the "
+        f"plan expects at least {n}. The plan comes from extend_seq_lens_cpu; "
+        "if the batch is now NARROWER than that, the two no longer describe "
+        "the same forward."
+    )
+    out_nope[plan.gathered_rows :] = k_nope[:n]
+    out_rope[plan.gathered_rows :] = k_pe[:n]
 
 
 def _pad_dcp_packed_send(
@@ -835,6 +865,15 @@ def _pad_dcp_packed_send(
     """
     local_len = plan.prefix_len // plan.dcp_size + int(
         dcp_rank < plan.prefix_len % plan.dcp_size
+    )
+    # Same disagreement as the extend tail, on the other side of the buffer: the
+    # plan's arithmetic and the pool's actual index must describe the same rows,
+    # and a mismatch would otherwise surface as an HCCL size error inside the
+    # collective, where it says nothing about which of the two is wrong.
+    assert shards.shape[0] == local_len, (
+        f"DCP packed read: rank {dcp_rank} holds {shards.shape[0]} prefix rows "
+        f"but the plan computes {local_len} from prefix_len={plan.prefix_len} "
+        f"over {plan.dcp_size} ranks"
     )
     if local_len == plan.send_rows:
         return shards.contiguous()
