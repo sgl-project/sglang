@@ -4,6 +4,7 @@ import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -262,6 +263,63 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
                 self.assertEqual(len(result.calls), 1)
                 self.assertEqual(json.loads(result.calls[0].parameters), arguments)
                 self.assertNotIn(DSML, result.normal_text)
+
+
+class TestDeepSeekV32SharesTheFix(CustomTestCase):
+    """`deepseekv32` inherits the same base, so it must gain the fix too.
+
+    The V3.2 detector is the parent class being changed, so these guard
+    both directions: the V3.2 dialect keeps working, and the shapes that
+    used to leak no longer do.
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        self.detector = DeepSeekV32Detector()
+
+    def _invoke(self):
+        return _invoke("get_weather", _param("city", "true", "SF"))
+
+    def _parse(self, text):
+        return self.detector.detect_and_parse(text, self.tools)
+
+    def test_v32_native_block_still_parses(self):
+        result = self._parse(
+            f"Sure.\n\n<{DSML}function_calls>\n{self._invoke()}\n</{DSML}function_calls>"
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertIn("Sure.", result.normal_text)
+
+    def test_v32_leaking_shapes_are_fixed(self):
+        cases = {
+            "bare invoke": f"Sure.\n\n{self._invoke()}",
+            "unterminated": f"<{DSML}function_calls>\n{self._invoke()}",
+            "v4 block name": f"<{DSML}tool_calls>\n{self._invoke()}\n</{DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                result = self._parse(text)
+
+                self.assertEqual([c.name for c in result.calls], ["get_weather"])
+                self.assertNotIn(DSML, result.normal_text)
+
+    def test_plain_text_is_untouched(self):
+        result = self._parse("plain answer")
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "plain answer")
 
 
 if __name__ == "__main__":
