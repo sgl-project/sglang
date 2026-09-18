@@ -916,6 +916,7 @@ class SchedulerBatchResultProcessor:
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
+        self.metrics_reporter.mark_idle()
 
     def process_batch_result_decode(
         self,

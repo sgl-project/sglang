@@ -224,6 +224,12 @@ class SchedulerMetricsReporter:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
+        # s of decode-step wall time since the last decode log
+        self.decode_step_time_acc = 0.0
+        # s of idle / non-decode wall time since the last decode log
+        self.decode_gap_time_acc = 0.0
+        # end of the last accounted scheduler event
+        self._step_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -644,6 +650,21 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.decode_step_time_acc = 0.0
+        self.decode_gap_time_acc = 0.0
+        self._step_tic = time.perf_counter()
+
+    def _account_step_time(self, is_decode: bool) -> None:
+        now = time.perf_counter()
+        elapsed = now - self._step_tic
+        self._step_tic = now
+        if is_decode:
+            self.decode_step_time_acc += elapsed
+        else:
+            self.decode_gap_time_acc += elapsed
+
+    def mark_idle(self) -> None:
+        self._account_step_time(is_decode=False)
 
     def report_prefill_stats(
         self,
@@ -652,6 +673,7 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        self._account_step_time(is_decode=False)
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled
@@ -836,6 +858,7 @@ class SchedulerMetricsReporter:
         running_batch: ScheduleBatch = None,
         num_generated_tokens: int = 0,
     ):
+        self._account_step_time(is_decode=True)
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
@@ -874,6 +897,10 @@ class SchedulerMetricsReporter:
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        step_ms = self.decode_step_time_acc / self.decode_log_interval * 1000
+        gap_ms = self.decode_gap_time_acc * 1000
+        self.decode_step_time_acc = 0.0
+        self.decode_gap_time_acc = 0.0
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -968,6 +995,9 @@ class SchedulerMetricsReporter:
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            # step-ms: decode-step wall time only; gap-ms: idle/prefill wall
+            # time in this window.
+            f"step-ms: {step_ms:.1f}, gap-ms: {gap_ms:.1f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
 
