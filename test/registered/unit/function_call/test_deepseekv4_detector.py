@@ -264,6 +264,62 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
                 self.assertEqual(json.loads(result.calls[0].parameters), arguments)
                 self.assertNotIn(DSML, result.normal_text)
 
+    def test_truncated_or_malformed_tag_is_stripped(self):
+        """A tag the model mangles must not survive into content.
+
+        Observed from a live server: the model emitted
+        `<｜DSML｜tool_calls|` (ASCII pipe, no closing `>`) alongside a
+        valid invoke. The call parses, but the broken opener was still
+        being returned as content.
+        """
+        mangled = f"<{DSML}tool_calls|"
+        result = self._parse(
+            f"{mangled}\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+            + f"\n</{DSML}tool_calls>"
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_stripping_does_not_eat_surrounding_prose(self):
+        """The strip must remove tags only, never the text around them."""
+        result = self._parse(
+            f"Before. <{DSML}tool_calls| After.\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+        )
+
+        self.assertNotIn(DSML, result.normal_text)
+        self.assertIn("Before.", result.normal_text)
+        self.assertIn("After.", result.normal_text)
+
+    def test_streaming_still_emits_a_malformed_opener_as_content(self):
+        """Known limitation: the streaming path is not covered by this fix.
+
+        Observed against a live server. The model emitted
+        `<｜DSML｜tool_calls|` (ASCII pipe, no closing `>`) before a valid
+        invoke. Non-streaming strips it; the streaming path has no
+        equivalent strip, so it still reaches `delta.content`. Recorded
+        here so the asymmetry is visible rather than surprising, and so
+        the test starts failing if the streaming path is ever fixed.
+        """
+        detector = DeepSeekV4Detector()
+        text = (
+            f"<{DSML}tool_calls|\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+            + f"\n</{DSML}tool_calls>"
+        )
+        normal = ""
+        for start in range(0, len(text), 8):
+            normal += detector.parse_streaming_increment(
+                text[start : start + 8], self.tools
+            ).normal_text
+
+        # Non-streaming removes it.
+        self.assertNotIn(DSML, self._parse(text).normal_text)
+        # Streaming does not, yet.
+        self.assertIn(DSML, normal)
+
 
 class TestDeepSeekV32SharesTheFix(CustomTestCase):
     """`deepseekv32` inherits the same base, so it must gain the fix too.
