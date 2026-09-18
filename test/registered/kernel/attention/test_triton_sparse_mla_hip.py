@@ -33,15 +33,15 @@ _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
 def test_cu_count_uses_tensor_device(monkeypatch):
     requested = []
 
-    class Properties:
-        multi_processor_count = 123
-
-    def get_device_properties(device):
+    def get_device_core_count(device):
         requested.append(device)
-        return Properties()
+        return 123
 
     _cu_count_for_device.cache_clear()
-    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsa.triton_sparse_mla.get_device_core_count",
+        get_device_core_count,
+    )
     monkeypatch.setattr(
         torch.cuda,
         "current_device",
@@ -97,8 +97,8 @@ def test_gfx950_launch_config():
 
 def test_gfx950_fp8_gate_supports_tp8_prefill(monkeypatch):
     monkeypatch.setattr(
-        "sglang.kernels.ops.attention.dsa.triton_sparse_mla._is_gfx950_device",
-        lambda _device: True,
+        "sglang.kernels.ops.attention.dsa.triton_sparse_mla.is_gfx95_supported",
+        lambda: True,
     )
     for heads in (8, 16):
         assert _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, heads, 512, 64, 576)

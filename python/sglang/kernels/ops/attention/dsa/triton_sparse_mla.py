@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import get_device_core_count, is_gfx95_supported
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
 _IS_FNUZ = is_fp8_fnuz()
@@ -130,7 +131,7 @@ def _device_index(device: torch.device | int | None = None) -> int:
 
 @functools.lru_cache(maxsize=None)
 def _cu_count_for_device(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+    return get_device_core_count(device_index)
 
 
 def _cu_count(device: torch.device | int | None = None) -> int:
@@ -199,20 +200,12 @@ def _kv_splits_heuristic(
     return _prev_pow2(min(splits_to_fill, max_kv_splits))
 
 
-@functools.lru_cache(maxsize=None)
-def _is_gfx950_device(device: int) -> bool:
-    properties = torch.cuda.get_device_properties(device)
-    arch = getattr(properties, "gcnArchName", "") or ""
-    return arch.split(":", 1)[0] == "gfx950"
-
-
 def _is_gfx950_sparse_mla_fp8(
     kv_dtype: torch.dtype,
     H: int,
     d_v: int,
     d_tail: int,
     kv_dim: int,
-    device: torch.device | int | None = None,
 ) -> bool:
     """Gate for gfx950 FP8 prefill tuning in the TP4/TP8 DSA shapes."""
     return (
@@ -221,7 +214,7 @@ def _is_gfx950_sparse_mla_fp8(
         and d_v == 512
         and d_tail == 64
         and kv_dim == 576
-        and _is_gfx950_device(_device_index(device))
+        and is_gfx95_supported()
     )
 
 
@@ -1075,9 +1068,7 @@ def _triton_sparse_mla_fwd_splitk(
     h_padded = n_head_blocks * BLOCK_H
     num_cu = _cu_count(q_nope.device)
     base_ctas = seq * n_head_blocks
-    optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
-        kv.dtype, H, d_v, d_tail, kv_dim, q_nope.device
-    )
+    optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(kv.dtype, H, d_v, d_tail, kv_dim)
 
     num_groups = d_v // 128
     assert num_groups <= 4, (
@@ -1227,7 +1218,7 @@ def triton_sparse_mla_fwd(
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
     optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
-        kv.dtype, H, d_v, q_rope.shape[-1], kv.shape[-1], q_nope.device
+        kv.dtype, H, d_v, q_rope.shape[-1], kv.shape[-1]
     )
     use_topk_length = (
         optimize_gfx950_fp8
