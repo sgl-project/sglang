@@ -1329,14 +1329,11 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     ) -> bool:
         """Price the pair on the float chain's grid, then against the budgets.
 
-        `full_available_size()` and `swa_available_size()` are both backed by
-        the shared gap (each takes `schedulable_available_size()`, which
-        credits the peer's drainable holes), so comparing each against its own
-        budget double-counts those bytes: two asks that fit alone can fail
-        together. `alloc_extend_swa_tail` prices them jointly, and its failure
-        surfaces at `_pre_alloc`'s `kv_loc is not None` assert rather than at
-        admission, so the joint check belongs here too. The budgets still
-        apply -- they carry decode headroom this allocator cannot see.
+        Each side's `available_size` takes `schedulable_available_size()`,
+        which credits the peer's drainable holes, so the two are backed by the
+        same bytes and a pair that fits each side alone can fail together. The
+        budgets still apply on top: they carry decode headroom this allocator
+        cannot see.
         """
         page_size = self.page_size
         if not self._fits_page_demand(
