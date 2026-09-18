@@ -830,6 +830,12 @@ async def server_info():
     after publication -- the model a weight update swapped in, its load format,
     an operator-set weight version -- are reported by `/model_info`, and the
     HiCache mirror by `GET /hicache/storage-backend`.
+
+    `effective_max_running_requests` is the minimum available per-DP
+    scheduler limit after memory-pool sizing. It describes per-worker
+    capacity; individual rank limits remain in `internal_states`.
+    The field is omitted when no rank reports an effective limit, and
+    `max_running_requests` retains its startup configuration value.
     """
     # Returns internal states per DP.
     internal_states: List[
@@ -851,9 +857,6 @@ async def server_info():
         "kv_events": describe_kv_events_publisher(server_args),
     }
 
-    # `max_running_requests` is the requested startup value. Hybrid models
-    # can reduce it after sizing the Mamba/linear-attention state cache, so
-    # expose the value the scheduler can actually serve at the top level too.
     effective_values = [
         state["effective_max_running_requests_per_dp"]
         for state in internal_states
