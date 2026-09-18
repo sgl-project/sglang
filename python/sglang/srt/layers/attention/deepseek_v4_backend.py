@@ -3253,7 +3253,7 @@ class DeepseekV4AttnBackend(
             start += lc
         empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=device)
         num_tokens = pos.shape[0]
-        # TODO: move this to candidate indexer
+        # TODO(candidate): move this to candidate indexer
         if not slot_chunks or num_tokens == 0:
             if indexer.is_candidate_source:
                 self.forward_metadata.candidate_metadata = CandidateMasks(

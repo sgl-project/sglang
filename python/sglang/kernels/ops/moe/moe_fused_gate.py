@@ -330,7 +330,8 @@ def moe_fused_gate(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    Mirrors :func:`moe_fused_gate_jit` (the CUDA JIT kernel) for the shared
+    parameters; the keyword-only extras are Triton-only.
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). ``scores`` contains raw GEMM logits.

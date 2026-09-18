@@ -190,7 +190,7 @@ class PagedIndexerMetadata:
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
         assert self.page_size % self.compress_ratio == 0, (
-            f"{self.page_size = } must divide {self.compress_ratio = }"
+            f"compress_ratio {self.compress_ratio} must divide page_size {self.page_size}"
         )
 
     @property
