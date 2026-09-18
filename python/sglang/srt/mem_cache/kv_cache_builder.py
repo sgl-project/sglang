@@ -265,8 +265,8 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
+    # component (match + lock + CoW), the same path as colocated serving.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -295,12 +295,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            logger.warning(
-                "--disaggregation-decode-enable-radix-cache with a hybrid "
-                "SSM/KDA model uses UnifiedRadixCache's Mamba component; "
-                "prefix-match-and-lock of recurrent state is experimental."
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
