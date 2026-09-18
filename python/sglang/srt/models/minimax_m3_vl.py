@@ -142,7 +142,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
-        # For EAGLE3 support
+        # For EAGLE3 auxiliary hidden-state capture.
         self.capture_aux_hidden_states = False
 
     @classmethod
@@ -226,6 +226,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             ]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # MiniMaxM3Model.forward checks this per-layer marker rather than
+        # membership in layers_to_capture.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

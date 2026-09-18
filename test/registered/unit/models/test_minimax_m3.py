@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 from sglang.srt.models.minimax_m3 import MiniMaxM3DecoderLayer
+from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -79,6 +80,44 @@ class TestMiniMaxM3DecoderLayer(CustomTestCase):
             should_allreduce_fusion=False,
             use_reduce_scatter=True,
         )
+
+
+class TestMiniMaxM3VlEagle3Capture(CustomTestCase):
+    @staticmethod
+    def _model(num_layers=60):
+        layers = [SimpleNamespace() for _ in range(num_layers)]
+        return SimpleNamespace(
+            pp_group=SimpleNamespace(is_last_rank=True),
+            capture_aux_hidden_states=False,
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(num_hidden_layers=num_layers)
+            ),
+            model=SimpleNamespace(layers=layers, layers_to_capture=[]),
+        )
+
+    def test_default_capture_layers_keep_legacy_indices(self):
+        model = self._model()
+
+        MiniMaxM3SparseForConditionalGeneration.set_eagle3_layers_to_capture(model)
+
+        self.assertEqual(model.model.layers_to_capture, [2, 30, 57])
+        self.assertEqual(
+            [
+                i
+                for i, layer in enumerate(model.model.layers)
+                if getattr(layer, "_is_layer_to_capture", False)
+            ],
+            [2, 30, 57],
+        )
+
+    def test_explicit_capture_layers_apply_output_offset(self):
+        model = self._model()
+
+        MiniMaxM3SparseForConditionalGeneration.set_eagle3_layers_to_capture(
+            model, [1, 29, 56]
+        )
+
+        self.assertEqual(model.model.layers_to_capture, [2, 30, 57])
 
 
 if __name__ == "__main__":

@@ -447,13 +447,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            if forward_batch.forward_mode.is_target_verify():
+                # TARGET_VERIFY keeps seq_lens at the committed prefix and
+                # writes draft_token_num new KV entries after it.
+                spec_info = getattr(forward_batch, "spec_info", None)
+                if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+                    self._max_seqlen_k += int(spec_info.draft_token_num)
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -1368,7 +1374,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
 
-    def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
+    def _resolve_extend_meta(
+        self,
+        forward_batch: ForwardBatch,
+        q: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+    ):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
         # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
@@ -1396,23 +1407,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             m = self._extend_meta
             return m.cu_seqlens, m.seq_lens, m.prefix_lens
 
+        resolved_extend_seq_lens = (
+            forward_batch.extend_seq_lens if self.is_npu else extend_seq_lens
+        )
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
+                    1, dtype=torch.int32, device=resolved_extend_seq_lens.device
                 ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                resolved_extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
+        base_seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if forward_batch.forward_mode.is_target_verify() and not self.is_npu:
+            # EAGLE TARGET_VERIFY leaves seq_lens at the committed prefix. The
+            # draft tokens are written after it, so sparse attention needs the
+            # pre-write prefix and post-write total KV lengths separately.
+            prefix_lens = base_seq_lens
+            seq_lens = base_seq_lens + resolved_extend_seq_lens
+        elif forward_batch.extend_prefix_lens is not None:
+            seq_lens = base_seq_lens
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
-        elif forward_batch.forward_mode.is_target_verify():
-            # TARGET_VERIFY: the part cached before the draft tokens.
-            # prefix_lens + extend_seq_lens == seq_lens must hold.
-            prefix_lens = seq_lens - forward_batch.extend_seq_lens.to(torch.int32)
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            seq_lens = base_seq_lens
+            prefix_lens = (
+                torch.zeros_like(seq_lens)
+                if self.is_npu
+                else seq_lens - resolved_extend_seq_lens
+            )
 
         # NPU cache write.
         if self.is_npu:
@@ -1466,6 +1488,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             extend_seq_lens = forward_batch.extend_seq_lens
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
 
+        if forward_batch.extend_seq_lens_cpu is None:
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+
         disable_value = layer.layer_id in self.disable_value_layer_ids
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
@@ -1493,7 +1518,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cached = self._prefill_seqblock_meta
         if cached is None or cached[0] is not forward_batch:
             cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
-                forward_batch, q
+                forward_batch, q, extend_seq_lens
             )
             if self.is_npu:
                 cu_seqblocks_q = max_seqblock_q = all_seqblock_q = None
