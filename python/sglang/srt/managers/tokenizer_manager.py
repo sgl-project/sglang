@@ -1485,7 +1485,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.fake_bootstrap_room_counter += 1
 
             tokenized_obj = TokenizedGenerateReqInput(
-                prefill_uncached_fraction=getattr(obj, "prefill_uncached_fraction", 1.0),
+                prefill_uncached_fraction=getattr(
+                    obj, "prefill_uncached_fraction", 1.0
+                ),
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -3609,7 +3611,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             if envs.SGLANG_TRUST_PREFILL_COST_HEADER.get() and request:
-                from sglang.srt.disaggregation.decode_hrrn import parse_uncached_fraction
+                from sglang.srt.disaggregation.decode_hrrn import (
+                    parse_uncached_fraction,
+                )
 
                 sub_obj.prefill_uncached_fraction = parse_uncached_fraction(
                     request.headers.get("x-smg-prefill-uncached-fraction")
