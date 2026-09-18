@@ -1336,6 +1336,11 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    if getattr(draft_token_to_kv_pool, "_pd_dflash_full_kv", False):
+        from sglang.srt.disaggregation.dflash_kv import draft_transfer_buffers
+
+        dp, dl, il = draft_transfer_buffers(draft_token_to_kv_pool, kv_args.page_size)
+        append_state_component(kv_args, StateType.DFLASH_KV, dp, dl, il)
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)

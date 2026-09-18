@@ -86,7 +86,20 @@ def get_draft_kv_pool(
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
+    pool = draft_runner.token_to_kv_pool
+    if (
+        spec_algorithm.is_dflash()
+        and get_disagg().disaggregation_transfer_backend == "nixl"
+    ):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        if isinstance(pool, MHATokenToKVPool):
+            # This pool consumes raw logical target locations, not DCP-local ones.
+            pool._pd_dflash_full_kv = True
+            pool._pd_dflash_window = getattr(
+                draft_runner.model_config.hf_text_config, "sliding_window", None
+            )
+    return pool
 
 
 def maybe_register_hicache_draft(
