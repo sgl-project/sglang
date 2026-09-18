@@ -92,7 +92,14 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         npu_ops = MagicMock()
         npu_ops.npu_dynamic_mx_quant.return_value = (quantized, input_scale)
         npu_ops.npu_quant_matmul.return_value = matmul_output
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        with (
+            patch.object(torch.ops, "npu", npu_ops, create=True),
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.linear_method_npu.torch_npu",
+                npu_ops,
+                create=True,
+            ),
+        ):
             output = npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,
@@ -133,7 +140,14 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         )
         npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
 
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        with (
+            patch.object(torch.ops, "npu", npu_ops, create=True),
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.linear_method_npu.torch_npu",
+                npu_ops,
+                create=True,
+            ),
+        ):
             npu_w8a8_mxfp8_linear(input_tensor, weight, [128, 128], weight_scale)
 
         self.assertEqual(
@@ -153,7 +167,14 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         )
         npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
 
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        with (
+            patch.object(torch.ops, "npu", npu_ops, create=True),
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.linear_method_npu.torch_npu",
+                npu_ops,
+                create=True,
+            ),
+        ):
             npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,

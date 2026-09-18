@@ -10,6 +10,11 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    import torch_npu
+
 
 class BaseHiddenStatesQuant(ABC):
     """Abstract base for NPU hidden state quantisation."""
@@ -40,7 +45,7 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
         if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
-            self._op = torch.ops.npu.npu_dynamic_quant
+            self._op = torch_npu.npu_dynamic_quant
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
 
