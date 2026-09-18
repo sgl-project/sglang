@@ -468,13 +468,9 @@ class _GenerationStreamAccumulator:
         self.beam_search_output.append(beam_output)
 
         if not self.rust_server_mode:
-            # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics)
-            # or gets pickled into the payload (time_stats). The Rust server
-            # replaces those stages and builds its own metadata from the
-            # ChunkEvent, so `push_generation` never reads these — skip the whole
-            # block. The parallel lists stay empty; the payload goes straight to
-            # `push_generation`, which only indexes the fields appended above.
+            # Rust detokenizes and counts output tokens itself. Keep only the
+            # Python detokenizer's inputs here; scheduler statistics below feed
+            # both frontends.
             self.http_worker_ipcs.append(req.http_worker_ipc)
             self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
@@ -486,16 +482,14 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
                 else len(output_ids_)
             )
-            self.cached_tokens.append(req.cached_tokens)
-
-            # Collect detailed cache breakdown if available
-            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
+        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer

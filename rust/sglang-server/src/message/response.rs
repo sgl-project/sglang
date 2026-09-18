@@ -3,6 +3,8 @@
 //! (batch / control result / error), and the columnar batch decode into
 //! per-request [`ChunkEvent`]s.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -119,9 +121,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
-/// `RustTokenizerManager.push_generation`'s `header_cols` in
+/// required; trailing fields default empty for older producers. New producers
+/// include the scheduler statistics even without logprob/hidden columns.
+/// Field order is the wire ABI and must match `RustServer.push_generation` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
 /// Field names follow `direction_family_shape`:
@@ -164,6 +166,16 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default)]
+    pub cached_tokens: Vec<u64>,
+    #[serde(default)]
+    pub cached_tokens_details: Vec<Option<BTreeMap<String, CacheDetailValue>>>,
+    #[serde(default)]
+    pub reasoning_tokens: Vec<u64>,
+    #[serde(default)]
+    pub retraction_counts: Vec<u64>,
+    #[serde(default)]
+    pub dp_ranks: Vec<Option<u32>>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -263,6 +275,19 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // and its unary drain pended forever. The producer already asserts this for the
     // extras columns; the four core ones were unchecked.
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+        reject!()
+    }
+    // A snapshot is all-or-nothing. Null details/ranks are entries, not absent
+    // columns; accepting a partial snapshot would fabricate metadata defaults.
+    let stats_lengths = [
+        h.cached_tokens.len(),
+        h.cached_tokens_details.len(),
+        h.reasoning_tokens.len(),
+        h.retraction_counts.len(),
+        h.dp_ranks.len(),
+    ];
+    let has_stats = stats_lengths.iter().any(|&len| len != 0);
+    if has_stats && stats_lengths.iter().any(|&len| len != n) {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -449,6 +474,13 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
+            stats: has_stats.then(|| GenerationStats {
+                cached_tokens: h.cached_tokens[i],
+                cached_tokens_details: h.cached_tokens_details[i].take(),
+                reasoning_tokens: h.reasoning_tokens[i],
+                num_retractions: h.retraction_counts[i],
+                dp_rank: h.dp_ranks[i],
+            }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
             // until it is actually decoded. With the struct-update syntax it
@@ -556,10 +588,34 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Latest scheduler snapshot, independent of per-step token/logprob deltas.
+    /// None for older producers or synthetic events without updated statistics.
+    pub stats: Option<GenerationStats>,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
     pub extras: Option<Box<ChunkExtras>>,
+}
+
+/// Scheduler-owned cumulative counts and cache/routing state. Replaced as one
+/// snapshot, never summed. Nullable fields remain present in native metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GenerationStats {
+    pub cached_tokens: u64,
+    pub cached_tokens_details: Option<BTreeMap<String, CacheDetailValue>>,
+    pub reasoning_tokens: u64,
+    pub num_retractions: u64,
+    pub dp_rank: Option<u32>,
+}
+
+/// Values admitted by Python's cache breakdown: counts, backend names, or null.
+/// Keep every key, including backend-specific details, without opaque JSON data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CacheDetailValue {
+    Count(u64),
+    Text(String),
+    Null,
 }
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
@@ -622,6 +678,121 @@ impl ChunkExtras {
 mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
+
+    /// Captured from RustServer.push_generation using the Python CPU test's
+    /// two-request payload (details=true, rank=1), encoded by msgspec.
+    #[test]
+    fn decodes_python_statistics_header() {
+        let header =
+            b"\xdc\x00\x15\x92\xa1\x30\xa1\x31\x92\xc0\xc0\x92\x02\x02\x92\x01\x01\x90\x90\x90\
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x92\x00\x07\x92\xc0\x84\xa6\x64\x65\x76\x69\
+\x63\x65\x03\xa4\x68\x6f\x73\x74\x02\xa7\x73\x74\x6f\x72\x61\x67\x65\x02\xaf\x73\
+\x74\x6f\x72\x61\x67\x65\x5f\x62\x61\x63\x6b\x65\x6e\x64\xa4\x74\x65\x73\x74\x92\
+\x00\x04\x92\x00\x02\x92\x01\x01";
+        let frame = frame_decode_batch_cols(header, &[&3i32.to_le_bytes(), &3i32.to_le_bytes()]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+        assert_eq!(events.len(), 2);
+        let empty = events[0].stats.as_ref().unwrap();
+        assert_eq!(
+            (empty.cached_tokens, empty.reasoning_tokens, empty.dp_rank),
+            (0, 0, Some(1))
+        );
+        assert!(empty.cached_tokens_details.is_none());
+        let stats = events[1].stats.as_ref().unwrap();
+        assert_eq!(
+            (
+                stats.cached_tokens,
+                stats.reasoning_tokens,
+                stats.num_retractions
+            ),
+            (7, 4, 2)
+        );
+        assert_eq!(
+            serde_json::to_value(&stats.cached_tokens_details).unwrap(),
+            serde_json::json!({"device":3,"host":2,"storage":2,"storage_backend":"test"})
+        );
+        assert_eq!(events[1].token_ids, vec![3]);
+    }
+
+    #[test]
+    fn statistics_columns_are_complete_and_typed() {
+        let header = BatchHeader {
+            rids: vec!["a".into(), "b".into()],
+            finish_reasons: vec![None, None],
+            prompt_tokens: vec![2, 3],
+            tok_lens: vec![0, 0],
+            cached_tokens: vec![0, 7],
+            cached_tokens_details: vec![
+                None,
+                Some([("device".into(), CacheDetailValue::Count(7))].into()),
+            ],
+            reasoning_tokens: vec![0, 4],
+            retraction_counts: vec![0, 2],
+            dp_ranks: vec![None, Some(1)],
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec(&header).unwrap();
+        let columns: Vec<rmpv::Value> = rmp_serde::from_slice(&bytes).unwrap();
+        for extras in [false, true] {
+            let mut columns = columns.clone();
+            let data = if extras {
+                columns[4] = rmpv::Value::Array(vec![1.into(), 0.into()]);
+                [(-0.5f32).to_le_bytes(), 42i32.to_le_bytes()].concat()
+            } else {
+                Vec::new()
+            };
+            let mut events = Vec::new();
+            let bytes = rmp_serde::to_vec(&columns).unwrap();
+            let frame = frame_decode_batch_cols(&bytes, &[&data]);
+            assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+            assert_eq!(events[0].stats, Some(GenerationStats::default()));
+            let stats = events[1].stats.as_ref().unwrap();
+            assert_eq!(
+                (
+                    stats.cached_tokens,
+                    stats.reasoning_tokens,
+                    stats.num_retractions,
+                    stats.dp_rank
+                ),
+                (7, 4, 2, Some(1))
+            );
+            assert_eq!(
+                stats.cached_tokens_details.as_ref().unwrap()["device"],
+                CacheDetailValue::Count(7)
+            );
+            assert_eq!(events[0].extras.is_some(), extras);
+
+            // Existing four-/sixteen-column producers remain readable, without
+            // inventing statistics; extras still consume the same raw buffers.
+            let old = rmp_serde::to_vec(&columns[..if extras { 16 } else { 4 }]).unwrap();
+            let frame = frame_decode_batch_cols(&old, &[&data]);
+            assert!(for_each_chunk(&frame[1..], |event| assert!(event.stats.is_none())).ok);
+
+            for column in 16..21 {
+                for invalid in [
+                    rmpv::Value::Nil,
+                    rmpv::Value::Array(vec![]),
+                    rmpv::Value::Array(vec![0.into()]),
+                    rmpv::Value::Array(vec![true.into(), false.into()]),
+                ] {
+                    let mut malformed = columns.clone();
+                    malformed[column] = invalid;
+                    let bytes = rmp_serde::to_vec(&malformed).unwrap();
+                    let frame = frame_decode_batch_cols(&bytes, &[&data]);
+                    let decoded =
+                        for_each_chunk(&frame[1..], |_| panic!("partial statistics were routed"));
+                    assert!(!decoded.ok, "column {column}");
+                    assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
+                }
+            }
+            for count in 17..21 {
+                let bytes = rmp_serde::to_vec(&columns[..count]).unwrap();
+                let frame = frame_decode_batch_cols(&bytes, &[&data]);
+                assert!(!for_each_chunk(&frame[1..], |_| panic!("partial header")).ok);
+            }
+        }
+    }
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {
@@ -1157,13 +1328,13 @@ mod tests {
         assert_ne!(events[0].rid, events[1].rid);
     }
 
-    /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// Common statistics stay inline (56 bytes); rare logprob/hidden columns
+    /// remain boxed. Avoid an allocation for every ordinary scheduler snapshot.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 200,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
