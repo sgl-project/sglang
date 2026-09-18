@@ -4892,9 +4892,12 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
-                # Storage workers need the GIL between I/O calls. Yield while
-                # there is no GPU batch so polling cannot starve their acks.
+            if (
+                self.enable_hicache_storage
+                or self.disaggregation_mode != DisaggregationMode.NULL
+            ):
+                # Storage and transfer workers need the GIL between I/O calls.
+                # Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
