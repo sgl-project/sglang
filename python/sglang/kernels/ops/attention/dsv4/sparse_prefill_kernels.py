@@ -74,7 +74,7 @@ def _combine_topk_swa_indices_kernel(
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         pos = tl.load(query_pos_ptr + token_idx)
-        # Candidate filtering can leave -1 holes within the top-k span.
+        # -1 entries inside the top-k span stay -1 (attention skips them).
         # top_k=0 disables the compressed portion for SWA-only layers.
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)

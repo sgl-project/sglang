@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -88,6 +89,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def last_shared_read_runner(self):
@@ -391,6 +398,24 @@ class TpModelWorker(BaseTpWorker):
             self.random_seed = random_seed
         elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
+        elif (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and get_parallel().pp_size > 1
+        ):
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead — that is exactly
+            # the set of ranks holding a draft worker. The draft worker is
+            # constructed with pp_rank=0, so derive the caller's global rank
+            # from the TP group rather than tp_size * pp_rank + tp_rank.
+            tp_group = self.model_runner.tp_group
+            self.random_seed = broadcast_pyobj(
+                [get_device().random_seed],
+                tp_group.ranks[self.ps.tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
@@ -445,6 +470,18 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode cuda graphs for all model runners (used
+        for the on-flip capture during a runtime PD role switch)."""
+        self.model_runner.ensure_decode_cuda_graphs(capture_bs)
+        for mr in self.model_runner_list[1:]:
+            mr.ensure_decode_cuda_graphs(capture_bs)
+
+    def get_decode_cuda_graph_bs(self) -> List[int]:
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill,
+        or on a runner that never allocates a KV pool, e.g. the MLX stub)."""
+        return list(getattr(self.model_runner, "decode_cuda_graph_capture_bs", []))
 
     def start_startup_weight_load(self) -> None:
         """Start deferred checkpoint prefetching for all model runners."""

@@ -153,7 +153,7 @@ def pair_pool_decode(
     Returns `(pooled, group_pos, slots)` and updates `state_kv` / `state_score`
     in place. With ring_size > 0, the state halves may be views of an interleaved
     CompressStatePool ring; pad_row is its sentinel row and stays untouched.
-    The default retains the legacy single-row-per-request state contract.
+    Otherwise the state is one row per request.
     """
     assert kv.is_contiguous() and score.is_contiguous()
     assert state_kv.stride(1) == state_score.stride(1) == 1

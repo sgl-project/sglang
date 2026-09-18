@@ -6,11 +6,13 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     _CompressedPoolConfig,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -177,6 +179,69 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertEqual(pool.get_index_k_page_size(4), 32)
         with self.assertRaisesRegex(AssertionError, "No indexer pool"):
             pool.get_index_k_page_size(128)
+
+
+class TestPagedDSparkWithEncoderReplay(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+            speculative_dspark_block_size=5,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_pool(self, *, draft):
+        return DeepSeekV4TokenToKVPool(
+            max_num_reqs=2,
+            num_req_slots=3,
+            swa_size=1024,
+            c4_size=0,
+            c128_size=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            page_size=256,
+            swa_page_size=256,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.bfloat16,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 0, 0],
+            online_mtp_max_draft_tokens=6,
+            full_size=2048,
+            is_draft_worker=draft,
+        )
+
+    def test_target_window_and_draft_paged_storage_share_allocator_mapping(self):
+        target = self.make_pool(draft=False)
+        draft = self.make_pool(draft=True)
+        self.assertIsNotNone(target.request_window)
+        self.assertIsNone(target.swa_kv_pool)
+        self.assertIsNone(draft.request_window)
+        self.assertEqual(len(draft.swa_kv_pool.kv_buffer), 3)
+        self.assertTrue(target.needs_paged_swa_allocator)
+        self.assertTrue(draft.needs_paged_swa_allocator)
+        allocator = SWATokenToKVPoolAllocator(
+            2048, 1024, 256, torch.float8_e4m3fn, "cpu", target, False
+        )
+        draft.register_mapping(allocator.full_to_swa_index_mapping)
+        allocator.full_to_swa_index_mapping[256:512] = torch.arange(768, 1024)
+        self.assertEqual(
+            draft.translate_loc_from_full_to_swa(
+                torch.tensor([256, 300, 511])
+            ).tolist(),
+            [768, 812, 1023],
+        )
 
 
 if __name__ == "__main__":

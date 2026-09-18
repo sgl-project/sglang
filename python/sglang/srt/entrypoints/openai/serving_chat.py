@@ -109,6 +109,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
+from sglang.srt.utils import ImageData
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -350,7 +351,6 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.chat_encoding_spec == "dsv41"
             else None
         )
-        self._dsv41_unsupported_efforts_warned: set = set()
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
@@ -699,15 +699,11 @@ class OpenAIServingChat(OpenAIServingBase):
         return parsed
 
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
-        """Request effort for the V4.1 encoder; unsupported tiers warn once and fall back."""
-        effort = chat_encoding.resolve_dsv41_reasoning_effort(value)
+        """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
+        effort = chat_encoding.parse_dsv41_reasoning_effort(value)
         if effort is not None:
             return effort
-        if (
-            value is not None
-            and repr(value) not in self._dsv41_unsupported_efforts_warned
-        ):
-            self._dsv41_unsupported_efforts_warned.add(repr(value))
+        if value is not None and value != "none":
             logger.warning(
                 "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
                 "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
@@ -1442,16 +1438,13 @@ class OpenAIServingChat(OpenAIServingBase):
             # dsv4/dsv41/dsv32 encoding path
             messages = copy.deepcopy(messages)
             is_dsv41 = self.chat_encoding_spec == "dsv41"
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
 
-            if is_dsv41:
-                # The V4.1 encoder consumes OpenAI parts lists itself (image
-                # parts become placeholders), so no flattening here.
-                for msg in messages:
-                    if msg.get("content") is None:
-                        msg["content"] = ""
-            else:
-                # dsv4/dsv32 are text-only and consume string content; flatten
-                # OpenAI parts-list content here so the encoder sees a plain string.
+            # The V4.1 encoder consumes OpenAI parts lists itself; dsv4/dsv32
+            # are text-only, so their parts-list content is flattened first.
+            if not is_dsv41:
                 for i, msg in enumerate(messages):
                     if isinstance(msg.get("content"), list):
                         messages[i] = process_content_for_template_format(
@@ -1459,8 +1452,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                 for msg in messages:
-                    if msg.get("content") is None:
-                        msg["content"] = ""
                     processed_msg = process_content_for_template_format(
                         msg,
                         template_content_format,
@@ -1477,9 +1468,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
-            # An empty system message hosts the request tools. dsv4/dsv32 render
-            # it to nothing, so they always insert one; dsv41 renders a system
-            # token for it, so it only gets one when tools need the host.
+            # An empty system message hosts the request tools; dsv41 renders a
+            # system token for it, so it only gets one when tools need the host.
             if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
@@ -1534,12 +1524,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 if media["images"]:
                     if not is_multimodal:
                         raise ValueError("image input is not supported for this model")
-                    image_data.extend(image["url"] for image in media["images"])
+                    image_data.extend(
+                        ImageData(url=image["url"]) for image in media["images"]
+                    )
                     tokenizer = self.tokenizer_manager.tokenizer
                     real_input = real_input.replace(
                         encoding_dsv41.IMAGE_PLACEHOLDER,
                         tokenizer.convert_ids_to_tokens(
-                            self.tokenizer_manager.model_config.hf_config.image_token_id
+                            self.tokenizer_manager.image_token_id
                         ),
                     )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)

@@ -1239,6 +1239,53 @@ class TestSWAPoolFloor(CustomTestCase):
             + cfg._get_c128_state_fixed_bytes(max_running_requests)
         )
 
+    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+            speculative_dspark_block_size=5,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=cfg,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            sliding_window_size=128,
+            page_size=256,
+            spec_algorithm=spec,
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+        )
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
+        self.assertGreater(planner.swa_cap_tokens, 0)
+        budget = 256 * 1024 * 1024
+        sizes = planner.calculate_pool_sizes(budget, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+        self.assertLessEqual(
+            sizes.full_max_total_num_tokens * planner.bytes_per_full_token
+            + planner._get_swa_fixed_bytes(),
+            budget,
+        )
+
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.

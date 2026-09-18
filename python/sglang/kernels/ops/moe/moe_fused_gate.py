@@ -298,10 +298,9 @@ def _router_triton_kernel(
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
     if HAS_PACKED:
-        # FlashInfer routed-MoE packed entry, the exact expression of
-        # _pack_topk_ids_triton_kernel applied in-register to the values stored
-        # above (same fp32 -> bf16 rounding, same -1 sentinel on padded rows),
-        # so it is bitwise identical to the separate pack launch it replaces.
+        # FlashInfer routed-MoE packed entry, bitwise identical to
+        # _pack_topk_ids_triton_kernel: same fp32 -> bf16 rounding, same -1
+        # sentinel on padded rows.
         w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
         packed = (selected_idx << 16) | (w_bits & 0xFFFF)
         out_p_ptr = (
@@ -343,8 +342,7 @@ def moe_fused_gate(
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
     ``packed_out`` ([M, topk] int32, optional) additionally receives the FlashInfer
     routed-MoE form ``(id << 16) | bf16_bits(weight)`` of the returned pair, computed
-    in-register (bitwise the separate ``PackTopkIds`` kernel; the radix fast path is
-    skipped when it is requested).
+    in-register and bitwise identical to the separate ``PackTopkIds`` kernel.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (

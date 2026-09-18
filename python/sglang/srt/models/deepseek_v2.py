@@ -555,11 +555,9 @@ class MoEGate(nn.Module):
         return logits
 
 
-# Fused finalize + shared add + TP all-reduce:
-# batch cap for routing onto the fused kernel. It stages the whole [T, hidden]
-# row view through one CustomAllReduceV2 push slot; 96 rows of 5120 bf16 fit
-# the 1 MiB slot the plane allocates, and larger batches keep the unfused
-# finalize + all-reduce chain (the slot fit itself is re-checked in the gate).
+# Batch cap for the fused finalize + shared add + TP all-reduce: the whole
+# [T, hidden] row view is staged through one CustomAllReduceV2 push slot, and
+# 96 rows of 5120 bf16 fit the 1 MiB slot the plane allocates.
 _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 96
 
 
@@ -1002,10 +1000,6 @@ class DeepseekV2MoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-        # What the routed experts receive as their pre-quantized input: the
-        # quant-once fp8 pair when that is on (also fed to the shared expert),
-        # otherwise the MXFP8 pre-quant issued on routed_quant_stream, whose
-        # layout the shared expert cannot take, or None.
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -1033,9 +1027,8 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
-        # Recorded after the router so the routed MoE's first kernel, which
-        # joins this side stream, keeps the main chain on the main stream at
-        # CUDA-graph replay (the fork point above is unchanged).
+        # Issued after the router so the routed MoE's first kernel, which joins
+        # this side stream, keeps the main chain on the main stream at replay.
         routed_pre_quant_input = pre_quant_input
         if should_quant_routed_input_mxfp8:
             with torch.cuda.stream(self.routed_quant_stream):
@@ -1064,8 +1057,8 @@ class DeepseekV2MoE(nn.Module):
             and self.experts.supports_deferred_finalize
         )
         if deferred_finalize:
-            # carries the routed pre-quant: the apply joins routed_quant_stream on
-            # its event, which the CUDA-graph capture requires
+            # The apply joins routed_quant_stream on the pre-quant's event,
+            # which the CUDA-graph capture requires.
             final_hidden_states = self.experts.forward_deferred_finalize(
                 hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
             )
@@ -1092,8 +1085,7 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        # Joins the shared expert; the routed-input pre-quant on its own stream
-        # was already joined by the event wait inside the routed MoE apply.
+        # The routed-input pre-quant was already joined inside the routed MoE apply.
         current_stream.wait_stream(self.alt_stream)
 
         all_reduce_done = False
@@ -1759,10 +1751,7 @@ class DeepseekV2MoE(nn.Module):
 
     @cached_property
     def _routed_mxfp8_prequant_static_enabled(self) -> bool:
-        """Whether forward_normal_dual_stream may quantize the routed MoE input
-        (MXFP8, linear scale layout) on ``routed_quant_stream`` ahead of
-        Mxfp4FlashinferTrtllmMoEMethod.apply instead of inline on the main
-        stream. Cached per layer; see _compute_routed_mxfp8_prequant_enabled."""
+        """Static (per-layer) half of the routed-input MXFP8 pre-quant gate."""
         return self._compute_routed_mxfp8_prequant_enabled()[0]
 
     def _compute_routed_mxfp8_prequant_enabled(self) -> Tuple[bool, str]:
@@ -1795,13 +1784,12 @@ class DeepseekV2MoE(nn.Module):
         return True, "ok"
 
     def _should_quant_routed_input_mxfp8(self, hidden_states: torch.Tensor) -> bool:
-        """Per-call gate for the routed-input pre-quant on ``routed_quant_stream``:
-        only while the current stream is being captured (this path is
-        capture-only; the graph then replays the side-stream quant and its event
-        join, and the tensors come from the graph pool, so no ``record_stream``
-        is needed), never inside a piecewise TC graph (its MoE op drops
-        ``pre_quant_input``), and only for a non-empty bf16 batch on a layer the
-        static check admits."""
+        """Per-call gate for the routed-input pre-quant on ``routed_quant_stream``.
+
+        Capture-only: the graph replays the side-stream quant and its event join,
+        and the tensors come from the graph pool, so no ``record_stream`` is
+        needed. The piecewise TC graph is excluded because its MoE op drops
+        ``pre_quant_input``."""
         return (
             torch.cuda.is_current_stream_capturing()
             and not is_in_tc_piecewise_cuda_graph()

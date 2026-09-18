@@ -58,7 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -263,7 +263,7 @@ class DSV4AttnMetadata:
         )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
-        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.index_topk == other.index_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
 
@@ -573,7 +573,7 @@ class DeepseekV4HipRadixBackend(
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
@@ -911,6 +911,7 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
+            req_pool_indices_repeated,
             seq_lens,
             extend_seq_lens,
             num_draft_tokens * bs,

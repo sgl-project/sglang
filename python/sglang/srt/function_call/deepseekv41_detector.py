@@ -1,5 +1,16 @@
 from typing import List, Literal, Optional, Union
 
+from xgrammar.structural_tag import (
+    AnyTextFormat,
+    ConstStringFormat,
+    JSONSchemaFormat,
+    OrFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
+
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
@@ -8,7 +19,7 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 class DeepSeekV41Detector(DeepSeekV32Detector):
     """DeepSeek V4.1 DSML detector.
 
-    Tag names have a leading space: " calls", " invoke", and " parameter".
+    The leading space in each tag name below is intentional, not a typo.
     """
 
     tool_calls_block_name = " calls"
@@ -35,24 +46,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         """The builtin "deepseek_v4" shape with the spaced tag names.
 
         Bodies are JSON: xgrammar's "deepseek_xml" body style also hardcodes
-        the unspaced " parameter" name, and the V3.2-lineage parser accepts a
+        the unspaced "parameter" name, and the V3.2-lineage parser accepts a
         JSON body inside an invoke.
         """
-        try:
-            from xgrammar.structural_tag import (
-                AnyTextFormat,
-                ConstStringFormat,
-                JSONSchemaFormat,
-                OrFormat,
-                SequenceFormat,
-                StructuralTag,
-                TagFormat,
-                TagsWithSeparatorFormat,
-                TriggeredTagsFormat,
-            )
-        except ImportError:
-            return None
-
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [

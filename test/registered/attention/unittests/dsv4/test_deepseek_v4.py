@@ -362,6 +362,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
             index_topk=128,
+            present_ratios=(4, 128),
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
@@ -390,6 +391,107 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
         return metadata
+
+    def test_present_ratios_gate_per_ratio_buffers(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+
+        with mock.patch.object(be, "_create_flashmla_metadata", side_effect=object):
+            c4_only = self._make_core_metadata(0)
+            c4_only.present_ratios = (4,)
+            c4_only.index_topk = 512
+            c4_only.c128_page_indices = None
+            c4_only.c128_topk_lengths_clamp1 = None
+            c4_only.init_flashmla_related(is_prefill=True)
+            self.assertTrue(c4_only.has_c4)
+            self.assertFalse(c4_only.has_c128)
+            self.assertEqual(c4_only.sparse_page_indices(4).shape[0], 2)
+            self.assertIsNotNone(c4_only.sparse_raw_indices(4))
+            self.assertIsNone(c4_only.sparse_page_indices(128))
+            self.assertIsNotNone(c4_only.c4_flashmla_metadata)
+            self.assertIsNone(c4_only.c128_flashmla_metadata)
+
+            c128_only = self._make_core_metadata(0)
+            c128_only.present_ratios = (128,)
+            c128_only.index_topk = 512
+            c128_only.c4_topk_lengths_clamp1 = None
+            c128_only.init_flashmla_related(is_prefill=True)
+            self.assertFalse(c128_only.has_c4)
+            self.assertIsNone(c128_only.sparse_page_indices(4))
+            self.assertIsNone(c128_only.sparse_raw_indices(4))
+            self.assertIs(
+                c128_only.sparse_page_indices(128), c128_only.c128_page_indices
+            )
+            self.assertIsNone(c128_only.c4_flashmla_metadata)
+            self.assertIsNotNone(c128_only.c128_flashmla_metadata)
+
+        # Replay metadata must describe the same set of ratios as its source.
+        src = self._make_core_metadata(100)
+        src.present_ratios = (4,)
+        with self.assertRaises(AssertionError):
+            self._make_core_metadata(0).copy_(src)
+        with self.assertRaises(AssertionError):
+            self._make_core_metadata(0).refresh_for_breakable_cuda_graph_replay_(src)
+
+    def test_sparse_topk_accessors_route_by_ratio(self):
+        metadata = self._make_core_metadata(0)
+        page_indices = torch.full((2, 4), 3, dtype=torch.int32)
+        lengths = torch.tensor([1, 2], dtype=torch.int32)
+        raw = torch.full((2, 4), 5, dtype=torch.int32)
+
+        metadata.set_sparse_topk(
+            4, page_indices=page_indices, topk_lengths=lengths, raw_indices=raw
+        )
+        self.assertIs(metadata.sparse_page_indices(4), page_indices)
+        self.assertIs(metadata.sparse_topk_lengths(4), lengths)
+        self.assertIs(metadata.sparse_raw_indices(4), raw)
+
+        metadata.set_sparse_topk(128, page_indices=page_indices, topk_lengths=lengths)
+        self.assertIs(metadata.c128_page_indices, page_indices)
+        self.assertIs(metadata.sparse_topk_lengths(128), lengths)
+        with self.assertRaises(AssertionError):
+            metadata.set_sparse_topk(
+                128, page_indices=page_indices, topk_lengths=lengths, raw_indices=raw
+            )
+        with self.assertRaises(ValueError):
+            metadata.sparse_raw_indices(128)
+        for bad_ratio in (0, 7):
+            with self.assertRaises(ValueError):
+                metadata.sparse_page_indices(bad_ratio)
+            with self.assertRaises(ValueError):
+                metadata.set_sparse_topk(
+                    bad_ratio, page_indices=page_indices, topk_lengths=lengths
+                )
+
+    def test_cp_reindex_slices_present_fields_and_skips_absent_ones(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+
+        metadata = self._make_core_metadata(0)
+        metadata.present_ratios = (4,)
+        metadata.c128_page_indices = None
+        metadata.c128_topk_lengths_clamp1 = None
+        parallel = SimpleNamespace(attn_cp_rank=1, attn_cp_size=2)
+        with mock.patch.object(be, "get_parallel", return_value=parallel):
+            metadata.apply_cp_reindex()
+
+        # Rank 1 of 2 keeps row 1 of every per-token field.
+        self.assertEqual(metadata.seq_lens_casual.tolist(), [8])
+        self.assertEqual(metadata.positions_casual.tolist(), [10])
+        self.assertEqual(metadata.page_table.tolist(), [[3, 4]])
+        self.assertEqual(metadata.swa_page_indices.tolist(), [[13, 14]])
+        self.assertEqual(metadata.swa_topk_lengths.tolist(), [16])
+        self.assertEqual(metadata.c4_topk_lengths_raw.tolist(), [22])
+        self.assertEqual(metadata.c4_topk_lengths_clamp1.tolist(), [24])
+        self.assertIsNone(metadata.c128_page_indices)
+        self.assertIsNone(metadata.c128_topk_lengths_clamp1)
+        # Cache-write locations stay in global logical order.
+        self.assertEqual(metadata.raw_out_loc.tolist(), [5, 6])
+        self.assertEqual(metadata.c4_out_loc.tolist(), [17, 18])
+
+        missing = self._make_core_metadata(0)
+        missing.swa_topk_lengths = None
+        with mock.patch.object(be, "get_parallel", return_value=parallel):
+            with self.assertRaises(AssertionError):
+                missing.apply_cp_reindex()
 
     def test_bcg_is_explicit_and_dsv4_backend_opt_in_only(self):
         from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -691,9 +793,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     "combine_topk_swa_indices",
                     return_value=combined,
                 ) as combine:
-                    cache.ensure_c128(page_indices)
+                    gather = cache.ensure_c128(page_indices)
 
-                self.assertEqual(cache.c128_flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
                 self.assertEqual(combine.call_args.kwargs["topk"], expected_extent)
                 self.assertEqual(
                     combine.call_args.kwargs["topk_indices"].shape,
@@ -718,6 +820,83 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
 
         backend._low_ratio_compress_decode.assert_called_once_with(layer, x, req, pos)
         backend._low_ratio_compress_torch.assert_not_called()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_pair_pool_matches_target_verify_rows(self):
+        from sglang.kernels.ops.attention.dsv4.pair_pool_decode import pair_pool_decode
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+
+        torch.manual_seed(47)
+        bs, verify_rows, ring_size, dim = 2, 6, 8, 512
+        n = bs * verify_rows
+        state = CompressStatePool(
+            size=bs * ring_size,
+            ring_size=ring_size,
+            overlap=False,
+            head_dim=dim,
+            dtype=torch.float32,
+            device="cuda",
+            enable_memory_saver=False,
+            ratio=2,
+        )
+        initial = torch.randn_like(state.kv_score_buffer.kv_score)
+        initial[-1, :dim] = 0
+        initial[-1, dim:] = -torch.inf
+        state.kv_score_buffer.kv_score.copy_(initial)
+        fused_state = initial.clone()
+        reference = object.__new__(DeepseekV4AttnBackend)
+        reference.token_to_kv_pool = SimpleNamespace(
+            get_attention_compress_states=lambda layer_id: state
+        )
+
+        kv, score = (torch.randn(n, dim, device="cuda") for _ in range(2))
+        req = torch.arange(bs, device="cuda", dtype=torch.int64).repeat_interleave(
+            verify_rows
+        )
+        raw_loc = torch.arange(256, 256 + n, device="cuda", dtype=torch.int32)
+
+        for start_pos in (7, 8):
+            with self.subTest(start_pos=start_pos):
+                fused_state.copy_(initial)
+                state.kv_score_buffer.kv_score.copy_(initial)
+                pos = (
+                    torch.arange(start_pos, start_pos + verify_rows, device="cuda")
+                    .repeat(bs)
+                    .to(torch.int64)
+                )
+                out_loc = torch.where(pos % 2 == 1, raw_loc // 2, -1)
+                partner_kv, partner_score = reference._low_ratio_pair_partners(
+                    layer_id=0, kv=kv, score=score, req=req, pos=pos, pad=raw_loc == 0
+                )
+                pairs = torch.stack([partner_kv, kv], dim=1)
+                weights = torch.stack([partner_score, score], dim=1).softmax(dim=1)
+                expected = (
+                    (pairs * weights).sum(dim=1),
+                    torch.where(pos % 2 == 1, pos - 1, pos),
+                    out_loc.clamp_min(0),
+                )
+
+                actual = pair_pool_decode(
+                    kv,
+                    score,
+                    pos,
+                    raw_loc,
+                    out_loc,
+                    req,
+                    fused_state[:, :dim],
+                    fused_state[:, dim:],
+                    fused_state.shape[0] - 1,
+                    ring_size=ring_size,
+                )
+
+                for got, wanted in zip(actual, expected):
+                    torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    fused_state, state.kv_score_buffer.kv_score, rtol=0, atol=0
+                )
 
     def test_ragged_verify_metadata_preserves_low_ratio_row_mapping(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as module

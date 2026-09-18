@@ -1121,9 +1121,9 @@ def prepare_dsv4_runner_inputs(
 def _seed_c4_if_needed(
     fixture: DSV4AttentionFixture, *, num_entries: int | None = None
 ) -> None:
-    """For compress_ratio=4, seed the C4 metadata the exercised path consumes
-    (the C4Indexer would normally populate it; the compact fixture skips the
-    indexer): `c4_sparse_page_indices` for the dense extend path,
+    """For compress_ratio in (1, 2, 4), seed the C4 metadata the exercised path
+    consumes (the indexer would normally populate it; the compact fixture skips
+    it): `c4_sparse_page_indices` for the dense extend path,
     `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
     if fixture.case.compress_ratio not in (1, 2, 4):
@@ -1266,14 +1266,10 @@ def _extra_metadata_indices(
     the upgraded `DSV4AttnMetadata`. Mirrors the dispatch in
     `DeepseekV4AttnBackend.forward(compress_ratio=...)`.
     """
-    if compress_ratio in (1, 2, 4):
-        return (
-            core_metadata.sparse_page_indices(compress_ratio),
-            core_metadata.sparse_topk_lengths(compress_ratio),
-        )
-    if compress_ratio == 128:
-        return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
-    raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+    return (
+        core_metadata.sparse_page_indices(compress_ratio),
+        core_metadata.sparse_topk_lengths(compress_ratio),
+    )
 
 
 def _pure_torch_dsv4_combined_reference(
@@ -1424,11 +1420,12 @@ def _seed_c4_sparse_indices(
         num_entries, dtype=sparse_indices.dtype, device=sparse_indices.device
     )
     lengths = md.sparse_topk_lengths(ratio)
-    setattr(md, f"c{ratio}_sparse_page_indices", seed)
-    setattr(
-        md,
-        f"c{ratio}_sparse_topk_lengths",
-        torch.full((num_q,), num_entries, dtype=lengths.dtype, device=lengths.device),
+    md.set_sparse_topk(
+        ratio,
+        page_indices=seed,
+        topk_lengths=torch.full(
+            (num_q,), num_entries, dtype=lengths.dtype, device=lengths.device
+        ),
     )
 
 
@@ -1470,9 +1467,12 @@ def _seed_c4_sparse_prefill_indices(
     )
     seeded = torch.where(seq < lens.unsqueeze(1), seq, seq.new_full((), -1))
     lengths = md.sparse_topk_lengths(ratio)
-    setattr(md, f"c{ratio}_sparse_raw_indices", seeded)
-    setattr(md, f"c{ratio}_sparse_page_indices", seeded.clone())
-    setattr(md, f"c{ratio}_sparse_topk_lengths", lens.to(lengths.dtype))
+    md.set_sparse_topk(
+        ratio,
+        page_indices=seeded.clone(),
+        topk_lengths=lens.to(lengths.dtype),
+        raw_indices=seeded,
+    )
 
 
 def run_dsv4_target_verify_attention_case(
@@ -1624,8 +1624,8 @@ def run_dsv4_compress_attention_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> None:
-    """Math-faithful test for the SWA + C4 (compress_ratio=4) / SWA + C128
-    (compress_ratio=128) path through `DeepseekV4AttnBackend.forward`.
+    """Math-faithful test for the SWA + compressed-cache path (compress ratios
+    1, 2, 4, 128) through `DeepseekV4AttnBackend.forward`.
 
     Pre-writes random packed K into both the SWA cache and the extra
     (C4/C128) cache via the production pack+set paths, lets

@@ -773,7 +773,7 @@ def _log_undetected_parser(attr: str, label: str) -> None:
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     """The parsers the model architecture implies, for the fields still on auto."""
-    from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_config
+    from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_arch
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     cfg = resolving_view(server_args)
@@ -794,7 +794,7 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
         "BailingMoeV3VLForConditionalGeneration",
     ) or model_type in ("bailing_hybrid", "bailing_moe_v3_vl"):
         reasoning_parser, tool_call_parser = "ling3", "ling3"
-    elif is_deepseek_v41_config(arch=arch, model_type=model_type):
+    elif is_deepseek_v41_arch(arch=arch, model_type=model_type):
         reasoning_parser, tool_call_parser = "deepseek-v41", "deepseekv41"
     elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"

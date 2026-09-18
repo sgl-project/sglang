@@ -35,9 +35,8 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # Same admission as _fused_gate_emits_packed_ids on the text path: only
-        # flashinfer_mxfp4 consumes the packed form, and nothing may rewrite ids
-        # or weights after the router -- which rules out the shared-expert slots
-        # that _scale_fused_shared_weights rescales below.
+        # flashinfer_mxfp4 consumes the packed form, and the shared-expert slots
+        # rescaled below would rewrite weights after the router.
         packed_topk = None
         if (
             num_fused_shared_experts == 0

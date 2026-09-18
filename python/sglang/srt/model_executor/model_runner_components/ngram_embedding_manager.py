@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.engram import EngramHasher
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -24,7 +25,7 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     # Draft runners have no hasher even when their config has engram layers.
-    engram_hasher: Optional[torch.nn.Module] = None
+    engram_hasher: Optional[EngramHasher] = None
 
     @classmethod
     def from_model(
@@ -58,7 +59,7 @@ class NgramEmbeddingManager:
                         max_running_requests, chunked_prefill_size, device
                     )
         engram_hasher = None
-        if model_config.engram_ngram_size > 0:
+        if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
 
             for module in model.modules():
@@ -69,7 +70,7 @@ class NgramEmbeddingManager:
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
-            n=model_config.ngram_context_size,
+            n=model_config.ngram_embedding_n,
             engram_hasher=engram_hasher,
         )
 
@@ -109,6 +110,7 @@ class NgramEmbeddingManager:
         *,
         chunked_req: Optional[Req],
     ) -> Optional[ScheduleBatch]:
+        """Fill the ngram token table and engram history before a forward pass."""
         if batch is None:
             return batch
         if self.engram_hasher is not None:
@@ -166,8 +168,7 @@ class NgramEmbeddingManager:
         return batch
 
     def _prepare_engram_history(self, batch: ScheduleBatch) -> None:
-        """Refresh extend predecessors after prefix hits, retraction, or slot reuse,
-        and seed the history row of a request whose prefill ran on another server."""
+        """Refresh extend predecessors after prefix hits, retraction, or slot reuse."""
         n1 = self.engram_hasher.max_ngram_size - 1
         if batch.forward_mode.is_prebuilt():
             # PD decode runs no EXTEND for this request, so the row its first
@@ -176,6 +177,8 @@ class NgramEmbeddingManager:
             history = self.engram_hasher.history
             rows = []
             for req in batch.reqs:
+                # full_untruncated_fill_ids is only refreshed on the extend and
+                # decode paths, which a PD decode request has not run yet.
                 fill_ids = req.origin_input_ids + req.output_ids
                 end = len(fill_ids) - 1
                 ids = fill_ids[max(0, end - n1) : end]
@@ -197,7 +200,7 @@ class NgramEmbeddingManager:
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
             rows.append([0] * (n1 - len(ids)) + list(ids))
-        batch.ne_history = torch.tensor(
+        batch.engram_history = torch.tensor(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
         ).view(len(rows), n1)
 

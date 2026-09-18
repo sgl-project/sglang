@@ -57,12 +57,12 @@ def run_encoder_swa_replay(worker, batch):
         replay.sampling_info = None
         replay.has_grammar = False
         replay.multimodal_inputs = [None]
-        replay.ne_history = None
+        replay.engram_history = None
         hasher = runner.model.model.engram_hasher
         if hasher is not None:
             n = hasher.max_ngram_size - 1
             ids = list(req.full_untruncated_fill_ids[max(0, start - n) : start])
-            replay.ne_history = torch.tensor(
+            replay.engram_history = torch.tensor(
                 [[0] * (n - len(ids)) + ids],
                 dtype=torch.int32,
                 device=runner.device,

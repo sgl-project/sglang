@@ -78,6 +78,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
     is_cp_active,
 )
@@ -101,12 +102,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import (
-    Engram,
-    EngramHasher,
-    EngramLayout,
-    build_engram_layout,
-)
+from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -458,10 +454,9 @@ def _apply_wo_a_bf16_matmul(
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
-    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
-    verify batches up to 384 rows and large prefill batches write token-major
-    output directly to avoid the layout copy before wo_b. ROCm decode can use
-    aiter batched GEMM; other cases use torch.einsum.
+    The fast paths below are gated on the exact validated TP4 shapes and write
+    token-major output directly, avoiding the layout copy before wo_b; anything
+    else falls back to torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -744,7 +739,7 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 
 class MqaAttentionBase(nn.Module):
-    # Read on paths main's fixtures reach without running __init__.
+    # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
 
     def __init__(
@@ -907,7 +902,7 @@ class MqaAttentionBase(nn.Module):
             # that is aiter's B-preshuffle, which silently permutes the weight
             # in place (same shape, dtype and strides) and makes this GEMM
             # return noise.
-            self.wo_a.skip_aiter_bpreshuffle = True
+            self.wo_a.keep_plain_weight_layout = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1465,12 +1460,10 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Decode / target-verify prepare of a compress-ratio 1/2 layer: the
-        compressor and indexer (``forward_low_ratio_sources``) run on one side
-        stream, the fused KV-cache write on another, and only the Q chain stays
-        on the current stream. Both side streams are joined before returning;
-        attention is the first reader of anything written on them, and no
-        tensor they read is released before the join."""
+        """Decode / target-verify prepare of a compress-ratio 1/2 layer, with the
+        compressor and indexer on one side stream and the fused KV-cache write on
+        another. Both are joined before returning; attention is the first reader
+        of what they write, and nothing they read is released before the join."""
         assert self.alt_streams is not None
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
@@ -1954,9 +1947,16 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            kv_for_cache = kv
+            if use_cp:
+                kv_for_cache = cp_gather_full_sequence_states(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
-                swa_k=kv,
+                swa_k=kv_for_cache,
                 forward_batch=forward_batch,
             )
             kv = None
@@ -2022,20 +2022,46 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
         else:
+            use_npu_cp_full_metadata = use_cp and _is_npu
             if self.indexer is not None:
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                )
+                if use_npu_cp_full_metadata:
+                    with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                        attn_backend.forward_indexer_compressor(
+                            x,
+                            forward_batch,
+                            self.indexer.layer_id,
+                            self.indexer.compressor,
+                        )
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        skip_compressor=True,
+                    )
+                else:
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                    )
             if self.compressor is not None:
-                attn_backend.forward_core_compressor(
-                    x,
-                    forward_batch,
-                    self.layer_id,
-                    self.compressor,
-                )
+                if use_npu_cp_full_metadata:
+                    with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                        attn_backend.forward_core_compressor(
+                            x,
+                            forward_batch,
+                            self.layer_id,
+                            self.compressor,
+                        )
+                else:
+                    attn_backend.forward_core_compressor(
+                        x,
+                        forward_batch,
+                        self.layer_id,
+                        self.compressor,
+                    )
 
         return q, kv
 
@@ -2172,10 +2198,10 @@ class MQALayer(MqaAttentionBase):
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
-                    # The V4.1 kernels read all padded heads, so the padding must be zero.
-                    # Each layer overwrites real heads and leaves padding zero. Reuse requires
-                    # all consumers on the layer's stream and no retained reference after return;
-                    # a side-stream consumer would need an event before the next layer writes.
+                    # The V4.1 kernels read all padded heads, so the padding
+                    # must be zero. The buffer is reused per layer: every
+                    # consumer must be on the layer's stream and hold no
+                    # reference to it after returning.
                     want = (x.shape[0], kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
                     q_padded = getattr(meta, "q_pad_buffer", None)
@@ -3114,11 +3140,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         normalized: Optional[torch.Tensor] = None,
         precomputed: Optional[tuple] = None,
     ) -> torch.Tensor:
-        """Collapse and normalize on the main stream, then fork tiny-row stats.
-
-        Preserve the fused quantization and cross-layer precomputed inputs.
-        Record the stats themselves immediately before their consuming join.
-        """
+        """Collapse and normalize on the main stream, then fork tiny-row stats."""
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         quantize = quantized is not None
@@ -3157,9 +3179,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                # The fused scale writer supports the small decode/verify
-                # tile only. Large prefill keeps its one-CTA-per-row norm and
-                # lets the projection quantize the full activation layout.
+                # The fused scale writer supports the small decode/verify tile
+                # only; large prefill lets the projection quantize instead.
                 if quantize and x.shape[0] <= 8:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
@@ -4010,7 +4031,7 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
-        self.engram_layout = build_engram_layout(config)
+        self.engram_layout = EngramLayout.from_config(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -4045,27 +4066,16 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
         self.engram_hasher = None
         if self.engram_layout is not None:
-            self.engram_hasher = EngramHasher.from_config(config, self.engram_layout)
-
-        self.engram_prefetch_stream = None
-        if (
-            _is_cuda
-            and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
-            and self.pp_group.world_size == 1
-            and not is_dp_attention_enabled()
-            and config.vision_n_layers == 0
-            and config.hc_pre_from_prev_sublayer
-            and self.start_layer <= 14 < self.end_layer
-            and self.layers[14].engram is not None
-            and self.layers[14].engram.embed._shared
-            # Other backends may share mutable GEMM workspace across streams.
-            and getattr(
-                self.layers[14].engram.wkv.quant_method, "mxfp8_dense_backend", None
+            self.engram_hasher = EngramHasher.from_config(
+                config,
+                self.engram_layout,
+                image_token_id=(
+                    config.image_token_id
+                    if config.model_type == "deepseek_v41"
+                    and config.vision_n_layers > 0
+                    else None
+                ),
             )
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-        ):
-            self.engram_prefetch_stream = torch.cuda.Stream()
-            logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
 
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
@@ -4188,20 +4198,6 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
-        prefetched_engram_kv = None
-        if (
-            self.engram_prefetch_stream is not None
-            and forward_batch.forward_mode.is_decode()
-            and hash_ids.shape[0] == 1
-        ):
-            prefetch_stream = self.engram_prefetch_stream
-            prefetch_stream.wait_stream(torch.cuda.current_stream())
-            engram = self.layers[14].engram
-            with torch.cuda.stream(prefetch_stream):
-                prefetched_engram_kv = engram.project(
-                    hash_ids[:, engram.layer_hash_index]
-                )
-            hash_ids.record_stream(prefetch_stream)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4231,21 +4227,12 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
-                if i == 14 and prefetched_engram_kv is not None:
-                    main_stream = torch.cuda.current_stream()
-                    main_stream.wait_stream(self.engram_prefetch_stream)
-                    prefetched_engram_kv.record_stream(main_stream)
-                    hidden_states = engram.apply_gate(
-                        hidden_states, prefetched_engram_kv
-                    )
-                    prefetched_engram_kv = None
-                else:
-                    hidden_states = engram(
-                        hidden_states,
-                        hash_ids[:, engram.layer_hash_index],
-                        forward_batch,
-                        cp_all_tokens=cp_extend,
-                    )
+                hidden_states = engram(
+                    hidden_states,
+                    hash_ids[:, engram.layer_hash_index],
+                    forward_batch,
+                    cp_all_tokens=cp_extend,
+                )
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
@@ -4432,6 +4419,7 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -4473,9 +4461,16 @@ class DeepseekV4Model(nn.Module):
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+
+        attn_backend = get_attn_backend()
+        if _is_npu and forward_batch.attn_cp_metadata is not None:
+            attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+            local_positions = getattr(forward_batch, "dsv4_cp_local_positions", None)
+            if (
+                local_positions is not None
+                and positions.shape[0] == local_positions.shape[0]
+            ):
+                forward_batch.positions = positions
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -4673,11 +4668,11 @@ class DeepseekV4ForCausalLM(nn.Module):
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
         """Tune resident MXFP8 linears without touching request/KV/draft state.
 
-        FlashInfer covers all M buckets through ``num_tokens`` from one call.
-        Decode/verify warmup only covers small M; the untuned large-M heuristic
-        can be substantially slower. Tune each distinct weight layout once and
-        call the quantization method directly to avoid TP collectives and model
-        side effects. The runner owns the synchronized autotune context.
+        One call covers every M bucket up to ``num_tokens``; decode/verify warmup
+        only reaches small M, and the untuned large-M heuristic can be much
+        slower. The quantization method is called directly to avoid TP
+        collectives and model side effects; the runner owns the synchronized
+        autotune context.
         """
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
@@ -4831,7 +4826,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -4923,7 +4917,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
                 # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # check the linear method honoured keep_plain_weight_layout: a
                 # preshuffled weight has the same shape, dtype and strides and
                 # would only show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (

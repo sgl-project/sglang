@@ -68,8 +68,7 @@ class Dsv41CandidateGraphVariants:
 
     Selected by the longest request in the batch: while every request's
     positions fit a limit, the captured variant skips the low-ratio scoring or
-    the candidate filtering that longer histories need (see
-    capture_mode.skip_low_ratio_indexer and the backend's _every_request_fits).
+    the candidate filtering that longer histories need.
     """
 
     # (label, max_seq_len it serves), ascending; the last label is the fallback.

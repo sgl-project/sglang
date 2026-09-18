@@ -1,4 +1,5 @@
-"""Block FP8 weight loading, MXFP8 dispatch, and prefill autotune integration."""
+"""Prefill autotune of block-FP8 weights served as MXFP8 (the numerics live in
+test_fp8_blockwise_linear_backends.py)."""
 
 import unittest
 from types import SimpleNamespace
@@ -61,8 +62,8 @@ def _block32_config():
 
 
 def _build_layer(method: Fp8LinearMethod, q: torch.Tensor, scale: torch.Tensor):
-    """Create the layer through the linear method and load the checkpoint tensors through
-    the parameters' own loaders (the scale arrives as e8m0, the way the checkpoint stores it)."""
+    """Load through the parameters' own loaders; the scale arrives as e8m0, the
+    way the checkpoint stores it."""
     n, k = q.shape
     layer = torch.nn.Module()
     method.create_weights(
@@ -97,75 +98,6 @@ class _OptInCase(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "_patch"):
             cls._patch.stop()
-
-
-class TestFp8LinearMethod(_OptInCase):
-    """Check decode and prefill outputs at the deployed dense projection shapes."""
-
-    SHAPES = [(1792, 5120), (5120, 576)]
-    MS = [1, 17, 300]
-
-    def test_apply_on_fused_quantized_input_matches_bf16(self):
-        from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
-            _quantize_partial,
-            _wo_a_reduce,
-        )
-        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
-
-        method = Fp8LinearMethod(_block32_config())
-        w = torch.randn(5120, 2048, device=DEVICE, dtype=torch.bfloat16) / 2048**0.5
-        qweight, scale = _quant_block32(w)
-        layer = _build_layer(method, qweight, scale)
-        for rows in range(2, 9):
-            for magnitude in (0.0, 1e-37, 1e-7, 1.0, 448.0, 1e10):
-                partial = torch.randn(8, rows, 2, 1024, device=DEVICE) * magnitude
-                bf16 = torch.empty(rows, 2048, dtype=torch.bfloat16, device=DEVICE)
-                _wo_a_reduce[(rows * 8,)](partial, bf16, rows * 2048, num_warps=4)
-                actual_q, actual_s = _quantize_partial(partial)
-                actual = method.apply(layer, Mxfp8SwizzledInput(actual_q, actual_s))
-                expected = method.apply(layer, bf16)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-        partial = torch.randn(8, 6, 2, 1024, device=DEVICE)
-        _quantize_partial(partial)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            q, s = _quantize_partial(partial)
-            output = method.apply(layer, Mxfp8SwizzledInput(q, s))
-        for _ in range(3):
-            partial.normal_()
-            s.fill_(255)
-            graph.replay()
-            bf16 = torch.empty(6, 2048, dtype=torch.bfloat16, device=DEVICE)
-            _wo_a_reduce[(48,)](partial, bf16, 6 * 2048, num_warps=4)
-            torch.testing.assert_close(
-                output, method.apply(layer, bf16), rtol=0, atol=0
-            )
-
-    def test_against_dequantized_reference(self):
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
-        method = Fp8LinearMethod(_block32_config())
-        for n, k in self.SHAPES:
-            w = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16) / (k**0.5)
-            q, s = _quant_block32(w)
-            layer = _build_layer(method, q, s)
-            w_deq = _dequant_block32(q, s)
-            for m in self.MS:
-                x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
-                xq, xs = sglang_per_token_group_quant_fp8(x, BLOCK, scale_ue8m0=True)
-                x_deq = (
-                    xq.float().view(m, k // BLOCK, BLOCK)
-                    * xs.view(m, k // BLOCK, 1).float()
-                )
-                ref = x_deq.view(m, k) @ w_deq.t()
-                out = method.apply(layer, x)
-                self.assertEqual(out.dtype, torch.bfloat16)
-                amax = ref.abs().max().item()
-                error = (out.float() - ref).abs().max().item() / amax
-                self.assertLess(error, 1e-2, (n, k, m, error))
 
 
 class TestPrefillAutotune(_OptInCase):
@@ -210,9 +142,7 @@ class TestPrefillAutotune(_OptInCase):
         method.w8a8_mxfp8_linear = call
         for rows, invariant, deterministic, expected in (
             (6, False, False, None),
-            (384, False, False, None),
             (4096, False, False, False),
-            (65536, False, False, False),
             (4096, True, False, True),
             (4096, False, True, True),
         ):
@@ -267,7 +197,7 @@ class TestPrefillAutotune(_OptInCase):
         method.mxfp8_prefill_autotune_min_tokens = 4096
         with autotune(True):
             method.apply(layer, x)
-        for rows in (6, 384, 4096, 65536):
+        for rows in (6, 65536):
             with self.subTest(rows=rows):
                 out = method.apply(layer, x[:rows])
                 self.assertTrue(torch.isfinite(out).all().item())

@@ -1,13 +1,13 @@
 """Engram: gated n-gram hash memory added to the hc residual stream.
 
-Predecessors come from the live batch and per-request history of the n - 1
-previous tokens. The token map, hash multipliers and prime layout must match
+The token map, hash multipliers and prime layout must match
 sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 """
 
 from __future__ import annotations
 
 import ctypes
+import errno
 import glob
 import logging
 import mmap
@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -58,11 +58,13 @@ logger = logging.getLogger(__name__)
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
+def _cuda_kernels(t: torch.Tensor) -> bool:
+    """True where the Triton kernels apply; ROCm and CPU take the torch paths."""
+    return t.is_cuda and is_cuda()
+
+
 def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin: exact for every n < 3.3e24, so it agrees with
-    ``sympy.isprime`` over the whole range the layout can reach. Kept local
-    because sympy is not a declared sglang dependency -- it only happens to
-    arrive with torch, and the engram layout must not depend on that."""
+    """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
         return False
     for p in _MILLER_RABIN_WITNESSES:
@@ -155,17 +157,14 @@ class EngramLayout(msgspec.Struct, frozen=True):
     head_dim: int
 
     @classmethod
-    def build(
-        cls,
-        layer_ids: tuple[int, ...],
-        num_embeddings: tuple[int, ...],
-        max_ngram_size: int,
-        n_heads: int,
-        head_dim: int,
-        vocab_size: int,
-    ) -> EngramLayout:
+    def from_config(cls, config) -> Optional[EngramLayout]:
         """Primes are drawn in (layer, n-gram size, head) order from one shared
-        ascending sequence starting above vocab_size - 1."""
+        ascending sequence starting above engram_vocab_size - 1."""
+        layer_ids = tuple(config.engram_layer_ids)
+        if not layer_ids:
+            return None
+        max_ngram_size, n_heads = config.engram_max_ngram_size, config.engram_n_heads
+        vocab_size = config.engram_vocab_size
         primes, seen = [], set()
         for _ in layer_ids:
             per_ngram = []
@@ -180,25 +179,11 @@ class EngramLayout(msgspec.Struct, frozen=True):
         return cls(
             max_ngram_size=max_ngram_size,
             layer_ids=layer_ids,
-            num_embeddings=num_embeddings,
+            num_embeddings=tuple(config.engram_num_embeddings),
             primes=tuple(primes),
             n_heads=n_heads,
-            head_dim=head_dim,
+            head_dim=config.engram_head_dim,
         )
-
-
-def build_engram_layout(config) -> Optional[EngramLayout]:
-    layer_ids = tuple(config.engram_layer_ids)
-    if not layer_ids:
-        return None
-    return EngramLayout.build(
-        layer_ids=layer_ids,
-        num_embeddings=tuple(config.engram_num_embeddings),
-        max_ngram_size=config.engram_max_ngram_size,
-        n_heads=config.engram_n_heads,
-        head_dim=config.engram_head_dim,
-        vocab_size=config.engram_vocab_size,
-    )
 
 
 def compute_engram_hash_ids(
@@ -215,8 +200,8 @@ def compute_engram_hash_ids(
     [T, n_engram_layers, (n - 1) * n_heads] row ids into each layer's table."""
     compressed = torch.where(blocked, pad_id, token_map[tokens])
     products = compressed.unsqueeze(1) * multipliers
-    # XOR the multiplied ids one look-back at a time: after step i the running value
-    # is the (i + 1)-gram hash, bucketed by that n-gram size's primes.
+    # After step i the running xor is the (i + 1)-gram hash, bucketed by that
+    # n-gram size's primes.
     rolling, hashes = products[..., 0], []
     for i in range(1, tokens.shape[-1]):
         rolling = torch.bitwise_xor(rolling, products[..., i])
@@ -258,11 +243,7 @@ class EngramHasher(nn.Module):
         self.pad_row = 0
 
     def init_history(self, num_req_slots: int, device) -> None:
-        """Allocate oldest-first history with a spare row for graph padding.
-
-        Extend reads scheduler-provided predecessors after prefix hits or
-        retraction. Decode commits in forward; verify commits after acceptance.
-        """
+        """Allocate oldest-first history with a spare row for graph padding."""
         self.history = torch.zeros(
             num_req_slots + 1,
             self.max_ngram_size - 1,
@@ -272,7 +253,9 @@ class EngramHasher(nn.Module):
         self.pad_row = num_req_slots
 
     @classmethod
-    def from_config(cls, config, layout: EngramLayout) -> EngramHasher:
+    def from_config(
+        cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
+    ) -> EngramHasher:
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -288,11 +271,7 @@ class EngramHasher(nn.Module):
             config.engram_pad_token_id,
             config.engram_compressed_vocab_size,
         )
-        result.image_token_id = (
-            config.image_token_id
-            if config.model_type == "deepseek_v41" and config.vision_n_layers > 0
-            else None
-        )
+        result.image_token_id = image_token_id
         return result
 
     def forward(
@@ -311,9 +290,8 @@ class EngramHasher(nn.Module):
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
-        # Which request each token belongs to and where its run starts; tokens at or
-        # past num_real are graph padding. History rows come from self.history via
-        # req_slots unless the scheduler supplied this extend's predecessors.
+        # Tokens at or past num_real are graph padding. History comes from
+        # self.history via req_slots unless the scheduler supplied this extend's rows.
         num_real, block, row, starts = num_tokens, 1, None, None
         history, hist_via_slots = self.history, True
         if mode.is_decode():
@@ -336,12 +314,12 @@ class EngramHasher(nn.Module):
             row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
             num_real = row.shape[0]
             kmode = MODE_EXTEND
-            if forward_batch.ngram_history is not None:
-                history, hist_via_slots = forward_batch.ngram_history, False
+            if forward_batch.engram_history is not None:
+                history, hist_via_slots = forward_batch.engram_history, False
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
-        if input_ids.is_cuda and torch.version.cuda is not None:
+        if _cuda_kernels(input_ids):
             if kmode == MODE_DECODE:
                 # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
                 assert forward_batch.out_cache_loc is not None
@@ -476,7 +454,7 @@ class EngramHasher(nn.Module):
     ) -> None:
         """Commit anchor + accepted drafts; the bonus is the next block's anchor."""
         assert self.history is not None, "EngramHasher.init_history was not called"
-        if self.history.is_cuda:
+        if _cuda_kernels(self.history):
             engram_commit_history(
                 self.history, verify_ids_2d, req_pool_indices, commit_lens
             )
@@ -532,18 +510,13 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
 _page_cache_dropped = False
 
 
-def drop_checkpoint_page_cache(model_path: Optional[str] = None) -> tuple[int, int]:
-    """Drop checkpoint page cache with posix_fadvise(DONTNEED); return (files, bytes).
-
-    Cached checkpoint pages can prevent 512 MiB huge-page allocation,
-    so drop them before pre-faulting private host tables.
-    """
-    if model_path is None:
-        try:
-            model_path = get_model().model_path
-        except (ValueError, AttributeError):
-            # No published runtime context (unit tests, offline tools): nothing to drop.
-            return 0, 0
+def drop_checkpoint_page_cache() -> tuple[int, int]:
+    """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
+    try:
+        model_path = get_model().model_path
+    except (ValueError, AttributeError):
+        # No published runtime context (unit tests, offline tools): nothing to drop.
+        return 0, 0
     files, nbytes = 0, 0
     for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
         try:
@@ -561,7 +534,7 @@ def drop_checkpoint_page_cache(model_path: Optional[str] = None) -> tuple[int, i
 
 def _drop_page_cache_once(reason: str) -> None:
     global _page_cache_dropped
-    if _page_cache_dropped or not envs.SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE.get():
+    if _page_cache_dropped:
         return
     _page_cache_dropped = True
     files, nbytes = drop_checkpoint_page_cache()
@@ -574,24 +547,22 @@ def _drop_page_cache_once(reason: str) -> None:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table.
+    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
-    Layouts:
-      shared   one memfd holding every row, mapped by all ranks of the group;
-               rank 0 creates it, the others open it through /proc/<pid>/fd.
-               No all-reduce. Huge pages need transparent_hugepage/shmem_enabled.
-      private  one anonymous mapping per rank holding only its own rows, so the
-               lookup keeps the sharded all-reduce. Huge pages come from
-               transparent_hugepage/enabled (madvise or always).
+    Lives for the whole process: the mapping, the memfd and the cudaHostRegister
+    pin are never released because the table is read by every forward.
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group, pin: bool):
-        assert layout in ("shared", "private"), layout
+    def __init__(self, layout: str, nbytes: int, name: str, group):
+        if layout not in ("shared", "per_rank"):
+            raise ValueError(
+                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
+                "'shared' or 'per_rank'"
+            )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        self.registered = False
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -611,31 +582,18 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "private":
-            # Fault the shard in now, on a host whose page cache has just been
-            # emptied: cached checkpoint pages left by a previous server, or by
-            # the loader itself, make the 512 MiB huge-page faults fall back.
-            _drop_page_cache_once("before pre-faulting the private shard")
+        if layout == "per_rank":
+            # Cached checkpoint pages, left by a previous server or by the loader,
+            # make the 512 MiB huge-page faults fall back, so empty them first.
+            _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        if pin:
-            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-            if int(err) != 0:
-                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
-            self.registered = True
-
-    @staticmethod
-    def choose_layout(requested: str) -> str:
-        if requested != "auto":
-            return requested
-        if _thp_mode("shmem_enabled") in ("advise", "always", "within_size", "force"):
-            return "shared"
-        if _thp_mode("enabled") in ("madvise", "always"):
-            return "private"
-        return "shared"
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -655,10 +613,8 @@ class _HostTable:
             ) from e
 
     def _collapse(self, tries: int = 3) -> None:
-        """madvise(MADV_COLLAPSE): synchronously fold whatever is still on base pages
-        into huge pages. Anonymous memory only; shmem obeys shmem_enabled and
-        refuses. EAGAIN means compaction ran out of time, so it is retried a few
-        times; anything else is logged and left."""
+        """Synchronously fold whatever is still on base pages into huge pages.
+        Anonymous memory only; shmem obeys shmem_enabled and refuses."""
         MADV_COLLAPSE = 25  # Linux >= 6.1; not in Python's mmap module
         libc = ctypes.CDLL(None, use_errno=True)
         libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
@@ -672,7 +628,7 @@ class _HostTable:
                 return
             err = ctypes.get_errno()
             if (
-                err != 11 or attempt == tries - 1
+                err != errno.EAGAIN or attempt == tries - 1
             ):  # EAGAIN is the only one worth retrying
                 logger.info("engram host table: MADV_COLLAPSE errno %d", err)
                 return
@@ -685,18 +641,17 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "private" and huge_kb < mapped_kb * 0.98:
+        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
-            if envs.SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE.get():
-                drop_checkpoint_page_cache()
+            drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
             f"engram host table {label}: layout={self.layout}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
-            f"({pct:.0f}%){', pinned' if self.registered else ', unpinned (ATS)'}"
+            f"({pct:.0f}%)"
         )
         if huge_kb == 0:
             knob = "shmem_enabled" if self.layout == "shared" else "enabled"
@@ -714,12 +669,10 @@ class _HostTable:
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Default: rows sharded over the TP group in device memory; each rank gathers
-    the rows it owns, zeroes the rest and the all-reduce reassembles the lookup.
-    With SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE the table lives in host memory and
-    the GPU gathers rows over the CPU link -- either one shared copy with no
-    all-reduce, or one private shard per rank (see _HostTable). Loading is
-    sharded in every layout: a rank writes only its own row range.
+    Rows are sharded over the TP group in device memory; with
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
+    one shared copy or one shard per rank (see _HostTable). Loading is sharded
+    in every layout: a rank writes only its own row range.
     """
 
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
@@ -748,9 +701,7 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = _HostTable.choose_layout(
-            envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        )
+        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
@@ -759,7 +710,6 @@ class EngramEmbedding(nn.Module):
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_tp_group(),
-            pin=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get(),
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
@@ -780,9 +730,8 @@ class EngramEmbedding(nn.Module):
         if self.host_table is not None:
             self.host_table.dirty = True
 
-    def finish_load(self, label: str = ""):
-        """Barrier (shared layout) once every rank has written its rows; log how
-        the table ended up backed."""
+    def finish_load(self, label: str):
+        """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
@@ -823,7 +772,7 @@ class EngramEmbedding(nn.Module):
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
-        private host shards zero unowned rows and the all-reduce reassembles."""
+        per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
             return self._empty(indices)
         values = self._owned_rows(indices)
@@ -840,9 +789,7 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        if self.host_table is None and (
-            not indices.is_cuda or torch.version.cuda is None
-        ):
+        if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
@@ -865,11 +812,7 @@ class EngramEmbedding(nn.Module):
     def _dp_sharded_lookup(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
     ) -> torch.Tensor:
-        """Gather DP ranks' indices before looking up TP-sharded rows.
-
-        Every rank joins, including idle ranks with zero rows; the reduced result
-        is sliced back to each rank's local tokens.
-        """
+        """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
         rows = get_global_dp_buffer_len()
         ids_global = torch.empty(
@@ -885,8 +828,6 @@ class EngramEmbedding(nn.Module):
             dtype=values.dtype,
             device=values.device,
         )
-        # MAX_LEN or gatherv-sized slices use reduce-scatter;
-        # otherwise scatter the summed buffer to the DP ranks.
         padding = forward_batch.dp_padding_mode
         if (
             padding is not None
@@ -909,13 +850,9 @@ def engram_gate(
     clamp_value: float,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy.
-
-    The fused kernel serves every token count on CUDA; the torch path below is the
-    non-CUDA fallback and materializes fp32 copies of x, key and value."""
+    followed by the shared value. Adds the gated value to every copy."""
     if (
-        x.is_cuda
-        and torch.version.cuda is not None
+        _cuda_kernels(x)
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype
@@ -985,15 +922,6 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
-        return self.apply_gate(x, kv)
-
-    def project(
-        self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
-    ) -> torch.Tensor:
-        kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
-        return kv
-
-    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
