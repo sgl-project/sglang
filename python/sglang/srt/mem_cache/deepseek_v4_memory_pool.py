@@ -1687,6 +1687,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def export_source_pages(
         self, source_layer_id: int, full_page_ids: torch.Tensor
     ) -> dict[str, torch.Tensor]:
+        self.wait_layer_transfer(max(source_layer_id, self._stage_start))
         ratio = self.compression_ratios[source_layer_id]
         source_index = self.sources_by_ratio[ratio].index(source_layer_id)
         page_ids = full_page_ids.to(torch.int64)
@@ -1725,6 +1726,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         full_page_ids: torch.Tensor,
         tensors: dict[str, torch.Tensor],
     ) -> None:
+        self.wait_layer_transfer(max(source_layer_id, self._stage_start))
         ratio = self.compression_ratios[source_layer_id]
         source_index = self.sources_by_ratio[ratio].index(source_layer_id)
         page_ids = full_page_ids.to(torch.int64)

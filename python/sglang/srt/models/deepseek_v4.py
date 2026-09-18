@@ -4505,6 +4505,8 @@ class DeepseekV4Model(nn.Module):
 
         metadata = self._pp_attention_metadata(tail_active)
         core = metadata.core_metadata
+        from sglang.srt.layers.attention.dsv4.pp import remap_sparse_slots
+
         for ratio in (1, 2):
             for suffix in (
                 "sparse_topk_lengths",
@@ -4515,18 +4517,70 @@ class DeepseekV4Model(nn.Module):
                 target = getattr(core, name, None)
                 value = tensors.get(f"pp_index_{name}")
                 if value is not None and target is not None:
+                    if suffix == "sparse_page_indices":
+                        value = remap_sparse_slots(
+                            value,
+                            tensors["pp_index_page_table"],
+                            core.page_table,
+                            core.page_size // ratio,
+                            tensors["pp_index_num_pages"],
+                        )
                     target.copy_(value)
 
         candidate_count = int(tensors.get("pp_candidate_count", 0))
-        if candidate_count:
+        if candidate_count or "pp_candidate_mask" in tensors:
             from sglang.srt.layers.attention.dsv4.candidate_indexer import (
                 CandidateMasks,
             )
 
             metadata.candidate_metadata = CandidateMasks(
+                mask=tensors.get("pp_candidate_mask"),
                 request_masks=[
                     tensors[f"pp_candidate_{index}"] for index in range(candidate_count)
                 ]
+                if candidate_count
+                else None,
+            )
+        candidate_ratio = tensors.get("pp_candidate_ratio")
+        index_metadata = (
+            getattr(metadata, f"c{candidate_ratio}_indexer_metadata", None)
+            if candidate_ratio is not None
+            else None
+        )
+        if "pp_candidate_blocks" in tensors and index_metadata is not None:
+            from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+                SparseBlockTable,
+                build_sparse_indexer_schedule,
+                sort_candidate_blocks,
+            )
+
+            blocks = tensors["pp_candidate_blocks"]
+            lens = index_metadata.compressed_seq_lens.reshape(-1)
+            phys_blocks = sort_candidate_blocks(
+                blocks,
+                lens,
+                index_metadata.page_table,
+                index_metadata.compressed_page_size,
+            )
+            request_ids = get_attn_backend().candidate_indexer._request_ids(
+                None, blocks.shape[0], blocks.device
+            )
+            schedule = build_sparse_indexer_schedule(
+                blocks,
+                lens,
+                index_metadata.page_table,
+                index_metadata.compressed_page_size,
+                torch.int8,
+                request_ids,
+            )
+            ready = torch.cuda.Event()
+            ready.record()
+            metadata.candidate_metadata = SparseBlockTable(
+                blocks,
+                schedule,
+                phys_blocks,
+                tensors["pp_candidate_valid_lens"],
+                ready,
             )
 
     def _export_pp_state(
@@ -4557,6 +4611,10 @@ class DeepseekV4Model(nn.Module):
 
         metadata = self._pp_attention_metadata(tail_active)
         core = metadata.core_metadata
+        tensors["pp_index_page_table"] = core.page_table
+        tensors["pp_index_num_pages"] = (
+            core.seq_lens_casual + core.page_size - 1
+        ) // core.page_size
         for ratio in (1, 2):
             for suffix in (
                 "sparse_topk_lengths",
@@ -4571,6 +4629,8 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
 
         candidate = metadata.candidate_metadata
+        if isinstance(candidate, CandidateMasks) and candidate.mask is not None:
+            tensors["pp_candidate_mask"] = candidate.mask
         if (
             isinstance(candidate, CandidateMasks)
             and candidate.request_masks is not None
@@ -4578,6 +4638,19 @@ class DeepseekV4Model(nn.Module):
             tensors["pp_candidate_count"] = len(candidate.request_masks)
             for index, mask in enumerate(candidate.request_masks):
                 tensors[f"pp_candidate_{index}"] = mask
+        if candidate is not None and not isinstance(candidate, CandidateMasks):
+            from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+                SparseBlockTable,
+            )
+
+            if isinstance(candidate, SparseBlockTable):
+                torch.cuda.current_stream().wait_event(candidate.ready)
+                source_layer = self.config.candidate_source_layer_id
+                tensors["pp_candidate_ratio"] = self.config.compress_ratios[
+                    source_layer
+                ]
+                tensors["pp_candidate_blocks"] = candidate.blocks
+                tensors["pp_candidate_valid_lens"] = candidate.valid_lens
 
     @torch.no_grad()
     def forward(

@@ -620,8 +620,12 @@ def _dsv4_low_ratio_entries(
         slots_per_page = page_size // ratio
         assert slots_per_page % index_pool.page_size == 0
         index_pages_per_full_page = slots_per_page // index_pool.page_size
+        # A preceding PP stage owns a shared source, but this stage caches its
+        # replica too. Restore it before the first local consumer; negative
+        # layer ids are never visited by the cache controller.
         layer_mapping = {
-            source - kvcache.start_layer: index for index, source in enumerate(sources)
+            max(source - kvcache.start_layer, 0): index
+            for index, source in enumerate(sources)
         }
         regions = [(names[0], kv_pool, kv_pool.kv_buffer)]
         if index_pool.index_k_with_scale_buffer is not None:

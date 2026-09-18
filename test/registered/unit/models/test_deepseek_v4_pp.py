@@ -12,6 +12,7 @@ from sglang.srt.models.deepseek_v4 import (
     _dsv41_multimodal_enabled,
     _should_build_dsv41_vision,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -29,6 +30,44 @@ class _Layer:
 
 
 class TestDeepSeekV41PP(unittest.TestCase):
+    def test_decode_candidate_mask_survives_pipeline_boundary(self):
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
+
+        mask = torch.tensor([[True, False], [False, True]])
+        core = SimpleNamespace(
+            page_table=torch.tensor([[3], [4]]),
+            page_size=256,
+            seq_lens_casual=torch.tensor([1, 1]),
+        )
+        sender_metadata = SimpleNamespace(
+            core_metadata=core,
+            candidate_metadata=CandidateMasks(mask=mask),
+        )
+        receiver_metadata = SimpleNamespace(core_metadata=core, candidate_metadata=None)
+        model = SimpleNamespace(
+            end_layer=1,
+            config=SimpleNamespace(compress_ratios=[0, 0]),
+            _pp_attention_metadata=lambda tail: sender_metadata,
+        )
+        tensors = {}
+        DeepseekV4Model._export_pp_state(model, tensors, None, False)
+        model._pp_attention_metadata = lambda tail: receiver_metadata
+        DeepseekV4Model._install_pp_state(model, PPProxyTensors(tensors), None, False)
+        self.assertIsInstance(receiver_metadata.candidate_metadata, CandidateMasks)
+        self.assertTrue(torch.equal(receiver_metadata.candidate_metadata.mask, mask))
+
+    def test_sparse_slots_follow_receiver_page_allocation(self):
+        from sglang.srt.layers.attention.dsv4.pp import remap_sparse_slots
+
+        # One shared sender page can map to different pages on the receiver.
+        source = torch.tensor([[3, 1, 0], [3, 2, 0]], dtype=torch.int32)
+        target = torch.tensor([[7, 5, 0], [9, 6, 0]], dtype=torch.int32)
+        slots = torch.tensor([[12, 7, -1], [13, 8, -1]], dtype=torch.int32)
+        result = remap_sparse_slots(
+            slots, source, target, 4, torch.tensor([2, 2], dtype=torch.int32)
+        )
+        self.assertTrue(torch.equal(result, torch.tensor([[28, 23, -1], [37, 24, -1]])))
+
     def test_vision_tower_is_owned_by_first_pp_stage(self):
         config = SimpleNamespace(
             model_type="deepseek_v41",

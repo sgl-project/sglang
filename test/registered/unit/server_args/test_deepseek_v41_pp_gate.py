@@ -60,31 +60,35 @@ def _validate(config, *, host_engram=True):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(host_engram),
     ):
         validate_deepseek_v41_features(SimpleNamespace())
+        return envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
 
 
 class TestDeepSeekV41PPGate(unittest.TestCase):
     def test_pp4_tp2_disaggregated_prefill_is_supported(self):
         _validate(_config())
 
-    def test_rejects_unvalidated_layout(self):
-        with self.assertRaisesRegex(ValueError, "PP4 x TP2"):
-            _validate(_config(pp_size=2, tp_size=4))
+    def test_topologies_and_cache_modes(self):
+        for pp, tp in ((4, 2), (2, 4), (8, 1)):
+            for mode in ("null", "prefill", "decode"):
+                for hicache in (False, True):
+                    with self.subTest(pp=pp, tp=tp, mode=mode, hicache=hicache):
+                        _validate(
+                            _config(
+                                pp_size=pp,
+                                tp_size=tp,
+                                disaggregation_mode=mode,
+                                disable_radix_cache=False,
+                                enable_hierarchical_cache=hicache,
+                            )
+                        )
 
-    def test_requires_flashinfer_autotune_disabled(self):
-        with self.assertRaisesRegex(ValueError, "FlashInfer autotuning"):
-            _validate(_config(disable_flashinfer_autotune=False))
-
-    def test_requires_host_engram(self):
-        with self.assertRaisesRegex(ValueError, "device-resident Engram"):
-            _validate(_config(), host_engram=False)
-
-    def test_requires_radix_cache_disabled(self):
-        with self.assertRaisesRegex(ValueError, "radix cache"):
-            _validate(_config(disable_radix_cache=False))
-
-    def test_rejects_decode_mode(self):
-        with self.assertRaisesRegex(ValueError, "disaggregated Prefill"):
-            _validate(_config(disaggregation_mode="decode"))
+    def test_execution_options_do_not_restrict_pp_deployment(self):
+        self.assertTrue(
+            _validate(
+                _config(disable_flashinfer_autotune=False, pp_async_batch_depth=2),
+                host_engram=False,
+            )
+        )
 
 
 if __name__ == "__main__":

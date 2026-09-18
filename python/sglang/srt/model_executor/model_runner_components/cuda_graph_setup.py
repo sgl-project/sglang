@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 _deep_gemm_layout_memory_budget_initialized = False
 
 
+def _requires_eager_dsv41_pp(model_runner: ModelRunner) -> bool:
+    """PP carries request-local sparse state that is not a static graph input."""
+    return (
+        getattr(getattr(model_runner, "ps", None), "pp_size", 1) > 1
+        and getattr(model_runner.model_config.hf_config, "model_type", None)
+        == "deepseek_v41"
+    )
+
+
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
@@ -338,6 +347,13 @@ def capture_prefill_graph(
             capture_time=capture_time,
         )
 
+    if _requires_eager_dsv41_pp(model_runner):
+        logger.info(
+            "Using eager prefill for DeepSeek-V4.1 PP because sparse page and "
+            "candidate state cross PP boundaries dynamically."
+        )
+        return result(eager_runner)
+
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
             "Disable prefill CUDA graph because cuda_graph_config "
@@ -541,6 +557,13 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         memory_usage_gb=0,
         capture_time=0,
     )
+
+    if _requires_eager_dsv41_pp(model_runner):
+        logger.info(
+            "Using eager decode for DeepSeek-V4.1 PP because sparse page and "
+            "candidate state cross PP boundaries dynamically."
+        )
+        return no_capture
 
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.
