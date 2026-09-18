@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -24,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
+    SessionReapPlan,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -77,6 +79,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
+    plan_session_reap: Optional[Callable[[float], Any]] = None
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
@@ -100,7 +103,16 @@ class SchedulerRequestReceiver:
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
-                return []
+                # A receive-skipped cycle still runs the rank-symmetric reap:
+                # the leader plans, later PP stages receive the relayed list
+                # through the usual point-to-point channel, and the plan rides
+                # the per-step broadcast, so every rank applies it at the same
+                # loop position instead of stranding close-deferred or
+                # timed-out sessions until the skipper next allows a receive.
+                # local_reqs (timeout aborts the caller already polled) ride
+                # the same broadcast instead of being dropped.
+                recv_reqs = self._pull_raw_reqs(pull_sockets=False)
+                return self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
         recv_reqs = self._pull_raw_reqs()
 
@@ -118,37 +130,52 @@ class SchedulerRequestReceiver:
 
         return recv_reqs
 
-    def _pull_raw_reqs(self) -> Optional[List]:
+    def _pull_raw_reqs(self, pull_sockets: bool = True) -> Optional[List]:
+        """Pull this cycle's input, honoring the per-rank receive roles.
+
+        pull_sockets=False (receive-skipped cycles) drains nothing from the
+        tokenizer/RPC sockets but keeps the leader's reap planning and the
+        PP point-to-point relay, so the SessionReapPlan still reaches every
+        pipeline stage at the same loop iteration.
+        """
         if get_parallel().pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
-                # Rust ringbuffer backend: drain the in-process ring fed by the
-                # embedded Rust TokenizerManager instead of a zmq socket. Same
-                # non-blocking, msgpack-decoded contract as the zmq path below.
-                if envs.SGLANG_RUST_SERVER.get():
-                    recv_reqs.extend(
-                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
-                    )
-                    return recv_reqs
+                if pull_sockets:
+                    # Rust ringbuffer backend: drain the in-process ring fed by
+                    # the embedded Rust TokenizerManager instead of a zmq
+                    # socket. Same non-blocking, msgpack-decoded contract as
+                    # the zmq path below.
+                    if envs.SGLANG_RUST_SERVER.get():
+                        recv_reqs.extend(
+                            self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                        )
+                    else:
+                        while True:
+                            try:
+                                if self.recv_limit_reached(len(recv_reqs)):
+                                    break
+                                recv_req = sock_recv(
+                                    self.recv_from_tokenizer, zmq.NOBLOCK
+                                )
+                            except zmq.ZMQError:
+                                break
+                            recv_reqs.append(recv_req)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        while True:
+                            try:
+                                if self.recv_limit_reached(len(recv_reqs)):
+                                    break
+                                recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                            except zmq.ZMQError:
+                                break
+                            recv_reqs.append(recv_rpc)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                if self.plan_session_reap is not None:
+                    plan = self.plan_session_reap(time.monotonic())
+                    if plan is not None:
+                        recv_reqs.append(plan)
             else:
                 recv_reqs = None
         else:
@@ -319,6 +346,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    SessionReapPlan,
                 ),
             )
         ]
@@ -332,6 +360,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    SessionReapPlan,
                 ),
             )
         ]
