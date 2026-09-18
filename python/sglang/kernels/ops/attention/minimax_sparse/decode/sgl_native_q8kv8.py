@@ -105,8 +105,8 @@ def _validate_contract(
         raise ValueError("req_to_token must have dtype torch.int32")
     if slot_ids.dtype != torch.int64:
         raise ValueError("slot_ids must have dtype torch.int64")
-    if seq_lens.dtype != torch.int32:
-        raise ValueError("seq_lens must have dtype torch.int32")
+    if seq_lens.dtype != torch.int64:
+        raise ValueError("seq_lens must have dtype torch.int64")
     if topk_idx.dtype != torch.int32:
         raise ValueError("topk_idx must have dtype torch.int32")
     if slot_ids.numel() != batch_size or seq_lens.numel() != batch_size:

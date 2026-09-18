@@ -51,7 +51,7 @@ void minimax_sparse_decode_q8kv8_sm90(
       static_cast<const int32_t*>(req_to_token.data_ptr()),
       static_cast<const int64_t*>(slot_ids.data_ptr()),
       static_cast<const int32_t*>(topk_idx.data_ptr()),
-      static_cast<const int32_t*>(seq_lens.data_ptr()),
+      static_cast<const int64_t*>(seq_lens.data_ptr()),
       static_cast<int>(batch_size),
       static_cast<int>(num_q_heads),
       static_cast<int>(num_kv_heads),

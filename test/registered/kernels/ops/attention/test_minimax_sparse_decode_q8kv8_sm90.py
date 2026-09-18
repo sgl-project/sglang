@@ -93,7 +93,7 @@ def _case(batch=3, num_q_heads=8, num_kv_heads=1, topk=32):
     slot_ids = torch.arange(batch, dtype=torch.int64, device="cuda")
     seq_lens = torch.tensor(
         [max_len - 17, 9 * page_size + 3, page_size + 1][:batch],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device="cuda",
     )
     topk_idx = torch.full(
