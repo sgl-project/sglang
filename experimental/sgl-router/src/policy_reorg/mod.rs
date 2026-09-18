@@ -12,12 +12,16 @@ pub mod least_load;
 pub mod power_of_two;
 pub mod random;
 pub mod round_robin;
+pub mod session_aware;
+pub mod sticky;
 
 pub use admission::*;
 
-use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind};
+use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, StickyFallbackKind};
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies::state::engine_load::LoadView;
+use crate::policies::state::AffinityStore;
+use crate::server::metrics::MetricsRegistry;
 use crate::workers::Worker;
 use futures::future::BoxFuture;
 use std::fmt;
@@ -57,10 +61,22 @@ pub struct PickRequest<'a> {
     pub expected_peak_sequence_tokens: Option<u64>,
     pub session_id: Option<&'a str>,
     pub routing_key: Option<&'a str>,
+    /// False when the resolver wants this pick to neither look up nor create bindings.
+    pub affinity_enabled: bool,
     pub load: &'a LoadView<'a>,
 }
 
 impl PickRequest<'_> {
+    /// Store key for a non-empty affinity `value`, scoped per the request.
+    pub fn affinity_key(&self, kind: &str, value: Option<&str>) -> Option<String> {
+        let value = value.filter(|value| self.affinity_enabled && !value.is_empty())?;
+        let scope = match self.scope {
+            AffinityScope::Global => "global",
+            AffinityScope::Bucket => self.bucket_id,
+        };
+        Some(format!("{:?}/{kind}/{scope}/{value}", self.stage))
+    }
+
     pub fn admission(&self) -> AdmissionContext<'_> {
         AdmissionContext {
             load: self.load,
@@ -94,6 +110,16 @@ pub enum PickError {
     InvalidSignal(String),
 }
 
+impl PickError {
+    /// Every candidate was `engine`, and it was rejected.
+    pub fn rejected_all(engine: &Worker, reason: AdmissionReason) -> Self {
+        Self::NoAdmissibleEngine(vec![EngineRejection {
+            engine: engine.id.clone(),
+            reason,
+        }])
+    }
+}
+
 pub type PickResult = Result<Pick, PickError>;
 
 pub trait Policy: Send + Sync + fmt::Debug {
@@ -118,8 +144,42 @@ pub enum BuildError {
     UnsupportedDecode(DecodePolicyKind),
 }
 
-pub fn build_policy(kind: PolicyKind, model: &ModelConfig) -> Result<Arc<dyn Policy>, BuildError> {
+/// Shared services policies hold handles to; started once by application wiring.
+pub struct PolicyDependencies {
+    pub metrics: Arc<MetricsRegistry>,
+    pub affinity: Arc<AffinityStore>,
+}
+
+pub fn build_policy(
+    kind: PolicyKind,
+    model: &ModelConfig,
+    deps: &PolicyDependencies,
+) -> Result<Arc<dyn Policy>, BuildError> {
     let admission = migrated_admission(kind, model);
+    Ok(match kind {
+        PolicyKind::SessionAware => Arc::new(session_aware::SessionAwarePolicy::new(
+            admission,
+            Arc::clone(&deps.affinity),
+        )),
+        PolicyKind::Sticky => {
+            let fallback = model
+                .sticky
+                .as_ref()
+                .map_or(StickyFallbackKind::RoundRobin, |sticky| {
+                    sticky.fallback_policy
+                });
+            Arc::new(sticky::StickyPolicy::new(
+                admission,
+                Arc::clone(&deps.affinity),
+                load_only(fallback.into(), Admission::allow_all())?,
+                Arc::clone(&deps.metrics),
+            ))
+        }
+        kind => load_only(kind, admission)?,
+    })
+}
+
+fn load_only(kind: PolicyKind, admission: Admission) -> Result<Arc<dyn Policy>, BuildError> {
     Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(round_robin::RoundRobinPolicy::new(admission)),
         PolicyKind::Random => Arc::new(random::RandomPolicy::new(admission)),
@@ -127,6 +187,17 @@ pub fn build_policy(kind: PolicyKind, model: &ModelConfig) -> Result<Arc<dyn Pol
         PolicyKind::LoadBased => Arc::new(least_load::LeastLoadPolicy::new(admission)),
         other => return Err(BuildError::Unsupported(other)),
     })
+}
+
+impl From<StickyFallbackKind> for PolicyKind {
+    fn from(kind: StickyFallbackKind) -> Self {
+        match kind {
+            StickyFallbackKind::RoundRobin => Self::RoundRobin,
+            StickyFallbackKind::Random => Self::Random,
+            StickyFallbackKind::PowerOfTwo => Self::PowerOfTwo,
+            StickyFallbackKind::LoadBased => Self::LoadBased,
+        }
+    }
 }
 
 pub fn build_decode_policy(kind: DecodePolicyKind) -> Result<Arc<dyn Policy>, BuildError> {
@@ -186,36 +257,61 @@ pub(crate) mod testing {
     }
 
     pub(crate) async fn pick(policy: &dyn Policy, engines: &[Arc<Worker>]) -> PickResult {
-        pick_with(
-            policy,
-            engines,
-            &EngineLoadTable::new(),
-            RoutingStage::Plain,
-        )
-        .await
+        Request::default().pick(policy, engines).await
     }
 
-    pub(crate) async fn pick_with(
-        policy: &dyn Policy,
-        engines: &[Arc<Worker>],
-        table: &EngineLoadTable,
-        stage: RoutingStage,
-    ) -> PickResult {
-        let load = LoadView::new(table);
-        let model = ModelId("m".into());
-        let request = PickRequest {
-            model: &model,
-            stage,
-            bucket_id: "global",
-            scope: AffinityScope::Bucket,
-            mode: PickMode::Normal,
-            input_tokens: 16,
-            expected_peak_sequence_tokens: None,
-            session_id: None,
-            routing_key: None,
-            load: &load,
-        };
-        policy.pick(engines, &request).await
+    #[derive(Default)]
+    pub(crate) struct Request {
+        session_id: Option<&'static str>,
+        routing_key: Option<&'static str>,
+        mode: Option<PickMode>,
+    }
+
+    impl Request {
+        pub(crate) fn session(id: &'static str) -> Self {
+            Self {
+                session_id: Some(id),
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn routing_key(key: &'static str) -> Self {
+            Self {
+                routing_key: Some(key),
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn hit_required(self) -> Self {
+            Self {
+                mode: Some(PickMode::HitRequired),
+                ..self
+            }
+        }
+
+        pub(crate) async fn pick(
+            &self,
+            policy: &dyn Policy,
+            engines: &[Arc<Worker>],
+        ) -> PickResult {
+            let table = EngineLoadTable::new();
+            let load = LoadView::new(&table);
+            let model = ModelId("m".into());
+            let request = PickRequest {
+                model: &model,
+                stage: RoutingStage::Plain,
+                bucket_id: "global",
+                scope: AffinityScope::Bucket,
+                mode: self.mode.unwrap_or(PickMode::Normal),
+                input_tokens: 16,
+                expected_peak_sequence_tokens: None,
+                session_id: self.session_id,
+                routing_key: self.routing_key,
+                affinity_enabled: true,
+                load: &load,
+            };
+            policy.pick(engines, &request).await
+        }
     }
 
     pub(crate) fn id(result: &PickResult) -> &str {
