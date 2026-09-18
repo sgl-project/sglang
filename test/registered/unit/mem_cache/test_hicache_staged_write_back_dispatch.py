@@ -585,6 +585,57 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
 
+    def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.kv_buffer = torch.empty(2, 2, 2, 2, 1, 1)
+
+        device_k = torch.empty(2, 3, 2, 1, 1)
+        device_v = torch.empty_like(device_k)
+        device_pool = SimpleNamespace(
+            # FIA exposes lists here; these must not be sent to the operator.
+            k_buffer=[device_k[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            v_buffer=[device_v[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            get_hicache_transfer_buffers=mock.Mock(return_value=(device_k, device_v)),
+        )
+        host_indices = _indices(0, 2)
+        device_indices = _indices(2, 4)
+        directions = SimpleNamespace(H2D="H2D", D2H="D2H")
+
+        with (
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
+                directions,
+                create=True,
+            ),
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                create=True,
+            ) as transfer,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="kernel_ascend",
+            )
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id=0,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertEqual(device_pool.get_hicache_transfer_buffers.call_count, 2)
+        self.assertEqual(transfer.call_count, 2)
+        for call in transfer.call_args_list:
+            self.assertIs(call.kwargs["device_k"], device_k)
+            self.assertIs(call.kwargs["device_v"], device_v)
+        self.assertEqual(transfer.call_args_list[0].kwargs["direction"], "D2H")
+        self.assertEqual(transfer.call_args_list[1].kwargs["direction"], "H2D")
+
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         kv_cache_dim = 5
@@ -747,6 +798,79 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+
+    def test_mamba_kernel_npu_backup_then_load_roundtrip(self):
+        num_layers = 2
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 5], dtype=torch.int64)
+        temporal = torch.arange(num_layers * 8 * 3, dtype=torch.float32).reshape(
+            num_layers, 8, 3
+        )
+        conv = (
+            torch.arange(num_layers * 8 * 2, dtype=torch.float32).reshape(
+                num_layers, 8, 2
+            )
+            / 8
+        ).to(torch.bfloat16)
+        device_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal.clone(), conv=[conv.clone()])
+        )
+        expected_temporal = device_pool.mamba_cache.temporal[:, device_indices].clone()
+        expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
+
+        host = MambaPoolHost.__new__(MambaPoolHost)
+        host.layout = "page_first_direct"
+        host.num_mamba_layers = num_layers
+        host.temporal_state_elem_size = 3
+        host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.float32)
+        host.conv_state_shapes = [(2,)]
+        host.conv_buffer = [torch.zeros(8, num_layers, 1, 2, dtype=torch.bfloat16)]
+        host.temporal_staging_buffer = None
+        host.conv_staging_buffers = [None]
+        host._temporal_can_use_jit = False
+        host._conv_can_use_jit = [False]
+        host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
+        host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
+
+        host.backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend="kernel_ascend",
+        )
+        device_pool.mamba_cache.temporal.zero_()
+        device_pool.mamba_cache.conv[0].zero_()
+        for layer_id in range(num_layers):
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.temporal[:, device_indices], expected_temporal
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.temporal_buffer[host_indices].squeeze(2).transpose(0, 1),
+                expected_temporal,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.conv_buffer[0][host_indices].squeeze(2).transpose(0, 1),
+                expected_conv,
             )
         )
 
@@ -1049,6 +1173,89 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_hybrid_indices.assert_called_once()
         self.assertEqual([indices.device.type for indices in captured], ["cpu", "cpu"])
+
+    def _chain_write_controller(self, captured):
+        """A hybrid controller over a real HostPoolGroup whose KV pool records
+        every backup it receives."""
+
+        class ChainHostPool:
+            layout = "page_first"
+            page_size = 4
+            device = "cpu"
+            size = 64
+            logical_size = 64
+            size_per_token = 2
+            can_use_write_back_jit = True
+
+            def __init__(self):
+                self.next_free = 0
+
+            def alloc(self, need_size):
+                start = self.next_free
+                self.next_free += need_size
+                return _indices(start, start + need_size)
+
+            def backup_from_device_all_layer(
+                self, device_pool, host_indices, device_indices, io_backend
+            ):
+                captured.append((host_indices, device_indices))
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = []
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=ChainHostPool(),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller.mem_pool_device = None
+        controller.ack_write_queue = []
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        return controller
+
+    def test_hybrid_write_without_flush_merges_chain_into_one_submit(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            first = controller.write(_indices(4, 8), node_id=1, flush=False)
+            second = controller.write(_indices(12, 16), node_id=2, flush=False)
+            self.assertEqual(len(controller.write_queue), 2)
+            self.assertEqual(captured, [])
+            self.assertEqual(controller.ack_write_queue, [])
+
+            controller.start_writing()
+            # Flushing a drained queue must not submit another copy or ack.
+            controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        host_indices, device_indices = captured[0]
+        self.assertEqual(host_indices.tolist(), torch.cat([first, second]).tolist())
+        self.assertEqual(
+            device_indices.tolist(), list(range(4, 8)) + list(range(12, 16))
+        )
+        self.assertEqual(len(controller.ack_write_queue), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1, 2])
+        self.assertEqual(controller.ack_write_queue[0].num_tokens, 8)
+
+    def test_hybrid_write_flushes_by_default(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1])
 
     def test_write_back_jit_cache_controller_keeps_host_indices_on_cpu(self):
         captured = {}

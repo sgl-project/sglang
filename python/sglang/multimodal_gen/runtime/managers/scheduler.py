@@ -43,7 +43,11 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
@@ -84,6 +88,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
     """
+
+    metrics: DiffusionMetrics | None = None
 
     def __init__(
         self,
@@ -132,6 +138,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
+        self.metrics = worker.metrics
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -559,6 +566,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._requires_sequential_multi_output(base_req, candidate_req):
+            return "sequential_multi_output"
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
+            return "pipeline_request_unsupported"
         if self._has_realtime_session(base_req) or self._has_realtime_session(
             candidate_req
         ):
@@ -589,9 +602,33 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
 
+    def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
+        pipeline_config = self.server_args.pipeline_config
+        return (
+            pipeline_config.supports_sequential_multi_output_inference()
+            and not pipeline_config.supports_sequential_dit_inference()
+            and any(max(1, int(req.num_outputs_per_prompt or 1)) > 1 for req in reqs)
+        )
+
+    def _pipeline_supports_dynamic_batching_for_request(self, *reqs: Req) -> bool:
+        checker = getattr(
+            self.server_args.pipeline_config,
+            "supports_dynamic_batching_for_request",
+            None,
+        )
+        return not callable(checker) or all(checker(req) for req in reqs)
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._requires_sequential_multi_output(base_req, candidate_req):
+            return False
+
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
             return False
 
         if self._has_realtime_session(base_req) or self._has_realtime_session(
@@ -625,6 +662,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_batch(request_count, stop_reason)
         if not self._batch_metrics_enabled:
             return
 
@@ -760,6 +799,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_batch: OutputBatch,
     ) -> None:
         identity, processed_req = item
+        if self.metrics is not None:
+            self.metrics.finish(id(processed_req), error=output_batch.error is not None)
         is_warmup = is_warmup_req(processed_req)
         self._log_warmup_result(output_batch, processed_req, is_warmup)
 
@@ -842,11 +883,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not self._can_dynamic_batch(base_req, req):
                 return None
 
+        dynamic_batch_seeds: list[int | list[int]] = []
+        try:
+            for req in reqs:
+                if max(1, int(req.num_outputs_per_prompt or 1)) == 1:
+                    dynamic_batch_seeds.append(
+                        normalize_output_seeds(
+                            req.seed,
+                            num_outputs_per_prompt=1,
+                        )[0]
+                    )
+                else:
+                    dynamic_batch_seeds.append(req.seed)
+        except (TypeError, ValueError):
+            return None
+
         merged_req = deepcopy(base_req)
         merged_req.prompt = [req.prompt for req in reqs]
 
         merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
+        merged_req.extra["dynamic_batch_seeds"] = dynamic_batch_seeds
         merged_req.return_file_paths_only = base_req.return_file_paths_only
         if merged_req.return_file_paths_only:
             dynamic_output_paths: list[str] = []
@@ -1207,6 +1263,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                if self.metrics is not None:
+                    for _, req_or_group in new_reqs:
+                        req = get_first_generation_req(req_or_group)
+                        if req is not None:
+                            self.metrics.enqueue(
+                                id(req_or_group), is_warmup=req.is_warmup, now=now
+                            )
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -1240,6 +1303,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            if self.metrics is not None:
+                for _, req in items:
+                    self.metrics.dispatch(id(req))
+                    if (
+                        isinstance(req, list)
+                        and get_first_generation_req(req) is not None
+                    ):
+                        self.metrics.observe_batch(1, "request_group")
             try:
                 with maybe_record_function(
                     f"REQ {self._req_label(items)} dispatch+forward"
@@ -1257,6 +1328,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     self._return_results_sequentially(items, handler_result.outputs)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending replies sequentially: {e}")
+                finally:
+                    if self.metrics is not None:
+                        for _, req in items:
+                            self.metrics.finish(id(req), error=True)
                 continue
 
             if isinstance(handler_result, list):
@@ -1288,6 +1363,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+            finally:
+                if self.metrics is not None:
+                    for _, req in items:
+                        self.metrics.finish(id(req), error=True)
 
         self._log_batch_metrics_summary()
 
