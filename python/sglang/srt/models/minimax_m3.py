@@ -1612,10 +1612,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():

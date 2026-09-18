@@ -313,6 +313,8 @@ class GroupCoordinator:
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
         self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        # Scale cohorts create these groups without the serving ranks.
+        use_local_synchronization = rank_offset > 0 and not recovered_rank
 
         if is_cuda_alike():
             device_id = (
@@ -335,7 +337,7 @@ class GroupCoordinator:
                 from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     assert max_world_size >= len(ranks), (
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
@@ -349,7 +351,7 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     dev_opts = MooncakeBackendOptions(
                         pg_active_ranks, recovered_rank, max_world_size
                     )
@@ -370,6 +372,7 @@ class GroupCoordinator:
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
@@ -377,6 +380,7 @@ class GroupCoordinator:
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             else:
                 active_ranks = torch.ones(
@@ -390,6 +394,7 @@ class GroupCoordinator:
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -398,6 +403,7 @@ class GroupCoordinator:
                     backend="gloo",
                     timeout=gloo_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -1086,7 +1092,17 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            assert input.numel() == output.numel() * self.world_size
+            # Reduction order must be independent of the receiving rank.
+            # Preserve input even when all_reduce mutates its argument.
+            reduced = self.all_reduce(input.clone())
+            output.copy_(
+                reduced.reshape(-1)
+                .narrow(0, self.rank_in_group * output.numel(), output.numel())
+                .view_as(output)
+            )
+        elif _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1167,6 +1183,33 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def _deterministic_reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        output: Optional[torch.Tensor],
+        sizes: Optional[List[int]],
+    ) -> torch.Tensor:
+        # Reduction order must be independent of the receiving rank.
+        # Offsets are a prefix sum, so unequal `sizes` work unchanged.
+        if sizes is not None:
+            assert len(sizes) == self.world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+            offset = sum(sizes[: self.rank_in_group])
+        else:
+            assert input_.shape[0] % self.world_size == 0
+            chunk_size = input_.shape[0] // self.world_size
+            offset = chunk_size * self.rank_in_group
+        output_shape = (chunk_size,) + input_.shape[1:]
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
+        # Preserve input even when all_reduce mutates its argument.
+        reduced = self.all_reduce(input_.clone())
+        output.copy_(reduced.narrow(0, offset, chunk_size))
+        return output
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1175,6 +1218,9 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
+
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            return self._deterministic_reduce_scatterv(input_, output, sizes)
 
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (
@@ -2028,7 +2074,11 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    recovered_rank: bool = False,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -2043,6 +2093,7 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
+        max_world_size=max_world_size,
     )
 
 
@@ -2441,7 +2492,11 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(
-            ranks, local_rank, backend, recovered_rank=recovered_rank
+            ranks=ranks,
+            local_rank=local_rank,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            max_world_size=max_world_size,
         )
     else:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
@@ -2524,7 +2579,7 @@ def initialize_model_parallel(
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
-        if recovered_rank
+        if recovered_rank or rank_offset > 0
         else torch.distributed.get_world_size()
     )
 
@@ -2613,6 +2668,8 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2830,6 +2887,9 @@ def initialize_model_parallel(
             backend,
             use_custom_allreduce=False,
             group_name="self_pp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
 
@@ -3101,6 +3161,26 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def abort_distributed_environment() -> None:
+    """Drop this rank's communicators locally.
+
+    ``destroy_process_group`` is collective and blocks when a peer is gone,
+    which on a shutdown path is the common case.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+    if abort is None:
+        # Older torch exposes no non-collective teardown,
+        # and the collective one is what this function exists to avoid.
+        return
+    try:
+        # No argument aborts every group, the default one included.
+        abort()
+    except Exception as e:
+        logger.warning(f"NCCL abort on shutdown failed, {type(e).__name__}: {e}")
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
