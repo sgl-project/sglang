@@ -161,21 +161,23 @@ def _kv_scale_divides(
     return scale != 1.0
 
 
-def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
-    """Whether ``t`` is addressable as ``token * t.stride(0) + head * head_dim + dim``.
+def _has_dense_kv_rows(
+    t: torch.Tensor, head_num: int, head_dim: int, num_tokens: int
+) -> bool:
+    """Whether ``t`` holds exactly ``num_tokens`` rows addressable as
+    ``token * t.stride(0) + head * head_dim + dim``.
 
-    Weaker than ``is_contiguous``: gaps between tokens are fine, since
-    ``reshape_and_cache_flash`` takes the token stride per source.
+    Weaker than ``is_contiguous`` (the kernel takes the token stride) but strict
+    on the count: it sizes the grid, and the slot index is read unmasked.
     """
     row = head_num * head_dim
     if t.is_contiguous():
-        return t.numel() % row == 0
+        return t.numel() == num_tokens * row
     if t.dim() == 2:
-        return t.shape[1] == row and t.stride(1) == 1
+        return tuple(t.shape) == (num_tokens, row) and t.stride(1) == 1
     if t.dim() == 3:
         return (
-            t.shape[1] == head_num
-            and t.shape[2] == head_dim
+            tuple(t.shape) == (num_tokens, head_num, head_dim)
             and t.stride(1) == head_dim
             and t.stride(2) == 1
         )
@@ -2588,6 +2590,8 @@ class MHATokenToKVPool(KVCache):
 
     def can_store_kv_fused_cast(
         self,
+        layer_id: int,
+        loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale=None,
@@ -2608,9 +2612,14 @@ class MHATokenToKVPool(KVCache):
             return False
         if _kv_scale_divides(k_scale) or _kv_scale_divides(v_scale):
             return False
+        # store_kv_fused_cast presents the buffer as page-size 1; a subclass whose
+        # per-layer buffer is already paged (NPU) would be mis-indexed.
+        if self.k_buffer[layer_id - self.start_layer].dim() != 3:
+            return False
+        num_tokens = loc.numel()
         return (
-            _has_dense_kv_rows(cache_k, self.head_num, self.head_dim)
-            and _has_dense_kv_rows(cache_v, self.head_num, self.head_dim)
+            _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, num_tokens)
+            and _has_dense_kv_rows(cache_v, self.head_num, self.head_dim, num_tokens)
             and cache_k.shape == cache_v.shape
         )
 
@@ -2627,6 +2636,8 @@ class MHATokenToKVPool(KVCache):
         """
         from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
 
+        # store_cache carries its own slot bound; this kernel does not.
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "store_kv_fused_cast")
         # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
         # slot-indexed buffer as page-size 1.
         launch_reshape_and_cache_flash(
@@ -5425,10 +5436,15 @@ class MHATokenToKOnlyPool(KVCache):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
         k_buffer = self.k_buffer[layer_id]
-        if cache_k.is_contiguous():
-            store_k_slots(k_buffer, cache_k.view(-1, *k_buffer.shape[1:]), loc)
+        if _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, loc.numel()):
+            store_k_slots(
+                k_buffer,
+                _as_token_head_dim(cache_k, self.head_num, self.head_dim),
+                loc,
+            )
         else:
-            # store_k_slots requires contiguous rows.
+            # store_k_slots needs each token's (head, dim) block dense. This branch
+            # also wraps a negative slot rather than skipping it; loc has none here.
             k_buffer[loc] = cache_k
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
@@ -5694,7 +5710,7 @@ class MiniMaxSparseKVPool(KVCache):
             )
         sub_pool = self.index_k_pool
         if cache_idx_k.dtype != sub_pool.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_idx_k = cache_idx_k / k_scale
         sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
 
@@ -5769,7 +5785,9 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        if self.main_pool.can_store_kv_fused_cast(cache_k, cache_v, k_scale, v_scale):
+        if self.main_pool.can_store_kv_fused_cast(
+            layer.layer_id, loc, cache_k, cache_v, k_scale, v_scale
+        ):
             self.main_pool.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
         else:
             # Fallback: separate stores (identical semantics; quantizes for fp8

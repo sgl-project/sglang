@@ -140,8 +140,8 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Zero-fill is required only when a route can be filtered: moe_align_block_size
-    # reserves an extra expert bucket whose row the GEMM may leave unwritten.
+    # torch.empty is safe only while every routed row is written. A route filtered
+    # to -1 is the one case moe_align_block_size may drop from the sort entirely.
     alloc = torch.zeros if may_filter_routes else torch.empty
     out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
@@ -286,6 +286,8 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
+        # No copy: from here on topk_ids is read, never written. Skipping the clamp
+        # needs every id inside [0, local_num_experts) — see _needs_expert_filter.
         topk_ids = topk_ids.to(torch.int32)
 
     # Only the branches above can drop a route to -1.

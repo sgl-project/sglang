@@ -143,7 +143,8 @@ def store_k_slots_kernel(
     pid_b = tl.program_id(1)
 
     loc = tl.load(loc_ptr + pid_n).to(tl.int64)
-    # Negative slot = padded row, as in reshape_and_cache_flash, which shares this `loc`.
+    # Negative slot = skip, matching reshape_and_cache_flash. Note ATen advanced
+    # indexing would wrap instead, so a fallback caller is not equivalent here.
     if loc < 0:
         return
 

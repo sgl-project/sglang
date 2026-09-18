@@ -7,6 +7,11 @@ import torch
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.cache_move import store_k_slots
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    _as_token_head_dim,
+    _has_dense_kv_rows,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=34, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -335,26 +340,6 @@ def test_store_k_slots_skips_negative_slots(index_dtype: torch.dtype) -> None:
     )
 
 
-def test_store_k_slots_leaves_other_slots_untouched() -> None:
-    head_num, head_dim = 8, 128
-    batch_size = 64
-    src = torch.randn((batch_size, head_num, head_dim), dtype=DTYPE, device=DEVICE)
-    k_buffer = torch.randn(
-        (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
-    )
-    before = k_buffer.clone()
-    loc = torch.randperm(SMALL_CACHE, device=DEVICE)[:batch_size]
-
-    store_k_slots(k_buffer, src, loc)
-
-    # A wrong slot stride would corrupt neighbours, which target-slot checks miss.
-    untouched = torch.ones(SMALL_CACHE, dtype=torch.bool, device=DEVICE)
-    untouched[loc] = False
-    torch.testing.assert_close(
-        k_buffer[untouched], before[untouched], rtol=0.0, atol=0.0
-    )
-
-
 def test_store_k_slots_empty_loc_is_noop() -> None:
     head_num, head_dim = 4, 128
     src = torch.randn((0, head_num, head_dim), dtype=DTYPE, device=DEVICE)
@@ -407,13 +392,158 @@ def test_store_k_slots_dtypes(dtype: torch.dtype) -> None:
     head_num, head_dim = 4, 128
     batch_size = 32
     src = torch.randn((batch_size, head_num, head_dim), dtype=dtype, device=DEVICE)
-    k_buffer = torch.randn((SMALL_CACHE, head_num, head_dim), dtype=dtype, device=DEVICE)
+    k_buffer = torch.randn(
+        (SMALL_CACHE, head_num, head_dim), dtype=dtype, device=DEVICE
+    )
     loc = torch.randperm(SMALL_CACHE, device=DEVICE)[:batch_size]
     expected = _ref_scatter(k_buffer, src, loc)
 
     store_k_slots(k_buffer, src, loc)
 
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# The guards that route a store to the kernels above: `_has_dense_kv_rows` for
+# both, plus the pool-side conditions in `can_store_kv_fused_cast`. Shape and
+# stride logic only, so these need no launch.
+# ---------------------------------------------------------------------------
+
+GUARD_HEAD_NUM, GUARD_HEAD_DIM = 2, 64
+GUARD_ROW = GUARD_HEAD_NUM * GUARD_HEAD_DIM
+QKV_WIDTH = 2304  # q + k + v at TP4, the width a K column slice strides by
+
+
+def _qkv_k_slice(num_tokens: int) -> torch.Tensor:
+    """A K slice as production produces it: `qkv.split(..., dim=-1)`."""
+    qkv = torch.zeros((num_tokens, QKV_WIDTH), dtype=DTYPE, device=DEVICE)
+    return qkv[:, GUARD_ROW : 2 * GUARD_ROW]
+
+
+def _dense(t: torch.Tensor, num_tokens: int) -> bool:
+    return _has_dense_kv_rows(t, GUARD_HEAD_NUM, GUARD_HEAD_DIM, num_tokens)
+
+
+def test_dense_kv_rows_accepts_qkv_column_slice() -> None:
+    k = _qkv_k_slice(8)
+    assert not k.is_contiguous()
+    assert k.stride() == (QKV_WIDTH, 1)
+    assert _dense(k, 8)
+
+
+def test_dense_kv_rows_accepts_contiguous_and_token_strided() -> None:
+    flat = torch.zeros((8, GUARD_ROW), dtype=DTYPE, device=DEVICE)
+    split = torch.zeros((8, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    # Dense (head, dim) block with gaps between tokens: in contract.
+    strided = torch.zeros(
+        (16, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )[::2]
+    assert not strided.is_contiguous()
+    assert _dense(flat, 8) and _dense(split, 8) and _dense(strided, 8)
+
+
+@pytest.mark.parametrize("layout", ["qkv_slice", "flat", "split"])
+def test_dense_kv_rows_rejects_wrong_token_count(layout: str) -> None:
+    # Right row layout, more tokens than loc. reshape_and_cache_flash sizes its
+    # grid from shape[0] and reads the slot index unmasked, so this overruns loc.
+    if layout == "qkv_slice":
+        t = _qkv_k_slice(8)
+    elif layout == "flat":
+        t = torch.zeros((8, GUARD_ROW), dtype=DTYPE, device=DEVICE)
+    else:
+        t = torch.zeros((8, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    assert _dense(t, 8)
+    assert not _dense(t, 4)
+
+
+def test_dense_kv_rows_rejects_non_dense_trailing_block() -> None:
+    # Sliced along head_dim: the trailing block is no longer a flat run.
+    sliced = torch.zeros(
+        (8, GUARD_HEAD_NUM, 2 * GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )[:, :, :GUARD_HEAD_DIM]
+    transposed = torch.zeros(
+        (8, GUARD_HEAD_DIM, GUARD_HEAD_NUM), dtype=DTYPE, device=DEVICE
+    ).transpose(1, 2)
+    assert tuple(transposed.shape) == (8, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    assert not _dense(sliced, 8)
+    assert not _dense(transposed, 8)
+
+
+def test_dense_kv_rows_rejects_unsupported_rank() -> None:
+    t4 = torch.zeros((2, 4, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    assert not _dense(t4[:, ::2], 4)
+
+
+def test_as_token_head_dim_does_not_copy() -> None:
+    k = _qkv_k_slice(8)
+    view = _as_token_head_dim(k, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    assert tuple(view.shape) == (8, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    assert view.data_ptr() == k.data_ptr()
+    assert view.stride() == (QKV_WIDTH, GUARD_HEAD_DIM, 1)
+
+
+class _PoolStub:
+    """Attribute-only stand-in: can_store_kv_fused_cast reads state, not methods."""
+
+    def __init__(self, buffer_dims: int = 3):
+        self.kv_cache_layout = "nhd"
+        self.use_hnd = False
+        self.is_quantized_kv_cache = False
+        self.dtype = torch.float8_e4m3fn
+        self.store_dtype = torch.uint8
+        self.head_num = GUARD_HEAD_NUM
+        self.head_dim = GUARD_HEAD_DIM
+        self.v_head_dim = GUARD_HEAD_DIM
+        self.start_layer = 0
+        shape = (
+            (SMALL_CACHE, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+            if buffer_dims == 3
+            # NPUMHATokenToKVPool's paged per-layer buffer.
+            else (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+        )
+        self.k_buffer = [torch.zeros(shape, dtype=torch.uint8, device=DEVICE)]
+
+
+def _can_store(pool: _PoolStub, num_tokens: int = 8, **kwargs) -> bool:
+    loc = torch.arange(num_tokens, dtype=torch.int64, device=DEVICE)
+    return MHATokenToKVPool.can_store_kv_fused_cast(
+        pool, 0, loc, _qkv_k_slice(num_tokens), _qkv_k_slice(num_tokens), **kwargs
+    )
+
+
+def test_can_store_kv_fused_cast_accepts_flat_slot_indexed_buffer() -> None:
+    assert _can_store(_PoolStub())
+    assert _can_store(_PoolStub(), k_scale=1.0, v_scale=1.0)
+
+
+def test_can_store_kv_fused_cast_rejects_paged_per_layer_buffer() -> None:
+    # store_kv_fused_cast presents the buffer as page-size 1 via unsqueeze(1),
+    # which mis-indexes a buffer that is already paged.
+    assert not _can_store(_PoolStub(buffer_dims=4))
+
+
+def test_can_store_kv_fused_cast_rejects_scales_that_divide() -> None:
+    assert not _can_store(_PoolStub(), k_scale=0.5)
+    assert not _can_store(_PoolStub(), v_scale=0.5)
+    # A tensor scale cannot be inspected without a sync, so it must divide.
+    assert not _can_store(_PoolStub(), k_scale=torch.ones(1, device=DEVICE))
+
+
+@pytest.mark.parametrize(
+    "attr,value",
+    [
+        ("dtype", DTYPE),  # source already in cache dtype
+        ("v_head_dim", GUARD_HEAD_DIM // 2),
+        ("kv_cache_layout", "hnd"),
+        ("use_hnd", True),
+        ("is_quantized_kv_cache", True),
+        ("store_dtype", DTYPE),
+    ],
+)
+def test_can_store_kv_fused_cast_rejects_unsupported_pool(attr: str, value) -> None:
+    pool = _PoolStub()
+    setattr(pool, attr, value)
+    assert not _can_store(pool)
 
 
 if __name__ == "__main__":
