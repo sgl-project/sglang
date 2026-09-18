@@ -721,10 +721,12 @@ class HybridCacheController(BaseHiCacheController):
                 if draft_host_layer is None:
                     continue
 
+                # Finish every draft before the final target-layer event,
+                # including chains deeper than the target model.
                 def draft_layer_mapper(
                     layer_id: int,
                     *,
-                    expected_layer_id: int = depth,
+                    expected_layer_id: int = min(depth, self.layer_num - 1),
                     host_layer_id: int = draft_host_layer,
                 ) -> Optional[int]:
                     if layer_id == expected_layer_id:
