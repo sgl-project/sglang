@@ -679,7 +679,7 @@ mod tests {
 
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
-        assert!(m.workers().contains(&id), "tree must hold the worker");
+        assert!(m.holds(&id), "tree must hold the worker");
     }
 
     /// The pump must carry each event's `medium` into the tree. The engine's
@@ -725,7 +725,7 @@ mod tests {
 
         let m = tree.match_prefix(None, &[10, 20]);
         assert_eq!(m.matched_blocks, 2, "host copy keeps the block routable");
-        assert!(m.workers().contains(&id));
+        assert!(m.holds(&id));
         assert!(!m.device_workers().contains(&id), "device copy is gone");
     }
 
@@ -1159,6 +1159,59 @@ mod tests {
             "remove_worker must clear engine load"
         );
         assert_eq!(index.engine_load().expected_count(), 0);
+        index.shutdown().await;
+    }
+
+    /// `remove_worker` is the tree's SECOND writer: it clears every rank's
+    /// state from whatever task service discovery calls it on
+    /// (`workers/manager.rs`) while the pump is live and writing the same
+    /// tree. This pins the wiring that makes the collision
+    /// `HashTree::concurrent_writers_never_orphan_a_chain` covers reachable
+    /// at all — a refactor moving the clear onto the pump would retire it.
+    #[tokio::test]
+    async fn remove_worker_clears_the_tree_off_the_pump_task() {
+        let index = KvEventIndex::new();
+        let url = "http://127.0.0.1:59124";
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 59124,
+            topic: String::new(),
+            load_port_base: None,
+            load_topic: None,
+            block_size: 64,
+            dp_size: 2,
+            is_bigram: false,
+        };
+        index.add_worker(url, Some(cfg)).await;
+
+        // Stand in for events the pump already applied for both ranks.
+        let tree = index.tree();
+        let (r0, r1) = (worker_id(url, 0), worker_id(url, 1));
+        tree.insert(&r0, None, &[10, 20]);
+        tree.insert(&r1, None, &[30, 40]);
+        assert!(tree.match_prefix(None, &[10, 20]).holds(&r0));
+        assert!(tree.match_prefix(None, &[30, 40]).holds(&r1));
+
+        // Parked on its channel, not finished, so the clear below genuinely
+        // runs on a different task than the one applying events.
+        assert!(
+            index.pump.lock().as_ref().is_some_and(|h| !h.is_finished()),
+            "pump task must still be live, or this proves nothing about a second writer",
+        );
+
+        index.remove_worker(url).await;
+
+        assert_eq!(
+            tree.match_prefix(None, &[10, 20]).matched_blocks,
+            0,
+            "remove_worker must clear the removed worker's tree state",
+        );
+        assert_eq!(
+            tree.match_prefix(None, &[30, 40]).matched_blocks,
+            0,
+            "every dp rank of the removed worker must be cleared",
+        );
+        assert_eq!(tree.node_count(), 0, "cleared chains must prune");
         index.shutdown().await;
     }
 }
