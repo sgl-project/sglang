@@ -521,6 +521,16 @@ class ParallelContext:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
         self._stamp.update(values)
 
+    def recorded(self, name: str):
+        """What `override_permanently` recorded for `name`, or None.
+
+        Not a read of `name`: the read chain also answers from a scope and
+        from the published configuration, and a caller asking this wants the
+        record itself -- whether this process was *told* where it is, as
+        opposed to being able to work it out from a group.
+        """
+        return self._stamp.get(name)
+
     def clear_stamp(self) -> None:
         """Drop every stamped name, ranks included."""
         self._stamp.clear()
@@ -1735,12 +1745,21 @@ def publish(
         )
     _CONTEXT._publish_role = role
     if ranks is not None:
-        # Two per-process identities with no group to answer them: `dp_rank`
-        # counts replicas, `gpu_id` names the device this process was given.
-        # Neither belongs on a config bag -- a bag holds what every process in
-        # the deployment shares -- so both are recorded here.
+        # Every identity the spawn knows, recorded now so a read does not need
+        # a process group. Two of them have no group that could answer anyway:
+        # `dp_rank` counts replicas, and `gpu_id` names the device this process
+        # was given -- neither belongs on a config bag, which holds what every
+        # process in the deployment shares. The scoped overrides that swap a
+        # group for a draft worker sit above all of these in the read chain, so
+        # a scope still wins.
         _CONTEXT.parallel.override_permanently(
-            dp_rank=ranks.dp_rank, gpu_id=ranks.gpu_id
+            dp_rank=ranks.dp_rank,
+            gpu_id=ranks.gpu_id,
+            tp_rank=ranks.tp_rank,
+            pp_rank=ranks.pp_rank,
+            attn_cp_rank=ranks.attn_cp_rank,
+            moe_dp_rank=ranks.moe_dp_rank,
+            moe_ep_rank=ranks.moe_ep_rank,
         )
         _stamp_attention_ranks(_CONTEXT.parallel, ranks.tp_rank)
     if _ROLE_NS_MODE == "record":

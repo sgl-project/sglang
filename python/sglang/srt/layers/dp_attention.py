@@ -383,7 +383,7 @@ def initialize_dp_attention(
     # Checked here, against the layout the groups were built from, because the
     # elastic rewrite below deliberately replaces that layout with the scale
     # identity. Only the first of the two is what `publish` recorded.
-    stamped = get_parallel()._stamp.get("attn_dp_rank")
+    stamped = get_parallel().recorded("attn_dp_rank")
     if stamped is not None and stamped != attn_dp_rank:
         raise RuntimeError(
             "attention-DP rank disagrees with the published configuration: "

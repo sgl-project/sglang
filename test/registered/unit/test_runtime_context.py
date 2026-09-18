@@ -2369,6 +2369,104 @@ class TestTheRecordAndTheGroupsMustAgree(_IsolatedOverrides):
             dp_attention.initialize_dp_attention(server_args, model_config)
         # The rewrite wins, and it is what the readers see afterwards.
         self.assertEqual(get_parallel().attn_dp_rank, 6)
+    def _two_stage_spawn(self):
+        publish(
+            ServerArgs(model_path="dummy", tp_size=2, pp_size=2),
+            role="test",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=1, pp_rank=1, dp_rank=None),
+        )
+
+    def test_the_group_build_accepts_ranks_that_match_the_record(self):
+        from sglang.srt.distributed import parallel_state
+
+        self._two_stage_spawn()
+        with (
+            patch(f"{_PS}.get_tensor_model_parallel_rank", return_value=1),
+            patch(f"{_PS}.get_pipeline_model_parallel_rank", return_value=1),
+        ):
+            parallel_state._check_built_groups_match_the_published_ranks()
+
+    def test_the_group_build_refuses_ranks_that_do_not(self):
+        from sglang.srt.distributed import parallel_state
+
+        self._two_stage_spawn()
+        with (
+            patch(f"{_PS}.get_tensor_model_parallel_rank", return_value=0),
+            patch(f"{_PS}.get_pipeline_model_parallel_rank", return_value=1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"tp_rank disagrees"):
+                parallel_state._check_built_groups_match_the_published_ranks()
+
+    def test_a_process_with_no_record_is_not_checked(self):
+        """Nothing to compare: the groups are that process's only account of
+        where it is, exactly as before there was a record."""
+        from sglang.srt.distributed import parallel_state
+
+        publish(ServerArgs(model_path="dummy", tp_size=2, pp_size=2), role="test")
+        with patch(
+            f"{_PS}.get_tensor_model_parallel_rank",
+            side_effect=AssertionError("the group must not be asked"),
+        ):
+            parallel_state._check_built_groups_match_the_published_ranks()
+
+
+class TestWhoAnswersDuringADraftScope(CustomTestCase):
+    """A draft worker runs in one process with the target, under a scope.
+
+    Two things have to hold for that to be workable, and neither is visible
+    from a single read: inside the scope every source agrees on the draft's
+    shape, and a reader that runs *outside* it still gets the draft's answer
+    from whatever it carried out.
+    """
+
+    def _single_member_group(self):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = 1
+        group.rank_in_group = 0
+        return group
+
+    def _two_stage_pipeline(self):
+        """This process is stage 1 of 2, published the way a spawn states it."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", pp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(gpu_id=0, tp_rank=0, pp_rank=1),
+        )
+
+    def test_the_pipeline_swap_states_every_member_it_installs(self):
+        """`pp_size` is a configured leaf: unlike `pp_rank` it does not follow
+        the group being swapped underneath, so a scope that installs a group
+        without stating its width reports the target's."""
+        from sglang.srt.distributed import parallel_state
+
+        group = self._single_member_group()
+        self._two_stage_pipeline()
+        self.assertEqual(get_parallel().pp_size, 2)
+        with patch.object(parallel_state, "_PP", group):
+            with parallel_state.patch_pipeline_parallel_group(group):
+                self.assertEqual(get_parallel().pp_size, 1)
+                self.assertEqual(get_parallel().pp_rank, 0)
+                self.assertIs(get_parallel().pp_group, group)
+        self.assertEqual(get_parallel().pp_size, 2)
+        self.assertEqual(get_parallel().pp_rank, 1)
+
+    def test_a_report_built_for_a_runner_follows_that_runner(self):
+        """A weight check is an on-demand request served from the scheduler
+        loop, so it runs outside the scope that describes a draft runner. Its
+        report has to name the runner it was built for, which is why it holds
+        a record instead of asking the context."""
+        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from sglang.srt.utils.weight_checker import WeightChecker
+
+        draft = ParallelState.trivial(pp_rank=0, pp_size=1)
+        checker = WeightChecker(get_model=lambda: None, ps=draft)
+        self._two_stage_pipeline()
+        info = checker._parallelism_info()
+        self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
 if __name__ == "__main__":
