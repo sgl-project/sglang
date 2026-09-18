@@ -4,11 +4,14 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
