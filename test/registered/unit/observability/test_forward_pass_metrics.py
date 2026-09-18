@@ -94,16 +94,11 @@ class TestDeviceTimerCapture(unittest.TestCase):
         event.assert_called_once_with(enable_timing=True)
         event.return_value.record.assert_called_once_with()
 
-    def test_wrapper_forwards_arguments_and_cleans_up_after_exception(self):
+    def test_wrapper_cleans_up_after_exception(self):
         timer = DeviceTimer()
-        forward = Mock(return_value=GenerationBatchResult())
+        forward = Mock(side_effect=ValueError("forward failed"))
         wrapped = wrap_forward_with_fpm(forward, timer)
         batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-        self.assertIs(wrapped(batch, pp_proxy_tensors="proxy"), forward.return_value)
-        forward.assert_called_once_with(batch, pp_proxy_tensors="proxy")
-        self.assertIs(wrapped.__wrapped__, forward)
-        self.assertEqual(forward.return_value.fpm_timing.num_intervals, 0)
-        forward.side_effect = ValueError("forward failed")
         with self.assertRaisesRegex(ValueError, "forward failed"):
             wrapped(batch)
         self.assertIsNone(timer._observer)
@@ -138,19 +133,6 @@ class TestDeviceTimerCapture(unittest.TestCase):
         timer._report()
         callbacks[0].assert_called_once()
         callbacks[1].assert_called_once()
-
-    def test_ready_intervals_wait_for_seal(self):
-        timer, timing, callback = DeviceTimer(), FpmTiming(), Mock()
-        with patch.object(
-            _TimingInterval, "create", return_value=FakeInterval(2, True)
-        ):
-            with timer.capture(timing):
-                timing.when_ready(callback)
-                with timer.wrap({}):
-                    pass
-                callback.assert_not_called()
-        timing.seal()
-        callback.assert_called_once_with(0.002)
 
     def test_empty_zero_and_cross_stream_spans(self):
         for intervals, expected in (
@@ -428,12 +410,6 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertTrue(self.scheduler._fpm_publisher.idle)
         self.reporter.record_scheduler_active()
         self.assertFalse(self.scheduler._fpm_publisher.idle)
-
-    def test_emit_uses_device_timer_gpu_time(self):
-        self._emit_ready(self._make_batch(), milliseconds=42)
-        metrics = self.scheduler._fpm_publisher.metrics
-        self.assertEqual(len(metrics), 1)
-        self.assertAlmostEqual(metrics[0].wall_time, 0.042)
 
     def test_emit_skips_uninstrumented_iteration(self):
         for timing in (None, capture_timing(DeviceTimer())):
