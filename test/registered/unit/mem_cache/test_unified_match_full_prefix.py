@@ -35,6 +35,10 @@ class _TombstonedSwaComponent(TreeComponent):
     def create_match_validator(self, match_device_only: bool = False):
         return lambda node: False
 
+    def build_hicache_transfers(self, node, phase, **kwargs):
+        # Like the real SWA component: a tombstoned node has nothing to build.
+        raise AssertionError("tombstoned SWA state has no transfer")
+
     def redistribute_on_node_split(self, new_parent, child):
         return None
 
@@ -162,6 +166,22 @@ class TestMatchFullPrefix(CustomTestCase):
 
         self.assertEqual(matched_len, 4)
         self.assertEqual(node_id, self.a.id)
+
+    def test_kv_only_load_back_spec_builds_no_component_transfers(self):
+        # The KV-only restore of an evicted FULL node behind tombstoned SWA
+        # state must not ask the SWA component for a transfer (it asserts).
+        c = _add_node(self.tree_core, self.b, [9, 10], device=False, host=True)
+
+        with self.assertRaises(AssertionError):
+            self.tree_core.build_load_back_spec(c.id)
+
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(c.id, kv_only=True)
+
+        self.assertEqual(comp_xfers, {})
+        self.assertEqual(
+            kv_xfer.host_indices.tolist(),
+            c.component_data[BASE_COMPONENT_TYPE].host_value.tolist(),
+        )
 
 
 if __name__ == "__main__":

@@ -397,6 +397,15 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def match_full_prefix(
+        self, key: RadixKey
+    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
+        """FULL-only match over device- or host-resident FULL KV, ignoring
+        component validators; the deepest node is split at the key end.
+        Returns (matched tokens, that node, split actions)."""
+        ...
+
+    @abstractmethod
     def inc_full_pin(self, node_id: NodeId) -> None:
         """Pin only FULL device values on the node's root path."""
         ...
@@ -521,9 +530,10 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self, node_id: NodeId, req: Optional[Req] = None, kv_only: bool = False
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        """Build the H->D load-back KV transfer plus per-component aux
+        transfers; ``kv_only`` builds no component transfers."""
         ...
 
     @abstractmethod

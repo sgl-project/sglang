@@ -2321,9 +2321,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self, node_id: NodeId, req: Optional[Req] = None, kv_only: bool = False
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        """Build the H->D load-back KV transfer plus per-component aux transfers.
+
+        ``kv_only`` builds no component transfers: a KV-only consumer never
+        restores component state, and the node's may be tombstoned (neither
+        host nor device), which a component build rejects."""
         # Component hooks take primitives, not Req: extract its fields here.
         mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         node = self.node_by_id(node_id)
@@ -2332,7 +2336,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )[0]
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for comp in self.components:
-            if comp.component_type == BASE_COMPONENT_TYPE:
+            if comp.component_type == BASE_COMPONENT_TYPE or kv_only:
                 continue
             t = comp.build_hicache_transfers(
                 node, CacheTransferPhase.LOAD_BACK, mamba_pool_idx=mamba_pool_idx

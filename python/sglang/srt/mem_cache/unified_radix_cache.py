@@ -1716,9 +1716,9 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_only: bool = False,
     ) -> bool:
         # Build the KV + per-component aux transfers.
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
-        if kv_only:
-            comp_xfers = {}
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            node_id, req=req, kv_only=kv_only
+        )
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers

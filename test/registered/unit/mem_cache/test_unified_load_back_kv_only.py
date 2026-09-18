@@ -57,11 +57,13 @@ class TestLoadBackKvOnly(CustomTestCase):
             req, comp.prepare_load_back.return_value, True
         )
 
-    def test_kv_only_drops_component_transfers(self):
+    def test_kv_only_builds_no_component_transfers(self):
+        # The spec itself must be KV-only: building an SWA transfer for a node
+        # whose SWA state is tombstoned (neither host nor device) asserts.
         cache = _cache()
         kv_xfer = SimpleNamespace(host_indices=torch.arange(128))
         cache.tree_core = Mock(
-            build_load_back_spec=Mock(return_value=(kv_xfer, {"swa": [Mock()]})),
+            build_load_back_spec=Mock(return_value=(kv_xfer, {})),
             commit_load_back=Mock(return_value=[]),
         )
         cache._build_sidecar_transfers = Mock(return_value=[])
@@ -82,6 +84,9 @@ class TestLoadBackKvOnly(CustomTestCase):
         )
 
         self.assertTrue(ok)
+        self.assertTrue(
+            cache.tree_core.build_load_back_spec.call_args.kwargs["kv_only"]
+        )
         self.assertIsNone(cache.cache_controller.load.call_args.kwargs["extra_pools"])
         commit_args = cache.tree_core.commit_load_back.call_args.args
         self.assertEqual(commit_args[3], {})
