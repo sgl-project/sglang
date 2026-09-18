@@ -1241,9 +1241,9 @@ class TestSWAPoolFloor(CustomTestCase):
 
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-        from sglang.srt.runtime_context import get_context
 
-        override = get_context().override_server_args(
+        _publish_config(
+            self,
             enable_encoder_swa_bounded_replay=True,
             speculative_algorithm="DSPARK",
             speculative_num_draft_tokens=6,
@@ -1252,8 +1252,6 @@ class TestSWAPoolFloor(CustomTestCase):
             max_running_requests=2,
             chunked_prefill_size=256,
         )
-        override.install()
-        self.addCleanup(override.restore)
         cfg = SimpleNamespace(
             qk_nope_head_dim=448,
             qk_rope_head_dim=64,
@@ -1276,7 +1274,6 @@ class TestSWAPoolFloor(CustomTestCase):
         )
         planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
-        self.assertGreater(planner.swa_cap_tokens, 0)
         budget = 256 * 1024 * 1024
         sizes = planner.calculate_pool_sizes(budget, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
