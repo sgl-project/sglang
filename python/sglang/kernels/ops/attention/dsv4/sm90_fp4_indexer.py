@@ -86,12 +86,12 @@ def _fp4_index_logits_kernel(
     scale = tl.exp2(exps.to(tl.float32) - 127.0)
     scale = scale[:, :, None]
     k_shape: tl.constexpr = (BLOCK_L, SCALE_BYTES, HALF_D // SCALE_BYTES)
-    k_low = tl.reshape(
-        tl.reshape(low, k_shape) * scale, (BLOCK_L, HALF_D)
-    ).to(tl.bfloat16)
-    k_high = tl.reshape(
-        tl.reshape(high, k_shape) * scale, (BLOCK_L, HALF_D)
-    ).to(tl.bfloat16)
+    k_low = tl.reshape(tl.reshape(low, k_shape) * scale, (BLOCK_L, HALF_D)).to(
+        tl.bfloat16
+    )
+    k_high = tl.reshape(tl.reshape(high, k_shape) * scale, (BLOCK_L, HALF_D)).to(
+        tl.bfloat16
+    )
 
     # queries: even / odd elements, [H, HALF_D] bf16
     q_even = tl.load(

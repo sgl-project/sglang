@@ -34,9 +34,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
             q = fake_quant_fp4(
                 torch.randn(rows, heads, 128, device="cuda", dtype=torch.bfloat16)
             )
-            weights = torch.randn(
-                rows, heads, device="cuda", dtype=torch.bfloat16
-            )
+            weights = torch.randn(rows, heads, device="cuda", dtype=torch.bfloat16)
             req = torch.arange(2, device="cuda", dtype=torch.int64).repeat_interleave(
                 group_size
             )
@@ -48,9 +46,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
             slots = torch.stack(
                 [torch.randperm(4 * page_size, device="cuda")[:width] for _ in range(2)]
             ).to(torch.int32)
-            table = torch.empty(
-                (4, page_size * 68), device="cuda", dtype=torch.uint8
-            )
+            table = torch.empty((4, page_size * 68), device="cuda", dtype=torch.uint8)
             store_fp4_index_k_cache(
                 torch.randn(
                     4 * page_size,
@@ -92,3 +88,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                         group_size,
                     )
                     torch.testing.assert_close(actual, expected, equal_nan=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
