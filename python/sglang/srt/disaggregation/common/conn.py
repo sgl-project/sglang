@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferDestination,
     KVTransferMetric,
     StateType,
 )
@@ -139,6 +140,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    supports_host_destination: bool = False
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -1112,6 +1114,7 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            "supports_host_destination": self.supports_host_destination,
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
@@ -1632,9 +1635,12 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # Preserve the target until in-flight writes drain, even when
+                # the scheduler has already observed Failed and cleared the room.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1666,8 +1672,20 @@ class CommonKVReceiver(BaseKVReceiver):
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
+        self.bootstrap_infos: Optional[List[Dict]] = None
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+
+    @property
+    def supports_host_destination(self) -> bool:
+        return (
+            self.kv_mgr.supports_host_destination
+            and bool(self.bootstrap_infos)
+            and all(
+                info.get("supports_host_destination", False)
+                for info in self.bootstrap_infos
+            )
+        )
 
     def init(self, prefill_dp_rank: int):
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
@@ -1903,6 +1921,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         raise NotImplementedError
 
@@ -2122,6 +2141,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                supports_host_destination=bool(
+                    data.get("supports_host_destination", False)
+                ),
             )
 
             self._registered_count += 1

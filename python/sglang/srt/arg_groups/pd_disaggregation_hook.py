@@ -50,6 +50,39 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if (
+        cfg.disaggregation_mode == "decode"
+        and envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.get()
+        and not cfg.disaggregation_decode_enable_host_receive
+    ):
+        raise ValueError(
+            "SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER requires "
+            "--disaggregation-decode-enable-host-receive"
+        )
+    if cfg.disaggregation_decode_enable_host_receive:
+        if (
+            cfg.speculative_algorithm is not None
+            or cfg.enable_hisparse
+            or cfg.hicache_storage_backend is not None
+            or cfg.enable_pd_role_switch
+            or cfg.disaggregation_decode_enable_radix_cache
+        ):
+            raise ValueError(
+                "Decode host receive does not yet support speculative decoding, "
+                "HiSparse, HiCache storage, role switching, or decode radix caching"
+            )
+
+        if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
+            raise ValueError("Decode host KV buffering requires host_pool retraction")
+        if cfg.hicache_mem_layout != "layer_first":
+            logger.info("Using layer_first host KV layout for decode host buffering")
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_retraction_backup="host_pool",
+            hicache_mem_layout="layer_first",
+        )
+
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
         # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.

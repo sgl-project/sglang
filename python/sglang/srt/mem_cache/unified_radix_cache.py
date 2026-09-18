@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1339,15 +1339,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
-        return isinstance(kv_cache, MHATokenToKVPool) and (
-            PoolName.KV in self.host_pool_group.entry_map
+        supports_dense_kv = isinstance(kv_cache, MHATokenToKVPool) or (
+            type(kv_cache) is MLATokenToKVPool and not kv_cache.use_dsa
         )
+        return supports_dense_kv and PoolName.KV in self.host_pool_group.entry_map
 
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool requires "
-                "an MHA or hybrid-SWA HiCache host stack."
+                "an MHA, plain MLA, or hybrid-SWA HiCache host stack."
             )
 
         for spec in self.sidecar_pool_specs:
@@ -1428,7 +1429,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+    def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
@@ -1471,11 +1472,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             completion.finish_event.synchronize()
         except Exception:
-            self.retraction_discard(backup)
+            self.discard_kv_cache_backup(backup)
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1520,9 +1521,9 @@ class UnifiedRadixCache(BasePrefixCache):
             layer_num=self.cache_controller.layer_num,
         )
         completion.finish_event.synchronize()
-        self.retraction_discard(backup)
+        self.discard_kv_cache_backup(backup)
 
-    def retraction_discard(self, backup: RetractionBackup) -> None:
+    def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
