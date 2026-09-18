@@ -4,13 +4,12 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -27,7 +26,7 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
-_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[int | None, int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -76,9 +75,9 @@ def is_dflash_sampling_verify_available() -> bool:
 def _dflash_npu_top_k_top_p_renorm_prob(
     probs: torch.Tensor,
     *,
-    top_ks: Optional[torch.Tensor] = None,
-    top_ps: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
+    top_ks: torch.Tensor | None = None,
+    top_ps: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     if not is_npu() or probs.device.type != "npu":
         return None
     try:
@@ -160,7 +159,7 @@ def scale_kv_cell_size_per_token_for_dflash(
     target_cell_size_per_token: int,
     target_num_layers: int,
     draft_num_layers: int,
-    draft_cell_size_per_token: Optional[int] = None,
+    draft_cell_size_per_token: int | None = None,
 ) -> int:
     """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
 
@@ -247,7 +246,7 @@ def apply_dflash_verify_logits_adjustments(
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
-    logits_3d: Optional[torch.Tensor] = None
+    logits_3d: torch.Tensor | None = None
 
     def get_logits_3d() -> torch.Tensor:
         nonlocal logits_3d
@@ -354,7 +353,7 @@ def _get_or_create_chain_verify_buffers(
     )
 
 
-def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
     """Select target layer indices used to build DFlash context features.
 
     Args:
@@ -394,7 +393,7 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
-def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
@@ -406,7 +405,7 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
-def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -511,8 +510,8 @@ def _parse_optional_int(
     value: Any,
     *,
     field_name: str,
-    min_value: Optional[int] = None,
-) -> Optional[int]:
+    min_value: int | None = None,
+) -> int | None:
     if value is None:
         return None
     try:
@@ -527,25 +526,25 @@ def _parse_optional_int(
 
 @dataclass(frozen=True)
 class DFlashDraftConfig:
-    num_hidden_layers: Optional[int]
-    num_target_layers: Optional[int]
-    block_size: Optional[int]
+    num_hidden_layers: int | None
+    num_target_layers: int | None
+    block_size: int | None
     conv_kernel_size: int
     conv_group_size: int
     selector_rank: int
     selector_top_k: int
     output_multiplier: float
-    final_logit_softcapping: Optional[float]
-    target_layer_ids: Optional[List[int]]
+    final_logit_softcapping: float | None
+    target_layer_ids: list[int] | None
     mask_token: str
-    mask_token_id: Optional[int]
-    projector_type: Optional[str]
-    shift_label: Optional[bool]
-    pure_draft_prefix_len: Optional[int]
-    gru_hidden_dim: Optional[int]
-    emb_dim: Optional[int]
+    mask_token_id: int | None
+    projector_type: str | None
+    shift_label: bool | None
+    pure_draft_prefix_len: int | None
+    gru_hidden_dim: int | None
+    emb_dim: int | None
     attention_sink_bias: bool = False
-    attention_value_scale: Optional[float] = None
+    attention_value_scale: float | None = None
 
     @property
     def is_domino(self) -> bool:
@@ -559,15 +558,15 @@ class DFlashDraftConfig:
             )
         return int(self.num_hidden_layers)
 
-    def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
+    def resolve_block_size(self, *, default: int | None = None) -> int | None:
         return self.block_size if self.block_size is not None else default
 
     def resolve_target_layer_ids(
         self,
         *,
         target_num_layers: int,
-        draft_num_layers: Optional[int] = None,
-    ) -> List[int]:
+        draft_num_layers: int | None = None,
+    ) -> list[int]:
         target_num_layers = int(target_num_layers)
         if target_num_layers <= 0:
             raise ValueError(
@@ -598,6 +597,19 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
+
+    sample_from_anchor = dflash_cfg.get(
+        "sample_from_anchor", _cfg_get(draft_hf_config, "sample_from_anchor", None)
+    )
+    if sample_from_anchor is True:
+        raise ValueError("sample_from_anchor=True is not supported for DFlash.")
+
+    query_zero_predicts_next = dflash_cfg.get(
+        "query_zero_predicts_next",
+        _cfg_get(draft_hf_config, "query_zero_predicts_next", None),
+    )
+    if query_zero_predicts_next is True:
+        raise ValueError("query_zero_predicts_next=True is not supported for DFlash.")
 
     num_hidden_layers = _parse_optional_int(
         _cfg_get(draft_text_config, "num_hidden_layers", None),
@@ -667,7 +679,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
-    parsed_target_layer_ids: Optional[List[int]]
+    parsed_target_layer_ids: list[int] | None
     if layer_ids is None:
         parsed_target_layer_ids = None
     else:
@@ -721,7 +733,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
     raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
     if raw_attention_value_scale is None:
-        attention_value_scale: Optional[float] = None
+        attention_value_scale: float | None = None
     else:
         if isinstance(raw_attention_value_scale, bool) or not isinstance(
             raw_attention_value_scale, (int, float)
@@ -833,7 +845,7 @@ def is_dense_head_weight(weight: Any) -> bool:
     return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
-def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
+def can_dflash_slice_qkv_weight(qkv_proj: Any) -> tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
     if not isinstance(quant_method, UnquantizedLinearMethod):
@@ -847,7 +859,7 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
+def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> tuple[bool, str]:
     """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
     eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
     if not eligible:
@@ -884,7 +896,7 @@ def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
 
     Args:
@@ -939,7 +951,7 @@ def compute_dflash_correct_drafts_and_bonus(
 def apply_dflash_simulated_acceptance(
     *,
     candidates: torch.Tensor,
-    target_predict: Optional[torch.Tensor],
+    target_predict: torch.Tensor | None,
     accept_len: torch.Tensor,
     commit_lens: torch.Tensor,
     bonus: torch.Tensor,
@@ -978,14 +990,14 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
-    max_top_k: Optional[int] = None,
-    uniform_top_k_value: Optional[int] = None,
-    threshold_single: Optional[float] = None,
-    threshold_acc: Optional[float] = None,
-    uniform_samples: Optional[torch.Tensor] = None,
-    uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
+    max_top_k: int | None = None,
+    uniform_top_k_value: int | None = None,
+    threshold_single: float | None = None,
+    threshold_acc: float | None = None,
+    uniform_samples: torch.Tensor | None = None,
+    uniform_samples_for_final_sampling: torch.Tensor | None = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -1124,8 +1136,8 @@ def build_dflash_verify_target_probs(
     sampling_info: Any,
     draft_token_num: int,
     bs: int,
-    max_top_k: Optional[int] = None,
-    uniform_top_k_value: Optional[int] = None,
+    max_top_k: int | None = None,
+    uniform_top_k_value: int | None = None,
     use_sparse_topk: bool = True,
 ) -> torch.Tensor:
     device = next_token_logits.device
@@ -1188,7 +1200,7 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> str | None:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
