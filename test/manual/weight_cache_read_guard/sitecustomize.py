@@ -9,6 +9,7 @@ not arbitrary native reads or a security boundary against hostile code.
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -69,6 +70,10 @@ def install():
             access(self.path, "safe_open.get_tensor")
             return self.value.get_tensor(key)
 
+        def get_tensors(self, *args, **kwargs):
+            access(self.path, "safe_open.get_tensors")
+            return self.value.get_tensors(*args, **kwargs)
+
         def get_slice(self, key):
             return GuardedSlice(self.value.get_slice(key), self.path)
 
@@ -87,6 +92,26 @@ def install():
         return original_torch_load(file, *args, **kwargs)
 
     torch.load = guarded_torch_load
+
+    # Host-memory-aware loaders can bypass safe_open and construct tensor views
+    # directly from a read-only mmap. Leave metadata-only keys/header access
+    # available, but guard the iterator used by both the native reader and VAE.
+    from sglang.multimodal_gen.runtime.loader import readonly_safetensors
+
+    original_readonly = readonly_safetensors.iter_safetensors_readonly
+
+    def guarded_readonly(path):
+        access(path, "iter_safetensors_readonly")
+        yield from original_readonly(path)
+
+    readonly_safetensors.iter_safetensors_readonly = guarded_readonly
+    # Importing the package can already have bound the native reader's alias.
+    # Future imports see the wrapper above; repair the existing alias as well.
+    reader = sys.modules.get(
+        "sglang.multimodal_gen.runtime.loader.weight_readers.safetensors_mmap"
+    )
+    if reader is not None:
+        reader.iter_safetensors_readonly = guarded_readonly
     record("installed")
 
 
