@@ -17,7 +17,10 @@ The admission criteria in `.claude/rules/unit-test-admission.md` apply to existi
 much as new ones. Spot: a test for a code path or kernel that no longer exists;
 assertions that only check a mock was called; a stress loop that cannot reproduce the
 failure it claims to guard; a case whose every assertion is also made by another case in
-the group. Examples: #34464, #34667, #39013, #38881, #38259.
+the group. Not a tautology: the rule's own carve-outs -- an external-source literal, or a
+completeness / negative-branch contract -- are bookkeeping, even when the code is a
+one-liner. A path that was renamed is not a path that no longer exists; check before
+declaring a test orphaned. Examples: #34464, #34667, #39013, #38881, #38259.
 
 **A2. A test earns its cost by what it protects; a guard on a standalone, rarely touched, rarely used surface can be deleted outright.**
 Tests exist to stop other people's changes from breaking code. That value scales with
@@ -25,6 +28,9 @@ how often the code changes, how many users hit it, and how entangled it is with 
 paths. Spot: the module under test has had no non-test commits in months; it has few
 importers; the feature sits behind a flag almost nobody enables or serves one model few
 people run. The heavier the test (server launch, multi-GPU), the higher this bar.
+Low churn alone is not low value: a stable, load-bearing path (cache eviction, PD
+transfer) is where a regression hurts most. All three signals -- little churn, few
+users, little entanglement -- must hold before deleting on this ground.
 Examples: none applied on this ground yet; #37990 (cases for models nobody runs) and
 #38011 (low-signal model tests demoted from the PR gate) are partial.
 
@@ -45,16 +51,23 @@ Examples: #38093, #39544, #33745, #33586, #34070, #33763, #34464, #33752, #39013
 
 **A4. Suites that differ only in launch arguments share one server or engine.**
 Spot: several classes in a group whose `setUpClass` differs by a flag. Launch cost usually
-dominates the cases themselves, so this saves more than the case count suggests.
+dominates the cases themselves, so this saves more than the case count suggests. Only
+request-level differences can share: a flag that changes server state (attention
+backend, page size, speculative decoding on or off) needs its own launch. Sharing also
+couples the classes, so one crash takes the others down with it.
 Examples: #33641, #33756, #33944, #36736, #38014, #37252.
 
 **A5. An end-to-end matrix whose only varying dimension is one layer belongs in a layer-level unit test.**
-Spot: a full server launch matrix that exists to select a kernel or backend. Examples: #33596, #33611.
+Spot: a full server launch matrix that exists to select a kernel or backend. The unit
+test covers the numerics; backend selection can still change integration (graph capture,
+memory pool layout), so keep one end-to-end smoke per backend. Examples: #33596, #33611.
 
 **A6. Skipped, disabled, or unreachable registrations are dead coverage; each carries a reason and an expiry, or is deleted.**
 Spot: `disabled=` registrations or `skipTest` calls with no reference to what would
 un-skip them; skips older than the issue they were waiting on; registrations naming a
-retired `runner_config`; registered files whose TestCase classes never execute.
+retired `runner_config`; registered files whose TestCase classes never execute. A
+hardware-conditional skip (`skipUnless` on compute capability) is a gate, not dead
+coverage, and a `disabled=` whose linked issue is still open is doing its job.
 Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 
 ---
@@ -64,13 +77,17 @@ Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 **B1. A test runs on the stage and runner its resources actually require.**
 Spot: CPU-only tests registered to a GPU `runner_config`; multi-GPU registrations for a
 test that launches one server; large-model accuracy suites gating every PR when a
-scheduled run would do. Examples: #34074, #33654, #33605, #34913, #33809, #36814,
+scheduled run would do. "Does not use a GPU" is not "can run on a CPU runner": check
+whether the file imports a CUDA-only module or `sgl_kernel` at import time before moving
+it. Examples: #34074, #33654, #33605, #34913, #33809, #36814,
 #37532, #38011, #37990, #35220.
 
 **B2. Declared cost matches measured cost; shard counts and timeouts derive from it.**
 Spot: an `est_time` off from the measured run by more than a small factor (the
 partitioner packs shards with it when live stats are missing); a shard count or job
-timeout that has not moved while the suite's contents have. Examples: #35407, #36242,
+timeout that has not moved while the suite's contents have. Live stats override
+`est_time` once they exist, so drift matters on files that lack them (new or renamed),
+and only when it is off by an order of magnitude. Examples: #35407, #36242,
 #38238, #32408, #37435, #37452, #39194, #37532.
 
 ---
@@ -85,6 +102,9 @@ reference value must not come from the implementation under test, or a shared bu
 both sides agree. Mocks must carry every field the code under test reads; a hand-built
 fake of an internal structure that needs patching after every refactor is the signal to
 stop hand-building it and construct it through the real constructor or a shared helper.
+The signal is repeated patching, not the existence of a fake: a deliberately minimal fake
+that isolates one unit is what a unit test is. The oracle is the one thing that must stay
+independent; harnesses, fixtures and eval entry points are shared (C6).
 Examples: #33615, #37339, #34100, #33509, #33179, #34746, #36424, #37148, #37182,
 #38314, #38315, #38418, #39019, #39100, #39101.
 
@@ -93,7 +113,8 @@ Spot: a test that relies on defaults to select an execution mode, capture range 
 fraction, so a default change silently moves what is covered; a job-level env var that
 changes which strategy a class exercises, so the class tests the wrong thing on every run
 of that lane; a filter or setting leaking from one suite into the next; cached process
-state that an env pin cannot override. Examples: #34146, #33776, #33847, #38221, #33772,
+state that an env pin cannot override. A test that exists to check the defaults work is
+not this pattern; pinning it would delete that coverage. Examples: #34146, #33776, #33847, #38221, #33772,
 #34300, #39411.
 
 **C3. The assertion matches the semantics under test.**
@@ -103,16 +124,22 @@ Examples: #34017, #37873, #32410, #34272, #35795.
 
 **C4. Thresholds come from a measured distribution; derived metrics are gated on the primary one.**
 Spot: round-number thresholds with no recorded basis; a derived quantity asserted without
-the accuracy result it depends on. Examples: #36570, #34145, #31702, #31748, #38725, #36290.
+the accuracy result it depends on. A deliberately loose bound whose job is "the model
+did not fall apart" is a design choice, not an unmeasured threshold; flag the ones with
+no margin or that keep being adjusted. Examples: #36570, #34145, #31702, #31748, #38725, #36290.
 
 **C5. Randomness is removed before a tolerance is loosened.**
 Spot: a kernel test with unseeded random inputs whose bound was widened to make it pass;
 a comparison that could be bit-exact but asserts within an epsilon. Seed the inputs, pin
-the RNG, or make the guard exact. Examples: #32126, #37343, #30026, #35787, #34356, #34607.
+the RNG, or make the guard exact. Where the kernel itself is nondeterministic (atomic
+or split-K reduction order), seeding does not help and a tolerance is the correct
+assertion. Examples: #32126, #37343, #30026, #35787, #34356, #34607.
 
 **C6. Shared test infrastructure has one implementation.**
 Spot: the same eval, mixin or fixture reimplemented locally in several files, each with
-its own threshold or drift. Examples: #34477, #36979, #39906.
+its own threshold or drift. This is about harnesses, not oracles: a reference
+implementation written independently inside a test is required by C1, not a duplicate.
+Examples: #34477, #36979, #39906.
 
 ---
 
