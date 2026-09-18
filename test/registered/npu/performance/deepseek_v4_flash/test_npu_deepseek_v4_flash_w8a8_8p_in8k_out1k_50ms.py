@@ -1,3 +1,5 @@
+import os
+import subprocess
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
@@ -7,6 +9,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+from sglang.utils import wait_for_server
 
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
@@ -129,6 +133,31 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     max_attempts = 3
     output_token_throughput = 2825
+
+    @classmethod
+    def setUpClass(cls):
+        """Launch server via `python3 -m sglang.launch_server` instead of `sglang serve`."""
+        cls._setup_per_case_output()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        env = os.environ.copy()
+        if cls.envs:
+            env.update(cls.envs)
+
+        _, host, port = cls.base_url.split(":")
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cls.model,
+            *[str(x) for x in cls.other_args],
+            "--host",
+            host[2:],
+            "--port",
+            port,
+        ]
+        cls.process = subprocess.Popen(command, env=env)
+        wait_for_server(cls.base_url, timeout=cls.timeout, process=cls.process)
 
     def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
