@@ -8,6 +8,7 @@ Rust is the default tree core. The centralized tree-core registry falls back to
 Python in these cases:
 
 - Session-aware caching.
+- T-LRU eviction.
 - C128 or other unsupported components.
 - Custom component overrides.
 - Non-Linux platforms.

@@ -9,6 +9,7 @@ from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInte
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -361,6 +362,28 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
             self.assertEqual(select_tree_core_backend(params), "python")
         self.assertEqual(resolve_tree_core_backend("rust", params), "python")
+
+    def test_tlru_uses_python_and_preserves_policy_configuration(self):
+        params = _cache_init_params(
+            eviction_policy="tlru",
+            eviction_policy_config={"threshold": 4096, "next_prompt_estimate": 1024},
+        )
+        self.assertEqual(select_tree_core_backend(params), "python")
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            self.assertEqual(select_tree_core_backend(params), "python")
+
+        rust_factory = mock.MagicMock(side_effect=AssertionError("Rust was loaded"))
+        component = mock.MagicMock()
+        with mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": rust_factory}):
+            core = create_tree_core("rust", params, {ComponentType.FULL: component})
+
+        rust_factory.assert_not_called()
+        self.assertIsInstance(core, UnifiedTreeCore)
+        self.assertIs(component.tree_core, core)
+        self.assertIsInstance(core.eviction_strategy, TLRUStrategy)
+        self.assertEqual(core.eviction_strategy.threshold, 4096)
+        self.assertEqual(core.eviction_strategy.next_prompt_estimate, 1024)
+        self.assertTrue(core.tlru_bookkeeping)
 
     def test_python_and_custom_backend_selections_are_unchanged(self):
         params = _cache_init_params(enable_session_radix_cache=True)
