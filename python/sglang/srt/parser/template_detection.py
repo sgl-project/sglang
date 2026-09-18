@@ -818,10 +818,15 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve parser fields explicitly set to `auto`.
+    """Resolve `--reasoning-parser=auto` / `--tool-call-parser=auto` from
+    checkpoint metadata or the chat template, before anything publishes
+    `server_args`.
 
-    Checkpoint `response_template` metadata takes precedence for fields it
-    defines, unless the operator supplied a different chat template.
+    Performs a lightweight tokenizer load, so it runs once in engine init. The
+    decision goes to this instance's declaration stash, so every holder of it
+    carries it -- the schedulers it forks, the HTTP server, the tokenizer
+    workers it is serialized for -- and each publishes bags projected from it.
+    The fields stay what the operator passed.
     """
     cfg = resolving_view(server_args)
     needs = tuple(
@@ -858,7 +863,7 @@ def resolve_auto_parsers(server_args) -> None:
 
     detected: Dict[str, Optional[str]] = {}
     if tokenizer is not None and chat_template_arg is None:
-        from sglang.srt.parser.response_template_config import (
+        from sglang.srt.parser.response_template import (
             resolve_detector_response_template,
             validate_response_template_for_serving,
         )

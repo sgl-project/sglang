@@ -18,10 +18,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Sequence
-
-import regex as re
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -33,12 +31,72 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.parser.response_template_config import (
-    resolve_detector_response_template,
-    validate_response_template_for_serving,
+from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
+from sglang.srt.parser.chat_parsing.response_templates import (
+    ResponseTemplate,
+    load_response_template,
 )
 
 logger = logging.getLogger(__name__)
+
+RESPONSE_TEMPLATE_CONFIG_KEY = "response_template"
+SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
+    {
+        "thinking",
+        "content",
+        "tool_calls",
+    }
+)
+
+
+def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
+    """Validate the template and reject semantic fields serving cannot route."""
+    loaded = load_response_template(template)
+    fields = set(loaded.fields)
+    unsupported = (fields - SUPPORTED_RESPONSE_TEMPLATE_FIELDS) | (
+        set(loaded.defaults) - {"role"}
+    )
+    if unsupported:
+        raise ValueError(
+            "response_template contains unsupported semantic fields: "
+            f"{sorted(unsupported)}. Supported fields are: "
+            f"{sorted(SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
+        )
+    for name in ("thinking", "content"):
+        field = template.get("fields", {}).get(name)
+        if not isinstance(field, dict):
+            continue
+        if (
+            field.get("content", "text") != "text"
+            or field.get("transform") is not None
+            or field.get("join") is not None
+            or field.get("content_args", {}).get("strip") is True
+        ):
+            raise ValueError(
+                f"response_template field {name!r} uses semantics that cannot "
+                "be streamed by the OpenAI serving adapter"
+            )
+    return loaded
+
+
+def resolve_detector_response_template(
+    tokenizer: Any | None,
+    fallback: dict | None,
+) -> dict | None:
+    """Load `response_template` from the tokenizer, then use the fallback."""
+    if tokenizer is None:
+        return fallback
+
+    template = getattr(tokenizer, RESPONSE_TEMPLATE_CONFIG_KEY, None)
+    if isinstance(template, dict):
+        return template
+
+    init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
+    template = init_kwargs.get(RESPONSE_TEMPLATE_CONFIG_KEY)
+    if isinstance(template, dict):
+        return template
+
+    return fallback
 
 
 class _ReasoningResult:
@@ -49,70 +107,50 @@ class _ReasoningResult:
         self.reasoning_text = reasoning_text
 
 
-def derive_tool_extraction_template(
-    full: dict[str, Any],
-    *,
-    sink_field: str = "normal",
-    tool_field: str = "tool_calls",
-) -> dict[str, Any]:
-    """Build a tool-stage template that only extracts tool-call regions."""
-    anchor: dict[str, Any] = {}
-    if "start_anchor_pattern" in full:
-        anchor["start_anchor_pattern"] = full["start_anchor_pattern"]
-    elif "start_anchor" in full:
-        anchor["start_anchor"] = full["start_anchor"]
-
-    fields: dict[str, Any] = {
-        sink_field: {"content": "text", "content_args": {"strip": False}},
-    }
-    field = copy.deepcopy(full["fields"][tool_field])
-    if field.get("content") == "xml-inline":
-        field.setdefault("content_args", {})["strict"] = True
-    fields[tool_field] = field
-    return {"defaults": {}, **anchor, "fields": fields}
-
-
-def derive_reasoning_extraction_template(
-    full: dict[str, Any],
-    *,
-    tool_field: str = "tool_calls",
-    thinking_field: str = "thinking",
-    content_field: str = "content",
-) -> dict[str, Any]:
-    """Build a text-only template for routing reasoning regions."""
-    template = copy.deepcopy(full)
-    fields = template["fields"]
-    if content_field not in fields and all(
+def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(template)
+    fields = result["fields"]
+    if "content" not in fields and all(
         "open" in field or "open_pattern" in field for field in fields.values()
     ):
-        fields[content_field] = {
+        fields["content"] = {
             "content": "text",
             "content_args": {"strip": False},
         }
-    for name in (thinking_field, content_field, tool_field):
-        field = fields.get(name)
-        if field is not None:
-            field["content"] = "text"
-            field["content_args"] = {"strip": False}
-            field["optional"] = True
-            field["transform"] = "{content}"
-            field.pop("transform_each", None)
-    return template
+    for field in fields.values():
+        field["optional"] = True
+    tool_field = fields.get("tool_calls")
+    if isinstance(tool_field, dict) and tool_field.get("content") == "xml-inline":
+        tool_field.setdefault("content_args", {})["strict"] = True
+    return result
 
 
-class AdapterMode(Enum):
-    REASONING = "reasoning"
-    TOOL = "tool"
+def _tool_extraction_template(
+    template: dict[str, Any],
+    *,
+    sink_field: str,
+    tool_field: str,
+) -> dict[str, Any]:
+    template = _streaming_template(template)
+    anchor_name = (
+        "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
+    )
+    return {
+        anchor_name: template[anchor_name],
+        "fields": {
+            sink_field: {"content": "text", "content_args": {"strip": False}},
+            tool_field: template["fields"][tool_field],
+        },
+    }
 
 
 class ResponseTemplateStreamAdapter:
-    """Streaming `response_template` parse with mode-specific event routing."""
+    """Stream a response template and route its generic region events."""
 
     def __init__(
         self,
-        template: dict[str, Any],
+        template: Any,
         *,
-        mode: AdapterMode,
         prefix: str | None = None,
         tool_field: str = "tool_calls",
         thinking_field: str = "thinking",
@@ -123,41 +161,16 @@ class ResponseTemplateStreamAdapter:
         self._thinking_field = thinking_field
         self._content_field = content_field
         self._passthrough_field = passthrough_field
-        self._mode = mode
-        if mode == AdapterMode.REASONING:
-            parser_template = derive_reasoning_extraction_template(
-                template,
-                tool_field=tool_field,
-                thinking_field=thinking_field,
-                content_field=content_field,
-            )
-        else:
-            parser_template = derive_tool_extraction_template(
-                template,
-                sink_field=passthrough_field,
-                tool_field=tool_field,
-            )
-        self._parser_template = parser_template
+        self._parser_template = template
         self._prefix = "" if prefix is None else prefix
         self._stream_parser = None
-        self._committed_input_offset = 0
-        self._passthrough = False
         self._pending_reasoning = ""
-        self._pending_tool_raw = ""
-        self._pending_tool_body = ""
+        self._pending_tool_start: int | None = None
+        self._pending_tool_body_start: int | None = None
         self._pending_tool_streamed = False
-        self._failed_streamed_tool = False
         self._finalized = False
-        self._prefix_opens_tool_region: bool | None = None
-        self._deferred_prefix_open_pending = True
-
-    @property
-    def passthrough(self) -> bool:
-        return self._passthrough
 
     def _make_parser(self, tools: Sequence[Any] | None = None):
-        from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
-
         parser_tools = [
             tool if isinstance(tool, dict) else tool.model_dump()
             for tool in tools or []
@@ -168,267 +181,195 @@ class ResponseTemplateStreamAdapter:
             tools=parser_tools,
         )
 
-    def _initial_events(self, parser: Any) -> list[dict]:
-        if self._mode != AdapterMode.TOOL:
-            return []
-        active_open = None
+    def _active_initial_tool_event(self, parser: Any) -> list[dict]:
+        active_open: dict | None = None
         for event in parser.initial_events:
             if event.get("field") != self._tool_field:
                 continue
             if event["type"] == "region_open":
-                active_open = {**event, "from_prefix": True}
-            elif event["type"] == "region_close":
+                active_open = event
+            elif event["type"] in {"region_close", "region_malformed"}:
                 active_open = None
-        if active_open is not None:
-            self._deferred_prefix_open_pending = False
         return [] if active_open is None else [active_open]
 
-    def _mark_deferred_prefix_open(self, events: list[dict]) -> list[dict]:
-        if not self._deferred_prefix_open_pending or not self._prefix:
-            return events
-        for index, event in enumerate(events):
-            raw = event.get("raw", "")
-            if (
-                event.get("field") == self._tool_field
-                and event["type"] == "region_open"
-                and raw
-                and self._prefix.endswith(raw)
-            ):
-                events[index] = {**event, "from_prefix": True}
-                self._deferred_prefix_open_pending = False
-                break
-        return events
+    @staticmethod
+    def _tool_name(value: Any) -> str | None:
+        function = value.get("function") if isinstance(value, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        return name if isinstance(name, str) else None
 
-    def _recover_failed_tool_input(self, current_text: str) -> str:
+    def _generated_text(
+        self,
+        event: dict,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> str:
         if self._stream_parser is None:
-            return current_text
-        parser_input = self._stream_parser.input_text
-        return parser_input[self._committed_input_offset :]
+            return ""
+        start = event["start"] if start is None else start
+        end = event["end"] if end is None else end
+        start = max(start, self._stream_parser.prefix_end)
+        return self._stream_parser.input_text[start:end] if start < end else ""
 
-    def prefix_opens_tool_region(self) -> bool:
-        if self._prefix_opens_tool_region is not None:
-            return self._prefix_opens_tool_region
+    def has_tool_region(self, text: str) -> bool:
         try:
-            result = bool(self._initial_events(self._make_parser()))
-        except Exception:
-            result = False
-        self._prefix_opens_tool_region = result
-        return result
-
-    def prefix_ends_with_tool_open(self, pattern: re.Pattern[str]) -> bool:
+            parser = self._make_parser()
+            events = self._active_initial_tool_event(parser) + parser.feed(text)
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return False
         return any(
-            match.end() == len(self._prefix) for match in pattern.finditer(self._prefix)
+            event["type"] == "region_open" and event.get("field") == self._tool_field
+            for event in events
         )
 
     def detect_and_parse(
         self,
         text: str,
         tools: Sequence[Any] | None = None,
-    ) -> tuple[list[dict], bool]:
-        try:
-            parser = self._make_parser(tools)
-            events = self._initial_events(parser)
-            events += self._mark_deferred_prefix_open(parser.feed(text))
-            _, final_events = parser.finalize()
-            events += final_events
-            return events, True
-        except Exception as exc:
-            logger.warning(
-                "response_template parsing failed; passing through: %s",
-                exc,
-            )
-            return [], False
+    ) -> list[dict]:
+        parser = self._make_parser(tools)
+        self._stream_parser = parser
+        events = self._active_initial_tool_event(parser) + parser.feed(text)
+        _, final_events = parser.finalize()
+        return events + final_events
 
     def feed(
         self,
         text: str,
         tools: Sequence[Any] | None = None,
-    ) -> tuple[list[dict], bool]:
-        if self._failed_streamed_tool:
-            if not text:
-                return [], True
-            return [
-                {
-                    "type": "region_malformed",
-                    "field": self._tool_field,
-                    "text": text,
-                }
-            ], True
-        if self._passthrough or self._finalized:
-            return [], False
+    ) -> list[dict]:
+        if self._finalized:
+            return []
         initial_events: list[dict] = []
-        try:
-            if self._stream_parser is None:
-                self._stream_parser = self._make_parser(tools)
-                initial_events = self._initial_events(self._stream_parser)
-                self._committed_input_offset = len(self._stream_parser.input_text)
-            events = initial_events + self._mark_deferred_prefix_open(
-                self._stream_parser.feed(text)
-            )
-            self._committed_input_offset = self._stream_parser.consumed_offset
-            return events, True
-        except Exception as exc:
-            logger.warning(
-                "response_template streaming parse failed; preserving wire bytes: %s",
-                exc,
-            )
-            if self._mode == AdapterMode.TOOL:
-                if self._pending_tool_streamed:
-                    malformed = (
-                        self._pending_tool_body + self._recover_failed_tool_input(text)
-                    )
-                    self._pending_tool_raw = ""
-                    self._pending_tool_body = ""
-                    self._failed_streamed_tool = True
-                    return [
-                        {
-                            "type": "region_malformed",
-                            "field": self._tool_field,
-                            "text": malformed,
-                        }
-                    ], True
-                self._passthrough = True
-                passthrough = self._recover_failed_tool_input(text)
-                self._pending_tool_raw = ""
-                return [
-                    {
-                        "type": "region_chunk",
-                        "field": self._passthrough_field,
-                        "text": passthrough,
-                    }
-                ], True
-            self._passthrough = True
-            return [], False
+        if self._stream_parser is None:
+            self._stream_parser = self._make_parser(tools)
+            initial_events = self._active_initial_tool_event(self._stream_parser)
+        return initial_events + self._stream_parser.feed(text)
 
     def finalize(
         self,
         tools: Sequence[Any] | None = None,
-    ) -> tuple[list[dict], bool]:
-        if self._failed_streamed_tool:
-            self._finalized = True
-            return [], True
-        if self._passthrough or self._finalized:
-            return [], not self._passthrough
+    ) -> list[dict]:
+        if self._finalized:
+            return []
         initial_events: list[dict] = []
-        try:
-            if self._stream_parser is None:
-                self._stream_parser = self._make_parser(tools)
-                initial_events = self._initial_events(self._stream_parser)
-                self._committed_input_offset = len(self._stream_parser.input_text)
-            _, events = self._stream_parser.finalize()
-            self._finalized = True
-            return initial_events + events, True
-        except Exception as exc:
-            logger.warning(
-                "response_template finalize failed; preserving wire bytes: %s",
-                exc,
-            )
-            if self._mode == AdapterMode.TOOL:
-                if self._pending_tool_streamed:
-                    malformed = (
-                        self._pending_tool_body + self._recover_failed_tool_input("")
-                    )
-                    self._pending_tool_raw = ""
-                    self._pending_tool_body = ""
-                    self._failed_streamed_tool = True
-                    self._finalized = True
-                    if not malformed:
-                        return [], True
-                    return [
-                        {
-                            "type": "region_malformed",
-                            "field": self._tool_field,
-                            "text": malformed,
-                        }
-                    ], True
-                self._passthrough = True
-                passthrough = self._recover_failed_tool_input("")
-                self._pending_tool_raw = ""
-                if not passthrough:
-                    return [], False
-                return [
-                    {
-                        "type": "region_chunk",
-                        "field": self._passthrough_field,
-                        "text": passthrough,
-                    }
-                ], True
-            self._passthrough = True
-            return [], False
+        if self._stream_parser is None:
+            self._stream_parser = self._make_parser(tools)
+            initial_events = self._active_initial_tool_event(self._stream_parser)
+        _, events = self._stream_parser.finalize()
+        self._finalized = True
+        return initial_events + events
 
     def route_reasoning_events(
-        self, events: List[dict], *, stream_reasoning: bool
+        self, events: list[dict], *, stream_reasoning: bool
     ) -> tuple[str, str]:
-        reasoning_parts: List[str] = []
-        normal_parts: List[str] = []
+        reasoning_parts: list[str] = []
+        normal_parts: list[str] = []
         for event in events:
             field = event.get("field")
             etype = event["type"]
             if field == self._thinking_field:
                 if etype == "region_chunk":
+                    text = self._generated_text(event)
                     if stream_reasoning:
-                        reasoning_parts.append(event["text"])
+                        reasoning_parts.append(text)
                     else:
-                        self._pending_reasoning += event["text"]
+                        self._pending_reasoning += text
                 elif etype == "region_close" and not stream_reasoning:
                     reasoning_parts.append(self._pending_reasoning)
                     self._pending_reasoning = ""
-            elif field == self._content_field:
-                if etype == "region_chunk":
-                    normal_parts.append(event["text"])
-            elif field == self._tool_field:
-                if etype == "region_open":
-                    if not event.get("from_prefix"):
-                        normal_parts.append(event.get("raw", ""))
-                elif etype == "region_close":
-                    normal_parts.append(event.get("raw", ""))
-                elif etype == "region_chunk":
-                    normal_parts.append(event["text"])
+            elif (
+                field == self._content_field
+                and etype == "region_chunk"
+                or field == self._tool_field
+                and etype
+                in {
+                    "region_open",
+                    "region_chunk",
+                    "region_close",
+                }
+            ):
+                normal_parts.append(self._generated_text(event))
+            elif field == self._tool_field and etype == "region_malformed":
+                close_start = event["end"] - len(event["raw_close"])
+                normal_parts.append(self._generated_text(event, start=close_start))
         return "".join(normal_parts), "".join(reasoning_parts)
 
     def route_tool_events(
         self,
-        events: List[dict],
+        events: list[dict],
         *,
         on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
         on_tool_malformed: Callable[[str, bool], None] | None = None,
     ) -> str:
-        normal_parts: List[str] = []
+        normal_parts: list[str] = []
+        malformed_starts = {
+            event["start"]
+            for event in events
+            if event.get("field") == self._tool_field
+            and event["type"] == "region_malformed"
+        }
         for event in events:
             field = event.get("field")
             etype = event["type"]
             if field == self._passthrough_field and etype == "region_chunk":
-                normal_parts.append(event["text"])
+                normal_parts.append(self._generated_text(event))
             elif field == self._tool_field:
                 if etype == "region_open":
-                    raw_open = event.get("raw", "")
-                    self._pending_tool_raw = (
-                        "" if event.get("from_prefix") else raw_open
+                    self._pending_tool_start = event["start"]
+                    self._pending_tool_body_start = event["end"]
+                    name = self._tool_name(event.get("provisional_value"))
+                    self._pending_tool_streamed = bool(
+                        event["start"] not in malformed_starts
+                        and name is not None
+                        and on_tool_open is not None
+                        and on_tool_open(name)
                     )
-                    self._pending_tool_body = ""
-                    if on_tool_open is not None:
-                        self._pending_tool_streamed = on_tool_open(raw_open)
-                elif etype == "region_chunk":
-                    self._pending_tool_raw += event["text"]
-                    self._pending_tool_body += event["text"]
                 elif etype == "region_malformed":
                     if on_tool_malformed is not None:
-                        on_tool_malformed(event["text"], False)
+                        body_start = event["start"] + len(event["raw_open"])
+                        body_end = event["end"] - len(event["raw_close"])
+                        on_tool_malformed(
+                            self._generated_text(
+                                event,
+                                start=body_start,
+                                end=body_end,
+                            ),
+                            event["closed"],
+                        )
+                    if not self._pending_tool_streamed:
+                        normal_parts.append(self._generated_text(event))
+                    self._clear_pending_tool()
                 elif etype == "region_close":
-                    raw_close = event.get("raw", "")
                     if not on_tool_close(event["value"]):
                         if (
                             self._pending_tool_streamed
                             and on_tool_malformed is not None
                         ):
-                            on_tool_malformed(self._pending_tool_body, True)
-                        else:
-                            normal_parts.append(self._pending_tool_raw + raw_close)
-                    self._pending_tool_raw = ""
-                    self._pending_tool_body = ""
-                    self._pending_tool_streamed = False
+                            on_tool_malformed(
+                                self._generated_text(
+                                    event,
+                                    start=self._pending_tool_body_start,
+                                    end=event["start"],
+                                ),
+                                True,
+                            )
+                        elif self._pending_tool_start is not None:
+                            normal_parts.append(
+                                self._generated_text(
+                                    event,
+                                    start=self._pending_tool_start,
+                                )
+                            )
+                    self._clear_pending_tool()
         return "".join(normal_parts)
+
+    def _clear_pending_tool(self) -> None:
+        self._pending_tool_start = None
+        self._pending_tool_body_start = None
+        self._pending_tool_streamed = False
 
 
 class _ResponseTemplateParserInputMixin:
@@ -482,8 +423,7 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         self.thinks_internally = False
         self.reasoning_default = "explicit_enable_thinking"
         self._adapter = ResponseTemplateStreamAdapter(
-            template,
-            mode=AdapterMode.REASONING,
+            _streaming_template(template),
             thinking_field=self.thinking_field,
             content_field=self.content_field,
             tool_field=self.tool_field,
@@ -491,31 +431,21 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         )
 
     def detect_and_parse(self, text: str) -> _ReasoningResult:
-        events, ok = self._adapter.detect_and_parse(text)
-        if not ok:
-            return _ReasoningResult(normal_text=text)
+        events = self._adapter.detect_and_parse(text)
         normal_text, reasoning_text = self._adapter.route_reasoning_events(
             events, stream_reasoning=True
         )
         return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def parse_streaming_increment(self, new_text: str) -> _ReasoningResult:
-        if self._adapter.passthrough:
-            return _ReasoningResult(normal_text=new_text)
-        events, ok = self._adapter.feed(new_text)
-        if not ok:
-            return _ReasoningResult(normal_text=new_text)
+        events = self._adapter.feed(new_text)
         normal_text, reasoning_text = self._adapter.route_reasoning_events(
             events, stream_reasoning=self.stream_reasoning
         )
         return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def finish(self) -> _ReasoningResult:
-        if self._adapter.passthrough:
-            return _ReasoningResult()
-        events, ok = self._adapter.finalize()
-        if not ok:
-            return _ReasoningResult()
+        events = self._adapter.finalize()
         normal_text, reasoning_text = self._adapter.route_reasoning_events(
             events, stream_reasoning=self.stream_reasoning
         )
@@ -551,23 +481,16 @@ class ResponseTemplateToolDetector(
         loaded = validate_response_template_for_serving(template)
         self.response_template = template
         self._adapter = ResponseTemplateStreamAdapter(
-            template,
-            mode=AdapterMode.TOOL,
+            _tool_extraction_template(
+                template,
+                sink_field=self.passthrough_field,
+                tool_field=self.tool_field,
+            ),
             tool_field=self.tool_field,
             passthrough_field=self.passthrough_field,
             prefix=prefix,
         )
         tool_spec = loaded.fields[self.tool_field]
-        self._tool_open_re = tool_spec.open_re
-        self._tool_name_template = None
-        if not tool_spec.transform_each:
-            transform = tool_spec.transform
-            if isinstance(transform, dict):
-                function = transform.get("function")
-                if isinstance(function, dict):
-                    name_template = function.get("name")
-                    if isinstance(name_template, str):
-                        self._tool_name_template = name_template
         if tool_spec.close_literals:
             self.eot_token = tool_spec.close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
@@ -577,37 +500,11 @@ class ResponseTemplateToolDetector(
         return bool(self.incomplete_tool_call_indices)
 
     def has_tool_call(self, text: str) -> bool:
-        return bool(
-            self._tool_open_re is not None
-            and self._tool_open_re.search(text) is not None
-        ) or (
-            self._tool_open_re is not None
-            and (
-                self._adapter.prefix_opens_tool_region()
-                or self._adapter.prefix_ends_with_tool_open(self._tool_open_re)
-            )
-        )
-
-    def _tool_name_from_open(self, raw: str) -> str | None:
-        if self._tool_open_re is None or self._tool_name_template is None:
-            return None
-        match = self._tool_open_re.fullmatch(raw)
-        if match is None:
-            return None
-        placeholder = re.fullmatch(
-            r"\{(?P<capture>\w+(?:\.\w+)*)\}",
-            self._tool_name_template,
-        )
-        if placeholder is None:
-            return self._tool_name_template
-        capture = placeholder.group("capture")
-        if "." in capture:
-            return None
-        return match.groupdict().get(capture)
+        return self._adapter.has_tool_region(text)
 
     def _to_tool_call_item(
-        self, value: Any, tool_indices: Dict[str, int], tool_index: int
-    ) -> Optional[ToolCallItem]:
+        self, value: Any, tool_indices: dict[str, int], tool_index: int
+    ) -> ToolCallItem | None:
         try:
             function = value["function"]
             name = function["name"]
@@ -632,9 +529,9 @@ class ResponseTemplateToolDetector(
     def _to_tool_call_items(
         self,
         value: Any,
-        tool_indices: Dict[str, int],
+        tool_indices: dict[str, int],
         first_tool_index: int,
-    ) -> Optional[List[ToolCallItem]]:
+    ) -> list[ToolCallItem] | None:
         values = value if isinstance(value, list) else [value]
         if not values:
             return None
@@ -647,7 +544,7 @@ class ResponseTemplateToolDetector(
         return items
 
     def _emit_tool_call(
-        self, item: ToolCallItem, pending_calls: List[ToolCallItem]
+        self, item: ToolCallItem, pending_calls: list[ToolCallItem]
     ) -> None:
         name_was_streamed = self.current_tool_name_sent
         self._ensure_tool_slot()
@@ -678,7 +575,7 @@ class ResponseTemplateToolDetector(
         while len(self.streamed_args_for_tool) <= self.current_tool_id:
             self.streamed_args_for_tool.append("")
 
-    def _emit_tool_name(self, name: str, pending_calls: List[ToolCallItem]) -> None:
+    def _emit_tool_name(self, name: str, pending_calls: list[ToolCallItem]) -> None:
         self._ensure_tool_slot()
         assert self.current_tool_id >= 0
         pending_calls.append(
@@ -698,7 +595,7 @@ class ResponseTemplateToolDetector(
     def _emit_malformed_tool_arguments(
         self,
         text: str,
-        pending_calls: List[ToolCallItem],
+        pending_calls: list[ToolCallItem],
         closed: bool,
     ) -> None:
         if self.current_tool_id < 0 or not self.current_tool_name_sent:
@@ -721,9 +618,9 @@ class ResponseTemplateToolDetector(
             self.current_tool_name_sent = False
 
     def _route_tool_events(
-        self, events: List[dict], tool_indices: Dict[str, int]
-    ) -> tuple[str, List[ToolCallItem]]:
-        calls: List[ToolCallItem] = []
+        self, events: list[dict], tool_indices: dict[str, int]
+    ) -> tuple[str, list[ToolCallItem]]:
+        calls: list[ToolCallItem] = []
 
         def on_close(value: Any) -> bool:
             items = self._to_tool_call_items(value, tool_indices, len(calls))
@@ -736,51 +633,33 @@ class ResponseTemplateToolDetector(
         return normal_text, calls
 
     def detect_and_parse(
-        self, text: str, tools: List[Tool]
+        self, text: str, tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        if not self.has_tool_call(text):
-            return ToolStreamingParseResult(normal_text=text, calls=[])
-
-        events, ok = self._adapter.detect_and_parse(text, tools)
-        if not ok:
-            return ToolStreamingParseResult(normal_text=text, calls=[])
-
+        events = self._adapter.detect_and_parse(text, tools)
         normal_text, calls = self._route_tool_events(
             events, self._get_tool_indices(tools)
         )
         return ToolStreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        if self._adapter.passthrough:
-            return ToolStreamingParseResult(normal_text=new_text, calls=[])
-
-        events, ok = self._adapter.feed(new_text, tools)
-        if not ok:
-            return ToolStreamingParseResult(normal_text=new_text, calls=[])
+        events = self._adapter.feed(new_text, tools)
         return self._emit_streaming_events(events, tools)
 
-    def finish(self, tools: List[Tool]) -> ToolStreamingParseResult:
-        if self._adapter.passthrough:
-            return ToolStreamingParseResult()
-        events, ok = self._adapter.finalize(tools)
-        if not ok:
-            return ToolStreamingParseResult()
+    def finish(self, tools: list[Tool]) -> ToolStreamingParseResult:
+        events = self._adapter.finalize(tools)
         return self._emit_streaming_events(events, tools)
 
     def _emit_streaming_events(
-        self, events: List[dict], tools: List[Tool]
+        self, events: list[dict], tools: list[Tool]
     ) -> ToolStreamingParseResult:
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        pending_calls: List[ToolCallItem] = []
+        pending_calls: list[ToolCallItem] = []
 
-        def on_open(raw: str) -> bool:
-            name = self._tool_name_from_open(raw)
-            if name is None:
-                return False
+        def on_open(name: str) -> bool:
             if (
                 name not in self._tool_indices
                 and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
@@ -790,7 +669,7 @@ class ResponseTemplateToolDetector(
             return True
 
         def on_close(value: Any) -> bool:
-            tool_index = self.current_tool_id if self.current_tool_id >= 0 else 0
+            tool_index = max(self.current_tool_id, 0)
             items = self._to_tool_call_items(
                 value,
                 self._tool_indices,

@@ -367,14 +367,6 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
-    def validate_structure_constraint_request(
-        self,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
-        parallel_tool_calls: bool,
-        strict_requested: bool,
-    ) -> None:
-        """Validate detector-specific structured generation requirements."""
-
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

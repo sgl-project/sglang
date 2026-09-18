@@ -295,11 +295,12 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
         should_constrain_auto = tool_choice == "auto" and strict_requested
-        self.detector.validate_structure_constraint_request(
-            tool_choice,
-            parallel_tool_calls,
-            strict_requested,
-        )
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            self.detector.validate_structure_constraint_request(
+                tool_choice,
+                parallel_tool_calls,
+                strict_requested,
+            )
 
         try:
             if (

@@ -21,8 +21,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
-)
-from sglang.srt.parser.response_template_config import (
     resolve_detector_response_template,
     validate_response_template_for_serving,
 )
@@ -628,8 +626,10 @@ class TestResponseTemplateAdapters(unittest.TestCase):
                 (
                     0,
                     None,
-                    '{location:<|"|>New York<|"|>,days:3,'
-                    "details:{metric:true},hours:[1,2]}unexpected<tool_call|>",
+                    (
+                        '{location:<|"|>New York<|"|>,days:3,'
+                        "details:{metric:true},hours:[1,2]}unexpected"
+                    ),
                 )
             ],
         )
@@ -643,9 +643,8 @@ class TestResponseTemplateAdapters(unittest.TestCase):
             failed.calls[0].parameters,
         )
         later = detector.parse_streaming_increment(" trailing bytes", [_tool()])
-        self.assertEqual(later.calls[0].tool_index, 0)
-        self.assertIsNone(later.calls[0].name)
-        self.assertEqual(later.calls[0].parameters, " trailing bytes")
+        self.assertEqual(later.normal_text, " trailing bytes")
+        self.assertEqual(later.calls, [])
 
     def test_streaming_malformed_transform_keeps_body_on_emitted_call(self):
         template = {
@@ -846,8 +845,10 @@ class TestResponseTemplateAdapters(unittest.TestCase):
                 (
                     1,
                     None,
-                    '{location:<|"|>New York<|"|>,days:3,'
-                    "details:{metric:true},hours:[1,2]}<tool_",
+                    (
+                        '{location:<|"|>New York<|"|>,days:3,'
+                        "details:{metric:true},hours:[1,2]}<tool_"
+                    ),
                 )
             ],
         )
