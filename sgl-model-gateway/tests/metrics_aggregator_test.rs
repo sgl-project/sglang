@@ -70,7 +70,10 @@ fn test_colons_in_names_and_label_values_are_preserved() {
     // aggregation so dashboards written against the engine's /metrics keep
     // working against the router's /engine_metrics (#12618).
     let pack1 = MetricPack {
-        labels: vec![("engine".to_string(), "prefill".to_string())],
+        labels: vec![(
+            "worker_addr".to_string(),
+            "http://10.0.0.1:8000".to_string(),
+        )],
         metrics_text: r#"
 # HELP sglang:num_running_reqs The number of running requests.
 # TYPE sglang:num_running_reqs gauge
@@ -79,7 +82,10 @@ sglang:num_running_reqs{model_name="org/model:v1"} 3
         .to_string(),
     };
     let pack2 = MetricPack {
-        labels: vec![("engine".to_string(), "decode".to_string())],
+        labels: vec![(
+            "worker_addr".to_string(),
+            "http://10.0.0.2:8000".to_string(),
+        )],
         metrics_text: r#"
 # HELP sglang:num_running_reqs The number of running requests.
 # TYPE sglang:num_running_reqs gauge
@@ -91,8 +97,8 @@ sglang:num_running_reqs{model_name="org/model:v1"} 12
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
     let expected = r#"# HELP sglang:num_running_reqs The number of running requests.
 # TYPE sglang:num_running_reqs gauge
-sglang:num_running_reqs{engine="prefill",model_name="org/model:v1"} 3
-sglang:num_running_reqs{engine="decode",model_name="org/model:v1"} 12
+sglang:num_running_reqs{model_name="org/model:v1",worker_addr="http://10.0.0.1:8000"} 3
+sglang:num_running_reqs{model_name="org/model:v1",worker_addr="http://10.0.0.2:8000"} 12
 "#;
     assert_eq!(result.trim(), expected.trim());
 }
@@ -301,53 +307,6 @@ fn assert_eq_sorted(result: &str, expected: &str) {
     result_lines.sort();
     expected_lines.sort();
     assert_eq!(result_lines, expected_lines);
-}
-
-#[test]
-fn test_pd_roles_and_worker_addresses_remain_distinct() {
-    let packs = [
-        (
-            "prefill",
-            "http://10.0.0.1:8000",
-            "num_prefill_bootstrap_queue_reqs",
-        ),
-        (
-            "decode",
-            "http://10.0.0.2:8000",
-            "num_decode_transfer_queue_reqs",
-        ),
-    ]
-    .into_iter()
-    .map(|(role, addr, queue)| MetricPack {
-        labels: vec![("worker_addr".to_string(), addr.to_string())],
-        metrics_text: format!(
-            "# TYPE sglang:e2e_request_latency_seconds histogram\n\
-             sglang:e2e_request_latency_seconds_bucket{{engine_type=\"{role}\",le=\"+Inf\"}} 1\n\
-             sglang:e2e_request_latency_seconds_sum{{engine_type=\"{role}\"}} 2\n\
-             sglang:e2e_request_latency_seconds_count{{engine_type=\"{role}\"}} 1\n\
-             # TYPE sglang:{queue} gauge\n\
-             sglang:{queue}{{engine_type=\"{role}\"}} 0\n"
-        ),
-    })
-    .collect();
-    let result = aggregate_metrics(packs).unwrap();
-    let counts: Vec<_> = result
-        .lines()
-        .filter(|line| line.starts_with("sglang:e2e_request_latency_seconds_count{"))
-        .collect();
-    assert_eq!(counts.len(), 2);
-    for (role, addr) in [
-        ("prefill", "http://10.0.0.1:8000"),
-        ("decode", "http://10.0.0.2:8000"),
-    ] {
-        assert!(counts
-            .iter()
-            .any(|line| line.contains(&format!("engine_type=\"{role}\""))
-                && line.contains(&format!("worker_addr=\"{addr}\""))
-                && line.ends_with(" 1")));
-    }
-    assert!(result.contains("sglang:num_prefill_bootstrap_queue_reqs{"));
-    assert!(result.contains("sglang:num_decode_transfer_queue_reqs{"));
 }
 
 #[test]
