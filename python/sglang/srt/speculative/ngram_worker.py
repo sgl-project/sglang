@@ -7,9 +7,6 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.kernels.ops.speculative.reconstruct_tree import (
-    reconstruct_indices_from_tree_mask_triton,
-)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult

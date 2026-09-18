@@ -4,9 +4,8 @@
 the compiled ``sgl_kernel.speculative.reconstruct_indices_from_tree_mask`` op on
 platforms that ship no such op (e.g. Intel XPU). It reconstructs NGRAM verify
 metadata (``positions`` / ``retrieve_index`` / ``retrieve_next_token`` /
-``retrieve_next_sibling``) from a per-batch ``n x n`` tree mask. This test runs
-on every available GPU-like backend (CUDA, XPU) so a Triton codegen regression
-on one backend doesn't slip through on the strength of the other's coverage.
+``retrieve_next_sibling``) from a per-batch ``n x n`` tree mask. Run manually;
+it exercises whichever GPU-like backends (CUDA, XPU) are locally available.
 
 This test pins the kernel to the op's documented contract two ways:
 

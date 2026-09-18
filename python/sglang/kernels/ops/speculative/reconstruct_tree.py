@@ -11,8 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import annotations
-
 """Fused Triton kernel: reconstruct NGRAM verify metadata from a tree mask.
 
 Device-native fallback used where the compiled
@@ -22,11 +20,11 @@ e.g. Intel XPU. It reproduces that op's contract exactly, mutating
 
 Semantics (per batch ``b``, per node ``tid``; ``n = draft_token_num``):
   ``tree_mask[b, i, j]`` (row-major, flat) marks node ``j`` an ancestor of ``i``.
-  ``anc[i, j]      = tree_mask[b, i, j] & (j < i)``          (strict ancestors)
+  ``ancestors[i, j]      = tree_mask[b, i, j] & (j < i)``          (strict ancestors)
   ``positions[b,tid] = (#ancestors of tid) + verified_seq_len[b]``
   ``retrieve_index[b,tid]        = b * n + tid``
-  ``parent[tid]                  = max{ j<tid : anc[tid, j] } else -1``
-  ``retrieve_next_token[b,tid]   = min{ k>tid : anc[k, tid] } else -1``  (first child)
+  ``parent[tid]                  = max{ j<tid : ancestors[tid, j] } else -1``
+  ``retrieve_next_token[b,tid]   = min{ k>tid : ancestors[k, tid] } else -1``  (first child)
   ``retrieve_next_sibling[b,tid] = min{ k>tid : parent[k]==parent[tid] }``
                                    else -1, and -1 when parent[tid] < 0.
 
@@ -35,6 +33,8 @@ batch loads it once into registers and emits all four outputs -- collapsing the
 ~15-launch, multi-``[bs,n,n]``-HBM-roundtrip torch fallback into one kernel with
 zero materialized intermediates.
 """
+
+from __future__ import annotations
 
 import torch
 import triton
@@ -69,22 +69,22 @@ def _reconstruct_tree_mask_kernel(
         tl.int1
     )
 
-    # anc[i, j] = mask[i, j] & (j < i): strict lower-triangular ancestors.
-    anc = m & (col < row)
-    anc_i = anc.to(tl.int32)
+    # ancestors[i, j] = mask[i, j] & (j < i): strict lower-triangular ancestors.
+    ancestors = m & (col < row)
+    ancestors_i = ancestors.to(tl.int32)
 
     # depth[i] = #ancestors (reduce columns); positions = depth + verified_seq_len.
-    depth = tl.sum(anc_i, axis=1)
+    depth = tl.sum(ancestors_i, axis=1)
     seq_len = tl.load(verified_seq_len_ptr + b).to(tl.int64)
     positions = depth.to(tl.int64) + seq_len
 
-    # parent[i] = largest j<i with anc[i, j], else -1 (reduce columns).
-    parent = tl.max(tl.where(anc, col, -1), axis=1)  # [BLOCK_N], indexed by i
+    # parent[i] = largest j<i with ancestors[i, j], else -1 (reduce columns).
+    parent = tl.max(tl.where(ancestors, col, -1), axis=1)  # [BLOCK_N], indexed by i
 
-    # first child of tid = smallest k>tid with anc[k, tid] (reduce rows over the
-    # tid-th column). anc already encodes k>tid via (col < row).
-    has_child = tl.max(anc_i, axis=0) > 0
-    first_child = tl.min(tl.where(anc, row, n), axis=0)  # indexed by column tid
+    # first child of tid = smallest k>tid with ancestors[k, tid] (reduce rows over the
+    # tid-th column). ancestors already encodes k>tid via (col < row).
+    has_child = tl.max(ancestors_i, axis=0) > 0
+    first_child = tl.min(tl.where(ancestors, row, n), axis=0)  # indexed by column tid
     next_token = tl.where(has_child, first_child, -1)
 
     # next sibling of tid = smallest k>tid sharing tid's parent; -1 if tid is a
