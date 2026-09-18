@@ -1,8 +1,10 @@
 """Unit tests for the post-capture startup weight-loading component."""
 
 import dataclasses
+import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -225,8 +227,9 @@ class _RecordingLoader:
         return tuple(
             SimpleNamespace(
                 use_safetensors=self.use_safetensors,
-                source=object(),
+                source=SimpleNamespace(prefix=""),
                 hf_folder=self.hf_folder,
+                weight_files=getattr(self, "weight_files", ()),
             )
             for _ in range(getattr(self, "num_resolved_sources", 1))
         )
@@ -310,6 +313,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
     def _create(
         self,
         *,
+        mode="overlap",
         options=None,
         model_config=None,
         load_config=None,
@@ -329,6 +333,15 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             if spec.profile == profile
         )
         with (
+            patch.object(
+                StartupWeightLoadOptions,
+                "from_published_config",
+                return_value=_make_options() if options is None else options,
+            ),
+            patch(
+                f"{_STARTUP_MODULE}.get_model",
+                return_value=SimpleNamespace(startup_weight_load_mode=mode),
+            ),
             patch(
                 f"{_STARTUP_MODULE}.get_model_architecture",
                 return_value=(
@@ -350,12 +363,12 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 ),
             ),
         ):
-            return StartupWeightLoadManager.create(
+            return StartupWeightLoadManager.create_from_published_config(
                 loader=self.loader if loader is None else loader,
                 model_config=model_config,
                 load_config=self.load_config if load_config is None else load_config,
                 device_config=self.device_config,
-                options=_make_options() if options is None else options,
+                is_draft_worker=False,
             )
 
     def test_supported_overlap_creates_a_manager(self):
@@ -801,6 +814,46 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         options=options, model_config=_make_qwen3_moe_model_config()
                     )
 
+    def test_dense_block_fp8_lora_falls_back_before_model_initialization(self):
+        for architecture in (
+            "LlamaForCausalLM",
+            "Qwen2ForCausalLM",
+            "Qwen3ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+        ):
+            config = _make_model_config(
+                quantization="fp8",
+                hf_config=SimpleNamespace(
+                    architectures=[architecture],
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                ),
+            )
+            options = _make_options(has_lora=True)
+            with (
+                self.subTest(architecture=architecture),
+                patch.object(self.loader, "initialize_model_for_startup") as initialize,
+            ):
+                self.assertIsNone(
+                    self._create(mode="auto", model_config=config, options=options)
+                )
+                with self.assertRaisesRegex(ValueError, "lora:"):
+                    self._create(model_config=config, options=options)
+                initialize.assert_not_called()
+
+                self.assertIsInstance(
+                    self._create(mode="auto", model_config=config),
+                    StartupWeightLoadManager,
+                )
+                config.quantization = None
+                config.hf_config.quantization_config = None
+                self.assertIsInstance(
+                    self._create(mode="auto", model_config=config, options=options),
+                    StartupWeightLoadManager,
+                )
+
     def test_unquantized_moe_rejects_only_non_reloadable_weight_layouts(self):
         for make_config in (
             _make_qwen3_moe_model_config,
@@ -1152,6 +1205,117 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIsNone(manager.finalize())
         self.assertIsNone(manager.finalize())
         self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+
+    def test_checkpoint_kv_scales_fall_back_before_capture(self):
+        from safetensors.torch import save_file
+
+        for scale, auto in ((0.5, True), (1.0, True), (0.5, False)):
+            with (
+                self.subTest(scale=scale, auto=auto),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = str(Path(directory) / "model.safetensors")
+                save_file(
+                    {"model.layers.0.self_attn.k_scale": torch.tensor(scale)}, path
+                )
+                trace = []
+                model = _TiedWeightModel()
+                before = model.weight.detach().clone()
+                loader = _RecordingLoader(model, trace)
+                loader.weight_files = (path,)
+                manager = self._manager(loader, fallback_to_serial=auto)
+                manager._model_config = _make_model_config(quantization="fp8")
+
+                if auto:
+                    self.assertIs(manager.prepare(), model)
+                    self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+                    self.assertEqual(manager.state, StartupWeightLoadState.READY)
+                    self.assertFalse(manager.is_deferred)
+                    self.assertIsNone(manager.finalize())
+                    torch.testing.assert_close(
+                        model.weight, torch.full_like(model.weight, 3)
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "checkpoint KV scales"):
+                        manager.prepare()
+                    self.assertEqual(trace, ["initialize", "resolve"])
+                    torch.testing.assert_close(model.weight, before)
+
+    def test_checkpoint_kv_scale_aliases_use_headers_across_sources(self):
+        names = (
+            "attn.k_scale",
+            "attn.v_scale",
+            "self_attn.kv_scale",
+            "self_attn.k_proj.k_scale",
+            "self_attn.v_proj.v_scale",
+            "attn_k_scale",
+            "attn_v_scale",
+            "k_scale",
+            "v_scale",
+            "kv_scale",
+            "k_proj.output_scale",
+            "v_proj.output_scale",
+        )
+        sources = (
+            SimpleNamespace(source=SimpleNamespace(prefix=""), weight_files=("first",)),
+            SimpleNamespace(
+                source=SimpleNamespace(prefix="model.layers.0."),
+                weight_files=("second", "third"),
+            ),
+        )
+        manager = self._manager(_RecordingLoader(_TiedWeightModel(), []))
+        manager._model_config = _make_model_config(quantization="fp8")
+        for name in names:
+            with (
+                self.subTest(name=name),
+                patch("safetensors.safe_open") as open_checkpoint,
+            ):
+                header = open_checkpoint.return_value.__enter__.return_value
+                header.keys.side_effect = (("weight",), ("weight_scale_inv",), (name,))
+                self.assertIn(
+                    "checkpoint KV scales", manager._get_checkpoint_rejection(sources)
+                )
+                self.assertEqual(
+                    open_checkpoint.call_args_list,
+                    [
+                        call(path, framework="pt", device="cpu")
+                        for path in ("first", "second", "third")
+                    ],
+                )
+                header.get_tensor.assert_not_called()
+                header.get_slice.assert_not_called()
+
+    def test_checkpoint_without_kv_scales_retains_overlap(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.safetensors")
+            save_file(
+                {
+                    name: torch.ones(1)
+                    for name in (
+                        "weight",
+                        "weight_scale",
+                        "weight_scale_inv",
+                        "input_scale",
+                        "q_proj.output_scale",
+                    )
+                },
+                path,
+            )
+            loader = _RecordingLoader(_TiedWeightModel(), [])
+            loader.weight_files = (path,)
+            manager = self._manager(loader, fallback_to_serial=True)
+            manager._model_config = _make_model_config(quantization="fp8")
+            manager.prepare()
+            self.assertTrue(manager.is_deferred)
+            self.assertNotIn("serial_load", loader._trace)
+
+        manager = self._manager(_RecordingLoader(_TiedWeightModel(), []))
+        with patch("safetensors.safe_open") as open_checkpoint:
+            manager.prepare()
+            self.assertTrue(manager.is_deferred)
+            open_checkpoint.assert_not_called()
 
     def test_mixed_fp8_unquantized_trt_experts_are_checked_before_capture(self):
         from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod

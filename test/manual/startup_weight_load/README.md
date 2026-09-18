@@ -76,6 +76,16 @@ buffers, and EAGLE token-mapped target heads. Auto mode selects serial loading;
 forced overlap rejects them before capture-safe preparation. Ordinary dtype and
 parallelism validation remains in the normal startup pipeline.
 
+LoRA/UNO with serialized block-FP8 weights also selects serial in auto mode:
+the wrappers hide checkpoint scale names before deferred loading. Unquantized
+dense LoRA remains eligible.
+
+FP8 checkpoint headers are checked for KV scales before capture. If present,
+auto selects serial and forced overlap rejects the checkpoint, since KV
+postprocessing turns these scales into captured Python constants. This checks
+names, not values: even unit scales select serial. FP8 KV cache without
+checkpoint KV scales remains eligible; the final constant check stays enabled.
+
 ## Known-limit reproductions
 
 These files deliberately do not match `test_*.py` discovery. Run them explicitly:

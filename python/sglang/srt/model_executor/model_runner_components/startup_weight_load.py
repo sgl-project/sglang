@@ -253,6 +253,11 @@ def _weight_format_rules(
         )
     return (
         (
+            "lora",
+            options.has_lora,
+            "LoRA wrappers hide block-FP8 checkpoint scales before startup commit",
+        ),
+        (
             "fp8_gemm_backend",
             converts_scales and uses_deepgemm and model_config.dtype == torch.bfloat16,
             "DeepGEMM UE8M0 scale conversion is not reload-safe during startup overlap",
@@ -880,9 +885,11 @@ class StartupWeightLoadManager:
             self._model_config,
             model,
         )
-        rejection = self._get_source_rejection(
-            resolved_sources
-        ) or self._get_model_rejection(model)
+        rejection = (
+            self._get_source_rejection(resolved_sources)
+            or self._get_model_rejection(model)
+            or self._get_checkpoint_rejection(resolved_sources)
+        )
         if rejection is not None:
             if not self._fallback_to_serial:
                 raise ValueError(rejection)
@@ -924,6 +931,35 @@ class StartupWeightLoadManager:
             source.use_safetensors for source in resolved_sources
         ):
             return "startup overlap requires safetensors checkpoints"
+        return None
+
+    def _get_checkpoint_rejection(
+        self, resolved_sources: Tuple[DefaultModelLoader.ResolvedSource, ...]
+    ) -> Optional[str]:
+        if self._model_config.quantization != "fp8":
+            return None
+
+        from safetensors import safe_open
+
+        # KV postprocess embeds checkpoint scales as Python constants in graphs.
+        # Check headers on every rank, including PP stages without attention.
+        scale_suffixes = (
+            ".k_scale",
+            ".v_scale",
+            ".kv_scale",
+            "_k_scale",
+            "_v_scale",
+            ".k_proj.output_scale",
+            ".v_proj.output_scale",
+        )
+        for source in resolved_sources:
+            for path in source.weight_files:
+                with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                    if any(
+                        f".{source.source.prefix}{name}".endswith(scale_suffixes)
+                        for name in checkpoint.keys()
+                    ):
+                        return "checkpoint KV scales must be loaded before CUDA graph capture"
         return None
 
     @staticmethod
