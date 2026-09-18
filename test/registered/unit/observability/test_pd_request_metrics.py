@@ -1,6 +1,7 @@
 """CPU regression tests executing real metrics methods with Prometheus collectors."""
 
 import ast
+import sys
 from pathlib import Path
 from types import MethodType
 from types import SimpleNamespace as NS
@@ -218,3 +219,7 @@ def test_positive_intervals_preserve_weight_for_both_collector_backends(
     assert registry.get_sample_value(
         "sglang:inter_token_latency_seconds_sum", labels
     ) == pytest.approx(0.12)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
