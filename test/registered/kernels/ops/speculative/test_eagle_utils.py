@@ -2,8 +2,17 @@ import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
-from sgl_kernel import verify_tree_greedy
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# CUDA and ROCm both build this kernel through the JIT launcher; MUSA still
+# gets it from the AOT extension.
+if torch.version.cuda is not None or torch.version.hip is not None:
+    from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+else:
+    from sgl_kernel import verify_tree_greedy
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def test_verify_tree_greedy():
@@ -86,4 +95,4 @@ def test_verify_tree_greedy():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
