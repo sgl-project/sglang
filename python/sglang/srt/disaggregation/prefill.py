@@ -1092,12 +1092,14 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
-        self._release_aborted_request(req)
+        # Stamp the abort before releasing so the streaming-session hook sees a
+        # terminal state instead of committing the failed turn as a finish.
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self._release_aborted_request(req)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1157,11 +1159,14 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
+        # A turn that failed before any allocation never reaches the cache hook.
+        if req.session is not None:
+            req.session.abort_req(req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1510,7 +1515,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache, is_retract=True)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0

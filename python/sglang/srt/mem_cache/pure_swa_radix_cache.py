@@ -63,7 +63,12 @@ class PureSWARadixCache(RadixCache):
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
     ):
         """Cache request when it finishes.
 
