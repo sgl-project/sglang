@@ -71,6 +71,13 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
 
+    def _cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        self.len_output_tokens += num_valid.to(
+            dtype=self.len_output_tokens.dtype
+        ).reshape_as(self.len_output_tokens)
+
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
         # device-to-host sync every decode step; torch.where is a plain

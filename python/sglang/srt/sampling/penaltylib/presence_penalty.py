@@ -39,6 +39,21 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             src=self.presence_penalties,
         )
 
+    def _cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        _, k = output_ids.shape
+        valid = torch.arange(k, device=output_ids.device)[None, :] < num_valid[:, None]
+        hit = torch.zeros_like(self.cumulated_presence_penalties, dtype=torch.int32)
+        hit.scatter_add_(1, output_ids, valid.to(torch.int32))
+        self.cumulated_presence_penalties.copy_(
+            torch.where(
+                hit > 0,
+                self.presence_penalties,
+                self.cumulated_presence_penalties,
+            )
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_presence_penalties)
 

@@ -1055,6 +1055,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv = ReqKvInfo()
+        self.penalty_cumulated_len = 0
 
         # Full-KV-derived boundary whose SWA window should be inserted after
         # the current prefill pass.
@@ -1964,6 +1965,7 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
+        self.penalty_cumulated_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -3494,6 +3496,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             latest_output_ids
+        )
+
+    def cumulate_penalty_output_tokens_since_last(self):
+        """Feed every token committed since the previous call (all accepted
+        speculative tokens, not only the last) to the penalizers. The first
+        call also feeds the last prompt token, matching the non-spec path."""
+        new_tokens = []
+        for req in self.reqs:
+            seq_len = 1 + len(req.output_ids)
+            start = req.penalty_cumulated_len
+            if start == 0:
+                toks = [req.origin_input_ids[-1]] + list(req.output_ids)
+            else:
+                toks = list(req.output_ids[start - 1 :])
+            new_tokens.append(toks)
+            req.penalty_cumulated_len = seq_len
+
+        k = max((len(t) for t in new_tokens), default=0)
+        if k == 0:
+            return
+
+        pin_memory = is_pin_memory_available(self.device)
+        ids = torch.zeros((len(self.reqs), k), dtype=torch.int64, pin_memory=pin_memory)
+        num_valid = torch.tensor(
+            [len(t) for t in new_tokens], dtype=torch.int64, pin_memory=pin_memory
+        )
+        for i, t in enumerate(new_tokens):
+            if t:
+                ids[i, : len(t)] = torch.tensor(t, dtype=torch.int64)
+
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens_multi(
+            ids.to(self.device, non_blocking=True),
+            num_valid.to(self.device, non_blocking=True),
         )
 
     def prepare_for_decode(self):
