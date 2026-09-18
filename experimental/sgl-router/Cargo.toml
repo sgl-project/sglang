@@ -83,6 +83,12 @@ uuid = { version = "1", features = ["v4"] }
 # `python/sglang/srt/disaggregation/kv_events.py`.
 parking_lot = "0.12"
 rmp-serde = "1"
+# FxHash for the KV-event radix tree's integer-keyed maps (i64 block
+# hashes, u64 node ids), off the routing hot path's SipHash cost. The
+# keys are client-derivable, not trusted; what bounds a collision attack
+# is that planting a key costs a real request — see the DoS note in
+# src/policies/kv_events/tree.rs.
+rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
