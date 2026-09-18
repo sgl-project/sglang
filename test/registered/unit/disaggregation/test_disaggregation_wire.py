@@ -7,7 +7,12 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -29,6 +34,8 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVReceiver,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -61,6 +68,245 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestMooncakeHostDestination(unittest.TestCase):
+    def setUp(self):
+        self.manager = object.__new__(MooncakeKVManager)
+        args = self.manager.kv_args = KVArgs()
+        args.kv_data_ptrs = [0x1000, 0x2000]
+        args.kv_data_lens = [512, 512]
+        args.kv_item_lens = [128, 128]
+        args.host_kv_data_ptrs = [0x3000, 0x4000]
+        args.host_kv_data_lens = [1024, 1024]
+        args.host_kv_item_lens = [128, 128]
+        args.aux_data_ptrs = [0x5000]
+        args.aux_data_lens = [128]
+        args.state_types = []
+        args.state_data_ptrs = []
+        args.state_data_lens = []
+        args.state_item_lens = []
+        args.state_dim_per_tensor = []
+        args.state_layer_ids = []
+        args.kv_layer_ids = []
+        args.engine_rank = 0
+        args.prefill_start_layer = 0
+        self.manager.local_ip = "127.0.0.1"
+        self.manager.rank_port = 1234
+        self.manager.attn_tp_size = 1
+        self.manager.attn_cp_size = 1
+        self.manager.pp_size = 1
+        self.manager.dcp_size = 1
+        self.manager.dcp_rank = 0
+        self.manager.enable_staging = False
+        self.manager.is_mla_backend = False
+        self.manager.is_hybrid_mla_backend = False
+        self.manager.enable_custom_mem_pool = False
+        self.manager.max_transfer_batch_indices = 0
+        self.manager.engine = Mock()
+        self.receiver = object.__new__(MooncakeKVReceiver)
+        self.receiver.kv_mgr = self.manager
+        self.receiver.bootstrap_infos = [
+            {"is_dummy": False, "supports_host_destination": True}
+        ]
+        self.receiver.bootstrap_room = 42
+        self.receiver.session_id = "session"
+        self.receiver.required_dst_info_num = 1
+        self.receiver.prefill_info = SimpleNamespace(
+            attn_tp_size=1, pp_size=1, attn_cp_size=1
+        )
+        self.socket = Mock()
+        connect = patch.object(
+            self.receiver,
+            "_connect_to_bootstrap_server",
+            return_value=(self.socket, threading.Lock()),
+        )
+        connect.start()
+        self.addCleanup(connect.stop)
+
+    def register(self):
+        self.assertTrue(self.receiver._register_kv_args())
+        return KVArgsRegisterInfo.from_zmq(self.socket.send_multipart.call_args.args[0])
+
+    def metadata(self, destination=KVTransferDestination.DEVICE):
+        self.receiver.send_metadata(
+            np.array([5, 7], dtype=np.int32), aux_index=3, destination=destination
+        )
+        return TransferInfo.from_zmq(self.socket.send_multipart.call_args.args[0])
+
+    def test_sender_clear_preserves_abort_ack_until_writes_drain(self):
+        for outstanding in (0, 1):
+            with self.subTest(outstanding=outstanding):
+                self.manager.request_status = {42: KVPoll.Failed}
+                self.manager.req_to_decode_prefix_len = {42: 0}
+                self.manager.transfer_infos = {42: {}}
+                self.manager._staging_outstanding = {42: outstanding}
+                self.manager._deferred_ack_targets = {}
+                self.manager.register_deferred_ack_target(42, "127.0.0.1", 1234)
+                sender = object.__new__(MooncakeKVSender)
+                sender.kv_mgr = self.manager
+                sender.bootstrap_room = 42
+                with patch.object(self.manager, "_send_abort_ack") as ack:
+                    sender.clear()
+                    self.assertNotIn(42, self.manager.request_status)
+                    if outstanding:
+                        ack.assert_not_called()
+                        self.assertIn(42, self.manager._deferred_ack_targets)
+                        self.manager._staging_outstanding[42] = 0
+                        self.manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
+                    self.assertNotIn(42, self.manager._deferred_ack_targets)
+                    self.manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once()
+
+    def test_registration_and_destination_roundtrip(self):
+        self.manager._validate_host_pool()
+        self.manager.register_buffer_to_engine()
+        self.manager.engine.batch_register.assert_called_once_with(
+            [0x1000, 0x2000, 0x3000, 0x4000, 0x5000],
+            [512, 512, 1024, 1024, 128],
+        )
+        info = self.register()
+        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 22)
+        self.assertEqual(info.dst_host_kv_ptrs, [0x3000, 0x4000])
+        self.assertEqual(info.dst_host_kv_data_lens, [1024, 1024])
+        self.assertEqual(info.dst_host_kv_item_lens, [128, 128])
+        for destination, expected_ptrs, num_frames in [
+            (KVTransferDestination.DEVICE, info.dst_kv_ptrs, 10),
+            (KVTransferDestination.HOST, info.dst_host_kv_ptrs, 11),
+        ]:
+            with self.subTest(destination=destination):
+                req = self.metadata(destination)
+                self.assertEqual(req.destination, destination)
+                self.assertEqual(req.dst_aux_index, 3)
+                np.testing.assert_array_equal(req.dst_kv_indices, [5, 7])
+                self.assertEqual(
+                    len(self.socket.send_multipart.call_args.args[0]), num_frames
+                )
+                self.assertIs(
+                    self.manager._select_kv_destination(req, info), expected_ptrs
+                )
+
+    def test_device_only_registration_preserves_wire(self):
+        args = self.manager.kv_args
+        args.host_kv_data_ptrs = None
+        args.host_kv_data_lens = None
+        args.host_kv_item_lens = None
+        self.manager._validate_host_pool()
+        info = self.register()
+        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 19)
+        self.assertEqual(info.dst_host_kv_ptrs, [])
+        self.assertEqual(self.metadata().destination, KVTransferDestination.DEVICE)
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            self.metadata(KVTransferDestination.HOST)
+
+    def test_old_prefill_rejects_host_before_publishing_indices(self):
+        for infos in (None, [{}], [{"supports_host_destination": True}, {}]):
+            with self.subTest(infos=infos):
+                self.receiver.bootstrap_infos = infos
+                self.assertFalse(self.receiver.supports_host_destination)
+                with self.assertRaisesRegex(ValueError, "Prefill does not support"):
+                    self.metadata(KVTransferDestination.HOST)
+        self.socket.send_multipart.assert_not_called()
+
+    def test_unsupported_topology_rejects_host_before_publishing_indices(self):
+        for target, field, value in [
+            (self.receiver.prefill_info, "attn_tp_size", 2),
+            (self.receiver.prefill_info, "pp_size", 2),
+            (self.receiver.prefill_info, "attn_cp_size", 2),
+            (self.manager, "dcp_size", 2),
+            (self.manager.kv_args, "state_types", [StateType.SWA]),
+        ]:
+            with self.subTest(field=field), patch.object(target, field, value):
+                self.assertFalse(self.receiver.supports_host_destination)
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    self.metadata(KVTransferDestination.HOST)
+        self.socket.send_multipart.assert_not_called()
+
+    def test_host_geometry_and_topology_fail_before_transfer(self):
+        info = self.register()
+        req = self.metadata(KVTransferDestination.HOST)
+        for target, field, value in [
+            (info, "dst_host_kv_ptrs", []),
+            (info, "dst_host_kv_item_lens", [64, 64]),
+            (info, "dst_host_kv_data_lens", [1000, 1024]),
+            (info, "dst_attn_tp_size", 2),
+            (info, "dst_dcp_size", 2),
+            (self.manager, "enable_staging", True),
+            (self.manager, "pp_size", 2),
+            (self.manager.kv_args, "state_types", [StateType.SWA]),
+            (req, "dst_kv_indices", np.array([-1], dtype=np.int32)),
+            (req, "dst_kv_indices", np.array([8], dtype=np.int32)),
+        ]:
+            with (
+                self.subTest(field=field, value=value),
+                patch.object(target, field, value),
+            ):
+                with self.assertRaises(ValueError):
+                    self.manager._select_kv_destination(req, info)
+        with patch.object(self.manager.kv_args, "host_kv_item_lens", [64, 64]):
+            with self.assertRaisesRegex(ValueError, "geometry"):
+                self.manager._validate_host_pool()
+        msg = list(self.socket.send_multipart.call_args.args[0])
+        msg[-1] = b"invalid-destination"
+        with self.assertRaises(ValueError):
+            TransferInfo.from_zmq(msg)
+
+    def test_host_transfer_uses_host_pages_and_keeps_device_registration(self):
+        info = self.register()
+        req = self.metadata(KVTransferDestination.HOST)
+        dst_ptrs = self.manager._select_kv_destination(req, info)
+        with (
+            patch.object(self.manager, "_transfer_data", return_value=0) as transfer,
+            get_context().override_server_args(enable_unified_memory=False),
+        ):
+            result = self.manager.send_kvcache(
+                "session",
+                np.array([0, 2], dtype=np.int32),
+                dst_ptrs,
+                req.dst_kv_indices,
+                executor=None,
+            )
+        self.assertEqual(result, 0)
+        transfer.assert_called_once_with(
+            "session",
+            [
+                (0x1000, 0x3000 + 5 * 128, 128),
+                (0x1000 + 2 * 128, 0x3000 + 7 * 128, 128),
+                (0x2000, 0x4000 + 5 * 128, 128),
+                (0x2000 + 2 * 128, 0x4000 + 7 * 128, 128),
+            ],
+        )
+        self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
+
+    def test_host_timeout_arms_drain_tracker_before_abort_and_keeps_ack(self):
+        self.metadata(KVTransferDestination.HOST)
+        self.manager._deferred_abort_ack_tracker = {}
+        self.manager.waiting_timeout = 0
+        self.manager.failure_records = {}
+        self.manager.failure_lock = threading.Lock()
+        self.manager.request_status = {42: KVPoll.WaitingForInput}
+        self.receiver.abort_notified = False
+        self.receiver.conclude_state = None
+        self.socket.reset_mock()
+
+        def receive_abort(parts):
+            self.assertEqual(parts[0], b"ABORT")
+            self.assertIn(42, self.manager._deferred_abort_ack_tracker)
+            self.manager.note_abort_ack(42, 0)
+
+        self.socket.send_multipart.side_effect = receive_abort
+        with patch.object(self.receiver, "invalidate_cached_bootstrap_infos"):
+            self.assertEqual(self.receiver._check_waiting_timeout(), KVPoll.Failed)
+        self.assertTrue(self.receiver.abort_notified)
+        self.assertTrue(self.manager.is_abort_release_safe(42, 1))
+
+        # The scheduler observes Failed after the notification and must not
+        # erase an ack that raced ahead of its deferred-release bookkeeping.
+        self.receiver.conclude_state = KVPoll.Failed
+        self.receiver.abort()
+        self.assertTrue(self.manager.is_abort_release_safe(42, 1))
+        self.socket.send_multipart.assert_called_once()
 
 
 class TestDisaggregationWire(unittest.TestCase):

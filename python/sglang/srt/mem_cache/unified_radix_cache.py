@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1339,15 +1339,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
-        return isinstance(kv_cache, MHATokenToKVPool) and (
-            PoolName.KV in self.host_pool_group.entry_map
+        supports_dense_kv = isinstance(kv_cache, MHATokenToKVPool) or (
+            type(kv_cache) is MLATokenToKVPool and not kv_cache.use_dsa
         )
+        return supports_dense_kv and PoolName.KV in self.host_pool_group.entry_map
 
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool requires "
-                "an MHA or hybrid-SWA HiCache host stack."
+                "an MHA, plain MLA, or hybrid-SWA HiCache host stack."
             )
 
         for spec in self.sidecar_pool_specs:

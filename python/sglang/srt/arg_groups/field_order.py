@@ -433,6 +433,7 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_ib_device",
     "disaggregation_decode_enable_radix_cache",
     "disaggregation_decode_enable_offload_kvcache",
+    "disaggregation_decode_enable_host_cache",
     "disaggregation_decode_retraction_backup",
     "num_reserved_decode_tokens",
     "disaggregation_decode_extra_slots",

@@ -55,6 +55,7 @@ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.disaggregation.decode_host_cache import DecodeHostCache
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
@@ -104,6 +105,7 @@ class SchedulerBatchResultProcessor:
     hisparse_coordinator: Optional[HiSparseCoordinator]
     req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
+    decode_host_cache: Optional[DecodeHostCache] = None
     metrics_collector: SchedulerMetricsCollector
     metrics_reporter: SchedulerMetricsReporter
     draft_worker: BaseTpWorker
@@ -123,6 +125,8 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                if self.decode_host_cache is not None:
+                    self.decode_host_cache.release(req)
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)

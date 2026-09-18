@@ -123,6 +123,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             kv_receiver=MagicMock(),
             metadata_buffer_index=-1,
             is_rebootstrap=False,
+            host_staged=False,
         )
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
