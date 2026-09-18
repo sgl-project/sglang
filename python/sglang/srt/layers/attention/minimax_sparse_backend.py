@@ -419,31 +419,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta = None
             self._extend_meta_key = None
 
-        if in_capture and forward_batch.forward_mode.is_target_verify():
-            # q/k bounds are Python integers and become CUDA Graph launch
-            # constants. They must cover every layout admitted by this graph,
-            # not merely the synthetic layout used while capturing it.
-            self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
-        else:
-            ragged_layout = (
-                resolve_ragged_verify_layout(forward_batch)
-                if forward_batch.forward_mode.is_target_verify()
-                else None
-            )
-            if ragged_layout is not None:
-                if ragged_layout.verify_lens_cpu is not None:
-                    self._max_seqlen_q = int(max(ragged_layout.verify_lens_cpu))
-                else:
-                    # Replay-side views intentionally have no fresh CPU mirror.
-                    # The fixed cap is safe and avoids a device-to-host sync.
-                    self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
+        if forward_batch.forward_mode.is_target_verify():
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            if (
+                not in_capture
+                and ragged_layout is not None
+                and ragged_layout.verify_lens_cpu is not None
+            ):
+                self._max_seqlen_q = int(max(ragged_layout.verify_lens_cpu))
             else:
-                extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-                self._max_seqlen_q = int(max(extend_lens)) if extend_lens else 1
+                # Uniform verify does not populate extend_seq_lens_cpu. Use the
+                # fixed verify width for eager execution as well as graph capture.
+                self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
+        else:
+            extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            self._max_seqlen_q = int(max(extend_lens)) if extend_lens else 1
 
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -544,6 +538,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_dec_meta = (kv_indices_buf, plan)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        # capture_one_shape invokes the same closure for warmup and capture.
+        # Drop warmup-derived seq_lens so TARGET_VERIFY rebuilds them while the
+        # graph is recording; otherwise replay keeps the synthetic capture length.
+        self._prefill_seqblock_meta = None
         if not self.is_npu:
             return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
@@ -1479,6 +1477,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             bs = int(forward_batch.seq_lens.shape[0])
             verify_len = self._target_verify_q_cap(forward_batch)
             expected_num_tokens = bs * verify_len
+            global_num_token_non_padded_cpu = getattr(
+                forward_batch, "global_num_token_non_padded_cpu", None
+            )
+            if getattr(forward_batch, "attn_tp_sequence_sharded", False) or (
+                global_num_token_non_padded_cpu is not None
+                and int(global_num_token_non_padded_cpu) < expected_num_tokens
+            ):
+                raise RuntimeError(
+                    "MiniMax sparse DP-padded or sequence-sharded TARGET_VERIFY "
+                    "requires per-request geometry; refusing to treat graph rows "
+                    "as uniform real tokens. "
+                    "global_num_token_non_padded_cpu="
+                    f"{global_num_token_non_padded_cpu}, "
+                    f"expected={expected_num_tokens}."
+                )
             if bs <= 0 or q.shape[0] != expected_num_tokens:
                 raise RuntimeError(
                     "MiniMax sparse non-ragged TARGET_VERIFY requires the fixed "
@@ -1856,6 +1869,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.

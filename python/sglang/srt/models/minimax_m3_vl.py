@@ -47,13 +47,22 @@ from sglang.srt.models.minimax_vl_common import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import (
+    add_prefix,
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 _device_sm = get_device_sm()
 
 
@@ -135,8 +144,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
-        self.capture_aux_hidden_states = False
-
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -153,10 +160,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if (_device_sm is not None) and (_device_sm < 80):
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
+        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
@@ -189,17 +198,11 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
-        for layer_id in self.model.layers_to_capture:
-            if self.model.start_layer <= layer_id < self.model.end_layer:
-                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(

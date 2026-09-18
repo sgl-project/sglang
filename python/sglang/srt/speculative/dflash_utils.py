@@ -58,6 +58,9 @@ elif is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
 
     tree_speculative_sampling_target_only = None
 else:
@@ -416,18 +419,15 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
         sliding_window = _get_dflash_config(config).get("swa_window_size")
 
     if sliding_window is None:
-        try:
-            import json
-            from pathlib import Path
+        import json
+        from pathlib import Path
 
-            model_path = _cfg_get(config, "_name_or_path")
-            if model_path:
-                config_path = Path(model_path) / "config.json"
-                if config_path.exists():
-                    raw_config = json.loads(config_path.read_text())
-                    sliding_window = raw_config.get("sliding_window")
-        except Exception:
-            sliding_window = None
+        model_path = _cfg_get(config, "_name_or_path")
+        if model_path:
+            config_path = Path(model_path) / "config.json"
+            if config_path.exists():
+                raw_config = json.loads(config_path.read_text())
+                sliding_window = raw_config.get("sliding_window")
 
     if sliding_window is None:
         raise ValueError(

@@ -142,9 +142,13 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
     kind = relative_parts[0]
     errors = []
     if kind == "unit":
-        non_cpu = [r for r in registries if r.backend.name != "CPU"]
-        if non_cpu:
-            errors.append(f"{path}: unit tests may register only CPU suites")
+        invalid = [
+            r
+            for r in registries
+            if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
+        ]
+        if invalid:
+            errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
         if any(r.est_time > 60 for r in registries):
             errors.append(f"{path}: unit test est_time must be <= 60 seconds")
         if _contains_call(tree, "popen_launch_server"):

@@ -1612,10 +1612,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():
@@ -1654,17 +1656,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
-        for layer_id in self.model.layers_to_capture:
-            if 0 <= layer_id < len(self.model.layers):
-                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1683,7 +1679,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
