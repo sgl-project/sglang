@@ -1981,9 +1981,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
-            # A too-short/fully-matched suffix can become a full recompute if
-            # the device match evicts while queued; arm the retry.
-            self.storage_prefetch_retries.poll_miss(req_id)
+            # No lookup was issued, so no retry is armed: polling here would
+            # spend the re-issue budget the admission-time device-hit-loss
+            # re-query needs once the device match evicts while queued.
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
