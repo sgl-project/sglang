@@ -1199,6 +1199,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             continue
                         try:
                             item.set_hash(int(hex_hash, 16))
+                            # Processors may have padded with the original hash.
+                            # Let the scheduler rebuild IDs using the caller's hash.
+                            mm_inputs.padded_input_ids = None
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Ignoring malformed mm_hashes entry %r; "
