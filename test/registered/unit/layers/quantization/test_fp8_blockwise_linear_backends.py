@@ -7,6 +7,7 @@ SM90 / SM100 / SM120.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -267,24 +268,26 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
             is_backend_supported.assert_called_once_with("cute-dsl", 107)
 
 
+def _build_block32_layer(n: int, k: int, keep_plain_weight_layout: bool = False):
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[32, 32],
+        scale_fmt="ue8m0",
+    )
+    layer = _make_linear(quant_config, n, k)
+    if keep_plain_weight_layout:
+        layer.keep_plain_weight_layout = True
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+    w_fp8, scale_e8m0, w_dequant = _quantize_fp8_block32_ue8m0(w)
+    load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_e8m0)
+    return layer, w_dequant
+
+
 class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     """A 32-wide-K ue8m0 block-fp8 weight served through the MXFP8 GEMMs."""
 
-    @staticmethod
-    def _build_layer(n: int, k: int, keep_plain_weight_layout: bool = False):
-        quant_config = Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            activation_scheme="dynamic",
-            weight_block_size=[32, 32],
-            scale_fmt="ue8m0",
-        )
-        layer = _make_linear(quant_config, n, k)
-        if keep_plain_weight_layout:
-            layer.keep_plain_weight_layout = True
-        w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
-        w_fp8, scale_e8m0, w_dequant = _quantize_fp8_block32_ue8m0(w)
-        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_e8m0)
-        return layer, w_dequant
+    _build_layer = staticmethod(_build_block32_layer)
 
     def _run(self, backend: str):
         self._check_backend(
@@ -337,6 +340,120 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
             self.assertFalse(plain_layer.block_fp8_mxfp8_ready)
             with self.assertRaises(ValueError):
                 plain_layer.quant_method.apply(plain_layer, Mxfp8SwizzledInput(q, s))
+
+
+@unittest.skipUnless(
+    "flashinfer_cutedsl" in _block32_backends(),
+    "block-fp8-as-MXFP8 prefill tuning needs the FlashInfer CuTe-DSL kernel",
+)
+class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
+    """The startup hook that tunes those layers for the prefill M buckets."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        torch.manual_seed(7)
+
+    @staticmethod
+    def _ready_layer(n: int, k: int, keep_plain_weight_layout: bool = False):
+        layer, _ = _build_block32_layer(n, k, keep_plain_weight_layout)
+        layer.quant_method.process_weights_after_loading(layer)
+        return layer
+
+    def test_model_hook_deduplicates_ready_block_fp8_weights(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        layers = torch.nn.ModuleList()
+        methods = []
+        for _ in range(2):
+            layer = self._ready_layer(128, 128)
+            methods.append(layer.quant_method)
+            layer.quant_method.apply = mock.Mock()
+            layers.append(layer)
+        # An unprepared layer intentionally has no swizzled scale buffer.
+        fallback = self._ready_layer(128, 128, keep_plain_weight_layout=True)
+        layers.append(fallback)
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), model=layers
+        )
+        count = DeepseekV4ForCausalLM.autotune_prefill_kernels(
+            model, 4096, dtype=torch.bfloat16
+        )
+        self.assertEqual(count, 1)
+        methods[0].apply.assert_called_once()
+        self.assertEqual(methods[0].apply.call_args.args[1].shape, (4096, 128))
+        methods[1].apply.assert_not_called()
+        for method in methods:
+            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+        self.assertIsNone(fallback.quant_method.mxfp8_prefill_autotune_min_tokens)
+
+    def test_block_fp8_dispatch_keeps_decode_and_determinism_pinned(self):
+        layer = self._ready_layer(128, 128)
+        method = layer.quant_method
+        method.mxfp8_prefill_autotune_min_tokens = 4096
+        call = mock.Mock(return_value=torch.empty(0))
+        method.w8a8_mxfp8_linear = call
+        for rows, invariant, deterministic, expected in (
+            (6, False, False, None),
+            (4096, False, False, False),
+            (4096, True, False, True),
+            (4096, False, True, True),
+        ):
+            with self.subTest(
+                rows=rows, invariant=invariant, deterministic=deterministic
+            ):
+                with (
+                    mock.patch(
+                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                        return_value=invariant,
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_exec",
+                        return_value=SimpleNamespace(
+                            deterministic=SimpleNamespace(
+                                enable_deterministic_inference=deterministic
+                            )
+                        ),
+                    ),
+                ):
+                    method.apply(layer, torch.empty(rows, 128, device="cuda"))
+                self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
+
+    def test_prefill_tuning_leaves_decode_bit_identical(self):
+        """Tuning the prefill buckets must not move the decode tactic: below the
+        stamped min_tokens the output has to stay bit-for-bit what it was."""
+        from flashinfer.autotuner import autotune
+
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        runtime_patch = mock.patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                deterministic=SimpleNamespace(enable_deterministic_inference=False)
+            ),
+        )
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+        layer = self._ready_layer(1792, 5120)
+        method = layer.quant_method
+        x = torch.randn(6, 5120, device="cuda", dtype=torch.bfloat16)
+        original = method.apply(layer, x)
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"),
+            model=torch.nn.ModuleList([layer]),
+        )
+        with autotune(True):
+            DeepseekV4ForCausalLM.autotune_prefill_kernels(
+                model, 4096, dtype=torch.bfloat16
+            )
+        self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+        torch.testing.assert_close(method.apply(layer, x), original, rtol=0, atol=0)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")

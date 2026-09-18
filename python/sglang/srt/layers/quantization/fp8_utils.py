@@ -746,9 +746,13 @@ def can_serve_block_fp8_as_mxfp8(
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
     if backend.is_flashinfer_cutlass():
-        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
+        )
     if backend.is_flashinfer_cutedsl():
-        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
+        )
     return _unsupported_mxfp8_linear
 
 
@@ -1473,9 +1477,14 @@ def flashinfer_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
     backend: str = "cutlass",
+    pin_tactic: bool = False,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
-    the backend expects, prepared at load time."""
+    the backend expects, prepared at load time.
+
+    pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
+    reduction order, breaking row-wise batch invariance.
+    """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -1507,15 +1516,29 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    output = flashinfer_mm_mxfp8(
-        q_input,
-        weight.t(),
-        x_scale_u8,
-        weight_scale_t,
-        out_dtype=output_dtype,
-        use_8x4_sf_layout=False,
-        backend=backend,
-    )
+    if pin_tactic:
+        from flashinfer.autotuner import autotune
+
+        with autotune(False, skip_ops={"mxfp8_gemm"}):
+            output = flashinfer_mm_mxfp8(
+                q_input,
+                weight.t(),
+                x_scale_u8,
+                weight_scale_t,
+                out_dtype=output_dtype,
+                use_8x4_sf_layout=False,
+                backend=backend,
+            )
+    else:
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight.t(),
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend=backend,
+        )
 
     if bias is not None:
         output += bias
