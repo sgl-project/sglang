@@ -223,6 +223,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
+        self.vision = None
 
         self.model = DeepseekV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

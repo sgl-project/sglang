@@ -3950,6 +3950,8 @@ class Scheduler(
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
+            if not adder.can_share_extend_batch(req):
+                break
 
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
