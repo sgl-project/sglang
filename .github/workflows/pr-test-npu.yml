@@ -382,12 +382,18 @@ jobs:
 
 
   # ==================== Recommend Tests from Coverage ==================== #
-  # Downloads the pre-built coverage baseline (test_case_map.json + covstub)
-  # from OBS and runs test_selector.py to recommend affected test cases for
-  # the current PR. continue-on-error: true so it never blocks the PR gate.
+  # Reads the pre-built coverage baseline (test_case_map.json + covstub)
+  # from the 800t shared disk (published by the setup-covstub job of the
+  # coverage-collection pipeline) and runs test_selector.py to recommend
+  # affected test cases for the current PR. Must run on an 800t runner to
+  # access the shared disk. continue-on-error: true so it never blocks the
+  # PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
-    runs-on: ubuntu-latest
+    needs: set-image-config
+    runs-on: linux-aarch64-a3-800t-2
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     continue-on-error: true
     if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
@@ -403,110 +409,39 @@ jobs:
             scripts
           sparse-checkout-cone-mode: false
 
-      - name: Download test case map
-        env:
-          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
-          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+      - name: Read baseline from shared disk
+        shell: bash
         run: |
           set -euo pipefail
 
-          if ! python3 -c "import obs" >/dev/null 2>&1; then
-            echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages esdk-obs-python
-          fi
+          # Fixed baseline dir published by the setup-covstub job of the
+          # coverage-collection pipeline. Deliberately has no RUN_DIR layer:
+          # this run has a different GITHUB_RUN_ID and must still find it.
+          PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
 
-          python3 - <<'EOF'
-          import os
-          import time
-          from obs import ObsClient
+          test -s "${PUBLISH_DIR}/test_case_map.json"
+          test -s "${PUBLISH_DIR}/outputs.tar.gz"
+          cp "${PUBLISH_DIR}/test_case_map.json" test_case_map.json
+          cp "${PUBLISH_DIR}/outputs.tar.gz" outputs.tar.gz
 
-          # Bucket is private, so downloads must be signed with the same
-          # credentials as the upload in the setup-covstub job.
-          client = ObsClient(
-              access_key_id=os.environ['OBS_ACCESS_KEY'],
-              secret_access_key=os.environ['OBS_SECRET_KEY'],
-              server='https://obs.cn-southwest-2.myhuaweicloud.com'
-          )
+          echo "Read baseline from shared disk: ${PUBLISH_DIR}"
+          du -h test_case_map.json outputs.tar.gz
 
-          last_error = None
-          for attempt in range(1, 4):
-              resp = client.getObject('sglang-npu', 'coverage/test_case_map.json',
-                                      downloadPath='test_case_map.json')
-              if resp.status < 300:
-                  print(f'Downloaded coverage/test_case_map.json (attempt {attempt})')
-                  break
-              last_error = f'status={resp.status}, error={resp.errorMessage}'
-              print(f'Download attempt {attempt} failed: {last_error}')
-              if attempt < 3:
-                  time.sleep(5)
-          else:
-              raise Exception(f'Download failed after 3 attempts: {last_error}')
-          EOF
-
-          test -s test_case_map.json
-          echo "Downloaded test_case_map.json"
-          du -h test_case_map.json
-
-      - name: Download coverage package and extract covstub
-        env:
-          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
-          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
-        run: |
-          set -euo pipefail
-
-          if ! python3 -c "import obs" >/dev/null 2>&1; then
-            echo "obs sdk not found for $(python3 -V); bootstrapping pip and installing esdk-obs-python"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages esdk-obs-python
-          fi
-
-          python3 - <<'EOF'
-          import os
-          import time
-          from obs import ObsClient
-
-          # Bucket is private, so downloads must be signed with the same
-          # credentials as the upload in the setup-covstub job.
-          client = ObsClient(
-              access_key_id=os.environ['OBS_ACCESS_KEY'],
-              secret_access_key=os.environ['OBS_SECRET_KEY'],
-              server='https://obs.cn-southwest-2.myhuaweicloud.com'
-          )
-
-          last_error = None
-          for attempt in range(1, 4):
-              resp = client.getObject('sglang-npu', 'coverage/outputs.tar.gz',
-                                      downloadPath='outputs.tar.gz')
-              if resp.status < 300:
-                  print(f'Downloaded coverage/outputs.tar.gz (attempt {attempt})')
-                  break
-              last_error = f'status={resp.status}, error={resp.errorMessage}'
-              print(f'Download attempt {attempt} failed: {last_error}')
-              if attempt < 3:
-                  time.sleep(5)
-          else:
-              raise Exception(f'Download failed after 3 attempts: {last_error}')
-          EOF
-
-          test -s outputs.tar.gz
-          echo "Downloaded outputs.tar.gz"
-          du -h outputs.tar.gz
           tar xzf outputs.tar.gz outputs/covstub
           test -d outputs/covstub
           echo "Extracted outputs/covstub"
           find outputs/covstub -maxdepth 2 -type d | head -20 || true
 
       - name: Recommend tests for current PR
+        shell: bash
         run: |
           set -euo pipefail
           if ! python3 -c "import regex" >/dev/null 2>&1; then
-            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages regex
+            pip install regex \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
           python3 -c "import regex; print('regex ok:', regex.__file__)"
           PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
@@ -570,12 +505,13 @@ jobs:
       log_artifact_pattern: selected-test-logs-*
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
 
-  # ==================== Coverage Assembly & Upload ==================== #
+  # ==================== Coverage Assembly & Publish ==================== #
   # Runs after all test jobs only when every need succeeded (skipped on any
   # failure or cancellation). Uses a runner that shares /root/.cache with
   # the test jobs. Assembles covstub, builds test_case_map.json, archives
-  # outputs.tar.gz and uploads both to OBS. Only runs in coverage mode
-  # (coverage_mode == true).
+  # outputs.tar.gz and publishes both to the 800t shared disk at a fixed
+  # path (no RUN_DIR layer) so other pipelines can read them. Only runs in
+  # coverage mode (coverage_mode == true).
   setup-covstub:
     needs:
       [
@@ -669,59 +605,48 @@ jobs:
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
 
-      - name: Upload outputs and map to OBS
-        env:
-          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
-          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+      - name: Publish outputs and map to shared disk
         shell: bash
         run: |
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          export RUN_DIR
+          # Fixed publish dir with no RUN_DIR layer: other pipelines have a
+          # different GITHUB_RUN_ID and must be able to read the baseline.
+          # Must match PUBLISH_DIR in the recommend-tests-from-coverage job.
+          PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
 
-          # Skip upload when no coverage data was collected this run (map build
-          # was skipped), so we never overwrite the historical package on OBS
-          # with an incomplete one.
+          # Skip publish when no coverage data was collected this run (map
+          # build was skipped), so we never overwrite the historical
+          # baseline on the shared disk with an incomplete one.
           if [ ! -s "${RUN_DIR}/test_case_map.json" ]; then
-            echo "::warning::test_case_map.json missing (no coverage data this run), skip OBS upload"
+            echo "::warning::test_case_map.json missing (no coverage data this run), skip publish"
             exit 0
           fi
 
-          if ! python3 -c "import obs" 2>/dev/null; then
-            pip install esdk-obs-python --quiet \
-              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
-              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
-              --retries 3 --timeout 60 \
-              || pip install esdk-obs-python --quiet -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-          fi
+          mkdir -p "${PUBLISH_DIR}"
 
-          python3 - <<'EOF'
-          import os
-          from obs import ObsClient
+          # mv (rename) within the same shared filesystem is atomic, so a
+          # concurrent reader sees either the old or the new baseline,
+          # never a partial file.
+          mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
+          mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
 
-          # Must match the download URLs in the recommend-tests-from-coverage job:
-          # https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/{outputs.tar.gz,test_case_map.json}
-          OBS_BUCKET = 'sglang-npu'
-          run_dir = os.environ['RUN_DIR']
+          echo "Published baseline to ${PUBLISH_DIR}"
+          du -h "${PUBLISH_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/test_case_map.json"
 
-          client = ObsClient(
-              access_key_id=os.environ['OBS_ACCESS_KEY'],
-              secret_access_key=os.environ['OBS_SECRET_KEY'],
-              server='https://obs.cn-southwest-2.myhuaweicloud.com'
-          )
-
-          uploads = [
-              (os.path.join(run_dir, 'outputs.tar.gz'), 'coverage/outputs.tar.gz'),
-              (os.path.join(run_dir, 'test_case_map.json'), 'coverage/test_case_map.json'),
-          ]
-          for local_path, obs_path in uploads:
-              resp = client.putFile(OBS_BUCKET, obs_path, local_path)
-              if resp.status < 300:
-                  print(f'Uploaded: {local_path} -> {obs_path}')
-              else:
-                  raise Exception(f'Failed to upload {local_path}: {resp.errorMessage}')
-          EOF
+      - name: Clean up per-run directory
+        # Runs when the publish step succeeded (including the no-data skip),
+        # so the shared disk does not accumulate one sglang source copy per
+        # coverage run. On publish failure it is skipped, keeping RUN_DIR
+        # for manual recovery. Raw data stays available inside the published
+        # outputs.tar.gz.
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          rm -rf "${RUN_DIR}"
+          echo "Removed ${RUN_DIR}"
 
   pr-test-npu-finish:
     needs:

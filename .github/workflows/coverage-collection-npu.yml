@@ -3,7 +3,8 @@
 #   - Runners to the 800t pool (shared /root/.cache with setup-covstub)
 #   - use_coverage_runner=true on all test jobs
 #   - Skips pr-gate, base-a (910b), multimodal-gen, recommend, analyze
-#   - Runs setup-covstub to assemble and upload coverage data to OBS
+#   - Runs setup-covstub to assemble coverage data and publish it to the
+#     800t shared disk at a fixed path (/root/.cache/tests/precise-test/coverage)
 # pr-test-npu-finish is the final gate in the called workflow.
 #
 # Manually triggered only (workflow_dispatch): PRs run the standard
