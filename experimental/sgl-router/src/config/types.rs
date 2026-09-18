@@ -1,3 +1,4 @@
+use crate::config::sampling::SamplingOverrides;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -247,6 +248,65 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
+    /// before the HTTP server stops accepting. The default covers both
+    /// deregistration paths: endpoint removal reaching kube-proxy after the
+    /// pod's `deletionTimestamp` is stamped, and a probe-driven load balancer,
+    /// which cannot act until `failureThreshold * periodSeconds` of `/readyz`
+    /// failures have accumulated.
+    ///
+    /// Note that it equals the k8s default `terminationGracePeriodSeconds`, so
+    /// a pod that has not raised its grace period is left with nothing for the
+    /// in-flight drain that follows the pause, and
+    /// [`shutdown_drain_advisory`](crate::config::shutdown_drain_advisory)
+    /// warns at every startup. That is the intended reading rather than a
+    /// misconfigured default: a router whose completions stream for minutes
+    /// cannot terminate cleanly inside 30 s at all, and the grace period is the
+    /// thing to raise. 0 disables the pause.
+    pub shutdown_drain_secs: u64,
+    /// The pod's actual `terminationGracePeriodSeconds`, when the operator
+    /// declares it. The router cannot read its own pod spec, so without this
+    /// the startup advisory can only compare the drain against the k8s
+    /// default — and warns, wrongly, about a deployment that raised the grace
+    /// period on purpose. `None` means "assume the default".
+    pub termination_grace_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// [`Self::shutdown_drain_secs`] as a `Duration`. Keeps the seconds-to-
+    /// `Duration` conversion in the library, where a test can pin it, rather
+    /// than in `main.rs` where a `from_secs`/`from_millis` slip would silently
+    /// shorten every drain by a factor of 1000.
+    pub fn shutdown_drain(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_drain_secs)
+    }
+}
+
+pub fn default_host() -> String {
+    "127.0.0.1".into()
+}
+
+pub fn default_port() -> u16 {
+    30000
+}
+
+pub fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+/// Exists so test fixtures can spell out only the fields they care about
+/// (`tests/` is a separate crate, so a `#[cfg(test)]` constructor cannot reach
+/// the integration fixtures). Keep `Cli::into_config` exhaustive so adding a
+/// field still forces a decision on the production path.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            termination_grace_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +350,9 @@ pub struct ModelConfig {
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
+    /// Disable router-generated input IDs for this model; keep routing tokenization.
+    /// Use when workers have rendering defaults or template stops the router cannot see.
+    pub disable_input_ids_forwarding: bool,
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
@@ -312,6 +375,12 @@ pub struct ModelConfig {
     pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.
     pub eligibility: Option<EligibilityConfig>,
+    /// Sampling parameters fixed fleet-wide for this model, and what happens
+    /// to a request that sends a different value: a 400 before admission, or
+    /// the client value forwarded untouched. Either way the configured value
+    /// is injected when the request omits the field — see
+    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
+    pub sampling_overrides: SamplingOverrides,
 }
 
 /// External KV Indexer client settings.
@@ -400,6 +469,11 @@ pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
 /// Default external-indexer request limits.
 pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
+/// Default min-load sample size: the pre-existing power-of-2 behavior.
+/// Every code path that has no `AffinityConfig` to read must fall back to
+/// this, so the no-affinity path never drifts from the configured default.
+pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
+
 /// Controls whether admission may select a session-affinity backup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
@@ -446,6 +520,67 @@ pub struct AffinityConfig {
     pub cache_candidate_ratio: f64,
     pub cache_candidate_max_workers: usize,
     pub cache_switch_margin_tokens: u64,
+    /// Queue gate (`--worker-queue-limit`): a worker whose engine reports at
+    /// least this many *waiting* requests cannot win a selection on cache
+    /// affinity — the request goes to another worker holding the same
+    /// prefix, or failing that to the least-loaded worker that is not
+    /// queueing. `None` disables the gate.
+    ///
+    /// Gating on the queue rather than on total depth is what makes this
+    /// targeted: `num_waiting_reqs` IS the question the request cares about
+    /// — will I sit behind other work before my prefill starts — whereas
+    /// depth only proxies it, and proxies it badly (an engine can queue at
+    /// 7-8 running on long-prompt traffic, far below its running cap, so a
+    /// depth threshold either fires on healthy busy workers or misses the
+    /// workers actually making requests wait).
+    ///
+    /// The gate reads the engine-published load sample and fails OPEN on a
+    /// worker with no fresh sample: the router-side in-flight counter cannot
+    /// separate a running request from a waiting one, so there is no honest
+    /// substitute to compare the limit against.
+    ///
+    /// Note the firing point scales with `dp_size`: the sample sums `waiting`
+    /// across a worker's DP ranks while a request lands on one of them, so
+    /// scale the limit with `--dp-size` on DP-attention deployments.
+    ///
+    /// The companion `saturation_queue_floor` cancels the gate's diversions
+    /// when they have no payoff (nothing in the fleet reads below the
+    /// floor).
+    pub worker_queue_limit: Option<u64>,
+    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
+    /// diversions that have no payoff. When no cache candidate survives
+    /// both `worker_queue_limit` and hard admission, at least one was over
+    /// the limit, AND no worker in the routable fleet has a fresh queue
+    /// reading strictly below this floor, the diverted request would wait
+    /// wherever it lands — so it pins to the least-pressured prefix owner
+    /// instead of cold-prefilling on a non-owner (which evicts other
+    /// prefixes and manufactures the next round of misses). `None` — the
+    /// default — preserves the pure gate behavior.
+    ///
+    /// Polarity note: a worker with no fresh sample does NOT count as idle
+    /// — the opposite of the gate's fail-open, and deliberately so. The
+    /// gate keeps affinity because that is the safe default action; the
+    /// pin asks whether a *provably better* destination exists, and an
+    /// unknown queue is not proof. Both polarities leave the request with
+    /// its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker_queue_limit` and requires the
+    /// gate; like the limit, scale the floor with `dp_size`.
+    pub saturation_queue_floor: Option<u64>,
+    /// Number of random candidates sampled for the min-load fallback
+    /// (`--min-load-choices`); the least-pressured of the sample wins.
+    /// [`DEFAULT_MIN_LOAD_CHOICES`] is the pre-existing power-of-2
+    /// behavior, so upgrading changes nothing. `k >= pool` skips the
+    /// shuffle and returns the exact minimum, with ties broken randomly
+    /// (an idle fleet ties on every comparison, so a fixed order would pin
+    /// every fallback dispatch to one worker); `k = 1` is a uniform draw
+    /// within the tier, and its sample has no second member, so the
+    /// proposal carries no backup and admission loses its backup-admission
+    /// and pressure-guard paths. The
+    /// `--cache-candidate-*` knobs bound the cache-affinity OWNER candidate
+    /// set; this bounds the min-load FALLBACK sample used when no owner is
+    /// usable.
+    pub min_load_choices: usize,
 }
 
 impl Default for AffinityConfig {
@@ -468,6 +603,9 @@ impl Default for AffinityConfig {
             cache_candidate_ratio: 0.05,
             cache_candidate_max_workers: 32,
             cache_switch_margin_tokens: 1_024,
+            worker_queue_limit: None,
+            saturation_queue_floor: None,
+            min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
         }
     }
 }

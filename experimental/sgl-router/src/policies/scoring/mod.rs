@@ -747,8 +747,15 @@ mod tests {
             (&ws[2], 0, 0, 0, 4_096),
         ]);
 
-        let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
-            .expect("capacity exhaustion must degrade inside the filtered domain");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            2,
+        )
+        .expect("capacity exhaustion must degrade inside the filtered domain");
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
     }
 
@@ -783,8 +790,15 @@ mod tests {
         assert_eq!(proposal.primary.id, ws[2].id);
 
         let snapshot = EngineLoadSnapshot::default();
-        let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
-            .expect("an eligible escape worker exists");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&ws),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            2,
+        )
+        .expect("an eligible escape worker exists");
         assert_ne!(decision.selected.id, ws[2].id);
         assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
 

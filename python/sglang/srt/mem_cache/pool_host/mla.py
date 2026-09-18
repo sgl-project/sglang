@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -653,8 +654,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -851,8 +856,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
