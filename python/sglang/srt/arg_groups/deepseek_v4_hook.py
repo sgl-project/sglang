@@ -246,18 +246,30 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # This validation runs before validate_deepseek_v4_cp resolves
+        # attn_cp_size from TP. Keep the existing interleave prefill CP path
+        # alongside DP-only attention; CP+DP remains unsupported.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+            and cfg.dp_size == 1
+            and cfg.attn_cp_size in (1, cfg.tp_size)
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "and DCP=1. Use CP=1 for DP attention, or interleave prefill "
+                "CP with DP=1. Both servers must use the same block size "
+                "and target/draft KV layout."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
