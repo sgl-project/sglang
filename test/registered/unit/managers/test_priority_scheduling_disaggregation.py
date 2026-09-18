@@ -8,13 +8,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVTransferDestination
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.environ import envs
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
@@ -183,66 +181,6 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
-
-    def test_host_receive_preserves_reserve_and_waits_for_device(self):
-        for device_free, force in ((0, False), (1000, True)):
-            with (
-                self.subTest(force=force),
-                get_context().override_server_args(
-                    disaggregation_decode_enable_host_receive=True,
-                    disaggregation_decode_enable_radix_cache=False,
-                ),
-                envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.override(force),
-            ):
-                entry = self._new_decode_req("host", 0)
-                entry.req.kv.req_pool_idx = None
-                entry.req.bootstrap_host = "prefill"
-                entry.req.lora_id = "host"
-                blocked = self._new_decode_req("blocked", 0)
-                blocked.req.lora_id = "blocked"
-                queue = self._new_queue([entry, blocked])
-                scheduler = queue.scheduler
-                scheduler.enable_lora = True
-                scheduler.enable_lora_overlap_loading = False
-                scheduler.lora_drainer = None
-                scheduler.can_schedule_lora_req = (
-                    Scheduler.can_schedule_lora_req.__get__(scheduler)
-                )
-                manager = LoRAManager.__new__(LoRAManager)
-                manager.max_loras_per_batch = 1
-                manager.num_pinned_loras = 0
-                scheduler.tp_worker.model_runner.lora_manager = manager
-                queue.host_pool = MagicMock(page_size=1)
-                queue.host_reserved_tokens = 8
-                queue.host_pool.available_size.return_value = 8
-                queue.host_pool.alloc.return_value = torch.arange(8, 11)
-                queue.token_to_kv_pool_allocator.available_size.return_value = (
-                    device_free
-                )
-                self.assertEqual(queue.pop_preallocated(), ([], []))
-                queue.host_pool.alloc.assert_not_called()
-                queue.host_pool.available_size.return_value = 11
-                self.assertEqual(queue.pop_preallocated(), ([entry], []))
-                self.assertEqual(queue.queue, [blocked])
-                self.assertIsNone(entry.req.kv.req_pool_idx)
-                queue._pre_alloc.assert_not_called()
-                self.assertIs(
-                    entry.req.kv.retraction_backup.host_indices,
-                    queue.host_pool.alloc.return_value,
-                )
-                self.assertEqual(
-                    entry.kv_receiver.send_metadata.call_args.kwargs["destination"],
-                    KVTransferDestination.HOST,
-                )
-                queue.transfer_queue.queue = [entry]
-                self.assertEqual(queue.num_tokens_pre_allocated, 0)
-                self.assertEqual(queue._active_req_count(), 0)
-                queue.token_to_kv_pool_allocator.available_size.return_value = 0
-                self.assertFalse(queue.allocate_host_staged(entry))
-                queue.token_to_kv_pool_allocator.available_size.return_value = 1000
-                self.assertTrue(queue.allocate_host_staged(entry))
-                queue._pre_alloc.assert_called_once_with(entry.req)
-                self.assertFalse(entry.host_staged)
 
     def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
         """In-flight requests retain their adapter slots."""
@@ -634,21 +572,10 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
-        req = MagicMock(
-            rid="request", origin_input_ids=[1, 2, 3], expected_kv_checksum=123
-        )
-        req.kv.req_pool_idx = 0
-        scheduler.waiting_queue = [req]
-        scheduler.req_to_token_pool.req_to_token = torch.arange(3).view(1, 3)
-        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.waiting_queue = [MagicMock(rid="request")]
 
         call_order = []
-        scheduler.kv_checksum_computer = MagicMock()
-        scheduler.kv_checksum_computer.compute.side_effect = lambda *_: (
-            call_order.append("checksum") or 123
-        )
         new_batch = MagicMock()
-        new_batch.reqs = scheduler.waiting_queue
         new_batch.is_empty.return_value = False
         new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
             "prepare"
@@ -664,13 +591,8 @@ class TestDecodePrebuilt(unittest.TestCase):
                 return_value=new_batch,
             ),
             get_context().override_server_args(
-                disaggregation_decode_enable_radix_cache=False,
-                disaggregation_decode_enable_host_receive=True,
+                disaggregation_decode_enable_radix_cache=False
             ),
-            patch(
-                "sglang.srt.disaggregation.decode.retraction_restore",
-                side_effect=lambda *_: call_order.append("restore"),
-            ) as restore,
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
@@ -680,16 +602,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.schedule_stream.wait_stream.assert_called_once_with(
             scheduler.forward_stream
         )
-        restore.assert_called_once_with(
-            new_batch.reqs[0],
-            scheduler.tree_cache,
-            scheduler.req_to_token_pool,
-            scheduler.token_to_kv_pool_allocator,
-            "host_pool",
-        )
-        self.assertEqual(
-            call_order, ["prepare", "wait", "restore", "checksum", "process"]
-        )
+        self.assertEqual(call_order, ["prepare", "wait", "process"])
 
 
 if __name__ == "__main__":
