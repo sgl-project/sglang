@@ -27,6 +27,8 @@ limitations under the License.
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
+
+#include "../../../jit/include/sgl_kernel/deepseek_v4/fp8_e4m3.h"
 #endif
 
 #include <ATen/cuda/CUDAContext.h>
@@ -54,7 +56,7 @@ using fp8x2_e4m3_t = uint16_t;
 #endif
 
 // ============================================================================
-// Utility helpers (inlined, no external header dependency)
+// Utility helpers (inlined)
 // ============================================================================
 
 static constexpr uint32_t kWarpSize = 32;
@@ -141,44 +143,14 @@ __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
   return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
 }
 #else
-// Software float -> FP8 E4M3 conversion for ROCm
+// FlashMLA stores E4M3FN bytes even on gfx942 (not native FNUZ).
+// Keep the CUDA packer's clamp contract: +/-Inf -> +/-448, NaN -> +448.
+// The shared SATFINITE converter then handles RNE and preserves signed zero.
 __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
-  constexpr float kMax = kFP8Max;
-  val = fmaxf(fminf(val, kMax), -kMax);
-  if (val == 0.0f) return 0;
-
-  uint32_t f32 = __float_as_uint(val);
-  uint8_t sign = static_cast<uint8_t>((f32 >> 24) & 0x80u);
-  f32 &= 0x7FFFFFFFu;
-
-  int32_t exp32 = static_cast<int32_t>((f32 >> 23) & 0xFFu);
-  uint32_t mant32 = f32 & 0x7FFFFFu;
-
-  // FP8 E4M3 bias=7, FP32 bias=127, offset=120
-  int32_t exp8 = exp32 - 120;
-
-  if (exp8 <= 0) {
-    mant32 |= 0x800000u;
-    int32_t shift = 1 - exp8;
-    if (shift > 24) return sign;
-    uint32_t shifted = mant32 >> (20 + shift);
-    uint32_t rbit = (shift <= 23) ? ((mant32 >> (19 + shift)) & 1u) : 0u;
-    uint32_t sbit = (shift <= 23) ? ((mant32 & ((1u << (19 + shift)) - 1u)) != 0) : 0u;
-    shifted += (rbit && (sbit || (shifted & 1u)));
-    return sign | static_cast<uint8_t>(shifted & 0x7u);
-  }
-  if (exp8 >= 15) return sign | 0x7Eu;
-
-  uint32_t mant3 = (mant32 >> 20) & 0x7u;
-  uint32_t rbit = (mant32 >> 19) & 1u;
-  uint32_t sbit = (mant32 & 0x7FFFFu) != 0;
-  mant3 += (rbit && (sbit || (mant3 & 1u)));
-  if (mant3 > 7) {
-    mant3 = 0;
-    exp8++;
-    if (exp8 >= 15) return sign | 0x7Eu;
-  }
-  return sign | (static_cast<uint8_t>(exp8) << 3) | static_cast<uint8_t>(mant3);
+  // Classify by bits so signaling NaNs follow the same contract as quiet NaNs.
+  if ((__float_as_uint(val) & 0x7fffffffu) > 0x7f800000u) val = kFP8Max;
+  val = fmaxf(fminf(val, kFP8Max), -kFP8Max);
+  return sglang::deepseek_v4::fp8::f32_to_fp8_e4m3_bits<false>(__float_as_uint(val));
 }
 
 __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
