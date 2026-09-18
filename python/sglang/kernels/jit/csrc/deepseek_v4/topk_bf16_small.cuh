@@ -96,7 +96,7 @@ SGL_DEVICE uint32_t warp_exclusive_suffix_sum(uint32_t x, uint32_t lane_id) {
   uint32_t inc = x;
 #pragma unroll
   for (uint32_t offset = 1; offset < device::kWarpThreads; offset <<= 1) {
-    const auto t = __shfl_down_sync(device::kFullMask, inc, offset);
+    const auto t = __shfl_down_sync(device::warp::kFullMask, inc, offset);
     if (lane_id + offset < device::kWarpThreads) inc += t;
   }
   return inc - x;
@@ -324,10 +324,10 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   // Block-wide exclusive prefix of (gt, eq), packed: one warp scan plus one shared atomic per
   // warp. Warps land in arrival order, which is fine since the output is unordered.
   const uint32_t local = cnt_gt << 16 | cnt_eq;
-  const uint32_t warp_inc = warp::inclusive_sum(lane_id, local);
+  const uint32_t warp_inc = warp::inclusive_sum(local, lane_id);
   uint32_t warp_base = 0;
   if (lane_id == kWarpThreads - 1) warp_base = atomicAdd(&smem.count_gt_eq, warp_inc);
-  warp_base = __shfl_sync(kFullMask, warp_base, kWarpThreads - 1);
+  warp_base = __shfl_sync(warp::kFullMask, warp_base, kWarpThreads - 1);
   const uint32_t before = warp_base + warp_inc - local;
 
   // Everything above the pivot is taken, plus `remain` of the elements equal to it.

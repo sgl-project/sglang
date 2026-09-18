@@ -810,6 +810,7 @@ class TboForwardBatchPreparer:
                 # The child runs the same forward, so it keeps the parent's
                 # sharding verdict; its counts above are already per-child.
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
+                encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,

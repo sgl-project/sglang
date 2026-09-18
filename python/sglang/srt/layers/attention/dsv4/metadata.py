@@ -182,7 +182,12 @@ class PagedIndexerMetadata:
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
-    # A list when the forward is row-chunked: one schedule per chunk.
+    # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
+    compress_ratio: int = 4
+    # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
+    # all rows at once.
+    row_chunk: int = 0
+    # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -236,6 +241,18 @@ class PagedIndexerMetadata:
                     self.rows_per_chunk,
                     self.mqa_logits_budget_bytes,
                 )
+            if self.row_chunk > 0:
+                self.deep_gemm_metadata = torch.stack(
+                    [
+                        get_paged_mqa_logits_metadata(
+                            compressed_seq_lens[_s : _s + self.row_chunk],
+                            self.compressed_page_size,
+                            deep_gemm.get_num_sms(),
+                        )
+                        for _s in range(0, compressed_seq_lens.shape[0], self.row_chunk)
+                    ]
+                )
+            elif self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
@@ -272,6 +289,9 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        assert self.page_size % self.compress_ratio == 0, (
+            f"compress_ratio {self.compress_ratio} must divide page_size {self.page_size}"
+        )
 
     def _mqa_logits_budget(self, *, num_rows: int) -> Optional[int]:
         """Free-memory budget for this forward's logits; None disables chunking.
@@ -303,6 +323,17 @@ class PagedIndexerMetadata:
     def max_compressed_seq_len(self) -> int:
         return self.page_table.shape[1] * self.compressed_page_size
 
+    def row_chunks(self):
+        num_rows = self.compressed_seq_lens.shape[0]
+        if self.row_chunk <= 0:
+            return [(slice(0, num_rows), self.deep_gemm_metadata)]
+        return [
+            (slice(start, min(start + self.row_chunk, num_rows)), plan)
+            for start, plan in zip(
+                range(0, num_rows, self.row_chunk), self.deep_gemm_metadata
+            )
+        ]
+
     def copy_(self, other: PagedIndexerMetadata):
         # A chunked schedule list has no in-place copy; rebind it instead.
         chunked = isinstance(self.deep_gemm_metadata, list) or isinstance(
@@ -326,6 +357,8 @@ class PagedIndexerMetadata:
             check_eq_fields=[
                 "page_size",
                 "compressed_page_size",
+                "compress_ratio",
+                "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",

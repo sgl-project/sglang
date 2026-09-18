@@ -134,7 +134,6 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             destination.compressed_seq_lens, source.compressed_seq_lens
         )
 
-
 class TestDSV4FlashInferTopK(CustomTestCase):
     def test_compact_page_transform_respects_fuse_topk(self):
         score_storage = torch.arange(160, dtype=torch.float32).reshape(2, 80)
@@ -873,6 +872,27 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
         for rows_per_chunk in (1, 7, 16, rows - 1):
             with self.subTest(rows_per_chunk=rows_per_chunk):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
+
+
+class TestCandidateIndexerGating(CustomTestCase):
+    def test_candidate_indexer_gating(self):
+        from sglang.srt.layers.attention.dsv4 import candidate_indexer
+
+        def platform(sm):
+            return patch.object(
+                candidate_indexer, "get_platform", lambda: SimpleNamespace(device_sm=sm)
+            )
+
+        flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
+        # V4 models have no candidate source; Hopper selects through masks inline.
+        with platform(100), patch(flag, True):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
+        with platform(90), patch(flag, False):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
+        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
+        with platform(100), patch(flag, False):
+            with self.assertRaises(RuntimeError):
+                candidate_indexer.make_candidate_indexer(2048, 8)
 
 
 if __name__ == "__main__":
