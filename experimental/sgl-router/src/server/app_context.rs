@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::buckets::BucketResolver;
 use crate::config::{Config, PolicyKind};
 use crate::policies::pools::PdPoolResolver;
 use crate::policies::state::engine_load::{ActiveLoadRegistry, EngineLoadTable, JanitorHandle};
 use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
 use crate::policies::state::AffinityStore;
-use crate::policy_reorg::buckets::BucketResolver;
-use crate::policy_reorg::{BuildError, PolicyDependencies};
+use crate::policies::{BuildError, PolicyDependencies};
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;

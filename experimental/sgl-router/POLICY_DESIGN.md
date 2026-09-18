@@ -1,6 +1,6 @@
 # Engine selection policies
 
-Status: proposed design. This document describes a refactor; the interfaces and configuration examples below are sketches, not implemented APIs.
+Status: implemented. The interfaces below are sketches; the code is the reference. Deviations: PD pool resolution lives in `policies/pools.rs` rather than inside `buckets.rs`; the per-stage `affinity_first` and bucket-fallback resolver options and `--min-load-choices` are not yet configurable (their defaults reproduce the behavior described here); admission is attached per policy kind, not yet per bucket in the JSON.
 
 ## Principles
 

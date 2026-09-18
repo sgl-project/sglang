@@ -5,18 +5,18 @@
 //! policy until one picks an engine. Cache and session preference live in the
 //! policies; this layer only owns membership, ordering and fallback.
 
-use super::cache_aware::PrefixMemo;
-use super::{
-    build_decode_policy, build_policy, AffinityScope, BuildError, Pick, PickError, PickMode,
-    PickRequest, Policy, PolicyDependencies, RoutingStage,
-};
 use crate::config::{
     BucketConfig, BucketSpec, BucketStage, ModelConfig, PolicyKind, SessionAffinityMode,
     SloBucketPolicy,
 };
 use crate::discovery::{ModelId, WorkerId};
+use crate::policies::cache_aware::PrefixMemo;
 use crate::policies::pools::{PdPoolResolver, PdResolveError};
 use crate::policies::state::engine_load::{EngineLoadTable, LoadView};
+use crate::policies::{
+    build_decode_policy, build_policy, AffinityScope, BuildError, Pick, PickError, PickMode,
+    PickRequest, Policy, PolicyDependencies, RoutingStage,
+};
 use crate::server::metrics::MetricsRegistry;
 use crate::workers::Worker;
 use std::collections::HashSet;
@@ -374,12 +374,12 @@ fn tps_eligible(spec: &BucketSpec, slo: Option<f64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::worker;
-    use super::super::{ready, AdmissionReason, AffinityScope, EngineRejection, PickResult};
     use super::*;
     use crate::config::{AffinityConfig, SamplingOverrides};
     use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex};
     use crate::policies::state::AffinityStore;
+    use crate::policies::testing::worker;
+    use crate::policies::{ready, AdmissionReason, AffinityScope, EngineRejection, PickResult};
     use futures::future::BoxFuture;
     use std::time::Duration;
 

@@ -9,13 +9,11 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::power_of_two::PowerOfTwoPolicy;
+use sgl_router::policies::random::RandomPolicy;
+use sgl_router::policies::round_robin::RoundRobinPolicy;
 use sgl_router::policies::state::engine_load::{EngineLoadTable, LoadView};
-use sgl_router::policy_reorg::power_of_two::PowerOfTwoPolicy;
-use sgl_router::policy_reorg::random::RandomPolicy;
-use sgl_router::policy_reorg::round_robin::RoundRobinPolicy;
-use sgl_router::policy_reorg::{
-    Admission, AffinityScope, PickMode, PickRequest, Policy, RoutingStage,
-};
+use sgl_router::policies::{Admission, AffinityScope, PickMode, PickRequest, Policy, RoutingStage};
 use sgl_router::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;
 

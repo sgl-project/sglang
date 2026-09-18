@@ -4,11 +4,11 @@
 mod forward;
 mod preparation;
 
+use crate::buckets::{SelectError, SelectionRequest};
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::cache_aware::PrefixMemo;
 use crate::policies::pools::PdResolveError;
-use crate::policy_reorg::buckets::{SelectError, SelectionRequest};
-use crate::policy_reorg::cache_aware::PrefixMemo;
-use crate::policy_reorg::{PickError, RoutingStage};
+use crate::policies::{PickError, RoutingStage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
