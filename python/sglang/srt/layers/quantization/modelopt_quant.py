@@ -3073,8 +3073,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
-                fc1_alpha=None if use_w4a16 else layer.g1_alphas,
-                fc2_alpha=None if use_w4a16 else layer.g2_alphas,
+                fc1_alpha=layer.g1_alphas,
+                fc2_alpha=layer.g2_alphas,
                 fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk

@@ -177,14 +177,10 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
 
 def validate_flashinfer_megamoe_envs() -> None:
     combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
-    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() and (
-        combine_dtype != "bf16"
-        or envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
-    ):
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() and combine_dtype != "bf16":
         raise ValueError(
             "FlashInfer MegaMOE NVFP4 W4A16 requires "
-            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=bf16 and "
-            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=0."
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=bf16."
         )
     if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
         raise ValueError(
