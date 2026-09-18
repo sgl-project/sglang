@@ -606,6 +606,130 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     return send
 
 
+_enable_dcp_gather_prefetch = envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
+
+if _enable_dcp_gather_prefetch and not envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get():
+    # The prefetch fills the buffer the operator reads directly. On the
+    # permuting path that buffer is produced by an index_select from a scratch,
+    # which cannot be prefetched a layer ahead without also double-buffering the
+    # scratch and splitting the plan's index. Refuse rather than be silently
+    # inert -- the whole point of the flag is that it does something.
+    raise ValueError(
+        "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH requires "
+        "SGLANG_NPU_ENABLE_DCP_PACKED_READ: there is nothing to prefetch into "
+        "until the operator reads the gathered buffer directly."
+    )
+
+
+class _DcpGatherPrefetcher:
+    """C3: gather layer l+1's prefix on a side stream while layer l computes.
+
+    The all-gather is ~0.52 s of a chunk at a ~990k prefix -- measured twice
+    over, once from collective volume (94.2 GB/rank at ~197 GB/s) and once as
+    the marginal cost of doubling the chunk count in the AISBench warm-up
+    (61 -> 121 batches for +31.13 s). It depends on nothing the current layer
+    computes: the prefix KV was written by earlier forwards and sits in the
+    pool. So it can run underneath the layer before it, and on a 78-layer model
+    only the first layer ever has to wait for one.
+
+    Two slots, indexed ``layer_id % 2``, exactly as upstream's page-interleave
+    pool does it (``_slots[layer_id % 2]``). One is being read by this layer's
+    attention while the other is being filled for the next.
+
+    **Every dcp-group gather goes on the side stream, including the first.** Not
+    an optimisation -- it keeps one HCCL communicator bound to one stream for
+    the life of the process. Alternating a communicator between streams is the
+    part of this design with no precedent on NPU here, so this does not do it.
+    The compute stream only ever waits on events.
+
+    **Only this chunk's own KV is written from the compute stream**, because it
+    is the one part that is not available early: ``k_nope``/``k_pe`` for layer
+    l+1 are computed during layer l+1. They are a contiguous tail slice, so that
+    write is a copy rather than a gather, and it is ordered after the slot's
+    ready event.
+
+    Memory: two slots instead of one, ~2.08 GiB a rank at a 972k context against
+    C1's ~1.04 GiB, so ~0.74 GiB more than the permuting path held. The AISBench
+    run peaked at 49.90 GiB allocated against a ceiling near 51.7, so this may
+    need ``--mem-fraction-static`` a notch below 0.70. That is the cost of the
+    overlap and it is worth knowing before the run rather than after.
+    """
+
+    def __init__(self) -> None:
+        self.stream = torch.npu.Stream()
+        # Events come from stream.record_event(), the idiom this module already
+        # uses for the q_b_proj side stream, rather than a reused Event object.
+        self.ready: list = [None, None]
+        # Which layer each slot currently holds the PREFIX for, per forward.
+        self.filled: list = [None, None]
+        self.prev_layer: Optional[int] = None
+
+    def _note_layer(self, layer_id: int) -> None:
+        """Drop both slots when a new forward starts.
+
+        Detected structurally -- layers run 0, 1, 2, ... and then the next
+        forward starts over, so a layer id that does not advance means a new
+        batch -- rather than by the identity of the ForwardBatch. Identity is
+        what a reused object breaks, and this port has already shipped one bug
+        of exactly that shape (the KV write plan, fixed in 960d3a031d). A stale
+        slot here would be worse than a crash: it holds a real prefix, just the
+        previous batch's.
+        """
+        if self.prev_layer is None or layer_id <= self.prev_layer:
+            self.filled = [None, None]
+        self.prev_layer = layer_id
+
+    def slots(self, plan, k_nope, k_pe, slot: int):
+        return (
+            dcp_extend_gather_buffer(f"packed_latent_{slot}", k_nope, plan.rows),
+            dcp_extend_gather_buffer(f"packed_rope_{slot}", k_pe, plan.rows),
+        )
+
+    def _gather_prefix(self, m, md, plan, k_nope, k_pe, layer_id: int) -> None:
+        """Issue one layer's prefix all-gather on the side stream."""
+        slot = layer_id % 2
+        out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
+        # Wait for everything already issued on compute, so the slot's previous
+        # reader -- layer_id - 2's attention -- is done before it is overwritten.
+        self.stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(self.stream):
+            if plan.gathered_rows:
+                parallel = get_parallel()
+                send_nope, send_rope = get_token_to_kv_pool().get_mla_kv_buffer(
+                    m.attn_mqa, md.dcp_local_prefix_kv_indices, layer_id=layer_id
+                )
+                send_nope = _pad_dcp_packed_send(send_nope, plan, parallel.dcp_rank)
+                send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
+                parallel.dcp_group.all_gather_into_tensor(
+                    out_nope[: plan.gathered_rows], send_nope
+                )
+                parallel.dcp_group.all_gather_into_tensor(
+                    out_rope[: plan.gathered_rows], send_rope
+                )
+            self.ready[slot] = self.stream.record_event()
+        self.filled[slot] = layer_id
+
+    def take(self, m, md, plan, k_nope, k_pe, layer_id: int, last_layer: int):
+        """This layer's KV buffer, with next layer's gather already in flight."""
+        self._note_layer(layer_id)
+        slot = layer_id % 2
+        if self.filled[slot] != layer_id:
+            # Layer 0 of a forward, or a layer whose prefetch was skipped. Issue
+            # it now and pay for it, exactly as the unprefetched path would.
+            self._gather_prefix(m, md, plan, k_nope, k_pe, layer_id)
+        out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
+        torch.npu.current_stream().wait_event(self.ready[slot])
+        # The one part that could not be prefetched: this chunk's own KV.
+        out_nope[plan.gathered_rows :] = k_nope
+        out_rope[plan.gathered_rows :] = k_pe
+        if layer_id < last_layer:
+            self._gather_prefix(m, md, plan, k_nope, k_pe, layer_id + 1)
+        return out_nope, out_rope
+
+
+_dcp_gather_prefetcher: Optional[_DcpGatherPrefetcher] = None
+
+
 def _dcp_gather_extend_kv_packed_npu(
     m: "DeepseekV2AttentionMLA",
     forward_batch: "ForwardBatch",
@@ -648,6 +772,23 @@ def _dcp_gather_extend_kv_packed_npu(
             plan_write(forward_batch.out_cache_loc)
         if _debug_dcp_extend_memory:
             _log_dcp_extend_memory(plan.prefix_len, plan.extend_len)
+
+    if _enable_dcp_gather_prefetch:
+        global _dcp_gather_prefetcher
+        if _dcp_gather_prefetcher is None:
+            _dcp_gather_prefetcher = _DcpGatherPrefetcher()
+        last_layer = getattr(get_token_to_kv_pool(), "end_layer", None)
+        # Asserted rather than defaulted. A default of m.layer_id would make
+        # `layer_id < last_layer` false on every layer, so nothing would ever be
+        # prefetched and the flag would look enabled while doing nothing --
+        # which is the failure mode this port has already paid for once.
+        assert last_layer is not None, (
+            "DCP gather prefetch needs the KV pool's end_layer to know when to "
+            "stop prefetching; this pool does not expose one"
+        )
+        return _dcp_gather_prefetcher.take(
+            m, md, plan, k_nope, k_pe, m.layer_id, last_layer
+        )
 
     out_nope = dcp_extend_gather_buffer("packed_latent", k_nope, plan.rows)
     out_rope = dcp_extend_gather_buffer("packed_rope", k_pe, plan.rows)

@@ -819,6 +819,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         layer: "RadixAttention",
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id: Optional[int] = None,
     ):
         """Gather ``(nope, rope)`` at physical rows ``loc``.
 
@@ -833,8 +834,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         selecting is then the whole operation, and it is correct at any
         ``dcp_size`` including 1.
         """
-        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
-        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        # ``layer_id`` overrides the layer's own id so a caller can read a
+        # DIFFERENT layer's KV -- which is the whole point of prefetching one
+        # layer ahead (C3). Everything else about the read is identical, so the
+        # override is a parameter rather than a second method.
+        read_layer_id = layer.layer_id if layer_id is None else layer_id
+        k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
         idx = loc.to(torch.int64)
         cache_k_nope = k.index_select(0, idx).unsqueeze(1)
         cache_k_rope = v.index_select(0, idx).unsqueeze(1)
