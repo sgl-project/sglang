@@ -98,10 +98,12 @@ def _free_req(req, _tree_cache, *, is_insert):
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 @patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
+@pytest.mark.parametrize("enable_storage", [False, True])
 def test_aborted_final_result_releases_hybrid_cache(
-    maybe_cache_unfinished_req, release_kv_cache
+    maybe_cache_unfinished_req, release_kv_cache, enable_storage
 ):
     scheduler = _Scheduler()
+    scheduler.enable_hicache_storage = enable_storage
     req = _Req(inflight_middle_chunks=0)
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
@@ -118,6 +120,31 @@ def test_aborted_final_result_releases_hybrid_cache(
     assert req.output_ids == []
     assert req.finished()
     assert req.metadata_buffer_index == -1
+    assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+
+
+@pytest.mark.parametrize("enable_storage", [False, True])
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache")
+@patch("sglang.srt.disaggregation.prefill.prepare_abort")
+def test_bootstrap_failure_finishes_cache_attempt(
+    prepare_abort, release_kv_cache, enable_storage
+):
+    scheduler = _Scheduler()
+    scheduler.enable_hicache_storage = enable_storage
+    scheduler.ps = SimpleNamespace(tp_rank=0)
+    scheduler.metrics_reporter.enable_metrics = False
+    req = _Req(inflight_middle_chunks=0)
+    req.bootstrap_room = 1
+    req.time_stats.trace_ctx = Mock()
+
+    scheduler.handle_bootstrap_failure(req)
+
+    scheduler.tree_cache.finish.assert_called_once_with(
+        req.cache_request_handle, CacheRequestOutcome.ABORT
+    )
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
+    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    assert not req.pending_bootstrap
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
 
 
