@@ -3631,11 +3631,17 @@ class AiterAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+            # Eager draft extend has its own query boundaries; the reusable
+            # prefill buffer may still describe a preceding, much larger batch.
+            qo_indptr = self.forward_metadata.qo_indptr
+            if qo_indptr is None:
+                qo_indptr = self.qo_indptr[:bs0]
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                qo_indptr,
                 self.forward_metadata.kv_indptr[:bs0],
                 page_table,
                 self.forward_metadata.max_q_len,
