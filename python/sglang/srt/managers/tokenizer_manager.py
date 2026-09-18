@@ -2571,7 +2571,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(0)
 
             if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i, meta_info)
+                self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
@@ -2957,9 +2957,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
-    def collect_metrics(
-        self, state: ReqState, recv_obj: BatchStrOutput, i: int, meta_info: dict
-    ):
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -3000,23 +2998,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            # Record the reciprocal of the existing per-request response field.
-            reason = recv_obj.finished_reasons[i]
-            if (
-                self.disaggregation_mode != DisaggregationMode.PREFILL
-                and completion_tokens > 1
-                and reason is not None
-                and reason.get("type") in ("stop", "length")
-            ):
-                decode_throughput = meta_info.get("decode_throughput")
-                if decode_throughput is not None and 0 < decode_throughput < float(
-                    "inf"
-                ):
-                    self.metrics_collector.observe_request_tpot(
-                        labels,
-                        1.0 / decode_throughput,
-                        stream=getattr(state.obj, "stream", False),
-                    )
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (

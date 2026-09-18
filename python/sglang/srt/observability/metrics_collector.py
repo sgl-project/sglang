@@ -1772,13 +1772,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
-        self.histogram_request_tpot = Histogram(
-            name="sglang:request_time_per_output_token_seconds",
-            documentation="Per-request mean decode latency; excludes aborted requests and outputs with fewer than two tokens.",
-            labelnames=[*labels.keys(), "is_streaming"],
-            buckets=bucket_inter_token_latency,
-        )
-
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1803,11 +1796,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 **self.labels,
                 phase=phase,
             ).set(float(duration))
-
-    def observe_request_tpot(self, labels, value, *, stream):
-        self.histogram_request_tpot.labels(
-            **labels, is_streaming=str(stream).lower()
-        ).observe(value)
 
     def observe_finished_outcome(self, labels, outcome, prompt_tokens, cached_tokens):
         outcome_labels = {**labels, "outcome": outcome}

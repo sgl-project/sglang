@@ -1,7 +1,6 @@
 """CPU regression tests executing real metrics methods with Prometheus collectors."""
 
 import ast
-import math
 from pathlib import Path
 from types import MethodType
 from types import SimpleNamespace as NS
@@ -77,7 +76,6 @@ def collector(role):
     for method in (
         "observe_time_to_first_token",
         "observe_inter_token_latency",
-        "observe_request_tpot",
         "observe_finished_outcome",
         "observe_one_finished_request",
     ):
@@ -118,55 +116,10 @@ def request(role, *, stream=False, tokens=101, reason="length", finished=True):
     return registry, manager, state, recv
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize(
-    "throughput", [200.0, 0.0, -1.0, float("inf"), float("nan"), None]
-)
-@pytest.mark.parametrize(
-    "role,reason,tokens",
-    [
-        ("null", "length", 101),
-        ("decode", "stop", 101),
-        ("prefill", "length", 101),
-        ("decode", "abort", 101),
-        ("decode", "other", 101),
-        ("null", "length", 1),
-    ],
-)
-def test_request_tpot_excludes_invalid_or_incomplete_decode(
-    stream, throughput, role, reason, tokens
-):
-    registry, manager, state, recv = request(
-        role, stream=stream, tokens=tokens, reason=reason, finished=False
-    )
-    meta = {"decode_throughput": throughput}
-    COLLECT(manager, state, recv, 0, meta)
-    labels = {"engine_type": role, "is_streaming": str(stream).lower()}
-    metric = "sglang:request_time_per_output_token_seconds"
-    assert registry.get_sample_value(metric + "_count", labels) is None
-    state.finished = True
-    COLLECT(manager, state, recv, 0, meta)
-    expected = (
-        role != "prefill"
-        and reason in ("stop", "length")
-        and tokens > 1
-        and throughput is not None
-        and math.isfinite(throughput)
-        and throughput > 0
-    )
-    assert registry.get_sample_value(metric + "_count", labels) == (
-        1 if expected else None
-    )
-    if expected:
-        assert registry.get_sample_value(metric + "_sum", labels) == pytest.approx(
-            0.005
-        )
-
-
 @pytest.mark.parametrize("role", ["null", "decode", "prefill"])
 def test_abort_without_output_does_not_observe_first_token(role):
     registry, manager, state, recv = request(role, tokens=0, reason="abort")
-    COLLECT(manager, state, recv, 0, {})
+    COLLECT(manager, state, recv, 0)
     assert not state.ttft_observed
     assert (
         registry.get_sample_value(
@@ -188,7 +141,7 @@ def test_prefill_never_observes_decode_intervals():
     registry, manager, state, recv = request("prefill", tokens=0, finished=False)
     for count in (0, 1, 8, 0):
         recv.completion_tokens = [count]
-        COLLECT(manager, state, recv, 0, {})
+        COLLECT(manager, state, recv, 0)
     assert (
         registry.get_sample_value(
             "sglang:inter_token_latency_seconds_count", {"engine_type": "prefill"}
@@ -199,10 +152,10 @@ def test_prefill_never_observes_decode_intervals():
 
 def test_token_count_reset_changes_baseline_without_negative_histograms():
     registry, manager, state, recv = request("decode", tokens=8, finished=False)
-    COLLECT(manager, state, recv, 0, {})
+    COLLECT(manager, state, recv, 0)
     for count in (0, 0, 2):
         recv.completion_tokens = [count]
-        COLLECT(manager, state, recv, 0, {})
+        COLLECT(manager, state, recv, 0)
     labels = {"engine_type": "decode"}
     assert state.last_completion_tokens == 2
     assert (
@@ -237,7 +190,7 @@ def test_collector_rejects_nonpositive_token_weights(delta):
 )
 def test_terminal_outcomes_and_tokens_are_separated(reason, outcome):
     registry, manager, state, recv = request("decode", reason=reason)
-    COLLECT(manager, state, recv, 0, {})
+    COLLECT(manager, state, recv, 0)
     labels = {"engine_type": "decode", "outcome": outcome}
     for metric, expected in [
         ("finished_requests_by_outcome", 1),
