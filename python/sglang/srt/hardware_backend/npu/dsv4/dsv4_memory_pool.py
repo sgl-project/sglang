@@ -118,6 +118,7 @@ class NPUCompressStatePool(CompressStatePool):
         enable_memory_saver: bool,
         ratio: int,
         ring_size: int,
+        request_scoped: bool,
         swa_page_size: int,
     ):
         assert ratio in (
@@ -139,6 +140,7 @@ class NPUCompressStatePool(CompressStatePool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             online=False,
+            request_scoped=request_scoped,
             swa_page_size=swa_page_size,
             state_cache_page_size=ring_size,
         )
@@ -352,6 +354,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
+            request_scoped=ratio == 128,
             swa_page_size=self.swa_page_size,
         )
 
