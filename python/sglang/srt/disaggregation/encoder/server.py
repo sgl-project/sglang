@@ -8,16 +8,16 @@ import pickle
 import time
 import traceback
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any
 
 import msgspec
 import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -79,15 +79,15 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
-def is_health_check_request(rid: Optional[str]) -> bool:
+def is_health_check_request(rid: str | None) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 rid_lock = asyncio.Lock()
-rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
-rid_to_receive_count: Dict[str, int] = dict()
+rid_to_receive_endpoint: dict[str, set[str]] = dict()
+rid_to_receive_count: dict[str, int] = dict()
 cond_dict_lock = asyncio.Lock()
-rid_to_cond: Dict[str, asyncio.Condition] = {}
+rid_to_cond: dict[str, asyncio.Condition] = {}
 encode_state_condition = asyncio.Condition()
 
 
@@ -155,13 +155,13 @@ class EncoderMetaRegistry:
         self.wait_timeout = wait_timeout
         # Backstop for state whose /send calls never all land.
         self.sweep_timeout = sweep_timeout
-        self._rid_to_meta: Dict[str, dict] = {}
-        self._rid_to_send_done: Dict[str, Set[str]] = {}
-        self._pending_at: Dict[str, float] = {}
-        self._sweeper_task: Optional[asyncio.Task] = None
-        self._stale_release_tasks: Dict[str, asyncio.Task] = {}
+        self._rid_to_meta: dict[str, dict] = {}
+        self._rid_to_send_done: dict[str, set[str]] = {}
+        self._pending_at: dict[str, float] = {}
+        self._sweeper_task: asyncio.Task | None = None
+        self._stale_release_tasks: dict[str, asyncio.Task] = {}
         # Set only where the embedding also lives; None in the DP main process.
-        self.on_release: Optional[Callable[[str], Awaitable[None]]] = None
+        self.on_release: Callable[[str], Awaitable[None]] | None = None
 
     def _touch(self, req_id: str) -> None:
         self._pending_at[req_id] = time.monotonic()
@@ -223,7 +223,7 @@ class EncoderMetaRegistry:
         nbytes: int,
         embedding_len: int,
         embedding_dim: int,
-        error: Optional[str] = None,
+        error: str | None = None,
     ) -> None:
         """Publish per-part metadata (or an error), wake waiters, arm the sweep."""
         meta = (
@@ -242,7 +242,7 @@ class EncoderMetaRegistry:
         async with cond:
             cond.notify_all()
 
-    async def wait(self, req_id: str) -> Optional[dict]:
+    async def wait(self, req_id: str) -> dict | None:
         """Block until req_id's metadata is published; TimeoutError past wait_timeout.
         No _touch here: a pull-first timestamp would let the sweeper pop the very
         Condition this waiter holds, stranding it when publish notifies a new one."""
@@ -312,9 +312,9 @@ class EncodeContext(msgspec.Struct):
     get_feature_fn: Any
     mm_feature: Any
     num_items: int
-    items_per_req: List[int]  # grid entries per request, in flatten order
+    items_per_req: list[int]  # grid entries per request, in flatten order
     aux_data: dict
-    str_mm_hashes: Optional[List[str]]
+    str_mm_hashes: list[str] | None
     use_global_cache: bool
     is_health_check: bool
 
@@ -354,7 +354,7 @@ class ReqState:
     """The result and in-flight work for one encoder request."""
 
     req_id: str
-    embedding_data: Optional[EmbeddingData] = None
+    embedding_data: EmbeddingData | None = None
     active_encodes: int = 0
     active_sends: int = 0
     release_requested: bool = False
@@ -370,8 +370,8 @@ class SendDestination:
     """One normalized destination for exactly one transfer."""
 
     endpoint: str
-    session_id: Optional[str] = None
-    buffer_address: Optional[int] = None
+    session_id: str | None = None
+    buffer_address: int | None = None
 
     @classmethod
     def from_host_port(
@@ -379,8 +379,8 @@ class SendDestination:
         prefill_host: str,
         embedding_port: int,
         *,
-        session_id: Optional[str] = None,
-        buffer_address: Optional[int] = None,
+        session_id: str | None = None,
+        buffer_address: int | None = None,
     ) -> "SendDestination":
         return cls(
             endpoint=NetworkAddress(prefill_host, embedding_port).to_host_port_str(),
@@ -537,7 +537,7 @@ class MMEncoder:
         schedule_path=None,
         dist_init_method=None,
         rank: int = 0,
-        gpu_id: Optional[int] = None,
+        gpu_id: int | None = None,
     ):
         """``gpu_id`` pins this encoder to a device other than
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
@@ -630,7 +630,7 @@ class MMEncoder:
             self.schedule_socket = get_zmq_socket(
                 self.context, zmq.PULL, schedule_path, True
             )
-        self.background_tasks: Set[asyncio.Task] = set()
+        self.background_tasks: set[asyncio.Task] = set()
 
         # Embedding dtype = model param dtype. Always available (both transfer
         # backends and the global-cache pool rely on it).
@@ -684,10 +684,10 @@ class MMEncoder:
                         ),
                     )
 
-            self.req_states: Dict[str, ReqState] = {}
+            self.req_states: dict[str, ReqState] = {}
             # A DP caller can disappear before its encode creates ReqState.
             # Preserve that release intent until _acquire_encode_ref runs.
-            self.abandoned_req_ids: Set[str] = set()
+            self.abandoned_req_ids: set[str] = set()
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
 
@@ -738,7 +738,7 @@ class MMEncoder:
             raise InternalError(f"Request state has no active encode work: {req_id}")
         return state
 
-    def _acquire_encode_ref(self, req_id: str) -> Optional[ReqState]:
+    def _acquire_encode_ref(self, req_id: str) -> ReqState | None:
         """Acquire a rank 0 encode ref before preprocessing can suspend."""
         if self.rank != 0:
             return None
@@ -763,7 +763,7 @@ class MMEncoder:
         """Drop an unused release marker after the worker task exits."""
         self.abandoned_req_ids.discard(req_id)
 
-    async def _release_encode_ref(self, state: Optional[ReqState]) -> None:
+    async def _release_encode_ref(self, state: ReqState | None) -> None:
         if state is None:
             return
         async with state.lifecycle_condition:
@@ -795,7 +795,7 @@ class MMEncoder:
         state.embedding_data = mm_data
         state.embedding_ready.set()
 
-    def _stage_embedding_batch(self, embeddings: List[EmbeddingData]) -> None:
+    def _stage_embedding_batch(self, embeddings: list[EmbeddingData]) -> None:
         """Validate the whole fused batch before publishing any result."""
         states = [self._embedding_state_for_stage(mm_data) for mm_data in embeddings]
         for state, mm_data in zip(states, embeddings):
@@ -944,7 +944,7 @@ class MMEncoder:
         self,
         mm_embedding: torch.Tensor,
         token_counts: Iterable[int],
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """Slice embeddings using preprocessing-owned token counts."""
         slices, offset = [], 0
         for count in token_counts:
@@ -958,8 +958,8 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
-    ) -> List[int]:
+        self, mm_feature, grid_thw: list, modality: Modality, mm_inputs=None
+    ) -> list[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
         preprocessed_items = (
             get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
@@ -999,10 +999,10 @@ class MMEncoder:
         self,
         mm_feature,
         preprocess_result: EncoderPreprocessResult,
-        indices: List[int],
+        indices: list[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
@@ -1027,9 +1027,9 @@ class MMEncoder:
         self,
         mm_feature,
         preprocess_result: EncoderPreprocessResult,
-        indices: List[int],
+        indices: list[int],
         modality: Modality,
-    ) -> List[MultimodalDataItem]:
+    ) -> list[MultimodalDataItem]:
         """Build the model-facing items selected for one encoder forward.
 
         Model preprocessors can preserve an item-wise representation with
@@ -1110,7 +1110,7 @@ class MMEncoder:
 
     async def _prepare_encode_context(
         self,
-        requests: List[dict],
+        requests: list[dict],
         modality: Modality,
         *,
         use_global_cache: bool,
@@ -1127,11 +1127,11 @@ class MMEncoder:
         except MMError:
             raise
         except NotImplementedError as e:
-            raise InternalError(f"Not implemented error: {str(e)}")
+            raise InternalError(f"Not implemented error: {e!s}")
         except (TypeError, ValueError) as e:
-            raise BadRequestError(f"Failed to process mm items: {str(e)}")
+            raise BadRequestError(f"Failed to process mm items: {e!s}")
         except Exception as e:
-            raise InternalError(f"Failed to process mm items: {str(e)}")
+            raise InternalError(f"Failed to process mm items: {e!s}")
 
         if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
             raise InternalError(
@@ -1209,7 +1209,7 @@ class MMEncoder:
 
     async def _prepare_encode_context_on_all_ranks(
         self,
-        requests: List[dict],
+        requests: list[dict],
         modality: Modality,
         *,
         use_global_cache: bool,
@@ -1269,11 +1269,11 @@ class MMEncoder:
 
     def _sync_tp_prepare_status(
         self,
-        local_error: Optional[Exception],
+        local_error: Exception | None,
         *,
         error_phase: int,
         layout_digest: tuple[int, int],
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """Raise the same preparation error on every TP rank."""
         tp_group = get_tp_group()
         error_code = (
@@ -1346,7 +1346,7 @@ class MMEncoder:
     async def _lookup_global_cache(
         self,
         ctx: EncodeContext,
-    ) -> Tuple[List[int], List[int]]:
+    ) -> tuple[list[int], list[int]]:
         if self.rank == 0:
             try:
                 exist_mask = await self.mm_global_cache.batch_is_exist(
@@ -1375,8 +1375,8 @@ class MMEncoder:
     def _prefetch_global_cache_hits(
         self,
         ctx: EncodeContext,
-        hit_indices: List[int],
-    ) -> Tuple[List[str], bool]:
+        hit_indices: list[int],
+    ) -> tuple[list[str], bool]:
         if self.rank != 0 or not hit_indices:
             return [], False
 
@@ -1398,10 +1398,10 @@ class MMEncoder:
     async def _wait_global_cache_prefetch(
         self,
         ctx: EncodeContext,
-        hit_indices: List[int],
-        hit_hashes: List[str],
+        hit_indices: list[int],
+        hit_hashes: list[str],
         prefetch_failed: bool,
-    ) -> List[int]:
+    ) -> list[int]:
         fallback_mask = torch.zeros(ctx.num_items, dtype=torch.int32)
         if self.rank == 0 and hit_indices:
             if prefetch_failed:
@@ -1444,9 +1444,9 @@ class MMEncoder:
     def _stage_global_cache_slices(
         self,
         ctx: EncodeContext,
-        indices: List[int],
-        slices: List[torch.Tensor],
-    ) -> Tuple[List[str], List[Any]]:
+        indices: list[int],
+        slices: list[torch.Tensor],
+    ) -> tuple[list[str], list[Any]]:
         """Stage cache insert data without making cache failure fatal."""
         if not slices:
             return [], []
@@ -1466,8 +1466,8 @@ class MMEncoder:
     def _launch_global_cache_insert(
         self,
         ctx: EncodeContext,
-        hashes: List[str],
-        d2h_handles: List[Any],
+        hashes: list[str],
+        d2h_handles: list[Any],
     ):
         if not hashes:
             return
@@ -1499,11 +1499,11 @@ class MMEncoder:
     def _assemble_global_cache_cpu(
         self,
         ctx: EncodeContext,
-        hit_indices: List[int],
-        missing_indices: List[int],
-        fallback_indices: List[int],
-        new_slices: List[torch.Tensor],
-        fallback_slices: List[torch.Tensor],
+        hit_indices: list[int],
+        missing_indices: list[int],
+        fallback_indices: list[int],
+        new_slices: list[torch.Tensor],
+        fallback_slices: list[torch.Tensor],
     ) -> torch.Tensor:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
@@ -1564,10 +1564,10 @@ class MMEncoder:
     def _assemble_global_cache_gpu(
         self,
         ctx: EncodeContext,
-        missing_indices: List[int],
-        fallback_indices: List[int],
-        new_slices: List[torch.Tensor],
-        fallback_slices: List[torch.Tensor],
+        missing_indices: list[int],
+        fallback_indices: list[int],
+        new_slices: list[torch.Tensor],
+        fallback_slices: list[torch.Tensor],
     ) -> torch.Tensor:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
@@ -1613,7 +1613,7 @@ class MMEncoder:
         ctx: EncodeContext,
         *,
         keep_on_gpu: bool,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Resolve cache hits, compute misses, assemble output, and insert misses."""
         missing_indices, hit_indices = await self._lookup_global_cache(ctx)
         hit_hashes, prefetch_failed = self._prefetch_global_cache_hits(ctx, hit_indices)
@@ -1827,16 +1827,16 @@ class MMEncoder:
 
             return mm_embedding
         except BadRequestError as e:
-            raise BadRequestError(f"Bad request error: {str(e)}")
+            raise BadRequestError(f"Bad request error: {e!s}")
         except Exception as e:
-            raise InternalError(f"Internal encoding error: {str(e)}")
+            raise InternalError(f"Internal encoding error: {e!s}")
 
     async def _compute_embedding(
         self,
         ctx: EncodeContext,
         *,
         keep_on_gpu: bool,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Compute one flattened request with global cache as an optional stage."""
         if ctx.use_global_cache:
             mm_embedding = await self._compute_global_cache_embedding(
@@ -1859,7 +1859,7 @@ class MMEncoder:
             )
 
     async def _publish_preprocess_metadata(
-        self, ctx: EncodeContext, requests: List[dict]
+        self, ctx: EncodeContext, requests: list[dict]
     ) -> None:
         """Publish each request's size after preprocessing, before model forward."""
         if self.rank != 0:
@@ -2115,11 +2115,11 @@ class MMEncoder:
     def _stage_embeddings(
         self,
         ctx: EncodeContext,
-        requests: List[dict],
-        mm_embedding: Optional[torch.Tensor],
+        requests: list[dict],
+        mm_embedding: torch.Tensor | None,
         *,
         keep_on_gpu: bool,
-    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+    ) -> list[tuple[int, int, int, str | None, int | None]]:
         """Split the fused embedding per request and stage one EmbeddingData each.
 
         Per-request token ranges are contiguous in flatten order, so each
@@ -2186,8 +2186,8 @@ class MMEncoder:
             raise
 
     def _stage_errors(
-        self, requests: List[dict], modality: Modality, exc: Exception
-    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        self, requests: list[dict], modality: Modality, exc: Exception
+    ) -> list[tuple[int, int, int, str | None, int | None]]:
         """Stage one error EmbeddingData per request so /send reports the failure."""
         code = (
             exc.code if isinstance(exc, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
@@ -2210,8 +2210,8 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
-    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        self, requests: list[dict], modality: Modality
+    ) -> list[tuple[int, int, int, str | None, int | None]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
         Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
@@ -2309,8 +2309,8 @@ class MMEncoder:
         state = self.req_states.get(req_id)
         if state is None:
             return
-        sent_urls: Set[str] = set()
-        all_tasks: List[Tuple[asyncio.Task, str]] = []
+        sent_urls: set[str] = set()
+        all_tasks: list[tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
         cond = await _get_receive_condition(req_id)
@@ -2486,4 +2486,4 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 # runtime.launch_local_runtime (non-DP) and
 # runtime.run_dp_worker (DP mode). None when metrics disabled. Kept
 # here because MMEncoder GPU methods reference it directly.
-encoder_metrics_collector: Optional[EncoderMetricsCollector] = None
+encoder_metrics_collector: EncoderMetricsCollector | None = None

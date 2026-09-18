@@ -1,9 +1,7 @@
 import logging
 import os
-from typing import List
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -16,7 +14,6 @@ try:
     import_error = None
 except ImportError as e:
     import_error = e
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +80,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             logger.error("Ascend Transfer Engine initialization failed.")
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]):
+    def batch_register(self, ptrs: list[int], lengths: list[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:

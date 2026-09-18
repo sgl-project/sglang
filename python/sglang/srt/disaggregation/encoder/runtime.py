@@ -19,12 +19,10 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple
-
-import zmq
-import zmq.asyncio
 
 import sglang.srt.disaggregation.encoder.server as server_module
+import zmq
+import zmq.asyncio
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.server import (
     ENCODER_MAX_BATCH_SIZE,
@@ -67,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 class PendingRequest:
-    __slots__ = ("request", "future", "submit_time")
+    __slots__ = ("future", "request", "submit_time")
 
     def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
         self.request = request
@@ -82,7 +80,7 @@ _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
 _DP_RELEASE_AFTER_ENCODE = "release_after_encode"
 
 
-def validate_encode_request(request: dict) -> Optional[str]:
+def validate_encode_request(request: dict) -> str | None:
     """Return a client-facing error before an encode request is dispatched."""
     if not isinstance(request, dict):
         return f"request is not a dict: {type(request).__name__}"
@@ -125,7 +123,7 @@ def _resolve_encoder_batch_policy(
     model_type: str,
     configured_max_batch_size: int,
     max_batch_size_is_explicit: bool,
-) -> Tuple[int, bool]:
+) -> tuple[int, bool]:
     """Return effective batch size and same-turn coalescing policy."""
     max_batch_size = max(1, int(configured_max_batch_size))
     coalesce_same_turn = model_type == "kimi_k3"
@@ -147,7 +145,7 @@ class EncoderScheduler:
     def __init__(
         self,
         encoder: "MMEncoder",
-        send_sockets: List[zmq.Socket],
+        send_sockets: list[zmq.Socket],
         max_batch_size: int,
         coalesce_same_turn: bool = False,
         request_timeout: float = server_module.ENCODER_REQ_TIMEOUT,
@@ -158,7 +156,7 @@ class EncoderScheduler:
         self.coalesce_same_turn = bool(coalesce_same_turn)
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
 
     def start(self) -> None:
         if self._worker_task is None:
@@ -184,7 +182,7 @@ class EncoderScheduler:
             if not pending.future.done():
                 pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
 
-    async def submit(self, request: dict) -> Tuple:
+    async def submit(self, request: dict) -> tuple:
         pending = PendingRequest(request, asyncio.get_running_loop())
         await self.pending_queue.put(pending)
         try:
@@ -201,7 +199,7 @@ class EncoderScheduler:
             )
             raise
 
-    async def _collect_batch(self) -> List[PendingRequest]:
+    async def _collect_batch(self) -> list[PendingRequest]:
         batch = [await self.pending_queue.get()]
         first_modality = Modality.from_str(batch[0].request.get("modality", "image"))
         should_yield = (
@@ -223,10 +221,10 @@ class EncoderScheduler:
 
     async def _batch_worker(self) -> None:
         while True:
-            batch: List[PendingRequest] = []
+            batch: list[PendingRequest] = []
             try:
                 batch = await self._collect_batch()
-                groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
+                groups: dict[Modality, list[PendingRequest]] = defaultdict(list)
                 for p in batch:
                     groups[
                         Modality.from_str(p.request.get("modality", "image"))
@@ -248,7 +246,7 @@ class EncoderScheduler:
 
     async def _dispatch_group(
         self,
-        group: List[PendingRequest],
+        group: list[PendingRequest],
         modality: Modality,
         *,
         observe_queue_wait: bool = True,
@@ -267,7 +265,7 @@ class EncoderScheduler:
         # Drop structurally-bad requests before broadcasting; otherwise TP
         # workers would join batch_encode collectives that rank-0 has already
         # abandoned.
-        valid: List[PendingRequest] = []
+        valid: list[PendingRequest] = []
         for p in group:
             err = validate_encode_request(p.request)
             if err is None:
@@ -359,7 +357,7 @@ class EncoderScheduler:
 
     async def _dispatch_per_request(
         self,
-        group: List[PendingRequest],
+        group: list[PendingRequest],
         modality: Modality,
     ) -> None:
         modality_str = modality.name.lower()
@@ -406,9 +404,9 @@ class EncoderRuntime:
 
     encoder: MMEncoder
     scheduler: EncoderScheduler
-    send_sockets: List[zmq.Socket]
+    send_sockets: list[zmq.Socket]
     zmq_context: zmq.Context
-    tp_processes: List[mp.Process]
+    tp_processes: list[mp.Process]
 
     def start(self) -> None:
         self.scheduler.start()
@@ -425,12 +423,12 @@ class DPDispatcher:
     def __init__(
         self,
         dp_size: int,
-        dispatch_sockets: List,
-        release_sockets: List,
+        dispatch_sockets: list,
+        release_sockets: list,
         result_socket,
-        worker_processes: List[mp.Process],
+        worker_processes: list[mp.Process],
         enable_metrics: bool = False,
-        labels: Optional[Dict[str, str]] = None,
+        labels: dict[str, str] | None = None,
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
@@ -439,22 +437,22 @@ class DPDispatcher:
         self.worker_processes = worker_processes
         # Key = req_id for encode/broadcast, or a per-control-request key for
         # Mooncake metadata waits, sends, and destination registrations.
-        self.pending_futures: List[Dict[str, asyncio.Future]] = [
+        self.pending_futures: list[dict[str, asyncio.Future]] = [
             {} for _ in range(dp_size)
         ]
-        self.req_id_to_rank: Dict[str, int] = {}
+        self.req_id_to_rank: dict[str, int] = {}
         self._mapping_condition = asyncio.Condition()
         self._rr_counter = 0
         self._broadcast_counter = 0
         self._metadata_counter = 0
-        self._dead_ranks: Set[int] = set()
+        self._dead_ranks: set[int] = set()
         # req_id -> monotonic ts a mooncake mapping has waited for its /send.
-        self._pending_send_at: Dict[str, float] = {}
+        self._pending_send_at: dict[str, float] = {}
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
         # The event loop only keeps weak references to tasks, so the long-lived
         # loops and fire-and-forget notifications need a strong reference.
-        self.background_tasks: Set[asyncio.Task] = set()
+        self.background_tasks: set[asyncio.Task] = set()
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -471,7 +469,7 @@ class DPDispatcher:
             )
 
     @property
-    def pending_counts(self) -> List[int]:
+    def pending_counts(self) -> list[int]:
         return [len(d) for d in self.pending_futures]
 
     def _update_pending_gauge(self) -> None:
@@ -481,7 +479,7 @@ class DPDispatcher:
                 self.pending_gauge.labels(**self.labels, dp_rank=str(i)).set(c)
 
     @property
-    def alive_ranks(self) -> List[int]:
+    def alive_ranks(self) -> list[int]:
         # Empty if the result listener died; else ranks not marked dead.
         if self._listener_failed:
             return []
@@ -550,7 +548,7 @@ class DPDispatcher:
         return key
 
     @staticmethod
-    def _pending_req_info(key: str) -> Tuple[str, str]:
+    def _pending_req_info(key: str) -> tuple[str, str]:
         marker_index, dp_type = max(
             (
                 (key.rfind("_send_"), "send"),
@@ -846,8 +844,8 @@ class DPDispatcher:
             raise
 
     async def broadcast(
-        self, request: dict, timeout: Optional[float] = None
-    ) -> List[dict]:
+        self, request: dict, timeout: float | None = None
+    ) -> list[dict]:
         # Skip dead ranks: a PUSH to a gone worker would just buffer and then
         # surface as a spurious per-rank timeout. All dead → 503 (same as
         # dispatch), which the profile endpoints turn into an HTTP error.
@@ -862,8 +860,8 @@ class DPDispatcher:
             )
         batch_id = self._broadcast_counter
         self._broadcast_counter += 1
-        rank_keys: List[Tuple[int, str]] = []
-        futures: List[asyncio.Future] = []
+        rank_keys: list[tuple[int, str]] = []
+        futures: list[asyncio.Future] = []
         dp_type = request.get("_dp_type", "unknown")
         try:
             for rank in alive_ranks:
@@ -883,7 +881,7 @@ class DPDispatcher:
                 *(asyncio.wait_for(fut, timeout=eff_timeout) for fut in futures),
                 return_exceptions=True,
             )
-            results: List[dict] = []
+            results: list[dict] = []
             for (rank, req_id), outcome in zip(rank_keys, outcomes):
                 if isinstance(outcome, asyncio.TimeoutError):
                     self._drop_pending_and_mapping(rank, req_id)
@@ -910,7 +908,7 @@ class DPDispatcher:
         # proc.sentinel becomes readable on process exit; fail this rank's
         # pending futures so awaiters don't hang on a dead worker.
         loop = asyncio.get_running_loop()
-        watch: Dict[int, asyncio.Future] = {}
+        watch: dict[int, asyncio.Future] = {}
         for rank, proc in enumerate(self.worker_processes):
             fut: asyncio.Future = loop.create_future()
 
@@ -1219,7 +1217,7 @@ async def _release_failed_request(
 
 async def _run_dispatched_encode(
     enc: MMEncoder, request: dict, modality: Modality
-) -> Tuple:
+) -> tuple:
     """Finish TP encode collectives before propagating caller cancellation."""
     encode_task = asyncio.create_task(
         enc.encode(
@@ -1238,11 +1236,11 @@ async def _run_dispatched_encode(
 
 async def execute_encode_pipeline(
     enc: MMEncoder,
-    sched: Optional[EncoderScheduler],
+    sched: EncoderScheduler | None,
     request: dict,
     *,
-    send_sockets: Optional[List[zmq.Socket]] = None,
-) -> Optional[dict]:
+    send_sockets: list[zmq.Socket] | None = None,
+) -> dict | None:
     """Run the shared HTTP/DP and Mooncake/ZMQ request lifecycle.
 
     Every backend publishes preprocess metadata. Mooncake has early consumers
@@ -1395,7 +1393,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
         modality = Modality.AUDIO
     else:
         # No processor → can't functionally probe; liveness alone is healthy.
-        return None
+        return
 
     # uuid keeps rids unique across workers; a bare time.time() can collide.
     req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -1403,7 +1401,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
         async with enc.encode_dispatch_lock:
             # Traffic may have started while the probe waited for the lock.
             if enc.has_pending_embeddings():
-                return None
+                return
             _, _, _, error_msg, error_code = await enc.encode(
                 mm_items=mm_items,
                 modality=modality,
@@ -1550,7 +1548,7 @@ async def _dp_worker_handle_request(
 
 async def _retire_abandoned_encode(
     enc: MMEncoder,
-    encode_task: Optional[asyncio.Task],
+    encode_task: asyncio.Task | None,
     req_id: str,
 ) -> None:
     """Retire an abandoned request without interrupting its encode work."""
@@ -1613,9 +1611,9 @@ async def run_dp_worker(
     release_sock = get_zmq_socket(ctx, zmq.PULL, release_path, False)
     send_sock = get_zmq_socket(ctx, zmq.PUSH, result_path, False)
     send_lock = asyncio.Lock()
-    inflight: Set[asyncio.Task] = set()
-    encode_tasks: Dict[str, asyncio.Task] = {}
-    release_tasks: Set[asyncio.Task] = set()
+    inflight: set[asyncio.Task] = set()
+    encode_tasks: dict[str, asyncio.Task] = {}
+    release_tasks: set[asyncio.Task] = set()
 
     async def listen_for_releases() -> None:
         # Cleanup must not wait behind the bounded encode queue: under a
@@ -1780,8 +1778,8 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
         )
         trace_set_thread_info("Encoder")
 
-    send_sockets: List[zmq.Socket] = []
-    tp_processes: List[mp.Process] = []
+    send_sockets: list[zmq.Socket] = []
+    tp_processes: list[mp.Process] = []
     for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
@@ -1841,20 +1839,20 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
 
     result_path = f"ipc:///tmp/{ipc_prefix}_dp_result"
     result_socket = get_zmq_socket(async_zmq_ctx, zmq.PULL, result_path, True)
-    dispatch_sockets: List[zmq.asyncio.Socket] = [
+    dispatch_sockets: list[zmq.asyncio.Socket] = [
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{r}", True
         )
         for r in range(dp_size)
     ]
-    release_sockets: List[zmq.asyncio.Socket] = [
+    release_sockets: list[zmq.asyncio.Socket] = [
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_release_{r}", True
         )
         for r in range(dp_size)
     ]
 
-    worker_processes: List[mp.Process] = []
+    worker_processes: list[mp.Process] = []
 
     def _kill_workers():
         for process in worker_processes:

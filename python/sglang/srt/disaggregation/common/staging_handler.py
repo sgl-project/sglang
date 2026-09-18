@@ -13,10 +13,9 @@ import logging
 import struct
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.runtime_context import (
     get_schedule,
 )
@@ -534,9 +533,9 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
 class StagingTransferInfo:
     """Per-chunk staging allocation info attached to a TransferInfo."""
 
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    offsets: list[int] = dataclasses.field(default_factory=lambda: [-1])
+    rounds: list[int] = dataclasses.field(default_factory=lambda: [0])
+    ends: list[int] = dataclasses.field(default_factory=lambda: [-1])
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
         while len(self.offsets) <= idx:
@@ -556,12 +555,12 @@ class StagingRegisterInfo:
     total_size: int = 0
     # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
     # older peers leave this empty and callers fall back to kv_layer_ids.
-    slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    slot_layer_ids: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
-    ) -> Optional[StagingRegisterInfo]:
+        cls, msg: list, msg_start_offset: int, slot_ids_index: int | None = None
+    ) -> StagingRegisterInfo | None:
         i = msg_start_offset
         base_ptr = (
             struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
@@ -573,7 +572,7 @@ class StagingRegisterInfo:
         )
         if base_ptr == 0 and total_size == 0:
             return None
-        slot_layer_ids: List[int] = []
+        slot_layer_ids: list[int] = []
         if (
             slot_ids_index is not None
             and len(msg) > slot_ids_index
@@ -611,8 +610,8 @@ class PrefillStagingStrategy:
         req,
         kv_chunk_index_start: int,
         num_chunk_pages: int,
-        session_id: Optional[str] = None,
-    ) -> Tuple[bool, int, int, int, int]:
+        session_id: str | None = None,
+    ) -> tuple[bool, int, int, int, int]:
         """Check if staging offset and watermark are ready for this chunk.
 
         Args:
@@ -935,7 +934,7 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
-    requester_pp_rank: Optional[int] = None,
+    requester_pp_rank: int | None = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -943,7 +942,6 @@ def prefetch_staging_reqs(
     allocates staging during the GPU forward pass.
     """
     import zmq
-
     from sglang.srt.disaggregation.common.staging_buffer import staging_grid_tokens
     from sglang.srt.utils.network import NetworkAddress
 

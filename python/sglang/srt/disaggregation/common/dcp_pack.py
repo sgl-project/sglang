@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
 import torch
-
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
@@ -43,7 +42,7 @@ def try_pack_dcp_src(
     src_token_indices: npt.NDArray[np.integer],
     token_item_lens: Sequence[int],
     pack_offset_bytes: int = 0,
-) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
+) -> tuple[list[int], npt.NDArray[np.int64]] | None:
     if pack_offset_bytes < 0:
         raise ValueError(
             f"pack_offset_bytes must be non-negative, got {pack_offset_bytes}"
@@ -74,7 +73,7 @@ def try_pack_dcp_src(
         copy_mla_rows_into_pack(kv_data_ptrs, row_indices, pack, token_item_lens)
     gather_stream.synchronize()
 
-    packed_ptrs: List[int] = []
+    packed_ptrs: list[int] = []
     offset = 0
     base = pack_buffer.get_ptr() + pack_offset_bytes
     for item_len in token_item_lens:
@@ -88,7 +87,7 @@ def init_dcp_pack_buffers(
     kv_args,
     count: int,
     dcp_size: int,
-) -> List[StagingBuffer]:
+) -> list[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _get_custom_mem_pool,
     )

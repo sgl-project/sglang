@@ -2,23 +2,18 @@ from __future__ import annotations
 
 import random
 from collections import deque
+from collections.abc import Iterable
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
-    Iterable,
-    List,
     Literal,
-    Optional,
-    Tuple,
-    Type,
     overload,
 )
 
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
@@ -52,9 +47,9 @@ _IS_HIP = is_hip()
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,
-    pp_good_rids: Optional[List[str]] = None,
-    pp_bad_rids: Optional[List[str]] = None,
-) -> List[Optional[int]]:
+    pp_good_rids: list[str] | None = None,
+    pp_bad_rids: list[str] | None = None,
+) -> list[int | None]:
     """Map authoritative PP consensus to poll states without polling again."""
     if pp_good_rids is None or pp_bad_rids is None:
         raise ValueError("PP consensus is required")
@@ -193,7 +188,7 @@ def unified_memory_disagg_move_gate(scheduler):
 #########################
 
 
-def _poll_with_failure_injection(pollers) -> List[int]:
+def _poll_with_failure_injection(pollers) -> list[int]:
     if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
@@ -227,7 +222,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
-def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+def _all_reduce_polls(polls: list[int], group: dist.ProcessGroup) -> list[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
@@ -238,7 +233,7 @@ def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
-    metadata_buffers: Optional[MetadataBuffers] = None,
+    metadata_buffers: MetadataBuffers | None = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -267,7 +262,7 @@ def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,
     gloo_group: dist.ProcessGroup,
-    metadata_buffers: Optional[MetadataBuffers] = None,
+    metadata_buffers: MetadataBuffers | None = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -316,7 +311,7 @@ class ReqToMetadataIdxAllocator:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self) -> Optional[int]:
+    def alloc(self) -> int | None:
         if len(self.free_slots) == 0:
             return None
 
@@ -636,28 +631,28 @@ class KVClassType(Enum):
 @overload
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.KVARGS]
-) -> Type[KVArgs]: ...
+) -> type[KVArgs]: ...
 @overload
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.MANAGER]
-) -> Type[CommonKVManager]: ...
+) -> type[CommonKVManager]: ...
 @overload
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.SENDER]
-) -> Type[CommonKVSender]: ...
+) -> type[CommonKVSender]: ...
 @overload
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.RECEIVER]
-) -> Type[CommonKVReceiver]: ...
+) -> type[CommonKVReceiver]: ...
 @overload
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
-) -> Type[CommonKVBootstrapServer]: ...
+) -> type[CommonKVBootstrapServer]: ...
 
 
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
-) -> Optional[Type]:
+) -> type | None:
     from sglang.srt.disaggregation.base import KVArgs
 
     # Every backend shares the same KVArgs container.
@@ -741,7 +736,7 @@ def get_kv_class(
 
 def _get_cp_rank_page_bounds(
     total_pages: int, cp_rank: int, cp_size: int
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     base = total_pages // cp_size
     rem = total_pages % cp_size
     local_start = cp_rank * base + min(cp_rank, rem)
@@ -753,8 +748,8 @@ def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,
     index_slice: slice,
-    total_pages: Optional[int] = None,
-) -> Tuple[np.ndarray, slice]:
+    total_pages: int | None = None,
+) -> tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
     if total_pages is None:
         total_pages = len(kv_indices)
@@ -836,8 +831,8 @@ def compute_mamba_state_slice_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
-) -> List[Tuple[int, int, int]]:
+    conv_shard_groups: list[int] | None = None,
+) -> list[tuple[int, int, int]]:
     """Blocks to copy one mamba state item across differing attn-TP sizes.
 
     Returns ``(src_dim_start, dst_dim_start, num_dims)`` triples in units of the
@@ -870,7 +865,7 @@ def compute_mamba_state_slice_blocks(
         # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
         # independently head-sharded sub-block at its grouped offset so the decode
         # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
-        blocks: List[Tuple[int, int, int]] = []
+        blocks: list[tuple[int, int, int]] = []
         src_off = 0
         dst_off = 0
         for full_sd in conv_shard_groups:
@@ -888,7 +883,7 @@ def compute_mamba_state_slice_blocks(
 
     # conv_state: gather the decode rank's [q | k | v] shard from the three
     # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
-    blocks: List[Tuple[int, int, int]] = []
+    blocks: list[tuple[int, int, int]] = []
     src_off = 0
     dst_off = 0
     for full_sd in conv_shard_groups:
@@ -912,8 +907,8 @@ def compute_mamba_state_slice_byte_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
-) -> List[Tuple[int, int, int]]:
+    conv_shard_groups: list[int] | None = None,
+) -> list[tuple[int, int, int]]:
     """Convert logical TP slices into physical byte blocks for one state slot.
 
     ``outer_count`` is one for the usual ``[slice_dim, ...]`` layout. Kimi
@@ -968,12 +963,12 @@ def compute_mamba_state_slice_byte_blocks(
 
 
 def build_transfer_entry_pairs(
-    src_layer_ids: List[int],
-    dst_layer_ids: List[int],
+    src_layer_ids: list[int],
+    dst_layer_ids: list[int],
     n_src: int,
     n_dst: int,
     allow_positional_fallback: bool = False,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """Pair prefill-local transfer entries with decode entries by layer id."""
     if n_src == 0:
         return []
@@ -1020,7 +1015,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
-) -> List[int]:
+) -> list[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
     Draft KV buffers are appended after the target's, so they need ids of their
@@ -1050,7 +1045,7 @@ def build_kv_layer_ids(
     return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
 
 
-def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+def _draft_entry_layer_ids(*, pool, num_entries: int) -> list[int]:
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if isinstance(pool, HybridLinearKVPool):
@@ -1073,11 +1068,11 @@ def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
 
 
 def resolve_dcp_dst_entry_indices(
-    src_layer_ids: List[int],
-    dst_layer_ids: List[int],
+    src_layer_ids: list[int],
+    dst_layer_ids: list[int],
     n_src: int,
     n_dst: int,
-) -> List[int]:
+) -> list[int]:
     """Destination entry index for each local KV entry, for a DCP relayout.
 
     DCP re-splits the KV by context while PP re-splits it by layer, so the two
@@ -1099,7 +1094,7 @@ def resolve_dcp_dst_entry_indices(
 
 def build_staging_slot_metadata(
     *,
-    kv_layer_ids: List[int],
+    kv_layer_ids: list[int],
     num_draft_entries: int,
     kv_pool,
     draft_kv_pool,
@@ -1146,13 +1141,13 @@ def build_staging_slot_metadata(
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
-    data_ptrs: List[int],
-    data_lens: List[int],
-    item_lens: List[int],
-    dim_per_tensor: Optional[List[int]] = None,
-    conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
-    slice_outer_counts: Optional[List[int]] = None,
-    layer_ids: Optional[List[int]] = None,
+    data_ptrs: list[int],
+    data_lens: list[int],
+    item_lens: list[int],
+    dim_per_tensor: list[int] | None = None,
+    conv_shard_groups: list[list[int] | None] | None = None,
+    slice_outer_counts: list[int] | None = None,
+    layer_ids: list[int] | None = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -1166,7 +1161,7 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
-def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
+def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> list[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
     if not pool.kpool_use_compress:
@@ -1198,11 +1193,11 @@ def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[in
 
 
 def slice_dsa_tail_dst_ptrs_for_pp(
-    src_ptrs: List[int],
-    dst_ptrs: List[int],
+    src_ptrs: list[int],
+    dst_ptrs: list[int],
     start_layer: int,
-    end_layer: Optional[int],
-) -> List[int]:
+    end_layer: int | None,
+) -> list[int]:
     if len(src_ptrs) == len(dst_ptrs):
         return list(dst_ptrs)
     if len(src_ptrs) % 2 != 0 or len(dst_ptrs) % 2 != 0:
@@ -1229,13 +1224,13 @@ def slice_dsa_tail_dst_ptrs_for_pp(
 
 
 def build_dsa_tail_transfer_blocks(
-    src_ptrs: List[int],
-    src_item_lens: List[int],
-    dst_ptrs: List[int],
-    src_indices: List[int],
-    dst_indices: List[int],
-    dst_item_lens: Optional[List[int]] = None,
-) -> List[Tuple[int, int, int]]:
+    src_ptrs: list[int],
+    src_item_lens: list[int],
+    dst_ptrs: list[int],
+    src_indices: list[int],
+    dst_indices: list[int],
+    dst_item_lens: list[int] | None = None,
+) -> list[tuple[int, int, int]]:
     """Remap live DSA tail tokens between rings with different speculative-slot counts."""
     if not src_indices and not dst_indices:
         return []
@@ -1266,7 +1261,7 @@ def build_dsa_tail_transfer_blocks(
             f"src={src_tail_size}, dst={dst_tail_size}"
         )
 
-    def parse_segments(indices: List[int], tail_size: int, side: str):
+    def parse_segments(indices: list[int], tail_size: int, side: str):
         segments = []
         for seg in (1, 2):
             off = int(indices[seg * 2 - 1])

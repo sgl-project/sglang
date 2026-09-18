@@ -5,10 +5,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -106,7 +105,7 @@ class DecodeHiCachePreallocMixin:
         )
 
     def _start_hicache_prefetch(
-        self, req: Req, prefix_match: Optional[DecodePrefixMatch]
+        self, req: Req, prefix_match: DecodePrefixMatch | None
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds.
 
@@ -265,13 +264,13 @@ class DecodeHiCacheTransferMixin:
             return False
         return True
 
-    def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
+    def _process_hicache_local_restores(self, decode_reqs: list[DecodeRequest]) -> None:
         if not hasattr(self.tree_cache, "is_load_back_event_done"):
             return
 
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
-        active: List[DecodeRequest] = []
+        active: list[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
                 continue

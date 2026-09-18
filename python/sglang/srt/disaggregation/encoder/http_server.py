@@ -15,15 +15,14 @@ import threading
 import time
 import uuid
 from http import HTTPStatus
-from typing import Annotated, List, Optional
+from typing import Annotated, Optional
 
 import requests as http_requests
+import sglang.srt.disaggregation.encoder.server as server_module
 import uvicorn
 import zmq
 from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
-
-import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.runtime import (
     DPDispatcher,
@@ -71,17 +70,17 @@ MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACX
 # Minimal WAV: 16kHz mono 16-bit PCM, 160 samples (0.01s) of silence
 MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 
-encoder: Optional[MMEncoder] = None
-send_sockets: List[zmq.Socket] = []
-encoder_scheduler: Optional[EncoderScheduler] = None
-local_runtime: Optional[EncoderRuntime] = None
+encoder: MMEncoder | None = None
+send_sockets: list[zmq.Socket] = []
+encoder_scheduler: EncoderScheduler | None = None
+local_runtime: EncoderRuntime | None = None
 
 # DP mode (--dp-size > 1): the protocol-neutral runtime owns worker processes
 # and ZMQ; HTTP only keeps the dispatcher handle used by route handlers.
 dp_dispatcher: Optional["DPDispatcher"] = None
 
 
-def is_health_check_request(rid: Optional[str]) -> bool:
+def is_health_check_request(rid: str | None) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
@@ -235,13 +234,13 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=get_serving().host, port=get_serving().port)
 
 
-def _summarise_dp_broadcast(results: List[dict]) -> Response:
+def _summarise_dp_broadcast(results: list[dict]) -> Response:
     # Treat missing/None content as failure so a stuck rank doesn't hide
     # behind the others' "ok". Status = the most severe per-rank error code
     # (5xx beats 4xx) rather than a blanket 400, so a worker's 500/503/504
     # isn't misreported as a client error.
-    msgs: List[str] = []
-    error_codes: List[int] = []
+    msgs: list[str] = []
+    error_codes: list[int] = []
     for r in results:
         content = r.get("content")
         if isinstance(content, dict):
@@ -645,7 +644,7 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
+async def start_profile_async(obj: Annotated[ProfileReq | None, Body()] = None):
     if dp_dispatcher is not None:
         if obj is not None:
             obj.req_type = ProfileReqType.START_PROFILE

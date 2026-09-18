@@ -25,14 +25,14 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Callable
 from itertools import count
 from queue import Queue
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import zmq
 from pydantic import BaseModel
-
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 def select_kv_publisher_dp_rank(
-    attn_dp_size: int, attn_dp_rank: int, dp_rank: Optional[int]
+    attn_dp_size: int, attn_dp_rank: int, dp_rank: int | None
 ) -> int:
     """Index used to offset this scheduler's KV-event publisher port.
 
@@ -63,7 +63,7 @@ def select_kv_publisher_dp_rank(
     return dp_rank or 0
 
 
-def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -> bool:
+def is_kv_publisher_rank(kv_events_config: str | None, ps: "ParallelState") -> bool:
     """Whether this scheduler owns a KV-event publisher slot: one per
     independent KV cache (pp/attn-TP/attn-CP rank 0). Shared by
     `SchedulerKvEventsPublisher` and `SchedulerLoadPublisher`, which must
@@ -87,7 +87,7 @@ LOAD_TOPIC = "load"
 _BIND_WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::"})
 
 
-def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
+def parse_tcp_port(endpoint: str | None) -> int | None:
     """Legal port of a tcp:// endpoint regardless of host, or None.
 
     Host-agnostic: answers "which ports does something else occupy" for the
@@ -102,7 +102,7 @@ def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
     return port if 0 < port <= 65535 else None
 
 
-def parse_advertisable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+def parse_advertisable_tcp(endpoint: str | None) -> tuple[str, int] | None:
     """``(host, port)`` of a tcp:// endpoint fit for /server_info, else None.
 
     Any host (KV events work connect-style); IPv6 re-bracketed so consumers
@@ -121,7 +121,7 @@ def parse_advertisable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]
     return host, addr.port
 
 
-def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+def parse_bindable_tcp(endpoint: str | None) -> tuple[str, int] | None:
     """``(host, port)`` if a PUB socket can BIND this tcp:// endpoint, else
     None. A concrete host is connect-style here, so a load PUB there would
     reach nobody while reporting no error."""
@@ -138,11 +138,11 @@ def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
 
 def resolve_load_pub_range(
     *,
-    kv_endpoint: Optional[str],
-    replay_endpoint: Optional[str],
+    kv_endpoint: str | None,
+    replay_endpoint: str | None,
     dp_size: int,
-    load_publish_endpoint: Optional[str] = None,
-) -> tuple[Optional[tuple[str, int]], Optional[str]]:
+    load_publish_endpoint: str | None = None,
+) -> tuple[tuple[str, int] | None, str | None]:
     """``((host, base), reason)`` for the load PUB range — exactly one is None.
 
     Rank ``r`` binds ``base + r`` and ``/server_info`` advertises ``base``.
@@ -236,7 +236,7 @@ class EventBatch(
 ):
     ts: float
     events: list[Any]
-    attn_dp_rank: Optional[int] = None
+    attn_dp_rank: int | None = None
 
 
 class KVCacheEvent(
@@ -272,28 +272,28 @@ class OffloadedState(msgspec.Struct):
     # Decode-incremental length already submitted for D2H offload.
     inc_len: int = 0
     # Tail of the page hash chain, extended as each offloaded chunk is backed up.
-    last_hash: Optional[str] = None
+    last_hash: str | None = None
 
 
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
-    parent_block_hash: Optional[int]
+    parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
-    lora_id: Optional[int]
-    medium: Optional[str] = None
+    lora_id: int | None
+    medium: str | None = None
     # Salt of the request that stored these blocks. Block hashes are already
     # namespaced by it; consumers index the emitted hashes rather than
     # recompute them.
-    cache_salt: Optional[str] = None
+    cache_salt: str | None = None
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
-    session_id: Optional[str] = None
+    session_id: str | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
-    medium: Optional[str] = None
+    medium: str | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -301,7 +301,7 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
 
 
 class EventPublisher(ABC):
@@ -372,7 +372,7 @@ class ZmqEventPublisher(EventPublisher):
         self,
         attn_dp_rank: int,
         endpoint: str = "tcp://*:5557",
-        replay_endpoint: Optional[str] = None,
+        replay_endpoint: str | None = None,
         buffer_steps: int = 10_000,
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
@@ -384,8 +384,8 @@ class ZmqEventPublisher(EventPublisher):
 
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
-        self._pub: Optional[zmq.Socket] = None
-        self._replay: Optional[zmq.Socket] = None
+        self._pub: zmq.Socket | None = None
+        self._replay: zmq.Socket | None = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
         self._replay_endpoint = self.offset_endpoint_port(
@@ -547,8 +547,8 @@ class ZmqEventPublisher(EventPublisher):
 
     @staticmethod
     def offset_endpoint_port(
-        endpoint: Optional[str], data_parallel_rank: int
-    ) -> Optional[str]:
+        endpoint: str | None, data_parallel_rank: int
+    ) -> str | None:
         """Helper function to offset the port in an endpoint by
             the data parallel rank.
 
@@ -590,7 +590,7 @@ class KVEventsConfig(BaseModel):
     """The zmq endpoint to use for publishing kv events.
     """
 
-    replay_endpoint: Optional[str] = None
+    replay_endpoint: str | None = None
     """The zmq endpoint to use for replaying kv events.
     """
 
@@ -632,7 +632,7 @@ class EventPublisherFactory:
         cls._registry[name] = ctor
 
     @classmethod
-    def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
+    def create(cls, config: str | None, attn_dp_rank: int = 0) -> EventPublisher:
         """Create publisher from a config mapping."""
         if not config:
             return NullEventPublisher()

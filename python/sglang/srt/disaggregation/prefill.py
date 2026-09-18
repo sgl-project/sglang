@@ -24,11 +24,10 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -96,10 +95,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +150,7 @@ class PrefillBootstrapQueue:
     def __init__(
         self,
         token_to_kv_pool: KVCache,
-        draft_token_to_kv_pool: Optional[KVCache],
+        draft_token_to_kv_pool: KVCache | None,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         tp_rank: int,
@@ -178,7 +176,7 @@ class PrefillBootstrapQueue:
         self.pp_size = pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue: List[Req] = []
+        self.queue: list[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
@@ -426,7 +424,7 @@ class PrefillBootstrapQueue:
             return
         self.queue.append(req)
 
-    def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
+    def extend(self, reqs: list[Req], num_kv_heads: int) -> None:
         for req in reqs:
             self.add(req, num_kv_heads)
 
@@ -450,9 +448,9 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
-    ) -> List[Req] | tuple[List[Req], List[Req]]:
+        pp_good_rids: list[str] | None = None,
+        pp_bad_rids: list[str] | None = None,
+    ) -> list[Req] | tuple[list[Req], list[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
@@ -614,7 +612,7 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
         running_batch: ScheduleBatch,
-        last_batch: Optional[ScheduleBatch],
+        last_batch: ScheduleBatch | None,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
         self._process_hicache_events()
@@ -764,7 +762,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
-        aborted_reqs: List[Req] = []
+        aborted_reqs: list[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
@@ -970,8 +968,8 @@ class SchedulerDisaggregationPrefillMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
-    ) -> List[Req]:
+        self: Scheduler, rids_to_check: list[str] | None = None
+    ) -> list[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
@@ -987,7 +985,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        undone_reqs: List[Req] = []
+        undone_reqs: list[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if rids_to_check is not None:
@@ -1081,13 +1079,13 @@ class SchedulerDisaggregationPrefillMixin:
 
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req
-    ) -> Optional[Exception]:
+    ) -> Exception | None:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
             f"Prefill transfer failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
-        exc: Optional[Exception] = None
+        exc: Exception | None = None
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
@@ -1209,7 +1207,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(
         self: Scheduler,
-        last_batch: Optional[ScheduleBatch],
+        last_batch: ScheduleBatch | None,
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
@@ -1293,9 +1291,9 @@ class SchedulerDisaggregationPrefillMixin:
         self,
         req: Req,
         last_chunk: bool = False,
-        end_idx: Optional[int] = None,
+        end_idx: int | None = None,
     ) -> None:
-        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        computer: KvChecksumComputer | None = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
                 value = 0
@@ -1312,7 +1310,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
-        end_idx: Optional[int] = None,
+        end_idx: int | None = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1348,7 +1346,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
-        state_indices: Optional[List] = None
+        state_indices: list | None = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 

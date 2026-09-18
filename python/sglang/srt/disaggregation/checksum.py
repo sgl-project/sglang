@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
 
 import torch
-
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
@@ -45,7 +44,7 @@ def page_indices_for_request(scheduler, req: Req, end_idx: int) -> torch.Tensor:
 
 def state_indices_for_request(
     scheduler, req: Req, seq_len: int
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if isinstance(pool, HybridLinearKVPool):
         return (
@@ -100,12 +99,12 @@ class KvChecksumComputer:
     def compute(
         self,
         kv_page_indices_gpu: torch.Tensor,
-        state_indices_gpu: Optional[torch.Tensor] = None,
+        state_indices_gpu: torch.Tensor | None = None,
     ) -> int:
         assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
-        all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
+        all_indices: list[torch.Tensor] = [kv_page_indices_gpu] * len(
             self._kv_data_ptrs
         )
         if self._state_data_ptrs:

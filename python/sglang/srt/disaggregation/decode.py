@@ -24,15 +24,14 @@ import hashlib
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -120,6 +119,7 @@ from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +150,7 @@ class DecodeReqToTokenPool:
     """
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
-    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    _on_alloc_rows: Callable[[list[int]], None] | None = None
 
     def __init__(
         self,
@@ -204,7 +204,7 @@ class DecodeReqToTokenPool:
     ) -> None:
         pass
 
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
@@ -236,7 +236,7 @@ class DecodeReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 
-    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+    def register_on_alloc_rows(self, hook: Callable[[list[int]], None]) -> None:
         assert self._on_alloc_rows is None
         self._on_alloc_rows = hook
 
@@ -249,19 +249,19 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         cache_params: Mamba2CacheParams,
-        mamba_layer_ids: List[int],
+        mamba_layer_ids: list[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_eagle_topk: int | None = None,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        short_conv_layer_ids: Optional[List[int]] = None,
-        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        short_conv_layer_ids: list[int] | None = None,
+        short_conv_state_shape: tuple[int, int] | None = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
@@ -331,11 +331,11 @@ class DecodeRequest:
     is_rebootstrap: bool = False
 
     # HiCache Status
-    prefix_match: Optional[DecodePrefixMatch] = None
-    hicache_restored_kv_indices: Optional[torch.Tensor] = None
+    prefix_match: DecodePrefixMatch | None = None
+    hicache_restored_kv_indices: torch.Tensor | None = None
     hicache_restored_node: Any = None
     # Receipt for the inc_lock_ref held on hicache_restored_node.
-    hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
+    hicache_restore_lock_receipt: DecLockRefParams | None = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -344,7 +344,7 @@ class DecodeRequest:
         return self.req.seqlen
 
     @property
-    def priority(self) -> Optional[int]:
+    def priority(self) -> int | None:
         return self.req.priority
 
 
@@ -357,7 +357,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        draft_token_to_kv_pool: Optional[KVCache],
+        draft_token_to_kv_pool: KVCache | None,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
@@ -398,16 +398,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
-        self.queue: List[DecodeRequest] = []
-        self.retracted_queue: List[Req] = []
-        self.pending_reqs: List[DecodeRequest] = []
+        self.queue: list[DecodeRequest] = []
+        self.retracted_queue: list[Req] = []
+        self.pending_reqs: list[DecodeRequest] = []
         # In-flight authoritative room -> DP-rank lookups, consumed below.
-        self._prefill_dp_rank_queries: Dict[
-            str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
+        self._prefill_dp_rank_queries: dict[
+            str, tuple[tuple[int, ...], Future[dict[str, int]]]
         ] = {}
-        self._ensure_retry_count: Dict[str, int] = {}
+        self._ensure_retry_count: dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
-        self._ensure_last_attempt_time: Dict[str, float] = {}
+        self._ensure_last_attempt_time: dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
@@ -415,7 +415,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # NOTE: requests held here are not reachable by ``/abort_request``; to
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
-        self.held_rebootstrap_reqs: List[Req] = []
+        self.held_rebootstrap_reqs: list[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -465,7 +465,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
-    ) -> Optional[str]:
+    ) -> str | None:
         page_size = self.token_to_kv_pool_allocator.page_size
         required = ceil_align(swa_tail_len, page_size)
         available = self.token_to_kv_pool_allocator.swa_available_size()
@@ -523,13 +523,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return len(req.origin_input_ids) + len(req.output_ids)
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
-    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
+    def _prealloc_kv_lens(self, req: Req) -> tuple[int, int]:
         allocated_kv_len = self._pre_alloc_fill_len(req)
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
 
-    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
+    def _prealloc_required_tokens(self, req: Req) -> tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size > 1:
@@ -721,7 +721,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ).to_dec_params()
         return self._build_decode_prefix_match(req, result)
 
-    def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+    def _resolve_prefill_dp_rank(self, req: Req) -> int | None:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
         if prefill_info is None:
@@ -831,7 +831,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return True
         return False
 
-    def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
+    def extend(self, reqs: list[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
@@ -854,8 +854,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
-        self, rids_to_check: Optional[List[str]] = None
-    ) -> List[Req]:
+        self, rids_to_check: list[str] | None = None
+    ) -> list[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
         # allocate memory
@@ -913,9 +913,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _update_handshake_waiters(
         self,
-        rids_to_check: Optional[List[str]] = None,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
+        rids_to_check: list[str] | None = None,
+        pp_good_rids: list[str] | None = None,
+        pp_bad_rids: list[str] | None = None,
     ) -> None:
         if not self.queue:
             return
@@ -942,7 +942,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if poll == KVPoll.Bootstrapping:
                 pass
-            elif poll == KVPoll.WaitingForInput:
+            elif poll in (KVPoll.WaitingForInput, KVPoll.Success):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
@@ -969,12 +969,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _ensure_prefill_info(
-        self, addr_to_reqs: Dict[str, List[DecodeRequest]]
-    ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
+        self, addr_to_reqs: dict[str, list[DecodeRequest]]
+    ) -> tuple[dict[str, list[DecodeRequest]], list[DecodeRequest]]:
         """Non-blocking ensure parallel info for each addr.
         Returns (ready_addrs, remaining_reqs)."""
-        ready: Dict[str, List[DecodeRequest]] = {}
-        remaining: List[DecodeRequest] = []
+        ready: dict[str, list[DecodeRequest]] = {}
+        remaining: list[DecodeRequest] = []
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
@@ -1019,7 +1019,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         queries = self._prefill_dp_rank_queries
 
-        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        addr_to_reqs: dict[str, list[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
@@ -1061,7 +1061,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
 
         # Group pending requests by bootstrap_addr
-        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        addr_to_reqs: dict[str, list[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
@@ -1069,9 +1069,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-        resolved: List[Tuple[DecodeRequest, int]] = []
+        resolved: list[tuple[DecodeRequest, int]] = []
         for bootstrap_addr, decode_reqs in ready_addrs.items():
-            need_query: List[DecodeRequest] = []
+            need_query: list[DecodeRequest] = []
             for decode_req in decode_reqs:
                 prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
                 if prefill_dp_rank is not None:
@@ -1122,10 +1122,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def pop_preallocated(
         self,
-        rids_to_check: Optional[List[str]] = None,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
-    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+        rids_to_check: list[str] | None = None,
+        pp_good_rids: list[str] | None = None,
+        pp_bad_rids: list[str] | None = None,
+    ) -> tuple[list[DecodeRequest], list[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
@@ -1256,7 +1256,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
-            prefix_match: Optional[DecodePrefixMatch] = None
+            prefix_match: DecodePrefixMatch | None = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
@@ -1542,7 +1542,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-            state_indices: Optional[List] = [
+            state_indices: list | None = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
@@ -1639,7 +1639,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _need_space_for_single_req(
-        self, retractable_tokens: Optional[int] = None
+        self, retractable_tokens: int | None = None
     ) -> int:
         need_space_for_single_req = (
             max(
@@ -1665,7 +1665,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _active_reserved_tokens(
-        self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
+        self, n_active: int | None = None, extra_reserved_reqs: int = 0
     ) -> int:
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
@@ -1673,10 +1673,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_aware_allocatable_token_budgets(
         self,
-        retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
+        retractable_swa_tokens: int | None = None,
         count_retracted: bool = True,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         n_active = self._active_req_count()
         reserved_tokens = self._active_reserved_tokens(n_active)
 
@@ -1696,10 +1696,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _allocatable_token_budgets(
         self,
-        retractable_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
         count_retracted: bool = True,
         extra_reserved_reqs: int = 0,
-        reserved_tokens: Optional[int] = None,
+        reserved_tokens: int | None = None,
         hicache_reserved_tokens: int = 0,
     ) -> int:
         need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
@@ -1752,11 +1752,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_tail_allocatable_token_budget(
         self,
-        retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
+        retractable_swa_tokens: int | None = None,
         count_retracted: bool = True,
-        n_active: Optional[int] = None,
-        reserved_tokens: Optional[int] = None,
+        n_active: int | None = None,
+        reserved_tokens: int | None = None,
         extra_reserved_reqs: int = 0,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
@@ -1838,9 +1838,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _pre_alloc(
         self,
         req: Req,
-        prefix_indices: Optional[torch.Tensor] = None,
-        prefix_len: Optional[int] = None,
-        total_prefix_len: Optional[int] = None,
+        prefix_indices: torch.Tensor | None = None,
+        prefix_len: int | None = None,
+        total_prefix_len: int | None = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -2024,10 +2024,10 @@ def alloc_for_decode_prealloc(
     delta_len: int,
     prefix_len: int,
     total_prefix_len: int,
-    prefix_indices: Optional[torch.Tensor],
+    prefix_indices: torch.Tensor | None,
     uses_swa_tail: bool,
     swa_tail_len: int,
-    req_to_token_pool: Optional[ReqToTokenPool] = None,
+    req_to_token_pool: ReqToTokenPool | None = None,
 ) -> torch.Tensor:
     req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
@@ -2125,7 +2125,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
-        self.queue: List[DecodeRequest] = []
+        self.queue: list[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -2143,12 +2143,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        self._deferred_releases: list[tuple[DecodeRequest, float, int, int]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
-    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+    def extend(self, decode_reqs: list[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
         # This queue now covers them.
         prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
@@ -2329,7 +2329,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
-    def _poll_with_metadata_gate(self) -> List[int]:
+    def _poll_with_metadata_gate(self) -> list[int]:
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
             if self.scheduler.enable_decode_hicache
@@ -2361,7 +2361,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(self, rids_to_check: list[str] | None = None) -> list[Req]:
         if not self.queue:
             return []
 
@@ -2562,7 +2562,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
-        pass
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -2607,7 +2606,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
-        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch: ScheduleBatch | None = None
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -2711,12 +2710,12 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
-    ) -> Optional[ScheduleBatch]:
-        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+    ) -> ScheduleBatch | None:
+        computer: KvChecksumComputer | None = self.kv_checksum_computer
         if computer is None:
             return self._get_new_prebuilt_batch(running_batch)
 
-        verified: List[Req] = []
+        verified: list[Req] = []
         for req in self.waiting_queue:
             if is_health_check_req(req):
                 verified.append(req)
@@ -2762,7 +2761,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
-    ) -> Optional[ScheduleBatch]:
+    ) -> ScheduleBatch | None:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2782,8 +2781,8 @@ class SchedulerDisaggregationDecodeMixin:
         num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
-        can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        can_run_list: list[Req] = []
+        waiting_queue: list[Req] = []
 
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]

@@ -10,14 +10,12 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from transformers import AutoProcessor
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
@@ -54,6 +52,7 @@ from sglang.srt.utils import (
     load_video,
 )
 from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
+from transformers import AutoProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +95,8 @@ def _get_original_image_size(image):
 @dataclass
 class EncoderPreprocessResult:
     mm_inputs: dict
-    grid_thw: Union[torch.Tensor, List]
-    token_counts: List[int]
+    grid_thw: torch.Tensor | list
+    token_counts: list[int]
 
 
 class EncoderPreprocessor:
@@ -124,7 +123,7 @@ class EncoderPreprocessor:
         server_args: ServerArgs,
         model_config: ModelConfig,
         encoder_media_processor_config: EncoderMediaProcessorConfig,
-        model_preprocessor: Optional[Callable] = None,
+        model_preprocessor: Callable | None = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
@@ -439,7 +438,7 @@ class EncoderPreprocessor:
         tp_rank: int,
         tp_size: int,
         video_processor_kwargs: dict,
-        precomputed_indices: Optional[List[int]] = None,
+        precomputed_indices: list[int] | None = None,
     ):
         video_config = video_config or {}
         video_fps = vr.avg_fps
@@ -671,16 +670,16 @@ class EncoderPreprocessor:
         return modality in self._supported_modalities
 
     async def process_batch_mm_items(
-        self, requests: List[dict], modality: Modality
-    ) -> tuple[EncoderPreprocessResult, List[int]]:
+        self, requests: list[dict], modality: Modality
+    ) -> tuple[EncoderPreprocessResult, list[int]]:
         """Flatten requests, run the processor once, and return batch layout."""
         flat_items, items_per_req = self._flatten_batch_requests(requests, modality)
         result = await self.process_mm_items(flat_items, modality)
         return result, items_per_req
 
     def _flatten_batch_requests(
-        self, requests: List[dict], modality: Modality
-    ) -> tuple[List, List[int]]:
+        self, requests: list[dict], modality: Modality
+    ) -> tuple[list, list[int]]:
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K2.5/K3 dict-of-images).
@@ -863,7 +862,7 @@ class EncoderPreprocessor:
         )
 
     def get_num_patches(
-        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+        self, grid: torch.Tensor | list[int], modality: Modality
     ) -> int:
         """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
@@ -875,8 +874,8 @@ class EncoderPreprocessor:
 
     @staticmethod
     def _kimi_hw_from_patch_grid(
-        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
-    ) -> Tuple[int, int]:
+        grid: torch.Tensor | np.ndarray | list[int] | tuple[int, ...],
+    ) -> tuple[int, int]:
         """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
         if isinstance(grid, torch.Tensor):
             values = grid.flatten().tolist()
@@ -892,14 +891,14 @@ class EncoderPreprocessor:
             )
         return int(values[-2]), int(values[-1])
 
-    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+    def _kimi_tokens_from_patch_grid(self, grid: torch.Tensor | list[int]) -> int:
         """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
         h, w = self._kimi_hw_from_patch_grid(grid)
         merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
         return (h * w) // (merge_h * merge_w)
 
     def get_num_tokens(
-        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+        self, grid: torch.Tensor | list[int], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
         if modality == Modality.AUDIO:
@@ -1004,7 +1003,7 @@ class EncoderPreprocessor:
                 flat.append(item)
         return flat
 
-    def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
+    def _grid_count_per_leaf(self, leaves: list, modality: Modality) -> list[int]:
         """Number of grid entries each leaf produces under the model's processor.
 
         Most processors map 1 leaf -> 1 grid. Kimi-VL/K2.5/K3 image processors expand

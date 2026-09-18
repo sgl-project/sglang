@@ -8,13 +8,11 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -91,16 +89,16 @@ class TransferInfo:
     mooncake_session_id: str
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
-    dst_state_indices: List[List[int]]  # parallel to receiver's state_types
+    dst_state_indices: list[list[int]]  # parallel to receiver's state_types
     required_dst_info_num: int
     is_dummy: bool
-    decode_prefix_len: Optional[int] = None
-    dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    decode_prefix_len: int | None = None
+    dst_device_kv_indices: npt.NDArray[np.int32] | None = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
-    staging: Optional[StagingTransferInfo] = None
+    staging: StagingTransferInfo | None = None
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]):
+    def from_zmq(cls, msg: list[bytes]):
         if msg[4] == b"" and msg[5] == b"":
             is_dummy = True
             dst_kv_indices = np.array([], dtype=np.int32)
@@ -141,25 +139,25 @@ class KVArgsRegisterInfo:
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
-    dst_state_data_ptrs: List[List[int]]  # parallel to state_types (same below)
+    dst_state_data_ptrs: list[list[int]]  # parallel to state_types (same below)
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
     # for mamba state different tp slice transfer
-    dst_state_item_lens: List[List[int]]
-    dst_state_dim_per_tensor: List[List[int]]
-    dst_kv_layer_ids: List[int]
-    dst_state_layer_ids: List[List[int]]
+    dst_state_item_lens: list[list[int]]
+    dst_state_dim_per_tensor: list[list[int]]
+    dst_kv_layer_ids: list[int]
+    dst_state_layer_ids: list[list[int]]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
-    dcp_token_item_lens: Optional[List[int]] = None
+    dcp_token_item_lens: list[int] | None = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
-    staging: Optional[StagingRegisterInfo] = None
+    staging: StagingRegisterInfo | None = None
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]):
+    def from_zmq(cls, msg: list[bytes]):
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -214,7 +212,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
@@ -240,7 +238,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
-            self.transfer_queues: List[FastQueue] = [
+            self.transfer_queues: list[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             assert transfer_thread_pool_size >= transfer_queue_size, (
@@ -298,17 +296,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
-    def _registerable_regions(self) -> List[Tuple[int, int]]:
+    def _registerable_regions(self) -> list[tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
 
         Deduped because the unified memory pool reports one raw buffer as both
         its KV and its mamba state component, and double registration fails in
         the engine.
         """
-        regions: List[Tuple[int, int]] = []
-        seen: Set[Tuple[int, int]] = set()
+        regions: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
 
-        def add(ptrs: List[int], lens: List[int]) -> None:
+        def add(ptrs: list[int], lens: list[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
@@ -351,7 +349,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         k_buffers: list,
         v_buffers: list,
         page_size: int,
-        slot_layer_ids: Optional[List[int]] = None,
+        slot_layer_ids: list[int] | None = None,
     ):
         # slot_layer_ids follows the staging slot order (every k_buffer, then
         # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
@@ -517,9 +515,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
-        dst_layer_ids: List[int],
+        dst_layer_ids: list[int],
         staging_buffer=None,
-        dst_slot_layer_ids: Optional[List[int]] = None,
+        dst_slot_layer_ids: list[int] | None = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -656,12 +654,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-        state_type: Optional[StateType] = None,
+        state_type: StateType | None = None,
         force_flat: bool = False,
-        src_layer_ids: Optional[List[int]] = None,
-        dst_layer_ids: Optional[List[int]] = None,
-        dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
-        dst_device_data_ptrs: Optional[set[int]] = None,
+        src_layer_ids: list[int] | None = None,
+        dst_layer_ids: list[int] | None = None,
+        dst_device_data_indices: npt.NDArray[np.int32] | None = None,
+        dst_device_data_ptrs: set[int] | None = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -754,7 +752,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
+        ) -> list[tuple[int, int, int]]:
             transfer_blocks = []
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
@@ -780,7 +778,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(layers_params: list[tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
@@ -864,8 +862,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _validate_envelope_kv_layout(
         self,
         dst_kv_ptrs: list[int],
-        dst_kv_item_len: Optional[int],
-        dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_len: int | None,
+        dst_attn_tp_size: int | None = None,
     ) -> None:
         """Reject a peer whose KV registration shape differs from ours.
 
@@ -933,10 +931,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-        dst_layer_ids: Optional[List[int]] = None,
-        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-        dst_kv_item_len: Optional[int] = None,
-        dst_attn_tp_size: Optional[int] = None,
+        dst_layer_ids: list[int] | None = None,
+        dst_device_kv_indices: npt.NDArray[np.int32] | None = None,
+        dst_kv_item_len: int | None = None,
+        dst_attn_tp_size: int | None = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -980,14 +978,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         *,
-        dcp_token_item_lens: List[int],
+        dcp_token_item_lens: list[int],
         dst_dcp_size: int,
         dst_dcp_rank: int,
         src_page_offset: int,
         decode_prefix_len: int,
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
-        dst_layer_ids: List[int],
+        dst_layer_ids: list[int],
         pack_buffer=None,
     ) -> int:
         if num_kv_tokens is None:
@@ -1071,7 +1069,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
-        ) -> List[Tuple[int, int, int]]:
+        ) -> list[tuple[int, int, int]]:
             src_groups, dst_groups = groups
             return [
                 (
@@ -1112,7 +1110,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
-        dst_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: list[int] | None = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -1263,7 +1261,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptr + length * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1316,7 +1314,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
-    def _handle_aux_data(self, msg: List[bytes]):
+    def _handle_aux_data(self, msg: list[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
         room = int(msg[1].decode("ascii"))
         buffer_index = int(msg[2].decode("ascii"))
@@ -1337,8 +1335,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def _get_dsa_cache_transfer_skip_flags(
-        self, info: Optional[KVArgsRegisterInfo]
-    ) -> Tuple[bool, bool]:
+        self, info: KVArgsRegisterInfo | None
+    ) -> tuple[bool, bool]:
         skip_kv = False
         skip_state = False
 
@@ -1392,9 +1390,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def maybe_send_extra(
         self,
         req: TransferInfo,
-        prefill_state_indices: List,
+        prefill_state_indices: list,
         executor: concurrent.futures.ThreadPoolExecutor,
-        target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        target_rank_registration_info: KVArgsRegisterInfo | None = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1706,9 +1704,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_state_item_lens: list[int],
         dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
-        src_layer_ids: Optional[List[int]] = None,
-        dst_layer_ids: Optional[List[int]] = None,
-        dst_state_item_lens: Optional[list[int]] = None,
+        src_layer_ids: list[int] | None = None,
+        dst_layer_ids: list[int] | None = None,
+        dst_state_item_lens: list[int] | None = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1750,8 +1748,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: int,
         src_state_conv_shard_groups: list = None,
         src_state_slice_outer_counts: list[int] = None,
-        src_layer_ids: Optional[List[int]] = None,
-        dst_layer_ids: Optional[List[int]] = None,
+        src_layer_ids: list[int] | None = None,
+        dst_layer_ids: list[int] | None = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -2279,7 +2277,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if decode_kv_args.requires_dcp_relayout:
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
+                        dst_item_lens: list[int | None] = [
                             decode_kv_args.dst_kv_item_len
                         ] * (num_entries - num_draft) + [None] * num_draft
                         decode_kv_args.dcp_token_item_lens = (
@@ -2388,10 +2386,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
         is_last_chunk: bool,
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
-        trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
+        trace_ctx: TraceReqContext | TraceNullContext | None = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2508,7 +2506,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
+        dest_tp_ranks: list[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
@@ -2528,8 +2526,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -2607,7 +2605,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self,
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
@@ -2706,10 +2704,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        decode_prefix_len: Optional[int] = None,
-        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        decode_prefix_len: int | None = None,
+        device_kv_indices: npt.NDArray[np.int32] | None = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(

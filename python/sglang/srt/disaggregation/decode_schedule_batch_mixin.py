@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -114,7 +113,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
-        last_tokens: List[int] = []
+        last_tokens: list[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
             # PREBUILT does not materialize a local SWA branching window.

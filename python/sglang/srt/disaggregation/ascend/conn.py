@@ -1,11 +1,9 @@
 import concurrent.futures
 import enum
 import logging
-from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
@@ -68,8 +66,8 @@ class AscendKVManager(MooncakeKVManager):
             self.engine.batch_register(ptrs, lens)
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
-    ) -> Tuple[List[int], List[int], int]:
+        self, src_kv_ptrs: list[int], dst_kv_ptrs: list[int], state_type=None
+    ) -> tuple[list[int], list[int], int]:
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
             if len(src_kv_ptrs) == len(dst_kv_ptrs):
@@ -161,10 +159,10 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-        dst_layer_ids: Optional[List[int]] = None,
-        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-        dst_kv_item_len: Optional[int] = None,
-        dst_attn_tp_size: Optional[int] = None,
+        dst_layer_ids: list[int] | None = None,
+        dst_device_kv_indices: npt.NDArray[np.int32] | None = None,
+        dst_kv_item_len: int | None = None,
+        dst_attn_tp_size: int | None = None,
     ):
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
@@ -245,7 +243,7 @@ class AscendKVManager(MooncakeKVManager):
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
+        ) -> list[tuple[int, int, int]]:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
@@ -260,7 +258,7 @@ class AscendKVManager(MooncakeKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(layers_params: list[tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))

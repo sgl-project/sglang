@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import aiohttp
 import numpy as np
@@ -23,8 +23,6 @@ import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
@@ -59,6 +57,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -116,17 +115,17 @@ class EncoderBootstrapServer:
         self,
         host: str,
         port: int,
-        urls: Optional[List[str]] = None,
-        health_check_interval: Optional[float] = None,
-        health_check_timeout: Optional[float] = None,
-        evicted_ttl: Optional[float] = None,
+        urls: list[str] | None = None,
+        health_check_interval: float | None = None,
+        health_check_timeout: float | None = None,
+        evicted_ttl: float | None = None,
     ):
 
         self.host = host
         self.port = port
-        self._urls: List[str] = urls if urls is not None else []
+        self._urls: list[str] = urls if urls is not None else []
         self._lock = threading.Lock()
-        self._server: Optional[uvicorn.Server] = None  # set in _run_server
+        self._server: uvicorn.Server | None = None  # set in _run_server
         self._health_check_interval = (
             health_check_interval
             if health_check_interval is not None
@@ -148,12 +147,12 @@ class EncoderBootstrapServer:
         # Values are eviction timestamps; URLs older than ``_evicted_ttl``
         # (when > 0) are permanently dropped.
         self._health_fail_threshold = 3
-        self._health_fail_counts: Dict[str, int] = {}
-        self._evicted_urls: Dict[str, float] = {}
+        self._health_fail_counts: dict[str, int] = {}
+        self._evicted_urls: dict[str, float] = {}
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
-            task: Optional[asyncio.Task] = None
+            task: asyncio.Task | None = None
             if self._health_check_interval > 0:
                 task = asyncio.create_task(self._health_check_loop())
             try:
@@ -232,7 +231,7 @@ class EncoderBootstrapServer:
                 logger.info(f"Unregistered encoder URL: {url}")
             return removed
 
-    def list_urls(self) -> List[str]:
+    def list_urls(self) -> list[str]:
         """Return a snapshot of all registered encoder URLs."""
         with self._lock:
             return list(self._urls)
@@ -468,7 +467,7 @@ class EmbeddingData:
             self.shape = list(embedding.shape) if embedding is not None else None
         # Encoder-side mooncake MR for `embedding`. Underscored so
         # copy_without_embedding drops this process-local address.
-        self._mr_ptr: Optional[int] = None
+        self._mr_ptr: int | None = None
         self.error_msg = error_msg
         # Coerce to plain int: this object crosses process boundaries via
         # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
@@ -530,7 +529,7 @@ _MIMO_VIDEO_AUDIO_META_ATTRS = (
 _VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
 
 
-def video_meta_attrs_for(model_type: Optional[str]) -> tuple:
+def video_meta_attrs_for(model_type: str | None) -> tuple:
     """Video-meta attrs for model_type. MiMo appends its audio-in-video fields."""
     attrs = _GENERAL_VIDEO_META_ATTRS
     if model_type and "mimo" in model_type.lower():
@@ -573,7 +572,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         modality,
         embedding,
         embedding_shape,
-        model_type: Optional[str] = None,
+        model_type: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -645,7 +644,7 @@ class MultiModalEmbeddingData(EmbeddingData):
     def from_embedding_data(
         cls,
         embedding_data: EmbeddingData,
-        model_type: Optional[str] = None,
+        model_type: str | None = None,
     ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         _validate_embedding_part(embedding_data)
@@ -731,7 +730,7 @@ class MultiModalEmbeddingData(EmbeddingData):
 
 def _validate_embedding_part(
     embedding_data: EmbeddingData,
-    current: Optional[MultiModalEmbeddingData] = None,
+    current: MultiModalEmbeddingData | None = None,
 ) -> None:
     """Reject malformed part metadata before indexing aggregation buffers."""
     if not isinstance(embedding_data, EmbeddingData):
@@ -804,8 +803,8 @@ def extract_original_req_id(part_req_id: str) -> str:
 
 
 def _resolve_embedding_part_request_id(
-    embedding_data: object, expected_req_id: Optional[str] = None
-) -> Optional[str]:
+    embedding_data: object, expected_req_id: str | None = None
+) -> str | None:
     """Validate and normalize an embedding part ID for safe routing."""
     expected = (
         f" for expected rid={expected_req_id}" if expected_req_id is not None else ""
@@ -890,7 +889,7 @@ class WaitingMMRequestBase(ABC):
         embedding_pool: Optional["EmbeddingPool"] = None,
         zmq_context=None,
         embedding_port=None,
-        registration_runner: Optional[_ReceiveRegistrationRunner] = None,
+        registration_runner: _ReceiveRegistrationRunner | None = None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -923,9 +922,9 @@ class WaitingMMRequestBase(ABC):
         # the pool is full.
         self.embedding_pool = embedding_pool
         self.embeddings_buffer = None
-        self._pool_slot_id: Optional[int] = None
+        self._pool_slot_id: int | None = None
         # Success-path finalizer handle so abort can release the slot early.
-        self._mm_finalizer: Optional[weakref.finalize] = None
+        self._mm_finalizer: weakref.finalize | None = None
         self._pool_full_warned = False
         self.registration_runner = registration_runner
         self.registration_future = None
@@ -1358,7 +1357,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         embeddings_engine,
         dtype,
         gpu_id=0,
-        model_type: Optional[str] = None,
+        model_type: str | None = None,
         embedding_pool=None,
         embedding_port=None,
     ):
@@ -1681,8 +1680,8 @@ class EmbeddingPool:
         self.engine = engine
         if engine is not None:
             engine.register(self.base, self.buffer.nbytes)
-        self._segments_free: List[Tuple[int, int]] = [(0, size_bytes)]
-        self._inflight: Dict[int, Tuple[int, int]] = {}
+        self._segments_free: list[tuple[int, int]] = [(0, size_bytes)]
+        self._inflight: dict[int, tuple[int, int]] = {}
         self._next_slot_id = 0
         self._total_inflight = 0
         self._lock = threading.Lock()
@@ -1693,7 +1692,7 @@ class EmbeddingPool:
             f"rdma_registered={engine is not None}"
         )
 
-    def try_alloc(self, nbytes: int) -> Optional[Tuple[torch.Tensor, int, int]]:
+    def try_alloc(self, nbytes: int) -> tuple[torch.Tensor, int, int] | None:
         """Non-blocking alloc: ``(tensor_view, gpu_addr, slot_id)``, or
         ``None`` when the pool is currently full (oversize requests also get
         ``None`` — callers detect those via ``size_bytes``)."""
@@ -1702,8 +1701,8 @@ class EmbeddingPool:
             return self._try_alloc_locked(nbytes, aligned)
 
     def try_stage(
-        self, parts: List[torch.Tensor]
-    ) -> Optional[Tuple[torch.Tensor, int]]:
+        self, parts: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, int] | None:
         """Copy CPU part tensors into one slot, packed in list order.
 
         Returns ``(slot_view, slot_id)``, or ``None`` when the pool is
@@ -1727,7 +1726,7 @@ class EmbeddingPool:
 
     def alloc(
         self, nbytes: int, timeout: float = 60.0
-    ) -> Optional[Tuple[torch.Tensor, int, int]]:
+    ) -> tuple[torch.Tensor, int, int] | None:
         """Allocate `nbytes` from the pool.
 
         Returns ``(tensor_view, gpu_addr, slot_id)`` on success, or ``None``
@@ -1778,7 +1777,7 @@ class EmbeddingPool:
 
     def _try_alloc_locked(
         self, nbytes: int, aligned: int
-    ) -> Optional[Tuple[torch.Tensor, int, int]]:
+    ) -> tuple[torch.Tensor, int, int] | None:
         for i, (off, length) in enumerate(self._segments_free):
             if length >= aligned:
                 if length == aligned:
@@ -1808,7 +1807,7 @@ class EmbeddingPool:
     def _coalesce_free_locked(self, off: int, length: int) -> None:
         self._segments_free.append((off, length))
         self._segments_free.sort()
-        merged: List[Tuple[int, int]] = []
+        merged: list[tuple[int, int]] = []
         for s_off, s_len in self._segments_free:
             if merged and merged[-1][0] + merged[-1][1] == s_off:
                 p_off, p_len = merged[-1]
@@ -1844,7 +1843,7 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
     in use. The pool path binds slot release to mm_inputs GC via finalize.
     """
     # mod -> [byte_start, byte_end, total_tokens, hidden]
-    mod_info: Dict[Modality, List[int]] = {}
+    mod_info: dict[Modality, list[int]] = {}
     for i, shape, start, end in _iter_part_ranges(embedding_data, dtype):
         mod = embedding_data.modality_list[i]
         info = mod_info.get(mod)
@@ -1867,13 +1866,13 @@ class MMReceiverBase(ABC):
     def __init__(
         self,
         server_args: ServerArgs,
-        dtype: Optional[torch.dtype] = None,
-        hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
+        dtype: torch.dtype | None = None,
+        hf_config: PretrainedConfig | None = None,
+        pp_rank: int | None = None,
+        tp_rank: int | None = None,
+        tp_group: GroupCoordinator | None = None,
         scheduler: Optional["Scheduler"] = None,
-        encode_urls: Optional[List[str]] = None,
+        encode_urls: list[str] | None = None,
     ):
         self.context = zmq.asyncio.Context(20)
         # Scheduler-side receive is polled synchronously. Keep one regular ZMQ
@@ -1886,7 +1885,7 @@ class MMReceiverBase(ABC):
         # register or unregister; the receiver always sees the current set.
         # When None (e.g. in a scheduler subprocess that has no in-process
         # bootstrap), fall back to a snapshot of the static --encoder-urls.
-        self.encode_urls: List[str] = (
+        self.encode_urls: list[str] = (
             encode_urls if encode_urls is not None else list(get_disagg().encoder_urls)
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
@@ -1897,8 +1896,8 @@ class MMReceiverBase(ABC):
         self.tp_group = tp_group
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
-        self.waiting_list: List[WaitingMMRequestBase] = []
-        self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
+        self.waiting_list: list[WaitingMMRequestBase] = []
+        self.waiting_by_rid: dict[str, WaitingMMRequestBase] = {}
         self.registration_runner = None
         self.scheduler_embedding_port = None
         self.scheduler_recv_socket = None
@@ -2185,7 +2184,7 @@ class MMReceiverBase(ABC):
 
     def send_encode_request(
         self, obj, time_stats_json=None, on_dispatch_error=None
-    ) -> Optional[threading.Event]:
+    ) -> threading.Event | None:
         return self._send_encode_request(
             obj,
             time_stats_json=time_stats_json,
@@ -2194,7 +2193,7 @@ class MMReceiverBase(ABC):
 
     def _send_encode_request(
         self, obj, time_stats_json=None, on_dispatch_error=None
-    ) -> Optional[threading.Event]:
+    ) -> threading.Event | None:
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -2552,7 +2551,7 @@ class MMReceiverBase(ABC):
 
     def _assign_items_by_modality(
         self, mm_data, encoder_num, random_shuffle=True
-    ) -> Dict:
+    ) -> dict:
         """
         Assign multimodal items across encoders by modality with cross-modality load balancing.
 
@@ -2596,7 +2595,7 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
-    def _extract_url_data(self, request_obj: GenerateReqInput) -> List[Dict]:
+    def _extract_url_data(self, request_obj: GenerateReqInput) -> list[dict]:
         def flatten_mm_items(items):
             if not isinstance(items, list):
                 return [items]
@@ -2671,13 +2670,13 @@ class MMReceiverHTTP(MMReceiverBase):
     def __init__(
         self,
         server_args: ServerArgs,
-        dtype: Optional[torch.dtype] = None,
-        hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
+        dtype: torch.dtype | None = None,
+        hf_config: PretrainedConfig | None = None,
+        pp_rank: int | None = None,
+        tp_rank: int | None = None,
+        tp_group: GroupCoordinator | None = None,
         scheduler: Optional["Scheduler"] = None,
-        encode_urls: Optional[List[str]] = None,
+        encode_urls: list[str] | None = None,
     ):
         super().__init__(
             server_args,
@@ -2810,13 +2809,13 @@ class MMReceiverGrpc(MMReceiverBase):
     def __init__(
         self,
         server_args: ServerArgs,
-        dtype: Optional[torch.dtype] = None,
-        hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
+        dtype: torch.dtype | None = None,
+        hf_config: PretrainedConfig | None = None,
+        pp_rank: int | None = None,
+        tp_rank: int | None = None,
+        tp_group: GroupCoordinator | None = None,
         scheduler: Optional["Scheduler"] = None,
-        encode_urls: Optional[List[str]] = None,
+        encode_urls: list[str] | None = None,
     ):
         if get_disagg().encoder_transfer_backend == "mooncake":
             # The RDMA receive path (WaitingRDMARequest + /meta + /send) only
@@ -2943,14 +2942,14 @@ _MM_RECEIVER_BY_MODE = {
 
 def create_mm_receiver(
     server_args: ServerArgs,
-    dtype: Optional[torch.dtype] = None,
-    hf_config: Optional[PretrainedConfig] = None,
-    pp_rank: Optional[int] = None,
-    tp_rank: Optional[int] = None,
-    tp_group: Optional[GroupCoordinator] = None,
+    dtype: torch.dtype | None = None,
+    hf_config: PretrainedConfig | None = None,
+    pp_rank: int | None = None,
+    tp_rank: int | None = None,
+    tp_group: GroupCoordinator | None = None,
     scheduler: Optional["Scheduler"] = None,
-    transport_mode: Optional[str] = None,
-    encode_urls: Optional[List[str]] = None,
+    transport_mode: str | None = None,
+    encode_urls: list[str] | None = None,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()

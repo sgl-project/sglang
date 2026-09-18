@@ -1,9 +1,7 @@
 import logging
-from typing import List, Optional
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.disaggregation.base.conn import (
     BaseKVManager,
     BaseKVReceiver,
@@ -25,7 +23,7 @@ class FakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.kv_args = args
@@ -41,13 +39,13 @@ class FakeKVSender(BaseKVSender):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
+        dest_tp_ranks: list[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
         self.has_sent = False
-        self.conclude_state: Optional[KVPoll] = None
+        self.conclude_state: KVPoll | None = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -67,18 +65,17 @@ class FakeKVSender(BaseKVSender):
     def init(
         self,
         kv_indices: list[int],
-        aux_index: Optional[int] = None,
+        aux_index: int | None = None,
     ):
         logger.debug(
             f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
         )
-        pass
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
     ):
         self.has_sent = True
         logger.debug(
@@ -97,14 +94,14 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ):
         self.kv_mgr = mgr
         self.abort_notified: bool = False
         self.bootstrap_done = False
         self.has_sent_metadata = False
         self.require_staging: bool = False
-        self.conclude_state: Optional[KVPoll] = None
+        self.conclude_state: KVPoll | None = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -126,9 +123,9 @@ class FakeKVReceiver(BaseKVReceiver):
     def send_metadata(
         self,
         kv_indices: list[int],
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        decode_prefix_len: Optional[int] = None,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        decode_prefix_len: int | None = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

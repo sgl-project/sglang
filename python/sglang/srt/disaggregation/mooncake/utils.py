@@ -14,10 +14,9 @@
 """Mooncake-specific utilities for custom memory pool management."""
 
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import torch
-
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NODE_NVLIN
 
 def init_mooncake_custom_mem_pool(
     device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
+) -> tuple[bool, Any | None, str | None]:
     """
     Initialize custom memory pool based on environment variable.
 
@@ -89,7 +88,7 @@ def init_mooncake_custom_mem_pool(
     return enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type
 
 
-def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
+def check_mooncake_custom_mem_pool_enabled() -> tuple[bool, str | None]:
     """
     Check if custom memory pool is enabled without importing allocators.
 

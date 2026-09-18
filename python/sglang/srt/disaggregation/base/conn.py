@@ -3,11 +3,10 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -39,36 +38,36 @@ class StateType(str, enum.Enum):
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
-    transfer_latency_s: Optional[float] = None
+    transfer_latency_s: float | None = None
     # Backends that cannot isolate allocation wait latency can leave this as None.
-    alloc_latency_s: Optional[float] = None
-    transfer_total_bytes: Optional[int] = None
+    alloc_latency_s: float | None = None
+    transfer_total_bytes: int | None = None
 
 
 class KVArgs:
     engine_rank: int
-    kv_data_ptrs: List[int]
-    kv_data_lens: List[int]
-    kv_item_lens: List[int]
-    kv_layer_ids: List[int]
+    kv_data_ptrs: list[int]
+    kv_data_lens: list[int]
+    kv_item_lens: list[int]
+    kv_layer_ids: list[int]
     kv_cache_dtype_str: str
-    aux_data_ptrs: List[int]
-    aux_data_lens: List[int]
-    aux_item_lens: List[int]
-    state_types: List[StateType]
-    state_data_ptrs: List[List[int]]
-    state_data_lens: List[List[int]]
-    state_item_lens: List[List[int]]
-    state_layer_ids: List[List[int]]
+    aux_data_ptrs: list[int]
+    aux_data_lens: list[int]
+    aux_item_lens: list[int]
+    state_types: list[StateType]
+    state_data_ptrs: list[list[int]]
+    state_data_lens: list[list[int]]
+    state_item_lens: list[list[int]]
+    state_layer_ids: list[list[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
-    state_dim_per_tensor: List[List[int]]
+    state_dim_per_tensor: list[list[int]]
     # Number of rows before the slice axis in each per-slot state tensor.
-    state_slice_outer_counts: List[List[int]]
+    state_slice_outer_counts: list[list[int]]
     is_hybrid_mla_backend: bool
     # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
-    state_conv_shard_groups: List[List[Optional[List[int]]]]
+    state_conv_shard_groups: list[list[list[int] | None]]
     ib_device: str
     gpu_id: int
     kv_head_num: int
@@ -77,7 +76,7 @@ class KVArgs:
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.
-    rust_http_port: Optional[int]
+    rust_http_port: int | None
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
@@ -85,12 +84,12 @@ class KVArgs:
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
     # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
     # list).
-    prefill_end_layer: Optional[int]
+    prefill_end_layer: int | None
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
-    mla_compression_ratios: Optional[List[int]]
+    mla_compression_ratios: list[int] | None
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
@@ -119,7 +118,7 @@ class BaseKVManager(ABC):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
     ): ...
 
     @abstractmethod
@@ -135,13 +134,13 @@ class BaseKVSender(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
+        dest_tp_ranks: list[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def init(self, num_kv_indices: int, aux_index: int | None = None):
         """
         Set req's index metadata locally or notify the decoder server about the kv indices length and aux index.
         """
@@ -151,8 +150,8 @@ class BaseKVSender(ABC):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -188,13 +187,11 @@ class BaseKVSender(ABC):
         """
         Clear any internal states.
         """
-        pass
 
     def abort(self):
         """
         Abort the current transfer.
         """
-        pass
 
 
 class BaseKVReceiver(ABC):
@@ -203,7 +200,7 @@ class BaseKVReceiver(ABC):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ): ...
 
     @abstractmethod
@@ -220,9 +217,9 @@ class BaseKVReceiver(ABC):
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        decode_prefix_len: Optional[int] = None,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        decode_prefix_len: int | None = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
@@ -247,13 +244,11 @@ class BaseKVReceiver(ABC):
         """
         Clear any internal states.
         """
-        pass
 
     def abort(self):
         """
         Abort the current transfer.
         """
-        pass
 
 
 class BaseKVBootstrapServer(ABC):

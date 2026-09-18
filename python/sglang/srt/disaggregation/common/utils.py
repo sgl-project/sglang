@@ -3,11 +3,9 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -22,21 +20,21 @@ class TransferKVChunk:
     prefill_kv_indices: npt.NDArray[np.int32]
     index_slice: slice
     is_last_chunk: bool
-    prefill_aux_index: Optional[int]
-    state_indices: Optional[List]
-    chunk_id: Optional[int] = None
-    num_kv_tokens: Optional[int] = None
-    trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
+    prefill_aux_index: int | None
+    state_indices: list | None
+    chunk_id: int | None = None
+    num_kv_tokens: int | None = None
+    trace_ctx: TraceReqContext | TraceNullContext = dataclasses.field(
         default_factory=TraceNullContext
     )
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
-    wait_event: Optional[object] = None
+    wait_event: object | None = None
 
 
-def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
+def pack_list_of_buffers(buffers: list[bytes]) -> bytes:
     if not buffers:
         return b""
     n = len(buffers)
@@ -44,7 +42,7 @@ def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     return header + b"".join(buffers)
 
 
-def unpack_list_of_buffers(buf: bytes) -> List[bytes]:
+def unpack_list_of_buffers(buf: bytes) -> list[bytes]:
     if buf == b"":
         return []
     (n,) = struct.unpack("<I", buf[:4])
@@ -61,7 +59,7 @@ def pack_int_lists(lists, fmt: str) -> bytes:
     return pack_list_of_buffers([struct.pack(f"<{len(a)}{fmt}", *a) for a in lists])
 
 
-def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
+def unpack_int_lists(buf: bytes, fmt: str) -> list[list[int]]:
     width = struct.calcsize(fmt)
     return [
         list(struct.unpack(f"<{len(b) // width}{fmt}", b))
@@ -105,12 +103,11 @@ class AuxDataCodec:
         dst_addr = dst_aux_ptr + item_len * aux_index
         buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
         buffer[:] = data
-        return
 
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
-) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:
+) -> tuple[list[npt.NDArray[np.int32]], list[npt.NDArray[np.int32]]]:
     """Vectorised NumPy implementation."""
     # src/dst indices are transferred pairwise, so an empty side means there is
     # nothing to transfer. Guarding both sides (not just src) avoids a cryptic
@@ -158,7 +155,7 @@ def build_dcp_token_transfer_plan(
     dcp_rank: int,
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
-    num_kv_tokens: Optional[int] = None,
+    num_kv_tokens: int | None = None,
 ) -> DCPTokenTransferPlan:
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)

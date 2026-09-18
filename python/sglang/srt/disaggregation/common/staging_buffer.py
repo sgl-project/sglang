@@ -14,12 +14,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -133,7 +131,7 @@ class StagingBuffer:
         self.size_bytes = size_bytes
         self.device = device
         self.gpu_id = gpu_id
-        self._gather_stream: Optional[torch.cuda.Stream] = None
+        self._gather_stream: torch.cuda.Stream | None = None
 
         torch.cuda.set_device(gpu_id)
         if custom_mem_pool is not None:
@@ -196,7 +194,7 @@ class StagingAllocator:
         self.head = 0
         self.round = 0
         self.allocations: dict = {}  # alloc_id -> (offset, size, round)
-        self.alloc_order: List[int] = []
+        self.alloc_order: list[int] = []
         self.next_alloc_id = 0
         self.watermark_round = 0
         self.watermark_tail = 0
@@ -211,7 +209,7 @@ class StagingAllocator:
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
-    def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
+    def assign(self, required_bytes: int) -> tuple[int, int, int] | None:
         """Allocate a region. Returns (alloc_id, offset, round) or None."""
         with self.lock:
             if required_bytes > self.total_size:
@@ -254,7 +252,7 @@ class StagingAllocator:
                 self.watermark_round = rnd
                 self.watermark_tail = off
 
-    def get_watermark(self) -> Tuple[int, int]:
+    def get_watermark(self) -> tuple[int, int]:
         """Return (round, tail_offset). Everything before this is safe to write."""
         with self.lock:
             return (self.watermark_round, self.watermark_tail)
@@ -691,7 +689,7 @@ def compute_head_slice_params(
     src_tp_rank: int,
     dst_tp_rank: int,
     total_kv_heads: int,
-) -> Tuple[int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Compute head slicing parameters for heterogeneous TP transfer.
 
     Returns:
@@ -729,7 +727,7 @@ def compute_staging_layout(
     num_tokens: int,
     bytes_per_head_token: int,
     num_layers: int,
-) -> Tuple[int, List[int], int]:
+) -> tuple[int, list[int], int]:
     """Compute per-writer byte layout for a staging region.
 
     Returns:
@@ -772,7 +770,7 @@ def resolve_total_kv_heads(
     )
 
 
-def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> int:
+def staging_grid_tokens(chunked_prefill_size: int | None, page_size: int) -> int:
     """Token width of one staging grid slot; shared by prefetch and the
     sender's grid alignment."""
     cps = chunked_prefill_size or 8192
@@ -781,12 +779,12 @@ def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> 
 
 def compute_grid_segments(
     start_idx: int, end_idx: int, base: int, grid_tokens: int
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """Split [start_idx, end_idx) at grid boundaries base + k * grid_tokens
     so each segment maps to exactly one staging slot. An empty range yields
     one empty segment (a metadata-only last chunk still needs a send).
     """
-    segments: List[Tuple[int, int]] = []
+    segments: list[tuple[int, int]] = []
     seg_start = start_idx
     while seg_start < end_idx:
         next_boundary = base + ((seg_start - base) // grid_tokens + 1) * grid_tokens

@@ -13,15 +13,12 @@ import multiprocessing as mp
 import traceback
 from concurrent import futures
 from http import HTTPStatus
-from typing import List
 
 import grpc
 import zmq
 import zmq.asyncio
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
-from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
-
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
 from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
@@ -39,6 +36,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
+from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
 logger = logging.getLogger(__name__)
 SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
@@ -86,7 +84,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     def __init__(
         self,
         encoder: MMEncoder,
-        send_sockets: List[zmq.Socket],
+        send_sockets: list[zmq.Socket],
         server_args: ServerArgs,
     ):
         self.encoder = encoder
@@ -259,7 +257,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
             get_serving().host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
 
-    send_sockets: List[zmq.Socket] = []
+    send_sockets: list[zmq.Socket] = []
     for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
