@@ -670,6 +670,7 @@ class Envs:
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
+    # - T-LRU eviction.
     # - C128 or other unsupported components.
     # - Custom component overrides.
     # - Non-Linux platforms.
