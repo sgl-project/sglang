@@ -81,6 +81,16 @@ class TestDeepseekV4RocmMultiStream(CustomTestCase):
             )
         )
 
+    def test_hca_uses_one_compressor_stream(self):
+        layer = self._layer(
+            alt_streams=[object()],
+            indexer=None,
+            compress_ratio=128,
+        )
+
+        self.assertTrue(self._enabled(layer, ForwardMode.DECODE))
+        self.assertTrue(self._enabled(layer, ForwardMode.TARGET_VERIFY))
+
     def test_rejects_only_unsafe_runtime_configurations(self):
         layer = self._layer()
         self.assertFalse(
@@ -88,7 +98,7 @@ class TestDeepseekV4RocmMultiStream(CustomTestCase):
         )
         self.assertFalse(
             self._enabled(
-                self._layer(indexer=None, compress_ratio=128),
+                self._layer(indexer=None, compress_ratio=16),
                 ForwardMode.DECODE,
             )
         )
@@ -206,6 +216,104 @@ class TestDeepseekV4RocmMultiStream(CustomTestCase):
         self.assertEqual(
             helper_kwargs["pre_indexer_streams"], [core_stream, indexer_stream]
         )
+
+    def test_hip_helper_runs_hca_compressor_on_one_stream(self):
+        expected = (torch.empty(1), None)
+        call_order = []
+        main_stream = Mock()
+        core_stream = Mock()
+        layer = SimpleNamespace(
+            alt_streams=[core_stream],
+            compressor=object(),
+            indexer=None,
+            compress_ratio=128,
+            layer_id=7,
+            _forward_prepare=Mock(
+                side_effect=lambda *args, **kwargs: (
+                    call_order.append("prepare"),
+                    expected,
+                )[1]
+            ),
+        )
+        backend = SimpleNamespace(
+            forward_core_compressor=Mock(
+                side_effect=lambda *args, **kwargs: call_order.append("core")
+            ),
+            forward_indexer_compressor=Mock(),
+        )
+
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=main_stream),
+            patch.object(torch.cuda, "stream", return_value=MagicMock()),
+        ):
+            actual = deepseek_v4.MQALayer._forward_prepare_multi_stream_hip(
+                layer,
+                object(),
+                object(),
+                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                backend,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(call_order, ["core", "prepare"])
+        core_stream.wait_stream.assert_called_once_with(main_stream)
+        backend.forward_core_compressor.assert_called_once()
+        backend.forward_indexer_compressor.assert_not_called()
+        helper_kwargs = layer._forward_prepare.call_args.kwargs
+        self.assertTrue(helper_kwargs["skip_core_compressor"])
+        self.assertFalse(helper_kwargs["skip_indexer_compressor"])
+        self.assertEqual(helper_kwargs["pre_indexer_streams"], [core_stream])
+
+    def test_forward_prepare_joins_hca_stream_before_return(self):
+        call_order = []
+        main_stream = Mock()
+        core_stream = object()
+        main_stream.wait_stream.side_effect = lambda stream: call_order.append("join")
+        q = torch.empty(1)
+        q_lora = torch.empty(1)
+        layer = SimpleNamespace(
+            fuse_wqa_wkv=False,
+            wq_a=Mock(return_value=(q_lora, None)),
+            dsa_enable_prefill_cp=False,
+            use_fused_qk_norm_rope=False,
+            _normalize_q_lora=Mock(return_value=(q_lora, q_lora)),
+            _compute_q_b=Mock(return_value=q),
+            _compute_kv_to_cache=Mock(
+                side_effect=lambda *args, **kwargs: call_order.append("prepare")
+            ),
+            indexer=None,
+            compressor=object(),
+            compress_ratio=128,
+        )
+        backend = SimpleNamespace(forward_core_compressor=Mock())
+
+        with (
+            patch.object(deepseek_v4, "_is_npu", False),
+            patch.object(torch.cuda, "current_stream", return_value=main_stream),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                return_value=False,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_fp8",
+                return_value=False,
+            ),
+        ):
+            actual = deepseek_v4.MQALayer._forward_prepare(
+                layer,
+                torch.empty(1),
+                object(),
+                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                backend,
+                skip_core_compressor=True,
+                pre_indexer_streams=[core_stream],
+            )
+
+        self.assertIs(actual[0], q)
+        self.assertIsNone(actual[1])
+        self.assertEqual(call_order, ["prepare", "join"])
+        main_stream.wait_stream.assert_called_once_with(core_stream)
+        backend.forward_core_compressor.assert_not_called()
 
     def test_hip_helper_joins_side_streams_on_failure(self):
         main_stream = Mock()

@@ -1680,14 +1680,16 @@ class MQALayer(MqaAttentionBase):
             raise
 
     def _use_hip_multi_stream(self, forward_batch: ForwardBatch) -> bool:
+        if not (_is_hip and envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get()):
+            return False
+        is_csa = self.compress_ratio == 4 and self.indexer is not None
+        is_hca = self.compress_ratio == 128 and self.indexer is None
+        required_streams = 2 if is_csa else 1
         return (
-            _is_hip
-            and envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get()
-            and self.alt_streams is not None
-            and len(self.alt_streams) >= 2
+            self.alt_streams is not None
+            and len(self.alt_streams) >= required_streams
             and self.compressor is not None
-            and self.indexer is not None
-            and self.compress_ratio == 4
+            and (is_csa or is_hca)
             and get_is_capture_mode()
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
