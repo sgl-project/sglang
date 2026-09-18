@@ -1363,7 +1363,7 @@ async fn streaming_active_load_drops_on_client_disconnect() {
 /// returns; cancellation fires; handler returns 504.
 #[tokio::test]
 async fn janitor_expiry_returns_504_stale_request_expired() {
-    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    use sgl_router::policies::state::engine_load::{spawn_janitor, ActiveLoadRegistry};
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
     let worker =
@@ -1385,7 +1385,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     // tick (every 20ms) and fire the cancellation token before the
     // upstream returns.
     let active_load = ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        Arc::new(sgl_router::policies::state::engine_load::SystemTimeClock),
         Duration::from_millis(50),
     );
     let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));

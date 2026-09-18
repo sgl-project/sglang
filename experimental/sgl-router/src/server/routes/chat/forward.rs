@@ -5,7 +5,7 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::policies::active_load::ActiveLoadGuard;
+use crate::policies::state::engine_load::ActiveLoadGuard;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;

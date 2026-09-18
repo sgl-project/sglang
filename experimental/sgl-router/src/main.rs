@@ -8,10 +8,10 @@ use sgl_router::{
     config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
     policies::{
-        active_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
         factory::build_registry as build_policy_registry,
-        kv_events::{BlockSizeOracle, KvEventIndex},
         prefix_provider::RadixTreePrefixProvider,
+        state::engine_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
+        state::kv_events::{BlockSizeOracle, KvEventIndex},
         PolicyRegistry,
     },
     proxy::Proxy,

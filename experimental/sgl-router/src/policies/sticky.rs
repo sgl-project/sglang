@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
+use crate::policies::state::engine_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::{Policy, SelectionContext};
 use crate::server::metrics::{MetricsRegistry, StickyOutcome};
 use crate::workers::Worker;
@@ -271,7 +271,9 @@ mod tests {
     }
 
     fn policy(idle_secs: u64) -> StickyPolicy {
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(crate::policies::state::engine_load::MockClock::new(
+            Instant::now(),
+        ));
         StickyPolicy::with_clock(Duration::from_secs(idle_secs), fallback(), clock)
     }
 
@@ -374,7 +376,9 @@ mod tests {
     #[test]
     fn sweep_evicts_idle_entries_keeps_fresh() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(crate::policies::state::engine_load::MockClock::new(
+            Instant::now(),
+        ));
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0"), worker("w1")];
 
@@ -401,7 +405,9 @@ mod tests {
     #[test]
     fn hit_refreshes_last_seen_so_active_key_is_not_evicted() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(crate::policies::state::engine_load::MockClock::new(
+            Instant::now(),
+        ));
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));

@@ -3,11 +3,11 @@
 
 use crate::config::Config;
 
-use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
-use crate::policies::engine_load::EngineLoadTable;
-use crate::policies::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
+use crate::policies::state::engine_load::ActiveLoadRegistry;
+use crate::policies::state::engine_load::EngineLoadTable;
+use crate::policies::state::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
@@ -49,7 +49,7 @@ pub struct AppContext {
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
     /// Indexer), where those series would all be a structural zero — see
-    /// [`crate::policies::kv_events::KvEventIndex::metrics_source`].
+    /// [`crate::policies::state::kv_events::KvEventIndex::metrics_source`].
     pub kv_metrics: Option<KvIndexMetrics>,
     /// Open HTTP exchanges, on every route. What axum's graceful shutdown
     /// is actually waiting on during the drain — `active_load` sees only the

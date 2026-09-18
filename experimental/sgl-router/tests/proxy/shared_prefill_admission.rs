@@ -11,7 +11,7 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
+use sgl_router::policies::state::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
