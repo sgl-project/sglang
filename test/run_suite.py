@@ -71,6 +71,7 @@ PER_COMMIT_SUITES = {
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
         "base-b-test-1-gpu-large",
+        "base-b-test-1-gpu-h200",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
         "base-b-kernel-unit-test-1-gpu-large",

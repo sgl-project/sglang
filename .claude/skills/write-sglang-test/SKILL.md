@@ -67,7 +67,7 @@ Defined in `python/sglang/test/test_utils.py`:
 A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
 
 - **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
-- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
+- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`, and `1-gpu-h200` on `1-gpu-h200`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
 
 > CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
@@ -101,6 +101,7 @@ Use the lightest suite that meets your test's needs:
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
 - **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
+- **Single-GPU H200** → `base-b-test-1-gpu-h200`
 - **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-large`
 - **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-test-4-gpu-b200`
 - **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-large`
