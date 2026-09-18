@@ -26,8 +26,9 @@ tiling, and graph execution. **Request** controls the background, resolution,
 steps, and output count. Set reference PNG paths under **Variables**; edits
 upload files from the machine running cURL, so they need not exist on the server.
 
-Hardware selection applies the recommended placement for that GPU. H200 and
-B200 keep weights resident; consumer GPUs use offload to fit the full pipeline.
+Hardware selection applies the recommended placement for that GPU. H200,
+B200, and RTX PRO 6000 96GB keep weights resident; RTX 5090 and RTX 4090 use
+offload to fit the full pipeline.
 Custom two- and four-GPU topologies and unverified feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
 currently uses the Python/source command; no published Docker image is verified.
@@ -48,9 +49,10 @@ PY
 
 ### Platform measurements
 
-Measurements in this page refer to the listed source revisions. They precede
+The following four-platform comparison and the fusion measurements below precede
 the training-template and VAE normalization corrections in `c2a31b2693c`;
 their output comparisons should not be treated as baselines for that revision.
+The separate RTX PRO 6000 measurement uses the corrected implementation.
 
 | GPU | Recommended placement / attention | Generation median | Single edit | Peak device memory |
 | --- | --- | --- | --- | --- |
@@ -87,9 +89,35 @@ this complete recipe passed generation, editing, and transparent PNG output.
 
 These are measurements of this small workload, not universal latency or image
 quality guarantees. Different prompts, reference sizes, batching, and software
-versions can change memory use and latency. Transparent-input editing and the
-multi-reference/batched request recipes retain their separate H200 verification
-scope in the picker.
+versions can change memory use and latency. Multi-reference and batched request
+recipes retain their separate H200 verification scope in the picker.
+
+### RTX PRO 6000 Blackwell 96GB
+
+The recommended single-GPU command keeps all weights resident and selects Torch
+SDPA. This is the 96GB Blackwell Server Edition (SM120). This runtime also maps
+`--attention-backend fa` to SDPA on this GPU; Ring therefore requires another
+supported backend and is rejected with either selection in the picker.
+
+Source revision `1eab5de5990` was measured on 2026-09-18:
+
+| Placement | Generation median | Edit median | Peak device memory |
+| --- | --- | --- | --- |
+| Resident (recommended) | 8.23 s | 9.85 s | 40.1 GiB |
+| DiT layerwise offload | 10.28 s | 10.66 s | 26.1 GiB |
+
+Both runs used PyTorch 2.13.0+cu130, Transformers 5.12.1, Diffusers 0.37.0,
+native precision, eager execution, and full-image VAE decoding.
+After two 1024px/40-step warmups, each measured five generations and three edits
+at that same resolution and step count, with seed 42, CFG 1, and CPU noise
+generation. HTTP latency includes PNG serialization and excludes server startup;
+device memory was sampled every 0.5 seconds across startup and requests.
+
+Transparent generation and two repeated edits of the same transparent input passed
+with both placements, retaining alpha values from 0 to 255. Repeated requests
+and corresponding outputs across placements produced identical RGBA pixels for
+this workload. Quantized checkpoints and multi-GPU recipes on RTX PRO 6000 remain
+unverified.
 
 ### Lossless RoPE fusion
 
@@ -240,9 +268,9 @@ The model predicts continuous alpha values, including partly transparent edges.
 No thresholding or background-removal postprocessing is applied. Transparent
 generation and transparent-input editing were compared against the reference
 at 1024 × 1024 and 40 steps; that check does not guarantee perfect cutouts for
-every prompt. The generated cURL commands for transparent generation and
-single-image editing also passed on the recommended one-H200 server at that
-resolution and step count, with one output per request.
+every prompt. Transparent generation and single-image editing also passed on
+the recommended one-H200 and one-RTX PRO 6000 servers at that resolution and
+step count, with one output per request.
 
 ## 4. Offline requests
 
@@ -456,9 +484,9 @@ for loader and parallelism constraints.
 Select **NVFP4 DiT**, **NVFP4 encoder**, or **NVFP4 DiT + encoder** in the
 picker, then set the component directories under **Variables**. These options
 require Blackwell; H200 and RTX 4090 cannot run this native FP4 path. B200 has
-completed the checks below. RTX 5090 remains unverified for this model's NVFP4
-exports; its FlashInfer backend defaults to `auto`, because TensorRT-LLM FP4
-GEMM does not support SM120. Keep that default on RTX 5090.
+completed the checks below. RTX PRO 6000 and RTX 5090 remain unverified for this
+model's NVFP4 exports; their FlashInfer backend defaults to `auto`, because
+TensorRT-LLM FP4 GEMM does not support SM120. Keep that default on these GPUs.
 
 Each exported directory contains its architecture config, weight shards, and
 index. The config declares `quant_method: modelopt`, `quant_algo: NVFP4`, and

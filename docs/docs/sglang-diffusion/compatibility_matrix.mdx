@@ -38,8 +38,16 @@ bit-exact. In the tested image, spatial versus full decode gave RGBA PSNR
 
 Request-local prefix KV reuse and new-request graph replay have CUDA regression
 tests. The deployment picker marks only its exact tested HTTP combinations as
-verified, including H200, B200, RTX 5090, and RTX 4090. CLI-only combinations
-remain Unverified in the picker.
+verified, including H200, B200, RTX PRO 6000 96GB, RTX 5090, and RTX 4090.
+CLI-only combinations remain Unverified in the picker.
+
+On `1eab5de5990`, one RTX PRO 6000 Blackwell Server Edition passed repeated
+1024px/40-step HTTP generation, editing, transparent generation, and transparent
+input editing with resident weights or DiT layerwise offload and Torch SDPA.
+Repeated requests and corresponding outputs across placements matched RGBA
+pixels; transparent outputs retained alpha from 0 to 255. Its SM120
+RoPE, normalization, fusion-gate, and model regressions also passed. This check
+does not establish multi-GPU or quantized-checkpoint coverage on that platform.
 
 Disaggregated encoder, denoiser, and decoder roles passed full-checkpoint HTTP
 generation, variable-length prompts, image editing, and CFG on three B200 GPUs,
@@ -80,7 +88,8 @@ matched the exports after runtime layout transforms. Both offload modes
 matched resident RGBA pixels exactly. NVFP4 and TP2 change image and alpha
 values; this private export uses max calibration on only six requests, without
 SVDQuant or AWQ. See the cookbook for measured errors. Native FP4 requires
-Blackwell, and this model's NVFP4 exports remain unverified on RTX 5090.
+Blackwell, and this model's NVFP4 exports remain unverified on RTX PRO 6000 and
+RTX 5090.
 
 Synthetic Diffusers-format LoRA passed dynamic loading, merging,
 and removal on one B200 and TP2 with encoder folding; both removal paths

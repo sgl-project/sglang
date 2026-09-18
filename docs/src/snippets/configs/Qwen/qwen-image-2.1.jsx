@@ -1,11 +1,13 @@
 export const config = (() => {
-const platformAttention = (s) => s.hw === "rtx5090" ? "sdpa" : "fa";
-const effectiveAttention = (s) => s.attention === "platform" || (s.hw === "rtx5090" && s.attention === "fa") ? platformAttention(s) : s.attention;
+const sm120Hardware = ["rtx5090", "rtxpro6000"];
+const platformAttention = (s) => sm120Hardware.includes(s.hw) ? "sdpa" : "fa";
+const effectiveAttention = (s) => s.attention === "platform" || (sm120Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
   modelName: "Qwen-Image 2.1",
-  supportedHardware: ["h200", "b200", "rtx5090", "rtx4090"],
+  supportedHardware: ["h200", "b200", "rtxpro6000", "rtx5090", "rtx4090"],
   hardware: [
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
     { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
   ],
@@ -43,17 +45,17 @@ const config = {
       options: [
         {
           id: "resident", label: "Resident",
-          recommendedWhen: (s) => ["h200", "b200"].includes(s.hw),
+          recommendedWhen: (s) => ["h200", "b200", "rtxpro6000"].includes(s.hw),
           disabled: (s) => ["rtx5090", "rtx4090"].includes(s.hw) && Number(s.gpus_per_node) === 1,
           disableReason: "The full resident pipeline exceeds one consumer GPU's memory. Select CPU offload.",
           flags: (s) => [Number(s.gpus_per_node) === 1 ? "--performance-mode speed" : "--performance-mode manual"],
-          description: "Keep all components on the GPU. Recommended for H200 and B200; consumer cards need offload.",
+          description: "Keep all components on the GPU. Recommended for H200, B200, and RTX PRO 6000 96GB. RTX 5090 and RTX 4090 need offload.",
         },
         {
           id: "offload", label: "CPU offload",
           flags: (s) => ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
-          soft: (s) => !["rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
+          soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
           description: "Streams DiT layers. RTX 4090 also offloads the encoder between requests to leave room for image editing. Requires sufficient host RAM.",
         },
@@ -76,9 +78,9 @@ const config = {
         {
           id: "platform", label: "Automatic", recommended: true,
           flags: (s) => [`--attention-backend ${platformAttention(s) === "sdpa" ? "torch_sdpa" : "fa"}`],
-          description: "Uses the measured recommendation: SDPA on RTX 5090, FlashAttention on the other listed GPUs.",
+          description: "Uses SDPA on RTX PRO 6000 and RTX 5090, and FlashAttention on the other listed GPUs.",
         },
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX 5090." },
+        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000 and RTX 5090." },
         {
           id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"],
           soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("sdpa") && Number(s.gpus_per_node) === r.gpus_per_node),
@@ -138,19 +140,19 @@ const config = {
         },
         {
           id: "nvfp4_dit", label: "NVFP4 DiT", flags: ['--component-paths.transformer "{{NVFP4_DIT_PATH}}"'],
-          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disabled: (s) => !["b200", "rtxpro6000", "rtx5090"].includes(s.hw),
           disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
-          soft: true, softReason: "A calibrated ModelOpt-format DiT export passed 1024px/40-step generation, editing, and transparent output on B200. Other exports and RTX 5090 need validation.",
+          soft: true, softReason: "A calibrated ModelOpt-format DiT export passed 1024px/40-step generation, editing, and transparent output on B200. Other exports, RTX PRO 6000, and RTX 5090 need validation.",
         },
         {
           id: "nvfp4_encoder", label: "NVFP4 encoder", flags: ['--component-paths.text_encoder "{{NVFP4_ENCODER_PATH}}"'],
-          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disabled: (s) => !["b200", "rtxpro6000", "rtx5090"].includes(s.hw),
           disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
           soft: true, softReason: "A calibrated language-encoder export passed generation, editing, and transparent output on B200; vision weights retain native precision. Output quality requires validation.",
         },
         {
           id: "nvfp4_both", label: "NVFP4 DiT + encoder", flags: ['--component-paths.transformer "{{NVFP4_DIT_PATH}}"', '--component-paths.text_encoder "{{NVFP4_ENCODER_PATH}}"'],
-          disabled: (s) => !["b200", "rtx5090"].includes(s.hw),
+          disabled: (s) => !["b200", "rtxpro6000", "rtx5090"].includes(s.hw),
           disableReason: "Native NVFP4 requires a Blackwell GPU (compute capability 10.0 or newer).",
           soft: true, softReason: "Combined exports passed generation, editing, transparent output, offload, and TP2 on B200. The small max-calibration sample changes image and alpha values; validate your exported checkpoint.",
         },
@@ -257,6 +259,8 @@ const config = {
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
         { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
+        { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
+        { id: "rtxpro6000-1-offload", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"] },
         { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
       ],
@@ -272,7 +276,7 @@ const config = {
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
         if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
-        if (s.precision?.startsWith("nvfp4_") && !["b200", "rtx5090"].includes(s.hw)) errors.push("Native NVFP4 requires a Blackwell GPU. Select B200 or RTX 5090.");
+        if (s.precision?.startsWith("nvfp4_") && !["b200", "rtxpro6000", "rtx5090"].includes(s.hw)) errors.push("Native NVFP4 requires a Blackwell GPU. Select B200, RTX PRO 6000, or RTX 5090.");
         if (perNode === 1 && ["rtx5090", "rtx4090"].includes(s.hw) && s.placement === "resident") errors.push("The full resident pipeline exceeds this GPU's memory. Select CPU offload.");
         return errors;
       },
@@ -293,7 +297,7 @@ const config = {
       // Exact HTTP workloads from the validation matrix, not blanket quality coverage.
       const requestVerified = serveVerified
         && ((["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
-            && (s.hw === "h200" || s.mode === "text" || s.background === "scene"))
+            && (["h200", "rtxpro6000"].includes(s.hw) || s.mode === "text" || s.background === "scene"))
           || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
           || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
       const world = Number(s.nodes) * Number(s.gpus_per_node);
@@ -317,7 +321,7 @@ const config = {
           },
           resolvedSettings: {
             attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)`
-              : s.hw === "rtx5090" && s.attention === "fa" ? "Torch SDPA (FA fallback)" : undefined,
+              : sm120Hardware.includes(s.hw) && s.attention === "fa" ? "Torch SDPA (FA fallback)" : undefined,
             encoder: s.encoder === "auto" && world === 1 ? "Single GPU (auto)" : undefined,
           },
         },
