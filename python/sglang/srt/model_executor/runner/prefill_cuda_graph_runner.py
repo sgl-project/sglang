@@ -1336,9 +1336,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_max_context_len=batch_max_context_len,
         ):
             return False
-        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
-            forward_batch
-        ):
+        if getattr(self, "enable_cp_bcg_capture", False):
+            if not is_cp_active(forward_batch):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
