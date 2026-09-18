@@ -240,7 +240,6 @@ def _get_spec_num_draft_tokens(other_args):
     if idx + 1 >= len(args):
         return None
     return int(args[idx + 1])
-
 # Package filtering keywords
 PACKAGE_FILTER_KEYWORDS = [
     "sglang",
