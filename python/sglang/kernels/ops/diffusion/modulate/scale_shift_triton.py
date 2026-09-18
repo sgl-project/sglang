@@ -6,6 +6,7 @@ from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
+    is_xpu,
     lazy_fallback,
     select_impl,
 )
@@ -420,8 +421,8 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        if shift.dim() == 4 and is_hip():
-            # ROCm has no fused CUTLASS scale-shift kernel, so this native path
+        if shift.dim() == 4 and (is_hip() or is_xpu()):
+            # ROCm and XPU lack a fused CUTLASS scale-shift kernel, so this path
             # handles the causal Wan / LingBot output AdaLN, which passes a
             # per-frame shift [B, F, 1, C]. Broadcast it across each frame's
             # tokens to per-token [B, L, C] before flattening to [B*L, C],
@@ -524,6 +525,66 @@ def fuse_scale_shift_kernel(
             num_stages=2,
         )
     return output
+
+
+def expand_scale_shift_cpu_param(
+    tensor: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    B, L, C = x.shape
+
+    if tensor.numel() == 1:
+        return tensor.reshape(1, 1, 1).expand(B, L, C)
+
+    if tensor.dim() == 1:
+        if tensor.shape[0] != C:
+            raise ValueError(f"1D modulation tensor must have shape [{C}]")
+        tensor = tensor.reshape(1, 1, C)
+
+    elif tensor.dim() == 2:
+        tensor = tensor[:, None, :]
+
+    elif tensor.dim() == 3:
+        pass
+
+    elif tensor.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        if tensor.shape[2] != 1:
+            raise ValueError("4D modulation tensor must have shape [B, F, 1, C]")
+        num_frames = tensor.shape[1]
+        if L % num_frames != 0:
+            raise ValueError("sequence length must be divisible by num_frames")
+        frame_seqlen = L // num_frames
+        tensor = tensor.expand(
+            tensor.shape[0], num_frames, frame_seqlen, tensor.shape[-1]
+        ).reshape(tensor.shape[0], L, tensor.shape[-1])
+
+    else:
+        raise ValueError("modulation tensor must be scalar or 1D/2D/3D/4D")
+    return tensor.expand(B, L, C)
+
+
+def _fuse_scale_shift_kernel_cpu(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    scale_constant: float = 1.0,
+    block_l: int = 128,
+    block_c: int = 128,
+) -> torch.Tensor:
+    import sgl_kernel  # noqa: F401
+
+    del block_l, block_c
+
+    scale = expand_scale_shift_cpu_param(scale, x)
+    shift = expand_scale_shift_cpu_param(shift, x)
+
+    return torch.ops.sgl_kernel.fused_scale_shift_cpu(
+        x,
+        scale,
+        shift,
+        scale_constant,
+    )
 
 
 def fuse_layernorm_scale_shift_gate_select01_kernel(
@@ -733,5 +794,5 @@ fuse_scale_shift_kernel = select_impl(
     npu=lazy_fallback("npu", "fuse_scale_shift_native"),
     mps=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     musa=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
-    cpu=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
+    cpu=_fuse_scale_shift_kernel_cpu,
 )
