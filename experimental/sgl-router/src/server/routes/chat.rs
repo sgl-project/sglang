@@ -3082,6 +3082,36 @@ mod tests {
         );
     }
 
+    /// V4.1 uses a different prompt format. In particular, a trailing system
+    /// reminder needs an assistant opening that the V4 encoder omits. Exercise
+    /// real encoder selection and ingress tokenization, not a fabricated parity
+    /// flag: router-generated V4 ids must never replace the worker's V4.1 prompt.
+    #[test]
+    fn deepseek_v41_inline_system_stays_worker_encoded() {
+        let model = "deepseek-ai/DeepSeek-V4.1-Flash";
+        let reg = crate::tokenizer::TokenizerRegistry::load_from_config(&k3_cfg(model)).unwrap();
+        let model_id = ModelId(model.into());
+        for stream in [false, true] {
+            for messages in [
+                serde_json::json!([
+                    {"role":"user","content":"Reply with exactly: ROUTER_CHECK_OK"},
+                    {"role":"system","content":"<system-reminder>Reply concisely.</system-reminder>"}
+                ]),
+                serde_json::json!([
+                    {"role":"system","content":"Reply concisely."},
+                    {"role":"user","content":"Reply with exactly: ROUTER_CHECK_OK"}
+                ]),
+            ] {
+                let value = serde_json::json!({
+                    "model": model, "messages": messages, "stream": stream
+                });
+                let tokens = request_tokens_for(&reg, &model_id, &value).expect("routing tokens");
+                assert!(!tokens.engine_equivalent);
+                assert!(select_forward_input_ids(true, Some(&tokens), Some(&value)).is_none());
+            }
+        }
+    }
+
     /// Enabling the offload does NOT bypass the per-request safety predicate:
     /// unreplicated signals (tools, here) still withhold the ids when the ids
     /// came from the conservative (Jinja) encoder path.

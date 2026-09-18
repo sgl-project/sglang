@@ -77,18 +77,24 @@ fn config() -> Config {
 }
 
 fn build_ctx(url: String) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_for_model(url, MODEL)
+}
+
+fn build_ctx_for_model(url: String, model: &str) -> Arc<AppContext> {
+    let mut cfg = config();
+    cfg.model.id = model.into();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+    assert_eq!(
+        tokenizers.has_chat_encoder(model),
+        model == MODEL,
+        "only the V4 fixture must auto-attach the built-in V4 encoder"
     );
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,
-        model_ids: vec![ModelId(MODEL.into())],
+        model_ids: vec![ModelId(model.into())],
         bootstrap_port: None,
         transfer_group: None,
     });
@@ -128,6 +134,30 @@ fn captured(mock: &MockWorker) -> Value {
         .clone()
         .expect("worker captured a request body");
     serde_json::from_slice(&b).expect("captured body is valid JSON")
+}
+
+#[tokio::test]
+async fn deepseek_v41_reminder_reaches_worker_without_v4_input_ids() {
+    let model = "deepseek-ai/DeepSeek-V4.1-Flash";
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_for_model(mock.url.clone(), model);
+    for stream in [false, true] {
+        let request = json!({
+            "model": model,
+            "messages": [
+                {"role":"user","content":"Reply with exactly: ROUTER_CHECK_OK"},
+                {"role":"system","content":"<system-reminder>Reply concisely.</system-reminder>"}
+            ],
+            "stream": stream,
+            "max_tokens": 64,
+            "temperature": 0,
+        });
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        let body = captured(&mock);
+        assert!(body.get("input_ids").is_none(), "wrong encoder ids: {body}");
+        assert_eq!(body["messages"], request["messages"]);
+        assert_eq!(body["stream"], request["stream"]);
+    }
 }
 
 #[tokio::test]
