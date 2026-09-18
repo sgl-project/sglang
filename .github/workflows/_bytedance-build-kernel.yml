@@ -47,26 +47,36 @@ on:
         default: "1"
 
 concurrency:
-  group: bytedance-sglang-kernel-${{ github.ref }}-${{ inputs.artifact_name }}
-  cancel-in-progress: true
+  group: bytedance-${{ inputs.runner }}
+  cancel-in-progress: false
 
 jobs:
   build-wheel:
     runs-on: ${{ inputs.runner }}
+    env:
+      SGL_KERNEL_BUILDER_NAME: sgl-kernel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.artifact_name }}
+      BUILDKITD_CONFIG: /tmp/sgl-kernel-buildkitd.toml
     steps:
       - name: Clean workspace
         run: |
           docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
-      - name: Prune stale Docker data
-        run: |
-          # Do not run daemon-wide system/volume pruning on shared runners.
-          docker buildx prune --filter "until=72h" -f
-
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref }}
+
+      - name: Reclaim disposable caches and require build capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 50
+          cat > "${BUILDKITD_CONFIG}" <<'EOF'
+          [worker.oci]
+            gc = true
+            reservedSpace = "5GB"
+            maxUsedSpace = "30GB"
+            minFreeSpace = "50GB"
+          EOF
 
       - name: Set up Python ${{ inputs.python_version }}
         uses: actions/setup-python@v5
@@ -85,7 +95,8 @@ jobs:
         env:
           BUILD_JOBS: ${{ inputs.build_jobs }}
           NVCC_THREADS: ${{ inputs.nvcc_threads }}
-          USE_CCACHE: ${{ inputs.use_ccache }}
+          USE_CCACHE: "0"
+          USE_LOCAL_BUILDX_CACHE: "0"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -93,3 +104,10 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: python/sglang/kernels/aot/dist/*
           if-no-files-found: error
+
+      - name: Remove run-scoped BuildKit state
+        if: always()
+        run: |
+          docker buildx rm "${SGL_KERNEL_BUILDER_NAME}" || true
+          docker image prune -af || true
+          df -h /

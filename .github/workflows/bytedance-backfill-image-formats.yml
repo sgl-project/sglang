@@ -46,6 +46,9 @@ jobs:
   backfill:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: x64-docker-build-node
+    concurrency:
+      group: bytedance-x64-docker-build-node
+      cancel-in-progress: false
     environment: prod
     env:
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
@@ -65,8 +68,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Reclaim disposable caches and require conversion capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              gc = true
+              reservedSpace = "10GB"
+              maxUsedSpace = "100GB"
+              minFreeSpace = "150GB"
 
       - name: Set up crane
         uses: imjasonh/setup-crane@v0.4
@@ -382,3 +397,9 @@ jobs:
 
           echo ""
           echo "All backfills complete."
+
+      - name: Remove disposable local images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /

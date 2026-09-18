@@ -1,0 +1,52 @@
+name: Bytedance Clean Build Runner Disk
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner pool to clean; run only when that pool has no active jobs"
+        required: true
+        type: choice
+        options:
+          - x64-kernel-build-node
+          - x64-docker-build-node
+      confirm:
+        description: "Type DELETE_BUILD_CACHES to confirm"
+        required: true
+        type: string
+
+concurrency:
+  group: bytedance-${{ inputs.runner }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Validate explicit confirmation
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm }}" != "DELETE_BUILD_CACHES" ]; then
+            echo "::error::confirmation must be DELETE_BUILD_CACHES"
+            exit 1
+          fi
+
+      - name: Checkout cleanup script
+        uses: actions/checkout@v4
+
+      - name: Deep-clean disposable build caches
+        run: |
+          set -euo pipefail
+          case "${{ inputs.runner }}" in
+            x64-kernel-build-node) required_gb=50 ;;
+            x64-docker-build-node) required_gb=150 ;;
+            *) echo "::error::unsupported runner pool"; exit 1 ;;
+          esac
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh \
+            --deep-clean \
+            --required-gb "${required_gb}"

@@ -46,6 +46,9 @@ jobs:
   sync:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: x64-docker-build-node
+    concurrency:
+      group: bytedance-x64-docker-build-node
+      cancel-in-progress: false
     environment: prod
     env:
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
@@ -69,6 +72,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Reclaim disposable caches and require sync capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 50
+
       - name: Validate Volcengine CR configuration
         run: |
           set -euo pipefail
@@ -89,6 +97,11 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
+            [worker.oci]
+              gc = true
+              reservedSpace = "5GB"
+              maxUsedSpace = "30GB"
+              minFreeSpace = "50GB"
 
       - name: Login to Volcengine CR
         run: |
@@ -120,3 +133,9 @@ jobs:
             --platform "${SYNC_PLATFORM}" \
             --plan-file /tmp/volcengine-sync-plan.json \
             --execute
+
+      - name: Remove disposable local images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /

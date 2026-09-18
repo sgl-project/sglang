@@ -374,6 +374,9 @@ jobs:
     if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_verify_image != '' }}
     environment: prod
     runs-on: x64-docker-build-node
+    concurrency:
+      group: bytedance-x64-docker-build-node
+      cancel-in-progress: false
     env:
       IMAGE_REF: ${{ inputs.private_debug_verify_image }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
@@ -381,6 +384,11 @@ jobs:
     steps:
       - name: Checkout verification script
         uses: actions/checkout@v4
+
+      - name: Reclaim disposable caches and require verification capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 50
 
       - name: Login to Volcengine CR
         run: |
@@ -430,3 +438,9 @@ jobs:
             python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
             python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
           '
+
+      - name: Remove pulled verification images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /

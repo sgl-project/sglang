@@ -107,6 +107,9 @@ jobs:
     if: github.repository == 'bytedance-iaas/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: x64-docker-build-node
+    concurrency:
+      group: bytedance-x64-docker-build-node
+      cancel-in-progress: false
     env:
       CUDA_KEY: ${{ inputs.cuda_key }}
       CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
@@ -265,21 +268,10 @@ jobs:
             echo "build-source=${BUILD_SOURCE}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          docker-images: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
-
-      - name: Prune Docker to reclaim disk space
+      - name: Reclaim disposable caches and require build capacity
         run: |
-          # Do not run daemon-wide system/volume pruning on shared runners.
-          docker buildx prune --filter "until=72h" -f
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
 
       - name: Download local sgl-kernel wheel
         if: ${{ inputs.artifact_name != '' }}
@@ -296,6 +288,11 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
+            [worker.oci]
+              gc = true
+              reservedSpace = "10GB"
+              maxUsedSpace = "100GB"
+              minFreeSpace = "150GB"
 
       - name: Login to Volcengine CR
         run: |
@@ -664,3 +661,9 @@ jobs:
           print(json.dumps({"nydus_layer_media_types": media_types}))
           PY
           done
+
+      - name: Remove disposable local images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /
