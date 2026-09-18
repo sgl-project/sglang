@@ -1,12 +1,12 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_sampling.py
 # and /sgl-workspace/sglang/python/sglang/kernels/aot/tests/test_sampling.py
 
-import os
 import sys
 
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -96,15 +96,6 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-def _default_is_deterministic() -> bool:
-    return os.environ.get("SGLANG_RENORM_DETERMINISTIC", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
     """A heavy-tailed, high-entropy distribution: thousands of tokens survive a
     top-p 0.95 cutoff, so the renorm kernels' histogram sums have many terms.
@@ -139,7 +130,7 @@ def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
         out = top_p_renorm_prob(probs, top_p, deterministic=True)
         assert torch.equal(out, ref), "top_p_renorm_prob output changed between calls"
     # the default path is the deterministic one unless the env opts out
-    if _default_is_deterministic():
+    if envs.SGLANG_RENORM_DETERMINISTIC.get():
         assert torch.equal(top_p_renorm_prob(probs, top_p), ref)
 
 
@@ -154,7 +145,7 @@ def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
     for _ in range(30):
         out = top_k_renorm_prob(probs, top_k, deterministic=True)
         assert torch.equal(out, ref), "top_k_renorm_prob output changed between calls"
-    if _default_is_deterministic():
+    if envs.SGLANG_RENORM_DETERMINISTIC.get():
         assert torch.equal(top_k_renorm_prob(probs, top_k), ref)
     # and the deterministic kernel must agree with the fast one up to rounding
     fast = top_k_renorm_prob(probs, top_k, deterministic=False)

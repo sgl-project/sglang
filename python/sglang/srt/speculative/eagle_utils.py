@@ -883,10 +883,6 @@ def eagle_sample(
             from sglang.kernels.ops.speculative.reject_sampling import (
                 chain_speculative_sampling_triton,
             )
-            from sglang.srt.layers.sampling_renorm import (
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-            )
 
         # if/else, not a ternary: the CUDA-only name still has to resolve in the
         # branch not taken, and HIP only reaches here with rejection sampling on.
