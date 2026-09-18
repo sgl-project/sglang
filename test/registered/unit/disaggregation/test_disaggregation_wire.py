@@ -70,206 +70,57 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class TestMooncakeHostDestination(unittest.TestCase):
-    def setUp(self):
-        self.manager = object.__new__(MooncakeKVManager)
-        args = self.manager.kv_args = KVArgs()
-        args.kv_data_ptrs = [0x1000, 0x2000]
-        args.kv_data_lens = [512, 512]
-        args.kv_item_lens = [128, 128]
-        args.host_kv_data_ptrs = [0x3000, 0x4000]
-        args.host_kv_data_lens = [1024, 1024]
-        args.host_kv_item_lens = [128, 128]
-        args.aux_data_ptrs = [0x5000]
-        args.aux_data_lens = [128]
-        args.state_types = []
-        args.state_data_ptrs = []
-        args.state_data_lens = []
-        args.state_item_lens = []
-        args.state_dim_per_tensor = []
-        args.state_layer_ids = []
-        args.kv_layer_ids = []
-        args.engine_rank = 0
-        args.prefill_start_layer = 0
-        self.manager.local_ip = "127.0.0.1"
-        self.manager.rank_port = 1234
-        self.manager.attn_tp_size = 1
-        self.manager.attn_cp_size = 1
-        self.manager.pp_size = 1
-        self.manager.dcp_size = 1
-        self.manager.dcp_rank = 0
-        self.manager.enable_staging = False
-        self.manager.is_mla_backend = False
-        self.manager.is_hybrid_mla_backend = False
-        self.manager.enable_custom_mem_pool = False
-        self.manager.max_transfer_batch_indices = 0
-        self.manager.engine = Mock()
-        self.receiver = object.__new__(MooncakeKVReceiver)
-        self.receiver.kv_mgr = self.manager
-        self.receiver.bootstrap_infos = [
-            {"is_dummy": False, "supports_host_destination": True}
-        ]
-        self.receiver.bootstrap_room = 42
-        self.receiver.session_id = "session"
-        self.receiver.required_dst_info_num = 1
-        self.receiver.prefill_info = SimpleNamespace(
-            attn_tp_size=1, pp_size=1, attn_cp_size=1
-        )
-        self.socket = Mock()
-        connect = patch.object(
-            self.receiver,
-            "_connect_to_bootstrap_server",
-            return_value=(self.socket, threading.Lock()),
-        )
-        connect.start()
-        self.addCleanup(connect.stop)
-
-    def register(self):
-        self.assertTrue(self.receiver._register_kv_args())
-        return KVArgsRegisterInfo.from_zmq(self.socket.send_multipart.call_args.args[0])
-
-    def metadata(self, destination=KVTransferDestination.DEVICE):
-        self.receiver.send_metadata(
-            np.array([5, 7], dtype=np.int32), aux_index=3, destination=destination
-        )
-        return TransferInfo.from_zmq(self.socket.send_multipart.call_args.args[0])
-
-    def test_sender_clear_preserves_abort_ack_until_writes_drain(self):
+class TestDisaggregationWire(unittest.TestCase):
+    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
+        manager = object.__new__(MooncakeKVManager)
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 42
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
-                self.manager.request_status = {42: KVPoll.Failed}
-                self.manager.req_to_decode_prefix_len = {42: 0}
-                self.manager.transfer_infos = {42: {}}
-                self.manager._staging_outstanding = {42: outstanding}
-                self.manager._deferred_ack_targets = {}
-                self.manager.register_deferred_ack_target(42, "127.0.0.1", 1234)
-                sender = object.__new__(MooncakeKVSender)
-                sender.kv_mgr = self.manager
-                sender.bootstrap_room = 42
-                with patch.object(self.manager, "_send_abort_ack") as ack:
+                manager.request_status = {42: KVPoll.Failed}
+                manager._staging_outstanding = {42: outstanding}
+                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
+                with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
-                    self.assertNotIn(42, self.manager.request_status)
                     if outstanding:
                         ack.assert_not_called()
-                        self.assertIn(42, self.manager._deferred_ack_targets)
-                        self.manager._staging_outstanding[42] = 0
-                        self.manager._maybe_ack_drained_abort(42)
+                        manager._staging_outstanding[42] = 0
+                        manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once_with("127.0.0.1", 1234, 42)
-                    self.assertNotIn(42, self.manager._deferred_ack_targets)
-                    self.manager._maybe_ack_drained_abort(42)
+                    manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
 
-    def test_host_transfer_and_legacy_device_wire(self):
-        self.manager._validate_host_pool()
-        self.manager.register_buffer_to_engine()
-        self.manager.engine.batch_register.assert_called_once_with(
-            [0x1000, 0x2000, 0x3000, 0x4000, 0x5000],
-            [512, 512, 1024, 1024, 128],
-        )
-        info = self.register()
-        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 22)
-        self.assertEqual(info.dst_host_kv_ptrs, [0x3000, 0x4000])
-        self.assertEqual(info.dst_host_kv_data_lens, [1024, 1024])
-        self.assertEqual(info.dst_host_kv_item_lens, [128, 128])
-        req = self.metadata(KVTransferDestination.HOST)
-        self.assertEqual(req.destination, KVTransferDestination.HOST)
-        self.assertEqual(req.dst_aux_index, 3)
-        np.testing.assert_array_equal(req.dst_kv_indices, [5, 7])
-        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 11)
+    def test_host_timeout_keeps_ack_that_arrives_before_cleanup(self):
+        manager = object.__new__(CommonKVManager)
+        manager._deferred_abort_ack_tracker = {}
+        manager.waiting_timeout = 0
+        manager.failure_records = {}
+        manager.failure_lock = threading.Lock()
+        manager.request_status = {}
+        manager.local_ip, manager.rank_port = "127.0.0.1", 1234
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.kv_mgr = manager
+        receiver.bootstrap_infos = [{}]
+        receiver.bootstrap_room, receiver.init_time = 42, 0
+        receiver.destination = KVTransferDestination.HOST
+        receiver.abort_notified, receiver.conclude_state = False, None
+        socket = Mock()
+        socket.send_multipart.side_effect = lambda _: manager.note_abort_ack(42, 0)
         with (
-            patch.object(self.manager, "_transfer_data", return_value=0) as transfer,
-            get_context().override_server_args(enable_unified_memory=False),
+            patch.object(receiver, "invalidate_cached_bootstrap_infos"),
+            patch.object(
+                receiver,
+                "_connect_to_bootstrap_server",
+                return_value=(socket, threading.Lock()),
+            ),
         ):
-            self.assertEqual(
-                self.manager.send_kvcache(
-                    "session",
-                    np.array([0, 2], dtype=np.int32),
-                    self.manager._select_kv_destination(req, info),
-                    req.dst_kv_indices,
-                    executor=None,
-                ),
-                0,
-            )
-        transfer.assert_called_once_with(
-            "session",
-            [
-                (0x1000, 0x3000 + 5 * 128, 128),
-                (0x1000 + 2 * 128, 0x3000 + 7 * 128, 128),
-                (0x2000, 0x4000 + 5 * 128, 128),
-                (0x2000 + 2 * 128, 0x4000 + 7 * 128, 128),
-            ],
-        )
-        self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
+            self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
+            self.assertTrue(manager.is_abort_release_safe(42, 1))
+            receiver.conclude_state = KVPoll.Failed
+            receiver.abort()
+            self.assertTrue(manager.is_abort_release_safe(42, 1))
+            socket.send_multipart.assert_called_once()
 
-        args = self.manager.kv_args
-        args.host_kv_data_ptrs = None
-        args.host_kv_data_lens = None
-        args.host_kv_item_lens = None
-        info = self.register()
-        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 19)
-        self.assertEqual(info.dst_host_kv_ptrs, [])
-        req = self.metadata()
-        self.assertEqual(req.destination, KVTransferDestination.DEVICE)
-        self.assertEqual(len(self.socket.send_multipart.call_args.args[0]), 10)
-        self.assertIs(self.manager._select_kv_destination(req, info), info.dst_kv_ptrs)
-        with self.assertRaisesRegex(ValueError, "not registered"):
-            self.metadata(KVTransferDestination.HOST)
-
-    def test_old_peer_and_mismatched_tp_reject_host_before_publish(self):
-        for target, field, value in [
-            (self.receiver, "bootstrap_infos", [{}]),
-            (self.receiver.prefill_info, "attn_tp_size", 2),
-        ]:
-            with self.subTest(field=field), patch.object(target, field, value):
-                with self.assertRaisesRegex(ValueError, "does not support"):
-                    self.metadata(KVTransferDestination.HOST)
-        self.socket.send_multipart.assert_not_called()
-
-    def test_invalid_stride_and_page_fail_before_transfer(self):
-        info = self.register()
-        req = self.metadata(KVTransferDestination.HOST)
-        for target, field, value in [
-            (info, "dst_host_kv_item_lens", [64, 64]),
-            (req, "dst_kv_indices", np.array([8], dtype=np.int32)),
-        ]:
-            with (
-                self.subTest(field=field, value=value),
-                patch.object(target, field, value),
-            ):
-                with self.assertRaises(ValueError):
-                    self.manager._select_kv_destination(req, info)
-
-    def test_host_timeout_arms_drain_tracker_before_abort_and_keeps_ack(self):
-        self.metadata(KVTransferDestination.HOST)
-        self.manager._deferred_abort_ack_tracker = {}
-        self.manager.waiting_timeout = 0
-        self.manager.failure_records = {}
-        self.manager.failure_lock = threading.Lock()
-        self.manager.request_status = {42: KVPoll.WaitingForInput}
-        self.receiver.abort_notified = False
-        self.receiver.conclude_state = None
-        self.socket.reset_mock()
-
-        def receive_abort(parts):
-            self.assertEqual(parts[0], b"ABORT")
-            self.assertIn(42, self.manager._deferred_abort_ack_tracker)
-            self.manager.note_abort_ack(42, 0)
-
-        self.socket.send_multipart.side_effect = receive_abort
-        with patch.object(self.receiver, "invalidate_cached_bootstrap_infos"):
-            self.assertEqual(self.receiver._check_waiting_timeout(), KVPoll.Failed)
-        self.assertTrue(self.receiver.abort_notified)
-        self.assertTrue(self.manager.is_abort_release_safe(42, 1))
-
-        # The scheduler observes Failed after the notification and must not
-        # erase an ack that raced ahead of its deferred-release bookkeeping.
-        self.receiver.conclude_state = KVPoll.Failed
-        self.receiver.abort()
-        self.assertTrue(self.manager.is_abort_release_safe(42, 1))
-        self.socket.send_multipart.assert_called_once()
-
-
-class TestDisaggregationWire(unittest.TestCase):
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -298,6 +149,45 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+
+        self.assertEqual(info.dst_host_kv_ptrs, [])
+        msg[16:18] = [b"1", b"0"]
+        msg.extend([b"", pack_int_lists([[0x4000], [1024], [128]], "Q")])
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_host_kv_ptrs, [0x4000])
+        manager = object.__new__(MooncakeKVManager)
+        manager.pp_size = manager.dcp_size = manager.attn_cp_size = 1
+        manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(state_types=[], kv_item_lens=[128])
+        metadata = [
+            b"42",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            np.array([5, 7], dtype=np.int32).tobytes(),
+            b"3",
+            b"",
+            b"1",
+            b"0",
+            b"",
+        ]
+        device_req = TransferInfo.from_zmq(metadata)
+        self.assertIs(
+            manager._select_kv_destination(device_req, info), info.dst_kv_ptrs
+        )
+        host_req = TransferInfo.from_zmq(metadata + [b"host"])
+        self.assertIs(
+            manager._select_kv_destination(host_req, info), info.dst_host_kv_ptrs
+        )
+        for field, value in (
+            ("dst_host_kv_ptrs", []),
+            ("dst_host_kv_item_lens", [64]),
+            ("dst_attn_tp_size", 2),
+            ("dst_host_kv_data_lens", [896]),
+        ):
+            with self.subTest(field=field), patch.object(info, field, value):
+                with self.assertRaises(ValueError):
+                    manager._select_kv_destination(host_req, info)
 
     def test_int_lists_roundtrip(self):
         cases = [

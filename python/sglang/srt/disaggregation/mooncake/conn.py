@@ -174,6 +174,7 @@ class KVArgsRegisterInfo:
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        host_buffers = unpack_int_lists(msg[19], "Q") if len(msg) > 19 else [[], [], []]
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -215,21 +216,9 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
-            dst_host_kv_ptrs=(
-                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
-                if len(msg) > 19
-                else []
-            ),
-            dst_host_kv_data_lens=(
-                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
-                if len(msg) > 20
-                else []
-            ),
-            dst_host_kv_item_lens=(
-                list(struct.unpack(f"{len(msg[21]) // 8}Q", msg[21]))
-                if len(msg) > 21
-                else []
-            ),
+            dst_host_kv_ptrs=host_buffers[0],
+            dst_host_kv_data_lens=host_buffers[1],
+            dst_host_kv_item_lens=host_buffers[2],
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
@@ -260,7 +249,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         # Host destinations cannot be reused until a failed transfer has drained.
         self.enable_deferred_decode_kv_release |= self.supports_host_destination
-        self._validate_host_pool()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -352,42 +340,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
-    def _validate_host_pool(self) -> None:
-        args = self.kv_args
-        if not any(
-            (args.host_kv_data_ptrs, args.host_kv_data_lens, args.host_kv_item_lens)
-        ):
-            return
-        if (
-            not args.host_kv_data_ptrs
-            or len(args.host_kv_data_ptrs) != len(args.kv_data_ptrs)
-            or len(args.host_kv_data_lens or []) != len(args.kv_data_ptrs)
-            or args.host_kv_item_lens != args.kv_item_lens
-        ):
-            raise ValueError("Host KV pool must match the device KV buffer geometry")
-        for ptr, length, item_len in zip(
-            args.host_kv_data_ptrs,
-            args.host_kv_data_lens,
-            args.host_kv_item_lens,
-        ):
-            if ptr <= 0 or item_len <= 0 or length <= 0 or length % item_len:
-                raise ValueError("Invalid host KV buffer address, size, or page stride")
-
     def _select_kv_destination(
         self, req: TransferInfo, info: KVArgsRegisterInfo
     ) -> List[int]:
         if req.destination == KVTransferDestination.DEVICE:
             return info.dst_kv_ptrs
-        if req.destination != KVTransferDestination.HOST:
-            raise ValueError(f"Unknown KV transfer destination: {req.destination}")
         if (
-            self.attn_tp_size != info.dst_attn_tp_size
-            or self.pp_size != 1
-            or self.attn_cp_size != 1
-            or self.dcp_size != 1
+            not self.supports_host_destination
+            or self.attn_tp_size != info.dst_attn_tp_size
             or info.dst_dcp_size != 1
-            or self.enable_staging
-            or self.kv_args.state_types
             or info.dst_state_data_ptrs
             or req.dst_device_kv_indices is not None
         ):
@@ -2928,11 +2889,13 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             host_fields = []
             if self.kv_mgr.kv_args.host_kv_data_ptrs:
                 host_fields = [
-                    struct.pack(f"{len(values)}Q", *values)
-                    for values in (
-                        self.kv_mgr.kv_args.host_kv_data_ptrs,
-                        self.kv_mgr.kv_args.host_kv_data_lens,
-                        self.kv_mgr.kv_args.host_kv_item_lens,
+                    pack_int_lists(
+                        [
+                            self.kv_mgr.kv_args.host_kv_data_ptrs,
+                            self.kv_mgr.kv_args.host_kv_data_lens,
+                            self.kv_mgr.kv_args.host_kv_item_lens,
+                        ],
+                        "Q",
                     )
                 ]
 

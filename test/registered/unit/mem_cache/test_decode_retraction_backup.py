@@ -1,17 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.disaggregation.decode_host_cache import DecodeHostCache
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import retraction_backup
+from sglang.srt.mem_cache.common import RetractionBackup, retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
@@ -245,22 +243,12 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 cache, pool = env.cache, env.target_pool
                 host = cache.host_pool_group.get_pool(PoolName.KV)
                 reserve = max(self.num_tokens, page_size)
-                receiver = DecodeHostCache(
-                    pool,
-                    page_size,
-                    host,
-                    reserve,
-                    cache.cache_controller.l2_transfer_engine,
-                )
-                self.addCleanup(receiver.clear)
                 host_capacity = host.available_size()
                 receive_slots = host_capacity - reserve
                 receive_tokens = receive_slots - int(page_size > 1)
-                receiving = Mock(rid="receiving", kv=ReqKvInfo())
-                host_indices = receiver.allocate(receiving, receive_tokens)
+                host_indices = host.alloc(receive_slots)
                 self.assertEqual(len(host_indices), receive_slots)
                 self.assertEqual(host.available_size(), reserve)
-                self.assertIsNone(receiver.allocate(Mock(), 1))
 
                 device_buffers = (
                     pool.kv_buffer if use_mla else pool.k_buffer + pool.v_buffer
@@ -301,14 +289,11 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 cache.retraction_restore(retracted, backup)
                 self.assertEqual(host.available_size(), reserve)
 
-                self.assertIsNotNone(env.req_to_token_pool.alloc([receiving]))
-                received_indices = env.allocator.alloc(receive_slots)
-                self.assertIsNotNone(received_indices)
-                env.req_to_token_pool.write(
-                    (receiving.kv.req_pool_idx, slice(0, receive_slots)),
-                    received_indices,
+                receiving, received_indices = self._admit_req(env, receive_slots)
+                receiving.seqlen = receive_tokens + 1
+                cache.retraction_restore(
+                    receiving, RetractionBackup(host_indices=host_indices)
                 )
-                receiver.load([receiving], env.req_to_token_pool).synchronize()
                 for buffer, restored, received in zip(
                     device_buffers,
                     expected_retraction,
@@ -322,7 +307,6 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                             received,
                         )
                     )
-                receiver.poll()
                 self.assertEqual(host.available_size(), host_capacity)
                 env.allocator.free(restored_indices)
                 env.allocator.free(received_indices)

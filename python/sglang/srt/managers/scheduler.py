@@ -633,22 +633,6 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
-        self.decode_host_cache = None
-        if get_disagg().disaggregation_decode_enable_host_receive:
-            from sglang.srt.disaggregation.decode_host_cache import DecodeHostCache
-            from sglang.srt.mem_cache.hicache_storage import PoolName
-
-            self.decode_host_cache = DecodeHostCache(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                self.token_to_kv_pool_allocator.page_size,
-                self.tree_cache.host_pool_group.get_pool(PoolName.KV),
-                kv_cache_builder.decode_retraction_max_tokens(
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator.get_kvcache(),
-                ),
-                self.tree_cache.cache_controller.l2_transfer_engine,
-            )
-
         if (
             get_disagg().disaggregation_mode == "decode"
             and get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1885,8 +1869,6 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
-        if self.decode_host_cache is not None:
-            self.decode_host_cache.clear()
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
@@ -2547,7 +2529,6 @@ class Scheduler(
             hisparse_coordinator=self.hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
-            decode_host_cache=self.decode_host_cache,
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
             draft_worker=self.draft_worker,
@@ -5438,8 +5419,8 @@ class Scheduler(
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.decode_host_cache is not None:
-                    self.decode_host_cache.release(req)
+                if get_disagg().disaggregation_decode_enable_host_receive:
+                    retraction_discard(req, self.tree_cache, "host_pool")
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
