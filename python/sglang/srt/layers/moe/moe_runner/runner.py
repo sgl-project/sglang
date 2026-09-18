@@ -80,9 +80,11 @@ class MoeRunner:
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
                 f"but this MoE layer's quantization method selected the "
-                f"'{runner_backend.value}' runner. deepep_v2 dispatches FP8 "
-                "activations plus scales, which only deep_gemm consumes; use an "
-                "FP8 blockwise-quantized checkpoint, or --moe-a2a-backend deepep."
+                f"'{runner_backend.value}' runner. deepep_v2 dispatches into "
+                "the deep_gemm grouped-GEMM layout (FP8 activations plus "
+                "scales, or BF16 activations for unquantized experts); use an "
+                "FP8 blockwise-quantized or BF16 checkpoint, or "
+                "--moe-a2a-backend deepep."
             )
 
         self.fused_func = None

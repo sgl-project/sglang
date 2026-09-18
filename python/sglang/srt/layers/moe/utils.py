@@ -405,6 +405,25 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     return DispatcherOutputDtype.BF16
 
 
+def get_deepep_v2_dispatcher_output_dtype(
+    experts_are_fp8: bool,
+) -> DispatcherOutputDtype:
+    """Match the dispatch dtype to the expert weights consumed by DeepGEMM."""
+    required = (
+        DispatcherOutputDtype.FP8 if experts_are_fp8 else DispatcherOutputDtype.BF16
+    )
+    requested = get_exec().moe.deepep_dispatcher_output_dtype
+    if requested != "auto" and DispatcherOutputDtype(requested) is not required:
+        raise ValueError(
+            f"--deepep-dispatcher-output-dtype {requested} contradicts this "
+            f"checkpoint: --moe-a2a-backend deepep_v2 dispatches "
+            f"{required.value} for "
+            f"{'FP8 blockwise' if experts_are_fp8 else 'BF16'} experts. Drop "
+            "the flag to let it follow the checkpoint."
+        )
+    return required
+
+
 def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
     from sglang.srt.layers import deep_gemm_wrapper

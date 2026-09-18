@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -107,6 +108,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
     replace_graph_time_usage,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
@@ -438,6 +440,9 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        # Scoped by a speculative worker to stage its shared reads before
+        # the target prefill graph publishes the read-done event.
+        self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
         set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
@@ -477,9 +482,10 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert self.support_pp, (
-                "Pipeline Parallel is not compatible with this model."
-            )
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
+                assert self.support_pp, (
+                    "Pipeline Parallel is not compatible with this model."
+                )
 
         # For weight updates
         self.init_weight_updater()
@@ -932,6 +938,11 @@ class ModelRunner:
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
+        # capture idempotent).
+        self.decode_cuda_graph_captured = False
+        # Captured decode bs; exposed via /get_server_info for role-switch queries.
+        self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -966,8 +977,8 @@ class ModelRunner:
             ),
         )
 
-    def post_capture_resize_kv_pool(self):
-        resize = compute_post_capture_kv_resize(self)
+    def post_capture_resize_kv_pool(self, *, draft_runners=()):
+        resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
         self.max_total_num_tokens = resize.max_total_num_tokens
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = resize.full_max_total_num_tokens
@@ -1114,7 +1125,9 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1124,7 +1137,9 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1370,7 +1385,11 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.kv_cache_configurator.hybrid_swa_token_capacity(
+                allocator=self.token_to_kv_pool_allocator,
+                full_capacity=self.full_max_total_num_tokens,
+                swa_capacity=self.swa_max_total_num_tokens,
+            )
         else:
             capacity = self.max_total_num_tokens
         if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
@@ -1480,6 +1499,51 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
+        # Bookkeeping for the PD role switch: mark the graphs as captured (makes
+        # the on-flip capture idempotent) and record the captured bs so it can be
+        # queried via /get_server_info.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
+        """Idempotently capture decode CUDA graphs after startup.
+
+        Used by the PD role switch: an instance launched as prefill runs fully
+        eager (decode CUDA graph disabled). On the first flip to decode we
+        enable the decode CUDA graph and capture it here, so the flipped
+        instance replays decode graphs instead of running eager.
+        """
+        if self.decode_cuda_graph_captured:
+            logger.info("Decode CUDA graphs already captured; skipping re-capture.")
+            return
+
+        cfg = get_exec().graph.cuda_graph_config
+        was_disabled = cfg is not None and cfg.decode.backend == Backend.DISABLED
+        if was_disabled:
+            # Prefill was launched with the decode CUDA graph disabled; enable it
+            # for the decode role.
+            logger.info(
+                "Enabling decode CUDA graph on role switch (was disabled at startup)."
+            )
+            cfg.decode.backend = Backend.FULL
+            get_context().override(
+                "model_runner.ensure_decode_cuda_graphs", disable_cuda_graph=False
+            )
+
+        if capture_bs:
+            # Capture-to-fit: only the requested (router-sized) batch sizes.
+            filtered_bs = sorted({int(b) for b in capture_bs if int(b) > 0})
+            if filtered_bs:
+                cfg.decode.bs = filtered_bs
+
+        if was_disabled:
+            # graph_shared_output is skipped at startup when decode is disabled,
+            # so build it now (before the decode runner reads its logits buffer).
+            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+
+        self.init_decode_cuda_graph()
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
@@ -1645,7 +1709,9 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            build_step_span_name(forward_batch, is_draft_worker=self.is_draft_worker)
+        )
 
         canary_ctx = (
             context_tuple(
