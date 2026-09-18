@@ -89,18 +89,14 @@ export const config = {
       // checkpoint boots on one 128 GB Spark. The engine snaps to the single
       // usable option in each case.
       //
-      // RTX PRO 6000 is the opposite case: on a 96 GB discrete card the FP8
-      // N-gram table (47.7 GiB) has to leave the GPU for the remaining 78 GiB
-      // of weights plus the pools to fit, so Auto and Off are greyed out and On
-      // is the only pick — the forced chip appends --ple-offload-embedding, so
-      // the cells do not list it themselves.
+      // RTX PRO 6000 cannot fit the checkpoint without PLE offload.
       showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
       default: "auto",
       options: [
         { id: "auto", label: "Auto",
           disabled: (sel) => sel.hw === "dgx-spark" || sel.hw === "rtx6000",
           disableReason: (sel) => sel.hw === "rtx6000"
-            ? "RTX PRO 6000 (96 GB) only fits this checkpoint with the 47.7 GiB FP8 N-gram table in pinned host RAM; the verified cells pass --ple-offload-embedding explicitly, so On is the only pick."
+            ? "The checkpoint does not fit in 96 GB without PLE offload. Select On or On (NVMe file)."
             : "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). The verified settings are Off for the two-node cells and On (NVMe file) for a single Spark.",
           hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
         { id: "on",   label: "On",
@@ -111,19 +107,15 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx6000" || (sel.hw === "dgx-spark" && sel.nodes === "single"),
           disableReason: (sel) => sel.hw === "dgx-spark"
             ? "A single DGX Spark cannot hold the 126 GiB checkpoint in its 128 GB of unified memory; the verified single-Spark cells keep the 47.7 GiB FP8 N-gram table in a file on the local NVMe (On (NVMe file))."
-            : "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the other 78 GiB of the checkpoint; the table must be offloaded to pinned host RAM (On).",
+            : "The checkpoint does not fit in 96 GB without PLE offload. Select On or On (NVMe file).",
           flags: ["--no-ple-offload-embedding"] },
-        // File-backed table (sgl-project/sglang#37068, merged into qwen4-main-squashed):
-        // a sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (override
-        // with --ple-offload-dir), created and filled by the server on boot and
-        // read by the gather kernel through the host page tables. Requires the
-        // device attribute cudaDevAttrPageableMemoryAccessUsesHostPageTables,
-        // which GB10 has; hidden on other hardware. Verified only single-node —
-        // the 2-node cells keep the table GPU-resident instead.
+        // Two-node recipes keep the PLE table on the GPUs.
         { id: "file", label: "On (NVMe file)",
-          showWhen: (sel) => sel.hw === "dgx-spark",
-          disabled: (sel) => sel.nodes !== "single",
-          disableReason: "The file-backed table is verified for the single-Spark cells; the 2-node cells shard the table across both GPUs instead (Off).",
+          showWhen: (sel) => sel.hw === "dgx-spark" || sel.hw === "rtx6000",
+          disabled: (sel) => sel.hw === "rtx6000" || sel.nodes !== "single",
+          disableReason: (sel) => sel.hw === "rtx6000"
+            ? "This cell's pinned image does not include host staging yet."
+            : "Two-node recipes shard the PLE table across the GPUs; select Off.",
           flags: ["--ple-offload-embedding", "--ple-offload-backend file"],
           hints: [
             "PLE table -> sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (put it on local NVMe; --ple-offload-dir relocates it).",
@@ -864,7 +856,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent); lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. Pinned offload requires >= 64 GB of free host RAM and Docker --ulimit memlock=-1. This cell was measured with pinned offload. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent); lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -900,7 +892,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. Pinned offload requires >= 64 GB of free host RAM and Docker --ulimit memlock=-1. This cell was measured with pinned offload. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1141,7 +1133,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. Pinned offload requires >= 64 GB of free host RAM and Docker --ulimit memlock=-1. This cell was measured with pinned offload. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1169,7 +1161,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. Pinned offload requires >= 64 GB of free host RAM and Docker --ulimit memlock=-1. This cell was measured with pinned offload. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",

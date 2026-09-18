@@ -242,6 +242,12 @@ class BaseRunner(ABC):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+    def validate_model_support(self) -> None:
+        """Run model-specific checks after buffer setup and before warmup or capture."""
+        validate = getattr(self.model_runner.model, "validate_runner_support", None)
+        if validate is not None:
+            validate(self)
+
     def warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
         mr = self.model_runner

@@ -152,6 +152,7 @@ class EagerRunner(BaseRunner):
             ),
             dp_size=get_parallel().dp_size,
         )
+        self.validate_model_support()
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
 
