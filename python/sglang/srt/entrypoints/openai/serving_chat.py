@@ -1929,7 +1929,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Handle logprobs
                 choice_logprobs = None
-                if request.logprobs and finish_reason_type != "abort":
+                if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
                     total_output_logprobs = content["meta_info"][
                         "output_token_logprobs_length"

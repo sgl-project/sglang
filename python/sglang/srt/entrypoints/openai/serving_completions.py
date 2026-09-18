@@ -74,7 +74,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
-        if request.echo and request.logprobs:
+        if request.echo and request.logprobs is not None:
             logger.warning(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
@@ -287,13 +287,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 # Handle logprobs
                 logprobs = None
-                if request.logprobs is not None and finish_reason_type != "abort":
+                if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if is_first_chunk and request.echo:
+                    if is_first_chunk and request.echo and request.logprobs:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
-                        input_top_logprobs = content["meta_info"]["input_top_logprobs"]
+                        input_top_logprobs = content["meta_info"].get(
+                            "input_top_logprobs", None
+                        )
                     else:
                         input_token_logprobs = None
                         input_top_logprobs = None
@@ -576,9 +578,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle logprobs
             logprobs = None
             if request.logprobs is not None:
-                if echo:
+                if echo and request.logprobs:
                     input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
-                    input_top_logprobs = ret_item["meta_info"]["input_top_logprobs"]
+                    input_top_logprobs = ret_item["meta_info"].get(
+                        "input_top_logprobs", None
+                    )
                 else:
                     input_token_logprobs = None
                     input_top_logprobs = None
