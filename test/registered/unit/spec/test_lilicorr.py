@@ -683,8 +683,8 @@ def test_a_greedy_masked_row_walks_the_greedy_path_bit_identically():
 
 
 def test_the_sampled_commit_converges_on_the_greedy_path_as_temperature_vanishes():
-    """Same claim by the other route, with the mask off: the proposal is ``softmax(psi /
-    T)``, so a vanishing temperature must reproduce the argmax.
+    """Same claim by the other route, with the mask off: the proposal is
+    softmax(psi / T), so a vanishing temperature must reproduce the argmax.
     """
     log_start, log_pair, tokens = _sampled_lattice(seed=1)
     picked, _ = lilicorr_sample_path(

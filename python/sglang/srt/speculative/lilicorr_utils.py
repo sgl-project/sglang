@@ -343,8 +343,8 @@ def propose_lilicorr_block(
 
     Serves the steps the draft CUDA graph cannot: prefill, extend, batches past the
     captured buckets, and tp>1. draft_hidden is [bs, block_size, hidden], slot 0
-    being the anchor position. Returns ``(tokens [bs, block_size - 1], candidate_tokens,
-    q_rows); the latter two are None unless sampling_enabled``.
+    being the anchor position. Returns (tokens [bs, block_size - 1], candidate_tokens,
+    q_rows); the latter two are None unless sampling_enabled.
 
     sampling_enabled is the worker's device gate rather than the module constant: this
     path publishes into the selector's accept kernel, which does not run everywhere
