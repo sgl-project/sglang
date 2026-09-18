@@ -115,7 +115,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         ]
         self.current_tool_id = -1
         # Any DSML tag, so leftovers never reach user-visible content.
-        self.residual_markup_regex = rf"</?{self.dsml_token}[^>]*>"
+        # Escaped because subclasses may override the marker.
+        self.residual_markup_regex = rf"</?{re.escape(self.dsml_token)}[^>]*>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
