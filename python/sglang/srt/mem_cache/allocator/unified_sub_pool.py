@@ -432,8 +432,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # schedulers read them O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        self._sched_avail_memo_epoch: Optional[int] = None
-        self._sched_avail_memo_tokens: int = 0
+        # (chain epoch, gate signature, schedulable tokens).
+        self._sched_gate_memo: Optional[Tuple[int, object, int]] = None
+        # (chain epoch, growth-side neighbor).
+        self._growth_neighbor_memo: Optional[
+            Tuple[int, Optional[MultiEndedAllocator]]
+        ] = None
 
         self.clear()
 
@@ -595,10 +599,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return out
 
     def _capacity_memo_violations(self) -> List[str]:
-        """Check currently reusable memos against a fresh computation.
+        """Compare memos matching the current epoch and gate state with fresh values.
 
-        Dynamic gate-dependent views are not epoch-cacheable. For cacheable
-        views, a mismatch can indicate a write that bypassed `_CapacityField`.
+        A mismatch can indicate a write that bypassed `_CapacityField`.
         """
         out: List[str] = []
         epoch = self._chain_capacity_epoch()
@@ -609,18 +612,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        if (
-            self._sched_avail_memo_epoch == epoch
-            and not self._schedulable_capacity_has_dynamic_gate()
-        ):
+        m = self._sched_gate_memo
+        if m is not None and m[0] == epoch and m[1] == self._gate_memo_signature(epoch):
             actual = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
-            if self._sched_avail_memo_tokens != actual:
+            if m[2] != actual:
                 out.append(
                     f"[{self.sub_pool_name}] stale schedulable_available_size "
-                    f"memo: cached={self._sched_avail_memo_tokens}, "
-                    f"actual={actual}"
+                    f"memo: cached={m[2]}, actual={actual}"
                 )
         return out
 
@@ -674,11 +674,26 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return total
 
     def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
-        """Nearest NON-transparent chain member on this pool's GROWTH side -- the
-        one whose compaction releases bytes reachable at this pool's frontier."""
+        """Nearest non-transparent growth-side neighbor, cached by chain epoch.
+
+        Wiring and transparency changes invalidate the memo. Test stubs without
+        epoch state use an uncached walk.
+        """
+        m = getattr(self, "_growth_neighbor_memo", None)
+        if m is not None:
+            try:
+                if m[0] == self._chain_capacity_epoch():
+                    return m[1]
+            except AttributeError:
+                pass  # duck-typed stub chain: memo unusable
         p = self.high_peer if self.grow_direction == "up" else self.low_peer
         while p is not None and p._is_frontier_transparent():
             p = p.high_peer if self.grow_direction == "up" else p.low_peer
+        try:
+            epoch = self._chain_capacity_epoch()
+        except AttributeError:
+            epoch = None  # duck-typed stub chain: skip memoization
+        self._growth_neighbor_memo = (epoch, p) if epoch is not None else None
         return p
 
     def _current_gap_bytes(self) -> int:
@@ -733,31 +748,35 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
-    def _schedulable_capacity_has_dynamic_gate(self) -> bool:
-        neighbor = self._growth_side_neighbor()
-        return (
-            neighbor is not None
-            and neighbor.lazy_compaction
-            and neighbor.disagg_move_gate is not None
-        )
+    def _gate_memo_signature(self, epoch: int) -> object:
+        """Growth-side gate state, reusing the caller's epoch for neighbor lookup."""
+        m = self._growth_neighbor_memo
+        if m is not None and m[0] == epoch:
+            neighbor = m[1]
+        else:
+            neighbor = self._growth_side_neighbor()
+        if neighbor is None or not neighbor.lazy_compaction:
+            return True
+        if neighbor.disagg_move_gate is None:
+            return True
+        return neighbor.disagg_move_gate()
 
     def schedulable_available_size(self) -> int:
-        """Tokens allocatable AFTER a neighbor urgent-flush; alloc gates use
-        `available_size()` instead. Dynamic peer gates can change without an
-        allocator mutation, so only ungated views use the chain-epoch memo.
+        """Tokens allocatable after a neighbor urgent flush; alloc uses available_size.
+
+        Cache by chain epoch and gate state: gates can flip without allocator
+        mutations, so the epoch alone cannot validate this view.
         """
-        if self._schedulable_capacity_has_dynamic_gate():
-            self._sched_avail_memo_epoch = None
-            return self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
         epoch = self._chain_capacity_epoch()
-        if self._sched_avail_memo_epoch != epoch:
-            self._sched_avail_memo_tokens = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            self._sched_avail_memo_epoch = epoch
-        return self._sched_avail_memo_tokens
+        gate_key = self._gate_memo_signature(epoch)
+        m = self._sched_gate_memo
+        if m is not None and m[0] == epoch and m[1] == gate_key:
+            return m[2]
+        tokens = self._available_tokens(
+            extra_gap_bytes=self._peer_drainable_hole_bytes()
+        )
+        self._sched_gate_memo = (epoch, gate_key, tokens)
+        return tokens
 
     def _flush_targets(self):
         """A band short on its OWN alloc asks only its growth-side neighbour to
@@ -2126,6 +2145,10 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
             f"{self.grow_direction!r}"
         )
+        # Per-side (chain epoch, neighbor) memos.
+        self._side_neighbor_memo: Dict[
+            str, Tuple[int, Optional[MultiEndedAllocator]]
+        ] = {}
 
     # -- span / frontier state --
 
@@ -2191,17 +2214,39 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     # -- availability --
 
     def _side_capacity_neighbor(self, side: str) -> Optional[MultiEndedAllocator]:
+        """Nearest non-transparent neighbor on this side, cached when epoch is available."""
+        try:
+            epoch = self._chain_capacity_epoch()
+        except AttributeError:
+            epoch = None  # duck-typed stub chain: skip memoization
+        m = self._side_neighbor_memo.get(side)
+        if epoch is not None and m is not None and m[0] == epoch:
+            return m[1]
         p = self.low_peer if side == "low" else self.high_peer
         while p is not None and p._is_frontier_transparent():
             p = p.low_peer if side == "low" else p.high_peer
+        if epoch is not None:
+            self._side_neighbor_memo[side] = (epoch, p)
         return p
 
-    def _schedulable_capacity_has_dynamic_gate(self) -> bool:
+    def _gate_memo_signature(self, epoch: int) -> object:
+        """Keep low/high gate states separate: each side contributes different capacity.
+
+        Reuse neighbor lookups while the epoch is unchanged.
+        """
+        sig = []
         for side in ("low", "high"):
-            p = self._side_capacity_neighbor(side)
-            if p is not None and p.lazy_compaction and p.disagg_move_gate is not None:
-                return True
-        return False
+            m = self._side_neighbor_memo.get(side)
+            p = (
+                m[1]
+                if (m is not None and m[0] == epoch)
+                else self._side_capacity_neighbor(side)
+            )
+            if p is None or not p.lazy_compaction or p.disagg_move_gate is None:
+                sig.append(True)
+            else:
+                sig.append(p.disagg_move_gate())
+        return tuple(sig)
 
     def _side_drainable_hole_bytes(self, side: str) -> int:
         """Realizable gap bytes an urgent flush of the neighbour on ``side``
