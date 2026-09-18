@@ -221,13 +221,24 @@ class HfModelConfigParser(ModelConfigParserBase):
             "gemma4_unified",
             "gemma4_unified_assistant",
             "diffusion_gemma",
+            "embedding_gemma2",
         ):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
             # base = full-attention, `swa_*` = sliding-window overrides.
             text_config = config.text_config
+            if hasattr(text_config, "allow_global_per_layer_attribute_access"):
+                text_config.allow_global_per_layer_attribute_access = True
             global_head_dim = getattr(text_config, "global_head_dim", None)
             global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
+            if (global_head_dim is None or global_kv_heads is None) and getattr(
+                text_config, "per_layer_config", None
+            ):
+                for layer_cfg in text_config.per_layer_config:
+                    hd = getattr(layer_cfg, "head_dim", None)
+                    if hd and (global_head_dim is None or hd > global_head_dim):
+                        global_head_dim = hd
+                        global_kv_heads = getattr(layer_cfg, "num_key_value_heads", None)
 
             swa_head_dim = text_config.head_dim
             swa_kv_heads = text_config.num_key_value_heads
