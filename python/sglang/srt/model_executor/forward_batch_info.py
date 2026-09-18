@@ -651,6 +651,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
+    # Runner-owned DFlash target output; eager forwards leave this unset.
+    aux_hidden_states_buffer: Optional[torch.Tensor] = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
 

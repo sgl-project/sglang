@@ -3049,6 +3049,8 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        shared_aux = forward_batch.aux_hidden_states_buffer
+        aux_tap_idx = 0
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -3068,9 +3070,23 @@ class KimiK3LinearModel(nn.Module):
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                captured = self._dspark_capture_stream(
+                    i, hidden_states, residual, attn_res
                 )
+                if shared_aux is None:
+                    aux_hidden_states.append(captured)
+                else:
+                    # Graph outputs share storage across batch sizes. Preserve
+                    # the upstream tap computation and pack in execution order.
+                    width = captured.shape[-1]
+                    assert shared_aux.shape == (
+                        captured.shape[0], len(self.dspark_layers_to_capture) * width
+                    )
+                    assert shared_aux.dtype == captured.dtype
+                    shared_aux[:, aux_tap_idx * width : (aux_tap_idx + 1) * width].copy_(
+                        captured
+                    )
+                    aux_tap_idx += 1
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3124,7 +3140,11 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+            if shared_aux is not None:
+                assert aux_tap_idx == len(self.dspark_layers_to_capture)
+            return hidden_states, (
+                shared_aux if shared_aux is not None else aux_hidden_states
+            )
         return hidden_states
 
     def _dspark_capture_stream(
@@ -3219,6 +3239,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def get_cuda_graph_aux_hidden_size(self) -> int:
+        if not self.capture_aux_hidden_states:
+            return 0
+        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
 
     @torch.no_grad()
     def forward(
@@ -3675,6 +3700,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_cuda_graph_aux_hidden_size(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_cuda_graph_aux_hidden_size()
 
     def preprocess_mm_for_encoder(
         self,
