@@ -16,11 +16,12 @@ authorship.
 
 ## Configure the server
 
-Store the default key and context window in a JSON file:
+Store the server keys and context window in a JSON file:
 
 ```json
 {
   "key": "0123456789abcdef",
+  "key_b": "fedcba9876543210",
   "context_window": 4
 }
 ```
@@ -39,7 +40,7 @@ python -m sglang.launch_server \
 <Warning>
   Values passed with `--watermark-key` or `--watermark-key-b` are visible in the
   process command line, including `/proc/*/cmdline` on Linux. Use
-  `--watermark-config` for the primary production key. SGLang redacts the key
+  `--watermark-config` for server-owned production keys. SGLang redacts the key
   arguments and config path from startup logs, request logs, server information
   responses, and request crash-dump payloads. Process and GPU core dumps may
   contain in-memory keys. Protect those artifacts, the configuration file, and
@@ -51,7 +52,7 @@ The server arguments are:
 | Argument | Default | Behavior |
 | --- | --- | --- |
 | `--enable-watermark` | disabled | Enables watermark state and accepts per-request watermark configuration. |
-| `--watermark-config PATH` | unset | Loads a JSON object containing exactly `key` and `context_window`. |
+| `--watermark-config PATH` | unset | Loads a JSON object containing `key`, optional `key_b`, and `context_window`. |
 | `--watermark-key HEX` | unset | Makes a server-owned 64-bit key available to opted-in or default-enabled requests. Prefer the file option. |
 | `--watermark-key-b HEX` | unset | Opts into dual-key mode with a second server-owned 64-bit key. Requires a primary server key. |
 | `--watermark-mixing-probability P` | `0.5` | In dual-key mode, sets the probability of selecting key A at each eligible position. Must be strictly between 0 and 1. |
@@ -59,10 +60,12 @@ The server arguments are:
 | `--watermark-default-enabled` | disabled | Uses the server key when a request omits the `watermark` field. Requests may still opt out. |
 | `--watermark-enforce-all` | disabled | Uses the server key by default and rejects `{"enabled": false}`. |
 
-`--watermark-config` and `--watermark-key` are mutually exclusive. When a
-configuration file is used, its `context_window` takes precedence over
-`--watermark-context-window`. A server key does not by itself watermark every
-request. Add `--watermark-default-enabled` for a default-on service or
+`--watermark-config` and `--watermark-key` are mutually exclusive. A file may
+also contain `key_b`; when it does, `--watermark-key-b` is mutually exclusive
+with that field. A CLI key B remains valid when the file omits `key_b`. The
+file's `context_window` takes precedence over `--watermark-context-window`. A
+server key does not by itself watermark every request. Add
+`--watermark-default-enabled` for a default-on service or
 `--watermark-enforce-all` for a service that also forbids opt-out. Both modes
 require a server key from `--watermark-key` or `--watermark-config`.
 
@@ -168,6 +171,17 @@ unsigned 32 bits.
    upper-tail probability `P[Gamma(n, 1) >= S]` as the p-value. The optional
    normal approximation is `z = (S - n) / sqrt(n)`.
 
+Generation watermarks at most the first 4,096 eligible unique contexts. For a
+matched statistic, score only that prefix; for longer completions, report a
+prefix test rather than adding the ordinary-sampling tail. Tail scores still
+follow the null distribution, but they dilute the standardized signal.
+
+Runtime repetition tracking stores the 32-bit context hash, while the detector
+deduplicates exact token tuples. A hash collision therefore makes generation
+skip a later distinct context that the detector may score. The extra detector
+score is an ordinary null sample, so this approximation can conservatively
+weaken detection rather than create watermark evidence.
+
 The MurmurHash3 primitives are:
 
 ```text
@@ -220,7 +234,7 @@ their own traffic.
 | JSON schema and regex grammars | Verified | Grammar masking runs before watermark selection; strict outputs remain valid and detectable. |
 | Streaming chat completions | Verified | Streaming and non-streaming requests use the same watermark state and token selection. |
 | Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
-| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at eligible positions; repeated-context and greedy bypass positions retain ordinary log probabilities. Speculative decode reports the unmodified target-model distribution. |
+| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at eligible positions; repeated-context and greedy bypass positions retain ordinary log probabilities. Speculative decode reports the pre-watermark target distribution. |
 | Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
 | Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
 | Chunked prefill | Verified | Each prefill chunk rebuilds the prompt tail from the request's complete logical fill IDs. |
@@ -232,6 +246,7 @@ their own traffic.
 | NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
 | EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
 | NEXTN speculative decoding | Verified | NEXTN uses the EAGLE verification path. |
+| Pipeline-parallel speculative decoding | Rejected | Startup validation fails closed until the PP relay and per-stage watermark state receive a service-level gate. |
 | Other speculative algorithms | Rejected | Startup validation fails closed. |
 | Speculative rejection sampling | Rejected | Startup validation fails closed. |
 | Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
@@ -242,9 +257,13 @@ their own traffic.
 | Non-CUDA devices | Rejected | Startup validation fails closed. |
 
 Speculative verification forces a clone of the target logits so downstream
-target-model log-probability computation continues to observe the unmodified
+target-model log-probability computation continues to observe the pre-watermark
 tensor. Tree-based EAGLE modes reconstruct a separate context for each draft
-node before selection.
+node before selection. Repeated-context admission is conservative across the
+whole verify tree: after a context hash appears in an earlier row, later rows
+with the same hash bypass forcing even on sibling branches. This prevents
+duplicate history entries safely, but reconvergent wide trees may carry less
+signal.
 
 ## Limitations and performance
 
@@ -275,3 +294,9 @@ measured the following mean output throughput over three repetitions per cell:
 
 These measurements describe one model, GPU, sampling configuration, and output
 length. Benchmark your deployment before setting capacity targets.
+
+Finite-top-k selector latency at batch size one is hardware-dependent. In the
+same microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than full
+sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits;
+at batch size eight it was faster on both. Deployments sensitive to single-
+request latency should benchmark their GPU and logit dtype.

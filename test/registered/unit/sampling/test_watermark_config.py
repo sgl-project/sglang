@@ -36,16 +36,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def _write_config(path, *, key="0123456789abcdef", context_window=4):
-    path.write_text(
-        json.dumps({"key": key, "context_window": context_window}), encoding="utf-8"
-    )
+def _write_config(path, *, key="0123456789abcdef", key_b=None, context_window=4):
+    config = {"key": key, "context_window": context_window}
+    if key_b is not None:
+        config["key_b"] = key_b
+    path.write_text(json.dumps(config), encoding="utf-8")
     os.chmod(path, 0o600)
 
 
 def test_file_config_resolution_contract(tmp_path):
     config_path = tmp_path / "watermark.json"
-    _write_config(config_path, context_window=2)
+    _write_config(config_path, key_b="fedcba9876543210", context_window=2)
     server_args = ServerArgs(
         model_path="dummy",
         device="cuda",
@@ -59,8 +60,10 @@ def test_file_config_resolution_contract(tmp_path):
     check_watermark_server_args(server_args)
 
     assert resolution_result(server_args, "watermark_key") == "0123456789abcdef"
+    assert resolution_result(server_args, "watermark_key_b") == "fedcba9876543210"
     assert resolution_result(server_args, "watermark_context_window") == 2
     assert server_args.watermark_key is None
+    assert server_args.watermark_key_b is None
     assert server_args.watermark_context_window == 9
 
     manager = object.__new__(TokenizerManager)
@@ -68,6 +71,7 @@ def test_file_config_resolution_contract(tmp_path):
     publish(server_args, role="test")
     try:
         assert b"0123456789abcdef" not in pickle.dumps(manager._server_args_for_dump())
+        assert b"fedcba9876543210" not in pickle.dumps(manager._server_args_for_dump())
     finally:
         reset_context()
 
@@ -83,6 +87,25 @@ def test_default_key_source_validation(tmp_path, monkeypatch):
             watermark_key="0123456789abcdef",
             watermark_config=str(config_path),
         ).resolve_once()
+
+    _write_config(config_path, key_b="fedcba9876543210")
+    with pytest.raises(ValueError, match="key_b.*mutually exclusive"):
+        ServerArgs(
+            model_path="dummy",
+            enable_watermark=True,
+            watermark_config=str(config_path),
+            watermark_key_b="1111222233334444",
+        ).resolve_once()
+
+    _write_config(config_path)
+    server_args = ServerArgs(
+        model_path="dummy",
+        enable_watermark=True,
+        watermark_config=str(config_path),
+        watermark_key_b="1111222233334444",
+    )
+    server_args.resolve_once()
+    assert resolution_result(server_args, "watermark_key_b") == "1111222233334444"
 
     server_args = ServerArgs(
         model_path="dummy",
@@ -146,6 +169,21 @@ def test_default_key_source_validation(tmp_path, monkeypatch):
     server_args.resolve_once()
     monkeypatch.setenv("SGLANG_RUST_SERVER", "1")
     with pytest.raises(ValueError, match="not supported with SGLANG_RUST_SERVER"):
+        check_watermark_server_args(server_args)
+
+
+def test_pipeline_parallel_speculative_watermark_is_rejected():
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key="0123456789abcdef",
+        pp_size=2,
+        speculative_algorithm="EAGLE",
+    )
+    server_args.resolve_once()
+
+    with pytest.raises(ValueError, match="pipeline-parallel speculative decoding"):
         check_watermark_server_args(server_args)
 
 
@@ -240,15 +278,18 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     secret = "fedcba9876543210"
     secret_b = "0123456789abcdee"
     config_path = tmp_path / f"watermark-{secret}.json"
-    _write_config(config_path, key=secret)
+    _write_config(config_path, key=secret, key_b=secret_b)
     config = load_watermark_config(str(config_path))
     assert secret not in repr(config)
+    assert secret_b not in repr(config)
+    redacted_config = redact_watermark_secrets(config)
+    assert redacted_config.key == "<redacted>"
+    assert redacted_config.key_b == "<redacted>"
 
     server_args = ServerArgs(
         model_path="dummy",
         enable_watermark=True,
         watermark_config=str(config_path),
-        watermark_key_b=secret_b,
     )
     server_args.resolve_once()
     logged_args = redact_watermark_secrets(server_args.resolved_dict())
@@ -359,6 +400,10 @@ def test_config_file_security_guards(tmp_path, caplog):
 
     _write_config(config_path, context_window=65)
     with pytest.raises(WatermarkConfigError, match="from 1 to 64"):
+        load_watermark_config(str(config_path))
+
+    _write_config(config_path, key_b="not-hex")
+    with pytest.raises(WatermarkConfigError, match="only hex digits"):
         load_watermark_config(str(config_path))
 
     fifo_path = tmp_path / "watermark.fifo"

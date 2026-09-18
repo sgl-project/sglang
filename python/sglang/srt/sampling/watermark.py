@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.sampling.watermark_config import parse_watermark_key
+from sglang.srt.sampling.watermark_config import (
+    WatermarkServerConfig,
+    parse_watermark_key,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -49,6 +52,12 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             key="<redacted>" if value.key is not None else None,
             context_window=value.context_window,
         )
+    if isinstance(value, WatermarkServerConfig):
+        return WatermarkServerConfig(
+            key="<redacted>",
+            key_b="<redacted>" if value.key_b is not None else None,
+            context_window=value.context_window,
+        )
     if isinstance(value, msgspec.Struct):
         result = copy.copy(value)
         replacements = {}
@@ -72,7 +81,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             key: (
                 "<redacted>"
                 if key in {"watermark_key", "watermark_key_b", "watermark_config"}
-                or (in_watermark_config and key == "key")
+                or (in_watermark_config and key in {"key", "key_b"})
                 else redact_watermark_secrets(
                     item,
                     in_watermark_config=in_watermark_config or key == "watermark",

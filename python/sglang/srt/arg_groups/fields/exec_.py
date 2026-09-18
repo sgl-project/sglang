@@ -91,6 +91,7 @@ class ExecFeatures(msgspec.Struct):
         Optional[str],
         Arg(
             help="Optional second hex-encoded 64-bit watermark key.",
+            resolvable=True,
         ),
     ] = None
     watermark_mixing_probability: A[
@@ -99,7 +100,7 @@ class ExecFeatures(msgspec.Struct):
     ] = 0.5
     watermark_config: A[
         Optional[str],
-        "Path to a JSON file containing the default watermark key and context_window.",
+        "Path to a JSON file containing key, optional key_b, and context_window.",
     ] = None
     watermark_context_window: A[
         int,

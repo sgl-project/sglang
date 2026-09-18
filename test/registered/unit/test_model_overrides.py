@@ -111,6 +111,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_attention_backend",
                     "watermark_context_window",
                     "watermark_key",
+                    "watermark_key_b",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",

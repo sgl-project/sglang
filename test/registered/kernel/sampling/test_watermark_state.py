@@ -6,8 +6,12 @@ import torch
 
 from sglang.srt.sampling.watermark import (
     WatermarkState,
+    _dual_key_a_mask_torch,
     _hash_context_token_ids,
+    _hash_contexts,
+    _truncate_probabilities,
     normalize_watermark_request,
+    select_watermark_tokens_torch,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -136,6 +140,118 @@ def test_speculative_record_stops_at_context_capacity():
 
     assert state.num_watermarked_contexts[0].item() == 2
     assert state.watermarked_context_hashes[0].tolist() == [10, 20]
+
+
+def test_dual_key_speculative_rows_match_per_request_config():
+    draft_token_num = 3
+    state = WatermarkState(
+        max_num_reqs=4,
+        context_window=4,
+        max_contexts_per_req=16,
+        key="0123456789abcdef",
+        key_b="fedcba9876543210",
+        mixing_probability=0.5,
+        device="cuda",
+    )
+    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    state.key_b_buffer[1] = 0x2222333344445555
+    state.key_b_buffer[3] = 0x3333444455556666
+    state.mixing_threshold_buffer[1] = 1 << 30
+    state.mixing_threshold_buffer[3] = 3 << 30
+    contexts = torch.tensor(
+        [
+            [1, 2, 3, 4],
+            [2, 3, 4, 5],
+            [3, 4, 5, 6],
+            [11, 12, 13, 14],
+            [12, 13, 14, 15],
+            [13, 14, 15, 16],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    context_lengths = torch.full((6,), 4, dtype=torch.int32, device="cuda")
+    request_keys = torch.tensor(
+        [0x0123456789ABCDEF, 0x1111222233334444],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.7], [1.3]], device="cuda"),
+        top_ks=torch.tensor([17, 31], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([0.95, 0.8], device="cuda"),
+        min_ps=torch.tensor([0.0, 0.05], device="cuda"),
+        max_top_k=31,
+        watermark_keys=request_keys,
+        watermark_context_windows=torch.full((2,), 4, dtype=torch.int32, device="cuda"),
+        watermark_enabled=torch.ones(2, dtype=torch.bool, device="cuda"),
+    )
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    logits = torch.randn((6, 257), generator=generator, device="cuda")
+    expected_logits = logits.clone()
+    context_hashes = _hash_contexts(contexts, context_lengths)
+    expanded_keys = request_keys.repeat_interleave(draft_token_num)
+    pool_indices = req_pool_indices.to(torch.int64)
+    expanded_keys_b = state.key_b_buffer[pool_indices].repeat_interleave(
+        draft_token_num
+    )
+    expanded_thresholds = state.mixing_threshold_buffer[pool_indices].repeat_interleave(
+        draft_token_num
+    )
+    key_a_mask = _dual_key_a_mask_torch(
+        expanded_keys, expanded_keys_b, context_hashes, expanded_thresholds
+    )
+    assert key_a_mask.any() and key_a_mask.logical_not().any()
+    assert torch.equal(
+        expanded_keys,
+        torch.tensor(
+            [
+                0x0123456789ABCDEF,
+                0x0123456789ABCDEF,
+                0x0123456789ABCDEF,
+                0x1111222233334444,
+                0x1111222233334444,
+                0x1111222233334444,
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+    )
+    expanded_temperatures = sampling_info.temperatures.repeat_interleave(
+        draft_token_num, dim=0
+    )
+    expanded_top_ks = sampling_info.top_ks.repeat_interleave(draft_token_num)
+    expanded_top_ps = sampling_info.top_ps.repeat_interleave(draft_token_num)
+    expanded_min_ps = sampling_info.min_ps.repeat_interleave(draft_token_num)
+    probabilities = _truncate_probabilities(
+        expected_logits,
+        expanded_temperatures,
+        expanded_top_ks,
+        expanded_top_ps,
+        expanded_min_ps,
+    )
+    expected_tokens = select_watermark_tokens_torch(
+        probabilities.float(),
+        context_hashes,
+        expanded_keys,
+        expanded_keys_b,
+        expanded_thresholds,
+    )
+    expected_logits.fill_(-torch.inf)
+    expected_logits[torch.arange(6, device="cuda"), expected_tokens.to(torch.int64)] = 0
+
+    actual_hashes, selected = state.force_speculative(
+        logits,
+        req_pool_indices,
+        contexts,
+        context_lengths,
+        sampling_info,
+        draft_token_num,
+    )
+
+    assert selected.all()
+    assert torch.equal(actual_hashes, context_hashes)
+    assert torch.equal(logits, expected_logits)
 
 
 if __name__ == "__main__":

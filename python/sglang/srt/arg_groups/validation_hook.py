@@ -92,6 +92,11 @@ def check_watermark_server_args(server_args: Any) -> None:
             "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
             f"and EAGLE3, got {cfg.speculative_algorithm!r}"
         )
+    if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-watermark is not supported with pipeline-parallel "
+            "speculative decoding"
+        )
     if cfg.speculative_use_rejection_sampling:
         raise ValueError(
             "--enable-watermark is incompatible with "

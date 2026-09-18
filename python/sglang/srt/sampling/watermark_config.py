@@ -22,10 +22,11 @@ class WatermarkConfigError(ValueError):
 class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     key: str
     context_window: int
+    key_b: str | None = None
 
     def __repr__(self) -> str:
         return (
-            "WatermarkServerConfig(key=<redacted>, "
+            "WatermarkServerConfig(key=<redacted>, key_b=<redacted>, "
             f"context_window={self.context_window!r})"
         )
 
@@ -69,10 +70,10 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         raise WatermarkConfigError("failed to read watermark config JSON") from error
     if not isinstance(raw, dict):
         raise WatermarkConfigError("watermark config must be a JSON object")
-    unknown = sorted(set(raw) - {"key", "context_window"})
+    unknown = sorted(set(raw) - {"key", "key_b", "context_window"})
     if unknown:
         raise WatermarkConfigError("watermark config contains unknown fields")
-    if set(raw) != {"key", "context_window"}:
+    if not {"key", "context_window"}.issubset(raw):
         raise WatermarkConfigError("watermark config requires key and context_window")
 
     key = raw["key"]
@@ -80,6 +81,12 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         parse_watermark_key(key)
     except ValueError as error:
         raise WatermarkConfigError(str(error)) from error
+    key_b = raw.get("key_b")
+    if key_b is not None:
+        try:
+            parse_watermark_key(key_b)
+        except ValueError as error:
+            raise WatermarkConfigError(str(error)) from error
     context_window = raw["context_window"]
     if (
         isinstance(context_window, bool)
@@ -89,4 +96,4 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         raise WatermarkConfigError(
             "watermark config context_window must be an integer from 1 to 64"
         )
-    return WatermarkServerConfig(key=key, context_window=context_window)
+    return WatermarkServerConfig(key=key, key_b=key_b, context_window=context_window)

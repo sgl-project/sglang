@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.kernels.ops.sampling.textseal_selector import (
+    can_use_finite_topk_watermark,
     force_watermark_tokens_triton,
     prepare_watermark_contexts_triton,
     select_watermark_tokens_triton,
@@ -263,6 +264,52 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
 
     assert torch.equal(dual_fast_selected, dual_sort_selected)
     assert torch.equal(dual_fast_logits, dual_sort_logits)
+
+
+@pytest.mark.parametrize("max_top_k", [8191, 8192])
+def test_finite_top_k_boundary_matches_sort_with_ties(max_top_k):
+    vocab_size = 8193
+    token_ids = torch.arange(vocab_size, device="cuda", dtype=torch.float32)
+    logits = torch.stack((torch.zeros_like(token_ids), token_ids.remainder(7))).to(
+        torch.bfloat16
+    )
+    temperatures = torch.tensor([[0.7], [1.3]], device="cuda")
+    top_ks = torch.full((2,), max_top_k, dtype=torch.int32, device="cuda")
+    top_ps = torch.tensor([0.95, 0.5], device="cuda")
+    min_ps = torch.tensor([0.0, 0.05], device="cuda")
+    context_hashes = torch.tensor([1, 1145416960], dtype=torch.int64, device="cuda")
+    keys = torch.tensor([1, 0x0123456789ABCDEF], dtype=torch.int64, device="cuda")
+    eligible = torch.ones(2, dtype=torch.bool, device="cuda")
+
+    assert can_use_finite_topk_watermark(max_top_k, vocab_size)
+    assert not can_use_finite_topk_watermark(8193, 8194)
+
+    sort_logits = logits.clone()
+    sort_selected = force_watermark_tokens_triton(
+        sort_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+    )
+    fast_logits = logits.clone()
+    fast_selected = force_watermark_tokens_triton(
+        fast_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+        max_top_k=max_top_k,
+    )
+
+    assert torch.equal(fast_selected, sort_selected)
+    assert torch.equal(fast_logits, sort_logits)
 
 
 def test_fused_context_state_matches_torch():

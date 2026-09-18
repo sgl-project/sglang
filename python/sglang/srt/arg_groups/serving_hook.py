@@ -40,11 +40,20 @@ def handle_secret_file_configs(server_args: Any) -> None:
             "--watermark-config and --watermark-key are mutually exclusive"
         )
     config = load_watermark_config(cfg.watermark_config)
+    if config.key_b is not None and cfg.watermark_key_b is not None:
+        raise ValueError(
+            "watermark config key_b and --watermark-key-b are mutually exclusive"
+        )
+    resolved = {
+        "watermark_key": config.key,
+        "watermark_context_window": config.context_window,
+    }
+    if config.key_b is not None:
+        resolved["watermark_key_b"] = config.key_b
     declare_resolution(
         server_args,
         "handle_secret_file_configs",
-        watermark_key=config.key,
-        watermark_context_window=config.context_window,
+        **resolved,
     )
 
 
