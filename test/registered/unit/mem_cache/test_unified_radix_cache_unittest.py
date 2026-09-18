@@ -1668,9 +1668,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1732,9 +1730,9 @@ class UnifiedRadixCacheSuite:
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
             cache.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+                req, is_insert=True, owned_kv_len=req.owned_kv_len()
             )
-            start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
+            start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:
@@ -1775,9 +1773,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=False, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -1952,9 +1948,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -4276,8 +4270,9 @@ class UnifiedRadixCacheSuite:
         cons.finish(aborted_rid, CacheRequestOutcome.ABORT)
         self.assertNotIn(aborted_rid.rid, cons.storage_prefetch_retries._pending)
 
-        # A fully-device-matched (empty-suffix) decline also arms the retry:
-        # the device match can evict while the request waits in the queue.
+        # A fully-device-matched (empty-suffix) decline issues no lookup and
+        # arms no retry; a queue-time eviction of that device match is
+        # re-queried at admission with the re-issue budget intact.
         cons.prefetch_from_storage(
             CacheRequestHandle("fully-matched", 0),
             cons.root_node_handle(),
@@ -4285,7 +4280,7 @@ class UnifiedRadixCacheSuite:
             None,
             None,
         )
-        self.assertIn("fully-matched", cons.storage_prefetch_retries._pending)
+        self.assertNotIn("fully-matched", cons.storage_prefetch_retries._pending)
         cons.sanity_check()
 
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
@@ -5115,7 +5110,9 @@ class UnifiedRadixCacheSuite:
                 CacheRequestHandle("subwin-req", 0), cons2.ongoing_prefetch
             )
             self.assertEqual(cons2._prefetch_outcome_stats["declined_too_short"], 1)
-            self.assertIn("subwin-req", cons2.storage_prefetch_retries._pending)
+            # A declined span issues no lookup, so it must not spend the
+            # re-issue budget on polls.
+            self.assertNotIn("subwin-req", cons2.storage_prefetch_retries._pending)
 
             cons2.prefetch_from_storage(
                 CacheRequestHandle("window-req", 0),
@@ -8405,9 +8402,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
