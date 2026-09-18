@@ -211,6 +211,14 @@ class SpeculativeAlgorithm(Enum):
             return build_dspark_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        if self.is_dflash():
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_disagg_draft_input,
+            )
+
+            return build_dflash_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
@@ -374,6 +382,10 @@ class SpecInputType(IntEnum):
     UNO_STATE = auto()
     UNO_DRAFT = auto()
     UNO_VERIFY = auto()
+    # Carried between rounds under PP: the tree the last stage drafted, which
+    # every stage rebuilds its verify input from. Neither a draft nor a verify
+    # input -- no forward ever runs on it.
+    PP_SPEC_RELAY = auto()
 
 
 class SpecInput(ABC):
