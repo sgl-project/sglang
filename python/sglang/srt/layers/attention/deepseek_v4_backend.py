@@ -35,7 +35,6 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_candidate_blocks,
-    fp4_index_logits_decode,
     fp4_index_logits_req_to_token,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
@@ -85,7 +84,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     deep_gemm_fp4_paged_mqa_logits,
-    select_candidate_block_indices,
     select_candidate_blocks,
     topk_transform_paged_from_metadata,
 )

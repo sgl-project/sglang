@@ -1183,6 +1183,8 @@ class C4Indexer(nn.Module):
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
         )
+
+
 def select_candidate_block_indices(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,

@@ -267,6 +267,8 @@ def candidate_block_logits(
         num_warps=4,
     )
     return output, keep
+
+
 @triton.jit
 def _candidate_row_lens_kernel(
     LENS,
