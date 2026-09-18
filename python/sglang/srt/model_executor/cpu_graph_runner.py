@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     empty_context,
+    get_availabl_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
