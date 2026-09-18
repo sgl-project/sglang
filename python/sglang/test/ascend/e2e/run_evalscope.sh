@@ -16,7 +16,7 @@ EVALSCOPE_CONSTRAINTS=(
 # Upper bound (seconds) for the pip install step. If any other component triggers
 # resolver backtracking and the install hangs, fail fast instead of timing out the
 # whole job.
-EVALSCOPE_INSTALL_TIMEOUT=1800
+EVALSCOPE_INSTALL_TIMEOUT=1200
 
 if [ -d "${PYTHON_ENV_FOR_EVALSCOPE}" ]; then
     echo "Virtual env ${PYTHON_ENV_FOR_EVALSCOPE} already exists, skip installation."
