@@ -15,19 +15,15 @@ Note: Uses do_bench instead of do_bench_cudagraph since CUDA graph
 capture doesn't support CPU-GPU memory transfers.
 """
 
-import itertools
 import os
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
-import triton
-import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
-from sglang.kernels.jit.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.kvcache.hicache import (
-    can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
@@ -39,7 +35,7 @@ register_cuda_ci(
 register_amd_ci(est_time=29, stage="jit-kernel-benchmark", runner_config="amd")
 
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
-PAGE_SIZE = 1
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "1"))
 ENABLE_SORT = True
 GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
 HOST_CACHE_SIZE = 512 * 1024  # 512K tokens on CPU
@@ -187,20 +183,14 @@ def pytorch_transfer(
 
 # Benchmark configuration
 
-BS_RANGE = get_benchmark_range(
-    full_range=[2**n for n in range(0, 16)],
-    ci_range=[16],
-)
 ELEMENT_SIZE_RANGE = get_benchmark_range(
     full_range=[64, 128, 256, 512, 1024],
     ci_range=[1024],
 )
 
 LINE_VALS = ["aot", "jit", "torch"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-STYLES = [("orange", "-"), ("blue", "--"), ("red", ":")]
-
-CONFIGS = list(itertools.product(ELEMENT_SIZE_RANGE, BS_RANGE))
+if DISABLE_TORCH:
+    LINE_VALS.remove("torch")
 
 
 # =============================================================================
@@ -208,22 +198,10 @@ CONFIGS = list(itertools.product(ELEMENT_SIZE_RANGE, BS_RANGE))
 # =============================================================================
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["element_size", "batch_size"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="hicache-one-layer-h2d",
-        args={},
-    )
-)
-def benchmark_one_layer_h2d(
-    element_size: int, batch_size: int, provider: str
-) -> Tuple[float, float, float]:
+@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
+@marker.benchmark("provider", LINE_VALS, unit="ms")
+def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
     """One Layer: Host (CPU) -> Device (GPU)."""
     global cache
     cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
@@ -281,19 +259,10 @@ def benchmark_one_layer_h2d(
         ],
     }
 
-    if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
-        return (float("nan"), float("nan"), float("nan"))
-
-    if DISABLE_TORCH and provider in ["torch"]:
-        return (float("nan"), float("nan"), float("nan"))
-
-    ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore
-        FN_MAP[provider], quantiles=DEFAULT_QUANTILES, warmup=5, rep=25
-    )
-    return (
-        1000 * ms / NUM_LAYERS,
-        1000 * max_ms / NUM_LAYERS,
-        1000 * min_ms / NUM_LAYERS,
+    return marker.do_bench(
+        FN_MAP[provider],
+        use_cuda_graph=False,
+        extra_memory_footprint=NUM_LAYERS * batch_size * (2 * element_bytes),
     )
 
 
@@ -311,22 +280,10 @@ def _create_ptr_tensor(tensors, device="cuda"):
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["element_size", "batch_size"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="hicache-all-layer-d2h",
-        args={},
-    )
-)
-def benchmark_all_layer_d2h(
-    element_size: int, batch_size: int, provider: str
-) -> Tuple[float, float, float]:
+@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
+@marker.benchmark("provider", LINE_VALS, unit="ms")
+def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
     """All Layer: Device (GPU) -> Host (CPU)."""
     global cache
     cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
@@ -385,19 +342,10 @@ def benchmark_all_layer_d2h(
         ],
     }
 
-    if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
-        return (float("nan"), float("nan"), float("nan"))
-
-    if DISABLE_TORCH and provider in ["torch"]:
-        return (float("nan"), float("nan"), float("nan"))
-
-    ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore
-        FN_MAP[provider], quantiles=DEFAULT_QUANTILES, warmup=5, rep=25
-    )
-    return (
-        1000 * ms / NUM_LAYERS,
-        1000 * max_ms / NUM_LAYERS,
-        1000 * min_ms / NUM_LAYERS,
+    return marker.do_bench(
+        FN_MAP[provider],
+        use_cuda_graph=False,
+        extra_memory_footprint=NUM_LAYERS * batch_size * (2 * element_bytes),
     )
 
 
@@ -413,12 +361,5 @@ if __name__ == "__main__":
         v_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
     )
 
-    print("=" * 60)
-    print("One Layer: Host -> Device (CPU -> GPU)")
-    print("=" * 60)
-    benchmark_one_layer_h2d.run(print_data=True)
-
-    print("\n" + "=" * 60)
-    print("All Layer: Device -> Host (GPU -> CPU) [per-layer avg]")
-    print("=" * 60)
-    benchmark_all_layer_d2h.run(print_data=True)
+    benchmark_one_layer_h2d.run(print_prefix="Per Layer: Host -> Device (CPU -> GPU)")
+    benchmark_all_layer_d2h.run(print_prefix="All Layer: Device -> Host (GPU -> CPU)")
