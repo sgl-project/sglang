@@ -11,7 +11,7 @@ service SglangService {
   rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
   rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
-  rpc GetIsReady(GetIsReadyRequest) returns (GetIsReadyResponse);
+  rpc WatchEngineState(WatchEngineStateRequest) returns (stream EngineStateSnapshot);
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
@@ -175,15 +175,21 @@ message HealthCheckResponse {
   bool healthy = 1;
 }
 
-// ---- Readiness ----
+// ---- Engine state ----
 
-message GetIsReadyRequest {}
+message WatchEngineStateRequest {}
 
-message GetIsReadyResponse {
-  // True when the server is ready to receive new requests.
-  bool is_ready = 1;
-  // Values are JSON-encoded, matching the existing meta_info convention.
-  map<string, string> metadata = 2;
+// A complete discovery and lifecycle snapshot. The JSON discovery payloads
+// intentionally retain the same wire shape as GetModelInfo/GetServerInfo.
+message EngineStateSnapshot {
+  // Unix time in nanoseconds, captured once for this engine process.
+  uint64 instance_id = 1;
+  // Starts at one and increases for each snapshot from this instance.
+  uint64 revision = 2;
+  bool healthy = 3;
+  bool is_pause = 4;
+  GetModelInfoResponse model_info = 5;
+  GetServerInfoResponse server_info = 6;
 }
 
 // ---- Model info ----
