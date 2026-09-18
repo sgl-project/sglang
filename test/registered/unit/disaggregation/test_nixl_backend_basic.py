@@ -900,6 +900,16 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_send_aux_rejects_metadata_buffer_count_mismatch(self):
+        agent = StagingFakeAgent()
+        mgr = self._make_manager(agent)
+        mgr.kv_args.aux_data_ptrs = [0x1000]
+        mgr.kv_args.aux_item_lens = [64]
+
+        with self.assertRaisesRegex(ValueError, "metadata buffer count mismatch"):
+            mgr.send_aux("peer", 0, [0x2000, 0x3000], 0, "room")
+
+        self.assertEqual(agent.get_xfer_descs_calls, [])
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
         mgr._staging_ctx = PrefillStagingContext()

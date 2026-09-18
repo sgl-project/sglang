@@ -2797,6 +2797,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         resumes_output = (
             decode_req.is_rebootstrap and len(decode_req.req.output_ids) > 0
         )
+        if not resumes_output and not _is_fake_transfer(decode_req.req):
+            customized_info = self.metadata_buffers.get_customized_info(idx)
+            if customized_info is not None:
+                if decode_req.req.customized_info is None:
+                    decode_req.req.customized_info = {}
+                for key, values in customized_info.items():
+                    decode_req.req.customized_info.setdefault(key, []).extend(values)
         if not resumes_output:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(
