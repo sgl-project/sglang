@@ -65,18 +65,7 @@ def _make_stage(latents):
 
 
 class TestProvidedLatentsPreparation(unittest.TestCase):
-    """Guards latent-ids / packing handling for caller-supplied initial latents.
-
-    The provided-latents branch used to only move the tensor to the device,
-    skipping the ``maybe_prepare_latent_ids`` / ``maybe_pack_latents`` steps the
-    randn branch runs. On packed models that leaves ``batch.latent_ids`` unset,
-    and the denoising loop then fails building rotary embeddings with
-    ``AttributeError: 'NoneType' object has no attribute 'ndim'``.
-
-    The preparation is keyed on the provided latents matching the layout this
-    stage would have drawn, because some callers legitimately supply
-    already-packed latents that must not be packed twice.
-    """
+    """Guard packing and latent IDs for caller-supplied initial latents."""
 
     def test_provided_latents_get_latent_ids_and_packing(self):
         provided = torch.zeros(1, 4, 8, 8)
@@ -92,14 +81,7 @@ class TestProvidedLatentsPreparation(unittest.TestCase):
         self.assertEqual(tuple(result.latents.shape), (1, 64, 4))
 
     def test_already_packed_latents_are_left_untouched(self):
-        """Pre-packed latents must not be packed again.
-
-        The ComfyUI executors assign ``Req.latents`` in the flat ``[B, S, D]``
-        layout the transformer consumes. Packing that a second time keeps the
-        element count identical, so the reshape succeeds and silently permutes
-        the caller's latents instead of raising -- this case is the guard against
-        reintroducing that.
-        """
+        """Do not pack ComfyUI-style flat latents twice."""
         packed = torch.arange(1 * 16 * 4, dtype=torch.float32).reshape(1, 16, 4)
         stage, batch, server_args, pipeline_config = _make_stage(packed.clone())
 
@@ -112,11 +94,7 @@ class TestProvidedLatentsPreparation(unittest.TestCase):
         self.assertTrue(torch.equal(result.latents, packed))
 
     def test_randn_and_provided_latents_agree_on_shapes(self):
-        """The two branches must leave the batch in the same shape.
-
-        This is the invariant the bug broke: an injected x_T should be
-        indistinguishable downstream from noise the stage drew itself.
-        """
+        """Leave generated and unpacked provided latents in the same shape."""
         stage_r, batch_r, args_r, _ = _make_stage(None)
         stage_r.get_forward_latent_num_frames = lambda batch, server_args: 1
         drawn = stage_r.forward(batch_r, args_r)
