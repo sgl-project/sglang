@@ -106,7 +106,7 @@ def _build_explicit_state_block_table(
     seqused: torch.Tensor,
     max_input_capacity: int,
 ) -> torch.Tensor:
-    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    """Adapt GPU-style state locations to the explicit cache_mode=2 table ABI."""
     req_pool_indices = req_pool_indices.to(torch.int64)
     capacities = cu_seqlens[1:] - cu_seqlens[:-1]
     history_size = coff * compress_ratio
@@ -1711,8 +1711,15 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos.zero_()
         fm.seqused.zero_()
 
-    def _refresh_graph_explicit_state_block_tables(self, ctx) -> None:
-        fm = ctx.fm
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # A5 consumes the request-bank table refreshed outside the graph.
+        if is_npu_arch35():
+            return
+
+        # Record the explicit table rebuild before the compressor. Replay reads the
+        # runner's static request indices and the start_pos/seqused buffers
+        # refreshed by _apply_dsv4_graph_metadata, without host dispatch here.
+        fm = self.forward_metadata
         for ratio, fixed_table in fm.dsv4_explicit_state_block_tables.items():
             fixed_table.copy_(
                 _build_explicit_state_block_table(
@@ -1721,7 +1728,9 @@ class DeepseekV4AscendAttnBackend(
                     state_pool=self._dsv4_state_pools_by_ratio[ratio],
                     token_to_kv_pool=self.token_to_kv_pool,
                     req_to_token=self.req_to_token,
-                    req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+                    req_pool_indices=forward_batch.req_pool_indices[
+                        : forward_batch.batch_size
+                    ],
                     start_pos=fm.start_pos,
                     cu_seqlens=fm.actual_seq_lengths_q_pa,
                     seqused=fm.seqused,
@@ -1825,8 +1834,6 @@ class DeepseekV4AscendAttnBackend(
                 self._clear_graph_target_verify_metadata(ctx)
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
-
-        self._refresh_graph_explicit_state_block_tables(ctx)
 
         self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
