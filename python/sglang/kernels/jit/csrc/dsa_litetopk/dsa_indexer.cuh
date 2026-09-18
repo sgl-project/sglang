@@ -4,11 +4,13 @@
 // vLLM integration is PR #48726. sglang deviations are marked SGLANG DEVIATION.
 #ifndef FLASHINFER_DSA_INDEXER_CUH_
 #define FLASHINFER_DSA_INDEXER_CUH_
+#include <cutlass/cuda_host_adapter.hpp>
+#include <cutlass/fast_math.h>
+
 #include "dsa_indexer_kernels.cuh"
 #include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -21,49 +23,7 @@
 #endif
 namespace {
 
-static void* driver_handle() {
-  static void* h = nullptr;
-  if (!h) {
-    h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
-    DSA_CHECK(h, "failed to load libcuda.so.1");
-  }
-  return h;
-}
-
-static CUresult enc_tiled(
-    CUtensorMap* tm,
-    CUtensorMapDataType dt,
-    cuuint32_t rank,
-    void* addr,
-    const cuuint64_t* dims,
-    const cuuint64_t* strides,
-    const cuuint32_t* box,
-    const cuuint32_t* estrides,
-    CUtensorMapInterleave il,
-    CUtensorMapSwizzle sw,
-    CUtensorMapL2promotion l2,
-    CUtensorMapFloatOOBfill oob) {
-  using FT = CUresult (*)(
-      CUtensorMap*,
-      CUtensorMapDataType,
-      cuuint32_t,
-      void*,
-      const cuuint64_t*,
-      const cuuint64_t*,
-      const cuuint32_t*,
-      const cuuint32_t*,
-      CUtensorMapInterleave,
-      CUtensorMapSwizzle,
-      CUtensorMapL2promotion,
-      CUtensorMapFloatOOBfill);
-  static FT f = nullptr;
-  if (!f) {
-    f = reinterpret_cast<FT>(dlsym(driver_handle(), "cuTensorMapEncodeTiled"));
-    DSA_CHECK(f, "failed to load cuTensorMapEncodeTiled");
-  }
-  return f(tm, dt, rank, addr, dims, strides, box, estrides, il, sw, l2, oob);
-}
-
+// SGLANG DEVIATION: tensor maps are encoded through the CUTLASS driver wrapper.
 static CUtensorMap make_2d(
     void* ptr,
     CUtensorMapDataType dt,
@@ -84,7 +44,7 @@ static CUtensorMap make_2d(
                                : swizzle_mode == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
                                : swizzle_mode == 32 ? CU_TENSOR_MAP_SWIZZLE_32B
                                                     : CU_TENSOR_MAP_SWIZZLE_NONE;
-  CUresult r = enc_tiled(
+  CUresult r = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
       &tm,
       dt,
       2,
@@ -99,10 +59,6 @@ static CUtensorMap make_2d(
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   DSA_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
   return tm;
-}
-
-static inline int align_up(int x, int a) {
-  return (x + a - 1) / a * a;
 }
 
 constexpr int NUM_HEADS = 32;
@@ -572,7 +528,7 @@ static int compute_smem_bytes() {
   const int smem_q = BLOCK_Q * NUM_HEADS * HEAD_DIM * esz_fp8;
   const int smem_w = BLOCK_Q * NUM_HEADS * esz_f32;
   const int smem_kv = BLOCK_KV * HEAD_DIM * esz_fp8;
-  const int smem_ks = align_up(BLOCK_KV * esz_f32, 512);
+  const int smem_ks = cutlass::round_up(BLOCK_KV * esz_f32, 512);
   const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * 2;
   const int smem_barriers = num_barriers * 8;
   const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes

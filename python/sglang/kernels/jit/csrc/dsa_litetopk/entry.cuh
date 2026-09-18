@@ -25,7 +25,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include "dsa_indexer.cuh"  // vendored kernels + NUM_HEADS/BLOCK_* config
+#include "dsa_indexer.cuh"  // LiteTopK kernels + NUM_HEADS/BLOCK_* config
 
 namespace sglang {
 
@@ -193,7 +193,7 @@ void dsa_litetopk_scan(
   const int refresh_every_i = external_refresh ? 0x7fffffff : static_cast<int>(refresh_every);
 
   const int esz_f32 = 4;
-  const int ks_aligned = align_up(seq_len_kv, 16 / esz_f32);
+  const int ks_aligned = cutlass::round_up(seq_len_kv, 16 / esz_f32);
   auto tm_q = make_2d(
       const_cast<void*>(q.data_ptr()),
       CU_TENSOR_MAP_DATA_TYPE_UINT8,

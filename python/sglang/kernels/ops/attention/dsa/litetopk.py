@@ -24,12 +24,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    KERNEL_PATH,
-    cache_once,
-    load_jit,
-    override_jit_cuda_arch,
-)
+from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -66,9 +61,7 @@ def _jit_dsa_litetopk_module() -> Module:
                 "-DCUTE_USE_PACKED_TUPLE=1",
                 "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
             ],
-            extra_include_paths=[
-                str(KERNEL_PATH / "csrc" / "dsa_litetopk" / "vendor_deep_gemm"),
-            ],
+            # Also supplies the deep_gemm headers the kernel includes.
             extra_dependencies=["cutlass"],
         )
 

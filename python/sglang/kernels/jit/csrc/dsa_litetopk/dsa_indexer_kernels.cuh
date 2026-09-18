@@ -23,6 +23,8 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
+// SGLANG DEVIATION: DeepGEMM headers come from the installed package, not a
+// vendored copy.
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
