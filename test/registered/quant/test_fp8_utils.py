@@ -112,18 +112,23 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
 
 class TestBlockFp8AsMxfp8(CustomTestCase):
     def test_block_scale_to_e8m0_matches_reference(self):
+        # Sibling classes leave torch's default device on cuda; stay on cpu.
         gen = torch.Generator().manual_seed(0)
         n, k, block_n = 100, 256, 32  # 4 scale rows, the last one partial
-        exps = torch.randint(-20, 21, (4, k // 32), generator=gen)
+        exps = torch.randint(-20, 21, (4, k // 32), generator=gen, device="cpu")
         got = block_fp8_scale_to_mxfp8_e8m0(
             torch.exp2(exps.float()), (n, k), [block_n, 32]
         )
         ref = (exps + 127).to(torch.uint8).repeat_interleave(block_n, dim=0)[:n]
         self.assertTrue(torch.equal(got, ref))
         with self.assertRaises(ValueError):  # 128-wide K block is not MXFP8
-            block_fp8_scale_to_mxfp8_e8m0(torch.ones(2, 8), (64, 1024), [32, 128])
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.ones(2, 8, device="cpu"), (64, 1024), [32, 128]
+            )
         with self.assertRaises(ValueError):  # not a power of two
-            block_fp8_scale_to_mxfp8_e8m0(torch.full((2, 8), 1.5), (64, 256), [32, 32])
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.full((2, 8), 1.5, device="cpu"), (64, 256), [32, 32]
+            )
 
     def test_serve_gate(self):
         platform = MagicMock()
