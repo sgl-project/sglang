@@ -154,7 +154,10 @@ class QwenImage21EncodingStage(PipelineStage):
                     pixels = torch.frombuffer(
                         bytearray(image.tobytes()), dtype=torch.uint8
                     ).reshape(image.height, image.width, ac.in_channels)
-                    pixels = pixels.permute(2, 0, 1)[None, :, None].float() / 255.0
+                    # preserve the reference's batch stride for identical cuDNN convolution rounding
+                    pixels = (
+                        pixels[None].permute(0, 3, 1, 2).unsqueeze(2).float() / 255.0
+                    )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
                     latent = vae.encode(pixels).mode()
                     mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)

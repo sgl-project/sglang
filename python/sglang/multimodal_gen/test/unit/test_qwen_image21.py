@@ -247,9 +247,9 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
     )
     assert vae.use_tiling is tiling
     expected = VaeImageProcessor(vae_scale_factor=16).preprocess(image).unsqueeze(2)
-    torch.testing.assert_close(
-        vae.encode.call_args.args[0], expected.bfloat16(), atol=0, rtol=0
-    )
+    actual = vae.encode.call_args.args[0]
+    torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)
+    assert actual.stride() == expected.stride()
 
 
 def test_condition_image_loading_preserves_alpha(tmp_path):
