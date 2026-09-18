@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import msgspec
-
+import torch
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -139,7 +139,7 @@ def index_attention_layers_by_global_id(
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
-    runner: Optional[BaseRunner]
+    runner: BaseRunner | None
     memory_phase: str
     memory_usage_gb: float
     capture_time: float
@@ -281,9 +281,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
+        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu") or (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
             decode = capture_decode_graph(model_runner=model_runner)
@@ -327,7 +325,7 @@ def capture_prefill_graph(
     role = "draft" if model_runner.is_draft_worker else "target"
 
     def result(
-        runner: Optional[BaseRunner],
+        runner: BaseRunner | None,
         memory_usage_gb: float = 0,
         capture_time: float = 0,
     ) -> GraphCapture:
@@ -524,6 +522,30 @@ def capture_prefill_graph(
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+
+    if model_runner.kv_cache_dtype != model_runner.model_config.dtype:
+        num_kv_heads = getattr(model_runner.model_config, "num_kv_heads", 1)
+        head_dim = getattr(model_runner.model_config, "head_dim", 128)
+        tp_size = get_parallel().tp_size
+        # Rough transient budget: tokens * heads * dim * 2 (K,V) * 2 bytes * num_attention_layers
+        num_attention_layers = sum(layer is not None for layer in model_runner.attention_layers)
+        transient_bytes = max_capture_tokens * (num_kv_heads // tp_size) * head_dim * 4 * num_attention_layers
+        transient_gb = transient_bytes / (1024 ** 3)
+        
+        if after_mem < transient_gb:
+            logger.warning(
+                f"Auto-disabling {capture_name} CUDA graph: free VRAM ({after_mem:.2f} GB) "
+                f"is below the estimated transient memory ({transient_gb:.2f} GB) needed for "
+                f"quantized KV cache dequantization at max capture size ({max_capture_tokens})."
+            )
+            del prefill_runner
+            if model_runner.device == "cuda":
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            return result(eager_runner, mem_usage, capture_time)
+
     return result(prefill_runner, mem_usage, capture_time)
 
 
