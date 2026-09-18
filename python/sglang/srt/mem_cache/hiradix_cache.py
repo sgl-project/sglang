@@ -1783,6 +1783,8 @@ class HiRadixCache(RadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        # Parity with UnifiedRadixCache; this cache has no component pools.
+        kv_only: bool = False,
     ):
         req_id = handle.rid
         prefetch_key = RadixKey(

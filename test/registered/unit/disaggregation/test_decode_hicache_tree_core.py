@@ -26,7 +26,6 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
-            storage_prefetch_is_all_or_nothing=False,
             ongoing_prefetch=ongoing_prefetch,
             has_ongoing_prefetch=ongoing_prefetch.__contains__,
             is_backuped=Mock(return_value=True),
@@ -80,6 +79,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             ["h0", "h1"],
             extra_key="model",
             cache_salt="tenant-a",
+            kv_only=True,
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):

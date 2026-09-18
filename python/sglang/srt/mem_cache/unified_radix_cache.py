@@ -1885,9 +1885,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.rotation_base_of(node_id)
 
     @property
-    def storage_prefetch_is_all_or_nothing(self) -> bool:
-        """Extra component pools (SWA / Mamba) make storage prefetches
-        all-or-nothing, so KV-only hit lengths over-promise."""
+    def _has_component_pools(self) -> bool:
         return any(ct is not BASE_COMPONENT_TYPE for ct in self.tree_components)
 
     def query_storage_hit_length(
@@ -1943,7 +1941,13 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        kv_only: bool = False,
     ) -> None:
+        """Issue an L3 -> L2 prefetch for ``new_input_tokens``.
+
+        ``kv_only`` fetches the base KV pages without the component objects
+        (SWA / Mamba), so the KV-only hit query is exact for the caller.
+        """
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -2016,7 +2020,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
+            if ct == BASE_COMPONENT_TYPE or kv_only:
                 continue
             # Size the component's staging now; it is allocated at hit time,
             # next to the KV staging, so the query holds no host memory.
@@ -3265,7 +3269,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node), or None when buffer-mode
         admission must retry without committing a load."""
-        if params.kv_only and self.storage_prefetch_is_all_or_nothing:
+        if params.kv_only and self._has_component_pools:
             if self.buffer_pipeline is not None or self.linker is not None:
                 raise NotImplementedError(
                     "kv_only load-back is not supported with buffer-mode or "

@@ -25,12 +25,10 @@ def _harness(
     fill_len: int,
     swa_tail_len: int,
     uses_swa_tail: bool = True,
-    all_or_nothing: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         scheduler=SimpleNamespace(enable_decode_hicache=True),
         tree_cache=SimpleNamespace(
-            storage_prefetch_is_all_or_nothing=all_or_nothing,
             hicache_storage_pass_prefix_keys=False,
             is_backuped=Mock(return_value=True),
             is_root=Mock(return_value=False),
@@ -58,17 +56,6 @@ def _match(harness: SimpleNamespace, *, l1: int, l2: int) -> DecodePrefixMatch:
 
 
 class TestDecodeHiCachePrefixMatch(CustomTestCase):
-    def test_hybrid_all_or_nothing_skips_storage_query(self):
-        harness = _harness(
-            l3_hit=1024, fill_len=2048, swa_tail_len=512, all_or_nothing=True
-        )
-
-        match = _match(harness, l1=0, l2=0)
-
-        self.assertEqual(match.l3_storage_hit_length, 0)
-        self.assertIsNone(match.last_host_node)
-        harness.tree_cache.query_storage_hit_length.assert_not_called()
-
     def test_swa_tail_cap_on_restored_range(self):
         # (l1, l2, l3_hit, fill_len, tail_len) -> (expected_l2, expected_l3)
         cases = [
@@ -140,6 +127,7 @@ class TestDecodeHiCachePrefetchDecline(CustomTestCase):
             last_host_node=22,
         )
         DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
+        self.prefetch_call = harness.tree_cache.prefetch_from_storage.call_args
         return prefix_match
 
     def test_registered_prefetch_keeps_l3_promise(self):
@@ -147,6 +135,14 @@ class TestDecodeHiCachePrefetchDecline(CustomTestCase):
 
         self.assertTrue(prefix_match.prefetch_registered)
         self.assertEqual(prefix_match.l3_storage_hit_length, 512)
+
+    def test_prefetch_is_kv_only(self):
+        # Component state (SWA / Mamba) comes from the P/D transfer; fetching
+        # it from L3 would be all-or-nothing, which the KV-only hit query
+        # cannot promise.
+        self._prefetch(registers=True)
+
+        self.assertTrue(self.prefetch_call.kwargs["kv_only"])
 
     def test_declined_prefetch_degrades_to_l2_only(self):
         # A silently declined prefetch (rate limit, host buffer alloc failure)

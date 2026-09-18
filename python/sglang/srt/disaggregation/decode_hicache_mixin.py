@@ -73,13 +73,9 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        # Hybrid models skip L3 promises: the KV-only hit query cannot see
-        # SWA/mamba objects (present only at backed-up entry boundaries), and
-        # an unfulfillable promise fails the request post transfer-trim.
-        if (
-            self.scheduler.enable_decode_hicache
-            and not self.tree_cache.storage_prefetch_is_all_or_nothing
-        ):
+        # The hit query is KV-only, which matches what decode fetches
+        # (kv_only prefetch below): component state comes from the transfer.
+        if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
@@ -161,6 +157,10 @@ class DecodeHiCachePreallocMixin:
                 prefix_keys,
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                # Base KV only, like the load-back: SWA / Mamba state comes
+                # from the transfer, and hybrid component fetches are
+                # all-or-nothing, which the KV-only hit query cannot promise.
+                kv_only=True,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
