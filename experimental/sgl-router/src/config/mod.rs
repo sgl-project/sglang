@@ -169,6 +169,15 @@ fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
             "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
             bucket.id
         );
+        ensure!(
+            !matches!(
+                bucket.policy,
+                Some(PolicyKind::FusedScore | PolicyKind::ScorePolicy)
+            ),
+            "bucket_config bucket {:?} policy {} cannot be attached to a bucket",
+            bucket.id,
+            bucket.policy.unwrap_or_default()
+        );
         match bucket.stage {
             BucketStage::Prefill
                 if bucket.min_sequence_tokens.is_some()
@@ -314,6 +323,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: Some(100),
                     tps_p05_at_capacity: None,
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
                 BucketSpec {
                     id: "p-long".into(),
@@ -328,6 +338,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: Some(200),
                     tps_p05_at_capacity: None,
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
             ],
             ttft_slo_policy: SloBucketPolicy::SloFirst,
@@ -356,6 +367,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: Some(100),
                     tps_p05_at_capacity: None,
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
                 BucketSpec {
                     id: "d-fast".into(),
@@ -370,6 +382,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: None,
                     tps_p05_at_capacity: Some(20.0),
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
             ],
             ttft_slo_policy: SloBucketPolicy::SloFirst,
@@ -398,6 +411,7 @@ mod tests {
                 ttft_p95_at_capacity_ms: None,
                 tps_p05_at_capacity: Some(20.0),
                 max_pending_prefill_tokens: None,
+                policy: None,
             }],
             ttft_slo_policy: SloBucketPolicy::Disabled,
             tps_slo_policy: SloBucketPolicy::SloFirst,
@@ -424,6 +438,7 @@ mod tests {
                 ttft_p95_at_capacity_ms: Some(100),
                 tps_p05_at_capacity: None,
                 max_pending_prefill_tokens: None,
+                policy: None,
             }],
             ttft_slo_policy: SloBucketPolicy::SloFirst,
             tps_slo_policy: SloBucketPolicy::Disabled,
@@ -447,6 +462,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: Some(100),
                     tps_p05_at_capacity: None,
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
                 BucketSpec {
                     id: "d".into(),
@@ -461,6 +477,7 @@ mod tests {
                     ttft_p95_at_capacity_ms: None,
                     tps_p05_at_capacity: Some(20.0),
                     max_pending_prefill_tokens: None,
+                    policy: None,
                 },
             ],
             ttft_slo_policy: SloBucketPolicy::SloFirst,
