@@ -262,30 +262,79 @@ class TestROPE(CustomTestCase):
                 )
 
     def test_apply_rotary_pos_emb(self):
-        num_tokens = 1024
-        num_heads = 8
-        head_size = 72
-        qkv = torch.randn(num_tokens, num_heads * head_size * 3).to(torch.bfloat16)
-        query, key, _ = qkv.split(
-            [num_heads * head_size, num_heads * head_size, num_heads * head_size],
-            dim=-1,
-        )
-        query = query.view(num_tokens, num_heads, head_size)
-        key = key.view(num_tokens, num_heads, head_size)
-        for sincos_dtype in [torch.float32, torch.bfloat16]:
-            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+        torch.manual_seed(1234)
+
+        def single_test(
+            q_shape, k_shape, cos_shape, unsqueeze_dim, dtype, sincos_dtype
+        ):
+            query = torch.randn(*q_shape).to(dtype)
+            key = torch.randn(*k_shape).to(dtype)
+            cos = torch.rand(*cos_shape).to(sincos_dtype)
+            sin = torch.rand(*cos_shape).to(sincos_dtype)
+            query_clone = query.clone()
+            key_clone = key.clone()
+
+            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(
+                query, key, cos, sin, unsqueeze_dim
+            )
             q_out_eager, k_out_eager = apply_rotary_pos_emb_native_eager(
-                query, key, cos, sin
+                query, key, cos, sin, unsqueeze_dim
             )
             q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
-                query, key, cos, sin
+                query_clone, key_clone, cos, sin, unsqueeze_dim
             )
             torch.testing.assert_close(q_out_ref, q_out_eager)
             torch.testing.assert_close(k_out_ref, k_out_eager)
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+            # the cpu kernel must be out-of-place like the native impl
+            torch.testing.assert_close(query, query_clone)
+            torch.testing.assert_close(key, key_clone)
+
+        num_tokens = 1024
+        num_heads = 8
+        num_kv_heads = 2
+        head_size = 72
+        batch_size = 4
+        seq_len = 64
+        for dtype in [torch.bfloat16, torch.float32]:
+            for sincos_dtype in [torch.float32, torch.bfloat16]:
+                # 3D: [num_tokens, num_heads, head_size], unsqueeze_dim=1
+                single_test(
+                    (num_tokens, num_heads, head_size),
+                    (num_tokens, num_heads, head_size),
+                    (num_tokens, head_size),
+                    1,
+                    dtype,
+                    sincos_dtype,
+                )
+                # 3D with GQA: num_heads != num_kv_heads
+                single_test(
+                    (num_tokens, num_heads, head_size),
+                    (num_tokens, num_kv_heads, head_size),
+                    (num_tokens, head_size),
+                    1,
+                    dtype,
+                    sincos_dtype,
+                )
+                # 4D: [batch, num_heads, seq_len, head_size], unsqueeze_dim=1
+                single_test(
+                    (batch_size, num_heads, seq_len, head_size),
+                    (batch_size, num_kv_heads, seq_len, head_size),
+                    (batch_size, seq_len, head_size),
+                    1,
+                    dtype,
+                    sincos_dtype,
+                )
+                # 4D: [batch, seq_len, num_heads, head_size], unsqueeze_dim=2
+                single_test(
+                    (batch_size, seq_len, num_heads, head_size),
+                    (batch_size, seq_len, num_kv_heads, head_size),
+                    (batch_size, seq_len, head_size),
+                    2,
+                    dtype,
+                    sincos_dtype,
+                )
 
     def test_apply_multidimensional_rope(self):
         """Test apply_multidimensional_rope_cpu against the native Python reference."""
