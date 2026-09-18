@@ -72,13 +72,15 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
-if _is_cuda:
+if _is_cuda or _is_xpu:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
@@ -572,7 +574,7 @@ class Qwen3MoeAttention(nn.Module):
         self.use_fused_qk_norm_rope = (
             get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
-            and _is_cuda
+            and (_is_cuda or _is_xpu)
             and can_use_fused_qk_norm_rope(
                 self.head_dim,
                 self.rotary_emb.is_neox_style,
@@ -658,8 +660,7 @@ class Qwen3MoeAttention(nn.Module):
             and qkv.dtype in (torch.bfloat16, torch.float16)
         )
         if use_fused:
-            if _is_cuda:
-                theta = self.rope_theta
+            if _is_cuda or _is_xpu:
                 positions = (
                     positions.view(-1)
                     .to(dtype=torch.int32, device=qkv.device)
@@ -677,13 +678,14 @@ class Qwen3MoeAttention(nn.Module):
                     self.q_norm.variance_epsilon,
                     self.q_norm.weight,
                     self.k_norm.weight,
-                    theta,
+                    self.rope_theta,
                     self.rotary_emb.is_neox_style,
                     positions,
                     factor,
                     low,
                     high,
                     attention_factor,
+                    self.rotary_emb.rotary_dim,
                 )
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             elif _is_cpu:
