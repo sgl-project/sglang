@@ -1645,6 +1645,7 @@
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
+                  "docs/sglang-diffusion/weight_cache",
                   "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
