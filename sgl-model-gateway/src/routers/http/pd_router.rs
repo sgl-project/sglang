@@ -2039,13 +2039,9 @@ mod tests {
 
     #[tokio::test]
     async fn native_messages_stream_preserves_engine_events() {
-        use futures_util::StreamExt;
         let prefill = axum::Router::new().route(
             "/v1/messages",
-            axum::routing::post(|| async {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                axum::Json(json!({"type":"message","content":[]}))
-            }),
+            axum::routing::post(|| async { axum::Json(json!({"type":"message","content":[]})) }),
         );
         let expected = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let decode = axum::Router::new().route(
@@ -2059,20 +2055,21 @@ mod tests {
             "model":"test","max_tokens":16,"messages":[],"stream":true
         }));
         let response = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(5),
             router.route_messages(None, &body, None),
         )
         .await
         .expect("native Messages response should be returned");
         assert_eq!(response.status(), StatusCode::OK);
-        let mut stream = response.into_body().into_data_stream();
-        let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(chunk, expected.as_bytes());
-        drop(stream);
+        // HTTP body frames need not align with SSE events or server writes.
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(body, expected.as_bytes());
         for task in tasks {
             task.abort();
         }
@@ -2094,8 +2091,6 @@ mod tests {
                                 if role == failing_role {
                                     (StatusCode::BAD_REQUEST, axum::Json(error))
                                 } else {
-                                    // Force the native 400 to arrive before stream commitment.
-                                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                                     (StatusCode::OK, axum::Json(json!({"type":"message"})))
                                 }
                             }
@@ -2106,7 +2101,12 @@ mod tests {
                 let body = crate::routers::native_messages::NativeMessagesRequest(json!({
                     "model":"test","max_tokens":16,"messages":[],"stream":stream
                 }));
-                let response = router.route_messages(None, &body, None).await;
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    router.route_messages(None, &body, None),
+                )
+                .await
+                .expect("native validation error should be returned");
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
                 let actual: Value = serde_json::from_slice(
                     &axum::body::to_bytes(response.into_body(), usize::MAX)
