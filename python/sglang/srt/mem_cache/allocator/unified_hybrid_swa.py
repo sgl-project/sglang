@@ -833,8 +833,11 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         """No float in a two-END chain -- nothing can slide."""
         return None
 
-    def has_shared_byte_envelope(self) -> bool:
+    def prealloc_fits_assumes_reclaim(self) -> bool:
         return True
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        return self.can_reserve(full_tokens, swa_tokens, empty_pool=True)
 
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
@@ -1313,6 +1316,35 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         return self._fits_page_demand(
             math.ceil(full_tokens / self.page_size),
             math.ceil(swa_tokens / self.page_size),
+        )
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Price the pair on the float chain's grid, then against the budgets.
+
+        `full_available_size()` and `swa_available_size()` are both backed by
+        the shared gap (each takes `schedulable_available_size()`, which
+        credits the peer's drainable holes), so comparing each against its own
+        budget double-counts those bytes: two asks that fit alone can fail
+        together. `alloc_extend_swa_tail` prices them jointly, and its failure
+        surfaces at `_pre_alloc`'s `kv_loc is not None` assert rather than at
+        admission, so the joint check belongs here too. The budgets still
+        apply -- they carry decode headroom this allocator cannot see.
+        """
+        page_size = self.page_size
+        if not self._fits_page_demand(
+            -(-full_tokens // page_size), -(-swa_tokens // page_size)
+        ):
+            return False
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
         )
 
     def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:

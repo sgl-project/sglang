@@ -95,15 +95,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
-    def has_shared_byte_envelope(self) -> bool:
-        """Whether FULL and SWA are cut from ONE buffer.
-
-        Two consequences for a caller: `prealloc_fits` prices both sides
-        together rather than comparing per-side token budgets, and it answers
-        about the state reachable AFTER reclaim -- so admitting on it still
-        owes the reclaim. False where each side owns its own buffer.
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        """Whether `prealloc_fits` answers about the state reachable AFTER
+        reclaiming the evictable pages, so admitting on it still owes the
+        reclaim. False when the answer describes the pool as it stands.
         """
         return False
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        """Whether a demand this size could EVER be preallocated, or None when
+        this pool has no ceiling of its own and the caller's token capacity is
+        the only bound.
+        """
+        return None
 
     def prealloc_fits(
         self,

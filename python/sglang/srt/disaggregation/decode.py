@@ -459,7 +459,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _uses_swa_reservation(self) -> bool:
         return (
             self._uses_swa_tail_prealloc()
-            or self.token_to_kv_pool_allocator.has_shared_byte_envelope()
+            or self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim()
         )
 
     def _prealloc_reservation_fits(
@@ -821,19 +821,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
         allocator = self.token_to_kv_pool_allocator
-        if allocator.has_shared_byte_envelope():
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if not self._uses_swa_tail_prealloc():
-                swa_required = full_required
-            # The one branch left in this method: the two sides below bound a
-            # different length (`_rebootstrap_prefill_len`), so folding them
-            # together would change which requests are refused.
-            if not allocator.can_reserve(full_required, swa_required, empty_pool=True):
-                message = (
-                    f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
-                    f"budget: full={full_required}, swa={swa_required}"
-                )
-        else:
+        full_required, swa_required = self._prealloc_required_tokens(req)
+        if not self._uses_swa_tail_prealloc():
+            swa_required = full_required
+        ceiling_fits = allocator.prealloc_ceiling_fits(full_required, swa_required)
+        if ceiling_fits is False:
+            message = (
+                f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
+                f"budget: full={full_required}, swa={swa_required}"
+            )
+        elif ceiling_fits is None:
             # HiSparse admits up to the host-backed logical capacity.
             capacity = (
                 self.scheduler.tp_worker.model_runner.max_token_pool_size
@@ -914,7 +911,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            if self.token_to_kv_pool_allocator.has_shared_byte_envelope():
+            if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
                 full_len, swa_len = self._prealloc_kv_lens(req)
                 if (
                     self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
@@ -1827,8 +1824,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         allocator = self.token_to_kv_pool_allocator
-        # The base implementation returns exactly the pair the static pools
-        # report, so the shared-envelope layouts differ only in the override.
         _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
             full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
         )

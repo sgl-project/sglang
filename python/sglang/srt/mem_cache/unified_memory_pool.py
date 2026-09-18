@@ -738,6 +738,22 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
+        views are indexed by; the formula is the one in the class docstring."""
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
 

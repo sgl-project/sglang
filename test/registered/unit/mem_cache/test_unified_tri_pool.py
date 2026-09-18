@@ -1460,5 +1460,54 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         self.assertEqual(flt._byte_accounting_violations(), [])
 
 
+class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
+    """REGRESSION: PD admission compared FULL and SWA against per-side token
+    budgets, but both sides report capacity backed by the same shared gap, so
+    a pair that fits neither together was admitted and then failed inside
+    `alloc_extend_swa_tail` -- surfacing as `_pre_alloc`'s `kv_loc is not
+    None` assert rather than as a refusal."""
+
+    def _build(self, **kw):
+        return TestUnifiedTriPool._build(self, **kw)
+
+    def test_generous_budgets_do_not_admit_an_infeasible_pair(self):
+        _, allocator, _, _ = self._build()
+        joint = allocator.available_size()
+        self.assertGreater(joint, 0)
+        over = joint * 2
+        budget = over * 4  # policy leaves room; only the grid can refuse
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                over,
+                over,
+                full_budget_tokens=budget,
+                swa_budget_tokens=budget,
+            )
+        )
+
+    def test_the_scheduler_budget_still_binds(self):
+        _, allocator, _, _ = self._build()
+        page_size = allocator.page_size
+        self.assertTrue(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size,
+                swa_budget_tokens=page_size,
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size - 1,
+                swa_budget_tokens=page_size,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
