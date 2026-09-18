@@ -97,8 +97,7 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
 
 def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
-    """High-entropy rows: thousands of tokens survive a top-p 0.95 cutoff, which
-    is the regime where the float-atomic kernels return different bytes."""
+    """High-entropy rows: the regime where the float-atomic kernels return different bytes."""
     gen = torch.Generator(device="cuda:0").manual_seed(7)
     ranks = torch.arange(1, vocab_size + 1, device="cuda:0", dtype=torch.float32)
     zipf = -1.1 * torch.log(ranks)
@@ -114,15 +113,14 @@ def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
 @pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
 @pytest.mark.parametrize("batch_size,vocab_size", [(256, 128256)])
 def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
-    """Repeated calls on the same input must return bit-identical output; a
-    last-bit difference desynchronizes TP ranks (#33549, #33289)."""
+    """Repeated calls on the same input return bit-identical output."""
     probs = _flat_distribution(batch_size, vocab_size)
     top_p = torch.full((batch_size,), 0.95, device="cuda:0")
     ref = top_p_renorm_prob(probs, top_p, deterministic=True)
     for _ in range(30):
         out = top_p_renorm_prob(probs, top_p, deterministic=True)
         assert torch.equal(out, ref), "top_p_renorm_prob output changed between calls"
-    # the env is the knob deployments are given; it must reach the same kernel
+    # the knob must reach the same kernel
     with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
         assert torch.equal(top_p_renorm_prob(probs, top_p), ref)
 
@@ -130,8 +128,7 @@ def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
 @pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
 @pytest.mark.parametrize("batch_size,vocab_size,k", [(256, 128256, 40)])
 def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
-    """Same invariant for top-k renorm; flashinfer's radix multi-CTA kernel
-    accumulates the kept mass with float atomics and is not reproducible."""
+    """Same invariant for top-k; the radix multi-CTA kernel sums with float atomics."""
     probs = _flat_distribution(batch_size, vocab_size)
     top_k = torch.full((batch_size,), k, device="cuda:0", dtype=torch.int32)
     ref = top_k_renorm_prob(probs, top_k, deterministic=True)
@@ -140,7 +137,7 @@ def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
         assert torch.equal(out, ref), "top_k_renorm_prob output changed between calls"
     with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
         assert torch.equal(top_k_renorm_prob(probs, top_k), ref)
-    # the default path, and it must agree with the deterministic one up to rounding
+    # default path agrees with the deterministic one up to rounding
     fast = top_k_renorm_prob(probs, top_k)
     torch.testing.assert_close(fast, ref, rtol=1e-5, atol=1e-6)
 

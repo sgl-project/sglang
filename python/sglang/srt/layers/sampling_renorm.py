@@ -1,17 +1,10 @@
-"""Top-p / top-k probability renormalization with deterministic output.
+"""Top-p / top-k probability renormalization with a deterministic variant.
 
-flashinfer's default ``top_p_renorm_probs`` (AIR radix) and
-``top_k_renorm_probs`` (radix multi-CTA) pool partial sums with float
-``atomicAdd``, so byte-identical input can return probabilities differing in
-the last bits (measured: 99 of 99 repeated calls on a 256 x 128256 flat
-distribution; for top-k even on peaky rows). Each TP rank renormalizes
-independently, and the output decides committed tokens and speculative accept
-lengths, so a last-bit gap desynchronizes the ranks (#33549, #33289).
-
-``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC``, which is off: the
-fast kernels cost 4-12x less on top-k, and the consumers that commit per-rank
-state already broadcast their decisions from rank 0. The top-k fallback goes
-away once the flashinfer pin includes flashinfer-ai/flashinfer#5034.
+flashinfer's default kernels pool partial sums with float ``atomicAdd``, so
+identical input can differ in the last bits (99 of 99 repeated calls on a
+256 x 128256 flat distribution). ``deterministic`` defaults to
+``SGLANG_RENORM_DETERMINISTIC`` (off; the deterministic top-k costs 4-12x). The
+top-k fallback goes away once the pin includes flashinfer-ai/flashinfer#5034.
 """
 
 from __future__ import annotations
@@ -49,8 +42,7 @@ def _split_param(x: Union[torch.Tensor, float, int]):
 def _single_cta_top_k(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
-    # torch.ops.sgl_kernel.top_k_renorm_probs is flashinfer's single-CTA kernel
-    # compiled into sgl_kernel: one block per row, fixed-order block reductions.
+    # flashinfer's single-CTA kernel compiled into sgl_kernel: fixed-order reductions.
     arr, val = _split_param(top_k)
     probs32 = probs.float()
     out = torch.empty_like(probs32)

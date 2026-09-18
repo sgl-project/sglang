@@ -1275,13 +1275,8 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
-    # Renormalize top-p / top-k on kernels that are bit-identical call to call.
-    # Off by default: the fast kernels cost 4-12x less on top-k, and every
-    # speculative accept decision is already broadcast from rank 0
-    # (SGLANG_SPEC_TP_SYNC). Set to 1 when a deployment needs the renorm output
-    # itself to agree across TP ranks -- its float atomics can disagree in the
-    # last bits, which desynchronizes the ranks that consume it (#33549, #33289).
-    # SGLANG_SYNC_TOKEN_IDS_ACROSS_TP is the other way to close that gap.
+    # Bit-identical top-p / top-k renorm; off because the deterministic top-k
+    # kernel costs 4-12x. Set to 1 when TP ranks must agree on the renorm output.
     SGLANG_RENORM_DETERMINISTIC = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)

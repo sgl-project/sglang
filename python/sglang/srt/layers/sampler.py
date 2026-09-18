@@ -653,14 +653,10 @@ class Sampler(nn.Module):
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
-            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
-            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # Not all of them are: the top-p / top-k renorm kernels pool with float atomics
-            # (SGLANG_RENORM_DETERMINISTIC=1 swaps in bit-identical ones), and the all-reduce order
-            # is only pinned under --enable-deterministic-inference. Enable this env variable to
-            # prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            # Off by default to save an all-reduce; correct only while the last all-reduce,
+            # the lm_head matmul and every sampling kernel agree across ranks. The top-p /
+            # top-k renorm kernels do not (SGLANG_RENORM_DETERMINISTIC=1 fixes that), so
+            # enable this when TP ranks desynchronize. Grammar always syncs: xgrammar makes it likely.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
