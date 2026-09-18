@@ -127,7 +127,7 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
     num_prompts = 160
     max_concurrency = 160
     random_range_ratio = 1
-    warmup_requests = 16
+    warmup_requests = 32
     request_rate = float("inf")
     seed = 1
     tpot = 50
