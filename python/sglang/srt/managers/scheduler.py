@@ -2898,9 +2898,17 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
+            if req.to_finish is not None or isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                if req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                req.time_stats.trace_ctx.abort(
+                    abort_info={"reason": req.finished_reason.message}
+                )
+                req.time_stats.set_quick_finish_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
                 return
 
         else:

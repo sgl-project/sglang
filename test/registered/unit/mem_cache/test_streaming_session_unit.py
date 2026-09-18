@@ -112,9 +112,16 @@ class _FakeReq:
             session_id=session_id,
             streaming=True,
             finish_req=lambda req: None,
-            abort_req=lambda rid=None: None,
             _inflight=False,
+            _inflight_rid=None,
         )
+
+        def abort_req(rid):
+            if self.session._inflight_rid == rid:
+                self.session._inflight = False
+                self.session._inflight_rid = None
+
+        self.session.abort_req = abort_req
         self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
@@ -160,7 +167,7 @@ def test_session_slot_round_trip_preserves_mamba_state():
 
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
-    the session: session=None, abort_req() called. Slot stays intact."""
+    the session: session=None, abort_req(rid) called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator(page_size=16)
@@ -206,6 +213,101 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
+
+
+def test_preabort_detaches_without_slot():
+    """Pre-aborted req detaches even when its session has no active slot."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    raw_result = MatchResult(
+        device_indices=torch.tensor([], dtype=torch.int64),
+        last_device_node=None,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=16,
+        match_results=[raw_result],
+    )
+    tree_cache = StreamingSession(inner)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1, allocated=1)
+    req.session._inflight_rid = req.rid
+    aborted = []
+    original_abort_req = req.session.abort_req
+
+    def record_abort_req(rid):
+        aborted.append(rid)
+        original_abort_req(rid)
+
+    req.session.abort_req = record_abort_req
+    req.to_finish = FINISH_ABORT("too long")
+
+    result = tree_cache.match_prefix(
+        SimpleNamespace(
+            req=req,
+            key=SimpleNamespace(token_ids=list(range(64))),
+        )
+    )
+
+    assert req.session is None
+    assert aborted == ["session-a"]
+    assert result is raw_result
+    assert len(result.device_indices) == 0
+    assert tree_cache.slots == {}
+
+
+def test_preabort_of_non_inflight_req_keeps_inflight():
+    """Only the matching in-flight request may clear session state."""
+
+    def match_preaborted_req(rid):
+        req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+        raw_result = MatchResult(
+            device_indices=torch.tensor([], dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+            best_match_node=None,
+        )
+        inner = _FakeInnerCache(
+            req_to_token_pool,
+            _FakeAllocator(),
+            page_size=16,
+            match_results=[raw_result],
+        )
+        tree_cache = StreamingSession(inner)
+        req = _FakeReq("session-a", req_pool_idx=0, committed=1, allocated=1)
+        req.rid = rid
+        req.session._inflight = True
+        req.session._inflight_rid = "turn-1"
+        abort_req = Mock()
+        real_abort_req = req.session.abort_req
+
+        def record_abort_req(request_rid):
+            if req.session._inflight_rid == request_rid:
+                abort_req(request_rid)
+            real_abort_req(request_rid)
+
+        req.session.abort_req = record_abort_req
+        req.to_finish = FINISH_ABORT("too long")
+
+        tree_cache.match_prefix(
+            SimpleNamespace(
+                req=req,
+                key=SimpleNamespace(token_ids=list(range(64))),
+            )
+        )
+        return req, abort_req
+
+    non_inflight_req, abort_req = match_preaborted_req("stub")
+    assert non_inflight_req.session is None
+    abort_req.assert_not_called()
+
+    inflight_req, abort_req = match_preaborted_req("turn-1")
+    assert inflight_req.session is None
+    abort_req.assert_called_once_with("turn-1")
 
 
 def test_first_mid_abort_nukes_ephemeral_slot():
