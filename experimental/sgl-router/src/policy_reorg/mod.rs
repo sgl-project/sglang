@@ -8,6 +8,7 @@
 //! accept the request. Bucket resolution and ordering live one layer up.
 
 pub mod admission;
+pub mod cache_aware;
 pub mod least_load;
 pub mod power_of_two;
 pub mod random;
@@ -20,6 +21,7 @@ pub use admission::*;
 use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, StickyFallbackKind};
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies::state::engine_load::LoadView;
+use crate::policies::state::kv_events::KvEventIndex;
 use crate::policies::state::AffinityStore;
 use crate::server::metrics::MetricsRegistry;
 use crate::workers::Worker;
@@ -61,6 +63,9 @@ pub struct PickRequest<'a> {
     pub expected_peak_sequence_tokens: Option<u64>,
     pub session_id: Option<&'a str>,
     pub routing_key: Option<&'a str>,
+    pub tokens: Option<&'a [u32]>,
+    /// Per-request prefix lookup shared across buckets.
+    pub prefix: Option<&'a cache_aware::PrefixMemo>,
     /// False when the resolver wants this pick to neither look up nor create bindings.
     pub affinity_enabled: bool,
     pub load: &'a LoadView<'a>,
@@ -148,6 +153,21 @@ pub enum BuildError {
 pub struct PolicyDependencies {
     pub metrics: Arc<MetricsRegistry>,
     pub affinity: Arc<AffinityStore>,
+    /// Local KV-event index; also the block-size source for a remote indexer.
+    pub kv_index: Arc<KvEventIndex>,
+    pub remote_cache: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+}
+
+impl PolicyDependencies {
+    fn cache_source(&self) -> cache_aware::CacheSource {
+        match &self.remote_cache {
+            Some(index) => cache_aware::CacheSource::Remote {
+                index: Arc::clone(index),
+                block_size: self.kv_index.block_size_oracle(),
+            },
+            None => cache_aware::CacheSource::Local(Arc::clone(&self.kv_index)),
+        }
+    }
 }
 
 pub fn build_policy(
@@ -157,6 +177,12 @@ pub fn build_policy(
 ) -> Result<Arc<dyn Policy>, BuildError> {
     let admission = migrated_admission(kind, model);
     Ok(match kind {
+        PolicyKind::CacheAware => Arc::new(cache_aware::CacheAwarePolicy::new(
+            deps.cache_source(),
+            admission,
+            model.affinity.clone().unwrap_or_default(),
+            Arc::clone(&deps.metrics),
+        )),
         PolicyKind::SessionAware => Arc::new(session_aware::SessionAwarePolicy::new(
             admission,
             Arc::clone(&deps.affinity),
@@ -244,7 +270,10 @@ fn migrated_admission(kind: PolicyKind, model: &ModelConfig) -> Admission {
 pub(crate) mod testing {
     use super::*;
     use crate::discovery::{WorkerMode, WorkerSpec};
-    use crate::policies::state::engine_load::EngineLoadTable;
+    use crate::policies::state::engine_load::{
+        EngineLoadSnapshot, EngineLoadTable, NativeCacheWorkerLoad,
+    };
+    use crate::policies::state::PrefixLookup;
 
     pub(crate) fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -260,14 +289,42 @@ pub(crate) mod testing {
         Request::default().pick(policy, engines).await
     }
 
-    #[derive(Default)]
-    pub(crate) struct Request {
+    pub(crate) fn native(
+        engine: &Worker,
+        running: u64,
+        waiting: u64,
+        used: u64,
+        capacity: u64,
+    ) -> (String, NativeCacheWorkerLoad) {
+        (
+            engine.url.clone(),
+            NativeCacheWorkerLoad {
+                num_running_reqs: running,
+                num_waiting_reqs: waiting,
+                num_waiting_uncached_tokens: waiting,
+                num_used_tokens: used,
+                num_total_tokens: used,
+                max_total_num_tokens: capacity,
+                max_running_requests: 64,
+                prefill_throughput_tokens_per_s: None,
+                estimated_prefill_queue_ms: None,
+                captured_at: std::time::Instant::now(),
+            },
+        )
+    }
+
+    #[derive(Default, Clone)]
+    pub(crate) struct Request<'m> {
         session_id: Option<&'static str>,
         routing_key: Option<&'static str>,
         mode: Option<PickMode>,
+        input_tokens: Option<u64>,
+        prefix: Option<PrefixLookup>,
+        memo: Option<&'m cache_aware::PrefixMemo>,
+        snapshot: Option<EngineLoadSnapshot>,
     }
 
-    impl Request {
+    impl<'m> Request<'m> {
         pub(crate) fn session(id: &'static str) -> Self {
             Self {
                 session_id: Some(id),
@@ -289,13 +346,50 @@ pub(crate) mod testing {
             }
         }
 
+        pub(crate) fn input_tokens(self, n: u64) -> Self {
+            Self {
+                input_tokens: Some(n),
+                ..self
+            }
+        }
+
+        pub(crate) fn prefix(self, lookup: PrefixLookup) -> Self {
+            Self {
+                prefix: Some(lookup),
+                ..self
+            }
+        }
+
+        pub(crate) fn memo(self, memo: &'m cache_aware::PrefixMemo) -> Self {
+            Self {
+                memo: Some(memo),
+                ..self
+            }
+        }
+
+        pub(crate) fn snapshot(
+            self,
+            loads: impl IntoIterator<Item = (String, NativeCacheWorkerLoad)>,
+        ) -> Self {
+            let snapshot =
+                EngineLoadSnapshot::from_native_cache_workers(1, loads.into_iter().collect());
+            Self {
+                snapshot: Some(snapshot),
+                ..self
+            }
+        }
+
         pub(crate) async fn pick(
             &self,
             policy: &dyn Policy,
             engines: &[Arc<Worker>],
         ) -> PickResult {
             let table = EngineLoadTable::new();
-            let load = LoadView::new(&table);
+            let load = match &self.snapshot {
+                Some(snapshot) => LoadView::from_snapshot(snapshot.clone()),
+                None => LoadView::new(&table),
+            };
+            let resolved = cache_aware::PrefixMemo::resolved(self.prefix.clone());
             let model = ModelId("m".into());
             let request = PickRequest {
                 model: &model,
@@ -303,10 +397,12 @@ pub(crate) mod testing {
                 bucket_id: "global",
                 scope: AffinityScope::Bucket,
                 mode: self.mode.unwrap_or(PickMode::Normal),
-                input_tokens: 16,
+                input_tokens: self.input_tokens.unwrap_or(16),
                 expected_peak_sequence_tokens: None,
                 session_id: self.session_id,
                 routing_key: self.routing_key,
+                tokens: None,
+                prefix: self.memo.or(self.prefix.is_some().then_some(&resolved)),
                 affinity_enabled: true,
                 load: &load,
             };

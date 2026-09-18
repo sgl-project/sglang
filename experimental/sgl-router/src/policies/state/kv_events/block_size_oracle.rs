@@ -118,6 +118,17 @@ impl BlockSizeOracle {
         self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
     }
 
+    /// Block hashes of `tokens` under the learned block size and hashing
+    /// scheme; `None` until a worker has told us the block size.
+    pub fn block_hashes(&self, tokens: &[u32]) -> Option<Vec<i64>> {
+        let block_size = self.get()? as usize;
+        Some(if self.is_bigram() {
+            super::compute_block_hashes_bigram(tokens, block_size)
+        } else {
+            super::compute_block_hashes(tokens, block_size)
+        })
+    }
+
     /// Publish a candidate block size. Returns the established value on
     /// success (idempotent: same candidate as already set is `Ok`);
     /// returns `Err(BlockSizeMismatch)` when the candidate disagrees.
