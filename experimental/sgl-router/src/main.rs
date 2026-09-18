@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
+    config::{
+        CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind,
+        SelectionEngine,
+    },
     discovery::spawn_discovery,
     policies::{
         factory::build_registry as build_policy_registry,
@@ -47,6 +50,7 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
+    let selection_engine = cli.routing.selection_engine;
     install_bootstrap_subscriber();
     let config = cli
         .into_config()
@@ -94,7 +98,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
-    let app_context = build_app_context(
+    let mut app_context = build_app_context(
         &config,
         tokenizers,
         worker_registry,
@@ -103,6 +107,12 @@ async fn main() -> Result<()> {
         &engine_state,
         external_kv_indexer_client,
     )?;
+    if selection_engine == SelectionEngine::Reorg {
+        app_context
+            .enable_bucket_engine()
+            .context("build bucket engine")?;
+    }
+    let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -263,9 +273,9 @@ fn build_app_context(
     worker_registry: Arc<WorkerRegistry>,
     routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<ActiveLoadRegistry>,
-    engine_state: &KvEventIndex,
+    engine_state: &Arc<KvEventIndex>,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
-) -> Result<Arc<AppContext>> {
+) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
@@ -291,7 +301,8 @@ fn build_app_context(
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_load = engine_state.engine_load();
     app_context.kv_metrics = engine_state.metrics_source();
-    Ok(Arc::new(app_context))
+    app_context.kv_index = Some(Arc::clone(engine_state));
+    Ok(app_context)
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped

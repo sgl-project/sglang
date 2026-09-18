@@ -22,7 +22,7 @@ pub use admission::*;
 use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, StickyFallbackKind};
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies::state::engine_load::LoadView;
-use crate::policies::state::kv_events::KvEventIndex;
+use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex};
 use crate::policies::state::AffinityStore;
 use crate::server::metrics::MetricsRegistry;
 use crate::workers::Worker;
@@ -148,26 +148,31 @@ pub enum BuildError {
     Unsupported(PolicyKind),
     #[error("decode policy `{0:?}` is not available in the bucket engine")]
     UnsupportedDecode(DecodePolicyKind),
+    #[error("cache_aware needs a local KV-event index or a KV indexer endpoint")]
+    NoPrefixSource,
 }
 
 /// Shared services policies hold handles to; started once by application wiring.
 pub struct PolicyDependencies {
     pub metrics: Arc<MetricsRegistry>,
     pub affinity: Arc<AffinityStore>,
-    /// Local KV-event index; also the block-size source for a remote indexer.
-    pub kv_index: Arc<KvEventIndex>,
+    pub local_cache: Option<Arc<KvEventIndex>>,
     pub remote_cache: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    pub block_size: Arc<BlockSizeOracle>,
 }
 
 impl PolicyDependencies {
-    fn cache_source(&self) -> cache_aware::CacheSource {
-        match &self.remote_cache {
-            Some(index) => cache_aware::CacheSource::Remote {
+    fn cache_source(&self) -> Result<cache_aware::CacheSource, BuildError> {
+        if let Some(index) = &self.remote_cache {
+            return Ok(cache_aware::CacheSource::Remote {
                 index: Arc::clone(index),
-                block_size: self.kv_index.block_size_oracle(),
-            },
-            None => cache_aware::CacheSource::Local(Arc::clone(&self.kv_index)),
+                block_size: Arc::clone(&self.block_size),
+            });
         }
+        self.local_cache
+            .as_ref()
+            .map(|index| cache_aware::CacheSource::Local(Arc::clone(index)))
+            .ok_or(BuildError::NoPrefixSource)
     }
 }
 
@@ -179,7 +184,7 @@ pub fn build_policy(
     let admission = migrated_admission(kind, model);
     Ok(match kind {
         PolicyKind::CacheAware => Arc::new(cache_aware::CacheAwarePolicy::new(
-            deps.cache_source(),
+            deps.cache_source()?,
             admission,
             model.affinity.clone().unwrap_or_default(),
             Arc::clone(&deps.metrics),
