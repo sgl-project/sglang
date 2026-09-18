@@ -95,8 +95,7 @@ class FakePool:
         dtype=torch.bfloat16,
         compressed_dtype=None,
     ):
-        # Same contract as QSATokenToKVPool: ring in the compute dtype,
-        # compressed cache (and index Q) in the storage dtype.
+        # Ring in the compute dtype, compressed cache and index Q in the storage dtype.
         self.qsa_compressed_dtype = compressed_dtype or dtype
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
@@ -141,8 +140,7 @@ def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
 
 
 def assert_fp8_within_one_ulp(actual, expected):
-    """One e4m3 code step (within a sign the uint8 order is the value order);
-    subnormals get an absolute 2^-8 allowance for the group-mean summation order."""
+    """One e4m3 code step, or 2^-8 absolute for subnormals and sign crossings."""
     assert actual.dtype == expected.dtype == torch.float8_e4m3fn
     code_diff = (
         actual.view(torch.uint8).int() - expected.view(torch.uint8).int()
@@ -206,8 +204,7 @@ def test_fused_compress_matches_eager(
 
 
 def test_fused_q_prep_fp8_matches_eager_cast():
-    """The fused Q prep must emit e4m3 Q equal (to one ulp) to the eager
-    normed+rotated Q cast at the end."""
+    """fp8 Q from the fused prep must match the eager Q cast at the end (one ulp)."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(11)
@@ -235,8 +232,7 @@ def test_fused_q_prep_fp8_matches_eager_cast():
 
 
 def _selected_score_multisets(logits, block_indices):
-    """Sorted logits of the selected blocks per row: what a selection is worth,
-    independent of which of two tied blocks was taken."""
+    """Sorted logits of the selected blocks per row, so tied blocks compare equal."""
     out = []
     for row in range(block_indices.shape[0]):
         picked = block_indices[row][block_indices[row] >= 0].long()
@@ -246,9 +242,9 @@ def _selected_score_multisets(logits, block_indices):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_tilelang_mqa_matches_torch_reference(dtype):
-    """TileLang scoring vs the fp32 torch reference on the same operands; the
-    selected blocks are compared as score multisets (fp8 ties at the top-k
-    boundary, so index identity is not the contract)."""
+    """TileLang scoring vs the fp32 torch reference on the same operands. The
+    selected blocks are compared as score multisets because fp8 ties at the
+    top-k boundary."""
     from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
@@ -262,8 +258,8 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
         pytest.skip("tilelang unavailable")
     device = torch.device("cuda")
     torch.manual_seed(3)
-    # Decode: paged compressed cache, one query row per request. The top-k
-    # kernel supports the production block budget (512 blocks) only.
+    # Decode: paged compressed cache. qsa_fast_topk only supports the production
+    # block budget (512).
     batch, max_pages, page_size, block_topk = 6, 256, 16, 512
     q = torch.randn(batch, NUM_Q_HEADS, HEAD_DIM, device=device).to(dtype)
     cache = torch.randn(512, page_size, 1, HEAD_DIM, device=device).to(dtype)
@@ -302,7 +298,7 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
 
 
 def test_tilelang_mqa_rejects_mixed_operand_dtypes():
-    """Mixed fp8/bf16 operands must fail loudly, not dequantize the cache."""
+    """Mixed fp8/bf16 operands must fail instead of dequantizing the cache."""
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
         tilelang_qsa_mqa_decode,

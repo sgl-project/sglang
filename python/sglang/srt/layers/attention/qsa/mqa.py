@@ -106,7 +106,7 @@ def torch_qsa_mqa_decode(
     return logits
 
 
-# TileLang dtype names of the scoring-kernel operands; the logits stay fp32.
+# TileLang dtype names of the scoring-kernel operands. The logits stay fp32.
 _TILELANG_DTYPES = {
     torch.bfloat16: "bfloat16",
     torch.float8_e4m3fn: "float8_e4m3fn",
@@ -397,7 +397,6 @@ def tilelang_qsa_mqa_decode(
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_kernel.unsqueeze(1).contiguous(),
-        # No-op when the dtypes already match: the pool is never copied.
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),

@@ -193,7 +193,6 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
-                # Q must match the compressed cache dtype it is scored against.
                 out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True

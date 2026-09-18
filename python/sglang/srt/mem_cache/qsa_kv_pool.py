@@ -29,7 +29,7 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
-# ``--qsa-indexer-dtype`` choices; the pending key ring stays bf16 regardless.
+# ``--qsa-indexer-dtype`` choices. The pending key ring stays bf16 regardless.
 QSA_INDEXER_DTYPE_CHOICES = ("auto", "bfloat16", "fp8_e4m3")
 
 

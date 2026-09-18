@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 def _jit_qsa_indexer_module(
     dtype: torch.dtype, out_dtype: torch.dtype, head_dim: int, is_neox_style: bool
 ) -> Module:
-    """Compile and cache one specialisation; ``out_dtype`` is ``dtype`` or fp8 e4m3."""
+    """Compile and cache the JIT QSA indexer module for one specialisation."""
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if out_dtype != dtype and out_dtype != torch.float8_e4m3fn:
@@ -103,7 +103,7 @@ def qsa_index_q_norm_rope_store(
     is_neox_style   : NeoX (True) or GPT-J (False) RoPE pairing
     q_heads_padded  : output head count; heads >= num_q_heads are zero-filled
                       (defaults to num_q_heads)
-    out_dtype       : dtype of the returned Q (default qk.dtype); fp8 e4m3 when
+    out_dtype       : dtype of the returned Q (default qk.dtype), fp8 e4m3 when
                       the indexer cache is fp8
 
     Returns
@@ -168,7 +168,7 @@ def qsa_index_k_compress_store(
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
     write_locs       : CUDA int32 [groups] compressed-cache slots to write
-    compressed_k_buffer : CUDA [compressed_slots, head_dim] (written); ring dtype
+    compressed_k_buffer : CUDA [compressed_slots, head_dim] (written), ring dtype
                        or fp8 e4m3
     compress_ratio   : raw keys per compressed key
     rotary_dim       : rotated prefix of each head row

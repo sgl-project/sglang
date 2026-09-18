@@ -225,7 +225,7 @@ class Model(msgspec.Struct):
             help=(
                 "Storage dtype of the compressed QSA indexer cache and index query "
                 '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
-                "with fp8 GEMMs (CUDA SM90+); the main KV cache is unaffected."
+                "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
             ),
             choices=["auto", "bfloat16", "fp8_e4m3"],
         ),

@@ -49,8 +49,8 @@ SGL_DEVICE float eager_round<fp16_t>(float x) {
 }
 
 /// \brief Convert a value computed in the compute dtype to the cache storage
-/// dtype. Identity when both agree; the fp8 compressed cache takes a plain
-/// e4m3 cast (no scale: the row is RMSNormed before it gets here).
+/// dtype. Identity when both agree. The fp8 compressed cache takes a plain
+/// e4m3 cast with no scale, as the row is RMSNormed before it gets here.
 template <typename TOut, typename T>
 SGL_DEVICE TOut qsa_storage_cast(T value) {
   if constexpr (std::is_same_v<TOut, T>) {
