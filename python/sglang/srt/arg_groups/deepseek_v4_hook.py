@@ -44,7 +44,8 @@ def validate_deepseek_v4_mega_moe_token_budget(
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        # Interleave CP pads every local shard to a multiple of CP size.
+        token_alignment = cfg.attn_cp_size
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size
@@ -331,26 +332,29 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # Prefill CP internally enables DP attention with dp_size=1. This is
+        # not multi-rank DP attention and is compatible with PD DSpark.
+        uses_cp = getattr(cfg, "enable_prefill_cp", False) or cfg.attn_cp_size > 1
+        invalid_cp_topology = uses_cp and cfg.disaggregation_mode != "prefill"
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
             or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
+            or invalid_cp_topology
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DP=1 and decode CP=1; prefill may use CP. Both servers must "
+                "enable DSpark with the same block size and KV layout."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
     prefill_graph = cfg.cuda_graph_config.prefill
     if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
+        # Both non-CP and CP captured low-ratio indexers score a static context
+        # width, so constrain the paged logits workspace for both paths.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
@@ -372,8 +376,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", cfg.enable_dp_attention),
+            # Prefill CP sets enable_dp_attention with DP=1 as an internal
+            # implementation detail; only real multi-rank DP is incompatible.
+            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:

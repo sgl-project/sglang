@@ -235,13 +235,18 @@ class CompressorBackendMixin:
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor: Compressor,
+        precomputed_kv_score: Optional[torch.Tensor] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        kv_score_input = (
+            precomputed_kv_score
+            if precomputed_kv_score is not None
+            else compressor.compute_kv_score(x, forward_batch)
+        )
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
