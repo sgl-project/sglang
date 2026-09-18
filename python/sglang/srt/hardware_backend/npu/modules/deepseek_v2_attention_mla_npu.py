@@ -41,6 +41,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
     is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.utils.common import print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -717,6 +718,16 @@ class _DcpGatherPrefetcher:
             # Layer 0 of a forward, or a layer whose prefetch was skipped. Issue
             # it now and pay for it, exactly as the unprefetched path would.
             self._gather_prefix(m, md, plan, k_nope, k_pe, layer_id)
+        else:
+            # Logged on a HIT, not on construction. A prefetcher that is built
+            # and then misses on every layer does no overlapping at all, and
+            # would log identically if this sat in __init__ -- which is the
+            # silently-inert failure the flag exists to rule out. Reaching here
+            # means a previous layer's side-stream gather filled this slot.
+            print_info_once(
+                "DCP gather prefetch is ON: layer l+1's prefix all-gather runs "
+                "on a side stream underneath layer l's compute"
+            )
         out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
         torch.npu.current_stream().wait_event(self.ready[slot])
         # The one part that could not be prefetched: this chunk's own KV.
