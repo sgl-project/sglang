@@ -1367,9 +1367,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )

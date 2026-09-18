@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.managers.scheduler import (
 from sglang.multimodal_gen.runtime.observability import metrics as metrics_module
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils import perf_logger
 
 
@@ -33,6 +34,21 @@ def metrics():
     registry = CollectorRegistry()
     collector = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
     return collector, registry
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_role_checks_http_port_only_when_exporting_metrics(enabled, monkeypatch):
+    args = ServerArgs.__new__(ServerArgs)
+    args.disagg_role = RoleType.DENOISER
+    args.enable_metrics = enabled
+    args.strict_ports = True
+    require_port = Mock()
+    monkeypatch.setattr(args, "_require_port", require_port)
+    args._adjust_network_ports()
+    http_checks = [
+        call.args for call in require_port.call_args_list if call.args[1] == "HTTP"
+    ]
+    assert http_checks == ([(args.port, "HTTP")] if enabled else [])
 
 
 def sample(registry, name, **labels):
