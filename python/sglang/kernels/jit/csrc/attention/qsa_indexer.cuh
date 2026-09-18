@@ -12,9 +12,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <type_traits>
-
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
@@ -241,7 +240,8 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
   }
 
   for (int32_t h = static_cast<int32_t>(warp); h < params.q_heads_padded; h += 4) {
-    TOut* out_row = static_cast<TOut*>(params.q_out) + (static_cast<int64_t>(token) * params.q_heads_padded + h) * kHeadDim;
+    TOut* out_row =
+        static_cast<TOut*>(params.q_out) + (static_cast<int64_t>(token) * params.q_heads_padded + h) * kHeadDim;
     if (h < params.num_q_heads) {
       const T* x_row = static_cast<const T*>(params.qk) + qk_row + h * kHeadDim;
       qsa_gemma_norm_row<T, kHeadDim>(x_row, static_cast<const T*>(params.weight), params.eps, smem_rows[warp]);
