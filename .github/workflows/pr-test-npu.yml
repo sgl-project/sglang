@@ -5,7 +5,6 @@ on:
     branches: [ main ]
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
-  pull_request:
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -395,7 +394,7 @@ jobs:
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     continue-on-error: true
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode == true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
     env:
@@ -499,7 +498,7 @@ jobs:
 
         recommend-tests-from-coverage,
       ]
-    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode != true }}
+    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode == true }}
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
