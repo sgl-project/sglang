@@ -1736,6 +1736,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            else:
+                q = _quantize_sgl_native_decode_query(
+                    q,
+                    enabled=self.use_sgl_native_q8kv8_decode,
+                    q_scale=layer.q_scale_float,
+                )
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (

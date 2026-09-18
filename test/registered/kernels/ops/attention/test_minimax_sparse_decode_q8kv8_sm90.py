@@ -216,3 +216,12 @@ def test_native_decode_quantizes_only_main_query_without_full_fp8_mode():
     actual = _quantize_sgl_native_decode_query(q, enabled=True, q_scale=0.5)
     assert actual.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(actual.float(), torch.tensor([2.0, -1.0]))
+
+
+def test_forward_decode_routes_main_query_through_native_fp8_quantization():
+    from sglang.srt.layers.attention.minimax_sparse_backend import (
+        MiniMaxSparseAttnBackend,
+    )
+
+    source = inspect.getsource(MiniMaxSparseAttnBackend.forward_decode)
+    assert "_quantize_sgl_native_decode_query(" in source
