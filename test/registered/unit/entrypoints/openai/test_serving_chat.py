@@ -4622,6 +4622,114 @@ class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
                 self.assertEqual(choice["finish_reason"], "tool_calls")
                 self.assertEqual(len(choice["message"]["tool_calls"]), 1)
 
+    def test_streaming_sse_body_is_clean(self):
+        """The SSE stream must not carry DSML either.
+
+        The streaming path is not modified by this change; this pins the
+        behaviour so a future change to the shared detector cannot start
+        leaking markup into `delta.content`.
+        """
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(  # noqa: ANN202
+            request: ChatCompletionRequest, raw_request: Request
+        ):
+            serving = raw_request.app.state.openai_serving_chat
+            return await serving.handle_request(request, raw_request)
+
+        generated = {"text": ""}
+
+        async def fake_generate(adapted_request, raw_request):  # noqa: ANN202
+            """Emit cumulative text, as the scheduler does."""
+            text = generated["text"]
+            for end in range(6, len(text) + 6, 6):
+                yield {
+                    "text": text[:end],
+                    "meta_info": {
+                        "id": "req-1",
+                        "finish_reason": None,
+                        "prompt_tokens": 10,
+                        "completion_tokens": end,
+                        "cached_tokens": 0,
+                        "weight_version": "v1",
+                    },
+                }
+            yield {
+                "text": text,
+                "meta_info": {
+                    "id": "req-1",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 10,
+                    "completion_tokens": len(text),
+                    "cached_tokens": 0,
+                    "weight_version": "v1",
+                },
+            }
+
+        self.chat.tokenizer_manager.generate_request = fake_generate
+        self.chat.tokenizer_manager.create_abort_task = lambda adapted: None
+        self.chat.template_manager.chat_template_name = "chatml"
+        app.state.openai_serving_chat = self.chat
+        client = TestClient(app)
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "stream": True,
+        }
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                generated["text"] = text
+
+                response = client.post("/v1/chat/completions", json=body)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn(self.DSML, response.text)
+
+                names, arguments, finish = [], "", None
+                for line in response.text.splitlines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[len("data: ") :].strip()
+                    if payload == "[DONE]":
+                        continue
+                    for choice in json.loads(payload).get("choices", []):
+                        delta = choice.get("delta") or {}
+                        for call in delta.get("tool_calls") or []:
+                            function = call.get("function") or {}
+                            if function.get("name"):
+                                names.append(function["name"])
+                            arguments += function.get("arguments") or ""
+                        if choice.get("finish_reason"):
+                            finish = choice["finish_reason"]
+
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
+                self.assertEqual(finish, "tool_calls")
+
 
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
