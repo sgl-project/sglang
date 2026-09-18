@@ -1,0 +1,251 @@
+//! Opaque values stored on radix-tree nodes.
+
+use std::fmt::Debug;
+use std::ops::Range;
+use std::sync::Arc;
+
+/// Value operations required by the radix-tree mechanism.
+///
+/// Implementations should make [`Self::shallow_clone`] cheap. Values are index
+/// descriptors rather than mutable KV data, so sharing immutable storage is
+/// safe for CPU simulation backends.
+pub trait RadixValue: Debug + Sized + 'static {
+    /// Number of logical radix atoms represented by this value.
+    fn len(&self) -> usize;
+
+    /// Whether the value contains no atoms.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Cheap handle clone used while collecting a matched path.
+    fn shallow_clone(&self) -> Self;
+
+    /// Compact, owned copy for the tree to store. It must not share the caller's
+    /// buffer: node values outlive the insert that produced them, and a shared
+    /// slice would pin the whole buffer until the last node holding it dies.
+    fn copy_for_adoption(&self) -> Self;
+
+    /// View or copy a contiguous logical range.
+    fn slice(&self, start: usize, len: usize) -> Self;
+
+    /// Split an owned value at an internal point (`0 < at < len`) into head and tail.
+    fn split_owned(self, at: usize) -> (Self, Self);
+
+    /// Concatenate values in path order.
+    fn concat(values: &[Self]) -> Self;
+
+    /// Empty value; `UnifiedTreeCore::new` also uses it as the shared empty
+    /// device indices. A backend whose empties need a placement exposes its
+    /// own constructor (Tensor: `new_on_device`).
+    fn empty() -> Self;
+
+    /// Materialize the indices as integers for inspection and canary walks.
+    fn to_i64_vec(&self) -> Vec<i64>;
+}
+
+/// Immutable, cheaply sliced list suitable for simulated KV page identifiers.
+#[derive(Clone, Debug)]
+pub struct PageValue<T> {
+    storage: Arc<[T]>,
+    range: Range<usize>,
+}
+
+// Equality is over the visible range only; two values may share or differ in
+// backing storage and still represent the same pages.
+impl<T: PartialEq> PartialEq for PageValue<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for PageValue<T> {}
+
+impl<T> PageValue<T> {
+    pub fn from_vec(values: Vec<T>) -> Self {
+        let len = values.len();
+        Self {
+            storage: values.into(),
+            range: 0..len,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.storage[self.range.clone()]
+    }
+}
+
+impl<T> Default for PageValue<T> {
+    fn default() -> Self {
+        Self {
+            storage: Arc::from([]),
+            range: 0..0,
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for PageValue<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::from_vec(values)
+    }
+}
+
+impl<T> RadixValue for PageValue<T>
+where
+    T: Copy + Debug + TryInto<i64> + 'static,
+{
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    fn shallow_clone(&self) -> Self {
+        self.clone()
+    }
+
+    fn copy_for_adoption(&self) -> Self {
+        Self::from_vec(self.as_slice().to_vec())
+    }
+
+    fn slice(&self, start: usize, len: usize) -> Self {
+        assert!(start <= self.len(), "slice start exceeds value length");
+        assert!(
+            len <= self.len() - start,
+            "slice length exceeds value length"
+        );
+        let absolute_start = self.range.start + start;
+        Self {
+            storage: Arc::clone(&self.storage),
+            range: absolute_start..absolute_start + len,
+        }
+    }
+
+    fn split_owned(self, at: usize) -> (Self, Self) {
+        assert!(0 < at && at < self.len(), "split point must be internal");
+        // Both halves stay in the tree, so neither may keep the wider buffer alive.
+        let (head, tail) = self.as_slice().split_at(at);
+        (Self::from_vec(head.to_vec()), Self::from_vec(tail.to_vec()))
+    }
+
+    fn concat(values: &[Self]) -> Self {
+        let Some(first) = values.first() else {
+            return Self::default();
+        };
+        // Adjacent views of one buffer concatenate to a wider view of it.
+        let mut end = first.range.end;
+        let mut is_contiguous = true;
+        for value in &values[1..] {
+            if !Arc::ptr_eq(&first.storage, &value.storage) || value.range.start != end {
+                is_contiguous = false;
+                break;
+            }
+            end = value.range.end;
+        }
+        if is_contiguous {
+            return Self {
+                storage: Arc::clone(&first.storage),
+                range: first.range.start..end,
+            };
+        }
+
+        let len = values.iter().map(Self::len).sum();
+        let mut joined = Vec::with_capacity(len);
+        for value in values {
+            joined.extend_from_slice(value.as_slice());
+        }
+        Self::from_vec(joined)
+    }
+
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn to_i64_vec(&self) -> Vec<i64> {
+        self.as_slice()
+            .iter()
+            .map(|&page| {
+                page.try_into()
+                    .unwrap_or_else(|_| panic!("page id does not fit in i64"))
+            })
+            .collect()
+    }
+}
+
+#[cfg(feature = "torch")]
+impl RadixValue for tch::Tensor {
+    fn len(&self) -> usize {
+        self.size()[0] as usize
+    }
+
+    fn shallow_clone(&self) -> Self {
+        tch::Tensor::shallow_clone(self)
+    }
+
+    fn copy_for_adoption(&self) -> Self {
+        self.copy()
+    }
+
+    fn slice(&self, start: usize, len: usize) -> Self {
+        self.narrow(0, start as i64, len as i64)
+    }
+
+    fn split_owned(self, at: usize) -> (Self, Self) {
+        let len = RadixValue::len(&self);
+        assert!(0 < at && at < len, "split point must be internal");
+        (
+            self.narrow(0, 0, at as i64).copy(),
+            self.narrow(0, at as i64, (len - at) as i64).copy(),
+        )
+    }
+
+    fn concat(values: &[Self]) -> Self {
+        tch::Tensor::cat(values, 0)
+    }
+
+    fn empty() -> Self {
+        tch::Tensor::empty([0], (tch::Kind::Int64, tch::Device::Cpu))
+    }
+
+    fn to_i64_vec(&self) -> Vec<i64> {
+        Vec::<i64>::try_from(&self.to(tch::Device::Cpu)).expect("failed to copy radix value to CPU")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PageValue, RadixValue};
+
+    #[test]
+    fn slices_are_views_and_stored_values_are_compact() {
+        let value = PageValue::from_vec(vec![10_u64, 11, 12, 13]);
+        let view = value.slice(1, 2);
+        assert_eq!(view.as_slice(), &[11, 12]);
+        assert_eq!(view.as_slice().as_ptr(), value.as_slice()[1..].as_ptr());
+        assert_eq!(view.storage.len(), 4);
+
+        // What the tree keeps must not pin the caller's wider buffer.
+        let adopted = view.copy_for_adoption();
+        assert_eq!(adopted.as_slice(), &[11, 12]);
+        assert_eq!(adopted.storage.len(), 2);
+        let (head, tail) = value.split_owned(3);
+        assert_eq!(head.as_slice(), &[10, 11, 12]);
+        assert_eq!(tail.as_slice(), &[13]);
+        assert_eq!((head.storage.len(), tail.storage.len()), (3, 1));
+    }
+
+    #[test]
+    fn concat_widens_adjacent_views_and_copies_otherwise() {
+        let value = PageValue::from_vec(vec![10_u64, 11, 12, 13]);
+        let joined = PageValue::concat(&[value.slice(0, 2), value.slice(2, 2)]);
+        assert_eq!(joined.as_slice(), &[10, 11, 12, 13]);
+        assert_eq!(joined.as_slice().as_ptr(), value.as_slice().as_ptr());
+        let copied = PageValue::concat(&[value.slice(2, 2), value.slice(0, 2)]);
+        assert_eq!(copied.as_slice(), &[12, 13, 10, 11]);
+    }
+
+    #[test]
+    fn page_value_equality_ignores_backing_storage() {
+        let shared = PageValue::from_vec(vec![1_u32, 2, 3]);
+        assert_eq!(shared.slice(0, 2), PageValue::from_vec(vec![1, 2]));
+        assert_ne!(shared.slice(0, 2), shared.slice(1, 2));
+    }
+}
