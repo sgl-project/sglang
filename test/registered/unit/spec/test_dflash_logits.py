@@ -272,10 +272,9 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
 
 
 def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
-    """The sampled LiLiCorr commit rides the selector's accept path, which needs
-    ``chain_speculative_sampling_triton`` and so is unavailable on NPU. Requesting it
-    there has to fall through to the warning and the argmax verify; returning early as
-    though it were supported would publish a proposal the accept path cannot consume."""
+    """The sampled commit rides the selector's accept path, which needs
+    chain_speculative_sampling_triton; where that is unavailable it must warn and fall
+    through to the argmax verify rather than return as though it were supported."""
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     warnings = []
