@@ -4276,8 +4276,9 @@ class UnifiedRadixCacheSuite:
         cons.finish(aborted_rid, CacheRequestOutcome.ABORT)
         self.assertNotIn(aborted_rid.rid, cons.storage_prefetch_retries._pending)
 
-        # A fully-device-matched (empty-suffix) decline also arms the retry:
-        # the device match can evict while the request waits in the queue.
+        # A fully-device-matched (empty-suffix) decline issues no lookup and
+        # arms no retry; a queue-time eviction of that device match is
+        # re-queried at admission with the re-issue budget intact.
         cons.prefetch_from_storage(
             CacheRequestHandle("fully-matched", 0),
             cons.root_node_handle(),
@@ -4285,7 +4286,7 @@ class UnifiedRadixCacheSuite:
             None,
             None,
         )
-        self.assertIn("fully-matched", cons.storage_prefetch_retries._pending)
+        self.assertNotIn("fully-matched", cons.storage_prefetch_retries._pending)
         cons.sanity_check()
 
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
@@ -5115,7 +5116,9 @@ class UnifiedRadixCacheSuite:
                 CacheRequestHandle("subwin-req", 0), cons2.ongoing_prefetch
             )
             self.assertEqual(cons2._prefetch_outcome_stats["declined_too_short"], 1)
-            self.assertIn("subwin-req", cons2.storage_prefetch_retries._pending)
+            # A declined span issues no lookup, so it must not spend the
+            # re-issue budget on polls.
+            self.assertNotIn("subwin-req", cons2.storage_prefetch_retries._pending)
 
             cons2.prefetch_from_storage(
                 CacheRequestHandle("window-req", 0),
