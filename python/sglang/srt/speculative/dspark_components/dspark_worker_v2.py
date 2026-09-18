@@ -329,6 +329,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
+                fused_argmax=target_is_dsv41,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,

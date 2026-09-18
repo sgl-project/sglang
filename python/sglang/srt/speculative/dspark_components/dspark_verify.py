@@ -168,6 +168,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            fused_argmax=self._target_is_dsv41,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -537,9 +538,11 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fused_argmax: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -746,6 +749,7 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=self._fused_argmax,
         )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
@@ -817,6 +821,7 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -827,6 +832,7 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
@@ -851,6 +857,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,

@@ -359,6 +359,11 @@ def maybe_flashinfer_autotune_extend(
         return  # decode-shaped autotune already covered these buckets
     # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
+    wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
+    if wants_prefill_autotune is not None and not wants_prefill_autotune():
+        # Entering the autotune context loads / saves the tactic cache and syncs
+        # ranks, so a model that has nothing to tune must decline before it.
+        prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):
             tuned = prefill_autotune(num_tokens, dtype=mr.dtype)

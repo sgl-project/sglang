@@ -59,6 +59,12 @@ class TestModelPrefillAutotune(CustomTestCase):
         autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=65536)
         self.hook.assert_not_called()
 
+    def test_declining_model_never_enters_the_autotune_context(self):
+        self.mr.model.wants_prefill_autotune = lambda: False
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=384)
+        self.hook.assert_not_called()
+        self.flashinfer_autotune_context.assert_not_called()
+
     def test_other_models_keep_extend_opt_in(self):
         del self.mr.model.autotune_prefill_kernels
         autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=384)

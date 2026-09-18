@@ -4659,6 +4659,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._mhc_prewarmed_at_load = False
 
     @torch.inference_mode()
+    def wants_prefill_autotune(self) -> bool:
+        return getattr(self.config, "model_type", None) == "deepseek_v41"
+
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
         """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
         The quant method is called directly, so no TP collectives run and no
