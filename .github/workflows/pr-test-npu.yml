@@ -472,7 +472,7 @@ jobs:
   # Cross-references test failures with coverage recommendations.
   # !cancelled() only: success()/failure() are unusable here because needs
   # always contain coverage_mode-skipped jobs (base-a, multimodal-gen), which
-  # poison the transitive status chain.
+  # poison the transitive status chain
   analyze-failure-report:
     name: Analyze failure report
     needs:
