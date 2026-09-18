@@ -7,7 +7,8 @@
 //! Without a configured `.timeout(...)` on the reqwest client, a stalled
 //! backend hangs the axum handler future forever and the test harness
 //! would just timeout. We assert here that the router returns a fast,
-//! clean 502 (`upstream_timeout`) instead.
+//! clean 504 (`upstream_timeout`) instead — a timeout is a gateway timeout,
+//! the same status class as the stale-deadline cancel.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -32,11 +33,13 @@ fn config(_worker_url: &str) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -46,6 +49,7 @@ fn config(_worker_url: &str) -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -100,7 +104,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         elapsed < Duration::from_secs(1),
         "router must short-circuit on upstream timeout; elapsed {elapsed:?}"
     );
-    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
         "upstream_timeout"

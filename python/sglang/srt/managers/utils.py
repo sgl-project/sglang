@@ -23,8 +23,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -101,6 +101,25 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
+
+    # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
+    # bonus) for the NEXT verify round, relayed last stage -> all stages,
+    # with the tree topology the tokens were arranged by (parent_list and
+    # top_scores_index have different widths, so they stay separate).
+    next_verify_chain: Optional[torch.Tensor] = None
+    next_verify_parent_list: Optional[torch.Tensor] = None
+    next_verify_top_scores_index: Optional[torch.Tensor] = None
+
+    # PP+spec: the verify forward's KV slots on a non-last stage. That stage
+    # prepares verify inside forward isolation, which restores
+    # batch.out_cache_loc, so the slots have to travel on the result to survive
+    # until the accepted path comes back over the relay.
+    spec_verify_out_cache_loc: Optional[torch.Tensor] = None
+
+    # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
+    # Every stage holds the KV for its own layers, so every stage has to compact
+    # that path into its committed prefix; only the last stage can compute it.
+    accept_index: Optional[torch.Tensor] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
