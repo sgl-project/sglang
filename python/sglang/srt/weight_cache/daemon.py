@@ -51,6 +51,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    SpawnRanks,
     get_exec,
     get_parallel,
     publish,
@@ -281,7 +282,16 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        publish(server_args, role="weight_cache_daemon")
+        # The launcher told this daemon where it sits; the MoE ranks it did
+        # not, and those keep coming from the groups built below -- which is
+        # why the bundle is the three identities this entry actually has.
+        publish(
+            server_args,
+            role="weight_cache_daemon",
+            ranks=SpawnRanks(
+                gpu_id=self.gpu_id, tp_rank=self.tp_rank, pp_rank=self.pp_rank
+            ),
+        )
 
         from sglang.srt.layers.moe import initialize_moe_config
 

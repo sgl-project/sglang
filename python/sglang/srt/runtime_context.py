@@ -405,15 +405,20 @@ class SpawnRanks(msgspec.Struct, frozen=True):
     launcher already computes all of it (`entrypoints/engine.py` lays out the
     ranks it is about to spawn), so the process entry hands it over at publish
     rather than each subsystem re-deriving its own copy.
+
+    Not every entry knows its whole placement. A field left at None is one
+    this entry was not told, and it keeps being answered by the process
+    groups; `dp_rank` is the exception, because no group has one member per
+    replica, so None there is an answer rather than an absence.
     """
 
-    gpu_id: int
     tp_rank: int
-    pp_rank: int
+    gpu_id: Optional[int] = None
+    pp_rank: Optional[int] = None
     dp_rank: Optional[int] = None
-    attn_cp_rank: int = 0
-    moe_dp_rank: int = 0
-    moe_ep_rank: int = 0
+    attn_cp_rank: Optional[int] = None
+    moe_dp_rank: Optional[int] = None
+    moe_ep_rank: Optional[int] = None
 
 
 class ParallelContext:
@@ -1746,21 +1751,26 @@ def publish(
     _CONTEXT._publish_role = role
     if ranks is not None:
         # Every identity the spawn knows, recorded now so a read does not need
-        # a process group. Two of them have no group that could answer anyway:
-        # `dp_rank` counts replicas, and `gpu_id` names the device this process
-        # was given -- neither belongs on a config bag, which holds what every
-        # process in the deployment shares. The scoped overrides that swap a
-        # group for a draft worker sit above all of these in the read chain, so
-        # a scope still wins.
-        _CONTEXT.parallel.override_permanently(
-            dp_rank=ranks.dp_rank,
-            gpu_id=ranks.gpu_id,
-            tp_rank=ranks.tp_rank,
-            pp_rank=ranks.pp_rank,
-            attn_cp_rank=ranks.attn_cp_rank,
-            moe_dp_rank=ranks.moe_dp_rank,
-            moe_ep_rank=ranks.moe_ep_rank,
-        )
+        # a process group. The scoped overrides that swap a group for a draft
+        # worker sit above these in the read chain, so a scope still wins.
+        #
+        # `dp_rank` and `gpu_id` are recorded whatever they are, None included:
+        # no group has one member per replica, and none names a device, so
+        # nothing else can answer them. The rest are recorded only when this
+        # entry was told them -- left out, they keep coming from the groups,
+        # which is what an entry that knows part of its placement needs.
+        recorded = {"dp_rank": ranks.dp_rank, "gpu_id": ranks.gpu_id}
+        for name in (
+            "tp_rank",
+            "pp_rank",
+            "attn_cp_rank",
+            "moe_dp_rank",
+            "moe_ep_rank",
+        ):
+            supplied = getattr(ranks, name)
+            if supplied is not None:
+                recorded[name] = supplied
+        _CONTEXT.parallel.override_permanently(**recorded)
         _stamp_attention_ranks(_CONTEXT.parallel, ranks.tp_rank)
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
