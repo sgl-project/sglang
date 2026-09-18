@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
