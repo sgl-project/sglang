@@ -5553,16 +5553,19 @@ class Scheduler(
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req)
+                    req.user_aborted = True
+                    prepare_abort(req, "Aborted")
+                    self._release_dropped_waiting_req_mm_inputs(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    req.user_aborted = True
+                    prepare_abort(req, "Aborted")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -5596,6 +5599,21 @@ class Scheduler(
                         receiver.kv_mgr.register_deferred_abort_room(
                             decode_req.req.bootstrap_room
                         )
+
+            # Abort requests held for rebootstrap (KV already freed by retract)
+            held_rebootstrap = self.disagg_decode_prealloc_queue.held_rebootstrap_reqs
+            idx = 0
+            while idx < len(held_rebootstrap):
+                req = held_rebootstrap[idx]
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                prepare_abort(req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req), req
+                )
+                held_rebootstrap.pop(idx)
 
             # Abort requests whose KV is already backed up for retraction.
             retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
