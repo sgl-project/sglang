@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -80,13 +81,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-
-if _is_cuda:
-    from sgl_kernel import fast_topk
-elif _is_hip:
-    from sgl_kernel import fast_topk
-else:
-    from sglang.srt.utils.common import fast_topk
 
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
