@@ -72,14 +72,14 @@ class SchedulerOutputStreamer:
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
-        if self.server_args.enable_lmcache:
-            return "LMCache"
         storage_backend_type = "none"
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
         if cache_controller and hasattr(cache_controller, "storage_backend"):
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
+        elif self.server_args.enable_lmcache:
+            storage_backend_type = "LMCache"
         return storage_backend_type
 
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
