@@ -1,6 +1,26 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+# Calibrated via tools/teacache_calibrate.py; shared by LongCat-Image T2I and
+# Edit (same DiT).
+_LONGCAT_IMAGE_COEFFICIENTS = [
+    -48.33117963214599,
+    65.13385568407884,
+    -27.579648889361575,
+    5.5492815393017,
+    -0.041339016370571656,
+]
+_LONGCAT_IMAGE_TEACACHE_THRESH = 0.13
+
+
+def _longcat_teacache_params() -> TeaCacheParams:
+    return TeaCacheParams(
+        teacache_thresh=_LONGCAT_IMAGE_TEACACHE_THRESH,
+        coefficients=list(_LONGCAT_IMAGE_COEFFICIENTS),
+    )
 
 
 @dataclass
@@ -12,6 +32,7 @@ class LongCatImageSamplingParams(SamplingParams):
     enable_cfg_renorm: bool = True
     cfg_renorm_min: float = 0.0
     enable_prompt_rewrite: bool = True
+    teacache_params: Any = field(default_factory=_longcat_teacache_params)
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
@@ -39,6 +60,7 @@ class LongCatImageEditSamplingParams(SamplingParams):
     negative_prompt: str = ""
     enable_cfg_renorm: bool = False
     enable_prompt_rewrite: bool = False
+    teacache_params: Any = field(default_factory=_longcat_teacache_params)
 
 
 @dataclass

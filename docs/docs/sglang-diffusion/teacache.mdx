@@ -92,6 +92,79 @@ params = TeaCacheParams(
 
 Different models may have different optimal configurations. The coefficients are typically tuned per-model to balance speed and quality.
 
+## Generating Coefficients (Calibration)
+
+The polynomial `coefficients` and `teacache_thresh` are **model-specific** and must be calibrated before a new model can use TeaCache. `tools/teacache_calibrate.py` produces them: it runs generations with TeaCache **disabled** (so every step is computed), records the per-step relative change of the modulated input (`diff_tm`) and of the transformer block-stack output (`diff_x`), then fits `diff_x` against `diff_tm` as a degree-4 polynomial and derives a threshold from the flattest stretch of `diff_x`.
+
+<Warning>
+Coefficients are only stable when calibrated over a **diverse prompt set of at least ~50 samples**. A handful of prompts overfits and gives unreliable skip decisions.
+</Warning>
+
+The DiT forward runs in a worker subprocess, so recording is activated by the `SGLANG_TEACACHE_CALIBRATE` env var (inherited by the worker) and the worker dumps accumulated rows to a file; the tool sets these for you.
+
+### Single GPU
+
+Provide a prompts file (one prompt per line, or JSONL with `{"prompt": ..., "image_path": ...}` for edit models):
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0 \
+python -m sglang.multimodal_gen.tools.teacache_calibrate \
+  --model-path /models/LongCat-Image \
+  --prompts-file prompts.txt \
+  --width 1024 --height 1024 \
+  --num-inference-steps 50 --guidance-scale 4.5 --negative-prompt "" \
+  --output ./fast_infer/teacache.json
+```
+
+### Multi-GPU (sharded, recommended)
+
+Calibration is data-parallel: shard the prompts across GPUs, record each shard independently, then merge (count-weighted, equivalent to an all-reduce across data-parallel ranks) and fit. Each shard needs a distinct `--port-base` and its own `--rows-out`; `--no-fit` records without fitting.
+
+```bash Command
+# 4 shards in parallel, one per GPU (record only)
+for i in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$i \
+  python -m sglang.multimodal_gen.tools.teacache_calibrate \
+    --model-path /models/LongCat-Image --prompts-file prompts.txt \
+    --shard $i/4 --width 1024 --height 1024 \
+    --num-inference-steps 50 --guidance-scale 4.5 --negative-prompt "" \
+    --no-fit --port-base $((30100 + i * 20)) \
+    --rows-out rows_$i.json --output ./fast_infer/teacache.json &
+done
+wait
+
+# merge the shard rows + fit (no generation)
+python -m sglang.multimodal_gen.tools.teacache_calibrate \
+  --merge-rows rows_0.json,rows_1.json,rows_2.json,rows_3.json \
+  --output ./fast_infer/teacache.json
+```
+
+### Output and wiring
+
+For a single-transformer model the JSON is `{"coefficients": [...], "teacache_thresh": ...}`; for a MoE dual-transformer model (e.g. Wan2.2) it is `{"high": {...}, "low": {...}}` — one set per expert.
+
+Wire the generated values into the model's `SamplingParams` subclass under `configs/sample/`, exactly like the existing Wan defaults:
+
+```python
+teacache_params: Any = field(
+    default_factory=lambda: TeaCacheParams(
+        teacache_thresh=0.13,
+        coefficients=[-48.33, 65.13, -27.58, 5.55, -0.041],
+    )
+)
+```
+
+### Enabling at inference
+
+TeaCache stays opt-in once coefficients are shipped:
+
+```bash Command
+sglang generate --model-path /models/LongCat-Image \
+  --prompt "..." --enable-teacache
+```
+
+Raise `teacache_thresh` for more aggressive skipping (roughly: 0.25 → ~1.5x, 0.4 → ~1.8x, 0.6 → ~2.0x) at some quality cost.
+
 ## Supported Models
 
 TeaCache support status by model family:
@@ -118,12 +191,22 @@ TeaCache support status by model family:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Coefficients are not calibrated yet; enabling TeaCache is accepted but currently no-ops</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support (T2V-A14B ships one calibrated polynomial per MoE expert)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LongCat-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support (T2I and Edit share the DiT and coefficients)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Lossy: video and audio are packed at different timesteps in one forward, so the skip is approximate rather than a rounding-level difference</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HunyuanVideo</td>
