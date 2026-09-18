@@ -95,6 +95,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "Denji-kk": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "DevashishLal-CB": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -917,6 +923,12 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
+    },
+    "metamergebot": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
     },
     "michaelzhang-ai": {
         "can_tag_run_ci_label": true,
