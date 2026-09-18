@@ -19,6 +19,8 @@ pub enum AdmissionReason {
     PendingPrefillBudget,
     InFlightLimit,
     QueueLimit,
+    /// A bound engine that is not among this pick's candidates.
+    NotACandidate,
 }
 
 impl AdmissionReason {
@@ -28,6 +30,7 @@ impl AdmissionReason {
             Self::PendingPrefillBudget => "pending_prefill_budget",
             Self::InFlightLimit => "in_flight_limit",
             Self::QueueLimit => "queue_limit",
+            Self::NotACandidate => "not_a_candidate",
         }
     }
 }
