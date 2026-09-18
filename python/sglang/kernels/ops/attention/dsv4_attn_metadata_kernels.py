@@ -142,10 +142,11 @@ def expand_prefill_causally(
         seq_lens_casual = torch.nn.functional.pad(
             seq_lens_casual, (0, pad_size), value=1
         )
-        req_pool_indices_repeated = torch.nn.functional.pad(
-            req_pool_indices_repeated,
-            (0, pad_size),
-            value=req_pool_indices_repeated[-1].item(),
+        req_pool_indices_repeated = torch.cat(
+            (
+                req_pool_indices_repeated,
+                req_pool_indices_repeated[-1:].expand(pad_size),
+            )
         )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
@@ -524,3 +525,71 @@ def build_causal_swa_page_indices_triton(
         BLOCK_K=BLOCK_K,
     )
     return out
+
+
+@triton.jit
+def _small_page_table(
+    REQ_TO_TOKEN,
+    REQS,
+    LENS,
+    OUT_LENS,
+    POS,
+    PAGES,
+    SWA,
+    STRIDE: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    if tile == 0:
+        length = tl.load(LENS + row).to(tl.int32)
+        tl.store(OUT_LENS + row, length)
+        tl.store(POS + row, length - 1)
+        tl.store(SWA + row, tl.minimum(length, WINDOW))
+    req = tl.load(REQS + row).to(tl.int64)
+    p = tile * BLOCK + tl.arange(0, BLOCK)
+    slot = tl.load(
+        REQ_TO_TOKEN + req * STRIDE + p.to(tl.int64) * PAGE_SIZE,
+        mask=p < NUM_PAGES,
+        other=0,
+    ).to(tl.int32)
+    tl.store(PAGES + row * NUM_PAGES + p, slot // PAGE_SIZE, mask=p < NUM_PAGES)
+
+
+def build_page_table_positions_small(
+    *,
+    req_to_token,
+    req_pool_indices_repeated,
+    seq_lens_casual,
+    max_seq_len,
+    page_size,
+    swa_window,
+):
+    assert page_size > 0 and page_size & (page_size - 1) == 0
+    rows = seq_lens_casual.numel()
+    pages = triton.cdiv(max_seq_len, page_size)
+    kw = dict(device=seq_lens_casual.device, dtype=torch.int32)
+    lengths, positions, swa = [torch.empty(rows, **kw) for _ in range(3)]
+    table = torch.empty((rows, pages), **kw)
+    _small_page_table[(rows, triton.cdiv(pages, 256))](
+        req_to_token,
+        req_pool_indices_repeated,
+        seq_lens_casual,
+        lengths,
+        positions,
+        table,
+        swa,
+        req_to_token.stride(0),
+        pages,
+        page_size,
+        swa_window,
+        256,
+    )
+    return PageTablePositionsResult(
+        seq_lens_casual=lengths,
+        positions_casual=positions,
+        page_table=table,
+        swa_topk_lengths=swa,
+    )

@@ -416,9 +416,52 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
+    _engine_state_changed_callback: Optional[Callable[[], None]] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
+
+    def _notify_engine_state_changed(self) -> None:
+        callback = self._engine_state_changed_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("Engine-state change callback failed")
+
+    def _set_engine_state_field(self, name: str, value: Any) -> None:
+        if value == getattr(self, name, None):
+            return
+        setattr(self, name, value)
+        self._notify_engine_state_changed()
+
+    def set_engine_state_changed_callback(self, callback: Callable[[], None]) -> None:
+        self._engine_state_changed_callback = callback
+
+    @property
+    def server_status(self):
+        return self._server_status
+
+    @server_status.setter
+    def server_status(self, value) -> None:
+        self._set_engine_state_field("_server_status", value)
+
+    @property
+    def gracefully_exit(self) -> bool:
+        return self._gracefully_exit
+
+    @gracefully_exit.setter
+    def gracefully_exit(self, value: bool) -> None:
+        self._set_engine_state_field("_gracefully_exit", value)
+
+    @property
+    def is_pause(self) -> bool:
+        return self._is_pause
+
+    @is_pause.setter
+    def is_pause(self, value: bool) -> None:
+        self._set_engine_state_field("_is_pause", value)
 
     @property
     def serving_chat_class(self):
@@ -625,6 +668,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+    def is_ready(self) -> bool:
+        """Return whether this server should receive new requests."""
+        return (
+            not self.is_pause
+            and not self.gracefully_exit
+            and self.server_status == ServerStatus.Up
+        )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -1366,24 +1417,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
-                )
-
-    def _validate_input_ids_in_vocab(
-        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
-    ) -> None:
-        # Handle both single sequence and batch of sequences
-        if isinstance(input_ids[0], list):
-            # Batch of sequences
-            for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
-                    raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
-                    )
-        else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
     def _create_tokenized_object(

@@ -1,9 +1,9 @@
 """Hand-tuned dispatch configs for the JIT custom all-reduce (v2).
 
 Thresholds and block counts come from sweeps of
-``test/registered/jit/benchmark/bench_custom_all_reduce.py`` on the listed
-GPUs; ``get_all_reduce_config`` picks the table for the current arch and
-world size.
+``test/registered/kernels/benchmark/communication/bench_custom_all_reduce.py``
+on the listed GPUs; ``get_all_reduce_config`` picks the table for the current
+arch and world size.
 """
 
 from functools import cache
