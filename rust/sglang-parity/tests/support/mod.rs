@@ -36,18 +36,7 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let lock = if cfg!(target_os = "macos") {
-            "rust/sglang-parity/environments/mlx.lock"
-        } else {
-            "rust/sglang-parity/environments/cuda.lock"
-        };
-        for relative in [
-            "python/pyproject.toml",
-            "python/pyproject_other.toml",
-            "rust/sglang-parity/environments/profiles.json",
-            "rust/sglang-parity/environments/probe.py",
-            lock,
-        ] {
+        for relative in ["python/pyproject.toml", "python/pyproject_other.toml"] {
             let destination = source.join(relative);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
             fs::copy(repository.join(relative), destination).unwrap();

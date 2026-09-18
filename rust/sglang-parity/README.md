@@ -260,8 +260,8 @@ is a separate, smaller input type.
 The source snapshot is pinned once for the whole run. Installations are shared by
 the existing commit/platform/lock/build-environment key, never by profile name.
 Each service combines that prepared interpreter with its own profile settings.
-A later installation reads its lock from the pinned snapshot, even if the
-original checkout has since changed branches.
+A later installation uses the same embedded lock and validates it against the
+pinned snapshot, even if the original checkout has since changed branches.
 
 ```text
 <run>/
@@ -312,7 +312,9 @@ Use `--report` with an individual `report.json` to inspect saved cases.
 
 Review [`environments/profiles.json`](environments/profiles.json) and the generated
 [`mlx.lock`](environments/mlx.lock) / [`cuda.lock`](environments/cuda.lock) for the
-installation contract. These are separate from the API suite specification.
+installation contract. These resources and the verification probe are embedded
+in the parity executable, separately from the API suite specification. The target
+SGLang checkout does not need to contain the parity crate or its environment files.
 
 | Backend | Host prerequisites | Dependency inputs |
 | --- | --- | --- |
@@ -337,6 +339,37 @@ located from the invocation directory; the cache uses
 commit, dependency lock digest, cache paths and resolved plans without creating
 an environment or starting services. These preparation settings belong to the
 embedded environment definition, not to the four-field run file.
+
+### Testing a separate PR checkout
+
+Build the tool in the parity checkout, then invoke its executable from the clean
+PR checkout. The working directory selects the SGLang source; the executable
+supplies the suites, profiles, dependency locks and verification probe.
+
+```sh
+cd /path/to/parity-checkout/rust
+cargo build --locked -p sglang-parity
+
+cd /path/to/pr-checkout/rust
+/path/to/parity-checkout/rust/target/debug/sglang-parity \
+  --config /path/to/parity-checkout/rust/sglang-parity/configs/mlx.json --describe
+```
+
+Remove `--describe` to run; select `configs/cuda.json` on a supported CUDA host.
+The recorded source commit is the PR checkout's exact `HEAD`, without merging
+parity into it. The runner validates the embedded lock against that checkout's
+dependency declarations and rechecks the pinned snapshot before installation.
+Dependency changes require a matching lock and a rebuilt tool; ordinary runs do
+not resolve dependencies. Keep the tool commit and executable digest with the
+experiment record when testing a separate source revision.
+
+The plan's `lock_source` identifies the embedded resource (for example,
+`embedded:environments/mlx.lock`); `lock_sha256` identifies its contents. Setup
+saves the exact lock and `probe.py` in the run artifacts and records the probe's
+`probe_sha256` in `environment.json`. It does not add resources to the target
+checkout or pinned source. Existing reports remain readable.
+
+### Execution and source verification
 
 The CLI prints progress to stderr by default: source revision, artifact directory,
 environment setup or reuse, server readiness, and each case/repeat. Stages that
@@ -406,7 +439,7 @@ but do not guarantee identical generation results across hardware.
 
 ### Updating dependencies
 
-From the desired checkout, with uv 0.11.14 available:
+From the parity tool checkout's `rust/` directory, with uv 0.11.14 available:
 
 ```sh
 cargo run -p sglang-parity -- --update-env-lock --backend mlx
@@ -419,6 +452,13 @@ they never re-resolve dependencies. Dependency/profile changes invalidate the
 input digest and require a lock update. Ordinary source changes do not. Commit
 updated locks alongside dependency changes. Generated files contain no local
 paths, timestamps, or source commit, so regeneration is reviewable.
+
+Lock maintenance reads the files in the parity checkout, including edits to its
+platform definitions; it does not use the executable's embedded copy. Rebuild
+the tool after updating these resources. To support a target with different
+dependency declarations, first align the parity checkout's declarations with
+that target, then regenerate and commit its locks. Do not add lock files or
+dependency changes to an unrelated bug-fix PR just to run parity.
 
 Model files and GPU drivers are outside the Python lock. The built-in environments
 pin model revisions through `--revision`, which is retained in the effective plan.
@@ -544,6 +584,7 @@ layout:
   report.html              # standalone human-readable diagnostics
   setup.log                # installation/build/verification output
   environment.lock         # exact dependency lock used
+  probe.py                 # exact embedded verification program used
   environment-probe.json   # installed packages, device and Rust artifact evidence
   environment.json         # source/profile/cache and successful verification record
   python/

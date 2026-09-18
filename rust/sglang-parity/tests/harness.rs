@@ -737,6 +737,7 @@ fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
 #[test]
 fn cli_describe_resolves_all_selections_without_preparation() {
     let fixture = Fixture::new();
+    let commit = git(&fixture.source(), &["rev-parse", "HEAD"]);
     let config_path = fixture.directory.path().join("run.json");
     let mut config = json!({
         "environment": if cfg!(target_os="macos") { "mlx" } else { "cuda" },
@@ -778,9 +779,12 @@ fn cli_describe_resolves_all_selections_without_preparation() {
             );
             for profile in profiles {
                 assert_eq!(profile["suite"]["check"], check);
-                assert_eq!(
-                    profile["environment"]["commit"],
-                    plans[0]["profiles"][0]["environment"]["commit"]
+                assert_eq!(profile["environment"]["commit"], commit);
+                assert!(
+                    profile["environment"]["lock_source"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("embedded:environments/")
                 );
                 if check == "generated-content" {
                     assert_eq!(
@@ -801,6 +805,8 @@ fn cli_describe_resolves_all_selections_without_preparation() {
     assert!(fixture.lifecycle().is_empty());
     assert!(fixture.preparations().is_empty());
     assert!(!fixture.config.output_dir.exists());
+    assert!(!fixture.source().join("rust/sglang-parity").exists());
+    assert!(!fixture.directory.path().join("cache").exists());
     // Legacy input is rejected before any implicit migration or installation.
     fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
@@ -863,12 +869,8 @@ async fn all_suites_keep_the_prepared_head_when_original_checkout_changes() {
     );
     let marker = fixture.source().join("python/fixture-version.txt");
     fs::write(&marker, "new HEAD").unwrap();
-    let lock = fixture.source().join(if cfg!(target_os = "macos") {
-        "rust/sglang-parity/environments/mlx.lock"
-    } else {
-        "rust/sglang-parity/environments/cuda.lock"
-    });
-    fs::write(&lock, "changed dependency lock in developer checkout").unwrap();
+    let manifest = fixture.source().join("python/pyproject.toml");
+    fs::write(&manifest, "changed dependencies in developer checkout").unwrap();
     git(
         &fixture.source(),
         &["commit", "--quiet", "-am", "advance original"],
@@ -896,6 +898,7 @@ async fn all_suites_keep_the_prepared_head_when_original_checkout_changes() {
     let snapshot = std::path::Path::new(environment["plan"]["source_snapshot"].as_str().unwrap());
     assert_eq!(git(snapshot, &["rev-parse", "HEAD"]), original_commit);
     assert!(git(snapshot, &["status", "--porcelain"]).is_empty());
+    assert!(!snapshot.join("rust/sglang-parity").exists());
     for report in &reports {
         let recorded = report.environment.as_ref().unwrap();
         assert_eq!(recorded["plan"]["commit"], original_commit);

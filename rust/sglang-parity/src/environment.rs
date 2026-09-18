@@ -19,6 +19,8 @@ use crate::runner::RunConfig;
 pub(crate) mod lock;
 pub use lock::{Backend, Profile};
 
+const PROBE: &str = include_str!("../environments/probe.py");
+
 /// Regenerate one committed dependency lock from the repository declarations.
 pub async fn update_lock(
     repo: &Path,
@@ -56,7 +58,7 @@ pub struct EnvironmentPlan {
     pub source_root: PathBuf,
     pub commit: String,
     pub profile: Profile,
-    pub lock_file: PathBuf,
+    pub lock_source: String,
     pub lock_sha256: String,
     pub cache_dir: PathBuf,
     pub source_snapshot: PathBuf,
@@ -212,8 +214,9 @@ pub fn describe(config: &RunConfig) -> Result<EnvironmentPlan, String> {
     let repo = source_root(config.environment.source_root.as_deref())?;
     clean_source(&repo)?;
     let commit = git(&repo, &["rev-parse", "HEAD"])?;
-    let profile = lock::load_profile(&repo, backend(config.environment.backend)?)?;
-    let spec = lock::inspect_lock(&repo, &profile)?;
+    let profile = lock::embedded_profile(backend(config.environment.backend)?)?;
+    let spec = lock::inspect_lock(&repo, &profile)
+        .map_err(|error| format!("source commit {commit}: {error}"))?;
     let cache = absolute(
         config
             .environment
@@ -225,7 +228,7 @@ pub fn describe(config: &RunConfig) -> Result<EnvironmentPlan, String> {
         source_root: repo,
         commit: commit.clone(),
         profile,
-        lock_file: spec.path,
+        lock_source: spec.source,
         lock_sha256: spec.sha256,
         source_snapshot: cache.join("sources").join(&commit),
         cache_dir: cache,
@@ -495,19 +498,18 @@ pub(crate) async fn prepare_environment(
         ),
     )
     .map_err(|e| e.to_string())?;
-    let lock_relative = plan
-        .lock_file
-        .strip_prefix(&plan.source_root)
-        .map_err(|e| e.to_string())?;
-    fs::copy(
-        plan.source_snapshot.join(lock_relative),
+    source.verify()?;
+    let snapshot_lock = lock::inspect_lock(&plan.source_snapshot, &plan.profile)?;
+    if snapshot_lock.sha256 != plan.lock_sha256 {
+        return Err("embedded dependency lock differs from the described lock".into());
+    }
+    fs::write(
         output.join("environment.lock"),
+        lock::lock_contents(plan.profile.backend),
     )
     .map_err(|e| e.to_string())?;
-    let copied_lock = fs::read(output.join("environment.lock")).map_err(|e| e.to_string())?;
-    if format!("{:x}", Sha256::digest(&copied_lock)) != plan.lock_sha256 {
-        return Err("dependency lock changed after configuration validation".into());
-    }
+    let probe_path = output.join("probe.py");
+    fs::write(&probe_path, PROBE).map_err(|e| e.to_string())?;
     if plan.managed {
         track(
             "Checking build tools and platform",
@@ -538,11 +540,6 @@ pub(crate) async fn prepare_environment(
         }
     }
     fs::create_dir_all(plan.cache_dir.join("environments")).map_err(|e| e.to_string())?;
-    source.verify()?;
-    let snapshot_lock = lock::inspect_lock(&plan.source_snapshot, &plan.profile)?;
-    if snapshot_lock.sha256 != plan.lock_sha256 {
-        return Err("source snapshot dependency lock differs from the described commit".into());
-    }
     let lease = track(
         "Waiting for environment cache access",
         &log,
@@ -675,9 +672,6 @@ pub(crate) async fn prepare_environment(
         )
         .await?;
     }
-    let probe_path = plan
-        .source_snapshot
-        .join("rust/sglang-parity/environments/probe.py");
     if plan.profile.backend == Backend::Cuda {
         let paths_file = output.join("runtime-library-paths.json");
         let mut discover = command(&plan.python, &environment);
@@ -759,7 +753,7 @@ pub(crate) async fn prepare_environment(
             ));
         }
     }
-    let record = json!({"plan": plan, "uv_version": plan.managed.then_some(&plan.profile.uv), "reused": reused, "probe": probe, "bytecode_cache": bytecode_cache});
+    let record = json!({"plan": plan, "uv_version": plan.managed.then_some(&plan.profile.uv), "reused": reused, "probe": probe, "probe_sha256": format!("{:x}", Sha256::digest(PROBE)), "bytecode_cache": bytecode_cache});
     if plan.managed && !reused {
         let pending = ready.with_extension("pending");
         fs::write(

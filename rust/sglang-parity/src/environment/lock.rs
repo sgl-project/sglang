@@ -48,7 +48,7 @@ pub struct Profile {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct LockSpec {
-    pub path: PathBuf,
+    pub source: String,
     pub sha256: String,
     pub input_digest: String,
 }
@@ -70,7 +70,22 @@ struct Platform {
     torch_backend: Option<String>,
 }
 
-pub(crate) fn load_profile(repo: &Path, backend: Backend) -> Result<Profile, String> {
+pub(crate) fn embedded_profile(backend: Backend) -> Result<Profile, String> {
+    parse_profile(
+        include_str!("../../environments/profiles.json"),
+        backend,
+        "embedded:environments/profiles.json",
+    )
+}
+
+fn load_profile(repo: &Path, backend: Backend) -> Result<Profile, String> {
+    let path = repo.join(DIRECTORY).join("profiles.json");
+    let contents = read(&path)?;
+    let text = std::str::from_utf8(&contents).map_err(|error| error.to_string())?;
+    parse_profile(text, backend, &path.display().to_string())
+}
+
+fn parse_profile(text: &str, backend: Backend, source: &str) -> Result<Profile, String> {
     let backend = match backend {
         Backend::Auto => match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => Backend::Mlx,
@@ -79,9 +94,8 @@ pub(crate) fn load_profile(repo: &Path, backend: Backend) -> Result<Profile, Str
         },
         backend => backend,
     };
-    let path = repo.join(DIRECTORY).join("profiles.json");
-    let mut profiles: Profiles = serde_json::from_slice(&read(&path)?)
-        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let mut profiles: Profiles =
+        serde_json::from_str(text).map_err(|error| format!("invalid {source}: {error}"))?;
     let platform = profiles
         .profiles
         .remove(backend.name())
@@ -355,24 +369,41 @@ fn validate_packages(contents: &str) -> Result<(), String> {
 }
 
 pub(crate) fn inspect_lock(repo: &Path, profile: &Profile) -> Result<LockSpec, String> {
-    let path = repo
-        .join(DIRECTORY)
-        .join(format!("{}.lock", profile.backend.name()));
-    let bytes = read(&path)?;
+    inspect_contents(
+        repo,
+        profile,
+        lock_contents(profile.backend),
+        &format!("embedded:environments/{}.lock", profile.backend.name()),
+    )
+}
+
+pub(crate) fn lock_contents(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Mlx => include_str!("../../environments/mlx.lock"),
+        Backend::Cuda => include_str!("../../environments/cuda.lock"),
+        Backend::Auto => unreachable!("resolve the backend before selecting a dependency lock"),
+    }
+}
+
+fn inspect_contents(
+    repo: &Path,
+    profile: &Profile,
+    text: &str,
+    source: &str,
+) -> Result<LockSpec, String> {
     let input_digest = inputs_digest(repo, profile)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
     let expected = header(profile, &input_digest);
     let packages = text.strip_prefix(&expected).ok_or_else(|| {
         format!(
-            "{} is stale; run sglang-parity --update-env-lock --backend {}",
-            path.display(),
+            "{source} is stale for dependency inputs in {}; update the matching lock in the parity tool checkout with --update-env-lock --backend {}, then rebuild the tool",
+            repo.display(),
             profile.backend.name()
         )
     })?;
     validate_packages(packages)?;
     Ok(LockSpec {
-        path,
-        sha256: sha256(&bytes),
+        source: source.into(),
+        sha256: sha256(text.as_bytes()),
         input_digest,
     })
 }
@@ -485,14 +516,14 @@ pub(crate) async fn update_lock(
     )
     .await?;
     let packages = fs::read_to_string(&output).map_err(|error| error.to_string())?;
-    validate_packages(&packages)?;
     if inputs_digest(repo, &load_profile(repo, profile.backend)?)? != input_digest {
         return Err(
             "dependency inputs changed while resolving the lock; retry --update-env-lock".into(),
         );
     }
-    fs::write(&output, header(&profile, &input_digest) + &packages)
-        .map_err(|error| error.to_string())?;
+    let contents = header(&profile, &input_digest) + &packages;
+    inspect_contents(repo, &profile, &contents, &output.display().to_string())?;
+    fs::write(&output, contents).map_err(|error| error.to_string())?;
     let destination = directory.join(format!("{}.lock", profile.backend.name()));
     fs::rename(output, &destination).map_err(|error| error.to_string())?;
     Ok(destination)
@@ -642,7 +673,8 @@ runtime = ["torch==2", "torchaudio==1"]
             header(&mlx, &digest) + &format!("base==1 \\\n    --hash=sha256:{}\n", "a".repeat(64)),
         )
         .unwrap();
-        let inspected = inspect_lock(repo, &mlx).unwrap();
+        let contents = fs::read_to_string(&lock).unwrap();
+        let inspected = inspect_contents(repo, &mlx, &contents, "fixture.lock").unwrap();
         assert_eq!(inspected.sha256, sha256(&fs::read(&lock).unwrap()));
         fs::write(
             repo.join("python/pyproject.toml"),
@@ -650,13 +682,29 @@ runtime = ["torch==2", "torchaudio==1"]
         )
         .unwrap();
         assert_eq!(inputs_digest(repo, &mlx).unwrap(), digest);
-        inspect_lock(repo, &mlx).unwrap();
+        inspect_contents(repo, &mlx, &contents, "fixture.lock").unwrap();
         fs::write(
             repo.join("python/pyproject.toml"),
             default.replace("tokenizers==2", "tokenizers==3"),
         )
         .unwrap();
-        assert!(inspect_lock(repo, &mlx).unwrap_err().contains("stale"));
+        assert!(
+            inspect_contents(repo, &mlx, &contents, "fixture.lock")
+                .unwrap_err()
+                .contains("stale")
+        );
+        let profiles_path = repo.join(DIRECTORY).join("profiles.json");
+        let mut profiles: serde_json::Value =
+            serde_json::from_slice(&read(&profiles_path).unwrap()).unwrap();
+        let (minor, patch) = mlx.python.rsplit_once('.').unwrap();
+        let changed_python = format!("{minor}.{}", patch.parse::<u32>().unwrap() + 1);
+        profiles["python"] = serde_json::json!(changed_python);
+        fs::write(profiles_path, profiles.to_string()).unwrap();
+        assert_eq!(
+            load_profile(repo, Backend::Mlx).unwrap().python,
+            changed_python
+        );
+        assert_eq!(embedded_profile(Backend::Mlx).unwrap().python, mlx.python);
     }
 
     #[test]
@@ -664,8 +712,18 @@ runtime = ["torch==2", "torchaudio==1"]
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for backend in [Backend::Mlx, Backend::Cuda] {
             let profile = load_profile(&repo, backend).unwrap();
+            assert_eq!(
+                serde_json::to_value(&profile).unwrap(),
+                serde_json::to_value(embedded_profile(backend).unwrap()).unwrap()
+            );
             let spec = inspect_lock(&repo, &profile).unwrap();
             assert_eq!(spec.input_digest, inputs_digest(&repo, &profile).unwrap());
+            let path = repo
+                .join(DIRECTORY)
+                .join(format!("{}.lock", backend.name()));
+            let disk = fs::read_to_string(path).unwrap();
+            assert_eq!(disk, lock_contents(backend));
+            assert_eq!(spec.sha256, sha256(disk.as_bytes()));
         }
     }
 }

@@ -14,22 +14,12 @@ impl Fixture {
         let root = directory.path();
         let source = root.join("source");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let lock = if cfg!(target_os = "macos") {
-            "mlx.lock"
-        } else {
-            "cuda.lock"
-        };
-        for relative in [
-            "python/pyproject.toml".to_owned(),
-            "python/pyproject_other.toml".to_owned(),
-            "rust/sglang-parity/environments/profiles.json".to_owned(),
-            "rust/sglang-parity/environments/probe.py".to_owned(),
-            format!("rust/sglang-parity/environments/{lock}"),
-        ] {
-            let destination = source.join(&relative);
+        for relative in ["python/pyproject.toml", "python/pyproject_other.toml"] {
+            let destination = source.join(relative);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
             fs::copy(repository.join(relative), destination).unwrap();
         }
+        fs::create_dir(source.join("rust")).unwrap();
         git(&source, &["init", "--quiet"]).unwrap();
         commit(&source);
         let tools = root.join("tools");
@@ -162,6 +152,8 @@ elif phase == 'probe':
 fn cache_identity_tracks_source_and_build_configuration() {
     let fixture = Fixture::new();
     let original = describe(&fixture.config).unwrap();
+    assert!(original.lock_source.starts_with("embedded:environments/"));
+    assert!(!original.source_root.join("rust/sglang-parity").exists());
     let mut changed = fixture.config.clone();
     changed.server.seed += 1;
     changed.server.model = "different-model".into();
@@ -197,9 +189,22 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
     let fixture = Fixture::new();
     let plan = describe(&fixture.config).unwrap();
     let ready = plan.environment_dir.join("parity-ready.json");
-    let first = prepare(&fixture.config, &plan, &fixture.output("first"))
-        .await
-        .unwrap();
+    let output = fixture.output("first");
+    let first = prepare(&fixture.config, &plan, &output).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(output.join("environment.lock")).unwrap(),
+        lock::lock_contents(plan.profile.backend)
+    );
+    assert_eq!(fs::read_to_string(output.join("probe.py")).unwrap(), PROBE);
+    assert_eq!(
+        first.record["probe_sha256"],
+        format!("{:x}", Sha256::digest(PROBE))
+    );
+    assert_eq!(
+        git(&plan.source_snapshot, &["rev-parse", "HEAD"]).unwrap(),
+        plan.commit
+    );
+    assert!(!plan.source_snapshot.join("rust/sglang-parity").exists());
     assert_eq!(first.record["reused"], false);
     assert_eq!(
         first.server(&fixture.config.server).python.as_ref(),
@@ -285,6 +290,41 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
             .count(),
         2
     );
+}
+
+#[test]
+fn runtime_uses_embedded_resources_but_checks_target_dependency_inputs() {
+    let fixture = Fixture::new();
+    let original = describe(&fixture.config).unwrap();
+    let resources = original.source_root.join("rust/sglang-parity/environments");
+    fs::create_dir_all(&resources).unwrap();
+    for name in ["profiles.json", "mlx.lock", "cuda.lock", "probe.py"] {
+        fs::write(resources.join(name), "invalid target resource").unwrap();
+    }
+    commit(&original.source_root);
+    let with_target_resources = describe(&fixture.config).unwrap();
+    assert_eq!(original.lock_source, with_target_resources.lock_source);
+    assert_eq!(original.lock_sha256, with_target_resources.lock_sha256);
+
+    let manifest = original.source_root.join("python/pyproject.toml");
+    let mut metadata: toml::Value = fs::read_to_string(&manifest).unwrap().parse().unwrap();
+    let tokenizers = metadata["project"]["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|value| value.as_str().unwrap().starts_with("tokenizers"))
+        .unwrap();
+    *tokenizers = toml::Value::String("tokenizers==0".into());
+    fs::write(manifest, toml::to_string(&metadata).unwrap()).unwrap();
+    commit(&original.source_root);
+    let error = describe(&fixture.config).unwrap_err();
+    assert!(
+        error.contains("embedded:") && error.contains("stale"),
+        "{error}"
+    );
+    assert!(error.contains("parity tool checkout") && error.contains("rebuild"));
+    assert!(fixture.phases().is_empty());
+    assert!(!original.cache_dir.exists());
 }
 
 #[tokio::test]
