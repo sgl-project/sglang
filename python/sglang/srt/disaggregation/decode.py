@@ -2672,6 +2672,10 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
+                if batch is None:
+                    # No forward ran to release the GIL, and on_idle -- which
+                    # would yield -- is skipped while last_batch is pending.
+                    self._yield_to_storage_threads()
             elif batch is None:
                 self.on_idle()
 

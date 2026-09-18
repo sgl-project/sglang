@@ -15,6 +15,7 @@ import torch
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -78,6 +79,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# A stalled offload fails on every write attempt, so it is loud by default.
+_OFFLOAD_STALLED_LOG_INTERVAL_S = 60.0
 
 
 class HiRadixCache(RadixCache):
@@ -200,6 +204,7 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self._last_offload_stalled_log_s = 0.0
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -882,9 +887,37 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            self._log_offload_stalled()
             return 0
 
         return len(host_indices)
+
+    def _log_offload_stalled(self) -> None:
+        """Say so when the host pool cannot take another page.
+
+        Reaching here twice means `evict_host` freed nothing, and `evict_host`
+        can only free a node once the *device* tier has already dropped it
+        (`_update_host_leaf_status` admits nothing else). So when the device
+        pool is larger than the host pool, the host pool fills first, GPU
+        eviction never fires, and offload stops for the life of the process --
+        it does not recover as older entries age out.
+
+        Silent otherwise: L2 write-through and L3 offload both just stop, every
+        subsequent request reports an ordinary cache miss, and the L3 backend
+        cannot see the difference between "nothing was ever stored" and "the
+        source stopped storing an hour ago".
+        """
+        now = time.monotonic()
+        if now - self._last_offload_stalled_log_s < _OFFLOAD_STALLED_LOG_INTERVAL_S:
+            return
+        self._last_offload_stalled_log_s = now
+        logger.warning(
+            "HiCache host pool is full and nothing is evictable; KV offload has "
+            "stopped. Host pages are reclaimed only when the device tier evicts "
+            "first, so this does not recover on its own when the device pool is "
+            "the larger of the two. Raise --hicache-size (or --hicache-ratio) to "
+            "at least the device pool size."
+        )
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
@@ -1546,6 +1579,11 @@ class HiRadixCache(RadixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        # Before the drains below: a backend that only moves when ticked may be
+        # what puts the completions into those queues.
+        if self.enable_storage:
+            self.cache_controller.storage_backend.tick()
+
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
@@ -1783,6 +1821,7 @@ class HiRadixCache(RadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
         req_id = handle.rid
         prefetch_key = RadixKey(
@@ -1815,6 +1854,7 @@ class HiRadixCache(RadixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            kv_hints=kv_hints,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (

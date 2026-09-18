@@ -24,6 +24,10 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    _kv_hints_extra_info,
+)
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -54,8 +58,16 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            kv_hints=kv_hints,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -69,6 +81,7 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -85,6 +98,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            kv_hints=kv_hints,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
@@ -566,6 +580,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -574,6 +589,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            kv_hints=kv_hints,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -610,7 +626,8 @@ class HybridCacheController(BaseHiCacheController):
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
+            extra_info=_kv_hints_extra_info(operation),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(

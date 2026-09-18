@@ -97,6 +97,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 result = _make_result()
 
                 scheduler = Scheduler.__new__(Scheduler)
+                scheduler.enable_hicache_storage = False
                 scheduler.gracefully_exit = False
                 scheduler.ingest_requests = MagicMock(
                     side_effect=[[], [], StopIteration]

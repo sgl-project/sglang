@@ -35,6 +35,13 @@ class HiCacheStorageConfig:
     enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    # Attention-DP position of this scheduler. Every (dp, cp, tp) rank builds its
+    # own backend in its own process from one shared extra_config, so a backend
+    # that names or binds anything per worker needs the full coordinate, not just
+    # the TP one. Defaulted so existing construction sites keep working; only
+    # attention DP populates it (plain --dp-size replicas all report 0).
+    dp_rank: int = 0
+    dp_size: int = 1
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
@@ -250,8 +257,13 @@ class HiCacheStorage(ABC):
         """
         Retrieve values for multiple keys.
         Returns a list of booleans indicating success for each key.
+
+        Raises rather than returning None when a backend has not implemented it:
+        the caller (`_page_get_zero_copy`) indexes the result, so a `None` here
+        surfaces as a `TypeError` on the prefetch daemon thread -- which HiCache
+        never restarts -- silently disabling L3 for the life of the process.
         """
-        pass
+        raise NotImplementedError()
 
     def batch_set_v1(
         self,
@@ -262,8 +274,12 @@ class HiCacheStorage(ABC):
         """
         Store multiple key-value pairs.
         Returns a list of booleans indicating success for each key.
+
+        Raises for the same reason as `batch_get_v1`: `_page_set_zero_copy`
+        wraps the result in `all(...)`, so returning None kills the backup
+        thread with a `TypeError` instead of reporting an unimplemented backend.
         """
-        pass
+        raise NotImplementedError()
 
     @abstractmethod
     def get(
@@ -347,6 +363,32 @@ class HiCacheStorage(ABC):
         pass
 
     def get_stats(self):
+        return None
+
+    def tick(self) -> None:
+        """Advance backend-owned state, on the scheduler thread.
+
+        Called once per scheduler loop from ``check_hicache_events``, idle
+        iterations included. A backend whose state machine only moves when
+        somebody calls it -- a P2P source serving a peer's pull, say -- would
+        otherwise need a polling thread of its own. It must not block: the
+        caller is the thread that runs forward passes.
+        """
+
+    def idle_poll_timeout_ms(self) -> Optional[int]:
+        """Cap on how long ``--sleep-on-idle`` may park, in ms, or None.
+
+        The sleeper parks on the request sockets for a second, which for a
+        ticking backend means one ``tick`` per second -- a P2P source serving a
+        peer's pull stalls behind a socket that will never see traffic. A
+        backend returning a smaller value shortens that park to its own cadence.
+
+        Shorten, never skip. The scheduler main loop holds the GIL while it
+        spins, and the transfer it is waiting on is driven by daemon threads in
+        the same process; a loop that never parks starves them, which costs more
+        than the park does. Gates the sleep only -- not ``is_fully_idle``, which
+        admits flush and attach.
+        """
         return None
 
 
