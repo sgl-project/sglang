@@ -1,0 +1,8 @@
+{
+  "environment": "mlx",
+  "suites": [
+    "native_generate"
+  ],
+  "check": "full-response",
+  "output_dir": "target/parity"
+}

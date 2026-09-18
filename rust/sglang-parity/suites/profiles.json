@@ -1,0 +1,115 @@
+{
+  "cached_cumulative": {
+    "args": [
+      "--enable-cache-report"
+    ],
+    "radix_cache": true
+  },
+  "cached_incremental": {
+    "args": [
+      "--incremental-streaming-output",
+      "--enable-cache-report"
+    ],
+    "radix_cache": true
+  },
+  "default": {
+    "args": []
+  },
+  "dp_cumulative": {
+    "args": [
+      "--dp-size",
+      "2"
+    ],
+    "requires": {
+      "backends": [
+        "cuda"
+      ],
+      "min_cuda_devices": 2
+    }
+  },
+  "dp_incremental": {
+    "args": [
+      "--dp-size",
+      "2",
+      "--incremental-streaming-output"
+    ],
+    "requires": {
+      "backends": [
+        "cuda"
+      ],
+      "min_cuda_devices": 2
+    }
+  },
+  "incremental": {
+    "args": [
+      "--incremental-streaming-output"
+    ]
+  },
+  "reasoning_cumulative": {
+    "args": [
+      "--reasoning-parser",
+      "qwen3"
+    ]
+  },
+  "reasoning_incremental": {
+    "args": [
+      "--reasoning-parser",
+      "qwen3",
+      "--incremental-streaming-output"
+    ]
+  },
+  "retractions_cumulative": {
+    "args": [],
+    "env": {
+      "SGLANG_TEST_RETRACT": "true",
+      "SGLANG_TEST_RETRACT_INTERVAL": "2"
+    },
+    "requires": {
+      "backends": [
+        "cuda"
+      ],
+      "min_cuda_devices": 1
+    }
+  },
+  "retractions_incremental": {
+    "args": [
+      "--incremental-streaming-output"
+    ],
+    "env": {
+      "SGLANG_TEST_RETRACT": "true",
+      "SGLANG_TEST_RETRACT_INTERVAL": "2"
+    },
+    "requires": {
+      "backends": [
+        "cuda"
+      ],
+      "min_cuda_devices": 1
+    }
+  },
+  "tools_cumulative": {
+    "args": [
+      "--tool-call-parser",
+      "qwen25"
+    ]
+  },
+  "tools_incremental": {
+    "args": [
+      "--incremental-streaming-output",
+      "--tool-call-parser",
+      "qwen25"
+    ]
+  },
+  "versioned_cumulative": {
+    "args": [
+      "--weight-version",
+      "parity-v1"
+    ]
+  },
+  "versioned_incremental": {
+    "args": [
+      "--weight-version",
+      "parity-v1",
+      "--incremental-streaming-output"
+    ]
+  }
+}

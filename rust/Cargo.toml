@@ -3,7 +3,8 @@ resolver = "3"
 members = [
     "sglang-grpc",
     "sglang-mm",
-    "sglang-server"
+    "sglang-server",
+    "sglang-parity",
 ]
 exclude = ["sglang-radix-tree"]
 

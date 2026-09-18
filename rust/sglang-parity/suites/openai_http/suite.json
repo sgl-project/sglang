@@ -1,0 +1,2048 @@
+{
+  "name": "openai_http",
+  "generated_content": {
+    "completion": ["index", "text"],
+    "chat": ["index", "message.content", "message.reasoning_content", "message.refusal", "message.tool_calls"],
+    "tool_call": ["type", "function.name", "function.arguments"],
+    "text": "exact",
+    "empty_text": "missing_null_or_empty_string",
+    "empty_tool_calls": "missing_null_or_empty_array"
+  },
+  "comparison": {
+    "base": "exact_json",
+    "per_result_numeric_rules": [
+      {
+        "path": "/choices/*/logprobs/content/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/content/*/top_logprobs/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/refusal/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/refusal/*/top_logprobs/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/token_logprobs/*",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/top_logprobs/*/*",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      }
+    ],
+    "per_result_value_exceptions": [
+      {
+        "path": "/id",
+        "presence": "optional",
+        "require": "non_empty_string",
+        "reason": "Response IDs vary per request; presence and type remain checked."
+      },
+      {
+        "path": "/created",
+        "presence": "optional",
+        "require": "non_negative_number",
+        "reason": "Creation times vary per request; presence and type remain checked."
+      },
+      {
+        "path": "/choices/0/message/tool_calls/0/id",
+        "presence": "optional",
+        "require": "non_empty_string",
+        "reason": "This suite requests exactly one tool call on choice 0. Its ID varies per request; presence and type remain checked."
+      },
+      {
+        "path": "/choices/0/delta/tool_calls/0/id",
+        "presence": "optional",
+        "require": "non_empty_string",
+        "reason": "This suite requests exactly one tool call on choice 0. Its ID varies per request; presence and type remain checked."
+      }
+    ]
+  },
+  "streaming": {
+    "envelope": {
+      "id": "chat_constant",
+      "created": "constant",
+      "object": "constant",
+      "model": "constant",
+      "system_fingerprint": "constant",
+      "service_tier": "constant",
+      "metadata": "constant",
+      "usage": "usage"
+    },
+    "completion": {
+      "index": "index",
+      "text": "text",
+      "logprobs": "logprobs",
+      "finish_reason": "terminal",
+      "matched_stop": "terminal"
+    },
+    "chat": {
+      "index": "index",
+      "delta": "delta",
+      "logprobs": "logprobs",
+      "finish_reason": "terminal",
+      "matched_stop": "terminal"
+    },
+    "delta": {
+      "role": "constant",
+      "content": "text",
+      "reasoning_content": "text",
+      "refusal": "text",
+      "tool_calls": "tool_calls",
+      "function_call": "constant"
+    }
+  },
+  "equivalence": [
+    "model",
+    "content",
+    "reasoning_content",
+    "tool_calls",
+    "refusal",
+    "finish_reason",
+    "logprobs",
+    "usage"
+  ],
+  "cases": [
+    {
+      "name": "completion_greedy_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_greedy",
+      "expectations": [
+        {
+          "check": "content",
+          "empty": false
+        },
+        {
+          "check": "logprobs",
+          "enabled": false
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": false
+        },
+        {
+          "check": "cached_tokens",
+          "positive": false
+        },
+        {
+          "check": "weight_version",
+          "value": "default"
+        }
+      ]
+    },
+    {
+      "name": "completion_greedy_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_greedy",
+      "expectations": [
+        {
+          "check": "content",
+          "empty": false
+        },
+        {
+          "check": "logprobs",
+          "enabled": false
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": false
+        },
+        {
+          "check": "cached_tokens",
+          "positive": false
+        }
+      ]
+    },
+    {
+      "name": "completion_one_token_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false,
+        "ignore_eos": true
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_one_token",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": false
+        }
+      ]
+    },
+    {
+      "name": "completion_one_token_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "ignore_eos": true
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_one_token",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": false
+        }
+      ]
+    },
+    {
+      "name": "completion_sampling_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "top_p": 0.8,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_sampling"
+    },
+    {
+      "name": "completion_sampling_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "top_p": 0.8,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_sampling"
+    },
+    {
+      "name": "completion_multiple_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_multiple"
+    },
+    {
+      "name": "completion_multiple_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_multiple"
+    },
+    {
+      "name": "completion_logprobs_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 2
+        }
+      ]
+    },
+    {
+      "name": "completion_logprobs_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 2
+        }
+      ]
+    },
+    {
+      "name": "completion_batch_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": [
+          "The capital of France is",
+          "One plus one is"
+        ],
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_batch"
+    },
+    {
+      "name": "completion_batch_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": [
+          "The capital of France is",
+          "One plus one is"
+        ],
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_batch"
+    },
+    {
+      "name": "completion_echo_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "echo": true,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_echo"
+    },
+    {
+      "name": "completion_echo_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "echo": true,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_echo"
+    },
+    {
+      "name": "completion_no_usage",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "completion_continuous_usage",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true,
+          "continuous_usage_stats": true
+        }
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "completion_invalid_max_tokens",
+      "path": "/v1/completions",
+      "profiles": [
+        "default"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": -1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 400
+    },
+    {
+      "name": "chat_greedy_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_greedy",
+      "expectations": [
+        {
+          "check": "content",
+          "empty": false
+        },
+        {
+          "check": "logprobs",
+          "enabled": false
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": false
+        },
+        {
+          "check": "cached_tokens",
+          "positive": false
+        },
+        {
+          "check": "reasoning",
+          "enabled": false
+        },
+        {
+          "check": "tool_calls",
+          "enabled": false
+        },
+        {
+          "check": "no_refusal"
+        },
+        {
+          "check": "weight_version",
+          "value": "default"
+        }
+      ]
+    },
+    {
+      "name": "chat_greedy_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_greedy",
+      "expectations": [
+        {
+          "check": "content",
+          "empty": false
+        },
+        {
+          "check": "logprobs",
+          "enabled": false
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": false
+        },
+        {
+          "check": "cached_tokens",
+          "positive": false
+        },
+        {
+          "check": "reasoning",
+          "enabled": false
+        },
+        {
+          "check": "tool_calls",
+          "enabled": false
+        },
+        {
+          "check": "no_refusal"
+        }
+      ]
+    },
+    {
+      "name": "chat_one_token_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false,
+        "ignore_eos": true
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_one_token",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": false
+        }
+      ]
+    },
+    {
+      "name": "chat_one_token_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "ignore_eos": true
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_one_token",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": false
+        }
+      ]
+    },
+    {
+      "name": "chat_sampling_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "top_p": 0.8,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_sampling"
+    },
+    {
+      "name": "chat_sampling_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "top_p": 0.8,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_sampling"
+    },
+    {
+      "name": "chat_multiple_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiple"
+    },
+    {
+      "name": "chat_multiple_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiple"
+    },
+    {
+      "name": "chat_logprobs_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 2
+        },
+        {
+          "check": "token_ids"
+        },
+        {
+          "check": "no_refusal"
+        }
+      ]
+    },
+    {
+      "name": "chat_logprobs_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 2
+        },
+        {
+          "check": "token_ids"
+        },
+        {
+          "check": "no_refusal"
+        }
+      ]
+    },
+    {
+      "name": "chat_multiturn_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be brief."
+          },
+          {
+            "role": "user",
+            "content": "My name is Ada."
+          },
+          {
+            "role": "assistant",
+            "content": "Hello Ada."
+          },
+          {
+            "role": "user",
+            "content": "What is my name?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiturn"
+    },
+    {
+      "name": "chat_multiturn_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be brief."
+          },
+          {
+            "role": "user",
+            "content": "My name is Ada."
+          },
+          {
+            "role": "assistant",
+            "content": "Hello Ada."
+          },
+          {
+            "role": "user",
+            "content": "What is my name?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiturn"
+    },
+    {
+      "name": "chat_no_usage",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "chat_continuous_usage",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true,
+          "continuous_usage_stats": true
+        }
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "chat_invalid_max_tokens",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": -1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 400
+    },
+    {
+      "name": "completion_logprobs_no_alternatives_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 0,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs_no_alternatives",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 0
+        }
+      ]
+    },
+    {
+      "name": "completion_logprobs_no_alternatives_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 0,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs_no_alternatives",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 0
+        }
+      ]
+    },
+    {
+      "name": "completion_empty_stop_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "prompt": "Reply with just the word Paris.",
+        "stop": [
+          " ",
+          "Paris",
+          "\n"
+        ],
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_empty_stop",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        },
+        {
+          "check": "content",
+          "empty": true
+        }
+      ]
+    },
+    {
+      "name": "completion_empty_stop_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "prompt": "Reply with just the word Paris.",
+        "stop": [
+          " ",
+          "Paris",
+          "\n"
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_empty_stop",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        },
+        {
+          "check": "content",
+          "empty": true
+        }
+      ]
+    },
+    {
+      "name": "completion_stop_string_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stop": [
+          "Paris",
+          " Paris"
+        ],
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_stop_string",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        }
+      ]
+    },
+    {
+      "name": "completion_stop_string_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stop": [
+          "Paris",
+          " Paris"
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_stop_string",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        }
+      ]
+    },
+    {
+      "name": "completion_cached_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "cached_cumulative",
+        "cached_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_cached",
+      "expectations": [
+        {
+          "check": "cached_tokens",
+          "positive": true
+        }
+      ],
+      "before_each": [
+        {
+          "temperature": 0,
+          "max_tokens": 1,
+          "seed": 42,
+          "prompt": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?",
+          "stream": false
+        }
+      ]
+    },
+    {
+      "name": "completion_cached_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "cached_cumulative",
+        "cached_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_cached",
+      "expectations": [
+        {
+          "check": "cached_tokens",
+          "positive": true
+        }
+      ],
+      "before_each": [
+        {
+          "temperature": 0,
+          "max_tokens": 1,
+          "seed": 42,
+          "prompt": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?",
+          "stream": false
+        }
+      ]
+    },
+    {
+      "name": "completion_versioned_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "versioned_cumulative",
+        "versioned_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_versioned",
+      "expectations": [
+        {
+          "check": "weight_version",
+          "value": "parity-v1"
+        }
+      ]
+    },
+    {
+      "name": "completion_versioned_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "versioned_cumulative",
+        "versioned_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_versioned",
+      "expectations": []
+    },
+    {
+      "name": "chat_logprobs_no_alternatives_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 0,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs_no_alternatives",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 0
+        },
+        {
+          "check": "token_ids"
+        },
+        {
+          "check": "no_refusal"
+        }
+      ]
+    },
+    {
+      "name": "chat_logprobs_no_alternatives_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 0,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs_no_alternatives",
+      "expectations": [
+        {
+          "check": "logprobs",
+          "enabled": true,
+          "alternatives": 0
+        },
+        {
+          "check": "token_ids"
+        },
+        {
+          "check": "no_refusal"
+        }
+      ]
+    },
+    {
+      "name": "chat_empty_stop_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with just the word Paris."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stop": [
+          " ",
+          "Paris",
+          "\n"
+        ],
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_empty_stop",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        },
+        {
+          "check": "content",
+          "empty": true
+        }
+      ]
+    },
+    {
+      "name": "chat_empty_stop_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with just the word Paris."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stop": [
+          " ",
+          "Paris",
+          "\n"
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_empty_stop",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        },
+        {
+          "check": "content",
+          "empty": true
+        }
+      ]
+    },
+    {
+      "name": "chat_stop_string_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stop": [
+          "Paris",
+          " Paris"
+        ],
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_stop_string",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        }
+      ]
+    },
+    {
+      "name": "chat_stop_string_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 32,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stop": [
+          "Paris",
+          " Paris"
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_stop_string",
+      "expectations": [
+        {
+          "check": "stop",
+          "matched": true
+        }
+      ]
+    },
+    {
+      "name": "chat_cached_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "cached_cumulative",
+        "cached_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_cached",
+      "expectations": [
+        {
+          "check": "cached_tokens",
+          "positive": true
+        }
+      ],
+      "before_each": [
+        {
+          "temperature": 0,
+          "max_tokens": 1,
+          "seed": 42,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?"
+            }
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        }
+      ]
+    },
+    {
+      "name": "chat_cached_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "cached_cumulative",
+        "cached_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_cached",
+      "expectations": [
+        {
+          "check": "cached_tokens",
+          "positive": true
+        }
+      ],
+      "before_each": [
+        {
+          "temperature": 0,
+          "max_tokens": 1,
+          "seed": 42,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Read this reference: Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. What is the capital of France?"
+            }
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        }
+      ]
+    },
+    {
+      "name": "chat_versioned_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "versioned_cumulative",
+        "versioned_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_versioned",
+      "expectations": [
+        {
+          "check": "weight_version",
+          "value": "parity-v1"
+        }
+      ]
+    },
+    {
+      "name": "chat_versioned_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "versioned_cumulative",
+        "versioned_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "The capital of France is"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_versioned",
+      "expectations": []
+    },
+    {
+      "name": "chat_reasoning_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "reasoning_cumulative",
+        "reasoning_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 3? Think briefly and answer with the number."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_reasoning",
+      "expectations": [
+        {
+          "check": "reasoning",
+          "enabled": true
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": true
+        }
+      ]
+    },
+    {
+      "name": "chat_reasoning_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "reasoning_cumulative",
+        "reasoning_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 3? Think briefly and answer with the number."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_reasoning",
+      "expectations": [
+        {
+          "check": "reasoning",
+          "enabled": true
+        },
+        {
+          "check": "reasoning_tokens",
+          "positive": true
+        }
+      ]
+    },
+    {
+      "name": "chat_tools_disabled_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "tools_cumulative",
+        "tools_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 96,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with hello. Do not call a tool."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Get weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "enum": [
+                      "Paris"
+                    ]
+                  }
+                },
+                "required": [
+                  "city"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": "none",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_tools_disabled",
+      "expectations": [
+        {
+          "check": "tool_calls",
+          "enabled": false
+        }
+      ]
+    },
+    {
+      "name": "chat_tools_disabled_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "tools_cumulative",
+        "tools_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 96,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with hello. Do not call a tool."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Get weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "enum": [
+                      "Paris"
+                    ]
+                  }
+                },
+                "required": [
+                  "city"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": "none",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_tools_disabled",
+      "expectations": [
+        {
+          "check": "tool_calls",
+          "enabled": false
+        }
+      ]
+    },
+    {
+      "name": "chat_tools_required_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "tools_cumulative",
+        "tools_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 96,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Get the weather in Paris."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Get weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "enum": [
+                      "Paris"
+                    ]
+                  }
+                },
+                "required": [
+                  "city"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "get_weather"
+          }
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_tools_required",
+      "expectations": [
+        {
+          "check": "tool_calls",
+          "enabled": true,
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      ]
+    },
+    {
+      "name": "chat_tools_required_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "tools_cumulative",
+        "tools_incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 96,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Get the weather in Paris."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Get weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "enum": [
+                      "Paris"
+                    ]
+                  }
+                },
+                "required": [
+                  "city"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "get_weather"
+          }
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_tools_required",
+      "expectations": [
+        {
+          "check": "tool_calls",
+          "enabled": true,
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      ]
+    }
+  ]
+}

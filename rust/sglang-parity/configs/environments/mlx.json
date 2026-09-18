@@ -1,0 +1,34 @@
+{
+  "server": {
+    "model": "mlx-community/Qwen3-0.6B-4bit",
+    "args": [
+      "--revision",
+      "73e3e38d981303bc594367cd910ea6eb48349da8",
+      "--device",
+      "mps",
+      "--disable-cuda-graph",
+      "--mlx-enable-sampling",
+      "--max-total-tokens",
+      "4096",
+      "--max-running-requests",
+      "4",
+      "--context-length",
+      "2048",
+      "--prefill-attention-backend",
+      "torch_native",
+      "--decode-attention-backend",
+      "torch_native"
+    ],
+    "env": {},
+    "port": 30000,
+    "seed": 42,
+    "radix_cache": false
+  },
+  "startup_timeout_secs": 600,
+  "request_timeout_secs": 120,
+  "shutdown_timeout_secs": 60,
+  "environment": {
+    "backend": "mlx",
+    "setup_timeout_secs": 1800
+  }
+}
