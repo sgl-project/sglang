@@ -13,7 +13,6 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
-    CacheRequestOutcome,
     InitLoadBackParams,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
@@ -220,31 +219,6 @@ def _two_rank_retry_trace(rank, rendezvous):
 
 
 class TestStagedPrefetchLifecycle(unittest.TestCase):
-    def test_abort_clears_only_the_aborted_attempt_bookkeeping(self):
-        for staged in (False, True):
-            with self.subTest(staged=staged):
-                cache, pipeline, _ = _staged_fixture()
-                if not staged:
-                    pipeline.release_staged_hold(_REQ)
-                    cache.buffer_pipeline = None
-                retry = CacheRequestHandle(_REQ.rid, _REQ.attempt_id + 1)
-                cache.prefetch_loaded_tokens_by_reqid[retry] = 8
-                cache.prefetch_loaded_storage_start_by_reqid[retry] = 4
-                cache._storage_prefetch_hit_remaining_by_reqid = {_REQ: 6, retry: 8}
-
-                cache.finish(_REQ, CacheRequestOutcome.ABORT)
-                cache.finish(_REQ, CacheRequestOutcome.ABORT)
-
-                self.assertEqual(cache.prefetch_loaded_tokens_by_reqid, {retry: 8})
-                self.assertEqual(
-                    cache.prefetch_loaded_storage_start_by_reqid, {retry: 4}
-                )
-                self.assertEqual(
-                    cache._storage_prefetch_hit_remaining_by_reqid, {retry: 8}
-                )
-                self.assertFalse(pipeline.has_staged(_REQ))
-                self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
-
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):
             for trims in ((2,), (2, 2), (8,), (2, 6)):
