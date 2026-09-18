@@ -2,8 +2,15 @@ import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
-from sgl_kernel import reconstruct_indices_from_tree_mask
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+if torch.version.cuda is not None:
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+else:
+    from sgl_kernel import reconstruct_indices_from_tree_mask
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def test_reconstruct_indices_from_tree_mask():
@@ -74,5 +81,4 @@ def test_reconstruct_indices_from_tree_mask():
 
 
 if __name__ == "__main__":
-    test_reconstruct_indices_from_tree_mask()
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
