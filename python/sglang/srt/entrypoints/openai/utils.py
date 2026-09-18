@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Literal
 
 import torch
 
@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 # (see openai/gpt-2 bytes_to_unicode); converting a token id back to its raw
 # bytes must go through this table, NOT through `token.encode()` on the
 # detokenized display string (that loses fragmentary bytes as U+FFFD).
-_BYTE_DECODER: Dict[str, int] = {}
+_BYTE_DECODER: dict[str, int] = {}
 
 # Tokenizer-level cache: once verified, we know whether *all* tokens from a
 # given tokenizer can safely use the byte decoder. Avoids per-token checks.
 _BYTE_LEVEL_TOKENIZERS: set = set()
 
 
-def _build_byte_decoder() -> Dict[str, int]:
+def _build_byte_decoder() -> dict[str, int]:
     bs = (
         list(range(ord("!"), ord("~") + 1))
         + list(range(ord(chr(0xA1)), ord(chr(0xAC)) + 1))
@@ -93,7 +93,7 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
         return False
 
 
-def token_id_to_bytes(tokenizer, token_id) -> Optional[List[int]]:
+def token_id_to_bytes(tokenizer, token_id) -> list[int] | None:
     """Raw bytes for a byte-level-BPE token id.
 
     Returns the token's original bytes via the GPT-2 byte decoder, or None when
@@ -213,14 +213,10 @@ def _lossless_token_text(tokenizer, token_id, token_text):
         return token_text if token_text is not None else ""
 
 
-
 def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[List]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> list | None:
     """Process hidden states from a ret item in non-streaming response.
 
     Args:
@@ -240,9 +236,9 @@ def process_hidden_states_from_ret(
 
 
 def process_hidden_states_for_response(
-    hidden_states: Optional[List],
-    return_hidden_states: Union[bool, Literal["last"]],
-) -> Optional[List]:
+    hidden_states: list | None,
+    return_hidden_states: bool | Literal["last"],
+) -> list | None:
     """Format scheduler hidden states for OpenAI API responses."""
     if not return_hidden_states or hidden_states is None:
         return None
@@ -269,12 +265,9 @@ def should_include_usage(
 
 
 def process_routed_experts_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[str]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> str | None:
     """Process routed experts from a ret item in non-streaming response."""
     if not getattr(request, "return_routed_experts", False):
         return None
@@ -282,7 +275,7 @@ def process_routed_experts_from_ret(
 
 
 def cached_tokens_details_from_dict(
-    details: Dict[str, Any],
+    details: dict[str, Any],
 ) -> CachedTokensDetails:
     """Convert a raw cached_tokens_details dict to a CachedTokensDetails object."""
     if "storage" in details:
@@ -300,12 +293,9 @@ def cached_tokens_details_from_dict(
 
 
 def process_cached_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[CachedTokensDetails]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> CachedTokensDetails | None:
     """Process cached tokens details from a ret item in non-streaming response."""
     if not request.return_cached_tokens_details:
         return None
@@ -318,8 +308,8 @@ def process_cached_tokens_details_from_ret(
 
 
 def spec_tokens_details_from_meta_info(
-    meta_info: Dict[str, Any],
-) -> Optional[SpecTokensDetails]:
+    meta_info: dict[str, Any],
+) -> SpecTokensDetails | None:
     """Build speculative decoding details from canonical or legacy metrics."""
     details = dict(meta_info)
 
@@ -352,12 +342,9 @@ def spec_tokens_details_from_meta_info(
 
 
 def process_spec_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[SpecTokensDetails]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> SpecTokensDetails | None:
     """Process speculative decoding details from a response item."""
     if not getattr(request, "return_spec_tokens_details", False):
         return None
@@ -365,8 +352,8 @@ def process_spec_tokens_details_from_ret(
 
 
 def convert_embeds_to_tensors(
-    embeds: Optional[Union[List[Optional[List[List[float]]]], List[List[float]]]],
-) -> Optional[List[Optional[List[torch.Tensor]]]]:
+    embeds: list[list[list[float]] | None] | list[list[float]] | None,
+) -> list[list[torch.Tensor] | None] | None:
     """Convert nested float lists from the HTTP API to lists of tensors.
 
     Accepts either:
