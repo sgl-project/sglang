@@ -484,7 +484,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
+        total_free_memory = get_available_cpu_memory() - psutil.virtual_memory().used
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -741,6 +741,41 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_available_cpu_memory():
+    # Try to retrieve CPU memory limit from /sys/fs/cgroup/memory.max
+    # If no legal value returned, fallback to querying psutil.virtual_memory().total
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r") as f:
+            content = f.read().strip().lower()
+            # Match a number followed optionally by a unit (e.g., "512m", "2gb", "1024", "512b", "1024bytes")
+            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content) 
+            # "max" or other non memory size content will be skipped
+            if not match:
+                raise ValueError
+
+            value_str, unit = match.groups()
+            value = int(value_str)
+
+            # Map units to their respective multiplier (binary/1024-based)
+            # If no unit or unit is 'b'/'bytes', the value is already in bytes (multiplier = 1)
+            if unit and unit not in ("b", "bytes"):
+                multipliers = {
+                    "k": 1024,
+                    "kb": 1024,
+                    "m": 1024**2,
+                    "mb": 1024**2,
+                    "g": 1024**3,
+                    "gb": 1024**3,
+                    "t": 1024**4,
+                    "tb": 1024**4,
+                }
+                value *= multipliers[unit]
+            return value
+
+    except (PermissionError, FileNotFoundError, ValueError):
+        return psutil.virtual_memory().total
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -748,28 +783,10 @@ def get_cpu_memory_capacity():
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
         # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+        n_numa_node = 1
+    per_numa_mem = get_available_cpu_memory() / n_numa_node
+    # Retrieved value in Byte, need MB
+    return float(per_numa_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
