@@ -83,14 +83,20 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             self.assertTrue(torch.equal(value[indices], expected_value))
 
     def _build_cache(
-        self, hicache_ratio: float, *, shared_receive=False, use_mla=False, page_size=1
+        self,
+        hicache_ratio: float,
+        *,
+        shared_receive=False,
+        use_mla=False,
+        page_size=1,
+        io_backend="kernel",
     ):
         """Bring up a UnifiedRadixCache over fresh pools, optionally with draft KV."""
         server_args = ServerArgs(
             model_path="dummy",
             page_size=page_size,
             hicache_ratio=hicache_ratio,
-            hicache_io_backend="kernel",
+            hicache_io_backend=io_backend,
             hicache_mem_layout="layer_first" if shared_receive else "page_first",
         )
         set_global_server_args_for_scheduler(server_args)
@@ -232,13 +238,19 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         req_to_token_pool.free(req)
 
     def test_receive_pressure_preserves_shared_retraction_and_restore(self):
-        for use_mla, page_size in ((False, 16), (True, 1)):
-            with self.subTest(use_mla=use_mla, page_size=page_size):
+        for use_mla, page_size, io_backend in (
+            (False, 16, "kernel"),
+            (False, 16, "direct"),
+            (True, 1, "kernel"),
+            (True, 1, "direct"),
+        ):
+            with self.subTest(use_mla=use_mla, io_backend=io_backend):
                 env = self._build_cache(
                     hicache_ratio=0.5,
                     shared_receive=True,
                     use_mla=use_mla,
                     page_size=page_size,
+                    io_backend=io_backend,
                 )
                 cache, pool = env.cache, env.target_pool
                 host = cache.host_pool_group.get_pool(PoolName.KV)

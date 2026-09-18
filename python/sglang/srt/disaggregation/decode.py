@@ -1268,6 +1268,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
+            if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
+                decode_req.req, running_loras
+            ):
+                continue
+
             if self.req_to_token_pool.available_size() <= 0 or (
                 envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.get()
                 and not decode_req.is_rebootstrap
@@ -1276,6 +1281,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self._pre_alloc_host(decode_req):
                     preallocated_reqs.append(decode_req)
                     indices_to_remove.add(i)
+                    if self.scheduler.enable_lora:
+                        running_loras.add(decode_req.req.lora_id)
                     continue
                 break
 
@@ -1294,11 +1301,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if hisparse_req_budget <= 0:
                 break
-
-            if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
-                decode_req.req, running_loras
-            ):
-                continue
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
@@ -1395,6 +1397,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self._pre_alloc_host(decode_req):
                     preallocated_reqs.append(decode_req)
                     indices_to_remove.add(i)
+                    if self.scheduler.enable_lora:
+                        running_loras.add(decode_req.req.lora_id)
                     continue
                 break
             if required_tokens_for_request > full_allocatable_tokens:
@@ -2913,25 +2917,39 @@ class SchedulerDisaggregationDecodeMixin:
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
+        batch = self._get_new_prebuilt_batch(running_batch)
+        if batch is None:
+            return None
+        # Verify after host restore and before process_prebuilt caches any KV.
+        self._verify_kv_checksums(batch)
+        if batch.is_empty():
+            return None
+        self.ngram_embedding_manager.prepare_for_forward(
+            batch, chunked_req=self.chunked_req
+        )
+        batch.process_prebuilt(self.future_map)
+        return batch
+
+    def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
-            return self._get_new_prebuilt_batch(running_batch)
+            return
 
-        verified: List[Req] = []
-        for req in self.waiting_queue:
+        verified: List[int] = []
+        for i, req in enumerate(batch.reqs):
             if is_health_check_req(req):
-                verified.append(req)
+                verified.append(i)
                 continue
             expected = req.expected_kv_checksum
             if expected == 0:
-                verified.append(req)
+                verified.append(i)
                 continue
             seq_len = len(req.origin_input_ids)
             page_indices_gpu = page_indices_for_request(self, req, seq_len)
             state_indices = state_indices_for_request(self, req, seq_len)
             actual = computer.compute(page_indices_gpu, state_indices)
             if actual == expected:
-                verified.append(req)
+                verified.append(i)
                 continue
             msg = (
                 f"KV checksum mismatch req={req.rid} "
@@ -2940,9 +2958,8 @@ class SchedulerDisaggregationDecodeMixin:
             )
             logger.error(msg)
             self._handle_kv_checksum_mismatch(req, msg)
-        self.waiting_queue = verified
-
-        return self._get_new_prebuilt_batch(running_batch)
+        if len(verified) != len(batch.reqs):
+            batch.filter_batch(keep_indices=verified)
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
@@ -3042,12 +3059,6 @@ class SchedulerDisaggregationDecodeMixin:
                         self.token_to_kv_pool_allocator,
                         "host_pool",
                     )
-        # The prebuilt batch never reaches the forward loop's prepare call.
-        self.ngram_embedding_manager.prepare_for_forward(
-            new_batch, chunked_req=self.chunked_req
-        )
-        new_batch.process_prebuilt(self.future_map)
-
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)

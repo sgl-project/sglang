@@ -197,8 +197,21 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
                 entry = self._new_decode_req("host", 0)
                 entry.req.kv.req_pool_idx = None
                 entry.req.bootstrap_host = "prefill"
-                queue = self._new_queue([entry])
-                queue.scheduler.enable_priority_scheduling = False
+                entry.req.lora_id = "host"
+                blocked = self._new_decode_req("blocked", 0)
+                blocked.req.lora_id = "blocked"
+                queue = self._new_queue([entry, blocked])
+                scheduler = queue.scheduler
+                scheduler.enable_lora = True
+                scheduler.enable_lora_overlap_loading = False
+                scheduler.lora_drainer = None
+                scheduler.can_schedule_lora_req = (
+                    Scheduler.can_schedule_lora_req.__get__(scheduler)
+                )
+                manager = LoRAManager.__new__(LoRAManager)
+                manager.max_loras_per_batch = 1
+                manager.num_pinned_loras = 0
+                scheduler.tp_worker.model_runner.lora_manager = manager
                 queue.host_pool = MagicMock(page_size=1)
                 queue.host_reserved_tokens = 8
                 queue.host_pool.available_size.return_value = 8
@@ -210,6 +223,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
                 queue.host_pool.alloc.assert_not_called()
                 queue.host_pool.available_size.return_value = 11
                 self.assertEqual(queue.pop_preallocated(), ([entry], []))
+                self.assertEqual(queue.queue, [blocked])
                 self.assertIsNone(entry.req.kv.req_pool_idx)
                 queue._pre_alloc.assert_not_called()
                 self.assertIs(
@@ -594,6 +608,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
 
         new_batch = MagicMock()
+        new_batch.is_empty.return_value = False
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
         with (
@@ -619,11 +634,22 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
-        scheduler.waiting_queue = [MagicMock(rid="request")]
+        req = MagicMock(
+            rid="request", origin_input_ids=[1, 2, 3], expected_kv_checksum=123
+        )
+        req.kv.req_pool_idx = 0
+        scheduler.waiting_queue = [req]
+        scheduler.req_to_token_pool.req_to_token = torch.arange(3).view(1, 3)
+        scheduler.token_to_kv_pool_allocator.page_size = 1
 
         call_order = []
+        scheduler.kv_checksum_computer = MagicMock()
+        scheduler.kv_checksum_computer.compute.side_effect = lambda *_: (
+            call_order.append("checksum") or 123
+        )
         new_batch = MagicMock()
         new_batch.reqs = scheduler.waiting_queue
+        new_batch.is_empty.return_value = False
         new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
             "prepare"
         )
@@ -661,7 +687,9 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.token_to_kv_pool_allocator,
             "host_pool",
         )
-        self.assertEqual(call_order, ["prepare", "wait", "restore", "process"])
+        self.assertEqual(
+            call_order, ["prepare", "wait", "restore", "checksum", "process"]
+        )
 
 
 if __name__ == "__main__":

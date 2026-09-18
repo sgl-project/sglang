@@ -60,35 +60,20 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "--disaggregation-decode-enable-host-receive"
         )
     if cfg.disaggregation_decode_enable_host_receive:
-        if cfg.disaggregation_mode != "decode":
-            raise ValueError(
-                "Decode host KV buffering requires disaggregation decode mode"
-            )
         if (
-            cfg.pp_size != 1
-            or cfg.dcp_size != 1
-            or cfg.speculative_algorithm is not None
+            cfg.speculative_algorithm is not None
             or cfg.enable_hisparse
-            or cfg.enable_hierarchical_cache
             or cfg.hicache_storage_backend is not None
-            or cfg.enable_lora
-            or cfg.disaggregation_decode_enable_offload_kvcache
-            or (cfg.enable_priority_scheduling and not cfg.disable_priority_preemption)
             or cfg.enable_pd_role_switch
             or cfg.disaggregation_decode_enable_radix_cache
-            or cfg.disaggregation_enable_kv_checksum
-            or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         ):
             raise ValueError(
-                "Decode host KV buffering currently requires PP=1, DCP=1, "
-                "dense KV, and no speculative decoding, HiCache/storage, decode radix "
-                "cache, LoRA, role switching, KV checksum, or heterogeneous-TP staging"
+                "Decode host receive does not yet support speculative decoding, "
+                "HiSparse, HiCache storage, role switching, or decode radix caching"
             )
 
         if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
             raise ValueError("Decode host KV buffering requires host_pool retraction")
-        if cfg.hicache_io_backend != "kernel":
-            raise ValueError("Decode host KV buffering requires kernel HiCache I/O")
         if cfg.hicache_mem_layout != "layer_first":
             logger.info("Using layer_first host KV layout for decode host buffering")
         declare_resolution(
