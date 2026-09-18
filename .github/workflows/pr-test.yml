@@ -231,6 +231,26 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # gb300 is Grace, and PyO3 modules are portable across neither arch nor
+  # interpreter, so it can use nothing the job above builds.
+  rust-ext-build-aarch64:
+    needs: [check-changes, call-gate]
+    # Same gate as rust-ext-build: every main-ref run has to seed the cache, and a
+    # docs-only PR still installs sglang on gb300.
+    if: |
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      collect_runs_on: ubuntu-22.04-arm
+      artifact_name: rust-ext-aarch64
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: |
@@ -455,7 +475,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -466,9 +486,8 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
-      # aarch64 has no prebuild, so this stage compiles during install - which also
-      # makes it the only stage still covering that path. Keep it that way.
-      skip_prebuilt_rust_ext: true
+      # The one aarch64 stage, so it takes the aarch64 build, not rust-ext-build's.
+      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-8-gpu-b300:
@@ -499,6 +518,7 @@ jobs:
         call-sgl-kernel-tests,
 
         rust-ext-build,
+        rust-ext-build-aarch64,
 
         wait-for-base-a,
         wait-for-base-b,

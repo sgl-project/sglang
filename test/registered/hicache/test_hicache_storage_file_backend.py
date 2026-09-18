@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -103,6 +103,7 @@ class HiCacheStorageBaseMixin:
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
         env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)

@@ -1151,6 +1151,14 @@ def fused_moe(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
+            # These were previously dropped, which silently computed a plain
+            # silu*up for GPT-OSS-style experts instead of the clamped
+            # gate*sigmoid(gate*alpha)*(up+1) the config asks for.
+            activation=moe_runner_config.activation,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
 
     return fused_experts(

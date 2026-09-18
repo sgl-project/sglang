@@ -14,11 +14,12 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class FakeReceiver:
@@ -34,6 +35,12 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
@@ -120,6 +127,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.metrics_reporter.enable_metrics = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -174,6 +182,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -227,6 +236,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._pre_alloc = MagicMock()
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
@@ -234,6 +247,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler

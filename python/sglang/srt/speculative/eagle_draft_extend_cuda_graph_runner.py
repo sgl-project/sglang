@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -53,6 +54,18 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+
+def resolve_draft_extend_seq_len_fill_value(
+    attn_backend, captured_req_width: int
+) -> int:
+    """Pad synthetic history past the fixed draft-width subtraction and KPool offset."""
+    fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
+    full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
+    if dsa_index_kpool > 1:
+        fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
+    return fill_value
 
 
 @dataclass
@@ -102,14 +115,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.attn_dp_size = model_runner.ps.attn_dp_size
         self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer()
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -124,6 +135,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -142,8 +154,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = (
-            self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+        self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+            self.draft_extend_attn_backend, self.captured_req_width
         )
         self.extend_seq_lens_cpu = [self.captured_req_width] * self.max_bs
 
@@ -176,8 +188,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if _hidden_size is not None
                 else None
             )
-            self.seq_len_fill_value = (
-                self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+                self.draft_extend_attn_backend, self.captured_req_width
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
@@ -243,7 +255,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.max_num_token, self.eagle_worker.dsa_index_topk),
+                (self.max_num_token, self.eagle_worker.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
@@ -332,6 +344,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         bs = size
         buffers = self.buffers

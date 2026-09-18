@@ -11,7 +11,7 @@ from sglang.test.ci import fork_test_worker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "fork requires a POSIX platform")

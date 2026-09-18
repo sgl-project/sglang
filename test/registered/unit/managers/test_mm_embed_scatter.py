@@ -4,7 +4,7 @@ import torch
 from sglang.srt.managers.mm_utils import _scatter_mm_embedding
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 
 NUM_TOKENS = 64
 

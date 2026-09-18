@@ -58,6 +58,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -89,7 +90,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -105,6 +106,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -316,6 +318,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
@@ -868,6 +876,17 @@ def is_mnnvl_fabric_device() -> bool:
     return any(tag in name for tag in ("GB200", "GB300"))
 
 
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
+
+
 @lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
@@ -1124,29 +1143,6 @@ def get_cuda_driver_bindings():
         from cuda import cuda as cuda_driver
 
     return cuda_driver
-
-
-def get_physical_device_id(pytorch_device_id: int) -> int:
-    """
-    Convert PyTorch logical device ID to physical device ID.
-
-    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
-    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
-    the device ID unchanged.
-
-    Args:
-        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-
-    Returns:
-        The physical device ID
-    """
-    device_idx = int(pytorch_device_id)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_list = cuda_visible_devices.split(",")
-        return int(device_list[device_idx])
-    else:
-        return device_idx
 
 
 def get_device_sm_nvidia_smi():
@@ -1412,25 +1408,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-def calculate_time(show=False, min_cost_ms=0.0):
-    def wrapper(func):
-        def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
-            if show:
-                start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            torch.cuda.synchronize()
-            if show:
-                cost_time = (time.perf_counter() - start_time) * 1000
-                if cost_time > min_cost_ms:
-                    print(f"Function {func.__name__} took {cost_time} ms to run.")
-            return result
-
-        return inner_func
-
-    return wrapper
-
-
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1477,24 +1454,6 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
-
-
-def make_layers_non_pp(
-    num_hidden_layers: int,
-    layer_fn: LayerFn,
-    prefix: str = "",
-) -> torch.nn.ModuleList:
-    from sglang.srt.utils.offloader import get_offloader
-
-    layers = torch.nn.ModuleList(
-        get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(num_hidden_layers)
-            )
-        )
-    )
-    return layers
 
 
 def set_random_seed(seed: int) -> None:
@@ -1812,6 +1771,7 @@ def smart_to_rgb(
     if not isinstance(image, Image.Image):
         return image
 
+    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
         width, height = image.size
@@ -1953,6 +1913,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 
@@ -2409,6 +2371,14 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
+
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
 
@@ -2788,11 +2758,6 @@ def init_custom_process_group(
     return pg
 
 
-def crash_on_warnings():
-    # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
-
-
 @functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
@@ -2926,26 +2891,6 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-def permute_weight(x: torch.Tensor) -> torch.Tensor:
-    b_ = x.shape[0]
-    n_ = x.shape[1]
-    k_ = x.shape[2]
-
-    x_ = x
-    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
-    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
-    else:
-        # return x_
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
-
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    return x_
-
-
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj, output_str: bool = False):
@@ -3022,16 +2967,38 @@ def normalize_serialized_named_tensor_payloads(
 
 
 class SafeUnpickler(pickle.Unpickler):
-    ALLOWED_MODULE_PREFIXES = {
+    # Standard-library modules expose powerful callables alongside harmless data
+    # types. Keep these globals exact so a newly added callable is denied by
+    # default instead of silently expanding the unpickling attack surface.
+    ALLOWED_GLOBALS = {
         # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
+        ("builtins", "bool"),
+        ("builtins", "bytearray"),
+        ("builtins", "bytes"),
+        ("builtins", "complex"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "range"),
+        ("builtins", "set"),
+        ("builtins", "slice"),
+        ("builtins", "str"),
+        ("builtins", "tuple"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("functools", "partial"),
+        ("itertools", "chain"),
+        ("itertools", "repeat"),
+        ("multiprocessing.reduction", "_rebuild_partial"),
+        ("multiprocessing.reduction", "_rebuild_socket"),
+        ("multiprocessing.resource_sharer", "DupFd"),
+        ("types", "SimpleNamespace"),
+    }
+
+    ALLOWED_MODULE_PREFIXES = {
         # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
@@ -3045,10 +3012,6 @@ class SafeUnpickler(pickle.Unpickler):
         "torch._C._distributed_c10d.",
         "torch._C._distributed_fsdp.",
         "torch.distributed.optim.",
-        # --- multiprocessing ---
-        "multiprocessing.resource_sharer.",
-        "multiprocessing.reduction.",
-        "pickletools.",
         # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
@@ -3064,35 +3027,14 @@ class SafeUnpickler(pickle.Unpickler):
         "torch_npu.",
     }
 
-    DENY_CLASSES = {
-        ("builtins", "eval"),
-        ("builtins", "exec"),
-        ("builtins", "compile"),
-        ("os", "system"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("codecs", "decode"),
-        ("types", "CodeType"),
-        ("types", "FunctionType"),
-    }
-
     def find_class(self, module, name):
-        # Block deterministic attacks
-        if (module, name) in self.DENY_CLASSES:
-            raise RuntimeError(
-                f"Blocked unsafe class loading ({module}.{name}), "
-                f"to prevent exploitation of CVE-2025-10164"
-            )
-        # Allowlist of safe-to-load modules.
-        if any(
+        if (module, name) in self.ALLOWED_GLOBALS or any(
             (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
         ):
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(
-            f"Blocked unsafe class loading ({module}.{name}), "
-            f"to prevent exploitation of CVE-2025-10164"
+            f"Blocked unsafe global ({module}.{name}) during pickle deserialization"
         )
 
 
@@ -3109,30 +3051,6 @@ def safe_pickle_loads(data):
         # zmq.Frame and other buffer-protocol objects
         buf = bytes(memoryview(data))
     return SafeUnpickler(io.BytesIO(buf)).load()
-
-
-def debug_timing(func):
-    # todo: replace with a more organized instrumentation
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 def nullable_str(val: str):
@@ -3675,35 +3593,6 @@ def is_no_spec_infer_or_topk_one(cfg):
     )
 
 
-def is_fa3_default_architecture(hf_config):
-    architectures = getattr(hf_config, "architectures", None)
-    if not isinstance(architectures, list) or not architectures:
-        return False
-    default_archs = {
-        "Llama4ForConditionalGeneration",
-        "LlamaForCausalLM",
-        "Olmo2ForCausalLM",
-        "Gemma2ForCausalLM",
-        "Gemma3ForConditionalGeneration",
-        "MixtralForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Glm4MoeForCausalLM",
-        "Glm4vForConditionalGeneration",
-        "Glm4vMoeForConditionalGeneration",
-        "GlmOcrForConditionalGeneration",
-        "Step3VLForConditionalGeneration",
-        "StepVLForConditionalGeneration",
-        "Step3p7ForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    }
-    return architectures[0] in default_archs
-
-
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
     def __init__(self, buffer_size: int, dtype, device):
@@ -4106,7 +3995,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
+    logger.debug(
         f"Freezing GC in {context} process. "
         f"gen0: {g0_before}->{g0_after}, "
         f"gen1: {g1_before}->{g1_after}, "
