@@ -5,12 +5,13 @@
 //! prefill/decode pressure ordering with Router-local fallback.
 
 use crate::policies::state::engine_load::{
-    EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad,
+    EngineLoadSnapshot, EngineLoadTable, EngineWorkerLoad, NativeCacheWorkerLoad,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// Applies snapshot-backed capacity admission when native monitor data is complete.
 /// Workers without monitor data remain eligible and use Router-local ordering.
@@ -268,4 +269,25 @@ fn compare_decode_load(left: &NativeCacheWorkerLoad, right: &NativeCacheWorkerLo
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
         .then(kv_usage)
         .then_with(|| left.num_used_tokens.cmp(&right.num_used_tokens))
+}
+
+/// One load snapshot per selection pass, captured on first use so policies
+/// that never read load never pay for it.
+pub struct LoadView<'a> {
+    table: &'a EngineLoadTable,
+    snapshot: OnceLock<EngineLoadSnapshot>,
+}
+
+impl<'a> LoadView<'a> {
+    pub fn new(table: &'a EngineLoadTable) -> Self {
+        Self {
+            table,
+            snapshot: OnceLock::new(),
+        }
+    }
+
+    pub fn snapshot(&self) -> &EngineLoadSnapshot {
+        self.snapshot
+            .get_or_init(|| self.table.capture_snapshot(Instant::now()))
+    }
 }
