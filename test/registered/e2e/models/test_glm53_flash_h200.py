@@ -74,16 +74,24 @@ class _GLM53FlashH200Base(CustomTestCase):
 
     def test_vision_ocr(self):
         import openai
+
         client = openai.Client(base_url=f"{self.base_url}/v1", api_key="EMPTY")
         response = client.chat.completions.create(
             model="default",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"}},
-                    {"type": "text", "text": "Describe this image briefly."}
-                ]
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            },
+                        },
+                        {"type": "text", "text": "Describe this image briefly."},
+                    ],
+                }
+            ],
             max_tokens=64,
         )
         content = response.choices[0].message.content
