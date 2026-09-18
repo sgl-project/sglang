@@ -43,15 +43,23 @@ def sample(registry, name, **labels):
 
 @pytest.mark.parametrize("sequential", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
-def test_scheduler_counts_original_requests_and_cleans_up(metrics, sequential, failure):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_scheduler_counts_original_requests_and_cleans_up(
+    metrics, sequential, failure, enabled
+):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.metrics = collector
+    scheduler.metrics = collector if enabled else None
     scheduler._disagg_role = RoleType.MONOLITHIC
     scheduler._disagg_metrics = None
     scheduler.receiver = None
     scheduler.context = Mock()
-    scheduler.waiting_queue = deque()
+
+    class NoScanQueue(deque):
+        def __iter__(self):
+            raise AssertionError("metrics must not scan the waiting queue")
+
+    scheduler.waiting_queue = NoScanQueue()
     scheduler._running = True
     scheduler._consecutive_error_count = 0
     scheduler._max_consecutive_errors = 1
@@ -65,13 +73,12 @@ def test_scheduler_counts_original_requests_and_cleans_up(metrics, sequential, f
     group = [Req(sampling_params=SamplingParams(prompt="group")) for _ in range(3)]
     reqs.append(group)
     scheduler.recv_reqs = lambda: [(None, req) for req in reqs]
-    scheduler.get_next_batch_to_run = lambda: [
-        (identity, req) for identity, req, _ in scheduler.waiting_queue
-    ]
+    scheduler.get_next_batch_to_run = lambda: [(None, req) for req in reqs]
 
     def dispatch(items):
-        assert sample(registry, "num_running_reqs") == 3
-        assert sample(registry, "num_queue_reqs") == 0
+        if enabled:
+            assert sample(registry, "num_running_reqs") == 3
+            assert sample(registry, "num_queue_reqs") == 0
         scheduler._running = False
         if failure and not sequential:
             raise RuntimeError("forward failed")
@@ -88,6 +95,13 @@ def test_scheduler_counts_original_requests_and_cleans_up(metrics, sequential, f
 
     scheduler._dispatch_items = dispatch
     scheduler.event_loop()
+    if not enabled:
+        assert not collector._requests
+        assert (
+            sample(registry, "requests_total", status="success", is_warmup="false")
+            is None
+        )
+        return
     errors = 2 if sequential else 3
     assert sample(registry, "requests_total", status="success", is_warmup="false") == (
         (1 if sequential else None) if failure else 3
@@ -228,13 +242,26 @@ m.finish(0, error=False)
             timeout=90,
         )
     scrape = """
+import asyncio
+from types import SimpleNamespace
+from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 r = CollectorRegistry()
 multiprocess.MultiProcessCollector(r)
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic','replica':'0'}) == 1
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic','replica':'1'}) == 2
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'decoder','replica':'0'}) == 0
 assert b'sglang:diffusion_requests_total' in generate_latest(r)
+args = SimpleNamespace(enable_metrics=True, pipeline_config=SimpleNamespace(
+    supports_action_endpoint=lambda: False, supports_openpi_endpoint=lambda: False))
+app = create_app(args)
+app.state.server_warmup_done = asyncio.Event()
+response = TestClient(app).get('/metrics')
+assert response.status_code == 200
+assert 'sglang:diffusion_requests_total' in response.text
+args.enable_metrics = False
+assert TestClient(create_app(args)).get('/metrics').status_code == 404
 """
     subprocess.run([sys.executable, "-c", scrape], env=env, check=True, timeout=90)
 

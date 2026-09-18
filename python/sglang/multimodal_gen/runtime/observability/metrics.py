@@ -166,6 +166,7 @@ class DiffusionMetrics:
             multiprocess_mode="mostrecent",
             registry=registry,
         )
+        self._publish_depths()
 
     def _publish_depths(self):
         self.queue.labels(*self._labels).set(self._queued)

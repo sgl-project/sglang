@@ -83,13 +83,13 @@ class _SequentiallyReturnedOutputs:
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
-    metrics: DiffusionMetrics | None = None
-
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
     """
+
+    metrics: DiffusionMetrics | None = None
 
     def __init__(
         self,
@@ -1306,6 +1306,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if self.metrics is not None:
                 for _, req in items:
                     self.metrics.dispatch(id(req))
+                    if (
+                        isinstance(req, list)
+                        and get_first_generation_req(req) is not None
+                    ):
+                        self.metrics.observe_batch(1, "request_group")
             try:
                 with maybe_record_function(
                     f"REQ {self._req_label(items)} dispatch+forward"
