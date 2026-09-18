@@ -15,7 +15,7 @@
 export const config = {
   modelName: "Qwen3.8-27B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300"],
+  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300", "xeon"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs, so they are not in the shared catalog.
@@ -25,6 +25,7 @@ export const config = {
   hardware: [
     { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
   ],
 
   // Every cell pins `--kv-cache-dtype fp8_e4m3` at the maintainers' direction
@@ -377,6 +378,7 @@ export const config = {
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
+    xeon:    "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -996,6 +998,26 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Xeon CPU: reference recipe only, not benchmarked on this page. No
+      // NVFP4/FP8 cell — those checkpoints have no verified CPU recipe.
+      match: { hw: "xeon", variant: "default", quant: "bf16", nodes: "single" },
+      verified: false,
+      verificationStatus: "unverified",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--mem-fraction-static 0.8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
