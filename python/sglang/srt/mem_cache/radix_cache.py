@@ -494,6 +494,19 @@ class RadixCache(BasePrefixCache):
             )
             return
 
+        if not is_insert:
+            # Frees committed slots that no token id names, which the insert
+            # path below cannot reach; the protected prefix stays with the cache.
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+            ]
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.kv.cache_protected_len
+            )
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -509,39 +522,36 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        if is_insert:
-            priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
-            )
-            # A request that was never cached while unfinished can add its
-            # whole prompt and generated output as one leaf. Split that leaf at
-            # the prompt boundary so LRU eviction can discard output KV without
-            # also losing the reusable prompt KV. Reinserting a prefix only
-            # changes radix topology; it reuses the indices inserted above.
-            prompt_key = RadixKey(
-                token_ids[: len(req.origin_input_ids)],
-                req.extra_key,
-                is_bigram=self.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            if 0 < len(prompt_key) < key_len:
-                self.insert(
-                    InsertParams(
-                        key=prompt_key,
-                        value=values[: len(prompt_key)],
-                        priority=priority + 1,
-                        # Topology-only re-insert: this request created these
-                        # nodes moments ago, so counting it as a hit is the
-                        # same self-referencing inflation `chunked` exists to
-                        # suppress. hit_count drives eviction order, so an
-                        # extra bump would silently promote every prompt node.
-                        chunked=True,
-                    )
+        priority = getattr(req, "priority", 0) or 0
+        result = self.insert(
+            InsertParams(key=radix_key, value=values, priority=priority)
+        )
+        # A request that was never cached while unfinished can add its
+        # whole prompt and generated output as one leaf. Split that leaf at
+        # the prompt boundary so LRU eviction can discard output KV without
+        # also losing the reusable prompt KV. Reinserting a prefix only
+        # changes radix topology; it reuses the indices inserted above.
+        prompt_key = RadixKey(
+            token_ids[: len(req.origin_input_ids)],
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if 0 < len(prompt_key) < key_len:
+            self.insert(
+                InsertParams(
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    priority=priority + 1,
+                    # Topology-only re-insert: this request created these
+                    # nodes moments ago, so counting it as a hit is the
+                    # same self-referencing inflation `chunked` exists to
+                    # suppress. hit_count drives eviction order, so an
+                    # extra bump would silently promote every prompt node.
+                    chunked=True,
                 )
-            freed_end = result.prefix_len
-        else:
-            freed_end = key_len
+            )
+        freed_end = result.prefix_len
 
         # duplicates / uninserted range, then the unaligned tail
         self.token_to_kv_pool_allocator.free_segments(

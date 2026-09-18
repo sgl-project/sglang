@@ -219,7 +219,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             ),
             patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             patch(
-                "sgl_kernel.tree_speculative_sampling_target_only",
+                "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
             ),
         ):
@@ -251,11 +251,16 @@ class TestGraphPoolBorrow(CustomTestCase):
         torch.cuda.synchronize()
 
         device_id = torch.cuda.current_device()
-        reserved_before = torch.cuda.memory_reserved(device_id)
+        borrow_stream = torch.cuda.Stream()
         with (
             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
             patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
+            torch.cuda.stream(borrow_stream),
         ):
+            lhs = torch.ones((32, 16), dtype=torch.bfloat16, device="cuda")
+            copied_product = torch.empty((32, 32), dtype=torch.float32, device="cuda")
+            pool.prewarm_graph_pool_borrow()
+            reserved_before = torch.cuda.memory_reserved(device_id)
             runs = pool.find_free_graph_pool_runs(handle)
             self.assertGreaterEqual(len(runs), 2)
             largest_run_bytes = runs[0][1]
@@ -301,6 +306,13 @@ class TestGraphPoolBorrow(CustomTestCase):
                 self.assertEqual(reused.data_ptr(), recycled_address)
                 del reused
 
+                # The first GEMM on this stream must not cache its workspace
+                # in borrowed storage, which replay would overwrite.
+                product = torch.mm(lhs, lhs.T, out_dtype=torch.float32)
+                self.assertTrue(on_a_run(product))
+                copied_product.copy_(product)
+                del product
+
             # Captures retire the persistent borrow pool. Its storage aliases
             # existing graph-pool runs, so the reserved footprint is unchanged.
             pool._teardown_borrow_pool()
@@ -315,6 +327,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                 graph.replay()
             torch.cuda.synchronize()
             self.assertTrue(torch.equal(y, torch.ones_like(y)))
+            self.assertTrue(
+                torch.equal(copied_product, torch.full_like(copied_product, 16))
+            )
 
         self.assertEqual(torch.cuda.memory_reserved(device_id), reserved_before)
         del graph, y

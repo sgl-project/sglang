@@ -292,6 +292,7 @@ from sglang.srt.mem_cache.common import (
     retraction_discard,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -1150,6 +1151,7 @@ class Scheduler(
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
+            prewarm_graph_pool_borrow()
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
@@ -3940,6 +3942,12 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                self.chunked_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:

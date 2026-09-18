@@ -233,7 +233,7 @@ class TestDecodeHostCacheQueue(unittest.TestCase):
         self.host_cache.allocate.return_value = torch.arange(20, 28)
         self.allocator = Mock(page_size=4)
         self.allocator.available_size.return_value = 0
-        self.req_pool = Mock(size=4)
+        self.req_pool = Mock(size=4, mamba_allocator=None)
         self.req_pool.available_size.return_value = 1
         self.metadata_allocator = ReqToMetadataIdxAllocator(4)
         self.scheduler = SimpleNamespace(
@@ -413,6 +413,11 @@ class TestDecodeHostCacheQueue(unittest.TestCase):
         self.scheduler.spec_algorithm = object()
         self.scheduler.future_map = object()
         self.scheduler.forward_stream = object()
+        self.scheduler.chunked_req = None
+        self.scheduler.ngram_embedding_manager = Mock()
+        self.scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
+            lambda *_args, **_kwargs: order.append("ngram")
+        )
         self.scheduler.schedule_stream = Mock()
         self.scheduler.schedule_stream.wait_stream.side_effect = lambda _: order.append(
             "fence"
@@ -425,7 +430,7 @@ class TestDecodeHostCacheQueue(unittest.TestCase):
                 self.scheduler, self.scheduler.running_batch
             )
         self.assertIs(result, batch)
-        self.assertEqual(order, ["prepare", "fence", "load", "process"])
+        self.assertEqual(order, ["prepare", "fence", "load", "ngram", "process"])
         self.host_cache.load.assert_called_once_with([self.req], self.req_pool)
 
     def test_failure_waits_for_drain_and_rank_consensus_past_timeout(self):
