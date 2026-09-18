@@ -1,7 +1,7 @@
 """Multimodal embedding scheduling and cache coordination."""
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -237,6 +237,45 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
+def _mm_encode_sync_group():
+    """Attention-TP group whose ranks must agree on which items to encode.
+
+    Returns None when no cross-rank agreement is needed (no distributed
+    init, or a single attention-TP rank).
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    parallel = get_parallel()
+    if parallel.attn_tp_size <= 1:
+        return None
+    return parallel.attn_tp_group
+
+
+def _rank_consistent_miss_hashes(
+    ordered_keys: List[Tuple[Optional[int], int]],
+    local_misses: Set[Tuple[Optional[int], int]],
+    tp_group,
+    device: torch.device,
+) -> Set[Tuple[Optional[int], int]]:
+    """Return the union over attention-TP ranks of the locally-missed cache keys.
+
+    The embedding cache is per process, so ranks can disagree on which items
+    need the ViT. The encoder is DP-sharded across the attention-TP group and
+    ends in a collective, so a rank that skips the encode while a peer runs
+    it deadlocks the group. The ordered keys must be built in the same
+    order on every rank (they are derived from the batch, which is identical).
+    """
+    flags = torch.tensor(
+        [1 if k in local_misses else 0 for k in ordered_keys],
+        # float32: the custom all-reduce kernels reject integer dtypes; 0/1
+        # sums stay exact.
+        dtype=torch.float32,
+        device=device,
+    )
+    flags = tp_group.all_reduce(flags)
+    return {k for k, f in zip(ordered_keys, flags.tolist()) if f > 0}
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -253,6 +292,7 @@ def _get_chunked_embedding_full(
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
+    expected_token_count = sum(end - start + 1 for start, end in items_offset)
 
     # A compact feature hash can collide for inputs with different token
     # counts.  Never feed a stale cache entry into the scheduler: the length
@@ -261,11 +301,30 @@ def _get_chunked_embedding_full(
     if embedding_per_req is not None and not isinstance(
         embedding_per_req, EVSEmbeddingResult
     ):
-        expected_token_count = sum(end - start + 1 for start, end in items_offset)
         cached_token_count = _embedding_token_count(embedding_per_req.embedding)
         if cached_token_count != expected_token_count:
             _discard_mismatched_cached_embedding(
                 embedding_items_hash, expected_token_count, cached_token_count
+            )
+            embedding_per_req = None
+
+    # The cache is per process; a peer that missed this combined entry enters
+    # the same attention-TP encoder collective, so the encode decision must be
+    # the union of all ranks' local misses.
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        cache_key = (embedding_items_hash, expected_token_count)
+        global_misses = _rank_consistent_miss_hashes(
+            [cache_key],
+            {cache_key} if embedding_per_req is None else set(),
+            sync_group,
+            device,
+        )
+        if global_misses and embedding_per_req is not None:
+            logger.warning(
+                "mm embedding cache hit on this rank but miss on a peer for a "
+                "combined per-request entry; re-encoding to keep the "
+                "attention-TP group in step"
             )
             embedding_per_req = None
 
@@ -377,6 +436,40 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        ordered_keys: List[Tuple[Optional[int], int]] = []
+        key_to_item: Dict[
+            Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]
+        ] = {}
+        for req_info in per_image_requests:
+            for _idx, item, start, end in req_info.overlapping:
+                cache_key = (item.hash, end - start + 1)
+                if cache_key not in key_to_item:
+                    ordered_keys.append(cache_key)
+                    key_to_item[cache_key] = (item, end - start + 1)
+        if ordered_keys:
+            global_misses = _rank_consistent_miss_hashes(
+                ordered_keys, set(unique_misses), sync_group, device
+            )
+            forced = [
+                k for k in ordered_keys if k in global_misses and k not in unique_misses
+            ]
+            if forced:
+                logger.warning(
+                    "mm embedding cache hit on this rank but miss on a peer for "
+                    "%d item(s); re-encoding to keep the attention-TP group in step",
+                    len(forced),
+                )
+            for k in forced:
+                hash_to_embedding.pop(k, None)
+                unique_misses[k] = key_to_item[k]
+            # Encode order feeds the DP image->rank assignment; keep it
+            # identical on every rank rather than local-miss-then-forced.
+            unique_misses = {
+                k: unique_misses[k] for k in ordered_keys if k in unique_misses
+            }
+
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
@@ -442,6 +535,7 @@ def _get_chunked_embedding_by_item(
 
     cached_embeddings = {}
     miss_items = []
+    hit_entries: List[Tuple[Tuple[Optional[int], int], MultimodalDataItem]] = []
     for idx, item, start, end in overlapping:
         expected_token_count = end - start + 1
         cached = embedding_cache.get_single(item.hash)
@@ -450,7 +544,11 @@ def _get_chunked_embedding_by_item(
             cached_token_count = _embedding_token_count(cached_embedding)
             if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+                # The hit acknowledge is deferred until after the cross-rank
+                # miss union below: a peer miss forces a re-encode, and a
+                # re-encoded item must not release its deferred CUDA-IPC
+                # feature as a cache hit.
+                hit_entries.append(((item.hash, expected_token_count), item))
             else:
                 _discard_mismatched_cached_embedding(
                     item.hash, expected_token_count, cached_token_count
@@ -458,6 +556,48 @@ def _get_chunked_embedding_by_item(
                 miss_items.append((idx, item, start, end))
         else:
             miss_items.append((idx, item, start, end))
+
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        ordered_keys: List[Tuple[Optional[int], int]] = []
+        seen_keys: Set[Tuple[Optional[int], int]] = set()
+        for _idx, item, start, end in overlapping:
+            cache_key = (item.hash, end - start + 1)
+            if cache_key not in seen_keys:
+                seen_keys.add(cache_key)
+                ordered_keys.append(cache_key)
+        local_misses = {
+            (item.hash, end - start + 1) for _, item, start, end in miss_items
+        }
+        global_misses = _rank_consistent_miss_hashes(
+            ordered_keys, local_misses, sync_group, device
+        )
+        forced = {
+            k for k in ordered_keys if k in global_misses and k not in local_misses
+        }
+        if forced:
+            logger.warning(
+                "mm embedding cache hit on this rank but miss on a peer for "
+                "%d item(s); re-encoding to keep the attention-TP group in step",
+                len(forced),
+            )
+            missed_idx = {idx for idx, _, _, _ in miss_items}
+            for idx, item, start, end in overlapping:
+                if (item.hash, end - start + 1) in forced and idx not in missed_idx:
+                    cached_embeddings.pop(idx, None)
+                    miss_items.append((idx, item, start, end))
+            # Encode order feeds the DP image->rank assignment; keep it in
+            # batch (overlapping) order on every rank.
+            miss_by_idx = {
+                idx: (idx, item, start, end) for idx, item, start, end in miss_items
+            }
+            miss_items = [
+                miss_by_idx[idx] for idx, *_ in overlapping if idx in miss_by_idx
+            ]
+        hit_entries = [(key, item) for key, item in hit_entries if key not in forced]
+
+    if hit_entries:
+        _acknowledge_deferred_cuda_ipc_cache_hits([item for _, item in hit_entries])
 
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
