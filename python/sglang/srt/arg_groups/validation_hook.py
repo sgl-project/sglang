@@ -17,11 +17,22 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
 
 
 def check_server_args(server_args: Any):
@@ -66,6 +77,36 @@ def check_server_args(server_args: Any):
                     "NPU PP + speculative decoding (MTP) is only supported "
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
+        elif envs.SGLANG_ENABLE_PP_SPEC.get():
+            assert cfg.disable_overlap_schedule, (
+                "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+            )
+            # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
+            # tail-drafts; every other algorithm would be mis-rebuilt.
+            assert (
+                cfg.speculative_algorithm == "EAGLE"
+                and not cfg.enable_multi_layer_eagle
+            ), (
+                "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only, "
+                f"got {cfg.speculative_algorithm}"
+            )
+            # PD prefill relays topk_p / topk_index / hidden states through
+            # RelayPayload; the gated flow replaces that relay with its own
+            # and does not carry those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The PP relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every stage rebuilds the same verify input from the relayed
+            # per-request state, so all stages must see the same batch.
+            # DP attention partitions it per DP rank.
+            assert not cfg.enable_dp_attention, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
         else:
             # Non-NPU: PP + speculative decoding is not supported
             assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
@@ -434,8 +475,37 @@ def validate_experimental_sgl_marlin(server_args: Any):
 
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.prefill_decode_interval < 0:
+    if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def default_unset_prefill_decode_interval(server_args: Any):
+    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_decode_interval is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_default",
+            prefill_decode_interval=0,
+        )
+
+
+def validate_sampling_mask_max_tokens(server_args: Any):
+    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
+            "Unset it. To enable sampling masks for disaggregated serving, set "
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
+            "--sampling-mask-max-tokens value on both prefill and decode servers."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
+        )
 
 
 def check_two_batch_overlap(server_args: Any):

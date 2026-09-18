@@ -139,20 +139,20 @@ jobs:
       scheduled: true
     secrets: inherit
 
-  # nightly-4-gpu-gb300:
-  #   needs: check-changes
-  #   if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
-  #   uses: ./.github/workflows/_pr-test-stage.yml
-  #   with:
-  #     self_name: nightly-test-4-gpu-gb300
-  #     runner_config: 4-gpu-gb300
-  #     check_changes: ${{ toJson(needs.check-changes.outputs) }}
-  #     caller_inputs: ${{ toJson(inputs) }}
-  #     partitions: ${{ needs.check-changes.outputs.partitions }}
-  #     run_timeout_minutes: '360'
-  #     job_timeout_minutes: '420'
-  #     scheduled: true
-  #   secrets: inherit
+  nightly-4-gpu-gb300:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-4-gpu-gb300
+      runner_config: 4-gpu-gb300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
+    secrets: inherit
 
   nightly-8-gpu-h200:
     needs: check-changes
@@ -265,7 +265,7 @@ jobs:
       - nightly-2-gpu-large
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
-      # - nightly-4-gpu-gb300
+      - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
     runs-on: ubuntu-latest
@@ -312,7 +312,7 @@ jobs:
       - nightly-2-gpu-large
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
-      # - nightly-4-gpu-gb300
+      - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
       - nightly-test-diffusion
