@@ -39,6 +39,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -155,11 +156,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         )
         # Host-pool retraction transfers full and sliding-window components
         # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        #
+        # The unified pool is excluded for the same reason hierarchical cache is
+        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
+        # device buffers with the ids it is handed, and under the unified pool
+        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
+        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
+        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
+        # asks for 418 GB of host memory per component.
+        supports_host_pool = (
+            not uses_ssm_state(tp_worker.model_runner.model_config)
+            and not memory.enable_unified_memory
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -223,7 +234,11 @@ def build_kv_cache(
     )
 
     # Hybrid memory pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa
+    token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
+    is_hybrid_swa = tp_worker.is_hybrid_swa and (
+        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        or token_to_kv_pool.needs_paged_swa_allocator
+    )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 

@@ -74,7 +74,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
-        if request.echo and request.logprobs:
+        if request.echo and request.logprobs is not None:
             logger.warning(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
@@ -274,6 +274,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         content["meta_info"]
                     )
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
@@ -286,11 +289,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if is_first_chunk and request.echo:
+                    if is_first_chunk and request.echo and request.logprobs:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
-                        input_top_logprobs = content["meta_info"]["input_top_logprobs"]
+                        input_top_logprobs = content["meta_info"].get(
+                            "input_top_logprobs", None
+                        )
                     else:
                         input_token_logprobs = None
                         input_top_logprobs = None
@@ -343,8 +348,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 else:
                     delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
                 # (timeout, OOM, validation): emit a streaming error chunk.
@@ -575,9 +578,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle logprobs
             logprobs = None
             if request.logprobs is not None:
-                if echo:
+                if echo and request.logprobs:
                     input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
-                    input_top_logprobs = ret_item["meta_info"]["input_top_logprobs"]
+                    input_top_logprobs = ret_item["meta_info"].get(
+                        "input_top_logprobs", None
+                    )
                 else:
                     input_token_logprobs = None
                     input_top_logprobs = None
