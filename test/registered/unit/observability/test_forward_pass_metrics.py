@@ -197,6 +197,19 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
 
+    def test_emit_decode_without_cpu_sequence_lengths(self):
+        for seq_lens_cpu, total, variance in ((None, 28, 9), ([10, 14], 24, 4)):
+            with self.subTest(seq_lens_cpu=seq_lens_cpu):
+                batch = self._make_batch(
+                    reqs=[_FakeReq(8, output_len=3), _FakeReq(12, output_len=5)],
+                    seq_lens_cpu=seq_lens_cpu,
+                )
+                self.reporter._emit_forward_pass_metrics(batch)
+                metrics = self.scheduler._fpm_publisher.metrics[-1].scheduled_requests
+                self.assertEqual(metrics.num_decode_requests, 2)
+                self.assertEqual(metrics.sum_decode_kv_tokens, total)
+                self.assertEqual(metrics.var_decode_kv_tokens, variance)
+
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True
         self.scheduler._fpm_gpu_time_acc = 0.042

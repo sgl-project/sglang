@@ -389,7 +389,13 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
+            # Speculative decoding can omit the CPU sequence-length mirror.
+            seq_lens = (
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else (req.seqlen for req in batch.reqs)
+            )
+            for sl in seq_lens:
                 decode_kv.add(int(sl))
 
         return ScheduledRequestMetrics(
