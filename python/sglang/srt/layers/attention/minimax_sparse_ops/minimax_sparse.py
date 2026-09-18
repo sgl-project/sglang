@@ -22,7 +22,6 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
-_sgl_native_q8kv8_decode_fallback_warned = False
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -34,18 +33,6 @@ def _warn_msa_fallback(err: Exception) -> None:
         err,
     )
     _msa_fallback_warned = True
-
-
-def _warn_sgl_native_q8kv8_decode_fallback(err: Exception) -> None:
-    global _sgl_native_q8kv8_decode_fallback_warned
-    if _sgl_native_q8kv8_decode_fallback_warned:
-        return
-    logger.warning(
-        "SGL native SM90 Q8KV8 sparse decode is unavailable (%s); "
-        "falling back to Triton Step3.",
-        err,
-    )
-    _sgl_native_q8kv8_decode_fallback_warned = True
 
 
 def minimax_sparse_prefill(
@@ -269,7 +256,6 @@ def minimax_sparse_decode(
     cached_topk_idx: Optional[torch.Tensor] = None,
     topk_out: Optional[torch.Tensor] = None,
     use_sgl_native_q8kv8_decode: bool = False,
-    sgl_native_q8kv8_decode_strict: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -335,52 +321,29 @@ def minimax_sparse_decode(
                 )
             topk_out.copy_(topk_idx)
         # Step 3 only: the indexer and top-k reduction above remain Triton.
-        if use_sgl_native_q8kv8_decode and sink is None:
+        if use_sgl_native_q8kv8_decode:
+            if sink is not None:
+                raise RuntimeError(
+                    "SGL native Q8KV8 decode does not support an attention sink"
+                )
             from sglang.kernels.ops.attention.minimax_sparse.decode.sgl_native_q8kv8 import (
-                SglNativeQ8KV8DecodeBuildError,
                 sgl_native_q8kv8_sparse_decode,
             )
 
-            try:
-                o = sgl_native_q8kv8_sparse_decode(
-                    q=q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    req_to_token=req_to_token,
-                    slot_ids=slot_ids,
-                    seq_lens=seq_lens,
-                    topk_idx=topk_idx,
-                    block_size_k=block_size_k,
-                    page_size=page_size,
-                    sm_scale=sm_scale,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
-            except (SglNativeQ8KV8DecodeBuildError, ValueError) as err:
-                if sgl_native_q8kv8_decode_strict:
-                    raise RuntimeError(
-                        "strict SGL native Q8KV8 decode dispatch failed"
-                    ) from err
-                _warn_sgl_native_q8kv8_decode_fallback(err)
-                o = flash_decode_with_gqa_share_sparse(
-                    q=q,
-                    sink=sink,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    req_to_token=req_to_token,
-                    seq_lens=seq_lens,
-                    slot_ids=slot_ids,
-                    block_size=block_size_k,
-                    topk_idx=topk_idx,
-                    sm_scale=sm_scale,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
-        elif use_sgl_native_q8kv8_decode and sgl_native_q8kv8_decode_strict:
-            raise RuntimeError(
-                "strict SGL native Q8KV8 decode does not support an attention sink"
+            o = sgl_native_q8kv8_sparse_decode(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                seq_lens=seq_lens,
+                topk_idx=topk_idx,
+                block_size_k=block_size_k,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         elif use_msa and sink is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main

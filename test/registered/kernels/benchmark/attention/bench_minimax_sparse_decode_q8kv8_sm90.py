@@ -3,11 +3,17 @@ from functools import partial
 
 import torch
 import triton
+
 from sglang.kernels.ops.attention.minimax_sparse.decode.sgl_native_q8kv8 import (
     sgl_native_q8kv8_sparse_decode,
 )
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 

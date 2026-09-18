@@ -3,7 +3,11 @@ import inspect
 
 import pytest
 import torch
+
 from sglang.srt.utils import is_sm90_supported
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 MODULE = "sglang.kernels.ops.attention.minimax_sparse.decode.sgl_native_q8kv8"
 FP8 = torch.float8_e4m3fn
@@ -26,14 +30,14 @@ def test_native_decode_requires_page_aligned_sparse_blocks():
         native._validate_page_contract(block_size_k=128, page_size=64)
 
 
-def test_sparse_decode_exposes_independent_native_strict_switch():
+def test_sparse_decode_exposes_independent_native_switch():
     sparse = importlib.import_module(
         "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse"
     )
     parameters = inspect.signature(sparse.minimax_sparse_decode).parameters
 
     assert "use_sgl_native_q8kv8_decode" in parameters
-    assert "sgl_native_q8kv8_decode_strict" in parameters
+    assert "sgl_native_q8kv8_decode_strict" not in parameters
 
 
 def _reference(q, k, v, req_to_token, slot_ids, seq_lens, topk_idx, scales):
@@ -181,3 +185,34 @@ def test_native_decode_cuda_graph_replay_uses_updated_indices_and_scales():
     graph.replay()
     expected = _reference(q, k, v, req_to_token, slot_ids, seq_lens, topk_idx, scales)
     torch.testing.assert_close(captured.float(), expected.float(), atol=3e-2, rtol=3e-2)
+
+
+def test_native_decode_uses_consistent_fail_closed_provider_contract():
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention import minimax_sparse_backend as backend
+    from sglang.srt.layers.attention.minimax_sparse_ops import minimax_sparse
+
+    assert hasattr(envs, "SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_DECODE")
+    assert (
+        "sgl_native_q8kv8_decode_strict"
+        not in inspect.signature(minimax_sparse.minimax_sparse_decode).parameters
+    )
+    assert backend._native_q8kv8_decode_contract(
+        is_npu=False,
+        is_sm90=True,
+        fp8_attn_gemm=False,
+        main_pool_dtype=torch.float8_e4m3fn,
+        block_size_k=128,
+        page_size=128,
+    )
+
+
+def test_native_decode_quantizes_only_main_query_without_full_fp8_mode():
+    from sglang.srt.layers.attention.minimax_sparse_backend import (
+        _quantize_sgl_native_decode_query,
+    )
+
+    q = torch.tensor([1.0, -0.5], dtype=torch.bfloat16)
+    actual = _quantize_sgl_native_decode_query(q, enabled=True, q_scale=0.5)
+    assert actual.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(actual.float(), torch.tensor([2.0, -1.0]))

@@ -1685,10 +1685,7 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     # Opt in to the SM90 native FP8-Q/FP8-KV split-K sparse decode Step3.
     # The Triton indexer and top-k reduction remain unchanged.
-    SGLANG_ENABLE_MINIMAX_NATIVE_Q8KV8_DECODE = EnvBool(False)
-    # Independent fail-closed mode: reject unsupported contracts/build failures
-    # instead of silently falling back to Triton Step3.
-    SGLANG_MINIMAX_NATIVE_Q8KV8_DECODE_STRICT = EnvBool(False)
+    SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):

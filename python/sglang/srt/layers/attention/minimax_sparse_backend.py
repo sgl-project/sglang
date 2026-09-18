@@ -111,6 +111,31 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     return q.to(torch.float8_e4m3fn)
 
 
+def _quantize_sgl_native_decode_query(
+    q: torch.Tensor, *, enabled: bool, q_scale: Optional[float]
+) -> torch.Tensor:
+    return _quant_q_fp8(q, q_scale) if enabled else q
+
+
+def _native_q8kv8_decode_contract(
+    *,
+    is_npu: bool,
+    is_sm90: bool,
+    fp8_attn_gemm: bool,
+    main_pool_dtype: torch.dtype,
+    block_size_k: int,
+    page_size: int,
+) -> bool:
+    return (
+        not is_npu
+        and is_sm90
+        and not fp8_attn_gemm
+        and main_pool_dtype == torch.float8_e4m3fn
+        and block_size_k == 128
+        and page_size == block_size_k
+    )
+
+
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
@@ -243,30 +268,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
-        _native_q8kv8_requested = envs.SGLANG_ENABLE_MINIMAX_NATIVE_Q8KV8_DECODE.get()
-        self.native_q8kv8_decode_strict = (
-            envs.SGLANG_MINIMAX_NATIVE_Q8KV8_DECODE_STRICT.get()
+        _native_q8kv8_requested = (
+            envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_DECODE.get()
         )
-        _native_q8kv8_contract = (
-            not self.is_npu
-            and is_sm90_supported()
-            and self.fp8_attn_gemm
-            and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
-            and self.block_size_k == 128
-            and self.page_size == 128
+        _native_q8kv8_contract_ok = _native_q8kv8_decode_contract(
+            is_npu=self.is_npu,
+            is_sm90=is_sm90_supported(),
+            fp8_attn_gemm=self.fp8_attn_gemm,
+            main_pool_dtype=self.kv_pool.main_pool.dtype,
+            block_size_k=self.block_size_k,
+            page_size=self.page_size,
         )
-        self.use_sgl_native_q8kv8_decode = (
-            _native_q8kv8_requested and _native_q8kv8_contract
-        )
-        if (
-            _native_q8kv8_requested
-            and self.native_q8kv8_decode_strict
-            and not _native_q8kv8_contract
-        ):
+        if _native_q8kv8_requested and not _native_q8kv8_contract_ok:
             raise RuntimeError(
-                "strict SGL native Q8KV8 decode requires SM90, fp8 attn-GEMM, "
-                "FP8 E4M3 main KV, and page_size=block_size_k=128"
+                "SGL native Q8KV8 decode requires SM90, FP8 E4M3 main KV, "
+                "page_size=block_size_k=128, and the full FP8 attention-GEMM "
+                "mode to be disabled"
             )
+        self.use_sgl_native_q8kv8_decode = (
+            _native_q8kv8_requested and _native_q8kv8_contract_ok
+        )
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
@@ -1514,6 +1535,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            else:
+                q = _quantize_sgl_native_decode_query(
+                    q,
+                    enabled=self.use_sgl_native_q8kv8_decode,
+                    q_scale=layer.q_scale_float,
+                )
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -1760,7 +1787,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
                 use_sgl_native_q8kv8_decode=self.use_sgl_native_q8kv8_decode,
-                sgl_native_q8kv8_decode_strict=self.native_q8kv8_decode_strict,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
