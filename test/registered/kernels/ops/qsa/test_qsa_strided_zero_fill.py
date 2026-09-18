@@ -4,7 +4,7 @@ Poison the packed scratch with NaN, gather with the strided layout used by
 `_forward_trtllm_sparse`, and require that (a) valid rows are copied exactly and
 (b) every slot in [valid_count, stride) is zero, so the paged decode kernel can never
 multiply masked probabilities into stale NaN/Inf bytes. Also checks the compact
-(FA2 fallback) layout is unchanged. Intended for test/registered/kernel/qsa/.
+(FA2 fallback) layout is unchanged. Intended for test/registered/kernels/ops/qsa/.
 """
 
 import sys
