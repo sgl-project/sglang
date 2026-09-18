@@ -214,6 +214,10 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # Restore base KV pages only, leaving component state (SWA / Mamba)
+    # host-resident. Decode-side P/D restores use this: component state is
+    # owned by the prefill transfer.
+    kv_only: bool = False
 
 
 class MatchResult(NamedTuple):

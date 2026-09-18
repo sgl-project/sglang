@@ -256,11 +256,16 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+        # Base KV only: the SWA window and the Mamba state of a P/D decode
+        # request come from the prefill transfer, which lands in the slots
+        # registered at prealloc. A restored checkpoint would race it and is
+        # the wrong state for a prompt that runs past the checkpoint anyway.
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                kv_only=True,
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device

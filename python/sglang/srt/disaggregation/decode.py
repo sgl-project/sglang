@@ -89,7 +89,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     dsv41_dspark_needs_rebootstrap,
-    evict_from_tree_cache,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -894,6 +893,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
+            if uses_swa_tail_prealloc:
+                # The budget above counts evictable SWA pages; free them before
+                # alloc_extend_swa_tail asks for the tail, as pop_preallocated
+                # does. A shortfall leaves the request retracted.
+                _, swa_len = self._prealloc_kv_lens(req)
+                reclaim_error = self._reclaim_swa_tail_capacity(swa_len, req.rid)
+                if reclaim_error is not None:
+                    logger.warning(reclaim_error)
+                    break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
@@ -1898,15 +1906,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len=fill_len, prefix_len=prefix_len
         )
 
-        # Evict per component pool (full + SWA), matching the colocated path:
-        # a full-attention-only shortfall leaves the SWA pool with pages that
-        # are counted evictable but never reclaimed, wedging the alloc below.
-        if get_disagg().disaggregation_decode_enable_radix_cache:
-            evict_from_tree_cache(self.tree_cache, required_alloc_tokens)
+        # Evict cached entries if the pool doesn't have enough free pages.
+        if (
+            get_disagg().disaggregation_decode_enable_radix_cache
+            and self._radix_full_available() < required_alloc_tokens
+        ):
+            num_to_evict = required_alloc_tokens - self._radix_full_available()
+            result = self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_to_evict)
+            )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self._radix_full_available()}. "
+                    f"available {self._radix_full_available()} "
+                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
                     f"evictable_size={self._radix_full_evictable()}, "
                     f"protected_size={self._radix_full_protected()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "
@@ -2073,12 +2086,14 @@ def alloc_for_decode_prealloc(
             )
         if uses_swa_tail:
             # Full-attention layers reuse prefix KV; SWA layers allocate only
-            # the live window tail.
+            # the live window tail. Like the non-SWA branch, the prefix is
+            # the full committed range: [prefix_len, total_prefix_len) is
+            # filled by the HiCache load-back, not allocated here.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor(
-                    [prefix_len], dtype=torch.int64, device=device
+                    [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
