@@ -211,6 +211,18 @@ nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
 is re-registered; its circuit breaker will open in the meantime.
 
+## Removed routing options
+
+Engine selection now runs through bucket-attached policies
+(`POLICY_DESIGN.md`). These options were removed and are rejected at startup:
+`--policy fused_score`, `--policy score_policy`, `--fuse`,
+`--filter prefix_cache`, `--prefix-cache-min-share`,
+`--decode-policy legacy_host_affinity`, `--stable-pair`, and
+`--affinity-mode soft` (only `strict` remains; a session binding is reused
+when admitted and never escaped to a backup). Pressure-guard tuning now
+applies to `--policy cache_aware` only. Buckets in `--bucket-config` may name
+their own `policy`.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should

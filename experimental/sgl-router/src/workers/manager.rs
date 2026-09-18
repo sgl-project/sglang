@@ -601,7 +601,6 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 affinity: None,
-                fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
             },

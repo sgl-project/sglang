@@ -13,9 +13,9 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode,
     ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig, CachePrefixProvider,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, SelectionEngine, ServerConfig,
-    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    FilterKind, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -167,28 +167,13 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub bucket_config: Option<String>,
 
-    /// Engine-selection implementation. `reorg` runs the bucket-attached
-    /// policies; `legacy` keeps the current selection ladder.
-    #[arg(long, value_enum, default_value = "legacy")]
-    pub selection_engine: SelectionEngine,
-
-    /// Weighted scoring terms, e.g. prefix_cache=2.0,load_based=0.3.
-    /// Defaults to prefix_cache,load_based for score_policy or fused_score.
-    /// Requires --policy score_policy or fused_score. Omitted weights use each term's default.
-    #[arg(long, value_delimiter = ',')]
-    pub fuse: Vec<FusedTerm>,
-
-    /// Ordered hard constraints applied before policy selection.
+    /// Hard constraints applied before policy selection (`overloaded`).
     #[arg(long, value_delimiter = ',')]
     pub filter: Vec<FilterKind>,
 
     /// Router-local in-flight limit for `--filter overloaded`.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
-
-    /// Minimum cached prompt share for `--filter prefix_cache`.
-    #[arg(long)]
-    pub prefix_cache_min_share: Option<f32>,
 
     /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
     #[arg(long)]
@@ -273,11 +258,7 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub session_eviction_interval_secs: Option<u64>,
 
-    /// Use a deterministic session backup (--policy session_aware).
-    #[arg(long)]
-    pub stable_pair: bool,
-
-    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
+    /// Session admission mode (--policy session_aware). Only `strict` is supported.
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
 
@@ -334,7 +315,6 @@ impl Cli {
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
-        let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
@@ -374,7 +354,6 @@ impl Cli {
                 cache_aware,
                 sticky,
                 affinity,
-                fused,
                 eligibility,
                 sampling_overrides,
             },
@@ -450,36 +429,6 @@ impl RoutingArgs {
         Ok(circuit_breaker)
     }
 
-    fn build_fused(&self) -> Result<Option<Vec<FusedTerm>>> {
-        let is_score_composition = matches!(
-            self.policy,
-            PolicyKind::FusedScore | PolicyKind::ScorePolicy
-        );
-        ensure!(
-            self.fuse.is_empty() || is_score_composition,
-            "--fuse requires --policy score_policy or fused_score"
-        );
-        if !is_score_composition {
-            return Ok(None);
-        }
-        let terms = if self.fuse.is_empty() {
-            DEFAULT_FUSE
-                .iter()
-                .map(|&kind| FusedTerm { kind, weight: None })
-                .collect()
-        } else {
-            self.fuse.clone()
-        };
-        for (i, t) in terms.iter().enumerate() {
-            ensure!(
-                !terms[..i].iter().any(|p| p.kind == t.kind),
-                "--fuse: `{}` is listed more than once",
-                t.kind
-            );
-        }
-        Ok(Some(terms))
-    }
-
     fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
         for (i, kind) in self.filter.iter().enumerate() {
             ensure!(
@@ -497,22 +446,12 @@ impl RoutingArgs {
             "--max-in-flight must be greater than 0"
         );
         ensure!(
-            (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
-            "--prefix-cache-min-share and `--filter prefix_cache` require each other"
-        );
-        ensure!(
-            self.prefix_cache_min_share
-                .is_none_or(|s| s > 0.0 && s <= 1.0),
-            "--prefix-cache-min-share must be in (0, 1]"
-        );
-        ensure!(
             self.policy != PolicyKind::Sticky || self.filter.is_empty(),
             "--filter cannot be combined with --policy sticky"
         );
         let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
             filters: self.filter.clone(),
             max_in_flight: self.max_in_flight,
-            min_prefix_share: self.prefix_cache_min_share,
         });
 
         Ok(eligibility)
@@ -592,17 +531,16 @@ impl AffinityArgs {
         let tuned_session_affinity = self.session_id_header.is_some()
             || self.session_idle_secs.is_some()
             || self.session_eviction_interval_secs.is_some()
-            || self.stable_pair
             || self.affinity_mode.is_some()
             || self.session_affinity_mode.is_some();
         ensure!(
             !tuned_session_affinity || policy == PolicyKind::SessionAware,
-            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+            "--session-id-header, --session-*-secs, --affinity-mode, and \
                  --session-affinity-mode require --policy session_aware"
         );
         ensure!(
-            !self.disable_pressure_guard || affinity_policy,
-            "--disable-pressure-guard requires --policy session_aware or cache_aware"
+            !self.disable_pressure_guard || policy == PolicyKind::CacheAware,
+            "--disable-pressure-guard requires --policy cache_aware"
         );
         let tuned_cache_candidates = cache.cache_affinity_min_matched_tokens.is_some()
             || cache.cache_affinity_min_match_ratio.is_some()
@@ -639,11 +577,11 @@ impl AffinityArgs {
             "cache candidate tuning flags require --policy cache_aware"
         );
         ensure!(
-            affinity_policy
+            policy == PolicyKind::CacheAware
                 || (self.pressure_abs_threshold_tokens.is_none()
                     && self.pressure_abs_threshold_ms.is_none()
                     && self.pressure_rel_threshold.is_none()),
-            "pressure guard tuning requires --policy session_aware or cache_aware"
+            "pressure guard tuning requires --policy cache_aware"
         );
         if !affinity_policy {
             return Ok(None);
@@ -714,8 +652,6 @@ impl AffinityArgs {
             session_id_header,
             session_idle_secs,
             session_eviction_interval_secs,
-            stable_pair: self.stable_pair,
-            mode: self.affinity_mode.unwrap_or(defaults.mode),
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -802,7 +738,7 @@ fn join_selector(terms: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+    use crate::config::{DiscoveryBackend, K8sDiscoveryMode};
 
     /// Parse argv (without the leading binary name) into a `Config`.
     fn into_config(args: &[&str]) -> Result<Config> {
@@ -1240,13 +1176,7 @@ mod tests {
 
     #[test]
     fn filters_and_fuse_terms_reject_non_members() {
-        let cases = [
-            (vec!["--filter", "load_based"], "load_based"),
-            (
-                vec!["--policy", "fused_score", "--fuse", "sticky"],
-                "sticky",
-            ),
-        ];
+        let cases = [(vec!["--filter", "load_based"], "load_based")];
         for (args, value) in cases {
             let err = into_config_owned(with_model(
                 &[&["--worker-urls", "http://x:30000"], &args[..]].concat(),
@@ -1501,13 +1431,7 @@ mod tests {
         for value in ["round_robin", "random", "power_of_two", "load_based"] {
             assert!(choices.contains(value), "missing {value}: {choices}");
         }
-        for value in [
-            "fused_score",
-            "score_policy",
-            "session_aware",
-            "cache_aware",
-            "sticky",
-        ] {
+        for value in ["session_aware", "cache_aware", "sticky"] {
             assert!(!choices.contains(value), "unexpected {value}: {choices}");
         }
     }
@@ -1544,20 +1468,18 @@ mod tests {
             "--policy",
             "round_robin",
             "--filter",
-            "overloaded,prefix_cache",
+            "overloaded",
             "--max-in-flight",
             "64",
-            "--prefix-cache-min-share",
-            "0.6",
         ]))
         .unwrap();
         let e = c.model.eligibility.expect("--filter must build the config");
         assert_eq!(
             e.filters,
-            vec![FilterKind::Overloaded, FilterKind::PrefixCache],
+            vec![FilterKind::Overloaded],
             "order is priority, so it must survive parsing",
         );
-        assert_eq!((e.max_in_flight, e.min_prefix_share), (Some(64), Some(0.6)));
+        assert_eq!(e.max_in_flight, Some(64));
         assert_eq!(
             c.model.policy,
             PolicyKind::RoundRobin,
@@ -1570,23 +1492,12 @@ mod tests {
 
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
-        let cases: [(&[&str], &str); 8] = [
+        let cases: [(&[&str], &str); 5] = [
             (&["--filter", "overloaded"], "require each other"),
             (&["--max-in-flight", "64"], "require each other"),
-            (&["--filter", "prefix_cache"], "require each other"),
-            (&["--prefix-cache-min-share", "0.6"], "require each other"),
             (
                 &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
                 "listed more than once",
-            ),
-            (
-                &[
-                    "--filter",
-                    "prefix_cache",
-                    "--prefix-cache-min-share",
-                    "0.0",
-                ],
-                "must be in (0, 1]",
             ),
             (
                 &["--filter", "overloaded", "--max-in-flight", "0"],
@@ -1732,112 +1643,10 @@ mod tests {
         ))
     }
 
-    fn fuse_err(argv: &str) -> String {
-        cfg_of(argv).unwrap_err().to_string()
-    }
-
-    /// Resolved terms as `(kind, weight)` pairs; `None` when the policy is
-    /// not `fused_score` and so builds no term list at all.
-    fn fused_of(argv: &str) -> Option<Vec<(ScoreTermKind, Option<f32>)>> {
-        let ts = cfg_of(argv).unwrap().model.fused?;
-        Some(ts.iter().map(|t| (t.kind, t.weight)).collect())
-    }
-
-    fn fuse_ok(argv: &str) -> Vec<(ScoreTermKind, Option<f32>)> {
-        fused_of(argv).expect("fused_score builds a term list")
-    }
-
-    /// `score_policy` is an independent top-level policy.
-    #[test]
-    fn score_policy_is_a_top_level_policy_with_its_own_cli_spelling() {
-        use PolicyKind::ScorePolicy;
-        use ScoreTermKind::{LoadBased, PrefixCache};
-        let pair = [(PrefixCache, None), (LoadBased, None)];
-        let config = cfg_of("--policy score_policy").unwrap();
-        assert_eq!(config.model.policy, ScorePolicy);
-        assert_eq!(
-            config
-                .model
-                .fused
-                .expect("score_policy must resolve its score terms")
-                .iter()
-                .map(|t| (t.kind, t.weight))
-                .collect::<Vec<_>>(),
-            pair,
-        );
-        assert_eq!(
-            fuse_ok("--policy score_policy --fuse prefix_cache=2.0,load_based=0.3"),
-            [(PrefixCache, Some(2.0)), (LoadBased, Some(0.3))],
-        );
-    }
-
-    /// `fused_score` keeps the compatibility entry point.
-    #[test]
-    fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
-        use ScoreTermKind::{LoadBased, PrefixCache, Random};
-        let pair = [(PrefixCache, None), (LoadBased, None)];
-        assert_eq!(fuse_ok("--policy fused_score"), pair);
-        // Comma-separated, order preserved, weight optional per term.
-        assert_eq!(
-            fuse_ok("--policy fused_score --fuse load_based=0.3,random"),
-            [(LoadBased, Some(0.3)), (Random, None)],
-        );
-        assert!(fused_of("").is_none(), "round_robin builds no term list");
-    }
-
-    #[test]
-    fn fuse_rejects_non_finite_and_negative_weights() {
-        for bad in ["nan", "NaN", "inf", "-inf", "-0.5", "banana"] {
-            let err = fuse_err(&format!("--policy fused_score --fuse load_based={bad}"));
-            assert!(err.contains("load_based"), "{bad}: names the term: {err}");
-            assert!(
-                err.contains("must be finite and >= 0") || err.contains("is not a number"),
-                "{bad}: {err}",
-            );
-        }
-        for good in ["0", "0.3", "2", "1e3"] {
-            let got = fuse_ok(&format!("--policy fused_score --fuse load_based={good}"))[0].1;
-            assert_eq!(got, Some(good.parse::<f32>().unwrap()));
-        }
-    }
-
-    #[test]
-    fn fuse_rejects_malformed_compositions() {
-        let cases: [(&str, &[&str]); 6] = [
-            ("--fuse load_based", &["--fuse requires", "fused_score"]),
-            (
-                "--policy fused_score --fuse fused_score,load_based",
-                &["fused_score", "not a score term"],
-            ),
-            (
-                "--policy fused_score --fuse load_based,load_based",
-                &["load_based", "listed more than once"],
-            ),
-            (
-                "--policy score_policy --fuse score_policy,load_based",
-                &["score_policy", "not a score term"],
-            ),
-            (
-                "--policy fused_score --fuse not_a_policy",
-                &["not_a_policy", "is not a score term"],
-            ),
-            (
-                "--policy sticky --sticky-fallback-policy prefix_cache",
-                &["prefix_cache", "invalid value"],
-            ),
-        ];
-        for (argv, wants) in cases {
-            let err = fuse_err(argv);
-            for want in wants {
-                assert!(err.contains(want), "{argv}: want {want:?}, got: {err}");
-            }
-        }
-    }
-
     #[test]
     fn session_aware_builds_affinity_config_from_its_cli_knobs() {
         let config = cfg_of(
-            "--policy session_aware --session-id-header x-agent-session --stable-pair \
+            "--policy session_aware --session-id-header x-agent-session \
              --affinity-mode strict --session-affinity-mode global-rebind",
         )
         .unwrap();
@@ -1848,8 +1657,6 @@ mod tests {
 
         assert_eq!(config.model.policy, PolicyKind::SessionAware);
         assert_eq!(affinity.session_id_header, "x-agent-session");
-        assert!(affinity.stable_pair);
-        assert_eq!(affinity.mode, AffinityMode::Strict);
         assert_eq!(
             affinity.session_affinity_mode,
             SessionAffinityMode::GlobalRebind
@@ -1976,19 +1783,13 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
 
-        let err = cfg_of("--policy power_of_two --stable-pair")
+        let err = cfg_of("--policy power_of_two --session-affinity-mode global-rebind")
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("--stable-pair") && err.contains("session_aware"),
+            err.contains("--session-affinity-mode") && err.contains("session_aware"),
             "got: {err}"
         );
-
-        let err =
-            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051 --stable-pair")
-                .expect_err("Cache-Aware has no stable backup")
-                .to_string();
-        assert!(err.contains("--stable-pair"), "got: {err}");
     }
 
     #[test]
@@ -2155,18 +1956,31 @@ mod tests {
     }
 
     #[test]
-    fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
+    fn decode_policy_defaults_to_p2_and_rejects_the_removed_host_affinity_mode() {
         let default_config = cfg_of("--policy power_of_two").unwrap();
         assert_eq!(
             default_config.model.decode_policy,
             DecodePolicyKind::PowerOfTwo
         );
+        let err = cfg_of("--decode-policy legacy_host_affinity")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy_host_affinity"), "{err}");
+    }
 
-        let legacy_config = cfg_of("--decode-policy legacy_host_affinity").unwrap();
-        assert_eq!(
-            legacy_config.model.decode_policy,
-            DecodePolicyKind::LegacyHostAffinity
-        );
+    #[test]
+    fn removed_routing_options_are_rejected_at_startup() {
+        for argv in [
+            "--policy fused_score",
+            "--policy score_policy",
+            "--policy round_robin --fuse load_based",
+            "--policy session_aware --stable-pair",
+            "--policy session_aware --affinity-mode soft",
+            "--policy round_robin --filter prefix_cache --prefix-cache-min-share 0.5",
+            "--policy session_aware --disable-pressure-guard",
+        ] {
+            assert!(cfg_of(argv).is_err(), "{argv} must be rejected");
+        }
     }
 
     #[test]

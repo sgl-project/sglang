@@ -14,7 +14,6 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{Cli, Config};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -61,9 +60,8 @@ fn build_ctx(url: String, flags: &[&str]) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 async fn send(ctx: Arc<AppContext>, body: Value) -> StatusCode {

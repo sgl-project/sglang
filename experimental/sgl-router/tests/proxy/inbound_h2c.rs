@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sgl_router::config::PolicyKind;
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -45,9 +44,8 @@ fn build_ctx() -> Arc<AppContext> {
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 /// Spawn the real router (`build_router`) behind `axum::serve` on an ephemeral

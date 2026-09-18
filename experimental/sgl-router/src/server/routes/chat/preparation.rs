@@ -5,10 +5,10 @@
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
-use crate::policies::{request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::MetricsRegistry;
+use crate::tokenizer::{request_tokens_for, RequestTokens};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -44,7 +44,7 @@ impl PreparedChatRequest {
         let needs_tokens = should_tokenize_request(
             ctx.tokenizers.has_chat_formatter(&model.0),
             policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
+            ctx.buckets.is_bucketed(),
         );
         // Parse the full body only when rendering or routing needs tokens.
         let parsed_body = needs_tokens

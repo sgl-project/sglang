@@ -6,7 +6,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -41,7 +40,6 @@ fn config_for(_worker_url: &str) -> Config {
             cache_aware: None,
             sticky: None,
             affinity: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -64,11 +62,10 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
     // `forward_*_to(&worker.url, ...)`; the proxy itself is URL-less.
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 #[tokio::test]
@@ -741,9 +738,8 @@ async fn no_healthy_workers_returns_503() {
     let cfg = config_for("http://unused");
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default()); // empty — no workers added
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap());
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -785,9 +781,8 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         model_ids: vec![ModelId("ghost-7b".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap());
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -1122,16 +1117,9 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(
-        cfg,
-        tokenizers,
-        proxy,
-        registry.clone(),
-        policies,
-    ));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry.clone()).unwrap());
     let app = build_router(ctx);
 
     // Grab the Worker handle so we can assert active_load().
@@ -1256,10 +1244,9 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap());
     let active_load = Arc::clone(&ctx.active_load);
     let app = build_router(ctx);
 
@@ -1378,7 +1365,6 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     // Aggressive 50ms timeout: the janitor will sweep on the next
@@ -1389,14 +1375,10 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         Duration::from_millis(50),
     );
     let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
-    let ctx = Arc::new(AppContext::with_active_load(
-        cfg,
-        tokenizers,
-        proxy,
-        registry,
-        policies,
-        active_load,
-    ));
+    let ctx = Arc::new(
+        AppContext::with_engine_state(cfg, tokenizers, proxy, registry, active_load, None, None)
+            .unwrap(),
+    );
     let app = build_router(ctx);
 
     let req = Request::builder()

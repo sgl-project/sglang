@@ -33,7 +33,6 @@ pub fn config() -> Config {
             cache_aware: Some(CacheAwareConfig::default()),
             affinity: None,
             sticky: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },

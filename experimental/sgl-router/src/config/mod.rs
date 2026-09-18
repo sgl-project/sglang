@@ -169,15 +169,6 @@ fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
             "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
             bucket.id
         );
-        ensure!(
-            !matches!(
-                bucket.policy,
-                Some(PolicyKind::FusedScore | PolicyKind::ScorePolicy)
-            ),
-            "bucket_config bucket {:?} policy {} cannot be attached to a bucket",
-            bucket.id,
-            bucket.policy.unwrap_or_default()
-        );
         match bucket.stage {
             BucketStage::Prefill
                 if bucket.min_sequence_tokens.is_some()
@@ -237,7 +228,6 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 affinity: None,
-                fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
             },

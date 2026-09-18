@@ -5,18 +5,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{
-        CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind,
-        SelectionEngine,
-    },
+    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
-    policies::{
-        factory::build_registry as build_policy_registry,
-        prefix_provider::RadixTreePrefixProvider,
-        state::engine_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
-        state::kv_events::{BlockSizeOracle, KvEventIndex},
-        PolicyRegistry,
+    policies::state::engine_load::{
+        spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock,
     },
+    policies::state::kv_events::{BlockSizeOracle, KvEventIndex},
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
     tokenizer::TokenizerRegistry,
@@ -50,7 +44,6 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
-    let selection_engine = cli.routing.selection_engine;
     install_bootstrap_subscriber();
     let config = cli
         .into_config()
@@ -74,16 +67,6 @@ async fn main() -> Result<()> {
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
-    // Build the policies that choose which workers receive each request.
-    let routing_policies = Arc::new(
-        build_policy_registry(
-            &config,
-            engine_state.tree(),
-            engine_state.block_size_oracle(),
-        )
-        .context("build policy registry")?,
-    );
-
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
 
@@ -98,21 +81,14 @@ async fn main() -> Result<()> {
     .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
-    let mut app_context = build_app_context(
+    let app_context = build_app_context(
         &config,
         tokenizers,
         worker_registry,
-        routing_policies,
         local_inflight_requests,
-        &engine_state,
+        engine_state,
         external_kv_indexer_client,
     )?;
-    if selection_engine == SelectionEngine::Reorg {
-        app_context
-            .enable_bucket_engine()
-            .context("build bucket engine")?;
-    }
-    let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -271,38 +247,25 @@ fn build_app_context(
     config: &Config,
     tokenizers: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
-    routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<ActiveLoadRegistry>,
-    engine_state: &Arc<KvEventIndex>,
+    engine_state: Arc<KvEventIndex>,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
-) -> Result<AppContext> {
-    let block_size_oracle = engine_state.block_size_oracle();
+) -> Result<Arc<AppContext>> {
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
             .context("build proxy client")?,
     );
-
-    let mut app_context = AppContext::with_active_load(
+    let app_context = AppContext::with_engine_state(
         config.clone(),
         tokenizers,
         proxy,
         worker_registry,
-        routing_policies,
         local_inflight_requests,
-    );
-    app_context.prefix_index = external_kv_indexer_client;
-    app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
-        && config
-            .model
-            .cache_aware
-            .as_ref()
-            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
-    app_context.block_size_oracle = block_size_oracle;
-    app_context.engine_load = engine_state.engine_load();
-    app_context.kv_metrics = engine_state.metrics_source();
-    app_context.kv_index = Some(Arc::clone(engine_state));
-    Ok(app_context)
+        Some(engine_state),
+        external_kv_indexer_client,
+    )
+    .context("build bucket engine")?;
+    Ok(Arc::new(app_context))
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped

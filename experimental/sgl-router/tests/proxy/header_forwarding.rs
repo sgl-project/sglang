@@ -8,7 +8,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -38,7 +37,6 @@ async fn forwards_whitelisted_headers_strips_others() {
             cache_aware: None,
             sticky: None,
             affinity: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -57,11 +55,10 @@ async fn forwards_whitelisted_headers_strips_others() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    let app = build_router(Arc::new(AppContext::new(
-        cfg, tokenizers, proxy, registry, policies,
-    )));
+    let app = build_router(Arc::new(
+        AppContext::new(cfg, tokenizers, proxy, registry).unwrap(),
+    ));
 
     let body = serde_json::to_vec(&serde_json::json!({
         "model":"tiny","messages":[{"role":"user","content":"hi"}]

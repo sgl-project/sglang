@@ -146,8 +146,6 @@ pub(crate) fn ready(result: PickResult) -> BoxFuture<'static, PickResult> {
 pub enum BuildError {
     #[error("policy `{0}` is not available in the bucket engine")]
     Unsupported(PolicyKind),
-    #[error("decode policy `{0:?}` is not available in the bucket engine")]
-    UnsupportedDecode(DecodePolicyKind),
     #[error("cache_aware needs a local KV-event index or a KV indexer endpoint")]
     NoPrefixSource,
 }
@@ -232,13 +230,11 @@ impl From<StickyFallbackKind> for PolicyKind {
     }
 }
 
-pub fn build_decode_policy(kind: DecodePolicyKind) -> Result<Arc<dyn Policy>, BuildError> {
-    match kind {
-        DecodePolicyKind::PowerOfTwo => Ok(Arc::new(power_of_two::PowerOfTwoPolicy::new(
-            Admission::before(CapacityAdmission),
-        ))),
-        other => Err(BuildError::UnsupportedDecode(other)),
-    }
+pub fn build_decode_policy(kind: DecodePolicyKind) -> Arc<dyn Policy> {
+    let DecodePolicyKind::PowerOfTwo = kind;
+    Arc::new(power_of_two::PowerOfTwoPolicy::new(Admission::before(
+        CapacityAdmission,
+    )))
 }
 
 /// The acceptance checks the current selection path runs implicitly for this

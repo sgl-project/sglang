@@ -28,7 +28,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -68,7 +67,6 @@ fn config() -> Config {
                 eviction_interval_secs: 3600,
             }),
             affinity: None,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -102,10 +100,8 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
-    // ingress tokenizes via `ctx.tokenizers`, not the policy.
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry).unwrap())
 }
 
 async fn send(ctx: Arc<AppContext>, routing_key: &str, body: Value) -> StatusCode {

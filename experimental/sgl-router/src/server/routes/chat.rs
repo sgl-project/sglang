@@ -4,22 +4,14 @@
 mod forward;
 mod preparation;
 
-use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::selection::{
-    select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
-};
-use crate::policies::state::engine_load::EngineLoadSnapshot;
-use crate::policies::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
-use crate::policies::{ExternalPrefixSignal, Policy};
-use crate::policy_reorg::buckets::{BucketResolver, SelectError, SelectionRequest};
+use crate::policies::pools::PdResolveError;
+use crate::policy_reorg::buckets::{SelectError, SelectionRequest};
 use crate::policy_reorg::cache_aware::PrefixMemo;
 use crate::policy_reorg::{PickError, RoutingStage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
-use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
@@ -50,58 +42,28 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-
-    if let Some(resolver) = &ctx.bucket_resolver {
-        return select_and_forward_with_buckets(
-            &ctx, resolver, model, fields, body, headers, start,
-        )
-        .await;
+    if model.0 != ctx.config.model.id {
+        return Err(ApiError::ModelNotFound(model.0));
     }
-
-    // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let candidates = resolver
-        .prefill_candidates(&model)
-        .map_err(|error| pool_error(error, &model))?;
-    let policy = ctx
-        .policies
-        .get(&model)
-        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
-
-    let request =
-        PreparedChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
-
-    // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
-    let workers = select_workers(
+    let request = PreparedChatRequest::prepare(
         &ctx,
-        &request,
-        &headers,
-        policy.as_ref(),
-        &candidates,
-        &resolver,
-    )
-    .await?;
-
+        model,
+        fields,
+        body,
+        ctx.buckets.needs_request_tokens(),
+    )?;
+    let workers = select_workers(&ctx, &request, &headers).await?;
     // PD sends to both workers and returns the decode response.
     forward_chat_request(&ctx, request, workers, headers, start).await
 }
 
-/// The bucket-engine path: one pick per stage, then the same forwarding.
-async fn select_and_forward_with_buckets(
+/// One pick per stage: a plain or prefill engine, then a decode peer in PD mode.
+async fn select_workers(
     ctx: &AppContext,
-    resolver: &BucketResolver,
-    model: ModelId,
-    fields: preparation::RoutingFields,
-    body: Bytes,
-    headers: HeaderMap,
-    start: Instant,
-) -> Result<Response<Body>, ApiError> {
-    if model.0 != ctx.config.model.id {
-        return Err(ApiError::ModelNotFound(model.0));
-    }
-    let request =
-        PreparedChatRequest::prepare(ctx, model, fields, body, resolver.needs_request_tokens())?;
-    let routing = RoutingContext::from_headers(ctx, &headers)?;
+    request: &PreparedChatRequest,
+    headers: &HeaderMap,
+) -> Result<SelectedWorkers, ApiError> {
+    let routing = RoutingContext::from_headers(ctx, headers)?;
     let prefix = PrefixMemo::new();
     let selection = SelectionRequest {
         model: &request.model,
@@ -114,14 +76,15 @@ async fn select_and_forward_with_buckets(
         tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         prefix: &prefix,
     };
-    let prefill = resolver
+    let prefill = ctx
+        .buckets
         .pick(RoutingStage::Prefill, &selection)
         .await
         .map_err(|error| select_error(ctx, &request.model, error))?
         .engine;
     let decode = match prefill.mode() {
         WorkerMode::Prefill => Some(
-            resolver
+            ctx.buckets
                 .pick(RoutingStage::Decode, &selection)
                 .await
                 .map_err(|error| match error {
@@ -134,12 +97,11 @@ async fn select_and_forward_with_buckets(
         ),
         _ => None,
     };
-    let workers = SelectedWorkers {
+    Ok(SelectedWorkers {
         prefill,
         decode,
-        track_dispatch_timestamps: resolver.needs_dispatch_timestamps(),
-    };
-    forward_chat_request(ctx, request, workers, headers, start).await
+        track_dispatch_timestamps: ctx.buckets.needs_dispatch_timestamps(),
+    })
 }
 
 fn select_error(ctx: &AppContext, model: &ModelId, error: SelectError) -> ApiError {
@@ -171,45 +133,7 @@ fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
     }
 }
 
-async fn select_workers(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    headers: &HeaderMap,
-    policy: &dyn Policy,
-    candidates: &[Arc<Worker>],
-    resolver: &PdPoolResolver,
-) -> Result<SelectedWorkers, ApiError> {
-    // Find cached prompt prefixes and capture engine load info.
-    let routing_context = RoutingContext {
-        prefix_matches: lookup_prefix_matches(ctx, request).await?,
-        load_snapshot: capture_load_snapshot(ctx, policy, candidates),
-        ..RoutingContext::from_headers(ctx, headers)?
-    };
-
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
-    Ok(SelectedWorkers {
-        prefill,
-        decode,
-        track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
-    })
-}
-
-fn capture_load_snapshot(
-    ctx: &AppContext,
-    policy: &dyn Policy,
-    candidates: &[Arc<Worker>],
-) -> Option<EngineLoadSnapshot> {
-    let needed = policy.needs_load_snapshot()
-        || candidates
-            .iter()
-            .any(|worker| worker.mode() == WorkerMode::Prefill);
-    needed.then(|| ctx.engine_load.capture_snapshot(Instant::now()))
-}
-
 struct RoutingContext<'a> {
-    prefix_matches: Option<ExternalPrefixSignal>,
-    load_snapshot: Option<EngineLoadSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
     routing_key: Option<&'a str>,
@@ -217,10 +141,10 @@ struct RoutingContext<'a> {
 }
 
 impl<'a> RoutingContext<'a> {
-    /// Header-derived selection inputs; prefix and load fields start empty.
+    /// Header-derived selection inputs.
     fn from_headers(ctx: &AppContext, headers: &'a HeaderMap) -> Result<Self, ApiError> {
         // Buckets group workers by token limits and service targets; disabled means one pool per role.
-        let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+        let (ttft_slo_ms, tps_slo) = if ctx.buckets.is_bucketed() {
             (
                 parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
                 parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?,
@@ -241,8 +165,6 @@ impl<'a> RoutingContext<'a> {
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.session_id_header));
         Ok(Self {
-            prefix_matches: None,
-            load_snapshot: None,
             ttft_slo_ms,
             tps_slo,
             routing_key,
@@ -256,108 +178,6 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
-}
-
-fn pick_prefill_worker(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    policy: &dyn Policy,
-    candidates: &[Arc<Worker>],
-    routing: &RoutingContext<'_>,
-) -> Result<Arc<Worker>, ApiError> {
-    let affinity = ctx.config.model.affinity.as_ref();
-    select_prefill_worker(&PrefillSelectionInputs {
-        policy,
-        policy_kind: ctx.config.model.policy,
-        bucket_selector: ctx.bucket_selector.as_ref(),
-        metrics: ctx.metrics.as_ref(),
-        model_id: &request.model,
-        body: Some(&request.body),
-        routing_key: routing.routing_key,
-        session_id: routing.session_id,
-        request_input_tokens: request.input_token_count as u64,
-        request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-        external_prefix: routing.prefix_matches.as_ref(),
-        load_snapshot: routing.load_snapshot.as_ref(),
-        workers: candidates,
-        ttft_slo_ms: routing.ttft_slo_ms,
-        tps_slo: routing.tps_slo,
-        session_affinity_mode: affinity
-            .map(|config| config.session_affinity_mode)
-            .unwrap_or(SessionAffinityMode::Bucket),
-        worker_queue_limit: affinity.and_then(|config| config.worker_queue_limit),
-        saturation_queue_floor: affinity.and_then(|config| config.saturation_queue_floor),
-    })
-    .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
-}
-
-fn pick_decode_worker(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    prefill: &Worker,
-    resolver: &PdPoolResolver,
-    routing: &RoutingContext<'_>,
-) -> Result<Option<Arc<Worker>>, ApiError> {
-    if prefill.mode() != WorkerMode::Prefill {
-        return Ok(None);
-    }
-    let candidates = resolver
-        .decode_candidates(&request.model)
-        .map_err(|error| pool_error(error, &request.model))?;
-    let decode = select_decode_peer(&DecodeSelectionInputs {
-        decode_policy_kind: ctx.config.model.decode_policy,
-        bucket_selector: ctx.bucket_selector.as_ref(),
-        model_id: &request.model,
-        prefill_url: &prefill.url,
-        decode_workers: &candidates,
-        request_input_tokens: request.input_token_count as u64,
-        requested_max_output_tokens: request.max_output_tokens,
-        ttft_slo_ms: routing.ttft_slo_ms,
-        tps_slo: routing.tps_slo,
-        load_snapshot: routing.load_snapshot.as_ref(),
-    })
-    .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
-        model: request.model.0.clone(),
-    })?;
-    Ok(Some(decode))
-}
-
-/// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
-async fn lookup_prefix_matches(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-) -> Result<Option<ExternalPrefixSignal>, ApiError> {
-    let signal = match (
-        ctx.prefix_index.as_ref(),
-        request.tokens.as_ref(),
-        ctx.block_size_oracle.get(),
-    ) {
-        // Remote indexer: hash tokens into blocks and match against the KV index.
-        (Some(index), Some(tokens), Some(block_size)) => {
-            let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
-            } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
-            };
-            let query_blocks = hashes.len();
-            let outcome = if hashes.is_empty() {
-                sgl_kv_indexer::PrefixOutcome::Empty
-            } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
-            };
-            Some(ExternalPrefixSignal {
-                outcome,
-                query_blocks,
-            })
-        }
-        // Without usable indexer inputs, try the in-process radix tree.
-        _ => ctx
-            .radix_tree_prefix_provider
-            .as_ref()
-            .zip(request.tokens.as_ref())
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
-    };
-    Ok(signal)
 }
 
 fn policy_selection_failed(
@@ -375,34 +195,6 @@ fn policy_selection_failed(
     );
     ApiError::PolicySelectionFailed {
         model: model.to_owned(),
-    }
-}
-
-fn resolve_prefix_query(
-    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
-    model: &str,
-) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
-    use sgl_kv_indexer::PrefixIndexError;
-    match result {
-        Ok(outcome) => Ok(outcome),
-        Err(
-            error @ (PrefixIndexError::Overloaded
-            | PrefixIndexError::Timeout
-            | PrefixIndexError::Unreachable),
-        ) => {
-            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
-            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
-        }
-        Err(error @ PrefixIndexError::QueryTooLarge) => {
-            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
-            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
-        }
-        Err(error) => {
-            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
-            Err(ApiError::PolicySelectionFailed {
-                model: model.to_string(),
-            })
-        }
     }
 }
 
@@ -448,38 +240,4 @@ fn parse_optional_positive_f64_header(
         )));
     }
     Ok(Some(parsed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
-        for error in [
-            sgl_kv_indexer::PrefixIndexError::Overloaded,
-            sgl_kv_indexer::PrefixIndexError::Timeout,
-            sgl_kv_indexer::PrefixIndexError::Unreachable,
-            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
-        ] {
-            assert_eq!(
-                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
-                sgl_kv_indexer::PrefixOutcome::Empty,
-                "{error} should degrade"
-            );
-        }
-    }
-
-    #[test]
-    fn rejected_indexer_query_still_fails_selection() {
-        assert!(matches!(
-            resolve_prefix_query(
-                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
-                    sgl_kv_indexer::RpcCode::InvalidArgument
-                )),
-                "tiny"
-            ),
-            Err(ApiError::PolicySelectionFailed { .. })
-        ));
-    }
 }

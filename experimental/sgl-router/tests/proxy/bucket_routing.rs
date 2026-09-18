@@ -16,8 +16,8 @@ use sgl_router::config::{
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults;
-use sgl_router::policies::state::engine_load::{LoadStat, NativeCacheRankLoad};
+use sgl_router::policies::state::engine_load::{ActiveLoadRegistry, LoadStat, NativeCacheRankLoad};
+use sgl_router::policies::state::kv_events::KvEventIndex;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -46,13 +46,12 @@ fn bucket(id: &str, stage: BucketStage, rank: u32, worker_id: &str) -> BucketSpe
     }
 }
 
-fn build_app_context(
-    specs: Vec<WorkerSpec>,
+fn build_config(
     bucket_config: BucketConfig,
     policy: PolicyKind,
     affinity: Option<AffinityConfig>,
-) -> AppContext {
-    let config = Config {
+) -> Config {
+    Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -69,7 +68,6 @@ fn build_app_context(
             cache_aware: None,
             sticky: None,
             affinity,
-            fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
         },
@@ -78,15 +76,32 @@ fn build_app_context(
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
-    };
+    }
+}
+
+fn build_app_context(
+    config: Config,
+    specs: Vec<WorkerSpec>,
+    prefix_index: Option<Arc<dyn PrefixIndex>>,
+) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for spec in specs {
         let _ = registry.add(spec);
     }
-    let policies = Arc::new(build_registry_with_defaults(&config).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    AppContext::new(config, tokenizers, proxy, registry, policies)
+    let index = KvEventIndex::new();
+    index.block_size_oracle().try_set(1).unwrap();
+    let ctx = AppContext::with_engine_state(
+        config,
+        tokenizers,
+        proxy,
+        registry,
+        ActiveLoadRegistry::with_defaults(),
+        Some(index),
+        prefix_index,
+    );
+    Arc::new(ctx.unwrap())
 }
 
 fn build_ctx(
@@ -95,9 +110,7 @@ fn build_ctx(
     policy: PolicyKind,
     affinity: Option<AffinityConfig>,
 ) -> Arc<AppContext> {
-    let mut context = build_app_context(specs, bucket_config, policy, affinity);
-    context.enable_bucket_engine().unwrap();
-    Arc::new(context)
+    build_app_context(build_config(bucket_config, policy, affinity), specs, None)
 }
 
 struct FakePrefixIndex {
@@ -197,9 +210,8 @@ fn build_cache_ctx_with_affinity(
     prefix_index: Arc<dyn PrefixIndex>,
     affinity: AffinityConfig,
 ) -> Arc<AppContext> {
-    let mut context =
-        build_app_context(specs, bucket_config, PolicyKind::CacheAware, Some(affinity));
-    context.config.model.cache_aware = Some(CacheAwareConfig {
+    let mut config = build_config(bucket_config, PolicyKind::CacheAware, Some(affinity));
+    config.model.cache_aware = Some(CacheAwareConfig {
         prefix_provider: CachePrefixProvider::Indexer,
         kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
             url: "http://fake-indexer".into(),
@@ -207,10 +219,7 @@ fn build_cache_ctx_with_affinity(
             query_max_inflight: 32,
         }),
     });
-    context.prefix_index = Some(prefix_index);
-    context.block_size_oracle.try_set(1).unwrap();
-    context.enable_bucket_engine().unwrap();
-    Arc::new(context)
+    build_app_context(config, specs, Some(prefix_index))
 }
 
 fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {

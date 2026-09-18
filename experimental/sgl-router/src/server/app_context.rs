@@ -1,16 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::Config;
-
-use crate::policies::buckets::BucketSelector;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
-use crate::policies::state::engine_load::ActiveLoadRegistry;
-use crate::policies::state::engine_load::EngineLoadTable;
-use crate::policies::state::engine_load::JanitorHandle;
+use crate::config::{Config, PolicyKind};
+use crate::policies::pools::PdPoolResolver;
+use crate::policies::state::engine_load::{ActiveLoadRegistry, EngineLoadTable, JanitorHandle};
 use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
 use crate::policies::state::AffinityStore;
-use crate::policies::PolicyRegistry;
 use crate::policy_reorg::buckets::BucketResolver;
 use crate::policy_reorg::{BuildError, PolicyDependencies};
 use crate::proxy::Proxy;
@@ -18,6 +13,7 @@ use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
+use sgl_kv_indexer::PrefixIndex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,107 +32,71 @@ pub struct AppContext {
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
-    pub policies: Arc<PolicyRegistry>,
-    /// Converts static Bucket configuration into request candidate domains.
-    pub bucket_selector: Arc<BucketSelector>,
+    /// Orders buckets and runs their attached policies for every request.
+    pub buckets: Arc<BucketResolver>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
-    /// Lightweight Prometheus-format metrics registry served via
-    /// `/metrics`. Shared with the chat handler (requests_total),
-    /// active-load registry, policy-specific counters, and PD dispatch.
+    /// Prometheus-format metrics served via `/metrics`.
     pub metrics: Arc<MetricsRegistry>,
-    /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
+    /// Shared engine LoadStat table; each selection pass captures one snapshot.
     pub engine_load: Arc<EngineLoadTable>,
-    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
-    pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
-    /// Read-only handles `/metrics` pulls the KV storage-tier series from on
-    /// scrape. `None` when this router maintains no local tree (external
-    /// Indexer), where those series would all be a structural zero — see
-    /// [`crate::policies::state::kv_events::KvEventIndex::metrics_source`].
+    /// `/metrics` handles for the KV storage-tier series; `None` without a
+    /// local tree, where every series would be a structural zero.
     pub kv_metrics: Option<KvIndexMetrics>,
-    /// Local KV-event index, when this router maintains one.
-    pub kv_index: Option<Arc<KvEventIndex>>,
-    /// Bucket engine, when `--selection-engine reorg` is set; replaces the
-    /// selection ladder for every request.
-    pub bucket_resolver: Option<Arc<BucketResolver>>,
-    affinity_sweeper: Option<JanitorHandle>,
     /// Open HTTP exchanges, on every route. What axum's graceful shutdown
     /// is actually waiting on during the drain — `active_load` sees only the
     /// proxied subset.
     pub inflight_http: Arc<InflightHttp>,
     readiness: AtomicU8,
+    _affinity_sweeper: Option<JanitorHandle>,
 }
 
 impl AppContext {
+    /// A context without engine state: no KV index and no remote indexer.
     pub fn new(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
         proxy: Arc<Proxy>,
         registry: Arc<WorkerRegistry>,
-        policies: Arc<PolicyRegistry>,
-    ) -> Self {
-        Self::with_active_load(
+    ) -> Result<Self, BuildError> {
+        Self::with_engine_state(
             config,
             tokenizers,
             proxy,
             registry,
-            policies,
             ActiveLoadRegistry::with_defaults(),
+            None,
+            None,
         )
     }
 
-    /// Construct an [`AppContext`] with an explicit [`ActiveLoadRegistry`].
-    /// Production wires the default (5-minute timeout, SystemTimeClock)
-    /// via [`Self::new`]; tests that exercise the janitor pass a registry
-    /// built with a `MockClock`.
-    pub fn with_active_load(
+    /// Wires the bucket engine over the shared engine state: the KV-event
+    /// index (load table, block size, local prefix lookup) and an optional
+    /// remote prefix indexer.
+    pub fn with_engine_state(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
         proxy: Arc<Proxy>,
         registry: Arc<WorkerRegistry>,
-        policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
-    ) -> Self {
+        kv_index: Option<Arc<KvEventIndex>>,
+        prefix_index: Option<Arc<dyn PrefixIndex>>,
+    ) -> Result<Self, BuildError> {
         let metrics = MetricsRegistry::new();
-        // Wire the per-worker active-load gauge so `sgl_router_active_load`
-        // mirrors the live counter on every register / drop / sweep.
-        // Without this, the metric is permanently 0 in production even
-        // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
-        // The metrics registry is built after the policy registry, so attach
-        // it here for policies that emit their own counters.
-        policies.attach_metrics(Arc::clone(&metrics));
-        let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
-        Self {
-            config,
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            bucket_selector,
-            active_load,
-            metrics,
-            prefix_index: None,
-            radix_tree_prefix_provider: None,
-            block_size_oracle: BlockSizeOracle::new(),
-            kv_metrics: None,
-            kv_index: None,
-            bucket_resolver: None,
-            affinity_sweeper: None,
-            engine_load: EngineLoadTable::new(),
-            inflight_http: InflightHttp::new(),
-            readiness: AtomicU8::new(READINESS_NOT_READY),
-        }
-    }
-
-    /// Builds the bucket engine over the already wired load table, caches and
-    /// metrics. Call after those fields are set.
-    pub fn enable_bucket_engine(&mut self) -> Result<(), BuildError> {
-        let model = &self.config.model;
+        let (engine_load, block_size_oracle, kv_metrics) = match &kv_index {
+            Some(index) => (
+                index.engine_load(),
+                index.block_size_oracle(),
+                index.metrics_source(),
+            ),
+            None => (EngineLoadTable::new(), BlockSizeOracle::new(), None),
+        };
+        let model = &config.model;
         let (idle, eviction) = match model.policy {
-            crate::config::PolicyKind::Sticky => {
+            PolicyKind::Sticky => {
                 let sticky = model.sticky.clone().unwrap_or_default();
                 (sticky.idle_secs, sticky.eviction_interval_secs)
             }
@@ -149,22 +109,35 @@ impl AppContext {
             }
         };
         let affinity = AffinityStore::new(Duration::from_secs(idle));
-        self.affinity_sweeper = affinity.spawn_sweeper(Duration::from_secs(eviction));
+        let affinity_sweeper = affinity.spawn_sweeper(Duration::from_secs(eviction));
         let deps = PolicyDependencies {
-            metrics: Arc::clone(&self.metrics),
+            metrics: Arc::clone(&metrics),
             affinity,
-            local_cache: self.kv_index.clone(),
-            remote_cache: self.prefix_index.clone(),
-            block_size: Arc::clone(&self.block_size_oracle),
+            local_cache: kv_index,
+            remote_cache: prefix_index,
+            block_size: Arc::clone(&block_size_oracle),
         };
-        let resolver = BucketResolver::from_config(
+        let buckets = BucketResolver::from_config(
             model,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.engine_load),
+            PdPoolResolver::new(Arc::clone(&registry)),
+            Arc::clone(&engine_load),
             &deps,
         )?;
-        self.bucket_resolver = Some(Arc::new(resolver));
-        Ok(())
+        Ok(Self {
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            buckets: Arc::new(buckets),
+            active_load,
+            metrics,
+            engine_load,
+            block_size_oracle,
+            kv_metrics,
+            inflight_http: InflightHttp::new(),
+            readiness: AtomicU8::new(READINESS_NOT_READY),
+            _affinity_sweeper: affinity_sweeper,
+        })
     }
 
     /// Report bootstrap as finished, unless the pod has already begun draining.
@@ -208,54 +181,41 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
-        Self {
-            config: Config {
-                server: crate::config::ServerConfig {
-                    host: "x".into(),
-                    port: 0,
-                    ..Default::default()
-                },
-                observability: Default::default(),
-                model: crate::config::ModelConfig {
-                    id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
-                    policy: crate::config::PolicyKind::RoundRobin,
-                    decode_policy: Default::default(),
-                    bucket_config: None,
-                    circuit_breaker: None,
-                    cache_aware: None,
-                    sticky: None,
-                    affinity: None,
-                    fused: None,
-                    eligibility: None,
-                    sampling_overrides: Default::default(),
-                },
-                discovery: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
-                proxy: crate::config::ProxyConfig::default(),
-                active_load: crate::config::ActiveLoadConfig::default(),
+        let config = Config {
+            server: crate::config::ServerConfig {
+                host: "x".into(),
+                port: 0,
+                ..Default::default()
             },
-            tokenizers: Arc::new(TokenizerRegistry::default()),
-            proxy: Arc::new(Proxy::new(Duration::from_secs(60)).expect("stub proxy")),
-            registry: Arc::new(WorkerRegistry::default()),
-            policies: Arc::new(PolicyRegistry::default()),
-            bucket_selector: Arc::new(BucketSelector::new(None)),
-            active_load: ActiveLoadRegistry::with_defaults(),
-            metrics: MetricsRegistry::new(),
-            prefix_index: None,
-            radix_tree_prefix_provider: None,
-            block_size_oracle: BlockSizeOracle::new(),
-            kv_metrics: None,
-            kv_index: None,
-            bucket_resolver: None,
-            affinity_sweeper: None,
-            engine_load: EngineLoadTable::new(),
-            inflight_http: InflightHttp::new(),
-            readiness: AtomicU8::new(READINESS_NOT_READY),
-        }
+            observability: Default::default(),
+            model: crate::config::ModelConfig {
+                id: "stub-model".into(),
+                tokenizer_path: "stub".into(),
+                policy: PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                bucket_config: None,
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+                affinity: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
+            },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
+            proxy: crate::config::ProxyConfig::default(),
+            active_load: crate::config::ActiveLoadConfig::default(),
+        };
+        Self::new(
+            config,
+            Arc::new(TokenizerRegistry::default()),
+            Arc::new(Proxy::new(Duration::from_secs(60)).expect("stub proxy")),
+            Arc::new(WorkerRegistry::default()),
+        )
+        .expect("stub context")
     }
 }
 

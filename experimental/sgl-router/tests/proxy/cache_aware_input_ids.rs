@@ -17,8 +17,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::state::kv_events::{BlockSizeOracle, HashTree};
+use sgl_router::policies::state::engine_load::ActiveLoadRegistry;
+use sgl_router::policies::state::kv_events::KvEventIndex;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -46,11 +46,17 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the configured tokenizer so the chat path can emit input_ids.
-    let policies =
-        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), BlockSizeOracle::new()).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+    let ctx = AppContext::with_engine_state(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        ActiveLoadRegistry::with_defaults(),
+        Some(KvEventIndex::new()),
+        None,
+    );
+    Arc::new(ctx.unwrap())
 }
 
 async fn send(ctx: Arc<AppContext>, body: Value) -> StatusCode {
