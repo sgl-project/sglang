@@ -1,6 +1,11 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.customized_info_sampler import (
+    CUSTOMIZED_INFO_ARRAY_FIELD,
+    CUSTOMIZED_INFO_FIELD,
+    CUSTOMIZED_INFO_SAMPLER_BACKEND,
+)
 from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -47,9 +52,23 @@ class TestUnifiedMemoryDisaggregation(PDLogprobParityMixin, PDDisaggregationServ
     prefill_tp_size = 1
     decode_tp_size = 1
     decode_base_gpu_id = 1
+    launch_module = "sglang.test.customized_info_sampler"
     baseline_args = UNIFIED_MEMORY_ARGS
-    extra_prefill_args = UNIFIED_MEMORY_ARGS
-    extra_decode_args = UNIFIED_MEMORY_ARGS
+    extra_prefill_args = UNIFIED_MEMORY_ARGS + [
+        "--sampling-backend",
+        CUSTOMIZED_INFO_SAMPLER_BACKEND,
+    ]
+    extra_decode_args = extra_prefill_args
+
+    def generate(self, base_url):
+        meta_info = super().generate(base_url)
+        if self.process_decode is not None:
+            token_ids = [item[1] for item in meta_info["output_token_logprobs"]]
+            self.assertEqual(meta_info[CUSTOMIZED_INFO_FIELD], token_ids)
+            self.assertEqual(
+                meta_info[CUSTOMIZED_INFO_ARRAY_FIELD], [[token] for token in token_ids]
+            )
+        return meta_info
 
 
 class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregation):
@@ -62,8 +81,11 @@ class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregat
 
     _chunked_args = UNIFIED_MEMORY_ARGS + ["--chunked-prefill-size", "64"]
     baseline_args = _chunked_args
-    extra_prefill_args = _chunked_args
-    extra_decode_args = _chunked_args
+    extra_prefill_args = TestUnifiedMemoryDisaggregation.extra_prefill_args + [
+        "--chunked-prefill-size",
+        "64",
+    ]
+    extra_decode_args = extra_prefill_args
 
 
 class TestUnifiedMemoryDisaggregationMHA(TestUnifiedMemoryDisaggregation):
