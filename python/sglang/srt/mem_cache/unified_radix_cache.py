@@ -570,6 +570,11 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def match_full_prefix(self, key: RadixKey) -> tuple[int, NodeId]:
+        matched_len, node_id, actions = self.tree_core.match_full_prefix(key)
+        self._apply_cache_actions(actions)
+        return matched_len, node_id
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 

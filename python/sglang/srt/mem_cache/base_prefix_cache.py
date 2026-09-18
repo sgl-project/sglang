@@ -388,6 +388,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
+    def match_full_prefix(self, key: RadixKey) -> tuple[int, Any]:
+        """Deepest node whose FULL KV is device- or host-resident for ``key``,
+        as (matched_len, node), ignoring component (SWA / Mamba) state. A
+        KV-only consumer (the P/D decode restore) locates its KV this way;
+        without component pools it is the regular match."""
+        result = self.match_prefix(MatchPrefixParams(key=key))
+        return (
+            len(result.device_indices) + result.host_hit_length,
+            result.best_match_node,
+        )
+
     def supports_fast_match_prefix(self) -> bool:
         return False
 

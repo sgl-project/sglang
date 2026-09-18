@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -260,14 +261,30 @@ class DecodeHiCacheTransferMixin:
         # request come from the prefill transfer, which lands in the slots
         # registered at prealloc. A restored checkpoint would race it and is
         # the wrong state for a prompt that runs past the checkpoint anyway.
-        new_indices, restored_node = self.tree_cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
-                req=dr.req,
-                kv_only=True,
+        # The promise was made KV-only too (L3 hit query), so locate the KV
+        # the same way: the all-component rematch ends at FULL nodes whose
+        # component state is tombstoned (a shared prefix whose SWA window
+        # belongs to other requests' tails) and would fail the coverage check.
+        full_len, full_node = self.tree_cache.match_full_prefix(
+            RadixKey(
+                dr.req.origin_input_ids[: pm.decode_prefix_len],
+                extra_key=dr.req.extra_key,
+                cache_salt=dr.req.cache_salt,
             )
         )
+        device_len = len(rematch.device_indices)
+        if full_len > device_len:
+            new_indices, restored_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=full_node,
+                    host_hit_length=full_len - device_len,
+                    req=dr.req,
+                    kv_only=True,
+                )
+            )
+        else:
+            new_indices = rematch.device_indices[:0]
+            restored_node = rematch.last_device_node
         # The rematch repointed req.last_node to feed init_load_back's device
         # boundary, but the prealloc lock and the receipt on the req still
         # belong to pm.last_device_node; restore the pairing so any release
@@ -290,9 +307,10 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
+        # The commit covers exactly [l1, decode_prefix_len).
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
+        )[: pm.decode_prefix_len - pm.l1_prefix_len]
         dr.hicache_restored_node = restored_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node

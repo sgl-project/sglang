@@ -943,6 +943,38 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key = key[prefix_len:]
         return matched_len, node.id, pinned_len
 
+    def match_full_prefix(
+        self, key: RadixKey
+    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
+        """FULL-only match over device- or host-resident FULL KV, independent
+        of the component validators (a tombstoned SWA window or Mamba state
+        does not end it). The deepest node is split at the key end so the
+        returned node covers exactly the matched span. Returns
+        (matched_len, node_id, split_actions)."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched_len = 0
+        actions: list[CacheAction | ComponentAction] = []
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            cd = child.component_data[BASE_COMPONENT_TYPE]
+            if cd.value is None and cd.host_value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
+            if prefix_len < len(child.key):
+                child, action = self._split_node(child.key, child, prefix_len)
+                if action is not None:
+                    actions.append(action)
+            matched_len += prefix_len
+            node = child
+            key = key[prefix_len:]
+        return matched_len, node.id, actions
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
