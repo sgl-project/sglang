@@ -29,7 +29,7 @@ Enabled metrics add host-side bookkeeping, not GPU synchronization or collective
 | `sglang:diffusion_num_queue_reqs` | Gauge | none | Original generation requests waiting for their first dispatch. |
 | `sglang:diffusion_num_running_reqs` | Gauge | none | Number of diffusion generation requests dispatched by the scheduler and not yet finished. |
 | `sglang:diffusion_requests_total` | Counter | `status`, `is_warmup` | Completed diffusion generation requests. Dynamic batches are counted per original scheduler request after the merged output is split. |
-| `sglang:diffusion_request_latency_seconds` | Histogram | `status`, `is_warmup` | Scheduler acceptance to completion, excluding HTTP preprocessing, encoding and response delivery. |
+| `sglang:diffusion_request_latency_seconds` | Histogram | `status`, `is_warmup` | Scheduler acceptance to completion, excluding HTTP preprocessing, media encoding and response delivery. |
 | `sglang:diffusion_queue_time_seconds` | Histogram | `is_warmup` | Time spent waiting in the diffusion scheduler queue. |
 | `sglang:diffusion_generation_batch_size` | Histogram | `stop_reason` | Generation batch size selected by the diffusion scheduler at dispatch time. |
 | `sglang:diffusion_stage_host_latency_seconds` | Histogram | `stage` | Host wall time around a stage, not GPU kernel execution time. Step labels are normalized to `DenoisingStep`. |
@@ -53,6 +53,7 @@ report their own stage and LoRA metrics, not duplicate completed requests.
 The generation-batch histogram currently describes monolithic scheduling only.
 
 Single-host pool mode exposes all child metrics through the head's `/metrics`.
+A scrape aggregates only processes sharing that host's metrics directory.
 For standalone remote roles, pass `--enable-metrics` to each process and scrape
 its `--host`/`--port` as well as the head. Each role serves a metrics-only HTTP
 endpoint. Use a separate, empty `PROMETHEUS_MULTIPROC_DIR` per server launch if
