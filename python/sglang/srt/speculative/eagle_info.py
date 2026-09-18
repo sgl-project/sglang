@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
