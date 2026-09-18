@@ -1288,10 +1288,12 @@ def _fused_append_shared_experts_kernel(
     out_weights_ptr,
     N_BASE,  # runtime scalar
     scale_factor,  # runtime scalar
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1317,22 +1319,35 @@ def _fused_append_shared_experts_kernel(
     ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
     ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
-
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
+    if HAS_PADDING:
+        # Padded rows retain valid ids but contribute zero weight.
+        if pid >= tl.load(num_token_non_padded_ptr):
+            ids = tl.zeros([BLOCK_K], dtype=ids.dtype)
+            ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
+            shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
-    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    N=None,
+    num_token_non_padded=None,
 ):
+    """Append shared experts and optionally materialize padded rows."""
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1344,6 +1359,8 @@ def fused_append_shared_experts(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_shared_experts_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1351,10 +1368,12 @@ def fused_append_shared_experts(
         out_weights,
         N_BASE=N,
         scale_factor=scale_factor,
+        num_token_non_padded_ptr=ntnp_ptr,
         K=k,
         S=s,
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
