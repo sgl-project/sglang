@@ -51,6 +51,11 @@ impl AffinityStore {
         self.assignments.contains_key(key)
     }
 
+    /// The bound engine id, whether or not it is still a candidate.
+    pub fn binding(&self, key: &str) -> Option<WorkerId> {
+        self.assignments.get(key).map(|a| a.engine.clone())
+    }
+
     /// Binds `engine`, unless a concurrent pick already bound another engine
     /// that is still in `engines`; that binding wins so racing first touches
     /// converge on one engine.
