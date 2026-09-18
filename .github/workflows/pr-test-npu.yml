@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       coverage_mode:
-        description: 'Run in coverage collection mode (uses 800t runners, enables coverage instrumentation, runs setup-covstub)'
+        description: 'Run in coverage collection mode (uses coverage runners, enables coverage instrumentation, runs setup-covstub)'
         required: false
         type: boolean
         default: false
@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
       coverage_mode:
-        description: 'Run in coverage collection mode (uses 800t runners, enables coverage instrumentation, runs setup-covstub)'
+        description: 'Run in coverage collection mode (uses coverage runners, enables coverage instrumentation, runs setup-covstub)'
         required: false
         type: boolean
         default: false
@@ -382,9 +382,8 @@ jobs:
 
 
   # ==================== Recommend Tests from Coverage ==================== #
-  # Downloads the pre-built coverage baseline (test_case_map.json + covstub)
-  # from OBS and runs test_selector.py to recommend affected test cases for
-  # the current PR. continue-on-error: true so it never blocks the PR gate.
+  # Recommends PR-affected test cases from the pre-built coverage baseline.
+  # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
@@ -471,9 +470,7 @@ jobs:
 
   # ==================== Analyze Failure Report ==================== #
   # Cross-references test failures with coverage recommendations.
-  # !cancelled() only: success()/failure() are unusable here because needs
-  # always contain coverage_mode-skipped jobs (base-a, multimodal-gen), which
-  # poison the transitive status chain.
+  # !cancelled() only: skipped jobs in needs poison success().
   analyze-failure-report:
     name: Analyze failure report
     needs:
@@ -502,9 +499,8 @@ jobs:
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
 
   # ==================== Coverage Assembly & Publish ==================== #
-  # Assembles covstub, builds test_case_map.json, publishes to the 800t
-  # shared disk. !failure() && !cancelled() (not success()): coverage_mode
-  # always skips pr-gate/base-a upstream, which poisons transitive success().
+  # Assembles coverage data and publishes the baseline to the shared disk.
+  # !failure() && !cancelled() (not success()): skipped upstream poisons success().
   setup-covstub:
     needs:
       [
