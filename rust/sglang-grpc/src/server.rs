@@ -11,6 +11,8 @@ use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
+use tonic_health::ServingStatus;
+use tonic_health::server::{HealthReporter, health_reporter};
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
 use crate::proto;
@@ -34,10 +36,14 @@ struct EngineStatePublisher {
     bridge: Arc<PyBridge>,
     instance_id: u64,
     sender: watch::Sender<proto::EngineStateSnapshot>,
+    health_reporter: HealthReporter,
 }
 
 impl EngineStatePublisher {
-    async fn new(bridge: Arc<PyBridge>) -> Result<Self, Status> {
+    async fn new(
+        bridge: Arc<PyBridge>,
+        mut health_reporter: HealthReporter,
+    ) -> Result<Self, Status> {
         let instance_id = u64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -48,11 +54,15 @@ impl EngineStatePublisher {
         )
         .map_err(|_| Status::internal("engine instance timestamp does not fit in uint64"))?;
         let snapshot = build_engine_state_snapshot(bridge.clone(), instance_id, 1).await?;
+        // tonic-health defaults the empty service to SERVING. Override it with
+        // the initial engine health before the listener accepts requests.
+        publish_health(&mut health_reporter, snapshot.healthy).await;
         let (sender, _) = watch::channel(snapshot);
         Ok(Self {
             bridge,
             instance_id,
             sender,
+            health_reporter,
         })
     }
 
@@ -60,10 +70,13 @@ impl EngineStatePublisher {
         self.sender.subscribe()
     }
 
-    async fn publish_current(&self) -> Result<(), Status> {
+    async fn publish_current(&mut self) -> Result<(), Status> {
         let revision = self.sender.borrow().revision + 1;
         let snapshot =
             build_engine_state_snapshot(self.bridge.clone(), self.instance_id, revision).await?;
+        if snapshot.healthy != self.sender.borrow().healthy {
+            publish_health(&mut self.health_reporter, snapshot.healthy).await;
+        }
         tracing::info!(
             instance_id = snapshot.instance_id,
             revision = snapshot.revision,
@@ -73,6 +86,18 @@ impl EngineStatePublisher {
         );
         self.sender.send_replace(snapshot);
         Ok(())
+    }
+}
+
+async fn publish_health(reporter: &mut HealthReporter, healthy: bool) {
+    // Pause affects generation, not the RuntimeHandle.health_check predicate.
+    let status = if healthy {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    };
+    for service in ["", "inference"] {
+        reporter.set_service_status(service, status).await;
     }
 }
 
@@ -1094,7 +1119,8 @@ pub async fn run_grpc_server(
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let (state_changed_tx, mut state_changed_rx) = tokio::sync::mpsc::channel(1);
     bridge.set_engine_state_changed_callback(state_changed_tx)?;
-    let engine_state = EngineStatePublisher::new(bridge.clone()).await?;
+    let (health_reporter, health_service) = health_reporter();
+    let mut engine_state = EngineStatePublisher::new(bridge.clone(), health_reporter).await?;
     let (stream_shutdown_tx, stream_shutdown_rx) = watch::channel(false);
     let service = SglangServiceImpl {
         bridge,
@@ -1121,6 +1147,7 @@ pub async fn run_grpc_server(
 
     let result = tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(health_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             stream_shutdown_tx.send_replace(true);
