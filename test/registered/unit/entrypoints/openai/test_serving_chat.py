@@ -1,9 +1,9 @@
 """
-Unit-tests for OpenAIServingChat -- rewritten to use only the std-lib 'unittest'.
-Run with either:
-    python tests/test_serving_chat_unit.py -v
-or
-    python -m unittest discover -s tests -p "test_*unit.py" -v
+CPU tests for OpenAIServingChat.
+
+  messages + tools             -> template and reasoning constraints
+  supplied IDs + turn boundary -> unchanged IDs and boundary in GenerateReqInput
+  generated results           -> streaming/non-streaming OpenAI responses
 """
 
 from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sgl_kernel
@@ -323,6 +323,23 @@ class ServingChatTestCase(CustomTestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_mm_token_expansion_start_len_is_forwarded_with_supplied_ids(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hello"}],
+            input_ids=[10, 11, 12],
+            mm_token_expansion_start_len=2,
+            routed_experts_start_len=1,
+        )
+        self.tm.tokenizer.encode.reset_mock()
+        adapted, _ = self.chat._convert_to_internal_request(request)
+        adapted.normalize_batch_and_arguments()
+
+        self.assertEqual(adapted.input_ids, [10, 11, 12])
+        self.assertEqual(adapted.mm_token_expansion_start_len, 2)
+        self.assertEqual(adapted.routed_experts_start_len, 1)
+        self.tm.tokenizer.encode.assert_not_called()
 
     @staticmethod
     def _close_event_loops():
