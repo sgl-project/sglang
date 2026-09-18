@@ -128,7 +128,6 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
     random_range_ratio = 1
     warmup_requests = 32
     request_rate = float("inf")
-    seed = 1
     tpot = 50
     max_attempts = 3
     output_token_throughput = 3100
