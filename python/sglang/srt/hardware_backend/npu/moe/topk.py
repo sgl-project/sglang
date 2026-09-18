@@ -72,16 +72,19 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
-        # npu_moe_gating_top_k requires x and bias to share a dtype. When
-        # they already match (e.g. a bf16 gate with bf16 bias) nothing is
-        # cast. Otherwise promote to fp32 if the bias is fp32 — bf16 bias
-        # reorders top-k routing (see the GLM-5.2 note in deepseek_v2.py) —
-        # and only downcast bf16 biases to the logits dtype.
-        if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
-            if correction_bias.dtype == torch.float32:
-                router_logits = router_logits.to(torch.float32)
-            else:
-                correction_bias = correction_bias.to(router_logits.dtype)
+        if correction_bias is not None:
+            # npu_moe_gating_top_k requires x and bias to share a dtype.
+            # Promote the logits to fp32 when the bias is fp32 — a bf16 bias
+            # reorders top-k routing (see the GLM-5.2 note in deepseek_v2.py) —
+            # and only align a bf16 bias up to the logits dtype.
+            if correction_bias.dtype != router_logits.dtype:
+                if correction_bias.dtype == torch.float32:
+                    router_logits = router_logits.to(torch.float32)
+                else:
+                    correction_bias = correction_bias.to(router_logits.dtype)
+        else:
+            # No bias: keep the historical fp32 scoring.
+            router_logits = router_logits.to(torch.float32)
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits,
             k=topk_config.top_k,
