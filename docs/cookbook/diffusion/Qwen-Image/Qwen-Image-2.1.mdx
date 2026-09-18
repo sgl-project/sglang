@@ -48,6 +48,10 @@ PY
 
 ### Platform measurements
 
+Measurements in this page refer to the listed source revisions. They precede
+the training-template and VAE normalization corrections in `c2a31b2693c`;
+their output comparisons should not be treated as baselines for that revision.
+
 | GPU | Recommended placement / attention | Generation median | Single edit | Peak device memory |
 | --- | --- | --- | --- | --- |
 | H200 141GB | Resident / FlashAttention | Functional verification only | Passed | Not measured in this comparison |
@@ -197,12 +201,32 @@ normalization, matching the reference implementation with Transformers
 4.57.3. Vision position interpolation also follows its BF16 rounding order.
 SGLang selects these native semantics explicitly, so keep the
 repository's installed dependencies instead of downgrading the entire runtime.
-Reference comparisons should use Transformers 4.57.3; the same
-`hidden_states[-1]` expression can have different semantics in newer versions.
+The updated [Diffusers reference](https://github.com/huggingface/diffusers/pull/14804)
+also selects pre-normalization hidden states explicitly on newer Transformers.
+
+Editing uses the training markers `<image1>`, `<image2>`, and so on. The vision
+encoder sees alpha composited over white, while the VAE receives the original
+RGBA pixels. Empty prompts become a space. The VAE normalizes features in
+FP32 before casting back to the activation dtype and compresses spatial
+dimensions by a factor of 16.
 
 Use `--model-id Qwen-Image-2.1` when the checkpoint directory has a different
 name. The model ID is a routing identifier; it does not grant access to model
 weights. Keep checkpoint access credentials in your environment.
+
+### Two-GPU end-to-end test
+
+The standard two-GPU suite includes `qwen_image21_t2i_tp2`: TP 2 with sequence
+parallelism disabled, 1024 × 1024 PNG output, 40 steps, CFG 1, and seed 42.
+It sends two consecutive requests and checks the model API and image consistency.
+Run it on a Linux CUDA host with two GPUs and checkpoint access:
+
+```bash Command
+pytest -s python/sglang/multimodal_gen/test/server/test_server_2_gpu.py \
+  -k qwen_image21_t2i_tp2
+```
+
+This case does not enforce a latency baseline or run a component accuracy check.
 
 ### Transparent PNG output
 

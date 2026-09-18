@@ -191,6 +191,7 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
     assert not model.use_tiling
     assert ac.scale_factor_spatial == ac.spatial_compression_ratio == 16
     model.use_tiling = tiling
+    model.use_parallel_tiling = False
     model.tile_sample_min_height = model.tile_sample_min_width = 32
     model.tile_sample_stride_height = model.tile_sample_stride_width = 16
     with torch.no_grad():
