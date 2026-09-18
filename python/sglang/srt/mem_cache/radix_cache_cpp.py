@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.runtime_context import (
+    get_memory,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -33,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 
 class RadixCacheCpp(BasePrefixCache):
+    @staticmethod
+    def _reject_cache_salt(cache_salt: Optional[str]) -> None:
+        if cache_salt is not None:
+            raise ValueError(
+                "cache_salt is not supported by the experimental C++ radix tree"
+            )
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -42,9 +52,9 @@ class RadixCacheCpp(BasePrefixCache):
         self.disable = params.disable
         self.enable_write_cancel = enable_write_cancel
 
-        assert (
-            params.enable_kv_cache_events is False
-        ), "HiRadixCache does not support kv cache events yet"
+        assert params.enable_kv_cache_events is False, (
+            "HiRadixCache does not support kv cache events yet"
+        )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[IOHandle] = set()
@@ -52,7 +62,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.ongoing_load_back: Set[IOHandle] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.device = self.token_to_kv_pool_allocator.device
@@ -65,7 +75,7 @@ class RadixCacheCpp(BasePrefixCache):
         if params.enable_metrics:
             self.init_metrics_collector()
 
-        if not server_args.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             self.tree = RadixTreeCpp(
                 disabled=self.disable,
                 page_size=self.page_size,
@@ -100,8 +110,9 @@ class RadixCacheCpp(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
+        self._reject_cache_salt(key.cache_salt)
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
-            self.tree.match_prefix(key.token_ids)
+            self.tree.match_prefix(key.raw_token_ids())
         )
         return MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
@@ -169,19 +180,21 @@ class RadixCacheCpp(BasePrefixCache):
     def total_size(self):
         return self.tree.total_size()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         """Cache request when it finishes."""
-        assert req.req_pool_idx is not None
-        kv_committed_len = req.pop_committed_kv_cache()
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        self._reject_cache_salt(req.cache_salt)
+        assert req.kv.holds_kv
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_len_to_handle
         ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
+        page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -200,7 +213,7 @@ class RadixCacheCpp(BasePrefixCache):
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < kv_committed_len:
+        if page_aligned_overall_len < kv_len_to_handle:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
@@ -209,11 +222,12 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
-        assert req.req_pool_idx is not None
-        token_ids = req.fill_ids
+        self._reject_cache_salt(req.cache_salt)
+        assert req.kv.holds_kv
+        token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.kv.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
@@ -240,7 +254,7 @@ class RadixCacheCpp(BasePrefixCache):
             )
             reused_indices = new_indices[old_prefix_len:new_prefix_len]
             self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len:new_prefix_len
+                req.kv.req_pool_idx, old_prefix_len:new_prefix_len
             ] = reused_indices
 
         if req.last_node != new_last_node:

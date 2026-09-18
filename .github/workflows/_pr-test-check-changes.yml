@@ -19,12 +19,16 @@ on:
     outputs:
       main_package:
         value: ${{ jobs.run.outputs.main_package }}
+      simulator:
+        value: ${{ jobs.run.outputs.simulator }}
       sgl_kernel:
         value: ${{ jobs.run.outputs.sgl_kernel }}
       jit_kernel:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
+      rust_workspace:
+        value: ${{ jobs.run.outputs.rust_workspace }}
       partitions:
         value: ${{ jobs.run.outputs.partitions }}
       partition_model_sha:
@@ -42,9 +46,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      simulator: ${{ steps.filter.outputs.simulator || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      rust_workspace: ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
       runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
@@ -79,31 +85,55 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-*.yml"
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
+              - "rust/**"
+              - "proto/sglang/runtime/v1/sglang.proto"
+            simulator:
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-simulator-cpu.yml"
+              - "benchmark/simulator/**/!(*.md)"
+              - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/jit_kernel/**"
-              - "python/sglang/jit_kernel/tests/diffusion/**"
-              - "python/sglang/jit_kernel/benchmark/diffusion/**"
+              - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
+              - "python/sglang/srt/observability/**"
+              - "python/sglang/kernels/ops/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
-              - "python/sglang/jit_kernel/**"
+              - "test/registered/kernels/**"
+              # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
+              # base-b-kernel suites import it directly, so kernel edits must run them.
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**"
             sgl_kernel:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+            rust_workspace:
+              # Gates the cargo test in test/registered/rust/; exported to the
+              # CPU stage as its negation, SGLANG_SKIP_RUST_TESTS.
+              - "rust/**"
+              - "proto/sglang/runtime/v1/sglang.proto"
+              - "test/registered/rust/**"
+              - ".github/workflows/_pr-test-*.yml"
 
       - name: Determine full-parallel mode
         id: parallel-mode
@@ -111,11 +141,16 @@ jobs:
           # `full=true` lifts the matrix-fanout throttle so each suite's
           # max_parallel = size. Conditions:
           #   1. Scheduled cron run.
-          #   2. pull_request event with the `high priority` label.
+          #   2. run_all_tests run (manual full dispatch / release) -- a full
+          #      run should mirror the cron's parallelism, not just its test set.
+          #   3. pull_request event with the `high priority` label.
           FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             FULL=true
             echo "Scheduled run -> full parallelism"
+          elif [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            FULL=true
+            echo "run_all_tests -> full parallelism"
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             FULL=true
             echo "high priority PR -> full parallelism"
@@ -209,6 +244,7 @@ jobs:
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| rust_workspace    | ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"

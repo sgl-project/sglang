@@ -11,13 +11,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with npu graph and torch.compile."""
+"""Run the model with NPU graph and torch.compile.
+
+NPUGraphRunner is a thin subclass of DecodeCudaGraphRunner: the
+factory returns NPUCudaGraphBackend for NPU devices, so all
+capture/replay mechanics live in the backend. This class adds:
+  - NPU-specific patch_model monkey-patch for the decode-Full +
+    torch.compile path.
+  - Profile context override (NPU profiler emits to disk, not in-mem).
+  - Replay override that issues an async NPUGraph.update for
+    seq_lens before replay (skipped for deepseek-nsa).
+  - Smaller cache_loc dtype (int32 instead of int64).
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -25,11 +35,19 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import numpy as np
 import torch
 
-import sglang
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+)
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    build_replay_fb_view,
+)
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -49,7 +67,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    compute_local_num_token_non_padded_cpu,
+    enable_num_token_non_padded,
+)
 
 
 @contextmanager
@@ -71,32 +94,63 @@ def patch_model_npu(
         yield model.forward
 
 
-class NPUGraphRunner(CudaGraphRunner):
-    """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
+class NPUGraphRunner(DecodeCudaGraphRunner):
+    """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
-        sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
-        super().__init__(model_runner)
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ):
+        # NPU patch_model override: monkey-patch torch_compile_decoration's
+        # patch_model with the NPU-specific version.
+        from sglang.srt.compilation import torch_compile_decoration
+
+        torch_compile_decoration.patch_model = patch_model_npu
+        super().__init__(
+            model_runner,
+            attn_backend=attn_backend,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
+        # DFLASH verify under dp attention replays through the generic DP
+        # graph machinery: the scheduler-level DP vote keeps all DP ranks on
+        # the same graph/eager decision, and load_batch pads every rank to
+        # the same global max bucket so the captured dp-gather geometry stays
+        # valid when per-rank batch sizes diverge.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.if_use_v2 = any(
+            arch
+            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
+            for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "context_lens",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            # TARGET_VERIFY must use a Python list: graph.update can only
+            # rebind the Host-side IntArray when captured as a list.
+            "TARGET_VERIFY": [],
         }
 
     def _create_device_graph(self):
@@ -121,9 +175,13 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
+        if self.if_use_v2:
+            return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
+        if self.if_use_v2:
+            return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
@@ -165,18 +223,65 @@ class NPUGraphRunner(CudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+        if forward_batch.needs_forward_metadata_init():
+            self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
+            # NPU skips the DFLASH verify pre-planning, so load_batch may
+            # never have recorded the padded batch shapes; recompute them on
+            # every batch (the verify batch size varies with concurrency).
+            raw_bs = forward_batch.batch_size
+            if self.require_mlp_tp_gather:
+                bs = self._pad_to_bucket(
+                    self._max_dp_batch_size(forward_batch), self.capture_bs
+                )
+            else:
+                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_bs * self.captured_req_width
+            self.bs = bs
+            # Restore the DeepEP dispatch mode recorded at capture time
+            # (mirrors load_batch); an interleaved eager extend may have
+            # switched it.
+            self.deepep_adapter.replay()
+            # Refresh the static DP token buffers bound by the captured
+            # graph (stale values misalign dp-gather segments across ranks);
+            # mirror the capture-side uniform [padded_num_tokens] * dp_size.
+            if self.require_mlp_tp_gather:
+                _padded_num_tokens = bs * self.captured_req_width
+                self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
+                self.buffers.global_num_tokens_for_logprob_gpu.fill_(_padded_num_tokens)
+            if (
+                enable_num_token_non_padded()
+                and self.require_gathered_buffer
+                and not self.enable_prefill_cp
+            ):
+                self.buffers.num_token_non_padded.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=(
+                            forward_batch.global_num_token_non_padded_cpu
+                        ),
+                        num_tokens_per_dp=bs * self.captured_req_width,
+                        sharded=self.model_runner.attn_tp_sequence_sharded(
+                            bs * self.captured_req_width
+                        ),
+                    )
+                )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
             if (
                 envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
                 and forward_batch.mrope_positions is not None
@@ -185,32 +290,94 @@ class NPUGraphRunner(CudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        self.update_attr_name = self._get_update_attr_name()
-        self.update_attr_type = self._get_update_attr_type()
-        # Replay
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+            # The pre-planned path skipped init_forward_metadata_out_graph;
+            # refresh attention metadata so replay reads correct KV pages.
+            self.buffers.seq_lens[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.req_pool_indices[: self.raw_bs].copy_(
+                forward_batch.req_pool_indices[: self.raw_bs]
+            )
+            self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
+            # Refresh the static out_cache_loc bound by the captured graph
+            # for full-pool KV writes in save_kv_cache (replay would
+            # otherwise write verify KV to stale capture-time slots).
+            if forward_batch.out_cache_loc is not None:
+                _padded_num_token = self.bs * self.captured_req_width
+                _n = min(self.raw_num_token, forward_batch.out_cache_loc.shape[0])
+                self.buffers.out_cache_loc[:_n].copy_(forward_batch.out_cache_loc[:_n])
+                self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=self.buffers,
+                bs=self.bs,
+                raw_bs=self.raw_bs,
+                num_tokens=self.bs * self.captured_req_width,
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+
+        graph_key = self._make_graph_key(self.bs)
+
+        if not (
+            is_deepseek_dsa(self.model_runner.model_config.hf_config)
+            or is_deepseek_v4(self.model_runner.model_config.hf_config)
+        ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                _attn = self._replay_attn_backend()
+                _meta = getattr(_attn, "forward_metadata", None)
+                _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                if _meta_list is not None:
+                    # graph.update must carry the exact KV length already
+                    # computed in forward_metadata.seq_lens_cpu_list (it
+                    # already includes the draft block for DFlash); do not
+                    # recompute and double-add here.
+                    seq_lens = list(_meta_list)
+                else:
+                    # Wrapper backends (e.g. hybrid linear attention) keep
+                    # forward_metadata only on their children, so it stays
+                    # None here; fall back to the pre-DFlash computation.
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + self.captured_req_width
+                    )
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-            thread.start()
-            self.graphs[self.bs].replay()
-            thread.join()
+            output = self.backend.replay_with_input_update(
+                graph_key,
+                seq_lens=seq_lens,
+                attr_name=self._get_update_attr_name(),
+                attr_type=self._get_update_attr_type(),
+            )
         else:
-            self.graphs[self.bs].replay()
+            output = self.backend.replay(graph_key, forward_batch)
 
-        output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
+                full_logits = (
+                    output.full_logits[: self.raw_num_token]
+                    if output.full_logits is not None
+                    else None
+                )
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,

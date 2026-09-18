@@ -41,7 +41,6 @@ def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Ten
 
 @dataclass
 class SanaPipelineConfig(SpatialImagePipelineConfig):
-
     task_type: ModelTaskType = ModelTaskType.T2I
 
     # should_use_guidance=False disables *embedded* guidance (timestep-conditioned
@@ -52,7 +51,7 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
     # DC-AE does not support tiling or SP VAE decode yet.
     vae_tiling: bool = False
     vae_sp: bool = False
-    vae_precision: str = "bf16"
+    vae_precision: str = "fp32"
 
     dit_config: DiTConfig = field(default_factory=SanaConfig)
     vae_config: VAEConfig = field(default_factory=SanaVAEConfig)

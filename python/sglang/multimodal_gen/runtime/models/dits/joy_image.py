@@ -9,9 +9,12 @@ import torch.nn as nn
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
+    divide,
     get_sp_group,
     get_sp_world_size,
+    get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -20,7 +23,11 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -32,11 +39,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTimeTextImageEmbedding
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 _MODULATION_FACTOR = 6
@@ -61,6 +68,16 @@ def fused_add_gate(
         torch.Tensor: residual + x * gate.unsqueeze(1)
     """
     return torch.addcmul(residual, x, gate.unsqueeze(1))
+
+
+def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Complex-valued RoPE table from a hoisted cat([cos, sin], dim=-1)
+    cos_sin_cache tensor, split back in half.
+    """
+    if freqs_cis is None:
+        return None
+    cos, sin = freqs_cis.chunk(2, dim=-1)
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
 
 
 class ModulateWan(nn.Module):
@@ -104,6 +121,8 @@ class MMDoubleStreamBlock(nn.Module):
         super().__init__()
         self.heads_num = heads_num
         self.hidden_size = hidden_size
+        self.tp_size = get_tp_world_size()
+        self.local_heads_num = divide(self.heads_num, self.tp_size)
         self.head_dim = self.hidden_size // self.heads_num
         self.mlp_hidden_dim = int(self.hidden_size * mlp_width_ratio)
 
@@ -114,10 +133,11 @@ class MMDoubleStreamBlock(nn.Module):
             elementwise_affine=False,
         )
 
-        self.img_attn_qkv = ReplicatedLinear(
+        self.img_attn_qkv = MergedColumnParallelLinear(
             self.hidden_size,
-            hidden_size * 3,
+            [hidden_size, hidden_size, hidden_size],
             bias=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.img_attn_qkv",
         )
@@ -129,10 +149,11 @@ class MMDoubleStreamBlock(nn.Module):
             self.head_dim,
             eps=1e-6,
         )
-        self.img_attn_proj = ReplicatedLinear(
+        self.img_attn_proj = RowParallelLinear(
             self.hidden_size,
             hidden_size,
             bias=True,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.img_attn_proj",
         )
@@ -157,10 +178,11 @@ class MMDoubleStreamBlock(nn.Module):
             eps=1e-6,
             elementwise_affine=False,
         )
-        self.txt_attn_qkv = ReplicatedLinear(
+        self.txt_attn_qkv = MergedColumnParallelLinear(
             self.hidden_size,
-            self.hidden_size * 3,
+            [self.hidden_size, self.hidden_size, self.hidden_size],
             bias=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.txt_attn_qkv",
         )
@@ -172,10 +194,11 @@ class MMDoubleStreamBlock(nn.Module):
             self.head_dim,
             eps=1e-6,
         )
-        self.txt_attn_proj = ReplicatedLinear(
+        self.txt_attn_proj = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.txt_attn_proj",
         )
@@ -193,7 +216,7 @@ class MMDoubleStreamBlock(nn.Module):
             prefix=f"{prefix}.txt_mlp",
         )
         self.attn = USPAttention(
-            num_heads=self.heads_num,
+            num_heads=self.local_heads_num,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -207,6 +230,8 @@ class MMDoubleStreamBlock(nn.Module):
         vec: torch.Tensor,
         vis_freqs_cis: Optional[torch.Tensor] = None,
         txt_freqs_cis: Optional[torch.Tensor] = None,
+        vis_complex_freqs: Optional[torch.Tensor] = None,
+        txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
@@ -233,7 +258,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
         img_qkv, _ = self.img_attn_qkv(img_modulated)
         img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.local_heads_num
         )
 
         if vis_freqs_cis is None:
@@ -255,6 +280,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.img_attn_k_norm,
             head_dim=img_q.shape[-1],
             cos_sin_cache=vis_freqs_cis,
+            freqs_complex=vis_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -266,7 +292,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
         txt_qkv, _ = self.txt_attn_qkv(txt_modulated)
         txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.local_heads_num
         )
 
         if txt_freqs_cis is not None and not (
@@ -282,6 +308,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.txt_attn_k_norm,
             head_dim=txt_q.shape[-1],
             cos_sin_cache=txt_freqs_cis,
+            freqs_complex=txt_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -336,9 +363,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
 
     _supports_gradient_checkpointing = True
-    _fsdp_shard_conditions = JoyImageDiTConfig()._fsdp_shard_conditions
-    _compile_conditions = JoyImageDiTConfig()._compile_conditions
-    _supported_attention_backends = JoyImageDiTConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_double_blocks]
+    _compile_conditions = [is_blocks_or_double_blocks]
     param_names_mapping = JoyImageDiTConfig().param_names_mapping
     reverse_param_names_mapping = JoyImageDiTConfig().reverse_param_names_mapping
     lora_param_names_mapping = JoyImageDiTConfig().lora_param_names_mapping
@@ -409,7 +435,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.hidden_size,
             self.out_channels * math.prod(self.patch_size),
             quant_config=quant_config,
-            prefix=f"proj_out",
+            prefix="proj_out",
         )
         self.__post_init__()
 
@@ -543,6 +569,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         txt_suffix_len = txt.shape[1] if sequence_shard_enabled else 0
 
+        vis_complex_freqs = _joy_complex_freqs(vis_freqs_cis)
+        txt_complex_freqs = _joy_complex_freqs(txt_freqs_cis)
+
         # Pass through DiT blocks
         for block in self.double_blocks:
             img, txt = block(
@@ -551,6 +580,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vec,
                 vis_freqs_cis,
                 txt_freqs_cis,
+                vis_complex_freqs=vis_complex_freqs,
+                txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
             )
 

@@ -65,7 +65,7 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
             side_effect=_fake_init_mooncake_transfer_engine,
         ),
         patch(
-            "sglang.srt.model_executor.model_runner.get_local_ip_auto",
+            "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.get_local_ip_auto",
             return_value="127.0.0.1",
         ),
     ):

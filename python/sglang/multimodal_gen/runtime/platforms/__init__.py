@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
+import os
 import traceback
-from typing import TYPE_CHECKING
+from pkgutil import resolve_name
 
 # imported by other files, do not remove
 from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
@@ -13,7 +14,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
+from sglang.multimodal_gen.third_party import pynvml
 
 logger = init_logger(__name__)
 
@@ -22,9 +23,6 @@ def cuda_platform_plugin() -> str | None:
     is_cuda = False
 
     try:
-        from sglang.multimodal_gen.utils import import_pynvml
-
-        pynvml = import_pynvml()  # type: ignore[no-untyped-call]
         pynvml.nvmlInit()
         try:
             # NOTE: Edge case: sgl_diffusion cpu build on a GPU machine.
@@ -50,6 +48,27 @@ def cuda_platform_plugin() -> str | None:
 
         if cuda_is_jetson():
             is_cuda = True
+        else:
+            # NVML is NVIDIA-specific. CUDA-compatible stacks (e.g. Iluvatar
+            # CoreX) expose devices through torch's CUDA API without shipping
+            # libnvidia-ml. Only fall back when NVML itself is unavailable;
+            # a successful NVML init that reports zero devices must keep the
+            # CPU-build-on-GPU-machine edge case above.
+            try:
+                import torch
+
+                # ROCm also exposes devices through torch.cuda, so keep this
+                # non-NVML fallback limited to non-HIP runtimes.
+                is_cuda = (
+                    getattr(torch.version, "hip", None) is None
+                    and torch.cuda.is_available()
+                    and torch.cuda.device_count() > 0
+                )
+                if is_cuda:
+                    logger.debug("CUDA detected via torch (NVML unavailable)")
+            except Exception as exc:
+                logger.debug("torch CUDA detection failed: %s", exc)
+
     if is_cuda:
         logger.debug("CUDA is available")
 
@@ -171,6 +190,24 @@ builtin_platform_plugins = {
 
 
 def resolve_current_platform_cls_qualname() -> str:
+    forced_platform = os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "").strip()
+    if forced_platform:
+        forced_map = {
+            "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
+            "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
+            "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+            "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
+            "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
+            "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+            "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
+        }
+        qualname = forced_map.get(forced_platform.lower())
+        if qualname is None:
+            raise ValueError(
+                f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={forced_platform!r}"
+            )
+        return qualname
+
     # TODO(will): if we need to support other platforms, we should consider if
     # vLLM's plugin architecture is suitable for our needs.
 
@@ -209,7 +246,7 @@ def resolve_current_platform_cls_qualname() -> str:
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
-    raise RuntimeError("No platform plugin found. Please check your " "installation.")
+    raise RuntimeError("No platform plugin found. Please check your installation.")
 
 
 _current_platform: Platform | None = None
@@ -228,7 +265,7 @@ def __getattr__(name: str):
         global _current_platform
         if _current_platform is None:
             platform_cls_qualname = resolve_current_platform_cls_qualname()
-            _current_platform = resolve_obj_by_qualname(platform_cls_qualname)()
+            _current_platform = resolve_name(platform_cls_qualname)()
             global _init_trace
             _init_trace = "".join(traceback.format_stack())
         return _current_platform

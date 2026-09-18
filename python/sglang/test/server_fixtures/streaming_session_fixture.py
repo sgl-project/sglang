@@ -21,7 +21,6 @@ import aiohttp
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -29,6 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 LOGPROB_PROMPTS = [
@@ -50,6 +50,15 @@ LEAK_FILLER = (
     "A wizard's job is to vex chumps quickly in fog. "
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
+
+SWA_MODEL = "openai/gpt-oss-20b"
+
+# Common gpt-oss-20b launch args. Matches TestSessionLatency/TestSWARadixCacheKL.
+SWA_COMMON_ARGS = [
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
 
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 256
@@ -305,8 +314,7 @@ async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -
                 tasks = []
                 for s in range(CONCURRENT_LOGPROB_SESSIONS):
                     text = (
-                        f"S{s} T{turn}: "
-                        f"{LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
+                        f"S{s} T{turn}: {LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
                     )
                     ids = tokenizer.encode(text)
                     tasks.append(
@@ -351,9 +359,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
             # Streaming requests — long prompts to trigger chunked prefill.
             for s in range(STRESS_NUM_SESSIONS):
                 offset = (s * STRESS_NUM_TURNS + turn) * 200
-                text = (
-                    f"Session {s} turn {turn}: " f"{LEAK_FILLER[offset : offset + 800]}"
-                )
+                text = f"Session {s} turn {turn}: {LEAK_FILLER[offset : offset + 800]}"
                 ids = tokenizer.encode(text)
                 tasks.append(
                     _async_generate(
@@ -402,7 +408,7 @@ class StreamingSessionServerBase(CustomTestCase):
     - `env_overrides`: list of `(env_attr_name, value)` tuples; each is
       pushed onto the `setUpClass` context stack so the env override is
       live during `popen_launch_server` and torn down on
-      `tearDownClass`-time. `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=2`
+      `tearDownClass`-time. `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=1`
       is always applied on top of these.
     """
 
@@ -417,8 +423,9 @@ class StreamingSessionServerBase(CustomTestCase):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2)
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1)
             )
+            stack.enter_context(envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(True))
             for name, val in cls.env_overrides:
                 stack.enter_context(getattr(envs, name).override(val))
             cls.process = popen_launch_server(
@@ -431,4 +438,4 @@ class StreamingSessionServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)

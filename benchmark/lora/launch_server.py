@@ -1,22 +1,25 @@
 import argparse
 import os
 
-NUM_LORAS = 4
-LORA_PATH = {
-    "base": "meta-llama/Llama-2-7b-hf",
-    "lora": "winddude/wizardLM-LlaMA-LoRA-7B",
-}
+DEFAULT_BASE_MODEL_PATH = "meta-llama/Llama-2-7b-hf"
+DEFAULT_LORA_PATH = "winddude/wizardLM-LlaMA-LoRA-7B"
+DEFAULT_NUM_LORAS = 4
 
 
 def launch_server(args):
-    base_path = LORA_PATH["base"]
-    lora_path = LORA_PATH["lora"]
+    base_path = args.base_model_path
+    lora_path = args.lora_path
 
     if args.base_only:
-        cmd = f"python3 -m sglang.launch_server --model {base_path} "
+        cmd = f"python3 -m sglang.launch_server --model-path {base_path} "
     else:
-        cmd = f"python3 -m sglang.launch_server --model {base_path} --lora-paths "
-        for i in range(NUM_LORAS):
+        if args.num_loras <= 0:
+            raise ValueError(
+                "--num-loras must be greater than 0 unless --base-only is set"
+            )
+
+        cmd = f"python3 -m sglang.launch_server --model-path {base_path} --lora-paths "
+        for i in range(args.num_loras):
             lora_name = f"lora{i}"
             cmd += f"{lora_name}={lora_path} "
     cmd += f"--disable-radix "
@@ -36,6 +39,30 @@ def launch_server(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--base-model-path",
+        type=str,
+        default=DEFAULT_BASE_MODEL_PATH,
+        help="Base model path or Hugging Face model ID.",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=DEFAULT_LORA_PATH,
+        help=(
+            "LoRA adapter path or Hugging Face model ID used for all registered "
+            "LoRA adapters."
+        ),
+    )
+    parser.add_argument(
+        "--num-loras",
+        type=int,
+        default=DEFAULT_NUM_LORAS,
+        help=(
+            "Number of LoRA adapters to register. For example, 4 registers "
+            "lora0, lora1, lora2, and lora3."
+        ),
+    )
     parser.add_argument(
         "--base-only",
         action="store_true",

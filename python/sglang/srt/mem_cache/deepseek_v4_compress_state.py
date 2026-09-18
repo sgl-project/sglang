@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 from contextlib import nullcontext
+from math import gcd
 
+import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -11,6 +13,10 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
+
+
+def _lcm(a: int, b: int) -> int:
+    return a // gcd(a, b) * b
 
 
 @dataclasses.dataclass
@@ -68,11 +74,56 @@ class KVAndScore:
         assert len(tensors) > 0, "At least one tensor is required for concatenation."
         item_size = tensors[0]._item_size
         for v in tensors:
-            assert (
-                v._item_size == item_size
-            ), "All tensors must have the same item size."
+            assert v._item_size == item_size, (
+                "All tensors must have the same item size."
+            )
 
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
+
+
+def c4_state_transfer_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ring_size: int,
+) -> np.ndarray:
+    """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
+    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
+    # pair the overlap compressor's live rows by logical token position.
+    if ring_size < 8 or ring_size % 4 != 0:
+        raise ValueError(
+            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
+        )
+
+    seq_len = max(0, int(seq_len))
+    state_len = seq_len % 4 + 4
+    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
+    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    return rows.astype(np.int32)
+
+
+def request_scoped_state_transfer_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ratio: int,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """PD transfer indices of a request-scoped compress state: the one pending
+    partial block of ``ratio`` tokens, as the request's single online row or the
+    ring page that holds it. Nothing pends at a block boundary."""
+    if seq_len == 0 or seq_len % ratio == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % ratio == 0, (
+        f"ring_size must be a multiple of {ratio}, got {ring_size}"
+    )
+    pages_per_req = ring_size // ratio
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // ratio
+    return np.array([page], dtype=np.int32)
 
 
 class CompressStatePool:
@@ -87,50 +138,124 @@ class CompressStatePool:
         enable_memory_saver: bool,
         ratio: int,
         online: bool = False,
+        request_scoped: bool = False,
         swa_page_size: int = 0,
+        online_mtp_max_draft_tokens: int = 0,
+        state_cache_page_size: int = 1,
     ):
+        self.ratio = ratio
+        # Request-scoped state is addressed by req_pool_idx (one ring per request
+        # slot) and travels on the PD request-state component; page-scoped state
+        # follows the SWA pages. The pool factory decides which ratios are which.
+        self.request_scoped = request_scoped
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
+        self.page_size = state_cache_page_size
         self.enable_memory_saver = enable_memory_saver
+        self.online = online
+        self.online_mtp_state_slot_offset = 0
+        self.online_mtp_max_draft_tokens = 0
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
-            self._size = size + self.ring_size + 1
+            self._logical_size = size + self.ring_size + 1
+            if online_mtp_max_draft_tokens > 0:
+                # Bank 0 is the committed state. Banks 1..N cache per-draft
+                # prefix states for lazy commit after target verify.
+                self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+                self.online_mtp_state_slot_offset = self._logical_size
+            self._size = self._logical_size * (1 + self.online_mtp_max_draft_tokens)
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1
-            self._size = (self._size + ratio - 1) // ratio * ratio
+            # The common GPU pool is flat by default. A backend that also needs
+            # a physical 3-D cache view can request its second-axis page size;
+            # allocation and ring ownership still stay in this shared class.
+            pad_to = ratio
+            if state_cache_page_size > 1:
+                pad_to = _lcm(pad_to, state_cache_page_size)
+            self._size = (self._size + pad_to - 1) // pad_to * pad_to
+            self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
 
-        if _is_hip:
-            self.kv_score_buffer = KVAndScore(
-                torch.empty((self._size, last_dim), dtype=dtype, device=device)
-            )
-            if not online:
+        self.last_dim = last_dim
+        self._alloc_kv_score_buffer(
+            dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
+        )
+        if not online:
+            if _is_hip and ratio == 128:
+                # Request-scoped C128 state is addressed by req_pool_idx (or a
+                # per-request ring).  The pool is allocated with torch.empty(),
+                # so a cold server can otherwise read uninitialized partial
+                # states before a request slot has been written for the first
+                # time.  Initialize all C128 rows to the empty-state sentinel;
+                # C4 keeps the historical last-row sentinel behavior.
+                self.kv_score_buffer.clear()
+            else:
                 self.kv_score_buffer[-1].clear()
-        else:
-            self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=enable_memory_saver
-            )
-            self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-                maybe_init_custom_mem_pool(device=device)
-            )
 
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                with (
-                    torch.cuda.use_mem_pool(self.custom_mem_pool)
-                    if self.custom_mem_pool
-                    else nullcontext()
-                ):
-                    self.kv_score_buffer = KVAndScore(
-                        torch.empty(
-                            (self._size, last_dim),
-                            dtype=dtype,
-                            device=device,
-                        )
+    def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        """PD transfer indices of this pool's state for one request."""
+        assert self.request_scoped, "page-scoped state travels with the SWA pages"
+        return request_scoped_state_transfer_indices(
+            req_pool_idx,
+            seq_len,
+            ratio=self.ratio,
+            online=self.online,
+            ring_size=self.ring_size,
+        )
+
+    def _alloc_kv_score_buffer(
+        self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
+    ) -> None:
+        """Allocate the flat ``(self._size, self.last_dim)`` kv+score buffer
+        under the memory-saver / custom-mem-pool context and wrap it in
+        :class:`KVAndScore`. Sets ``self.memory_saver_adapter``,
+        ``self.custom_mem_pool`` and ``self.kv_score_buffer``.
+
+        The shared constructor computes ``self._size`` and ``self.last_dim``
+        before entering this helper. Backend subclasses should normally call
+        that constructor instead of duplicating this allocation path.
+        """
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=device)
+        )
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_score_buffer = KVAndScore(
+                    torch.empty(
+                        (self._size, self.last_dim),
+                        dtype=dtype,
+                        device=device,
                     )
-                    if not online:
-                        self.kv_score_buffer[-1].clear()
+                )
+
+    @property
+    def state_cache_3d(self) -> torch.Tensor:
+        """``[block_num, page_size, last_dim]`` view of the flat kv+score
+        buffer. ``last_dim = 2*(1+overlap)*head_dim`` — exactly the
+        ``2*coff*D`` layout the fused compressor op wants for its
+        ``state_cache`` argument (kv at ``[:, :, :coff*D]``, score at
+        ``[:, :, coff*D:]``). Only valid for the non-online buffer; the
+        online layout has ``last_dim = 3*head_dim`` which the fused path
+        doesn't use.
+        """
+        assert not self.online, (
+            "state_cache_3d is for the fused compressor path; "
+            "online (3*head_dim) buffer is indexer-only."
+        )
+        assert self.page_size > 1, (
+            "state_cache_3d requires page_size>1; pool was constructed "
+            "with the default page_size=1 (flat 2D layout)."
+        )
+        return self.kv_score_buffer.kv_score.view(-1, self.page_size, self.last_dim)
 
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor
@@ -138,6 +263,13 @@ class CompressStatePool:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
         state_loc = torch.where(swa_loc < 0, -1, state_loc)
+        return state_loc
+
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
+        state_loc = torch.where(positions < 0, -1, state_loc)
         return state_loc
 
     def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:

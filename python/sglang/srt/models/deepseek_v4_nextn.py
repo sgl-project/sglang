@@ -6,11 +6,17 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import (
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
-    dp_gather_partial,
-    get_attention_dp_size,
+    dp_gather_replicate,
+    get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -18,13 +24,19 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    _is_npu,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -77,21 +89,26 @@ class DeepseekV4ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("h_proj", prefix),
         )
-
-        layer_name = "decoder"
+        if isinstance(quant_config, ModelSlimConfig):
+            prefix = "mtp.0"
+        else:
+            prefix = add_prefix("decoder", prefix)
 
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
+            prefix=prefix,
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
 
     def hc_head(
         self,
@@ -134,24 +151,52 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
-        if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
+        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Token IDs are replicated within an attention-TP group. Use replicate
+            # gather to avoid summing duplicated IDs when attention_tp_size > 1.
+            # Clone because the MAX_LEN gather may zero its local input in place.
+            dp_gather_replicate(
+                input_ids_global, input_ids[:, None].clone(), forward_batch
+            )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            input_ids_global = input_ids
+            input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
-        hidden_states = self.decoder(
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        if use_prefill_cp and is_cp_active(forward_batch):
+            attn_backend = get_attn_backend()
+            if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                local_positions = getattr(
+                    forward_batch, "dsv4_cp_local_positions", None
+                )
+                if (
+                    local_positions is not None
+                    and positions.shape[0] == local_positions.shape[0]
+                ):
+                    forward_batch.positions = positions
+
+        if _is_npu:
+            # Same per-forward rope prime as DeepseekV4Model.forward: the
+            # decoder layer reads the memoized gather instead of re-gathering.
+            prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
+
+        hidden_states, residual, post, comb = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if residual is not None:
+            # NextN has a single decoder layer, so no later layer can consume a
+            # deferred fused hc_post state.
+            hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -164,7 +209,6 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -173,7 +217,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
@@ -186,7 +230,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

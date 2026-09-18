@@ -283,10 +283,7 @@ def _format_non_tensor_rich_body(
     target_val: str = escape(record.target_value)
 
     if record.values_equal:
-        return (
-            f"═ {name}{suffix} = {baseline_val} "
-            f"({record.baseline_type}) [green]✓[/]"
-        )
+        return f"═ {name}{suffix} = {baseline_val} ({record.baseline_type}) [green]✓[/]"
     return (
         f"═ [bold red]{name}{suffix}[/]\n"
         f"  baseline = {baseline_val} ({record.baseline_type})\n"

@@ -4,15 +4,44 @@ from transformers import (
     Cache,
     DynamicCache,
 )
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+    WeightOnlyFP8ColumnParallelLinear,
+    WeightOnlyFP8Linear,
+    WeightOnlyFP8RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
+    Qwen3VLVisionTransformer,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    apply_qwen_vl_text_rope,
+    build_qwen_vl_text_rope,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.common import add_prefix
+from sglang.srt.layers.layernorm import RMSNorm
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
@@ -37,56 +66,232 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLModelOutputWithPast,
-    Qwen3VLTextRMSNorm,
-    Qwen3VLTextRotaryEmbedding,
-    Qwen3VLVisionModel,
-    apply_rotary_pos_emb,
 )
+
+
+def _make_text_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
+    return RMSNorm(
+        hidden_size,
+        eps=eps,
+        cast_x_before_out_mul=True,
+        force_native=True,
+    )
+
+
+class Qwen3VLQuantizedLinear(ReplicatedLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+class Qwen3VLColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+class Qwen3VLRowParallelLinear(RowParallelLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+def _tp_world_size() -> int:
+    if not model_parallel_is_initialized():
+        return 1
+    return get_tp_world_size()
+
+
+def _make_text_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool,
+    quant_config: QuantizationConfig | None,
+    use_weight_only_fp8: bool,
+    use_tensor_parallel: bool,
+    gather_output: bool,
+    prefix: str,
+):
+    tp_size = _tp_world_size()
+    use_column_parallel = (
+        use_tensor_parallel and tp_size > 1 and out_features % tp_size == 0
+    )
+    if use_weight_only_fp8:
+        if use_column_parallel:
+            return WeightOnlyFP8ColumnParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                gather_output=gather_output,
+                enable_fused_w8a8=False,
+            )
+        return WeightOnlyFP8Linear(
+            in_features, out_features, bias=bias, enable_fused_w8a8=False
+        )
+    if quant_config is not None:
+        if use_column_parallel:
+            return Qwen3VLColumnParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                gather_output=gather_output,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return Qwen3VLQuantizedLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if use_column_parallel:
+        return Qwen3VLColumnParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            gather_output=gather_output,
+            quant_config=None,
+            prefix=prefix,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def _make_text_row_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool,
+    quant_config: QuantizationConfig | None,
+    use_weight_only_fp8: bool,
+    use_tensor_parallel: bool,
+    prefix: str,
+):
+    tp_size = _tp_world_size()
+    use_row_parallel = (
+        use_tensor_parallel and tp_size > 1 and in_features % tp_size == 0
+    )
+    if use_row_parallel and quant_config is not None:
+        use_row_parallel = quant_config.supports_input_partition(
+            prefix, in_features // tp_size
+        )
+    if use_weight_only_fp8:
+        if use_row_parallel:
+            return WeightOnlyFP8RowParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                input_is_parallel=True,
+                enable_fused_w8a8=False,
+            )
+        return WeightOnlyFP8Linear(
+            in_features, out_features, bias=bias, enable_fused_w8a8=False
+        )
+    if use_row_parallel:
+        return Qwen3VLRowParallelLinear(
+            input_size=in_features,
+            output_size=out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if quant_config is not None:
+        return Qwen3VLQuantizedLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def _gather_tensor_parallel_activation(
+    x: torch.Tensor, linear: nn.Module
+) -> torch.Tensor:
+    tp_group = getattr(linear, "tp_group", None)
+    if tp_group is None:
+        return x
+    return tensor_model_parallel_all_gather(x, tp_group=tp_group)
 
 
 class Qwen3VLTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+        layer_idx: int,
+        quant_config: QuantizationConfig | None = None,
+        use_weight_only_fp8: bool = False,
+        use_tensor_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = (
+            int(config.head_dim)
+            if getattr(config, "head_dim", None) is not None
+            else config.hidden_size // config.num_attention_heads
         )
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_key_value_heads = config.num_key_value_heads
+        tp_size = _tp_world_size() if use_tensor_parallel else 1
+        use_tensor_parallel = (
+            use_tensor_parallel
+            and tp_size > 1
+            and self.total_num_heads % tp_size == 0
+            and self.total_num_key_value_heads % tp_size == 0
+        )
+        self.tp_size = tp_size if use_tensor_parallel else 1
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.num_key_value_heads = self.total_num_key_value_heads // self.tp_size
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
 
-        self.q_proj = nn.Linear(
+        self.q_proj = _make_text_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             bias=config.attention_bias,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            gather_output=False,
+            prefix=f"{prefix}.q_proj",
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = _make_text_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            gather_output=False,
+            prefix=f"{prefix}.k_proj",
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = _make_text_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            gather_output=False,
+            prefix=f"{prefix}.v_proj",
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = _make_text_row_linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
+        self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.rotary_emb = build_qwen_vl_text_rope(config, mrope_interleaved=True)
 
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -103,7 +308,7 @@ class Qwen3VLTextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -120,14 +325,15 @@ class Qwen3VLTextAttention(nn.Module):
         ).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
+        query_states, key_states = apply_qwen_vl_text_rope(
+            self.rotary_emb,
+            position_ids,
+            query_states,
+            key_states,
         )
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -150,45 +356,109 @@ class Qwen3VLTextAttention(nn.Module):
         attn_output = self.attn(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        if not isinstance(
+            self.o_proj, (Qwen3VLRowParallelLinear, WeightOnlyFP8RowParallelLinear)
+        ):
+            attn_output = _gather_tensor_parallel_activation(attn_output, self.q_proj)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
 
 class Qwen3VLTextMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        use_weight_only_fp8: bool = False,
+        use_tensor_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = _make_text_linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            gather_output=False,
+            prefix=f"{prefix}.gate_proj",
+        )
+        self.up_proj = _make_text_linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            gather_output=False,
+            prefix=f"{prefix}.up_proj",
+        )
+        self.down_proj = _make_text_row_linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            prefix=f"{prefix}.down_proj",
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        if not isinstance(
+            self.down_proj, (Qwen3VLRowParallelLinear, WeightOnlyFP8RowParallelLinear)
+        ):
+            hidden_states = _gather_tensor_parallel_activation(
+                hidden_states, self.gate_proj
+            )
+        down_proj = self.down_proj(hidden_states)
         return down_proj
 
 
 class Qwen3VLTextDecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+        layer_idx: int,
+        quant_config: QuantizationConfig | None = None,
+        use_weight_only_fp8: bool = False,
+        use_tensor_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
-
-        self.mlp = Qwen3VLTextMLP(config)
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.self_attn = Qwen3VLTextAttention(
+            config=config,
+            layer_idx=layer_idx,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            prefix=f"{prefix}.self_attn",
         )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+
+        self.mlp = Qwen3VLTextMLP(
+            config,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
+            use_tensor_parallel=use_tensor_parallel,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.post_attention_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -206,7 +476,6 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -220,26 +489,53 @@ class Qwen3VLTextDecoderLayer(nn.Module):
 
 
 class Qwen3VLTextModel(nn.Module):
+    # used only as `self.embed_tokens(input_ids)`; no tied output head here
+    host_resident_table_names = ["embed_tokens"]
     config: Qwen3VLTextConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
 
-    def __init__(self, config: Qwen3VLTextConfig):
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+        quant_config: QuantizationConfig | None = None,
+        use_weight_only_fp8: bool = False,
+        use_tensor_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        embedding_prefix = add_prefix("embed_tokens", prefix)
+        if quant_config is not None and quant_config.quantizes_embedding(
+            embedding_prefix
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=embedding_prefix,
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx
+            )
         self.layers = nn.ModuleList(
             [
-                Qwen3VLTextDecoderLayer(config, layer_idx)
+                Qwen3VLTextDecoderLayer(
+                    config,
+                    layer_idx,
+                    quant_config=quant_config,
+                    use_weight_only_fp8=use_weight_only_fp8,
+                    use_tensor_parallel=use_tensor_parallel,
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
+        self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -315,24 +611,10 @@ class Qwen3VLTextModel(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
-
-        attention_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
-        )
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # decoder layers
@@ -340,11 +622,10 @@ class Qwen3VLTextModel(nn.Module):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=text_position_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
             # hidden_states = layer_outputs
@@ -390,7 +671,8 @@ class Qwen3VLTextModel(nn.Module):
     ):
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+        local_this = hidden_states[visual_pos_masks, :]
+        local_this.add_(visual_embeds)
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
@@ -403,10 +685,31 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        use_tensor_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
-        self.language_model = Qwen3VLTextModel(config.text_config)
+        vision_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.supports_srt_linear_layers
+            else None
+        )
+        self.visual = Qwen3VLVisionTransformer(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
+        self.language_model = Qwen3VLTextModel(
+            config.text_config,
+            quant_config=quant_config,
+            use_tensor_parallel=use_tensor_parallel,
+            prefix=add_prefix("language_model", prefix),
+        )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
 
@@ -607,6 +910,14 @@ class Qwen3VLModel(nn.Module):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
+    def _get_flat_visual_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        grid_thw: Optional[torch.LongTensor],
+    ):
+        visual_out = self.visual(pixel_values, grid_thw=grid_thw)
+        return visual_out.pooler_output, visual_out.deepstack_features
+
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -621,10 +932,9 @@ class Qwen3VLModel(nn.Module):
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
         """
-        pixel_values = pixel_values.type(self.visual.dtype)
-        visual_out = self.visual(pixel_values, grid_thw=image_grid_thw)
-        image_embeds = visual_out.pooler_output
-        deepstack_image_embeds = visual_out.deepstack_features
+        image_embeds, deepstack_image_embeds = self._get_flat_visual_features(
+            pixel_values, image_grid_thw
+        )
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()
@@ -735,35 +1045,40 @@ class Qwen3VLModel(nn.Module):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        if inputs_embeds is None:
+        inputs_embeds_owned = inputs_embeds is None
+        if inputs_embeds_owned:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         image_mask = None
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(  # long
+            image_embeds, deepstack_image_embeds = self._get_flat_visual_features(
                 pixel_values, image_grid_thw
             )
-            image_embeds = torch.cat(image_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            if inputs_embeds_owned:
+                inputs_embeds.masked_scatter_(image_mask, image_embeds)
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                inputs_embeds_owned = True
 
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.get_video_features(
+            video_embeds, deepstack_video_embeds = self._get_flat_visual_features(
                 pixel_values_videos, video_grid_thw
             )
-            video_embeds = torch.cat(video_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if inputs_embeds_owned:
+                inputs_embeds.masked_scatter_(video_mask, video_embeds)
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                inputs_embeds_owned = True
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -779,8 +1094,8 @@ class Qwen3VLModel(nn.Module):
                 deepstack_image_embeds, deepstack_video_embeds
             ):
                 embed_joint = img_embed.new_zeros(
-                    visual_pos_masks.sum(), img_embed.shape[-1]
-                ).to(img_embed.device)
+                    img_embed.shape[0] + vid_embed.shape[0], img_embed.shape[-1]
+                )
                 embed_joint[image_mask_joint, :] = img_embed
                 embed_joint[video_mask_joint, :] = vid_embed
                 deepstack_visual_embeds.append(embed_joint)
@@ -876,6 +1191,7 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",
@@ -905,6 +1221,12 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+        if getattr(config, "tie_word_embeddings", False) or getattr(
+            config.text_config, "tie_word_embeddings", False
+        ):
+            # Tied checkpoints may omit lm_head.weight, as Hugging Face does.
+            # Keep one registered parameter so strict native loading stays safe.
+            self.lm_head.weight = self.model.get_input_embeddings().weight
 
     @torch.no_grad()
     def forward(
@@ -987,6 +1309,8 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if "visual." in name:
+                name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
 
             try:
                 param = params_dict[name]

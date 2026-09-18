@@ -26,7 +26,8 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
-    allocate_token_bitmask,
+    bitmask_dtype,
+    get_bitmask_shape,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -35,31 +36,45 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.torch_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_torch,
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
+
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
-    from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    from sglang.kernels.ops.grammar.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
     )
 
+from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
-from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
-class XGrammarGrammar(BaseGrammarObject):
+def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
+    # Pin where pinning exists, so the later H2D can be a genuine non_blocking
+    # copy (a pageable source silently downgrades it).  MPS torch has no
+    # pin-memory kernel and asserts on pin_memory=True.
+    return torch.full(
+        get_bitmask_shape(batch_size, vocab_size),
+        -1,
+        dtype=bitmask_dtype,
+        pin_memory=is_pin_memory_available(),
+    )
 
+
+class XGrammarGrammar(BaseGrammarObject):
     def __init__(
         self,
         matcher: GrammarMatcher,
@@ -102,7 +117,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
@@ -118,7 +133,15 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            apply_token_bitmask_inplace_torch(logits, vocab_mask)
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type == "cpu":
+            # Used by the MLX backend, which builds its additive mask rows
+            # on the CPU before inserting them into the lazy graph.
+            from xgrammar import apply_token_bitmask_inplace
+
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -228,7 +251,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return _allocate_token_bitmask(vocab_size, batch_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -320,11 +343,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                # Inspect the decoded schema for semantic loss, then give the
+                # original string to XGrammar to preserve its parser behavior.
+                schema = json.loads(key_string)
+                validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
 
-        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
+        except (
+            RuntimeError,
+            UnsupportedJSONSchemaFeature,
+            json.decoder.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))

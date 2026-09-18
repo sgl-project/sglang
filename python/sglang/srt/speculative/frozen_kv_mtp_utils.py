@@ -14,53 +14,74 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.frozen_kv_mtp_info import (
-    FrozenKVMTPContext,
-    FrozenKVMTPDraftExtendInput,
-    FrozenKVMTPDraftInput,
-)
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 
 @contextmanager
-def frozen_kv_target_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPContext):
-    """Build attention metadata against committed target-prefix geometry."""
+def frozen_kv_target_view(
+    forward_batch: ForwardBatch,
+    kv_context: FrozenKVMTPContext,
+    draft_attn_backend: AttentionBackend,
+):
+    """Build attention metadata against committed target-prefix geometry.
+
+    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool
+    so any helper that reads ``get_token_to_kv_pool()`` during metadata init
+    sees the frozen target pool. Pool refs are derived from
+    ``get_attn_backend().token_to_kv_pool`` — the single backend-attribute
+    swap is seen by both readers (``get_token_to_kv_pool()`` and the
+    backend's own ``self.token_to_kv_pool``).
+    """
     if kv_context is None:
         raise RuntimeError(
             "Frozen-KV MTP target view called before the model was bound; "
             "bind the frozen KV context first."
         )
     saved_spec_info = forward_batch.spec_info
-    saved_kv_pool = forward_batch.token_to_kv_pool
     forward_batch.spec_info = None
-    forward_batch.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
         forward_batch.spec_info = saved_spec_info
-        forward_batch.token_to_kv_pool = saved_kv_pool
+        draft_attn_backend.token_to_kv_pool = saved_backend_pool
 
 
 @contextmanager
-def target_kv_pool_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPContext):
+def target_kv_pool_view(
+    forward_batch: ForwardBatch,
+    kv_context: FrozenKVMTPContext,
+    draft_attn_backend: AttentionBackend,
+):
+    """Run the draft model's forward with the target's frozen KV pool.
+
+    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool.
+    The single backend-attribute swap is seen by both readers —
+    ``get_token_to_kv_pool()`` (because it resolves through
+    ``get_attn_backend()``) and the backend's own ``self.token_to_kv_pool``
+    reads (because ``self is draft_attn_backend``).
+    """
     if kv_context is None:
         raise RuntimeError(
             "Frozen-KV MTP target KV pool view called before the model was bound; "
             "bind the frozen KV context first."
         )
-    saved_kv_pool = forward_batch.token_to_kv_pool
-    forward_batch.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
-        forward_batch.token_to_kv_pool = saved_kv_pool
+        draft_attn_backend.token_to_kv_pool = saved_backend_pool
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
@@ -108,9 +129,11 @@ def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
 
     positions = torch.clamp(forward_batch.seq_lens - 1, min=0).to(torch.int64)
     forward_batch.positions = positions
-    forward_batch.num_token_non_padded_cpu = positions.numel()
-    if forward_batch.num_token_non_padded is not None:
-        forward_batch.num_token_non_padded.fill_(positions.numel())
+    forward_batch.global_num_token_non_padded_cpu = positions.numel()
+    # Bump the GLOBAL scalar; the LOCAL count is derived from it when the draft
+    # forward localizes (eager prep / graph replay).
+    if forward_batch.global_num_token_non_padded is not None:
+        forward_batch.global_num_token_non_padded.fill_(positions.numel())
     if (
         forward_batch.mrope_positions is not None
         and forward_batch.mrope_positions.shape[-1] * topk == positions.numel()
@@ -132,22 +155,3 @@ def select_last_extend_hidden(
     lens = torch.tensor(batch.extend_lens, device=hidden_states.device)
     last_indices = torch.cumsum(lens, dim=0) - 1
     return hidden_states[last_indices.to(torch.long)]
-
-
-def select_last_verified_seed(
-    draft_input: FrozenKVMTPDraftExtendInput,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    counts = draft_input.num_accept_tokens.to(torch.long)
-    last_indices = torch.cumsum(counts, dim=0) - 1
-    return (
-        draft_input.input_ids[last_indices],
-        draft_input.hidden_states[last_indices],
-    )
-
-
-def capture_for_decode(
-    logits_output: LogitsProcessorOutput, draft_input: FrozenKVMTPDraftInput, topk: int
-) -> None:
-    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-    draft_input.topk_p, draft_input.topk_index = fast_topk(probs, topk, dim=-1)
-    draft_input.hidden_states = logits_output.hidden_states
