@@ -5,6 +5,9 @@ import triton
 import triton.language as tl
 
 _DRAFT_TOPK1_BLOCK = 8192
+# Above this many rows one block per row already fills the GPU, so row_argmax
+# hands the reduction back to torch.
+_ROW_ARGMAX_ROW_LIMIT = 32
 
 
 @triton.jit
@@ -69,6 +72,90 @@ def _draft_topk1_finalize_kernel(
 
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
+
+
+@triton.jit
+def _row_argmax_finalize_kernel(
+    partial_vals,
+    partial_indices,
+    out_indices,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_splits
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    split = tl.argmax(vals, axis=0)
+    index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
+    tl.store(out_indices + row, index)
+
+
+def _partial_argmax_block(rows: int, vocab_size: int) -> int:
+    """Widest partial that still spreads the rows over the whole GPU."""
+    block = _DRAFT_TOPK1_BLOCK
+    while block > 2048 and rows * triton.cdiv(vocab_size, block) < 256:
+        block //= 2
+    return block
+
+
+def row_argmax(values: torch.Tensor) -> torch.Tensor:
+    """``values.argmax(dim=-1, keepdim=True)`` with the row split across CTAs.
+
+    Same reason as draft_topk1_postprocess: torch walks one block per row, so a
+    vocab-wide row at the speculative row counts leaves the GPU idle. MI355X,
+    vocab 154880, under CUDA graph replay: 19.7 -> 11.2 us at 1 row, 39.1 -> 11.4
+    at 2, 38.7 -> 11.4 at 32. Eager at 1 row is a 2.3x LOSS (12.6 -> 29.0): torch
+    has a fast path there and the three launches are not amortized, so this pays
+    off only under graph capture, which is how decode runs. Ties go to
+    the lowest index, which is also what the split reduction above guarantees and
+    ROCm's argmax does not (#26358). Falls back to torch for the shapes the split
+    does not pay for, so callers can use it unconditionally.
+    """
+    if (
+        values.ndim != 2
+        or values.dtype != torch.float32
+        or values.shape[0] == 0
+        or values.shape[0] > _ROW_ARGMAX_ROW_LIMIT
+        or values.stride(1) != 1
+        or not values.is_cuda
+    ):
+        return values.argmax(dim=-1, keepdim=True)
+
+    bs, vocab_size = values.shape
+    block = _partial_argmax_block(bs, vocab_size)
+    num_splits = triton.cdiv(vocab_size, block)
+    partial_vals = torch.empty(
+        (bs, num_splits), dtype=torch.float32, device=values.device
+    )
+    partial_indices = torch.empty(
+        (bs, num_splits), dtype=torch.int32, device=values.device
+    )
+    out_indices = torch.empty((bs, 1), dtype=torch.int64, device=values.device)
+
+    _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
+        values,
+        partial_vals,
+        partial_indices,
+        values.stride(0),
+        vocab_size,
+        num_splits,
+        BLOCK=block,
+        num_warps=8,
+    )
+    _row_argmax_finalize_kernel[(bs,)](
+        partial_vals,
+        partial_indices,
+        out_indices,
+        num_splits,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    return out_indices
 
 
 def draft_topk1_postprocess(
