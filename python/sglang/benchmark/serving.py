@@ -1858,9 +1858,7 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             **cache_protocol,
-            "total_cached_tokens": sum(
-                o.cached_tokens for o in outputs if o.success
-            ),
+            "total_cached_tokens": sum(o.cached_tokens for o in outputs if o.success),
         }
 
         if args.cache_report:

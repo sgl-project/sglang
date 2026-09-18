@@ -75,21 +75,21 @@ class TestBenchmarkCacheProtocolRecord(unittest.TestCase):
             },
         )
         self.assertEqual(
-            resolve_benchmark_cache_protocol(
-                "sglang", False, ci_env="1"
-            )["flushed_cache"],
+            resolve_benchmark_cache_protocol("sglang", False, ci_env="1")[
+                "flushed_cache"
+            ],
             True,
         )
         self.assertEqual(
-            resolve_benchmark_cache_protocol(
-                "sglang", False, ci_env="true"
-            )["cache_flush_reason"],
+            resolve_benchmark_cache_protocol("sglang", False, ci_env="true")[
+                "cache_flush_reason"
+            ],
             "ci",
         )
         self.assertEqual(
-            resolve_benchmark_cache_protocol(
-                "sglang", False, ci_env=None
-            )["flushed_cache"],
+            resolve_benchmark_cache_protocol("sglang", False, ci_env=None)[
+                "flushed_cache"
+            ],
             False,
         )
 
