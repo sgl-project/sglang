@@ -234,7 +234,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
+        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -283,7 +283,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
+        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -331,7 +331,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         cache.token_to_kv_pool_allocator.reset_mock()
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
+            req, is_insert=False, owned_kv_len=req.kv.kv_committed_len
         )
 
         free_call = cache.token_to_kv_pool_allocator.free_segment.call_args
@@ -345,6 +345,53 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertEqual(cache.protected_size(), 0)
         # Prefix tokens should still be in tree and evictable
         self.assertEqual(cache.evictable_size(), len(prefix))
+
+    def test_insert_releases_committed_slot_without_token_id(self):
+        """The insert path releases up to owned_kv_len, not len(token_ids).
+
+        Pins the ownership contract on BasePrefixCache.cache_finished_req.
+        """
+        cache, req_to_token = _make_cache_with_pools()
+
+        prefix = [1, 2, 3]
+        prefix_vals = [10, 20, 30]
+        self._populate_prefix(cache, prefix, prefix_vals)
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        matched_node = result.last_device_node
+        prefix_len = len(result.device_indices)
+        cache.inc_lock_ref(matched_node)
+
+        # Token sequence is 5 long; a 6th KV slot is committed with no token id.
+        full_ids = [1, 2, 3, 4, 5]
+        row_vals = [10, 20, 30, 40, 50, 60]
+        req_to_token[0, : len(row_vals)] = torch.tensor(row_vals, dtype=torch.int64)
+
+        req = _make_req(
+            fill_ids=full_ids,
+            req_pool_idx=0,
+            cache_protected_len=prefix_len,
+            last_node=matched_node,
+        )
+        req.kv.kv_committed_len = len(row_vals)
+        req.kv.kv_allocated_len = len(row_vals)
+
+        cache.token_to_kv_pool_allocator.reset_mock()
+        cache.cache_finished_req(
+            req, is_insert=True, owned_kv_len=req.kv.kv_committed_len
+        )
+
+        # The unnamed tail slot is freed as the segment past the radix key.
+        segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
+        freed = {
+            int(start_pos) + i: int(v)
+            for indices, start_pos in segments
+            for i, v in enumerate(indices.tolist())
+        }
+        self.assertIn(
+            len(full_ids), freed, "committed slot with no token id was not freed"
+        )
+        self.assertEqual(freed[len(full_ids)], row_vals[-1])
 
     def test_full_transfer_failure(self):
         """Scenario 4: no prefix match, transfer fails.
@@ -384,7 +431,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
+            req, is_insert=False, owned_kv_len=req.kv.kv_committed_len
         )
 
         # Root lock unchanged, nothing protected or evictable
@@ -572,7 +619,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
+            cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

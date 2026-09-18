@@ -292,6 +292,7 @@ from sglang.srt.mem_cache.common import (
     retraction_discard,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -1134,6 +1135,7 @@ class Scheduler(
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
+            prewarm_graph_pool_borrow()
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
@@ -2190,11 +2192,14 @@ class Scheduler(
 
         request_errors = []
         for tokenized_req in tokenized_reqs:
+            # The request broadcast makes this skip consistent across ranks.
+            if tokenized_req.mm_inputs is None:
+                request_errors.append(None)
+                continue
+
             local_error = None
             try:
-                if tokenized_req.mm_inputs is not None and not isinstance(
-                    tokenized_req.mm_inputs, MultimodalInputs
-                ):
+                if not isinstance(tokenized_req.mm_inputs, MultimodalInputs):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
