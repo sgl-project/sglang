@@ -1669,7 +1669,8 @@
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables"
+                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/production_metrics"
                 ]
               },
               {
