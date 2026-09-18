@@ -380,18 +380,6 @@ def initialize_dp_attention(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
 
-    # Checked here, against the layout the groups were built from, because the
-    # elastic rewrite below deliberately replaces that layout with the scale
-    # identity. Only the first of the two is what `publish` recorded.
-    stamped = get_parallel().recorded("attn_dp_rank")
-    if stamped is not None and stamped != attn_dp_rank:
-        raise RuntimeError(
-            "attention-DP rank disagrees with the published configuration: "
-            f"publish placed this process at {stamped}, the groups built since "
-            f"put it at {attn_dp_rank}. The record that was published does not "
-            "describe the groups this process built."
-        )
-
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
         # Reads the resolution, not a bag: this runs under

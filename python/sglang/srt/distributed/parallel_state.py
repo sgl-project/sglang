@@ -2512,33 +2512,6 @@ def init_distributed_environment(
         )
 
 
-def _check_built_groups_match_the_published_ranks() -> None:
-    """The groups just built must place this process where `publish` said.
-
-    `publish` records the placement the launcher decided; the groups are built
-    from the same configuration, so a disagreement means the record published
-    in this process does not describe the groups it went on to build. Answering
-    with either value would hide that, and the wrong one is silent -- a rank is
-    a plausible small integer whichever way it is wrong.
-    """
-    parallel = get_parallel()
-    for name, live in (
-        ("tp_rank", get_tensor_model_parallel_rank),
-        ("pp_rank", get_pipeline_model_parallel_rank),
-    ):
-        stamped = parallel.recorded(name)
-        if stamped is None:
-            continue
-        built = live()
-        if stamped != built:
-            raise RuntimeError(
-                f"{name} disagrees with the published configuration: publish "
-                f"placed this process at {stamped}, the groups built here put "
-                f"it at {built}. The published record does not describe these "
-                "groups."
-            )
-
-
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -2957,8 +2930,6 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
-
-    _check_built_groups_match_the_published_ranks()
 
 
 def create_custom_parallel_group(

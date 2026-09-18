@@ -801,23 +801,18 @@ class ModelRunner:
             enable_batch_invariant_mode()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        # Asks this runner's own record, not the context: a draft runner is
-        # built under `draft_pp_context` but these are called from graph
-        # capture, which is outside it, so the context would report the
-        # target's pipeline shape for a runner that has none.
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
-            pp_size=self.ps.pp_size,
-            pp_rank=self.ps.pp_rank,
+            pp_size=get_parallel().pp_size,
+            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
-        # See `get_pp_proxy_topk_size` for why this is the runner's record.
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
-            pp_size=self.ps.pp_size,
-            pp_rank=self.ps.pp_rank,
+            pp_size=get_parallel().pp_size,
+            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 

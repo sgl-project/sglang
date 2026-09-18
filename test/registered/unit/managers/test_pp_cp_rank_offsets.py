@@ -39,13 +39,14 @@ def _make_ps(**overrides) -> ParallelState:
 def _published_topology():
     """The topology `_make_ps` describes, published instead of stood in.
 
-    `tp_rank=4` is what puts this process at `attn_dp_rank=1` with
-    `attn_tp_rank=0`: the context derives both from the rank and the widths,
-    where the record above had to be handed each of them.
+    World rank 12 of a `tp=8, pp=2` world is `tp_rank=4` on the second stage,
+    which puts this process at `attn_dp_rank=1` with `attn_tp_rank=0`: the
+    context derives all of them from that one number and the widths, where the
+    record above had to be handed each.
     """
     return published_topology(
         role="scheduler",
-        ranks={"tp_rank": 4, "pp_rank": 1, "dp_rank": 1},
+        ranks={"world_rank": 12, "dp_rank": 1},
         tp_size=8,
         pp_size=2,
         dp_size=2,
@@ -180,6 +181,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
+        enter_scope(self, _published_topology())
         calls = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):

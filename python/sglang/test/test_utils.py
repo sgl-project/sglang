@@ -2015,22 +2015,14 @@ def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
     widths honest: a hand-built double can claim an `attn_tp_size` the
     configuration would never produce.
 
-    `ranks` overrides individual spawn identities; by default this process is
-    rank zero of everything. The context is reset on exit, including when the
+    `ranks` overrides the spawn identities; by default this process is rank
+    zero of the world, which fixes every other rank. The context is reset on exit, including when the
     test fails.
     """
     from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
     from sglang.srt.server_args import ServerArgs
 
-    bundle = dict(
-        gpu_id=0,
-        tp_rank=0,
-        pp_rank=0,
-        dp_rank=None,
-        attn_cp_rank=0,
-        moe_dp_rank=0,
-        moe_ep_rank=0,
-    )
+    bundle = dict(world_rank=0, dp_rank=None)
     bundle.update(ranks or {})
     server_args = ServerArgs(model_path="dummy", **server_args_fields)
     reset_context()

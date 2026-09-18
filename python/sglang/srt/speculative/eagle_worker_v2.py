@@ -338,6 +338,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_attention_backends(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -347,6 +348,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_cuda_graphs(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),

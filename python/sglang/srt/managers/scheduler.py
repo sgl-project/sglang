@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     publish,
+    spawn_world_rank,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -778,7 +779,7 @@ class Scheduler(
             if get_parallel().pp_size > 1:
                 logger.error("only zbal mix mode support pp_size > 1!")
             init_zbal(
-                get_parallel().tp_size, get_parallel().gpu_id, get_parallel().tp_rank
+                get_parallel().tp_size, self.ps.gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
 
     def init_model_config(self):
@@ -1009,7 +1010,7 @@ class Scheduler(
     def init_tp_model_worker(self):
         worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=get_parallel().gpu_id,
+            gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
         )
@@ -1047,7 +1048,7 @@ class Scheduler(
         # — is resolved per runner, not on a config copy.
         draft_worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=get_parallel().gpu_id,
+            gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
@@ -1237,7 +1238,7 @@ class Scheduler(
 
         # Print debug info
         self.startup_available_gpu_memory_gb = get_available_gpu_memory(
-            self.device, get_parallel().gpu_id, empty_cache=False
+            self.device, self.ps.gpu_id, empty_cache=False
         )
         if get_parallel().tp_rank == 0:
             logger.info(
@@ -1573,7 +1574,7 @@ class Scheduler(
                 tp_rank=get_parallel().tp_rank,
                 tp_size=get_parallel().tp_size,
                 dp_size=get_parallel().dp_size,
-                gpu_id=get_parallel().gpu_id,
+                gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 pp_rank=get_parallel().pp_rank,
@@ -1604,7 +1605,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=get_parallel().tp_rank,
                 tp_size=get_parallel().tp_size,
-                gpu_id=get_parallel().gpu_id,
+                gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -6034,13 +6035,8 @@ def run_scheduler_process(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=pp_rank),
             dp_rank=dp_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            moe_ep_rank=moe_ep_rank,
         ),
     )
     configure_scheduler_process(

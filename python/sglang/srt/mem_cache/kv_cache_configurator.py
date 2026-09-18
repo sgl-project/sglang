@@ -2415,16 +2415,16 @@ class KVCacheConfigurator:
         # allocates its own [start_layer, end_layer) slice. Charge the largest
         # per-stage share so every rank derives the same pool without a collective.
         all_mamba_layers = config.mamba2_cache_params.layers
-        if get_parallel().pp_size > 1 and all_mamba_layers:
+        if self.ps.pp_size > 1 and all_mamba_layers:
             max_stage_mamba_layers = max(
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
                         self.model_config.num_hidden_layers,
                         rank,
-                        get_parallel().pp_size,
+                        self.ps.pp_size,
                     )
-                    for rank in range(get_parallel().pp_size)
+                    for rank in range(self.ps.pp_size)
                 )
             )
         else:
