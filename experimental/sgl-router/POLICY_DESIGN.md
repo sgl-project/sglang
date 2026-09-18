@@ -5,9 +5,16 @@ responsibilities and behavior; the interface and configuration examples are
 sketches, not a specification of the current API or CLI. Implementation status is
 listed at the end.
 
-The central idea is simple: **the resolver decides which engines a request may
-use, a bucket's policy chooses one of them, and admission decides whether that
-engine may accept the request.**
+The central idea is simple: **the resolver supplies eligible candidate groups.
+Each group's policy selects an engine using its attached admission checks, which
+run either before or after selection. A successful pick always returns an
+admitted engine.**
+
+Admission runs inside the policy's `pick()` operation at the configured
+placement. Before-selection admission filters candidates before the policy
+chooses an engine; after-selection admission checks the chosen engine. Migrated
+power-of-two, session-aware, cache-aware, and decode power-of-two configurations
+use before-selection admission.
 
 An engine is represented by `Worker` in the code. A bucket is a configured group
 of engines with membership rules, request limits, and an attached policy.
@@ -35,7 +42,9 @@ Order candidate groups: optional affinity group, then compatible size buckets
   v
 For each group, call its policy with that group's candidates
   |
-  +-- policy selects an engine and applies admission --> selected engine
+  +-- policy.pick() ----------------------------------> admitted engine
+  |     BeforeSelection: filter by admission, then choose
+  |     AfterSelection:  choose, then check admission
   |
   +-- empty group or admission rejection -------------> next permitted group
   |
