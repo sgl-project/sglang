@@ -1842,16 +1842,11 @@ class AscendAttnBackend(AttentionBackend):
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
 
-                # ASCEND_USE_FIA opts into CANN MLA prefix prefill. Keep ATB as
-                # the default for environments using the existing RingMLA path.
                 if self.use_fia:
-                    # FIA TND lengths are cumulative, unlike ATB RingMLA lengths.
                     query_lens = self.forward_metadata.extend_seq_lens_cpu_int
                     cu_query_lens = query_lens.cumsum(0).tolist()
                     q_nope, q_rope = q_nope.contiguous(), q_rope.contiguous()
 
-                    # Attend to the new tokens with a causal mask. FIA V2 dispatches
-                    # to the CANN implementation for both A2/A3 and Ascend 950 (A5).
                     attn_output, attn_lse = (
                         torch_npu.npu_fused_infer_attention_score_v2(
                             query=q_nope,
@@ -1872,7 +1867,6 @@ class AscendAttnBackend(AttentionBackend):
                         )
                     )
                 else:
-                    # 1st, compute extend tokens to get attn_output and attn_lse
                     num_tokens = q_nope.size(0)
                     attn_output = torch.zeros(
                         num_tokens,
@@ -1907,7 +1901,6 @@ class AscendAttnBackend(AttentionBackend):
                         softmax_lse=attn_lse,
                     )
 
-                # Load history kvcache (kv_a and k_pe) and calculate k_nope.
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_cached = torch.index_select(
@@ -1924,7 +1917,6 @@ class AscendAttnBackend(AttentionBackend):
                 k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
 
                 if self.use_fia:
-                    # Every query can attend to its entire cached prefix.
                     k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
                     prefix_lens = self.forward_metadata.prefix_lens
                     prefix_output, prefix_lse = (
@@ -1945,8 +1937,6 @@ class AscendAttnBackend(AttentionBackend):
                         )
                     )
 
-                    # Empty prefixes must have zero softmax weight, regardless of
-                    # the FIA version's LSE sentinel for an empty KV sequence.
                     query_start = 0
                     for query_end, prefix_len in zip(
                         cu_query_lens, prefix_lens.tolist()
@@ -1956,9 +1946,6 @@ class AscendAttnBackend(AttentionBackend):
                             prefix_lse[query_start:query_end].fill_(-float("inf"))
                         query_start = query_end
 
-                    # FIA returns LSE in [T, N, 1], matching the [T*N, D] order
-                    # required by AttentionUpdate. Merge in FP32 before casting
-                    # back to the query dtype, preserving the RingMLA semantics.
                     attn_output, _ = torch_npu.npu_attention_update(
                         (attn_lse.reshape(-1), prefix_lse.reshape(-1)),
                         (
@@ -1969,7 +1956,6 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_output = attn_output.to(q.dtype)
                 else:
-                    # 3rd, compute history kv to attn_out
                     k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
                     seq_len = torch.stack(
                         [

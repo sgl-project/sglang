@@ -763,8 +763,6 @@ class TestCommonTemplate(unittest.TestCase):
 
 
 class TestMlaPrefixFia(unittest.TestCase):
-    """Compare the real prefix branch with dense, prefix-first attention."""
-
     @staticmethod
     def _fia_reference(**kwargs):
         q, k, v = (kwargs[name] for name in ("query", "key", "value"))
@@ -781,7 +779,6 @@ class TestMlaPrefixFia(unittest.TestCase):
         q_start = kv_start = 0
         for q_end, kv_end in zip(kwargs["actual_seq_qlen"], kwargs["actual_seq_kvlen"]):
             if kv_start == kv_end:
-                # Some kernel versions use a positive sentinel for empty KV.
                 output[q_start:q_end] = float("nan")
                 lse[q_start:q_end] = float("inf")
             else:
@@ -869,7 +866,6 @@ class TestMlaPrefixFia(unittest.TestCase):
         v = torch.randn(tokens + padding, heads, 144, dtype=dtype)[..., :128]
         q.mul_(magnitude)
         k.mul_(magnitude)
-        # Nontrivial page order catches accidental use of the whole KV pool.
         cached = torch.randn(prefix_tokens + 3, 1, 32, dtype=dtype)
         cached_rope = torch.randn(prefix_tokens + 3, 1, 1, 64, dtype=dtype)
         indices = torch.randperm(prefix_tokens + 3)[:prefix_tokens]
