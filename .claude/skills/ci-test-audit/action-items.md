@@ -76,13 +76,18 @@ Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 
 **B1. A test runs on the stage and runner its resources actually require.**
 Spot: CPU-only tests registered to a GPU `runner_config`; multi-GPU registrations for a
-test that launches one server; large-model accuracy suites gating every PR when a
-scheduled run would do. "Does not use a GPU" is not "can run on a CPU runner": check
-whether the file imports a CUDA-only module or `sgl_kernel` at import time before moving
-it. Examples: #34074, #33654, #33605, #34913, #33809, #36814,
-#37532, #38011, #37990, #35220.
+test that launches one server. "Does not use a GPU" is not "can run on a CPU runner":
+check whether the file imports a CUDA-only module or `sgl_kernel` at import time before
+moving it. Examples: #34074, #33654, #33605, #34913, #35220.
 
-**B2. Declared cost matches measured cost; shard counts and timeouts derive from it.**
+**B2. Trigger frequency matches signal per unit of cost: per-commit for fast, high-signal checks; nightly for model-level accuracy and perf; weekly or a shadow cadence for slow-moving coverage.**
+Spot: a multi-GPU accuracy suite registered per-commit whose failures have never been
+PR-specific; a nightly job whose result has not changed in weeks and that a weekly run
+would catch just as well; a retired platform still running daily. Demoting is not
+deleting -- the nightly and weekly grids exist to hold this coverage at the right cost.
+Examples: #38011, #37990, #33809, #36814, #37532, #34204, #37586, #31749.
+
+**B3. Declared cost matches measured cost; shard counts and timeouts derive from it.**
 Spot: an `est_time` off from the measured run by more than a small factor (the
 partitioner packs shards with it when live stats are missing); a shard count or job
 timeout that has not moved while the suite's contents have. Live stats override
