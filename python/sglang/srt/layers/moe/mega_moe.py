@@ -196,20 +196,33 @@ def _run_mega_routed(
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded if forward_batch is not None else None
         )
+        if isinstance(
+            getattr(moe.gate, "e_score_correction_bias_vl", None), torch.Tensor
+        ):
+            # V4.1 uses a different correction bias for image-token rows. The
+            # MegaMoE transport consumes the same routed ids/weights as TopK.
+            from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+            )
+        else:
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=moe.layer_id,
+                ),
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
