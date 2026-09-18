@@ -68,6 +68,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_prefill_interleaving,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -3147,6 +3148,82 @@ class TestHandleCrashDumpEnv(CustomTestCase):
                 os.path.isdir(os.path.join(preset_dir, socket.gethostname())),
                 "coredump dir not created for preset CUDA_COREDUMP_FILE",
             )
+
+
+class TestPrefillInterleavingArgs(CustomTestCase):
+    def test_cli_controls_and_validation(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for policy, flags in (
+            ("hrrn", ["--enable-prefill-interleaving"]),
+            ("shortest-prefill-first", []),
+        ):
+            with self.subTest(policy=policy):
+                parsed = parser.parse_args(
+                    [
+                        "--model-path",
+                        "dummy",
+                        "--schedule-policy",
+                        policy,
+                        "--chunked-prefill-size",
+                        "4096",
+                        "--page-size",
+                        "256",
+                        "--prefill-interleaving-min-continuation-tokens",
+                        "1024",
+                        *flags,
+                    ]
+                )
+                args = ServerArgs.from_cli_args(parsed)
+                check_prefill_interleaving(args)
+                self.assertEqual(
+                    args.prefill_interleaving_min_continuation_tokens, 1024
+                )
+                self.assertEqual(args.enable_prefill_interleaving, policy == "hrrn")
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--schedule-policy",
+                "shortest-prefill-first",
+                "--disable-prefill-interleaving",
+            ]
+        )
+        args = ServerArgs.from_cli_args(parsed)
+        check_prefill_interleaving(args)
+        self.assertTrue(args.disable_prefill_interleaving)
+
+    def test_rejects_incompatible_controls(self):
+        for overrides, message in (
+            ({"disable_prefill_interleaving": True}, "both enable and disable"),
+            ({"schedule_policy": "fcfs"}, "requires hrrn or shortest"),
+            ({"chunked_prefill_size": -1}, "requires chunked prefill"),
+            ({"disable_radix_cache": True}, "requires radix caching"),
+            ({"dllm_algorithm": "LowConfidence"}, "autoregressive prefill"),
+            ({"prefill_interleaving_min_continuation_tokens": 0}, "positive multiple"),
+            (
+                {"prefill_interleaving_min_continuation_tokens": 257},
+                "positive multiple",
+            ),
+            ({"prefill_interleaving_min_continuation_tokens": 4096}, "less than"),
+            (
+                {
+                    "enable_prefill_interleaving": False,
+                    "prefill_interleaving_min_continuation_tokens": 1024,
+                },
+                "requires prefill interleaving",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                values = dict(
+                    schedule_policy="hrrn",
+                    enable_prefill_interleaving=True,
+                    chunked_prefill_size=4096,
+                    page_size=256,
+                )
+                values.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    check_prefill_interleaving(ServerArgs(model_path="dummy", **values))
 
 
 class TestGrpcServerArgs(CustomTestCase):

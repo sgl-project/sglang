@@ -60,6 +60,18 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
+    enable_prefill_interleaving: A[
+        bool,
+        "Allow fitting waiting requests to share a pass with a continuing prefill. Supported with hrrn and shortest-prefill-first; enabled by default for shortest-prefill-first.",
+    ] = False
+    disable_prefill_interleaving: A[
+        bool,
+        "Disable prefill interleaving, including the shortest-prefill-first default.",
+    ] = False
+    prefill_interleaving_min_continuation_tokens: A[
+        Optional[int],
+        "Minimum tokens reserved for the continuing request when interleaving prefills. Defaults to one KV page. Must be a positive multiple of page_size. Without fitting waiters, the continuation uses the normal chunk budget.",
+    ] = None
     prefill_decode_interval: A[
         Optional[int],
         Arg(

@@ -244,6 +244,10 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        *,
+        enable_prefill_interleaving: bool = False,
+        disable_prefill_interleaving: bool = False,
+        prefill_interleaving_min_continuation_tokens: Optional[int] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -252,6 +256,13 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        self.prefill_interleaving = not disable_prefill_interleaving and (
+            enable_prefill_interleaving
+            or self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        )
+        self.prefill_interleaving_min_continuation_tokens = (
+            prefill_interleaving_min_continuation_tokens
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -448,27 +459,37 @@ class SchedulePolicy:
             )
         )
 
-    def shortest_prefill_chunk_limit(
+    def prefill_interleaving_chunk_limit(
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
-        ):
+        """Reserve whole waiting prefills and put selected HRRN requests first."""
+        minimum = self.prefill_interleaving_min_continuation_tokens or page_size
+        if not self.prefill_interleaving or budget < minimum + page_size:
             return None
+        shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
         )
         reserved = 0
+        selected = []
+        skipped = []
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
-                break
+            if (shortest_first and work >= remaining) or (
+                reserved + charge > budget - minimum
+            ):
+                if shortest_first:
+                    break
+                skipped.append(req)
+                continue
+            selected.append(req)
             reserved += charge
         if not reserved:
             return None
+        if not shortest_first:
+            # Admission stops on failure; try fitting requests before skipped ones.
+            waiting_queue[:] = selected + skipped
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
 
@@ -636,6 +657,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        prefill_interleaving: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -646,6 +668,7 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
+        self.prefill_interleaving = prefill_interleaving
         self.dllm_config = dllm_config
         self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
 
@@ -1393,9 +1416,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if (has_chunked_req or self.new_chunked_req is not None) and (
+                self.prefill_interleaving
+                or get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
