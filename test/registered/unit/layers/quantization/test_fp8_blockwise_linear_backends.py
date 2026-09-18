@@ -1,8 +1,9 @@
 """Numerics for the FP8 dense-linear GEMM backends (--fp8-gemm-backend).
 
-Real layer path vs a dequantized-reference matmul, in three formats: FP8
-blockwise, MXFP8, and per-tensor FP8 (auto dispatch). Backend sets adapt to
-the device SM, so one file covers SM90 / SM100 / SM120.
+Real layer path vs a dequantized-reference matmul, in four formats: FP8
+blockwise, MXFP8, 32-wide-K ue8m0 block FP8 served as MXFP8, and per-tensor
+FP8 (auto dispatch). Backend sets adapt to the device SM, so one file covers
+SM90 / SM100 / SM120.
 """
 
 import unittest
@@ -14,6 +15,7 @@ from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -39,6 +41,12 @@ FP8_BLOCK_SHAPES = [
 
 # (M, N, K); K must be a multiple of 256 (flashinfer trtllm mxfp8 requirement).
 MXFP8_SHAPES = [
+    (64, 512, 512),
+    (5, 384, 768),
+]
+
+# (M, N, K); N % 64 == 0 and K % 128 == 0 for the FlashInfer MXFP8 scale swizzle.
+BLOCK32_SHAPES = [
     (64, 512, 512),
     (5, 384, 768),
 ]
@@ -86,6 +94,27 @@ def _quantize_fp8_blockwise(w: torch.Tensor, block: int = 128):
     w_fp8 = (tiles / scale[:, None, :, None]).to(torch.float8_e4m3fn)
     w_dequant = (w_fp8.float() * scale[:, None, :, None]).reshape(n, k)
     return w_fp8.reshape(n, k), scale, w_dequant
+
+
+def _block32_backends():
+    # The block-fp8-as-MXFP8 route takes the FlashInfer CUTLASS / CuTe-DSL MXFP8
+    # kernels only, on SM100/103.
+    if get_device_sm() in (100, 103):
+        return ["flashinfer_cutlass", "flashinfer_cutedsl"]
+    return []
+
+
+def _quantize_fp8_block32_ue8m0(w: torch.Tensor, block: int = 32):
+    """Per (block, block) tile fp8 quantization with power-of-two scales; returns
+    checkpoint-format (w_fp8 [N, K], scale e8m0 [N/block, K/block]) and the
+    dequant reference."""
+    n, k = w.shape
+    tiles = w.float().reshape(n // block, block, k // block, block)
+    amax = tiles.abs().amax(dim=(1, 3)).clamp(min=1e-30)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / FP8_MAX)))
+    w_fp8 = (tiles / scale[:, None, :, None]).to(torch.float8_e4m3fn)
+    w_dequant = (w_fp8.float() * scale[:, None, :, None]).reshape(n, k)
+    return w_fp8.reshape(n, k), scale.to(torch.float8_e8m0fnu), w_dequant
 
 
 def _quantize_mxfp8(w: torch.Tensor, block: int = 32):
@@ -236,6 +265,78 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
                 fp8_utils.Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS,
             )
             is_backend_supported.assert_called_once_with("cute-dsl", 107)
+
+
+class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
+    """A 32-wide-K ue8m0 block-fp8 weight served through the MXFP8 GEMMs."""
+
+    @staticmethod
+    def _build_layer(n: int, k: int, keep_plain_weight_layout: bool = False):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[32, 32],
+            scale_fmt="ue8m0",
+        )
+        layer = _make_linear(quant_config, n, k)
+        if keep_plain_weight_layout:
+            layer.keep_plain_weight_layout = True
+        w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+        w_fp8, scale_e8m0, w_dequant = _quantize_fp8_block32_ue8m0(w)
+        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_e8m0)
+        return layer, w_dequant
+
+    def _run(self, backend: str):
+        self._check_backend(
+            backend, _block32_backends(), BLOCK32_SHAPES, self._build_layer
+        )
+
+    def test_flashinfer_cutlass(self):
+        self._run("flashinfer_cutlass")
+
+    def test_flashinfer_cutedsl(self):
+        self._run("flashinfer_cutedsl")
+
+    def test_mxfp8_view_and_swizzled_input(self):
+        if "flashinfer_cutedsl" not in _block32_backends():
+            self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
+        from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+            _quantize_partial,
+            _wo_a_reduce,
+        )
+
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            n, k = 512, 2048
+            layer, _ = self._build_layer(n, k)
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertTrue(layer.quant_method.block_fp8_as_mxfp8)
+            self.assertTrue(layer.block_fp8_mxfp8_ready)
+            # Block scales stay in place for the Triton fallback and raw readers.
+            self.assertEqual(tuple(layer.weight_scale_inv.shape), (n // 32, k // 32))
+            self.assertIsNotNone(layer.weight_scale_inv_swizzled)
+
+            # A prequantized 128x4-swizzled MXFP8 activation must give the same
+            # output as the bf16 input the layer quantizes itself.
+            rows = 6
+            partial = torch.randn(8, rows, 2, k // 2, device="cuda")
+            bf16 = torch.empty(rows, k, dtype=torch.bfloat16, device="cuda")
+            _wo_a_reduce[(rows * 8,)](partial, bf16, rows * k, num_warps=4)
+            q, s = _quantize_partial(partial)
+            swizzled = layer.quant_method.apply(layer, Mxfp8SwizzledInput(q, s))
+            plain = layer.quant_method.apply(layer, bf16)
+            torch.testing.assert_close(swizzled, plain, rtol=0, atol=0)
+
+            # A layer that keeps the plain weight layout has no MXFP8 view.
+            plain_layer, _ = self._build_layer(n, k, keep_plain_weight_layout=True)
+            plain_layer.quant_method.process_weights_after_loading(plain_layer)
+            self.assertFalse(plain_layer.block_fp8_mxfp8_ready)
+            with self.assertRaises(ValueError):
+                plain_layer.quant_method.apply(plain_layer, Mxfp8SwizzledInput(q, s))
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
