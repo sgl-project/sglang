@@ -488,6 +488,20 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_decode_latency(self):
         return self.finished_time - self.first_token_time
 
+    def get_time_per_output_token(self, completion_tokens: int) -> Optional[float]:
+        """Return per-request TPOT, excluding the first output token."""
+        if self.first_token_time <= 0.0 or completion_tokens <= 1:
+            return None
+        decode_latency = self.get_decode_latency()
+        if decode_latency <= 0.0:
+            return None
+        return decode_latency / (completion_tokens - 1)
+
+    def get_decode_throughput(self, completion_tokens: int) -> Optional[float]:
+        """Return per-request decode throughput in tokens/s."""
+        tpot = self.get_time_per_output_token(completion_tokens)
+        return None if tpot is None else 1.0 / tpot
+
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
@@ -514,9 +528,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
-        decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 1:
-            meta_info["decode_throughput"] = (completion_tokens - 1) / decode_latency
+        decode_throughput = self.get_decode_throughput(completion_tokens)
+        if decode_throughput is not None:
+            meta_info["decode_throughput"] = decode_throughput
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
