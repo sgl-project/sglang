@@ -80,6 +80,10 @@ pub struct PendingPrefillAdmission {
 }
 
 impl PendingPrefillAdmission {
+    pub fn new(budget_by_engine: HashMap<String, u64>) -> Self {
+        Self { budget_by_engine }
+    }
+
     /// `None` when no prefill bucket configures a budget.
     pub fn from_buckets(config: &BucketConfig) -> Option<Self> {
         let budget_by_engine: HashMap<String, u64> = config
@@ -89,7 +93,7 @@ impl PendingPrefillAdmission {
             .filter_map(|spec| Some((spec, spec.max_pending_prefill_tokens?)))
             .flat_map(|(spec, limit)| spec.worker_ids.iter().map(move |id| (id.clone(), limit)))
             .collect();
-        (!budget_by_engine.is_empty()).then_some(Self { budget_by_engine })
+        (!budget_by_engine.is_empty()).then(|| Self::new(budget_by_engine))
     }
 }
 

@@ -274,20 +274,31 @@ fn compare_decode_load(left: &NativeCacheWorkerLoad, right: &NativeCacheWorkerLo
 /// One load snapshot per selection pass, captured on first use so policies
 /// that never read load never pay for it.
 pub struct LoadView<'a> {
-    table: &'a EngineLoadTable,
+    table: Option<&'a EngineLoadTable>,
     snapshot: OnceLock<EngineLoadSnapshot>,
 }
 
 impl<'a> LoadView<'a> {
     pub fn new(table: &'a EngineLoadTable) -> Self {
         Self {
-            table,
+            table: Some(table),
             snapshot: OnceLock::new(),
         }
     }
 
+    /// A view over an already captured snapshot.
+    pub fn from_snapshot(snapshot: EngineLoadSnapshot) -> Self {
+        Self {
+            table: None,
+            snapshot: OnceLock::from(snapshot),
+        }
+    }
+
     pub fn snapshot(&self) -> &EngineLoadSnapshot {
-        self.snapshot
-            .get_or_init(|| self.table.capture_snapshot(Instant::now()))
+        self.snapshot.get_or_init(|| {
+            self.table
+                .map(|table| table.capture_snapshot(Instant::now()))
+                .unwrap_or_default()
+        })
     }
 }

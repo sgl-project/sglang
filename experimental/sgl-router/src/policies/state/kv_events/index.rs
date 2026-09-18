@@ -42,6 +42,7 @@ use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::KvCacheEvent;
 use crate::policies::state::engine_load::EngineLoadTable;
+use crate::policies::state::{PrefixLookup, PrefixMatch};
 
 /// Channel buffer between the subscriber registry and the pump task.
 ///
@@ -211,6 +212,28 @@ impl KvEventIndex {
     /// Shared accessor for the per-process block-size oracle.
     pub fn block_size_oracle(&self) -> Arc<BlockSizeOracle> {
         Arc::clone(&self.block_size_oracle)
+    }
+
+    /// Deepest cached prefix per worker URL (DP ranks collapse to the max).
+    /// `None` without a block size or with no matching worker.
+    pub fn match_prefix(&self, tokens: &[u32]) -> Option<PrefixLookup> {
+        let hashes = self.block_size_oracle.block_hashes(tokens)?;
+        let mut depth_by_url = std::collections::BTreeMap::<String, u32>::new();
+        for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
+            let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+            let current = depth_by_url.entry(worker.url).or_default();
+            *current = (*current).max(depth);
+        }
+        (!depth_by_url.is_empty()).then(|| PrefixLookup {
+            matches: depth_by_url
+                .into_iter()
+                .map(|(address, matched_prefix_blocks)| PrefixMatch {
+                    address,
+                    matched_prefix_blocks,
+                })
+                .collect(),
+            query_blocks: hashes.len(),
+        })
     }
 
     /// Clone the underlying tree handle for cache-aware selection and
