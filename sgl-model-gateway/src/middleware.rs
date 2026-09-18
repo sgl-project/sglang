@@ -1083,8 +1083,9 @@ mod tests {
 
 #[cfg(test)]
 mod strict_admission_tests {
-    use super::*;
     use http_body_util::BodyExt;
+
+    use super::*;
 
     #[tokio::test]
     async fn admission_overload_returns_503_and_retry_after() {
