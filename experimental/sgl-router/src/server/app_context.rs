@@ -38,7 +38,8 @@ pub struct AppContext {
     /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
-    /// `/metrics`. Shared with the chat handler (requests_total),
+    /// `/metrics`. Shared with the edge middleware (requests_total /
+    /// responses_total), the chat handler (worker_requests_total), the
     /// active-load registry, policy-specific counters, and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
