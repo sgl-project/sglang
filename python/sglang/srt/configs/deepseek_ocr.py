@@ -272,12 +272,16 @@ def is_ocr2_config(config) -> bool:
     """Whether a checkpoint is DeepSeek-OCR-2.
 
     Both checkpoints ship identical processor configs, so identity comes from the
-    model config: the DeepEncoder V2 vision encoder, or its 896-dim projector
-    (the projector also covers derived checkpoints that drop `model_name`).
+    model config: the DeepEncoder V2 vision encoder, or its 896-dim projector.
+    Both lookups are guarded because the projector clause is what covers derived
+    checkpoints that drop `model_name` -- reading it unguarded would raise before
+    that clause is reached.
     """
+    vision_config = getattr(config, "vision_config", None)
+    projector_config = getattr(config, "projector_config", None)
     return (
-        str(config.vision_config.model_name).lower() == "deepencoderv2"
-        or config.projector_config.input_dim == 896
+        str(getattr(vision_config, "model_name", "")).lower() == "deepencoderv2"
+        or getattr(projector_config, "input_dim", None) == 896
     )
 
 
@@ -568,7 +572,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             img_w, img_h = get_image_size(image)
             image_shapes.append((img_w, img_h))
 
-            # Official OCR-1 / OCR-2 compare against 640 / 768, i.e. self.image_size.
+            # Both official processors threshold on their own crop size (640 for
+            # OCR-1, 768 for OCR-2), which is what `image_size` holds here.
             if img_w <= self.image_size and img_h <= self.image_size:
                 crop_ratio = [1, 1]
             else:
@@ -580,8 +585,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
                     crop_ratio = [1, 1]
 
             """process the global view"""
-            # Upstream guards this on `image_size <= CROP_SIZE`; image_size is always
-            # the checkpoint's own local crop (see apply_ocr_geometry), so it holds.
+            # Upstream compares against the model's own crop constant, which is
+            # exactly what `image_size` holds, so the test is always true and the
+            # guard reduces to `not cropping`.
             if not cropping:
                 image = resize_image(image, (self.image_size, self.image_size))
 
@@ -607,8 +613,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 (self.base_size // self.patch_size) / self.downsample_ratio
             )
 
-            # Block order is cosmetic: image tokens are padded by count, and the model
-            # scatters features in its own order ([local, global, separator]).
             if self.ocr2_mode:
                 tokenized_image = []
                 if num_width_tiles > 1 or num_height_tiles > 1:

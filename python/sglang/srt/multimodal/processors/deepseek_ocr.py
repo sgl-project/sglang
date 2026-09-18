@@ -9,15 +9,15 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 
 
-def apply_ocr_geometry(_processor, hf_config) -> None:
+def apply_ocr_geometry(processor, hf_config) -> None:
     """Patch a checkpoint's local-crop geometry onto an already-built HF processor.
 
     `image_size` is overwritten unconditionally: neither checkpoint carries the
     crop size (see `local_crop_size`), so a value in `processor_config.json` would
     not survive.
     """
-    _processor.ocr2_mode = is_ocr2_config(hf_config)
-    _processor.image_size = local_crop_size(hf_config)
+    processor.ocr2_mode = is_ocr2_config(hf_config)
+    processor.image_size = local_crop_size(hf_config)
 
 
 class DeepseekOCRProcessor(BaseMultimodalProcessor):
