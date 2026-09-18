@@ -2931,9 +2931,15 @@ class NixlKVSender(CommonKVSender):
             self.has_sent = True
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             timeout_result = self._check_bootstrap_timeout()
             if timeout_result is not None:
