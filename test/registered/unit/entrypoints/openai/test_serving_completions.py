@@ -400,6 +400,7 @@ class ServingCompletionTestCase(unittest.TestCase):
                     "completion_tokens": 1,
                     "cached_tokens": 0,
                     "finish_reason": {"type": "stop"},
+                    "weight_version": "v1",
                     "input_token_logprobs": [],
                     "output_token_logprobs": [(-0.1, 3, " world")],
                     "output_token_logprobs_length": 1,
