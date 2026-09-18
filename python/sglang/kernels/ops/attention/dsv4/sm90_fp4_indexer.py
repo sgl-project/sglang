@@ -25,7 +25,8 @@ def _e2m1_decode(code):
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
     sub = m * 0.5
-    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
+    exp = tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0))
+    nor = (1.0 + m * 0.5) * exp
     v = tl.where(e == 0, sub, nor)
     return tl.where((code >> 3) == 1, -v, v)
 
@@ -71,20 +72,26 @@ def _fp4_index_logits_kernel(
     )
     low = _e2m1_decode(pay & 0x0F)
     high = _e2m1_decode((pay >> 4) & 0x0F)
-    # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
-    sc_idx = offs_i // 16
+    # e8m0 block scales: each scale covers 16 payload bytes (32 elements).
+    offs_s = tl.arange(0, SCALE_BYTES)
     exps = tl.load(
         table_ptr
         + row_base[:, None]
         + page_size * PAYLOAD_BYTES
         + off[:, None] * SCALE_BYTES
-        + sc_idx[None, :],
+        + offs_s[None, :],
         mask=valid[:, None],
         other=127,
     )
     scale = tl.exp2(exps.to(tl.float32) - 127.0)
-    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
-    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
+    scale = scale[:, :, None]
+    k_shape: tl.constexpr = (BLOCK_L, SCALE_BYTES, HALF_D // SCALE_BYTES)
+    k_low = tl.reshape(
+        tl.reshape(low, k_shape) * scale, (BLOCK_L, HALF_D)
+    ).to(tl.bfloat16)
+    k_high = tl.reshape(
+        tl.reshape(high, k_shape) * scale, (BLOCK_L, HALF_D)
+    ).to(tl.bfloat16)
 
     # queries: even / odd elements, [H, HALF_D] bf16
     q_even = tl.load(
