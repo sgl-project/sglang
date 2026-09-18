@@ -29,7 +29,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     MlxStepLogprobs,
     lazy_logprob_arrays,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -119,6 +119,7 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        self._mlx_active_reqs: dict[str, tuple[Req, int]] = {}
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -157,19 +158,28 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+        """Discard retracted state before flushing or reusing scheduler rows."""
+        for rid, (req, retraction_count) in list(self._mlx_active_reqs.items()):
+            if not req.kv.holds_kv or req.retraction_count != retraction_count:
+                # Finished prefills, aborts, and retraction can release a row
+                # without the worker hook. Never flush native KV to a reused row.
+                self._mlx_runner.remove_request(rid, sync_kv=False)
+                self._mlx_active_rids.discard(rid)
+                self._mlx_active_reqs.pop(rid)
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
+                self._mlx_active_reqs.pop(rid, None)
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Publish MLX KV at the scheduler's radix insert point."""
+        self._mlx_active_reqs.pop(req.rid, None)
         if self._mlx_runner.has_request(req.rid):
-            self._mlx_runner.store_auxiliary_state_for_request(req.rid)
+            self._mlx_runner.prepare_for_kv_cache_release(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
@@ -419,6 +429,9 @@ class MlxTpModelWorker(TpModelWorker):
             )
 
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
+        self._mlx_active_reqs.update(
+            (req.rid, (req, req.retraction_count)) for req in reqs
+        )
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]

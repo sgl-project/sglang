@@ -186,16 +186,12 @@ class SchedulerMlxOverlapMixin:
 
         def _launch_chained(prev: MlxPendingJob) -> MlxPendingJob:
             assert prev.launch.decode is not None
-            # Composition is identical to prev: every scheduler-side field
-            # carries over, and only a fresh batch copy of the same
-            # underlying ScheduleBatch is needed so process_batch_result
-            # updates the same req objects with the new token.
-            batch_copy = prev.batch_copy.copy()
-            self._prepare_mlx_launch(batch_copy)
-            # Keep the live scheduler batch's iteration aligned: when the
-            # chain breaks, prepare_for_decode() may run SWA maintenance
-            # before the next fresh launch gets a chance to re-stamp it.
-            prev.schedule_batch.forward_iter = batch_copy.forward_iter
+            # The MLX graph supplies the next input token, but the scheduler
+            # still owns the next KV slot and sequence-length bookkeeping.
+            batch = prev.schedule_batch
+            batch.prepare_for_decode()
+            self._prepare_mlx_launch(batch)
+            batch_copy = batch.copy()
             return replace(
                 prev,
                 launch=self.tp_worker.async_chained_decode_mlx(prev.launch.decode),
@@ -223,6 +219,7 @@ class SchedulerMlxOverlapMixin:
                 and pending_curr.launch.decode is not None
                 and pending_curr.chain_safe
                 and not self.waiting_queue
+                and pending_curr.schedule_batch.check_decode_mem()
             )
             if can_chain and pending_next is None:
                 # Build + launch the chained step BEFORE we block on
