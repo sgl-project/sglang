@@ -92,7 +92,7 @@ class TestNamespaceTools(CustomTestCase):
             "dotted.but.flat", "{}", set(), namespace_names
         )
         self.assertEqual(item.name, "dotted.but.flat")
-        self.assertNotIn("namespace", item.model_dump())
+        self.assertIsNone(item.model_dump().get("namespace"))
 
     def test_replayed_namespaced_call_requalifies_for_chat(self):
         message = OpenAIServingResponses._normalize_response_message_for_chat(
