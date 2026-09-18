@@ -3,7 +3,17 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import tree_speculative_sampling_target_only
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+if torch.version.cuda is not None:
+    from sglang.kernels.ops.speculative.sampling import (
+        tree_speculative_sampling_target_only,
+    )
+else:
+    from sgl_kernel import tree_speculative_sampling_target_only
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 test_cases = [
     (
@@ -128,4 +138,4 @@ def test_tree_speculative_sampling_target_only(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
