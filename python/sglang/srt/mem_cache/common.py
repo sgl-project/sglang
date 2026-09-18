@@ -269,7 +269,14 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    is_retract: bool = False,
+):
+    # is_retract marks a release that keeps the req alive for re-admission
+    # (retract / optimistic requeue) as opposed to a terminal release.
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -289,6 +296,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         owned_kv_len=owned_kv_len,
+        is_retract=is_retract,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim

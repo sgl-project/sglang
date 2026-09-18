@@ -2235,7 +2235,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    release_kv_cache(req, tree_cache, is_insert=False, is_retract=True)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -3275,6 +3275,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
+                # Terminal, not a requeue: the streaming turn must not stay
+                # inflight.
+                if req.session is not None:
+                    req.session.abort_req(req.rid)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
             if self.release_req(idx, len(sorted_indices)):
@@ -3287,6 +3291,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
                 reqs_to_abort.append(req)
+                # Terminal, not a requeue: the streaming turn must not stay
+                # inflight.
+                if req.session is not None:
+                    req.session.abort_req(req.rid)
                 logger.warning(
                     "retract_decode: aborted request %s, retraction host pool "
                     "exhausted",
@@ -3313,6 +3321,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.token_to_kv_pool_allocator,
                 )
             self.release_req(last_idx, 0, offload_kv=False)
+            # Terminal, not a requeue: the streaming turn must not stay inflight.
+            if last_req.session is not None:
+                last_req.session.abort_req(last_req.rid)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )

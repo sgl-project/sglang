@@ -957,9 +957,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
+        **kwargs,
     ) -> None:
-        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+        if self.session.try_cache_finished_req(
+            req, is_insert=is_insert, is_retract=is_retract, **kwargs
+        ):
             return
 
         if self.disable:

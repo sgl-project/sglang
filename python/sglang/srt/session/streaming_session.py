@@ -266,9 +266,10 @@ class StreamingSession(BasePrefixCache):
         )
 
     def try_cache_finished_req(
-        self, req: Req, is_insert: bool = True, **kwargs
+        self, req: Req, is_insert: bool = True, is_retract: bool = False, **kwargs
     ) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
+        """Handles a streaming-session finish (save slot / mid-abort nuke /
+        retract nuke).
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
             return False
@@ -279,30 +280,21 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
+        # Mid-processing abort: nuke the turn's KV, drop the slot. Token IDs
+        # stay in req_nodes (last successful req); the next request
+        # re-prefills from scratch.
         if isinstance(req.finished_reason, FINISH_ABORT):
-            kv = req.detach_kv()
-            if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup;
-                # the detached record carries the mamba refs for
-                # _free_slot_mamba, and last_node lets release_session
-                # dec_lock_ref the tree lock.
-                slot = SessionSlot(
-                    kv=kv,
-                    last_node=req.last_node,
-                    lock_receipt=req.lock_receipt,
-                    swa_prefix_lock_released=req.swa_prefix_lock_released,
-                )
-                self.slots[session_id] = slot
-            else:
-                assert kv is slot.kv
-            self.release_session(session_id)
+            self._release_turn_kv(slot, req, session_id)
             req.session.abort_req(req.rid)
+            return True
+
+        # Retract (release_kv_cache(is_retract=True)): same nuke, but the turn
+        # stays inflight and the checkpoint (req_nodes / slot) stays at the
+        # last finished turn; re-admission re-prefills from scratch. Explicit
+        # intent, not finished_reason: disaggregated prefill releases a
+        # finished transfer before stamping FINISH_LENGTH.
+        if is_retract:
+            self._release_turn_kv(slot, req, session_id)
             return True
 
         if is_first:
@@ -326,6 +318,25 @@ class StreamingSession(BasePrefixCache):
         req.session.finish_req(req)
 
         return True
+
+    def _release_turn_kv(
+        self, slot: Optional[SessionSlot], req: Req, session_id: str
+    ) -> None:
+        kv = req.detach_kv()
+        if slot is None:
+            # First-turn nuke: build an ephemeral slot from the req so
+            # release_session frees the KV, the tree lock and the mamba
+            # slots.
+            slot = SessionSlot(
+                kv=kv,
+                last_node=req.last_node,
+                lock_receipt=req.lock_receipt,
+                swa_prefix_lock_released=req.swa_prefix_lock_released,
+            )
+            self.slots[session_id] = slot
+        else:
+            assert kv is slot.kv
+        self.release_session(session_id)
 
     def try_cache_unfinished_req(
         self, req: Req, chunked: bool = False, **kwargs
@@ -355,8 +366,12 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, is_retract: bool = False, **kwargs
+    ):
+        if self.try_cache_finished_req(
+            req, is_insert=is_insert, is_retract=is_retract, **kwargs
+        ):
             return
         self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 

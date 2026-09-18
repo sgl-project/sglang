@@ -439,7 +439,12 @@ class LMCRadixCache(RadixCache):
             )
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
     ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
