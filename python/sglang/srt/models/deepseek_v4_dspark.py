@@ -386,10 +386,15 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 class DSparkV4MarkovHead(nn.Module):
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
+        # The sharded greedy fold and the NVLink vocab gather ship with V4.1;
+        # a V4 head keeps the block sampler and the NCCL all-gather.
+        self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"DSparkV4MarkovHead requires markov_rank > 0, got {self.markov_rank}."
@@ -444,7 +449,8 @@ class DSparkV4MarkovHead(nn.Module):
         self._vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
-            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+            prefer_nvlink=self._is_dsv41
+            and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
         )
         if shard_group.rank == 0:
             cls_name = type(self._vocab_gather).__name__
@@ -505,7 +511,9 @@ class DSparkV4MarkovHead(nn.Module):
 
     @property
     def supports_sharded_greedy(self) -> bool:
-        return self._tp_shard is not None and self._opt_markov_w2_bf16
+        return (
+            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
+        )
 
     def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
         if not self.supports_sharded_greedy or not base_logits.is_cuda:
@@ -875,6 +883,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
+            is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)

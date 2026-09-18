@@ -710,6 +710,9 @@ class DeepseekV2MoE(nn.Module):
                 topk_kwargs.update(
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
+                    sqrtsoftplus_log1p=(
+                        getattr(config, "model_type", None) == "deepseek_v41"
+                    ),
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
                     apply_routed_scaling_factor_on_output=(
                         True

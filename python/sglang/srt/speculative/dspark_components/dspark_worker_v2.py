@@ -304,8 +304,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
+        target_is_dsv41 = (
+            getattr(
+                self.target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         static_epilogue_supported = (
-            self._verify_planner.mode_value == "static"
+            target_is_dsv41
+            and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
             and not get_parallel().enable_dp_attention
             and self.ps.pp_size == 1

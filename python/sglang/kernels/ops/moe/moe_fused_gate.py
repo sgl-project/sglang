@@ -111,6 +111,7 @@ def _router_triton_kernel(
     EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
     BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
     SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
+    SQRTSOFTPLUS_LOG1P: tl.constexpr,  # sqrtsoftplus via log1p (V4.1 numerics)
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
@@ -184,9 +185,19 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + row_bias
     elif SCORING_FUNC == 1:
-        # log1p preserves small positive scores for negative logits.
-        sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
-        activated = libdevice.sqrt(sp)
+        if SQRTSOFTPLUS_LOG1P:
+            # log1p preserves small positive scores for negative logits.
+            sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
+            activated = libdevice.sqrt(sp)
+        else:
+            # sqrt(softplus(x)) with log1p recovered from log via z*log(u)/(u-1);
+            # the DeepSeek-V4 numerics.
+            z = tl.exp(-tl.abs(scores))
+            u = 1.0 + z
+            exact = u == 1.0
+            log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
+            sp = tl.maximum(scores, 0.0) + log1p_z
+            activated = tl.sqrt(sp)
         biased = activated + row_bias
     else:
         # softmax over the row: weight is the softmax probability (bias kept), with
@@ -206,7 +217,7 @@ def _router_triton_kernel(
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
-    if SCORING_FUNC == 1:
+    if SCORING_FUNC == 1 and SQRTSOFTPLUS_LOG1P:
         # Rank NaNs above finite scores, matching torch.topk.
         biased = tl.where(biased == biased, biased, float("inf"))
     else:
@@ -327,6 +338,7 @@ def moe_fused_gate(
     num_token_non_padded: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -338,6 +350,8 @@ def moe_fused_gate(
 
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
+    ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
+    (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
     """
@@ -464,6 +478,7 @@ def moe_fused_gate(
         EXPERTS_PER_GROUP=experts_per_group,
         BLOCK_G=BLOCK_G,
         SCORING_FUNC=scoring_func_int,
+        SQRTSOFTPLUS_LOG1P=bool(sqrtsoftplus_log1p),
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),

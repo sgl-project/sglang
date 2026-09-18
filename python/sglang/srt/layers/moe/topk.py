@@ -236,6 +236,8 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
+    sqrtsoftplus_log1p: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -536,6 +538,7 @@ class TopK(BaseFusedOp):
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
+        sqrtsoftplus_log1p: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -574,6 +577,7 @@ class TopK(BaseFusedOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
@@ -1378,6 +1382,7 @@ def biased_topk_jit_kernel_impl(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -1428,6 +1433,7 @@ def biased_topk_jit_kernel_impl(
             ),
             # Optional FlashInfer routed-MoE packed ids, written in the same launch.
             packed_out=packed_out,
+            sqrtsoftplus_log1p=sqrtsoftplus_log1p,
         )
         topk_weights, topk_ids = (
             topk_weights.to(torch.float32),
@@ -2536,6 +2542,8 @@ def select_experts(
                     device=hidden_states.device,
                 )
                 _packed_kwargs = dict(packed_out=packed_topk)
+            if topk_config.sqrtsoftplus_log1p:
+                _packed_kwargs["sqrtsoftplus_log1p"] = True
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

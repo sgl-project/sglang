@@ -58,6 +58,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             apply_routed_scaling_factor_on_output=config.apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
             packed_out=packed_topk,
+            sqrtsoftplus_log1p=True,
         )
         weights = _scale_fused_shared_weights(
             weights,
