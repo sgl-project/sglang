@@ -1,7 +1,10 @@
+import copy
 import os
+import pickle
 import re
 from collections.abc import Generator
 
+import msgspec
 import torch
 import transformers
 from torch import nn
@@ -106,6 +109,36 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 )
 
 logger = init_logger(__name__)
+
+
+class ResolvedTextEncoderLoad(msgspec.Struct):
+    """Native loader decisions; no model, tensors or process groups are stored."""
+
+    model_cls: type[nn.Module]
+    config: EncoderConfig
+    hf_config: dict
+    model_path: str
+    weights_path: str
+    server_args: ServerArgs
+    component_name: str
+    dtype: str
+    component_starts_on_cpu: bool | None
+    weight_files: tuple[str, ...] | None = None
+
+    def freeze(self):
+        return FrozenTextEncoderLoad(
+            pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+
+
+class FrozenTextEncoderLoad(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Trusted process-local snapshot, never accepted from a cache peer."""
+
+    _payload: bytes
+
+    def thaw(self) -> ResolvedTextEncoderLoad:
+        return pickle.loads(self._payload)
+
 
 _ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
 
@@ -498,7 +531,29 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         component_name: str,
         component_starts_on_cpu: bool | None = None,
     ):
-        """Load the text encoders based on the model path, and inference args."""
+        recipe = self.prepare_customized(
+            component_model_path, server_args, component_name, component_starts_on_cpu
+        )
+        return self.materialize_prepared(recipe)
+
+    def prepare_customized(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        component_starts_on_cpu: bool | None = None,
+        *,
+        planned_device: torch.device | None = None,
+    ) -> ResolvedTextEncoderLoad:
+        """Resolve the ordinary native path without constructing a module.
+
+        Cache preparation uses a copied, single-rank configuration before any
+        process group exists. The ordinary path keeps its existing folding policy.
+        """
+        if planned_device is not None:
+            if server_args.num_gpus != 1:
+                raise ValueError("Prepared encoder loading currently requires one GPU")
+            server_args = copy.deepcopy(server_args)
         component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
@@ -525,39 +580,61 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 encoder_config,
                 server_args.component_paths,
             )
-        encoder_dp_group = get_encoder_data_parallel_group()
-        prefer_dp = (
-            server_args.batching_max_size > 1
-            and encoder_dp_group is not None
-            and encoder_dp_group.world_size > 1
-            and issubclass(model_cls, TextEncoder)
-            and model_cls.supports_dp_encode
-        )
-        # real dims are populated now; resolve fold vs replicate
-        finalize_encoder_folding(
-            encoder_config,
-            server_args.encoder_parallel,
-            prefer_dp=prefer_dp,
-        )
+        if planned_device is not None:
+            encoder_config.parallel_folding_mode = None
+        else:
+            encoder_dp_group = get_encoder_data_parallel_group()
+            prefer_dp = (
+                server_args.batching_max_size > 1
+                and encoder_dp_group is not None
+                and encoder_dp_group.world_size > 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            )
+            # Real dims are populated now; resolve fold vs replicate.
+            finalize_encoder_folding(
+                encoder_config, server_args.encoder_parallel, prefer_dp=prefer_dp
+            )
         encoder_dtype = self.component_load_precision(server_args, component_name)
         assert encoder_dtype is not None
-        # TODO(will): add support for other dtypes
+        encoder_config.enable_image_understanding = isinstance(
+            server_args.pipeline_config,
+            (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
+        )
+        encoder_config.honor_cache_free_padding_mask = isinstance(
+            server_args.pipeline_config, LongCatImagePipelineConfig
+        )
+        return ResolvedTextEncoderLoad(
+            model_cls,
+            encoder_config,
+            model_config,
+            component_model_path,
+            component_weights_path,
+            server_args,
+            component_name,
+            encoder_dtype,
+            component_starts_on_cpu,
+        )
+
+    def materialize_prepared(self, prepared_load):
+        recipe = prepared_load
         try:
             return self.load_model(
-                component_weights_path,
-                encoder_config,
-                server_args,
-                encoder_dtype,
-                component_starts_on_cpu=component_starts_on_cpu,
-                component_name=component_name,
+                recipe.weights_path,
+                recipe.config,
+                recipe.server_args,
+                recipe.dtype,
+                component_starts_on_cpu=recipe.component_starts_on_cpu,
+                component_name=recipe.component_name,
+                prepared_load=recipe,
             )
         except ComponentCheckpointUnsupportedError:
             raise
         except Exception as error:
-            if encoder_config.quant_config is None:
+            if recipe.config.quant_config is None:
                 raise
             raise ComponentCheckpointUnsupportedError(
-                f"Failed to load quantized native {component_name!r}: {error}"
+                f"Failed to load quantized native {recipe.component_name!r}: {error}"
             ) from error
 
     def build_model_config(
@@ -618,6 +695,8 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         dtype: str = "fp16",
         component_starts_on_cpu: bool | None = None,
         component_name: str = "text_encoder",
+        *,
+        prepared_load: ResolvedTextEncoderLoad | None = None,
     ):
         local_torch_device = get_local_torch_device()
         quant_config = model_config.quant_config
@@ -682,17 +761,20 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             use_tensor_parallel_group(encoder_tp_group),
             set_default_torch_dtype(PRECISION_TO_TYPE[dtype]),
         ):
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                model_config.arch_config.architectures
-            )
-            model_config.enable_image_understanding = isinstance(
-                server_args.pipeline_config,
-                (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
-            )
-            # longcat consumes the padded body without an attention cache
-            model_config.honor_cache_free_padding_mask = isinstance(
-                server_args.pipeline_config, LongCatImagePipelineConfig
-            )
+            if prepared_load is None:
+                model_cls, _ = ModelRegistry.resolve_model_cls(
+                    model_config.arch_config.architectures
+                )
+                model_config.enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
+                )
+                # LongCat consumes the padded body without an attention cache.
+                model_config.honor_cache_free_padding_mask = isinstance(
+                    server_args.pipeline_config, LongCatImagePipelineConfig
+                )
+            else:
+                model_cls = prepared_load.model_cls
             model = initialize_model(
                 model_cls, {"config": model_config}, param_dtype, model_device
             )
@@ -727,6 +809,19 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model_path,
                     quant_config.tensor_meta,
                     key_filter=model.should_materialize_checkpoint_weight,
+                )
+            elif prepared_load is not None and prepared_load.weight_files is not None:
+                from sglang.multimodal_gen.runtime.loader.weight_utils import (
+                    safetensors_weights_iterator,
+                )
+
+                checkpoint_weights = safetensors_weights_iterator(
+                    list(prepared_load.weight_files),
+                    to_cpu=component_starts_on_cpu,
+                    key_filter=lambda name: (
+                        not name.endswith(".comfy_quant")
+                        and model.should_materialize_checkpoint_weight(name)
+                    ),
                 )
             else:
                 checkpoint_weights = self._get_all_weights(
