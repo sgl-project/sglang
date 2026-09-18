@@ -204,6 +204,11 @@ def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, in
     return effort
 
 
+def spec_supports_inline_system(spec: Optional[str]) -> bool:
+    """Native encoders verified to preserve mid-conversation system messages."""
+    return spec == "kimi_k3"
+
+
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` renders assistant reasoning history itself.
 

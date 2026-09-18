@@ -46,6 +46,61 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
+    def test_inline_instructions_preserve_history_prefix(self):
+        from utils import MockTemplateManager, MockTokenizerManager
+
+        inline = (
+            "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}{% endfor %}"
+        )
+        for encoding, template, preserve in (
+            ("kimi_k3", None, True),
+            (None, inline, True),
+            (None, None, False),
+            (None, "{{ messages[0]['content'] }}", False),
+        ):
+            for role in ("developer", "system"):
+                with self.subTest(encoding=encoding, template=template, role=role):
+                    manager = MockTokenizerManager()
+                    manager.tokenizer.chat_template = template
+                    templates = MockTemplateManager()
+                    templates.chat_template_name = None
+                    make_serving()
+                    with patch.object(
+                        OpenAIServingResponses,
+                        "_resolve_chat_encoding_spec",
+                        return_value=encoding,
+                    ):
+                        serving = OpenAIServingResponses(manager, templates)
+                    history = [
+                        {"role": "user", "content": "Existing conversation"},
+                        {"role": "assistant", "content": "Previous answer"},
+                    ]
+                    before = serving._construct_input_messages(
+                        ResponsesRequest(
+                            model="x",
+                            instructions="Stable instructions",
+                            input=history,
+                        )
+                    )
+                    after = serving._construct_input_messages(
+                        ResponsesRequest(
+                            model="x",
+                            instructions="Stable instructions",
+                            input=history
+                            + [
+                                {"role": role, "content": "New instruction"},
+                                {"role": "user", "content": "Next turn"},
+                            ],
+                        )
+                    )
+                    if preserve:
+                        self.assertEqual(after[: len(before)], before)
+                        self.assertEqual(after[-2]["role"], "system")
+                        self.assertIn("New instruction", after[-2]["content"])
+                    else:
+                        self.assertIn("New instruction", after[0]["content"])
+                        self.assertNotEqual(after[0], before[0])
+
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")

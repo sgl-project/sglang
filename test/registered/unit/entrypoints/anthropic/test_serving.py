@@ -1475,6 +1475,26 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
 
+    def test_native_kimi_preserves_inline_system_without_jinja(self):
+        chat = _FakeOpenAIServingChat(chat_template=None)
+        chat.chat_encoding_spec = "kimi_k3"
+        serving = AnthropicServing(chat)
+        request = self._anthropic_request(
+            stream=False,
+            system="Stable instructions",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "New instruction"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        converted = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in converted.messages],
+            ["system", "user", "system", "user"],
+        )
+        self.assertEqual(converted.messages[0].content, "Stable instructions")
+
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages
         system turn) is unaffected on both detection paths: the system field is
