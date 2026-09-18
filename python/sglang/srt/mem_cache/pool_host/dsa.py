@@ -218,6 +218,20 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
 
+    def get_contiguous_buf_infos(self):
+        assert self.layout == "layer_first", (
+            "DSA indexer host staging requires --hicache-mem-layout layer_first, "
+            f"got {self.layout}."
+        )
+        data_ptrs = [
+            int(self.index_k_data_ptrs[i].item()) for i in range(self.layer_num)
+        ]
+        data_lens = [self.index_k_data_refs[i].nbytes for i in range(self.layer_num)]
+        item_lens = [
+            self.index_k_data_refs[i][0].nbytes for i in range(self.layer_num)
+        ]
+        return data_ptrs, data_lens, item_lens
+
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
             return host_indices, device_indices
