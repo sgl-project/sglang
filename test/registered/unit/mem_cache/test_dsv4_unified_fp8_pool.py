@@ -6,6 +6,7 @@ import torch
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV4_FP8_NOPE_ROW_BYTES,
     DSV4_FP8_QUANT_TILE,
+    DeepSeekV4TokenToKVPool,
     DeepSeekV4UnifiedKVPool,
     dsv4_unified_row_bytes,
 )
@@ -122,6 +123,118 @@ class TestDSV4UnifiedFp8PoolAllocation(CustomTestCase):
     def test_rope_accessor_rejects_the_bf16_pool(self):
         with self.assertRaises(AssertionError):
             self._pool(fp8=False).get_unified_kv_rope(0)
+
+
+class _StubTokenToKVPool:
+    """
+    Only the attributes the region math reads, so it can be exercised without standing
+    up a whole DeepSeekV4TokenToKVPool.
+    """
+
+    _unified_page_views = DeepSeekV4TokenToKVPool._unified_page_views
+    unified_region_buffers = DeepSeekV4TokenToKVPool.unified_region_buffers
+    unified_rope_region_buffers = DeepSeekV4TokenToKVPool.unified_rope_region_buffers
+
+    def __init__(self, unified_kv_pool, page_size, stage_ratios, fp8):
+        self.unified_kv_pool = unified_kv_pool
+        self.page_size = page_size
+        self.compression_ratios = list(stage_ratios)
+        self._stage_start = 0
+        self._stage_end = len(stage_ratios)
+        self._unified_kv = True
+        self._unified_kv_fp8 = fp8
+
+
+class TestDSV4UnifiedRegionBuffers(CustomTestCase):
+    """
+    HiCache mirrors the compressed region of every unified_kv layer. Under fp8
+    that region lives in two pools, and offloading only the nope half refills a
+    fetched page with stale rope (wrong output, no crash), so the pairing is what
+    these tests pin.
+    """
+
+    # Two c4 layers to cover the per-ratio layer filter, one c128 layer. Blocks
+    # must be even: a c4 layer holds `num_blocks * 32` compressed rows plus one
+    # padding page of 64, which only divides into whole pages when it is.
+    STAGE_RATIOS = [4, 4, 128]
+    NUM_SLOTS = 3
+    NUM_BLOCKS = 6
+    PAGE_SIZE = 256
+    SWA_RING = 8
+    NUM_PAGES = 4
+
+    def _stub(self, fp8):
+        pool = DeepSeekV4UnifiedKVPool(
+            stage_ratios=self.STAGE_RATIOS,
+            num_slots=self.NUM_SLOTS,
+            num_blocks=self.NUM_BLOCKS,
+            page_size=self.PAGE_SIZE,
+            qk_nope_head_dim=NOPE_DIM,
+            qk_rope_head_dim=ROPE_DIM,
+            device="cpu",
+            memory_saver_adapter=_StubMemorySaver(),
+            custom_mem_pool=None,
+            swa_ring_size=self.SWA_RING,
+            fp8=fp8,
+        )
+        return pool, _StubTokenToKVPool(pool, self.PAGE_SIZE, self.STAGE_RATIOS, fp8)
+
+    def test_bf16_keeps_the_whole_row_in_one_region(self):
+        """
+        The bf16 arm must not grow a second host pool: its row is undivided,
+        and a stray rope region would mirror a buffer that does not exist.
+        """
+        _, stub = self._stub(fp8=False)
+        for ratio, num_layers in ((4, 2), (128, 1)):
+            views, item_bytes = stub.unified_region_buffers(ratio)
+            rows_per_page = self.PAGE_SIZE // ratio
+            self.assertEqual(len(views), num_layers)
+            self.assertEqual(item_bytes, rows_per_page * (NOPE_DIM + ROPE_DIM) * 2)
+            self.assertIsNone(stub.unified_rope_region_buffers(ratio))
+
+    def test_fp8_pairs_a_rope_region_with_the_nope_one(self):
+        _, stub = self._stub(fp8=True)
+        for ratio, num_layers in ((4, 2), (128, 1)):
+            rows_per_page = self.PAGE_SIZE // ratio
+            for (views, item_bytes), row_bytes in (
+                (stub.unified_region_buffers(ratio), DSV4_FP8_NOPE_ROW_BYTES),
+                (stub.unified_rope_region_buffers(ratio), ROPE_DIM * 2),
+            ):
+                self.assertEqual(len(views), num_layers)
+                self.assertEqual(item_bytes, rows_per_page * row_bytes)
+                for view in views:
+                    self.assertEqual(view.dtype, torch.uint8)
+                    self.assertEqual(list(view.shape), [self.NUM_PAGES, item_bytes])
+
+    def test_regions_start_past_the_swa_ring(self):
+        """
+        The host pool takes each view's data_ptr as the device base, so a view
+        that still covered the ring would offload ring rows as page 0.
+        """
+        pool, stub = self._stub(fp8=True)
+        swa_pages = pool.swa_pages
+        for (views, _), device_buffers in (
+            (stub.unified_region_buffers(4), pool.kv_buffer),
+            (stub.unified_rope_region_buffers(4), pool.kv_buffer_rope),
+        ):
+            for view, buf in zip(views, device_buffers):
+                row_bytes = buf.shape[1] * buf.element_size()
+                self.assertEqual(
+                    view.data_ptr(), buf.data_ptr() + swa_pages * row_bytes
+                )
+
+    def test_fp8_regions_cover_the_same_bytes_as_bf16(self):
+        """
+        Both halves together must mirror the whole row; the 0.625x is the same
+        saving the row-width test pins.
+        """
+        _, bf16 = self._stub(fp8=False)
+        _, fp8 = self._stub(fp8=True)
+        for ratio in (4, 128):
+            _, whole = bf16.unified_region_buffers(ratio)
+            _, nope = fp8.unified_region_buffers(ratio)
+            _, rope = fp8.unified_rope_region_buffers(ratio)
+            self.assertAlmostEqual((nope + rope) / whole, 0.625)
 
 
 if __name__ == "__main__":
