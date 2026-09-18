@@ -1143,18 +1143,35 @@ def _w8a8_block_fp8_matmul_hopper(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Upper bound over every tuned config that sets SPLIT_K (max observed: 16).
+# The kernel masks the rows beyond the runtime `splits`, so this only sizes the
+# `tl.arange`, it does not bound what the caller may pass.
+# Two spellings of one number: a plain int for the host-side assert, and a
+# `tl.constexpr` for the kernel body (a bare module-level int is not readable
+# from inside a @triton.jit function).
+_MAX_SPLIT_K = 16
+_MAX_SPLIT_K_CONST = tl.constexpr(_MAX_SPLIT_K)
+
+
 @triton.jit
-def _reduce_block_fp8_split_k(
-    Parts, Out, ELEMENTS: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr
-):
+def _reduce_block_fp8_split_k(Parts, Out, elements, splits, BLOCK: tl.constexpr):
+    # `elements` (= M*N) and `splits` (= SPLIT_K) are runtime scalars, not
+    # tl.constexpr. Under speculative decoding M changes almost every decode
+    # step, so a constexpr M*N mints a fresh Triton specialization -- a ~2s
+    # serving-time compile -- for each distinct token count, and the cache never
+    # converges. Keeping both runtime means one compiled variant serves every M;
+    # only BLOCK stays constexpr. `splits` is masked against a fixed-size
+    # arange rather than being a constexpr itself, for the same reason.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    splits = tl.arange(0, SPLITS)
+    split_ids = tl.arange(0, _MAX_SPLIT_K_CONST)
+    # int64: split_ids * elements can exceed int32 for the widest tuned shapes.
+    src = Parts + split_ids.to(tl.int64)[:, None] * elements + offsets[None, :]
     values = tl.load(
-        Parts + splits[:, None] * ELEMENTS + offsets[None, :],
-        offsets[None, :] < ELEMENTS,
+        src,
+        (split_ids[:, None] < splits) & (offsets[None, :] < elements),
         0.0,
     )
-    tl.store(Out + offsets, tl.sum(values, axis=0), offsets < ELEMENTS)
+    tl.store(Out + offsets, tl.sum(values, axis=0), offsets < elements)
 
 
 @triton.jit
@@ -1761,6 +1778,10 @@ def w8a8_block_fp8_matmul_triton(
     )
 
     if split_k > 1:
+        assert split_k <= _MAX_SPLIT_K, (
+            f"SPLIT_K={split_k} exceeds _MAX_SPLIT_K={_MAX_SPLIT_K}; "
+            "raise the kernel's arange bound if a tuned config needs more."
+        )
         _reduce_block_fp8_split_k[(triton.cdiv(M * N, 256),)](
             partials, C, M * N, split_k, 256
         )
