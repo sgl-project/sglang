@@ -234,7 +234,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req, owned_kv_end=req.kv.kv_committed_len)
+        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -283,7 +283,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, owned_kv_end=req.kv.kv_committed_len)
+        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -331,7 +331,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         cache.token_to_kv_pool_allocator.reset_mock()
         cache.cache_finished_req(
-            req, is_insert=False, owned_kv_end=req.kv.kv_committed_len
+            req, is_insert=False, owned_kv_len=req.kv.kv_committed_len
         )
 
         free_call = cache.token_to_kv_pool_allocator.free_segment.call_args
@@ -347,10 +347,10 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertEqual(cache.evictable_size(), len(prefix))
 
     def test_insert_releases_committed_slot_without_token_id(self):
-        """The insert path must release up to owned_kv_end, not len(token_ids).
+        """The insert path must release up to owned_kv_len, not len(token_ids).
 
         Pins the ownership contract in BasePrefixCache.cache_finished_req:
-        [cache_protected_len, owned_kv_end) is the request's own KV and every
+        [cache_protected_len, owned_kv_len) is the request's own KV and every
         slot in it is this call's to account for. Slicing the kv row by the
         token-id count instead strands the slots in between -- the radix key
         cannot name them, and no caller releases them either.
@@ -382,7 +382,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         cache.token_to_kv_pool_allocator.reset_mock()
         cache.cache_finished_req(
-            req, is_insert=True, owned_kv_end=req.kv.kv_committed_len
+            req, is_insert=True, owned_kv_len=req.kv.kv_committed_len
         )
 
         # The unnamed tail slot is freed as the segment past the radix key.
@@ -435,7 +435,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
         cache.cache_finished_req(
-            req, is_insert=False, owned_kv_end=req.kv.kv_committed_len
+            req, is_insert=False, owned_kv_len=req.kv.kv_committed_len
         )
 
         # Root lock unchanged, nothing protected or evictable
@@ -619,7 +619,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, owned_kv_end=req.kv.kv_committed_len)
+            cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

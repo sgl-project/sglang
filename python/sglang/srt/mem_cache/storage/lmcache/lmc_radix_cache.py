@@ -439,11 +439,11 @@ class LMCRadixCache(RadixCache):
             )
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(req, is_insert=is_insert, owned_kv_end=owned_kv_end)
+        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)

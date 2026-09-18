@@ -460,16 +460,16 @@ class SWARadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ) -> None:
         """Cache request when it finishes."""
         if self.disable:
-            self.free_kv_row(req.kv, [(0, owned_kv_end)])
+            self.free_kv_row(req.kv, [(0, owned_kv_len)])
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_end]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_end
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         radix_key = RadixKey(
@@ -497,7 +497,7 @@ class SWARadixCache(BasePrefixCache):
             self.free_kv_row(req.kv, [(old_prefix_len, page_aligned_len)])
 
         # free the unaligned tail
-        self.free_kv_row(req.kv, [(page_aligned_len, owned_kv_end)])
+        self.free_kv_row(req.kv, [(page_aligned_len, owned_kv_len)])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(

@@ -63,7 +63,7 @@ class PureSWARadixCache(RadixCache):
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         """Cache request when it finishes.
 
@@ -77,14 +77,14 @@ class PureSWARadixCache(RadixCache):
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :owned_kv_end
+                req.kv.req_pool_idx, :owned_kv_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_end]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_end
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         radix_key = RadixKey(

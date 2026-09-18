@@ -77,11 +77,11 @@ class ChunkCache(BasePrefixCache):
         return InsertResult(prefix_len=0)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
-        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_end)])
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -151,10 +151,10 @@ class PureSWAChunkCache(SWAChunkCache):
     """
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_end
+            req.kv.req_pool_idx, :owned_kv_len
         ]
         # The cache_protected_len prefix is not this req's to free.
         protected_len = req.kv.cache_protected_len
@@ -164,9 +164,9 @@ class PureSWAChunkCache(SWAChunkCache):
             parts = []
             if evict_floor > protected_len:
                 parts.append(kv_indices[protected_len:evict_floor])
-            if evicted_seqlen < owned_kv_end:
+            if evicted_seqlen < owned_kv_len:
                 parts.append(
-                    kv_indices[max(evicted_seqlen, protected_len) : owned_kv_end]
+                    kv_indices[max(evicted_seqlen, protected_len) : owned_kv_len]
                 )
             if parts:
                 self.token_to_kv_pool_allocator.free(torch.cat(parts))
