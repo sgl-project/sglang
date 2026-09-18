@@ -1019,7 +1019,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=false"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1042,7 +1042,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=false"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1062,7 +1062,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=false"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1094,7 +1094,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "mtp-314", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=false"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
