@@ -6,6 +6,8 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.unified_cache.components.base import BASE_COMPONENT_TYPE
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,6 +85,36 @@ class TestLoadBackKvOnly(CustomTestCase):
         self.assertIsNone(cache.cache_controller.load.call_args.kwargs["extra_pools"])
         commit_args = cache.tree_core.commit_load_back.call_args.args
         self.assertEqual(commit_args[3], {})
+
+    def test_kv_only_resident_full_kv_needs_no_dma(self):
+        # After a KV-only restore the node's FULL KV is on device while its
+        # Mamba / SWA state stays host-only, so a rematch still reports a host
+        # hit. A KV-only consumer must get the resident indices, not a failed
+        # load_back (reported on the PR by HZY-Wade).
+        cache = _cache()
+        cache.buffer_pipeline = None
+        cache.linker = None
+        cache.tree_components = (BASE_COMPONENT_TYPE, "mamba")
+        cache.ongoing_load_back = {}
+        cache.tree_core = Mock(
+            is_full_device_evicted=Mock(return_value=False),
+            collect_full_device_indices=Mock(return_value=torch.tensor([20, 21])),
+        )
+        cache.load_back = Mock()
+        req = SimpleNamespace(
+            rid="req-0", last_node=3, swa_host_hit_length=0, mamba_host_hit_length=1
+        )
+
+        indices, node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=7, host_hit_length=2, req=req, kv_only=True
+            )
+        )
+
+        self.assertEqual(indices.tolist(), [20, 21])
+        self.assertEqual(node, 7)
+        cache.load_back.assert_not_called()
+        self.assertFalse(cache.has_ongoing_load_back(7))
 
 
 if __name__ == "__main__":

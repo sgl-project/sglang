@@ -298,8 +298,11 @@ class DecodeHiCacheTransferMixin:
             restored_node
         ).to_dec_params()
 
-        if len(new_indices) == 0:
-            # Whole prefix already on device; no DMA needed.
+        if len(new_indices) == 0 or not self.tree_cache.has_ongoing_load_back(
+            restored_node
+        ):
+            # Whole prefix already on device (or only component state was
+            # host-resident, which a KV-only restore never fetches); no DMA.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
         return True

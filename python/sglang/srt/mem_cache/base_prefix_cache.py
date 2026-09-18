@@ -542,6 +542,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
 
+    def has_ongoing_load_back(self, node_id: Any) -> bool:
+        """Whether init_load_back issued a DMA for ``node_id`` that is still in
+        flight. Caches that always DMA on a host hit keep the default."""
+        return True
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading

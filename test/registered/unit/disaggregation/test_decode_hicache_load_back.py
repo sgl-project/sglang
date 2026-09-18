@@ -29,6 +29,7 @@ class TestDecodeLoadBackIsKvOnly(CustomTestCase):
         tree_cache = Mock(
             init_load_back=Mock(return_value=(torch.tensor([20, 21]), 99)),
             inc_lock_ref=Mock(return_value=Mock(to_dec_params=Mock())),
+            has_ongoing_load_back=Mock(return_value=True),
         )
         harness = SimpleNamespace(tree_cache=tree_cache)
         dr = SimpleNamespace(
@@ -55,6 +56,42 @@ class TestDecodeLoadBackIsKvOnly(CustomTestCase):
         self.assertTrue(params.kv_only)
         self.assertEqual(params.host_hit_length, 2)
         self.assertEqual(dr.hicache_restored_node, 99)
+
+    @patch("sglang.srt.disaggregation.decode_hicache_mixin.match_prefix_for_req")
+    def test_resident_full_kv_is_ready_without_dma(self, match_prefix):
+        # Host hit made of component state only: init_load_back hands back the
+        # resident FULL indices and issues no DMA, so the restore is READY now.
+        match_prefix.return_value = SimpleNamespace(
+            best_match_node=5,
+            host_hit_length=2,
+            device_indices=torch.tensor([10, 11]),
+        )
+        tree_cache = Mock(
+            init_load_back=Mock(return_value=(torch.tensor([20, 21]), 99)),
+            inc_lock_ref=Mock(return_value=Mock(to_dec_params=Mock())),
+            has_ongoing_load_back=Mock(return_value=False),
+        )
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        dr = SimpleNamespace(
+            req=SimpleNamespace(
+                rid="req-0", origin_input_ids=list(range(8)), last_node=None
+            ),
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=torch.tensor([10, 11]),
+                l2_host_hit_length=2,
+                l3_storage_hit_length=0,
+                last_device_node=11,
+                last_host_node=None,
+            ),
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restored_node=None,
+        )
+
+        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(harness, dr)
+
+        self.assertFalse(queued)
+        self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.READY)
+        self.assertEqual(dr.hicache_restored_kv_indices.tolist(), [20, 21])
 
 
 if __name__ == "__main__":

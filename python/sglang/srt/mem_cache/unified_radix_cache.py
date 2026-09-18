@@ -3285,6 +3285,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
+        if params.kv_only and not self.tree_core.is_full_device_evicted(
+            best_match_node_id
+        ):
+            # A KV-only consumer only needs the FULL KV, which is resident;
+            # the host hit is component state (SWA / Mamba) it never restores.
+            # No DMA: the caller sees this via has_ongoing_load_back().
+            return (
+                self.tree_core.collect_full_device_indices(
+                    best_match_node_id, last_best_match_device_node_id
+                ),
+                best_match_node_id,
+            )
+
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
@@ -3392,6 +3405,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def has_ongoing_load_back(self, node_id: NodeId) -> bool:
+        return node_id in self.ongoing_load_back
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
