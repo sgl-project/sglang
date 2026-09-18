@@ -798,6 +798,80 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertFalse(session.has_unfinished_request())
         self._assert_idle(observer, checker)
 
+    def test_queue_full_reject_of_incoming_turn_clears_session(self):
+        """A queue-full reject of the incoming request (not a priority
+        eviction) must run the dropped-request cleanup for it: the session's
+        inflight marker clears and its req-owned early mamba alloc returns,
+        or the session bricks for later turns."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-full", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        assert session.has_unfinished_request()
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.max_queued_requests = 0
+        scheduler.enable_priority_scheduling = False
+        scheduler._release_dropped_waiting_req_mamba_slot = types.MethodType(
+            Scheduler._release_dropped_waiting_req_mamba_slot, scheduler
+        )
+
+        rejected = Scheduler._abort_on_queued_limit(scheduler, req)
+
+        assert rejected is True
+        self.assertFalse(session.has_unfinished_request())
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+
+    def test_queue_full_reject_of_non_streaming_session_turn_is_terminal(self):
+        """A non-streaming session's dropped turn must be stamped terminal:
+        req_nodes only unblocks appends and session close once the req is
+        finished, and abort_req alone clears just the streaming inflight
+        marker, so an unstamped drop bricks the session."""
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            _observer,
+            _checker,
+        ) = _build()
+        session = Session(
+            capacity_of_str_len=0, session_id="session-a", streaming=False
+        )
+        req = session.create_req(
+            _recv("turn-1", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        assert session.req_nodes
+        self.assertTrue(session.has_unfinished_request())
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.max_queued_requests = 0
+        scheduler.enable_priority_scheduling = False
+        scheduler._release_dropped_waiting_req_mamba_slot = types.MethodType(
+            Scheduler._release_dropped_waiting_req_mamba_slot, scheduler
+        )
+
+        rejected = Scheduler._abort_on_queued_limit(scheduler, req)
+
+        assert rejected is True
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(req.finished_reason.status_code, 503)
+        self.assertFalse(session.has_unfinished_request())
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+
     def test_abort_all_over_multiple_retracted_and_queued_decode_reqs(self):
         """abort_all must hit retracted, prealloc, and transfer reqs in one
         pass, tolerating plain Reqs with no session attached."""
@@ -1223,7 +1297,6 @@ class TestSessionQueueAbort(CustomTestCase):
         )
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         self._assert_idle(observer, checker)
-
 
 
     def test_dllm_process_result_finalizes_deferred_abort_on_empty_token_list(self):
