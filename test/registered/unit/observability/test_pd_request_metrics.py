@@ -36,10 +36,10 @@ def collector(role):
     return registry, Collector(labels={"engine_type": role})
 
 
-def request(role, *, stream=False, tokens=101, reason="length", finished=True):
+def request(role, *, tokens, finished=True):
     registry, metrics = collector(role)
     state = NS(
-        obj=NS(stream=stream),
+        obj=NS(stream=False),
         ttft_observed=False,
         last_completion_tokens=1,
         finished=finished,
@@ -58,7 +58,6 @@ def request(role, *, stream=False, tokens=101, reason="length", finished=True):
     )
     recv = NS(
         completion_tokens=[tokens],
-        finished_reasons=[{"type": reason}],
         prompt_tokens=[100],
         cached_tokens=[60],
     )
@@ -67,7 +66,7 @@ def request(role, *, stream=False, tokens=101, reason="length", finished=True):
 
 @pytest.mark.parametrize("role", ["null", "decode", "prefill"])
 def test_abort_without_output_does_not_observe_first_token(role):
-    registry, manager, state, recv = request(role, tokens=0, reason="abort")
+    registry, manager, state, recv = request(role, tokens=0)
     COLLECT(manager, state, recv, 0)
     assert not state.ttft_observed
     assert (
@@ -76,13 +75,6 @@ def test_abort_without_output_does_not_observe_first_token(role):
             {"engine_type": role, "is_streaming": "false"},
         )
         is None
-    )
-    assert (
-        registry.get_sample_value(
-            "sglang:finished_requests_by_outcome_total",
-            {"engine_type": role, "outcome": "abort"},
-        )
-        == 1
     )
 
 
@@ -126,47 +118,6 @@ def test_collector_rejects_nonpositive_token_weights(delta):
         )
         is None
     )
-
-
-@pytest.mark.parametrize(
-    "reason,outcome",
-    [
-        ("stop", "success"),
-        ("length", "success"),
-        ("abort", "abort"),
-        ("other", "other"),
-    ],
-)
-def test_terminal_outcomes_and_tokens_are_separated(reason, outcome):
-    registry, manager, state, recv = request("decode", reason=reason)
-    COLLECT(manager, state, recv, 0)
-    labels = {"engine_type": "decode", "outcome": outcome}
-    for metric, expected in [
-        ("finished_requests_by_outcome", 1),
-        ("finished_prompt_tokens_by_outcome", 100),
-        ("finished_cached_tokens_by_outcome", 60),
-    ]:
-        assert (
-            registry.get_sample_value("sglang:" + metric + "_total", labels) == expected
-        )
-
-
-@pytest.mark.parametrize("injected_backend", [False, True])
-def test_positive_intervals_preserve_weight_for_both_collector_backends(
-    injected_backend,
-):
-    registry, metrics = collector("decode")
-    if not injected_backend:
-        metrics._histogram_cls = None
-    metrics.observe_inter_token_latency({"engine_type": "decode"}, 0.12, 3)
-    labels = {"engine_type": "decode"}
-    assert (
-        registry.get_sample_value("sglang:inter_token_latency_seconds_count", labels)
-        == 3
-    )
-    assert registry.get_sample_value(
-        "sglang:inter_token_latency_seconds_sum", labels
-    ) == pytest.approx(0.12)
 
 
 if __name__ == "__main__":

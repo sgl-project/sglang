@@ -3014,21 +3014,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
-            # A terminal abort without output is not an observed first token.
-            finish_reason = recv_obj.finished_reasons[i] or {}
-            reason_type = finish_reason.get("type")
-            if reason_type in ("stop", "length"):
-                outcome = "success"
-            elif reason_type == "abort":
-                outcome = "abort"
-            else:
-                outcome = "other"
-            self.metrics_collector.observe_finished_outcome(
-                labels,
-                outcome,
-                recv_obj.prompt_tokens[i],
-                recv_obj.cached_tokens[i],
-            )
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
