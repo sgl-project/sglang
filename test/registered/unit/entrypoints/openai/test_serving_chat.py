@@ -323,6 +323,23 @@ class ServingChatTestCase(CustomTestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_mm_token_expansion_start_len_is_forwarded_with_supplied_ids(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hello"}],
+            input_ids=[10, 11, 12],
+            mm_token_expansion_start_len=2,
+            routed_experts_start_len=1,
+        )
+        self.tm.tokenizer.encode.reset_mock()
+        adapted, _ = self.chat._convert_to_internal_request(request)
+        adapted.normalize_batch_and_arguments()
+
+        self.assertEqual(adapted.input_ids, [10, 11, 12])
+        self.assertEqual(adapted.mm_token_expansion_start_len, 2)
+        self.assertEqual(adapted.routed_experts_start_len, 1)
+        self.tm.tokenizer.encode.assert_not_called()
+
     @staticmethod
     def _close_event_loops():
         try:
