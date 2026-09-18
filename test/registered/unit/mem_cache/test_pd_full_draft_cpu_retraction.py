@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -60,7 +61,7 @@ def make_pools(dcp_size):
     return target, draft, mamba, hybrid
 
 
-class TestFullDraftCpuRetraction(unittest.TestCase):
+class TestFullDraftCpuRetraction(CustomTestCase):
     def test_full_draft_registers_but_compact_mapping_does_not(self):
         for compact in (False, True):
             with self.subTest(compact=compact):
