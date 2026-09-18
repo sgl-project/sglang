@@ -122,8 +122,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-
-
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -2795,7 +2793,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
-
             output = fused_experts(
                 x,
                 layer.w13_weight,
