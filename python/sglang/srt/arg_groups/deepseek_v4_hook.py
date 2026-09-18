@@ -322,6 +322,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         and prefill_graph.max_seq_len is None
         and not cp_breakable_prefill
     ):
+        # The non-CP captured low-ratio indexer scores a static context width.
+        # CP BCG runs these sources eagerly with live prefix metadata, so this
+        # default would only force long-prefix CP batches back to eager.
+        # Explicit max_seq_len values still constrain both paths.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
