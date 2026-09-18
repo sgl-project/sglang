@@ -453,7 +453,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts

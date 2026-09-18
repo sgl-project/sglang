@@ -963,6 +963,20 @@ class TestDSV4RequestStateTransfer(unittest.TestCase):
                 _make_state_pool(ratio=128, request_scoped=True, ring_size=256),
             ).request_state_transfer_indices(0, 5)
 
+    def test_multiple_pair_pools_share_request_slot_indices(self):
+        kv = self._kv(
+            *[
+                _make_state_pool(ratio=2, request_scoped=True, ring_size=2)
+                for _ in range(3)
+            ]
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 17), np.array([7], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 18), np.empty((0,), dtype=np.int32)
+        )
+
     def test_page_scoped_pool_has_no_transfer_indices(self):
         with self.assertRaises(AssertionError):
             _make_state_pool(ratio=4, request_scoped=False).transfer_indices(0, 5)

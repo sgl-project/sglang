@@ -1165,6 +1165,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
         # Keep each indexer immediately after the KV buffers of the same ratio.
         for ratio, kv_pool in self.kv_pools.items():
+            sources = self.sources_by_ratio[ratio]
+            producer_indices = [
+                index
+                for index, source in enumerate(sources)
+                if self._stage_start <= source < self._stage_end
+            ]
             if self._unified_kv:
                 # Unified buffers store token rows after the SWA ring. Transfer
                 # compressed pages from the offset; SWA ships as StateType.SWA_RING.
@@ -1181,8 +1187,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     data_lens.append(compress_rows * row_bytes)
                     item_lens.append(rows_per_page * row_bytes)
             elif kv_pool is not None:
-                for buf in kv_pool.kv_buffer:
-                    append_page_buffer(buf)
+                for index in producer_indices:
+                    append_page_buffer(kv_pool.kv_buffer[index])
 
             indexer_pool = self.index_pools.get(ratio)
             if indexer_pool is None:
@@ -1200,13 +1206,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 index_pages_per_full_page = (
                     slots_per_full_page // indexer_pool.page_size
                 )
-            for buf in indexer_pool.contiguous_page_row_buffers():
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+            index_buffers = indexer_pool.contiguous_page_row_buffers()
+            group_count = len(index_buffers) // len(sources)
+            for group in range(group_count):
+                for index in producer_indices:
+                    buf = index_buffers[group * len(sources) + index]
+                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                    data_ptrs.append(buf.data_ptr())
+                    data_lens.append(buf.nbytes)
+                    item_lens.append(buf[0].nbytes * index_pages_per_full_page)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_kv_layer_ids(self) -> List[int]:
+        layer_ids: List[int] = []
+        for ratio in self.kv_pools:
+            sources = [
+                source
+                for source in self.sources_by_ratio[ratio]
+                if self._stage_start <= source < self._stage_end
+            ]
+            layer_ids.extend(sources)
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is not None:
+                groups = len(indexer_pool.contiguous_page_row_buffers()) // len(
+                    self.sources_by_ratio[ratio]
+                )
+                for _ in range(groups):
+                    layer_ids.extend(sources)
+        return layer_ids
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
@@ -1319,6 +1347,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
+    def get_state_layer_ids(self) -> List[int]:
+        if not hasattr(self, "_stage_start"):
+            return []
+        layer_ids: List[int] = []
+        if getattr(self, "swa_kv_pool", None) is not None:
+            layer_ids.extend(range(self._stage_start, self._stage_end))
+        for pools in (
+            self.compress_state_pools,
+            self.indexer_compress_state_pools,
+        ):
+            layer_ids.extend(
+                layer_id
+                for layer_id, pool in enumerate(pools)
+                if pool is not None and not pool.request_scoped
+            )
+        return layer_ids
+
+    def get_unified_swa_ring_layer_ids(self) -> List[int]:
+        if not self._unified_kv or not hasattr(self, "_stage_start"):
+            return []
+        return list(range(self._stage_start, self._stage_end))
+
     def get_request_state_buf_infos(
         self,
     ) -> Tuple[List[int], List[int], List[int]]:
@@ -1339,6 +1389,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             else:
                 item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        return [
+            layer_id
+            for layer_id, pool in enumerate(self.compress_state_pools)
+            if pool is not None and pool.request_scoped
+        ]
 
     def _init_compressed_pools(
         self,
@@ -1595,13 +1652,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         sources_by_ratio: dict[int, List[int]] = {}
         for ratio in (4, 128, 1, 2):
             if ratio in (1, 2):
-                layers = [
-                    l
-                    for l in self.kv_source_layers
-                    if l in stage and self.compression_ratios[l] == ratio
-                ]
+                layers = sorted(
+                    {
+                        max(
+                            source
+                            for source in self.kv_source_layers
+                            if source <= layer_id
+                            and self.compression_ratios[source] == ratio
+                        )
+                        for layer_id in stage
+                        if self.compression_ratios[layer_id] == ratio
+                    }
+                )
             else:
-                layers = [l for l in stage if self.compression_ratios[l] == ratio]
+                layers = [
+                    layer_id
+                    for layer_id in stage
+                    if self.compression_ratios[layer_id] == ratio
+                ]
             if layers:
                 sources_by_ratio[ratio] = layers
         return sources_by_ratio
@@ -1610,9 +1678,83 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """The layer owning this layer's compressed storage: itself for ratios 4/128,
         the nearest preceding kv_source layer for ratios 1/2."""
         ratio = self.compression_ratios[layer_id]
-        sources = [l for l in self.sources_by_ratio[ratio] if l <= layer_id]
+        sources = [
+            source for source in self.sources_by_ratio[ratio] if source <= layer_id
+        ]
         assert sources, f"layer {layer_id} (ratio {ratio}) has no kv_source layer"
         return max(sources)
+
+    def export_source_pages(
+        self, source_layer_id: int, full_page_ids: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        ratio = self.compression_ratios[source_layer_id]
+        source_index = self.sources_by_ratio[ratio].index(source_layer_id)
+        page_ids = full_page_ids.to(torch.int64)
+        tensors = {
+            "kv": self.kv_pools[ratio].kv_buffer[source_index][page_ids].clone(),
+        }
+        index_pool = self.index_pools.get(ratio)
+        if index_pool is None:
+            return tensors
+
+        pages_per_full_page = self.page_size // ratio // index_pool.page_size
+        index_page_ids = (
+            page_ids[:, None] * pages_per_full_page
+            + torch.arange(
+                pages_per_full_page,
+                dtype=torch.int64,
+                device=page_ids.device,
+            )
+        ).flatten()
+        if index_pool.index_k_with_scale_buffer is not None:
+            tensors["index"] = index_pool.index_k_with_scale_buffer[source_index][
+                index_page_ids
+            ].clone()
+        else:
+            tensors["index_payload"] = index_pool.index_k_payload_buffer[source_index][
+                index_page_ids
+            ].clone()
+            tensors["index_scale"] = index_pool.index_k_scale_buffer[source_index][
+                index_page_ids
+            ].clone()
+        return tensors
+
+    def install_source_pages(
+        self,
+        source_layer_id: int,
+        full_page_ids: torch.Tensor,
+        tensors: dict[str, torch.Tensor],
+    ) -> None:
+        ratio = self.compression_ratios[source_layer_id]
+        source_index = self.sources_by_ratio[ratio].index(source_layer_id)
+        page_ids = full_page_ids.to(torch.int64)
+        self.kv_pools[ratio].kv_buffer[source_index].index_copy_(
+            0, page_ids, tensors["kv"]
+        )
+        index_pool = self.index_pools.get(ratio)
+        if index_pool is None:
+            return
+
+        pages_per_full_page = self.page_size // ratio // index_pool.page_size
+        index_page_ids = (
+            page_ids[:, None] * pages_per_full_page
+            + torch.arange(
+                pages_per_full_page,
+                dtype=torch.int64,
+                device=page_ids.device,
+            )
+        ).flatten()
+        if index_pool.index_k_with_scale_buffer is not None:
+            index_pool.index_k_with_scale_buffer[source_index].index_copy_(
+                0, index_page_ids, tensors["index"]
+            )
+        else:
+            index_pool.index_k_payload_buffer[source_index].index_copy_(
+                0, index_page_ids, tensors["index_payload"]
+            )
+            index_pool.index_k_scale_buffer[source_index].index_copy_(
+                0, index_page_ids, tensors["index_scale"]
+            )
 
     def _init_compressed_layer_mapping(self):
         layer_counts = {0: 0, **{ratio: 0 for ratio in self.kv_pools}}
@@ -1734,7 +1876,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        bs = req_pool_indices.numel()
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue

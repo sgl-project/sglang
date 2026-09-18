@@ -272,6 +272,51 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if cfg.pp_size > 1:
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        incompatible = (
+            (
+                "a PP/TP layout other than PP4 x TP2",
+                (cfg.pp_size, cfg.tp_size) != (4, 2),
+            ),
+            ("data parallelism", cfg.dp_size != 1),
+            ("decode context parallelism", cfg.dcp_size != 1),
+            (
+                "context parallelism",
+                cfg.enable_prefill_cp or cfg.attn_cp_size != 1,
+            ),
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            (
+                "a mode other than disaggregated Prefill",
+                cfg.disaggregation_mode != "prefill",
+            ),
+            (
+                "a transfer backend other than Mooncake",
+                cfg.disaggregation_transfer_backend != "mooncake",
+            ),
+            ("HiCache", cfg.enable_hierarchical_cache),
+            (
+                "device-resident Engram tables",
+                not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),
+            ),
+            ("radix cache", not cfg.disable_radix_cache),
+            ("pipeline async batch depth", cfg.pp_async_batch_depth != 0),
+            ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+            (
+                "prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+            ("FlashInfer autotuning", not cfg.disable_flashinfer_autotune),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("two-batch overlap", cfg.enable_two_batch_overlap),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    "DeepSeek-V4.1 ordinary PP does not support "
+                    f"{feature}; use PP4 x TP2 eager disaggregated Prefill."
+                )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -316,7 +361,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
         ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
