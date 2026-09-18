@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -248,6 +249,8 @@ def _scheduler_stub(cache):
         ),
         beam_coordinator=SimpleNamespace(retire_group=Mock()),
         disaggregation_mode=DisaggregationMode.NULL,
+        disagg_prefill_pending_chunk_rids=set(),
+        enable_hicache_storage=False,
         dllm_config=None,
         grammar_manager=SimpleNamespace(abort_requests=Mock()),
         ps=SimpleNamespace(pp_size=1),
@@ -261,6 +264,9 @@ def _scheduler_stub(cache):
         Scheduler._release_dropped_waiting_req_mm_inputs, stub
     )
     stub.collect_inflight_reqs = types.MethodType(Scheduler.collect_inflight_reqs, stub)
+    stub.clear_pending_chunk_send = types.MethodType(
+        SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send, stub
+    )
     return stub
 
 
@@ -422,7 +428,7 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[req]
+            queue=[], retracted_queue=[req], held_rebootstrap_reqs=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
@@ -470,7 +476,7 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[decode_req], retracted_queue=[]
+            queue=[decode_req], retracted_queue=[], held_rebootstrap_reqs=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
@@ -597,7 +603,7 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[]
+            queue=[], retracted_queue=[], held_rebootstrap_reqs=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[decode_req])
         send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
@@ -831,7 +837,9 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[prealloc_decode_req], retracted_queue=[retracted_req]
+            queue=[prealloc_decode_req],
+            retracted_queue=[retracted_req],
+            held_rebootstrap_reqs=[],
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(
             queue=[transfer_decode_req]
@@ -888,7 +896,7 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[req]
+            queue=[], retracted_queue=[req], held_rebootstrap_reqs=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
@@ -943,7 +951,7 @@ class TestSessionQueueAbort(CustomTestCase):
         scheduler = _scheduler_stub(cache)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[req_a, req_b]
+            queue=[], retracted_queue=[req_a, req_b], held_rebootstrap_reqs=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
@@ -964,6 +972,257 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertTrue(req_a.finished())
         self.assertTrue(req_b.finished())
         self.assertEqual(send_output.call_count, 3)
+
+    def test_prefill_bootstrap_queue_abort_finishes_session_turn(self):
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(req.kv.req_pool_idx)
+        req.disagg_kv_sender = Mock()
+        req.bootstrap_room = 0
+        req.time_stats = SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **kwargs: None)
+        )
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.ps.tp_rank = 0
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[req])
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        scheduler.req_to_metadata_buffer_idx_allocator = None
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.finished_reason.status_code)
+        self.assertFalse(session.has_unfinished_request())
+        req.disagg_kv_sender.abort.assert_called_once()
+        self.assertEqual(scheduler.disagg_prefill_bootstrap_queue.queue, [req])
+
+        SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
+
+        self.assertIsNone(req.finished_reason.status_code)
+        scheduler.metrics_collector.increment_bootstrap_failed_reqs.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_prefill_inflight_queue_abort_stamps_user_abort(self):
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+        req.disagg_kv_sender = Mock()
+        req.bootstrap_room = 0
+        req.time_stats = SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **kwargs: None)
+        )
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.ps.tp_rank = 0
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_inflight_queue = [req]
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.finished_reason.status_code)
+        req.disagg_kv_sender.abort.assert_called_once()
+        # The sender's failure_exception() is also its cleanup; it must still
+        # run for a user abort, with its exception swallowed.
+        req.disagg_kv_sender.failure_exception.side_effect = RuntimeError("aborted")
+
+        exc = SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure(
+            scheduler, req
+        )
+
+        req.disagg_kv_sender.failure_exception.assert_called_once_with()
+        self.assertIsNone(exc)
+        self.assertIsNone(req.finished_reason.status_code)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_natural_prefill_transfer_failure_still_reports_500(self):
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+        req.disagg_kv_sender = Mock()
+        req.bootstrap_room = 0
+        req.time_stats = SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **kwargs: None)
+        )
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.ps.tp_rank = 0
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_inflight_queue = [req]
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+
+        exc = SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure(
+            scheduler, req
+        )
+
+        self.assertIsNone(exc)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(req.finished_reason.status_code, 500)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_prefill_inflight_failure_of_internally_aborted_req_counts_as_failure(self):
+        """An internal 500 FINISH_ABORT on the prefill side is not a user
+        cancel either: the sender's exception must propagate to the caller,
+        the req is restamped with the transfer error, and the failure metric
+        fires."""
+        (
+            _server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        _prefill(req, cache, allocator, req_to_token_pool)
+        req.disagg_kv_sender = Mock()
+        req.bootstrap_room = 0
+        req.time_stats = SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **kwargs: None)
+        )
+        # An internal failure already stamped a 500 abort.
+        req.finished_reason = FINISH_ABORT("corruption detected", 500)
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.ps.tp_rank = 0
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_inflight_queue = [req]
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        scheduler.metrics_collector = Mock()
+        boom = RuntimeError("boom")
+        req.disagg_kv_sender.failure_exception.side_effect = boom
+
+        exc = SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure(
+            scheduler, req
+        )
+
+        self.assertIs(exc, boom)
+        req.disagg_kv_sender.failure_exception.assert_called_once_with()
+        self.assertEqual(req.finished_reason.status_code, 500)
+        self.assertIn("Prefill transfer failed", req.finished_reason.message)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.assertFalse(session.has_unfinished_request())
+        self._assert_idle(observer, checker)
+
+    def test_held_rebootstrap_abort_targeted_and_abort_all(self):
+        (
+            _server_args,
+            cache,
+            _allocator,
+            _req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req_a = SimpleNamespace(
+            rid="held-a",
+            session=None,
+            multimodal_inputs=None,
+            finished_reason=None,
+            return_logprob=False,
+            weight_version_events=[],
+            output_ids=array("q"),
+        )
+        req_b = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertTrue(session.has_unfinished_request())
+
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[],
+            retracted_queue=[],
+            held_rebootstrap_reqs=[req_a, req_b],
+            add=Mock(),
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req_a.rid))
+        held = scheduler.disagg_decode_prealloc_queue.held_rebootstrap_reqs
+        self.assertEqual(held, [req_b])
+        self.assertIsInstance(req_a.finished_reason, FINISH_ABORT)
+        send_output.assert_called_once()
+        self.assertEqual(send_output.call_args[0][0].rid, req_a.rid)
+        self.assertTrue(session.has_unfinished_request())
+
+        Scheduler.abort_request(scheduler, AbortReq(rid="", abort_all=True))
+        self.assertEqual(held, [])
+        self.assertIsInstance(req_b.finished_reason, FINISH_ABORT)
+        self.assertFalse(session.has_unfinished_request())
+        self.assertEqual(send_output.call_count, 2)
+
+        DecodePreallocQueue.enqueue_held_rebootstrap(
+            scheduler.disagg_decode_prealloc_queue
+        )
+        scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+        self._assert_idle(observer, checker)
 
 
 
