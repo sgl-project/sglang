@@ -31,11 +31,25 @@ impl Policy for PowerOfTwoPolicy {
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, PickResult> {
         let ctx = request.admission();
-        ready(self.admission.select(engines, &ctx, |admitted| {
-            let (left, right) = sample_pair(admitted, &mut rand::thread_rng())?;
-            Some(lower_pressure(left, right, request.stage, request.load.snapshot()).clone())
-        }))
+        ready(
+            self.admission
+                .select(engines, &ctx, |admitted| choose(admitted, request).cloned()),
+        )
     }
+}
+
+/// One power-of-two choice among `engines`; the shared fallback of affinity policies.
+pub(crate) fn choose<'e>(
+    engines: &'e [Arc<Worker>],
+    request: &PickRequest<'_>,
+) -> Option<&'e Arc<Worker>> {
+    let (left, right) = sample_pair(engines, &mut rand::thread_rng())?;
+    Some(lower_pressure(
+        left,
+        right,
+        request.stage,
+        request.load.snapshot(),
+    ))
 }
 
 /// Two distinct candidates when there are at least two; one pairs with itself.
