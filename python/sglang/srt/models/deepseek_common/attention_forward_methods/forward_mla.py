@@ -89,10 +89,8 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_dcp_mla_decode_phase(
-    forward_batch: ForwardBatch, is_draft: bool = False
-) -> bool:
-    if not get_parallel().dcp_enabled or is_draft:
+def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    if get_attn_backend().dcp_size == 1:
         return False
     return (
         forward_batch.forward_mode.is_decode()
@@ -316,7 +314,7 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn)
+            and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -392,7 +390,7 @@ class DeepseekMLAForwardMixin:
                     # full-head Q from the gathered weight (skips Q all-gather)
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * get_attn_backend().dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -464,7 +462,7 @@ class DeepseekMLAForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * get_attn_backend().dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -629,8 +627,8 @@ class DeepseekMLAForwardMixin:
         )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+        if get_attn_backend().dcp_size > 1:
+            if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -723,7 +721,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+            elif is_dcp_mla_decode_phase(forward_batch):
                 # set return_lse=True to correct attn_output
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
@@ -772,10 +770,10 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+        if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * get_attn_backend().dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():

@@ -319,6 +319,7 @@ class DeepseekSparseAttnBackend(
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
+        self._init_dcp(model_runner.is_draft_worker)
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
@@ -350,9 +351,6 @@ class DeepseekSparseAttnBackend(
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         allocator = model_runner.token_to_kv_pool_allocator
         self.kv_address_space_size = allocator.size_full + allocator.page_size
-        self._dcp_sharded_kv = (
-            get_parallel().dcp_enabled and not model_runner.is_draft_worker
-        )
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -1994,7 +1992,7 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
-        if self._dcp_sharded_kv:
+        if self.dcp_size > 1:
             if forward_batch.forward_mode.is_extend_without_speculative():
                 assert k is not None
                 kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
@@ -2029,8 +2027,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 return_lse=(
-                    self._dcp_sharded_kv
-                    and forward_batch.forward_mode.is_target_verify()
+                    self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify()
                 ),
             )
         elif dsa_impl == "triton":
@@ -2292,7 +2289,7 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if self._dcp_sharded_kv:
+        if self.dcp_size > 1:
             page_table_1 = self._dcp_global_to_local_kv_indices(page_table_1)
 
         if dsa_impl == "flashmla_sparse":
@@ -2344,7 +2341,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                return_lse=self._dcp_sharded_kv,
+                return_lse=self.dcp_size > 1,
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3614,7 +3611,7 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         # Note(kpham-sgl): Gathered prefill KV uses sequence offsets, not cache slots.
-        if self._dcp_sharded_kv and forward_mode.is_extend_without_speculative():
+        if self.dcp_size > 1 and forward_mode.is_extend_without_speculative():
             return TopkTransformMethod.RAGGED
         if (
             # disable for MTP

@@ -43,7 +43,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -380,7 +383,7 @@ class DeepseekMLARocmForwardMixin:
 
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn)
+            and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -500,7 +503,7 @@ class DeepseekMLARocmForwardMixin:
                 if q_replicate_active:
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * get_attn_backend().dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -525,7 +528,7 @@ class DeepseekMLARocmForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * get_attn_backend().dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -593,7 +596,7 @@ class DeepseekMLARocmForwardMixin:
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
 
         force_rope_for_aiter_dcp_decode = (
-            get_parallel().dcp_enabled
+            get_attn_backend().dcp_size > 1
             and (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
@@ -624,8 +627,8 @@ class DeepseekMLARocmForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+        if get_attn_backend().dcp_size > 1:
+            if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -747,7 +750,7 @@ class DeepseekMLARocmForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                if is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+                if is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -785,7 +788,7 @@ class DeepseekMLARocmForwardMixin:
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
-            and get_parallel().dcp_enabled
+            and get_attn_backend().dcp_size > 1
         ):
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             if llama_4_scaling is not None:
@@ -840,10 +843,10 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch, is_draft=self.is_nextn):
+        if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * get_attn_backend().dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():

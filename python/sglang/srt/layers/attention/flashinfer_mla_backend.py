@@ -229,6 +229,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
+        self._init_dcp(model_runner.is_draft_worker)
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
@@ -660,7 +661,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             or spec_info.custom_mask is not None
         ):
             return None
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             return None
         draft_token_num = int(spec_info.draft_token_num)
         kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
@@ -819,9 +820,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
-            return_lse=(
-                forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
-            ),
+            return_lse=(forward_batch.forward_mode.is_decode() and self.dcp_size > 1),
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -836,7 +835,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
-            * get_parallel().attn_dcp_size
+            * attn_backend.dcp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -912,7 +911,7 @@ class FlashInferMLAIndicesUpdaterDecode:
 
             # The stream above is deliberately VIRTUAL under DCP.
             n_kernel_ids = paged_kernel_lens_sum
-            if get_parallel().dcp_enabled:
+            if self.attn_backend.dcp_size > 1:
                 n_kernel_ids = plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,

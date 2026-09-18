@@ -228,7 +228,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # A DCP decode attends with the query all-gathered across the DCP
         # group, so the kernel sees attn_dcp_size x this rank's heads. Anything
         # sized per decode head must use this, not num_q_heads.
-        self.num_decode_q_heads = self.num_q_heads * get_parallel().attn_dcp_size
+        self.num_decode_q_heads = self.num_q_heads * self.dcp_size
 
         # MLA-specific dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -313,7 +313,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._fused_set_kv_concat_q = (
             self.data_type == torch.bfloat16
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
-            and not get_parallel().dcp_enabled
+            and self.dcp_size == 1
             and can_use_set_mla_kv_concat_q(
                 self.kv_lora_rank * 2, self.qk_rope_head_dim * 2
             )
@@ -357,19 +357,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # the whole trtllm_mla family shares it. A no-op when DCP is off.
     # ------------------------------------------------------------------
     def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
+        if self.dcp_size == 1:
             return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
+        return get_dcp_lens(seq_lens, self.dcp_size, self.dcp_rank).to(torch.int32)
 
     def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
+        if self.dcp_size == 1:
             return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
+        local_max = max_seq_len // self.dcp_size + int(
+            self.dcp_rank < max_seq_len % self.dcp_size
         )
         # A positive scheduling bound is required even when every sequence in a
         # padded graph row is empty on this rank.
@@ -381,7 +377,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices: torch.Tensor,
         local_seq_lens: torch.Tensor,
     ) -> None:
-        parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
         # None on a static pool, whose collapsed page is already physical.
         v2p = self.kv_index_translator.full_v2p_table
@@ -402,8 +397,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices.stride(0),
             self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
-            DCP_SIZE=parallel.dcp_size,
-            DCP_RANK=parallel.dcp_rank,
+            DCP_SIZE=self.dcp_size,
+            DCP_RANK=self.dcp_rank,
             PAGES_PER_BLOCK=pages_per_block,
             HAS_V2P=v2p is not None,
         )
@@ -433,7 +428,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             self._fill_dcp_block_kv_indices(
                 block_kv_indices,
                 req_pool_indices,
@@ -585,7 +580,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             if metadata.global_seq_lens_k is None:
                 # A DCP decode consumes both the rank-local and the global
                 # lens, and the branches above allocate this only for verify.
@@ -614,7 +609,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             return self._apply_dcp_cuda_graph_metadata(
                 bs, req_pool_indices, seq_lens, forward_mode, metadata
             )
@@ -921,7 +916,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
             self.forward_decode_metadata.batch_size = bs
 
-            if get_parallel().dcp_enabled:
+            if self.dcp_size > 1:
                 metadata = self.forward_decode_metadata
                 if (
                     forward_batch.forward_mode.is_target_verify()
@@ -1051,7 +1046,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         (only plain decode requests the LSE the cross-rank merge needs).
         """
         q_len = query.shape[1] if query.dim() == 4 else 1
-        if get_parallel().dcp_enabled and (
+        if self.dcp_size > 1 and (
             q_len > 1 or causal_seqs is not None or not return_lse
         ):
             raise NotImplementedError(
@@ -1219,11 +1214,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
         ):
             return None
-        parallel = get_parallel()
         # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
         # is also its only skip. A DCP-resolved loc never reaches here -- see
         # the `_fused_set_kv_concat_q_fp8` gate.
-        assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
+        assert not (self.dcp_size > 1 and self.kv_index_translator.is_translating), (
             "fused fp8 KV write reached with a DCP-resolved loc"
         )
         return set_mla_kv_concat_q_fp8(
@@ -1233,8 +1227,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cache_k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
-            dcp_world_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
+            dcp_world_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def _dummy_dcp_decode_for_autotune(
@@ -1274,7 +1268,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
-        if get_parallel().dcp_enabled and get_in_autotune_dummy_run():
+        if self.dcp_size > 1 and get_in_autotune_dummy_run():
             return self._dummy_dcp_decode_for_autotune(q, layer)
 
         merge_query = q_rope is not None
@@ -1398,7 +1392,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             return self._forward_decode_dcp(
                 query, kv_cache, metadata, layer, forward_batch
             )
@@ -1595,7 +1589,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             if forward_batch.forward_mode.is_target_verify():
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                dcp_enabled = get_parallel().dcp_enabled
+                dcp_enabled = self.dcp_size > 1
                 max_seq_len = metadata.max_seq_len_k + (
                     0 if dcp_enabled else draft_token_num
                 )
@@ -1681,10 +1675,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and get_parallel().dcp_enabled
-            ):
+            if forward_batch.forward_mode.is_target_verify() and self.dcp_size > 1:
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,
@@ -1693,8 +1684,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     max_seq_len=max_seq_len,
                     layer=layer,
                     causal_seqs=metadata.global_seq_lens_k,
-                    cp_world=get_parallel().dcp_size,
-                    cp_rank=get_parallel().dcp_rank,
+                    cp_world=self.dcp_size,
+                    cp_rank=self.dcp_rank,
                     return_lse=True,
                 )
                 output = raw_out.view(
