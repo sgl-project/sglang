@@ -21,6 +21,7 @@ class KVCacheBuildResult:
     token_to_kv_pool_allocator: object
     disable_radix_cache: bool
     tree_cache: object
+    storage_contributor: object = None
 
 
 from typing import TYPE_CHECKING
@@ -207,6 +208,66 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _maybe_create_decode_storage_contributor(
+    *, server_args: ServerArgs, params
+) -> object:
+    """Mount decode host memory into the Mooncake store without cache I/O.
+
+    Only ranks that link to the store mount a segment, and disaggregated decode
+    defaults to a chunk cache, so its host memory never joins the pool however
+    free it is. The contributor owns a segment but no cache pool, so no KV is
+    read or written through it. A decode rank holds no store configuration, so
+    the knob is the operator asserting that prefixes live in Mooncake.
+    """
+    if get_disagg().disaggregation_mode != "decode":
+        return None
+    if not get_memory().mooncake_store_contributor:
+        return None
+    if not (envs.MOONCAKE_MASTER.is_set() or envs.MOONCAKE_CLIENT.is_set()):
+        raise ValueError(
+            "--mooncake-store-contributor needs MOONCAKE_MASTER or "
+            "MOONCAKE_CLIENT; the knob only applies where prefix pages are "
+            "stored in Mooncake."
+        )
+
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+
+    try:
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "--mooncake-store-contributor needs the Mooncake store package."
+        ) from exc
+
+    parallel = get_parallel()
+    storage_config = HiCacheStorageConfig(
+        tp_rank=parallel.attn_tp_rank,
+        tp_size=parallel.attn_tp_size,
+        pp_rank=params.pp_rank,
+        pp_size=params.pp_size,
+        attn_cp_rank=params.attn_cp_rank,
+        attn_cp_size=params.attn_cp_size,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=False,
+        model_name=server_args.model_path,
+    )
+    contributor = MooncakeStore(storage_config=storage_config, mem_pool=None)
+    logger.info(
+        "Decode rank contributes store capacity: attn_tp_rank=%d/%d, "
+        "attn_cp_rank=%d/%d, pp_rank=%d/%d",
+        parallel.attn_tp_rank,
+        parallel.attn_tp_size,
+        params.attn_cp_rank,
+        params.attn_cp_size,
+        params.pp_rank,
+        params.pp_size,
+    )
+    return contributor
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -335,6 +396,10 @@ def build_kv_cache(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
+    storage_contributor = _maybe_create_decode_storage_contributor(
+        server_args=server_args, params=params
+    )
+
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(
             server_args=server_args,
@@ -374,6 +439,7 @@ def build_kv_cache(
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     return KVCacheBuildResult(
+        storage_contributor=storage_contributor,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         sliding_window_size=sliding_window_size,

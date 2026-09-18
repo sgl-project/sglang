@@ -1799,6 +1799,26 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
+    def test_store_contributor_is_decode_only_and_excludes_the_linker(self):
+        with self.assertRaises(ValueError):
+            handle_hicache(self._make_args(mooncake_store_contributor=True))
+
+        with self.assertRaises(ValueError):
+            handle_hicache(
+                self._make_args(
+                    mooncake_store_contributor=True,
+                    disaggregation_mode="decode",
+                    enable_unified_cache_external_linker=True,
+                )
+            )
+
+        handle_hicache(
+            self._make_args(
+                mooncake_store_contributor=True,
+                disaggregation_mode="decode",
+            )
+        )
+
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
