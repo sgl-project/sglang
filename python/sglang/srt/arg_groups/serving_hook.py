@@ -466,13 +466,20 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and (
-            cfg.hicache_storage_backend is not None
-            or cfg.hicache_write_policy != "write_back"
+        elif cfg.enable_hierarchical_cache and not (
+            (
+                cfg.hicache_storage_backend is None
+                and cfg.hicache_write_policy == "write_back"
+            )
+            or (
+                cfg.hicache_storage_backend is not None
+                and cfg.hicache_host_memory_mode == "buffer_only"
+                and cfg.hicache_write_policy == "write_through"
+            )
         ):
             logger.warning(
-                "Optimistic prefill only supports L2 hierarchical cache "
-                "with write-back policy"
+                "Optimistic prefill supports L2 write-back or L3 buffer-only "
+                "write-through hierarchical cache"
             )
             declare_resolution(
                 server_args,
