@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from contextlib import nullcontext
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_utils.pool import (
+    borrow_graph_pool,
+    graph_pool_borrow_largest_run,
+)
 from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
@@ -434,6 +442,10 @@ def _deterministic_inference_enabled() -> bool:
         return False
 
 
+# Scratch allocations and caching-allocator segment rounding in the borrow scope.
+_GRAPH_POOL_BORROW_SLACK_BYTES = 64 << 20
+
+
 class InputLogprobProcessor:
     """Input (prefill) logprob processing: single-pass or chunked.
 
@@ -442,7 +454,13 @@ class InputLogprobProcessor:
     the lm_head / TP-gather machinery in LogitsProcessor.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        vocab_size: int,
+        chunking_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.vocab_size = vocab_size
+        self.chunking_group = chunking_group
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
@@ -479,6 +497,10 @@ class InputLogprobProcessor:
         else:
             chunk_size = self.logprobs_chunk_size
 
+        borrow_logits_memory = False
+        if pruned_states.is_cuda and not skip_chunking_for_dp_attn:
+            borrow_logits_memory = self._can_borrow_logits_memory(chunk_size)
+
         return self._forward_by_chunk(
             pruned_states,
             sample_indices,
@@ -488,7 +510,36 @@ class InputLogprobProcessor:
             get_logits_fn,
             logits_metadata,
             chunk_size,
+            borrow_logits_memory=borrow_logits_memory,
         )
+
+    def _can_borrow_logits_memory(self, chunk_size: int) -> bool:
+        """Borrow only when the planned chunk fits on every TP rank.
+
+        Resizing chunks to graph-pool capacity changes LM-head GEMM shapes
+        and their rounding. Keep chunk boundaries independent of the graph
+        memory layout, including when borrowing is disabled on another runner.
+        """
+        # TP gathering can hold the local projection, gathered tensor, and
+        # contiguous reshape together; FP32 bounds their possible dtypes.
+        bytes_per_row = 3 * self.vocab_size * 4
+        # NCCL's symmetric allocator owns its collective buffers, so those
+        # allocations cannot be counted as borrowed storage.
+        free_run = (
+            0 if is_symmetric_memory_enabled() else graph_pool_borrow_largest_run()
+        )
+        fit_rows = max(0, free_run - _GRAPH_POOL_BORROW_SLACK_BYTES) // bytes_per_row
+        if self.chunking_group is not None:
+            capacity = torch.tensor(fit_rows, dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(
+                capacity,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.chunking_group,
+            )
+            fit_rows = int(capacity.item())
+        # Fall back to the existing reserved workspace if borrowing cannot
+        # hold the whole chunk; do not change LoRA or logprob chunk boundaries.
+        return fit_rows >= chunk_size
 
     def _forward_by_chunk(
         self,
@@ -500,6 +551,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
+        borrow_logits_memory: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
@@ -557,14 +609,20 @@ class InputLogprobProcessor:
             # writing through the shared graph logits buffer would alias
             # chunks whose shape happens to match the buffer.
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = get_logits_fn(
-                chunk_states,
-                lm_head,
-                logits_metadata,
-                use_logits_buffer=num_chunks == 1,
-            )
+            with (
+                borrow_graph_pool(user="input logits")
+                if borrow_logits_memory
+                else nullcontext()
+            ):
+                chunk_logits = get_logits_fn(
+                    chunk_states,
+                    lm_head,
+                    logits_metadata,
+                    use_logits_buffer=num_chunks == 1,
+                )
 
-            # Initialize sampled_logits on first chunk
+            # Sampled outputs must survive graph replay, so they are allocated
+            # outside borrowing. The transient logits are released below.
             if i == 0:
                 sampled_logits = torch.empty(
                     (sample_indices.shape[0], chunk_logits.shape[1]),
