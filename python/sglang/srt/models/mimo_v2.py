@@ -1006,7 +1006,7 @@ class MiMoV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self.layers_to_capture = []
 
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank or self.pp_group.is_last_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1382,17 +1382,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             "forward() should not be called in encoder_only mode"
         )
 
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+        if self._is_multimodal:
+            mm_forward_output = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1400,6 +1391,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 positions=positions,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # Non-last PP stages return PPProxyTensors from the language model;
+            # forward that proxy intact instead of unpacking its mapping keys as
+            # (hidden_states, hidden_states_before_norm).
+            if isinstance(mm_forward_output, PPProxyTensors):
+                return mm_forward_output
+            hidden_states, hidden_states_before_norm = mm_forward_output
         else:
             hidden_states, hidden_states_before_norm = self.model(
                 input_ids,
@@ -1682,7 +1679,19 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         assert self.model is not None and self.lm_head is not None, (
             "get_embed_and_head() is not available in encoder_only mode"
         )
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        from sglang.srt.layers.utils import PPMissingLayer
+
+        embed = (
+            self.model.embed_tokens.weight
+            if not isinstance(self.model.embed_tokens, PPMissingLayer)
+            else None
+        )
+        head = (
+            self.lm_head.weight
+            if not isinstance(self.lm_head, PPMissingLayer)
+            else None
+        )
+        return embed, head
 
     def set_embed_and_head(self, embed, head):
         assert self.model is not None and self.lm_head is not None, (

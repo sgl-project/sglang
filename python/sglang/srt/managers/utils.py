@@ -99,6 +99,9 @@ class GenerationBatchResult:
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
+    # PP speculative verify bookkeeping carried on the output ring.
+    spec_accept_indices: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
 

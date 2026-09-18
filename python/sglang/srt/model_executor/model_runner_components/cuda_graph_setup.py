@@ -225,10 +225,20 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
     world_group = get_world_group()
+    # In PP speculative decoding, only the last PP stage constructs the
+    # draft runner. A world-wide all_reduce here would therefore be called
+    # once by every target runner but an additional time only by the last
+    # stage's draft runner, leaving the other PP stages waiting in the next
+    # collective. The draft shares the last stage's GPU with its target, so a
+    # local memory value is sufficient and keeps collective counts rank
+    # uniform.
+    distributed_budget = world_group.world_size > 1 and not (
+        model_runner.is_draft_worker and get_parallel().pp_size > 1
+    )
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=world_group.world_size > 1,
+        distributed=distributed_budget,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(

@@ -431,6 +431,21 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
+                # In PP + DP-attention decode, only the attention-TP leader
+                # posts the request/consensus P2P messages. Other TP ranks
+                # would otherwise enter the DP metadata NCCL all_gather while
+                # the leader is still waiting for the next PP stage to receive
+                # a message. That crosses Gloo P2P with the NCCL collective
+                # and can deadlock (the watchdog reports an all_gather timeout
+                # even though the first mismatch is the PP control channel).
+                # Align every rank in this PP stage before scheduling the
+                # batch.  The PP control messages are posted only by each
+                # attention-TP leader; use the stage's TP group so the other
+                # TP ranks cannot enter DP metadata NCCL all_gather while the
+                # leader is still waiting for the next PP stage.
+                if self.require_mlp_sync and self.ps.pp_size > 1:
+                    self.tp_group.barrier()
+
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
                     running_batch=self.running_batch
@@ -831,10 +846,38 @@ class SchedulerPPMixin:
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
-            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+        if result.speculative_num_draft_tokens is not None:
+            # Spec V2 flattens verify outputs per request. Preserve the row
+            # width across the PP transport so rank 0 can decode accepted
+            # tokens from the flattened tensor.
+            tensor_dict["speculative_num_draft_tokens"] = int(
+                result.speculative_num_draft_tokens
+            )
+        if result.speculative_output_stride is not None:
+            tensor_dict["speculative_output_stride"] = int(
+                result.speculative_output_stride
+            )
+
+        if draft_input is not None:
+            # ``next_token_ids`` is the flattened verify proposal tree for
+            # speculative decoding (width can be > 1 per request). FutureMap
+            # needs the separate per-request bonus token that seeds the next
+            # draft iteration, so relay it explicitly instead of making the
+            # receiver mistake the full proposal tensor for that token.
+            if draft_input.bonus_tokens is not None:
+                tensor_dict["draft_bonus_tokens"] = draft_input.bonus_tokens.contiguous()
+            if draft_input.topk_p is not None:
+                tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+                tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+                if draft_input.hidden_states is not None:
+                    tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
+        if result.spec_accept_indices is not None:
+            tensor_dict[
+                "spec_accept_indices"
+            ] = result.spec_accept_indices.contiguous()
+        if result.accept_lens is not None:
+            tensor_dict["spec_accept_lens"] = result.accept_lens.contiguous()
 
         has_sampling_mask_output = (
             result.logits_output is not None
@@ -1041,79 +1084,87 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        if not self.spec_algorithm.is_none():
+            # Spec V2 result processing consumes host-side accept lengths and
+            # token ids. The output ring carries device tensors, so stage the
+            # small metadata payload before process_batch_result.
+            next_token_ids = next_token_ids.to("cpu")
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
+        if "draft_bonus_tokens" in pp_outputs.tensors or "draft_topk_p" in pp_outputs.tensors:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
+            bonus_tokens = pp_outputs.tensors.get("draft_bonus_tokens")
+            if bonus_tokens is None:
+                # Compatibility with an older PP sender. New senders always
+                # relay draft_bonus_tokens; retaining this fallback keeps the
+                # error explicit if a mixed-version deployment is used.
+                raise RuntimeError(
+                    "PP speculative output is missing per-request draft_bonus_tokens"
+                )
             next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
-                bonus_tokens=next_token_ids,
+                topk_p=pp_outputs.tensors.get("draft_topk_p"),
+                topk_index=pp_outputs.tensors.get("draft_topk_index"),
+                hidden_states=pp_outputs.tensors.get("draft_hidden_states"),
+                bonus_tokens=bonus_tokens,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
             )
             batch.spec_info = next_draft_input
 
-        if self._pp_spec_relay:
-            # Gated single-instance PP+spec: the sampled first token roots
-            # round 1's tree. Only the chunk that finishes the prompt samples
-            # a real token; a middle chunk's next_token_ids is a placeholder
-            # no consumer reads, and storing it would seed the next verify
-            # round with a token the model never emitted. The decode rounds
-            # relay their own state, so the future_map stash is skipped.
-            if batch.contains_last_prefill_chunk:
-                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
-
-                fwd_batch = (
-                    mb_metadata.fwd_batch
-                    if mb_metadata.fwd_batch is not None
-                    else batch
-                )
-                self._pp_spec_set_relay(
-                    batch,
-                    PPSpecRelayInput.degenerate(
-                        rids=[req.rid for req in fwd_batch.reqs],
-                        bonus_tokens=next_token_ids,
-                        num_draft_tokens=get_spec().speculative_num_draft_tokens,
-                    ),
-                )
-        else:
-            # PP rank 0 also relays into output_tokens_buf so the next iter's
-            # resolve_forward_inputs finds these tokens for the decode portion
-            # of mixed-chunk batches (which gather via mix_running_indices).
-            self.future_map.stash(
-                batch.req_pool_indices,
-                RelayPayload(
-                    bonus_tokens=next_token_ids,
-                    topk_p=(
-                        None if next_draft_input is None else next_draft_input.topk_p
-                    ),
-                    topk_index=(
-                        None
-                        if next_draft_input is None
-                        else next_draft_input.topk_index
-                    ),
-                    hidden_states=(
-                        None
-                        if next_draft_input is None
-                        else next_draft_input.hidden_states
-                    ),
+        # PP rank 0 also relays into output_tokens_buf so the next iter's
+        # resolve_forward_inputs finds these tokens for the decode portion
+        # of mixed-chunk batches (which gather via mix_running_indices).
+        self.future_map.stash(
+            batch.req_pool_indices,
+            RelayPayload(
+                bonus_tokens=(
+                    next_token_ids
+                    if next_draft_input is None
+                    else next_draft_input.bonus_tokens
+                ),
+                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                topk_index=(
+                    None if next_draft_input is None else next_draft_input.topk_index
+                ),
+                hidden_states=(
+                    None if next_draft_input is None else next_draft_input.hidden_states
                 ),
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            # Use the normalized tensor above. Spec V2's result processor
+            # requires next_token_ids on CPU, while PP transport receives the
+            # original device tensor.
+            next_token_ids=next_token_ids,
             next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=pp_outputs.tensors.get(
+                "speculative_num_draft_tokens"
+            ),
+            speculative_output_stride=pp_outputs.tensors.get(
+                "speculative_output_stride"
+            ),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        output_result.spec_accept_indices = pp_outputs.tensors.get(
+            "spec_accept_indices"
+        )
+        accept_lens = pp_outputs.tensors.get("spec_accept_lens")
+        output_result.accept_lens = (
+            accept_lens.to("cpu") if accept_lens is not None else None
+        )
+        if (
+            not self.pp_group.is_last_rank
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, "reconcile_after_verify")
+        ):
+            self.draft_worker.reconcile_after_verify(batch, output_result)
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
