@@ -915,7 +915,10 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
+        # Prefill CP predicates must stay out of decode graph capture.
+        if forward_batch.forward_mode.is_context_parallel_extend() and (
+            dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)
+        ):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
