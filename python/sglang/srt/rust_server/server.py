@@ -436,7 +436,7 @@ class RustServer:
             payload.cached_tokens_details,
             payload.reasoning_tokens,
             payload.retraction_counts,
-            payload.dp_ranks,
+            payload.dp_ranks or [],  # Idle batches carry no rank column.
         )
         if any(col is None or len(col) != len(rids) for col in statistics):
             raise ValueError("generation statistics must have one entry per request")
