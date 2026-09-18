@@ -25,8 +25,13 @@ class JSONConstrainedMixin:
             self.base_url + "/generate",
             json={
                 "text": (
-                    "Introduce the capital of France. Return in a JSON format. The JSON Schema is: "
-                    + json.dumps(json_schema)
+                    "Introduce the capital of France. Return a single compact JSON object. "
+                    "The JSON Schema is: "
+                    + (
+                        json_schema
+                        if isinstance(json_schema, str)
+                        else json.dumps(json_schema)
+                    )
                 ),
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
@@ -72,8 +77,8 @@ class JSONConstrainedMixin:
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {
                     "role": "user",
-                    "content": "Introduce the capital of France. Return in a JSON format. "
-                    "The JSON Schema is: " + json.dumps(self.json_schema),
+                    "content": "Introduce the capital of France. Return a single compact JSON object. "
+                    "The JSON Schema is: " + self.json_schema,
                 },
             ],
             temperature=0,
@@ -88,7 +93,7 @@ class JSONConstrainedMixin:
         try:
             js_obj = json.loads(text)
         except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
+            print("JSONDecodeError", repr(text), response.choices[0].finish_reason)
             raise
 
         self.assertIsInstance(js_obj["name"], str)
