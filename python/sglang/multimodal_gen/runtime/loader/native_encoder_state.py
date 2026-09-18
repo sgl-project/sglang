@@ -3,10 +3,43 @@
 
 import importlib
 import json
+from collections.abc import Callable
 
 import msgspec
 
 from sglang.multimodal_gen.runtime.loader.utils import finalize_loaded_model
+
+
+def _validate_h3_architecture(recipe):
+    from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+        MiniMaxH3Qwen3VLArchConfig,
+        MiniMaxH3Qwen3VLConfig,
+    )
+
+    native = recipe.config
+    arch = native.arch_config
+    if (
+        type(native) is not MiniMaxH3Qwen3VLConfig
+        or type(arch) is not MiniMaxH3Qwen3VLArchConfig
+        or arch.conditioning_projection_path is not None
+        or arch.checkpoint_num_hidden_layers != 64
+        or arch.num_hidden_layers != 50
+        or arch.text_config.num_hidden_layers != 50
+        or arch.hidden_size != 5120
+        or arch.architectures != ["MiniMaxH3Qwen3VLEncoder"]
+        or arch.text_config.use_cache
+        or arch.text_config.output_hidden_states
+        or native.enable_image_understanding
+        or native.honor_cache_free_padding_mask
+    ):
+        raise ValueError("Unverified resolved H3 text encoder representation")
+
+
+def _finalize_h3(model):
+    # Request state is process-local, never part of the shared weight bundle.
+    if model.model.rope_deltas is not None or model.conditioning_projection is not None:
+        raise ValueError("Unexpected H3 text encoder derived state")
+    return finalize_loaded_model(model)
 
 
 class NativeEncoderStateContract(
@@ -16,6 +49,8 @@ class NativeEncoderStateContract(
     model_module: str
     model_name: str
     config_json: str
+    validate_architecture: Callable
+    finalize_after_import: Callable = finalize_loaded_model
 
     @property
     def expected_config(self):
@@ -30,11 +65,6 @@ class NativeEncoderStateContract(
         )
 
     def validate_supported(self, frozen, *, attention):
-        from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
-            MiniMaxH3Qwen3VLArchConfig,
-            MiniMaxH3Qwen3VLConfig,
-        )
-
         recipe = frozen.thaw()
         if not self.matches_model(recipe.model_cls):
             raise ValueError("No audited state contract for this native encoder")
@@ -48,34 +78,24 @@ class NativeEncoderStateContract(
         expected.pop("model_type")
         if config != expected:
             raise ValueError(
-                "Unverified H3 text encoder architecture/configuration extension"
+                "Unverified text encoder architecture/configuration extension"
             )
         args, native = recipe.server_args, recipe.config
-        arch = native.arch_config
+        self.validate_architecture(recipe)
         if (
-            type(native) is not MiniMaxH3Qwen3VLConfig
-            or type(arch) is not MiniMaxH3Qwen3VLArchConfig
-            or native.quant_config is not None
+            native.quant_config is not None
             or native.lora_config is not None
-            or arch.conditioning_projection_path is not None
-            or arch.checkpoint_num_hidden_layers != 64
-            or arch.num_hidden_layers != 50
-            or arch.text_config.num_hidden_layers != 50
-            or arch.hidden_size != 5120
-            or arch.architectures != [self.model_name]
-            or arch.text_config.use_cache
-            or arch.text_config.output_hidden_states
             or native.parallel_folding_mode is not None
-            or native.enable_image_understanding
-            or native.honor_cache_free_padding_mask
         ):
-            raise ValueError("Unverified resolved H3 text encoder representation")
+            raise ValueError(
+                "Unverified quantized/LoRA/folded text encoder representation"
+            )
         if (
             recipe.dtype != "bf16"
             or attention != "fa"
             or args.attention_backend not in (None, "fa")
         ):
-            raise ValueError("H3 text encoder cache requires bf16 / FA")
+            raise ValueError("Text encoder cache requires bf16 / FA")
         if (
             recipe.component_starts_on_cpu
             or args.residency_mode(recipe.component_name) != "resident"
@@ -86,7 +106,7 @@ class NativeEncoderStateContract(
             or args.attention_backend_config
         ):
             raise ValueError(
-                "H3 text encoder cache requires resident non-FSDP eager inference without LoRA"
+                "Text encoder cache requires resident non-FSDP eager inference without LoRA"
             )
         for name in (
             "num_gpus",
@@ -97,22 +117,12 @@ class NativeEncoderStateContract(
             "dp_size",
         ):
             if getattr(args, name) != 1:
-                raise ValueError(f"H3 text encoder cache requires {name}=1")
+                raise ValueError(f"Text encoder cache requires {name}=1")
 
     def adapt_meta_schema(self, model):
         # Registered RoPE buffers (including non-persistent buffers) already match
         # the ordinary loader. No assignment/repacking or extra tensor reads.
         return model
-
-    def finalize_after_import(self, model):
-        # This is request state, not shared weight state. It is populated on each
-        # encoder forward; an imported model must start with its own empty cache.
-        if (
-            model.model.rope_deltas is not None
-            or model.conditioning_projection is not None
-        ):
-            raise ValueError("Unexpected H3 text encoder derived state")
-        return finalize_loaded_model(model)
 
 
 MINIMAX_H3_TEXT_ENCODER = NativeEncoderStateContract(
@@ -182,6 +192,8 @@ MINIMAX_H3_TEXT_ENCODER = NativeEncoderStateContract(
   "vision_start_token_id": 151652
 }
     """,
+    validate_architecture=_validate_h3_architecture,
+    finalize_after_import=_finalize_h3,
 )
 
 
