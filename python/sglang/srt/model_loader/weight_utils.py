@@ -1210,10 +1210,14 @@ def fastsafetensors_weights_iterator(
         loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
-            keys = list(fb.key_to_rank_lidx.keys())
-            for k in keys:
-                t = fb.get_tensor(k)
-                yield k, t
+            try:
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                # The file buffer owns memory that loader.close() does not release.
+                fb.close()
         finally:
             loader.close()
         if drop_cache_after_load:
