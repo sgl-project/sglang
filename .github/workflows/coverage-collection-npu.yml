@@ -13,7 +13,7 @@
 name: Coverage Collection (NPU)
 
 on:
-   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: npu-coverage-collection-${{ github.ref }}
