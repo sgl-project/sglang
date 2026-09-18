@@ -15,7 +15,7 @@ instead of failing with a duplicate error. Covers:
 
 import asyncio
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -121,6 +121,28 @@ class TestLoRAManagerUpsert(CustomTestCase):
 
         self.assertTrue(result.success)
         manager.memory_pool.load_lora_weight_to_buffer.assert_not_called()
+
+    def test_cuda_upsert_waits_for_buffer_copy(self):
+        manager = _make_manager()
+        manager.device = torch.device("cuda")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
+        manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+        manager.memory_pool.uid_to_buffer_id = {ref.lora_id: 3}
+
+        with (
+            patch("sglang.srt.lora.lora_manager.torch.cuda.synchronize") as pre_sync,
+            patch(
+                "sglang.srt.lora.lora_manager.torch.cuda.current_stream"
+            ) as current_stream,
+        ):
+            result = manager.load_lora_adapter_from_tensors(
+                ref, {}, CONFIG_DICT, upsert=True
+            )
+
+        self.assertTrue(result.success)
+        pre_sync.assert_called_once_with(manager.device)
+        current_stream.assert_called_once_with(manager.device)
+        current_stream.return_value.synchronize.assert_called_once_with()
 
     def test_upsert_falls_back_to_register_when_not_loaded(self):
         manager = _make_manager()
@@ -233,6 +255,7 @@ class TestUpsertRollback(CustomTestCase):
 
     def test_failed_buffer_rewrite_restores_old_weights(self):
         manager = _make_manager()
+        manager.device = torch.device("cuda")
         ref = LoRARef(lora_name="a", lora_path="__stream__")
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         old_config = manager.configs[ref.lora_id]
@@ -243,9 +266,15 @@ class TestUpsertRollback(CustomTestCase):
             None,  # the restore pass
         ]
 
-        result = manager.load_lora_adapter_from_tensors(
-            ref, {}, CONFIG_DICT, upsert=True
-        )
+        with (
+            patch("sglang.srt.lora.lora_manager.torch.cuda.synchronize"),
+            patch(
+                "sglang.srt.lora.lora_manager.torch.cuda.current_stream"
+            ) as current_stream,
+        ):
+            result = manager.load_lora_adapter_from_tensors(
+                ref, {}, CONFIG_DICT, upsert=True
+            )
 
         self.assertFalse(result.success)
         self.assertIn("copy failed", result.error_message)
@@ -256,6 +285,7 @@ class TestUpsertRollback(CustomTestCase):
         calls = manager.memory_pool.load_lora_weight_to_buffer.call_args_list
         self.assertEqual(len(calls), 2)
         self.assertIs(calls[1].args[2], old_lora)
+        current_stream.return_value.synchronize.assert_called_once_with()
 
 
 class TestUpsertPinnedAccounting(CustomTestCase):
