@@ -306,7 +306,8 @@ def _release_overallocated_kv_indices(
     page_size = allocator.page_size
     spec_algo = get_spec().speculative_algorithm
 
-    # The cacheable prefix can be shorter than the physical committed KV.
+    # The cacheable prefix can be shorter than the physical committed KV;
+    # strip_thinking_cache widens that gap on purpose (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
         assert req.kv.kv_committed_len == end_p, (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, "
