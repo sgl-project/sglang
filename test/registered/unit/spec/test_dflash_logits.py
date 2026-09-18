@@ -9,10 +9,13 @@ from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     _grouped_conv,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    parse_dflash_draft_config,
+    select_dflash_pred_hidden,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 def test_dflash_unary_logit_transform():
@@ -432,6 +435,120 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def _layout_config(dflash_config):
+    return {"num_hidden_layers": 5, "dflash_config": dflash_config}
+
+
+def test_every_draft_query_prediction_is_used():
+    """No query's prediction may be discarded: the draft block is sized so that the
+    rows from pred_start on are exactly the drafts the verify block has room for.
+
+    An anchor-first checkpoint predicts the first draft from query 0, so reading from
+    position 1 (the 1+N layout) shifts every draft position by one.
+    """
+    bs, verify_block_size, hidden_size = 2, 4, 3
+
+    for pred_start, num_queries, expected in ((1, 4, [1, 2, 3]), (0, 3, [0, 1, 2])):
+        # Each row carries its own block position, so a shifted read is visible.
+        block_positions = torch.arange(bs * num_queries) % num_queries
+        hidden_states = (
+            block_positions.float().unsqueeze(1).expand(-1, hidden_size).contiguous()
+        )
+        selected = select_dflash_pred_hidden(
+            hidden_states,
+            bs=bs,
+            num_draft_queries=num_queries,
+            pred_start=pred_start,
+        )
+        # Nothing dropped: every query from pred_start on lands in the verify block.
+        assert selected.shape[1] == num_queries - pred_start
+        assert tuple(selected.shape) == (bs, verify_block_size - 1, hidden_size)
+        torch.testing.assert_close(
+            selected[:, :, 0],
+            torch.tensor([expected] * bs, dtype=torch.float32),
+        )
+
+
+def test_anchor_first_draft_block_is_one_query_narrower():
+    """Both layouts fill the same verify block, so the anchor-first drafter runs one
+    query fewer rather than computing a prediction it would have to discard."""
+    for dflash_config, expected_queries in (
+        ({}, 8),
+        ({"query_zero_predicts_next": True}, 7),
+    ):
+        config = parse_dflash_draft_config(
+            draft_hf_config=_layout_config(dflash_config)
+        )
+        assert config.resolve_num_draft_queries(verify_block_size=8) == expected_queries
+
+
+def test_draft_block_layout_defaults_to_one_plus_n():
+    config = parse_dflash_draft_config(draft_hf_config=_layout_config({}))
+    assert config.anchor_first is False
+    assert config.draft_pred_start == 1
+
+
+@pytest.mark.parametrize("field", ("query_zero_predicts_next", "sample_from_anchor"))
+@pytest.mark.parametrize("nested", (True, False))
+def test_both_published_spellings_declare_the_anchor_first_layout(field, nested):
+    """Checkpoints declare this layout under two names; neither may be dropped."""
+    raw = (
+        _layout_config({field: True})
+        if nested
+        else {"num_hidden_layers": 5, field: True, "dflash_config": {}}
+    )
+    config = parse_dflash_draft_config(draft_hf_config=raw)
+    assert config.anchor_first is True
+    assert config.draft_pred_start == 0
+
+
+def test_contradictory_block_layout_declarations_are_rejected():
+    with pytest.raises(ValueError, match="declared inconsistently"):
+        parse_dflash_draft_config(
+            draft_hf_config=_layout_config(
+                {"query_zero_predicts_next": True, "sample_from_anchor": False}
+            )
+        )
+
+
+def test_non_bool_block_layout_declaration_is_rejected():
+    with pytest.raises(ValueError, match="must be a bool"):
+        parse_dflash_draft_config(
+            draft_hf_config=_layout_config({"sample_from_anchor": "true"})
+        )
+
+
+def _domino_layout_config(**overrides):
+    dflash_config = {
+        "projector_type": "domino",
+        "shift_label": True,
+        "pure_draft_prefix_len": 1,
+        "gru_hidden_dim": 4,
+        "emb_dim": 5,
+    }
+    dflash_config.update(overrides)
+    return _layout_config(dflash_config)
+
+
+def test_domino_shift_label_drives_the_block_layout():
+    """Domino spells the same layout choice as shift_label; the two must not diverge."""
+    for shift_label, expected_start in ((True, 0), (False, 1)):
+        config = parse_dflash_draft_config(
+            draft_hf_config=_domino_layout_config(shift_label=shift_label)
+        )
+        assert config.anchor_first is shift_label
+        assert config.draft_pred_start == expected_start
+
+
+def test_domino_rejects_a_layout_that_contradicts_shift_label():
+    with pytest.raises(ValueError, match="declared inconsistently"):
+        parse_dflash_draft_config(
+            draft_hf_config=_domino_layout_config(
+                shift_label=True, query_zero_predicts_next=False
+            )
+        )
 
 
 if __name__ == "__main__":
