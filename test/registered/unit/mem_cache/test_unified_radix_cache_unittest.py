@@ -4319,7 +4319,7 @@ class UnifiedRadixCacheSuite:
 
     def test_buffer_load_back_swa_window_charged_at_admission(self):
         """Admission contract: a request the SWA budget gate accepts must be
-        allocatable at batch time (_swa_reserved_tokens: "an admitted request
+        allocatable at batch time (estimate_swa_kv_tokens: "an admitted request
         cannot OOM"). Regression: buffer mode surfaced a staged prefetch as
         host_hit_length only, so the gate never charged the SWA window that
         consumption (init_load_back -> cc.load) allocates and the request
@@ -10177,7 +10177,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         cache.dec_host_lock_ref.assert_not_called()
         self.assertEqual(controller.prefetch_tokens_occupied, 8)
 
-    def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
+    def test_positive_hit_with_lost_anchor_reports_anchor_lost(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache.ongoing_prefetch = {
@@ -10191,7 +10191,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         cache._handle_storage_prefetch_anchor_loss(self._REQ)
 
         cache._finish_storage_prefetch.assert_called_once_with(
-            self._REQ, fulfilled_tokens=0, reason="shrunk"
+            self._REQ, fulfilled_tokens=0, reason="anchor_lost"
         )
         # The eviction widened the span, so the request replans over it --
         # skipping the query, the prior hit having proved it stored, and the
