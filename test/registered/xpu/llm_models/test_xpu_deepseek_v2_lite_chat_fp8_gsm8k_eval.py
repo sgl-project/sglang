@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-register_xpu_ci(est_time=2400, suite="1x-gpu-suite", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-xpu-1-gpu", nightly=True)
 
 INVALID = -9999999
 
@@ -36,9 +36,9 @@ class ModelConfig:
     """Configuration for a model to test."""
 
     model_path: str
+    accuracy_threshold: float
     tp_size: int = 1
     pp_size: int = 1
-    accuracy_threshold: float = 0.40
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
     timeout: Optional[int] = None
@@ -70,8 +70,8 @@ XPU_DEEPSEEK_V2_LITE_CHAT_FP8_MODELS = [
         other_args=[
             "--attention-backend",
             "triton",
-            # "--decode-attention-backend",
-            # "intel_xpu",
+            "--moe-runner-backend",
+            "triton",
             "--disable-radix-cache",
             "--mem-fraction-static",
             "0.7",
