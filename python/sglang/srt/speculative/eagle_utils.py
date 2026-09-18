@@ -49,7 +49,11 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or _is_hip:
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -386,7 +390,10 @@ def verify_tree_greedy_func(
     topk: int = -1,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -889,7 +896,11 @@ def eagle_sample(
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
         else:
-            if not _is_npu:
+            if _is_cuda:
+                from sglang.kernels.ops.speculative.sampling import (
+                    tree_speculative_sampling_target_only,
+                )
+            elif not _is_npu:
                 from sgl_kernel import tree_speculative_sampling_target_only
 
             sampling_fn = tree_speculative_sampling_target_only
@@ -902,6 +913,9 @@ def eagle_sample(
             from sglang.kernels.ops.sampling.renorm_triton import (
                 top_p_renorm_probs_triton as top_p_renorm_prob,
             )
+        elif _is_cuda:
+            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
         elif not _is_npu:
             from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 

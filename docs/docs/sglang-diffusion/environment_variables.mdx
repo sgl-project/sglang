@@ -187,6 +187,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Experimental opt-in for fused W8A8 FP8 GEMM in diffusion weight-only FP8 linears. When disabled, FP8 weights are dequantized to the compute dtype before matmul. Enabling this dynamically quantizes activations to FP8 and may change output quality.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable Ascend MXFP8 FA for supported non-causal self-attention layers. Applies to online <code>MXFP8Config</code> and offline ModelSlim <code>W8A8_MXFP8</code> checkpoints. Unsupported calls continue to use the regular attention path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum number of attention heads processed by each Ascend MXFP8 FA call. Smaller chunks may improve performance for large workloads but add kernel launches; the optimal value depends on the model and input shape. Set to 0 to disable head splitting.</td>
+    </tr>
   </tbody>
 </table>
 
