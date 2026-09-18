@@ -21,6 +21,8 @@ class JSONConstrainedMixin:
     def _run_decode_json(
         self, json_schema, return_logprob=False, top_logprobs_num=0, n=1
     ):
+        # Keep this raw completion prompt: the compact JSON chat prompt made
+        # Llama-2 with EAGLE repeat newlines until the token limit.
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -72,8 +74,8 @@ class JSONConstrainedMixin:
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {
                     "role": "user",
-                    "content": "Introduce the capital of France. Return in a JSON format. "
-                    "The JSON Schema is: " + json.dumps(self.json_schema),
+                    "content": "Introduce the capital of France. Return a single compact JSON object. "
+                    "The JSON Schema is: " + self.json_schema,
                 },
             ],
             temperature=0,
@@ -88,7 +90,7 @@ class JSONConstrainedMixin:
         try:
             js_obj = json.loads(text)
         except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
+            print("JSONDecodeError", repr(text), response.choices[0].finish_reason)
             raise
 
         self.assertIsInstance(js_obj["name"], str)

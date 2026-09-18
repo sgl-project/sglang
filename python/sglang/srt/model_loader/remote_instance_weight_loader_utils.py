@@ -158,6 +158,16 @@ def register_memory_region_v2(model, transfer_engine):
     for segment in memory_snapshot:
         current_weight_block = None
         blocks = segment.get("blocks", [])
+        if torch.version.hip is not None and any(
+            block.get("state") == "active_allocated"
+            and block.get("address") in weight_addr_set
+            for block in blocks
+        ):
+            # HIP IPC exports an entire allocator segment. Register its real
+            # base so Mooncake preserves offsets when importing suballocated
+            # weights (https://github.com/kvcache-ai/Mooncake/issues/3546).
+            weight_blocks_for_reg_mr.append((segment["address"], segment["total_size"]))
+            continue
         for block in blocks:
             address = block.get("address", -1)
             size = block.get("size", -1)

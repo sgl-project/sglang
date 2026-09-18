@@ -36,6 +36,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  # Match CUDA test workflows: shared H100 runners can fail NVLS allocation.
+  NCCL_NVLS_ENABLE: "0"
 
 jobs:
   build-wheel:
@@ -272,7 +274,7 @@ jobs:
             # they get skipped there by hooks.py. Run them here so coverage holds.
             test_dirs: "e2e_test/chat_completions/test_enable_thinking.py"
             extra_deps: ""
-            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            env_vars: "SHOW_WORKER_LOGS=1 SHOW_ROUTER_LOGS=1 NCCL_DEBUG=WARN"
             reruns: "--reruns 2 --reruns-delay 5"
             parallel_opts: ""
     runs-on: ${{ matrix.runner }}
