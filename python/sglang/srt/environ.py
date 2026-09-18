@@ -950,6 +950,9 @@ class Envs:
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # BF16 wo_a: use F.linear for single-local-group decode (Flash TP8),
+    # retaining the original weight layout. Opt-in for A/B.
+    SGLANG_OPT_NPU_BF16_WO_A_GEMM = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
@@ -983,6 +986,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
+    # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
+    SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
@@ -1300,6 +1306,10 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (non-overlap schedule, no DP attention).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1454,6 +1464,9 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
+    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
@@ -1463,6 +1476,15 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
