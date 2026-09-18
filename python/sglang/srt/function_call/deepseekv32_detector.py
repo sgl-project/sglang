@@ -118,8 +118,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Escaped because subclasses may override the marker. The closing
         # `>` is optional: a model can emit a truncated or malformed tag
         # (e.g. `<｜DSML｜tool_calls|`), and that must be stripped too.
+        # The leading `<` and trailing `>` are both optional: the marker is
+        # a single special token, so a model can emit it truncated or
+        # mangled (e.g. `<｜DSML｜tool_calls|`, seen from a live server).
+        # Any occurrence is model markup rather than prose, so remove it.
         self.residual_markup_regex = (
-            rf"</?{re.escape(self.dsml_token)}(?:[^>\n]*>|\w*\|?)"
+            rf"<?/?{re.escape(self.dsml_token)}(?:[^>\n]*>|\w*\|?)?"
         )
 
     def has_tool_call(self, text: str) -> bool:

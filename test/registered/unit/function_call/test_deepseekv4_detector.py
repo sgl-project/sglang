@@ -293,6 +293,22 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
         self.assertIn("Before.", result.normal_text)
         self.assertIn("After.", result.normal_text)
 
+    def test_bracketless_marker_is_stripped(self):
+        """The marker is one special token, so a bare occurrence is markup.
+
+        `｜DSML｜` encodes to a single token id, so the model emitting it
+        without surrounding brackets is still leaked markup rather than
+        prose the user wrote.
+        """
+        result = self._parse(
+            f"The {DSML} marker.\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+        self.assertIn("marker.", result.normal_text)
+
     def test_streaming_still_emits_a_malformed_opener_as_content(self):
         """Known limitation: the streaming path is not covered by this fix.
 
