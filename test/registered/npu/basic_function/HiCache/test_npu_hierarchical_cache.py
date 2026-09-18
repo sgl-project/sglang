@@ -2,7 +2,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -10,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
@@ -51,7 +51,7 @@ class TestNPUHierarchicalCache(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_hierarchical_cache_reused_long_identical(self):
         """Long identical texts should reuse HierarchicalCache"""

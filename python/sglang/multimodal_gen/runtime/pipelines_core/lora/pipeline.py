@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -297,6 +301,8 @@ class LoRAPipeline(ComposedPipelineBase):
         offload_disabled_modules = []
         for module_name in module_names:
             module = self.modules.get(module_name)
+            if isinstance(module, torch.nn.Module):
+                restore_weight_snapshot(module)
             if module is not None and is_layerwise_offloaded_module(module):
                 module.disable_offload()
                 offload_disabled_modules.append(module)
@@ -320,6 +326,11 @@ class LoRAPipeline(ComposedPipelineBase):
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
             module = self.modules.get(module_name)
+            if (
+                isinstance(module, torch.nn.Module)
+                and weight_snapshot(module) is not None
+            ):
+                return True
             if module is not None and is_layerwise_offloaded_module(module):
                 return True
         return False
@@ -600,6 +611,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if merge_mode == "dynamic":
             return False
         uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
+        has_unmergeable_weights = any(
+            not layer.can_merge_base_weight for layer in lora_layers.values()
+        )
         if merge_mode == "auto":
             if uses_dtensor_weights:
                 logger.info(
@@ -607,7 +621,18 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name,
                 )
                 return False
+            if has_unmergeable_weights:
+                logger.info(
+                    "Using dynamic LoRA for %s because its quantized weights cannot be merged in place.",
+                    module_name,
+                )
+                return False
             return True
+        if has_unmergeable_weights:
+            raise ValueError(
+                f"LoRA merge mode is unavailable for {module_name} because its "
+                "quantized weights cannot be updated in place; use merge mode 'dynamic'"
+            )
         if uses_dtensor_weights:
             logger.warning(
                 "Merging LoRA for %s with FSDP-sharded weights may require full-gather and can OOM.",

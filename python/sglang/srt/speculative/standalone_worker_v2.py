@@ -28,10 +28,7 @@ from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, get_plan_stream
-from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
-
-if is_cuda():
-    from sgl_kernel import segment_packbits  # noqa: F401
+from sglang.srt.utils import empty_context, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
@@ -84,7 +81,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -108,6 +105,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
             and self.topk == 1
         )
         self.dsa_index_topk = None
+        self.dsa_seed_topk_width = None
         self.seed_dsa_topk_from_draft_extend = False
         self.dsa_extend_topk_buf = None
 
@@ -150,7 +148,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
 
 class StandaloneWorkerV2(EAGLEWorkerV2):
-
     def __init__(
         self,
         server_args: ServerArgs,

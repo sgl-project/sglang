@@ -26,7 +26,9 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
+import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -147,12 +149,13 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = (
-    "meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen3-8B,Qwen/Qwen3-4B"
+# Deliberate omission: a model another registered suite already uses as its base
+# model is left out, since a regression there surfaces in that suite instead.
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = (
+    "meta-llama/Llama-3.1-70B-Instruct,Qwen/Qwen2-57B-A14B-Instruct"
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -658,6 +661,18 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def unified_radix_tree_server_env(
+    tree_core_backend: str, **extra_env: str
+) -> dict[str, str]:
+    return {
+        **os.environ,
+        **extra_env,
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
+    }
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -833,14 +848,17 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
+    pids = collect_process_tree_pids(process.pid)
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
     kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
 
 
 def popen_launch_pd_server(
@@ -1987,6 +2005,9 @@ def maybe_stub_sgl_kernel():
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2088,20 +2109,116 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
+
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
 def server_args_variant(server_args, **fields):
     """A modified deep copy of a config, for a test double whose fixture
     differs from the (possibly published, read-only) config it starts from.
     The receiver is untouched; the copy keeps its read-only guard.
 
-    A name may also shadow a method with a fixture value (the runner kits set
-    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
-    names that exist nowhere on the class fail loudly."""
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
     variant = copy.deepcopy(server_args)
     cls = type(variant)
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+        if name not in cls.__struct_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
@@ -2111,21 +2228,32 @@ def server_args_variant(server_args, **fields):
     stash = getattr(variant, "_resolved_overrides", None)
     if stash is None:
         stash = []
-        object.__setattr__(variant, "_resolved_overrides", stash)
+        msgspec.Struct.__setattr__(variant, "_resolved_overrides", stash)
     declared = {
-        name: value
-        for name, value in fields.items()
-        if name in cls.__dataclass_fields__
+        name: value for name, value in fields.items() if name in cls.__struct_fields__
     }
     if declared:
         stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
-        object.__setattr__(variant, name, value)
+        msgspec.Struct.__setattr__(variant, name, value)
     return variant
 
 
-class CustomTestCase(unittest.TestCase):
+def enter_override(test_case, override):
+    """Install a scoped context override for the length of one test.
 
+    `unittest.TestCase.enterContext` does exactly this in one call, but it is
+    Python 3.11+ and this package supports 3.10 (`requires-python = ">=3.10"`).
+    On 3.10 it raises `AttributeError: ... has no attribute 'enterContext'` --
+    and only there, so a developer on a newer interpreter sees every test pass
+    while CI does not.
+    """
+    installed = override.install()
+    test_case.addCleanup(override.restore)
+    return installed
+
+
+class CustomTestCase(unittest.TestCase):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 

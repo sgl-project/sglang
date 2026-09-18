@@ -112,6 +112,7 @@ void bmm_kernel_impl(
           /*   C */ out + bs * out_strideB + mb_start * out_strideM + nb_start,
           /* Btmp*/ Btmp,
           /* Ctmp*/ Ctmp,
+          /* bias*/ nullptr,
           /*scale*/ scale,
           /*   M */ mb_size,
           /*   N */ nb_size,

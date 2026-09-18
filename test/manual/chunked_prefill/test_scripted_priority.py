@@ -30,9 +30,9 @@ class TestPriorityBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert (
-            r.status == "waiting"
-        ), f"force-retracted chunked req must be back in waiting; got {r.status}"
+        assert r.status == "waiting", (
+            f"force-retracted chunked req must be back in waiting; got {r.status}"
+        )
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
 
         t.continue_generation()
@@ -168,13 +168,13 @@ class TestPriorityBasic(ScriptedTestCase):
             if (
                 r.kv_pages == 0
                 and r.lock_refs == 0
-                and (r.req is None or r.req.req_pool_idx is None)
+                and (r.req is None or r.req.kv.req_pool_idx is None)
             ):
                 break
             yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         t.continue_generation()
         yield
         assert r.kv_pages == 0 and r.lock_refs == 0

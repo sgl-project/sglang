@@ -7,7 +7,7 @@ import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
@@ -19,7 +19,7 @@ def test_mhc_fused_post_pre_matches_unfused(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
-    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
+    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     # This is a single-process kernel unit test with no TP group initialized.
     # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
     # pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
