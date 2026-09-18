@@ -169,6 +169,9 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
+///
+/// `out` supplies this frame's content; `cumulative` supplies request-wide counts
+/// and input candidates, which remain cumulative in incremental streams.
 pub(super) fn frame_value(
     out: &ChunkEvent,
     cumulative: &ChunkEvent,
@@ -180,7 +183,7 @@ pub(super) fn frame_value(
         "meta_info": {
             "id": rid,
             "prompt_tokens": out.prompt_tokens,
-            "completion_tokens": out.completion_tokens,
+            "completion_tokens": cumulative.completion_tokens,
             // Full dict (type + matched + message + status_code + …), or null.
             "finish_reason": out.finish_reason,
         },
@@ -390,9 +393,7 @@ pub(super) fn stream_frame_value(
     options: LogprobOptions,
 ) -> serde_json::Value {
     if incremental {
-        let mut d = delta;
-        d.completion_tokens = acc.snapshot().completion_tokens;
-        frame_value(&d, acc.snapshot(), rid_str, options)
+        frame_value(&delta, acc.snapshot(), rid_str, options)
     } else {
         frame_value(acc.snapshot(), acc.snapshot(), rid_str, options)
     }
