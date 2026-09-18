@@ -25,7 +25,9 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
+    remap_dcp_write_locations_fixed_shape,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -144,6 +146,22 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_fixed_shape_write_remap_uses_reserved_dummy_slot(self):
+        virtual = torch.tensor([256, 257, 258, 259, 512, 513], dtype=torch.int32)
+        rank0 = remap_dcp_write_locations_fixed_shape(virtual, 2, 0)
+        rank1 = remap_dcp_write_locations_fixed_shape(virtual, 2, 1)
+
+        self.assertEqual(rank0.tolist(), [128, 0, 129, 0, 256, 0])
+        self.assertEqual(rank1.tolist(), [0, 128, 0, 129, 0, 256])
+        self.assertEqual(rank0.shape, virtual.shape)
+        self.assertEqual(rank1.shape, virtual.shape)
+
+    def test_fixed_shape_write_remap_rejects_invalid_topology(self):
+        with self.assertRaises(ValueError):
+            remap_dcp_write_locations_fixed_shape(torch.arange(4), 0, 0)
+        with self.assertRaises(ValueError):
+            remap_dcp_write_locations_fixed_shape(torch.arange(4), 2, 2)
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):
@@ -192,6 +210,41 @@ class TestGetDcpLens(CustomTestCase):
     def test_dcp_size_one_is_identity(self):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
+
+    def test_metadata_planner_delegates_to_backend_builder(self):
+        expected = object()
+        builder = MagicMock(return_value=expected)
+        backend = SimpleNamespace(dcp_metadata_builder=builder)
+        seq_lens = torch.tensor([3], dtype=torch.int32)
+        extend_lens = torch.tensor([1], dtype=torch.int32)
+
+        with (
+            rc.get_parallel().override(
+                dcp_enabled=True,
+                dcp_size=2,
+                dcp_rank=0,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            result = prepare_decode_context_parallel_metadata(
+                seq_lens=seq_lens,
+                extend_prefix_lens=torch.tensor([2], dtype=torch.int32),
+                extend_prefix_lens_cpu=torch.tensor([2], dtype=torch.int32),
+                extend_seq_lens=extend_lens,
+                req_pool_indices=torch.tensor([0]),
+                req_to_token=torch.tensor([[10, 11, 12]], dtype=torch.int32),
+                seq_lens_sum=3,
+                kv_buffer_shape=torch.Size([3, 1]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn=None,
+            )
+
+        self.assertIs(result, expected)
+        builder.assert_called_once()
 
     def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
         """A local Q shard must not restart GQA mapping at KV head zero."""
