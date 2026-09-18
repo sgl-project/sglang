@@ -570,6 +570,11 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def match_full_prefix(self, key: RadixKey) -> tuple[int, NodeId]:
+        matched_len, node_id, actions = self.tree_core.match_full_prefix(key)
+        self._apply_cache_actions(actions)
+        return matched_len, node_id
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
@@ -1660,8 +1665,13 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         mem_quota: Optional[int] = None,
         req=None,
+        kv_only: bool = False,
     ) -> bool:
-        """Load evicted KV data from host back to device (H→D)."""
+        """Load evicted KV data from host back to device (H→D).
+
+        ``kv_only`` restores the base KV pages and leaves component state
+        (SWA / Mamba) host-resident on the node.
+        """
         if self.cache_controller is None:
             return False
 
@@ -1673,9 +1683,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component pre-allocate per-request state for the load-back;
         # the finally below lets components recover it unless the load succeeds.
+        components = () if kv_only else self._components_tuple
         preps: dict[ComponentType, PrepareLoadBackResult] = {
             comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
+            for comp in components
         }
         success = False
         try:
@@ -1686,10 +1697,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
+                kv_only=kv_only,
             )
             return success
         finally:
-            for comp in self._components_tuple:
+            for comp in components:
                 comp.finalize_load_back(req, preps[comp.component_type], success)
 
     def _load_back_transfers(
@@ -1701,9 +1713,12 @@ class UnifiedRadixCache(BasePrefixCache):
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
+        kv_only: bool = False,
     ) -> bool:
         # Build the KV + per-component aux transfers.
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            node_id, req=req, kv_only=kv_only
+        )
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
@@ -1874,6 +1889,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    @property
+    def _has_component_pools(self) -> bool:
+        return any(ct is not BASE_COMPONENT_TYPE for ct in self.tree_components)
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -1927,7 +1946,13 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        kv_only: bool = False,
     ) -> None:
+        """Issue an L3 -> L2 prefetch for ``new_input_tokens``.
+
+        ``kv_only`` fetches the base KV pages without the component objects
+        (SWA / Mamba), so the KV-only hit query is exact for the caller.
+        """
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -2000,7 +2025,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
+            if ct == BASE_COMPONENT_TYPE or kv_only:
                 continue
             # Size the component's staging now; it is allocated at hit time,
             # next to the KV staging, so the query holds no host memory.
@@ -3249,6 +3274,12 @@ class UnifiedRadixCache(BasePrefixCache):
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node), or None when buffer-mode
         admission must retry without committing a load."""
+        if params.kv_only and self._has_component_pools:
+            if self.buffer_pipeline is not None or self.linker is not None:
+                raise NotImplementedError(
+                    "kv_only load-back is not supported with buffer-mode or "
+                    "linker caches on hybrid models"
+                )
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3259,6 +3290,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
+        if params.kv_only and not self.tree_core.is_full_device_evicted(
+            best_match_node_id
+        ):
+            # A KV-only consumer only needs the FULL KV, which is resident;
+            # the host hit is component state (SWA / Mamba) it never restores.
+            # No DMA: the caller sees this via has_ongoing_load_back().
+            return (
+                self.tree_core.collect_full_device_indices(
+                    best_match_node_id, last_best_match_device_node_id
+                ),
+                best_match_node_id,
+            )
+
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
@@ -3267,7 +3311,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            if self.load_back(
+                best_match_node_id, mem_quota, req=req, kv_only=params.kv_only
+            ):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
@@ -3364,6 +3410,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def has_ongoing_load_back(self, node_id: NodeId) -> bool:
+        return node_id in self.ongoing_load_back
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.

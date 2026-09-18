@@ -79,6 +79,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -892,6 +893,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
+            if uses_swa_tail_prealloc:
+                # The budget above counts evictable SWA pages; free them before
+                # alloc_extend_swa_tail asks for the tail, as pop_preallocated
+                # does. A shortfall leaves the request retracted.
+                _, swa_len = self._prealloc_kv_lens(req)
+                reclaim_error = self._reclaim_swa_tail_capacity(swa_len, req.rid)
+                if reclaim_error is not None:
+                    logger.warning(reclaim_error)
+                    break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
@@ -1411,15 +1421,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            # Prefetch before allocation: a declined prefetch degrades the
+            # promised L3 range, which the alloc and metadata must reflect.
+            decode_req.prefix_match = prefix_match
+            if self.scheduler.enable_decode_hicache and prefix_match is not None:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                total_prefix_len = min(total_prefix_len, prefix_match.decode_prefix_len)
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
-            decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1872,11 +1885,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
-
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        # Same admission path as the colocated scheduler: on hybrid SSM pools
+        # this evicts cached mamba checkpoints before taking a fresh slot. The
+        # pool stamps req.kv.req_pool_idx; the call raises if it cannot.
+        alloc_req_slots(self.req_to_token_pool, [req], self.tree_cache)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2074,12 +2086,14 @@ def alloc_for_decode_prealloc(
             )
         if uses_swa_tail:
             # Full-attention layers reuse prefix KV; SWA layers allocate only
-            # the live window tail.
+            # the live window tail. Like the non-SWA branch, the prefix is
+            # the full committed range: [prefix_len, total_prefix_len) is
+            # filled by the HiCache load-back, not allocated here.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor(
-                    [prefix_len], dtype=torch.int64, device=device
+                    [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,

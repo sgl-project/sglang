@@ -71,7 +71,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
-        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=page_size, swa_available_size=lambda: physical_available
+        )
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,

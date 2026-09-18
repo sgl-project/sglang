@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -73,6 +74,8 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
+        # The hit query is KV-only, which matches what decode fetches
+        # (kv_only prefetch below): component state comes from the transfer.
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
@@ -94,6 +97,24 @@ class DecodeHiCachePreallocMixin:
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+
+        # Cap the restored (L2/L3) range at the sliding-window start, like
+        # the L1 cap in pop_preallocated. L2 nodes cannot split mid-node
+        # (degrade to none); L3 trims to the page-aligned cap.
+        if (
+            l2_host_hit_length + l3_storage_hit_length > 0
+            and self._uses_swa_tail_prealloc()
+        ):
+            fill_len = self._pre_alloc_fill_len(req)
+            swa_prefix_cap = max(0, fill_len - self._swa_tail_len(fill_len))
+            if l1_prefix_len + l2_host_hit_length > swa_prefix_cap:
+                l2_host_hit_length = 0
+                l3_storage_hit_length = 0
+            else:
+                page_size = self.token_to_kv_pool_allocator.page_size
+                allowed = swa_prefix_cap - l1_prefix_len - l2_host_hit_length
+                l3_storage_hit_length = min(l3_storage_hit_length, allowed)
+                l3_storage_hit_length -= l3_storage_hit_length % page_size
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -137,10 +158,24 @@ class DecodeHiCachePreallocMixin:
                 prefix_keys,
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                # Base KV only, like the load-back: SWA / Mamba state comes
+                # from the transfer, and hybrid component fetches are
+                # all-or-nothing, which the KV-only hit query cannot promise.
+                kv_only=True,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            if not prefix_match.prefetch_registered:
+                # A silently declined prefetch leaves the promised L3 range
+                # unrestorable; degrade to L2-only.
+                logger.warning(
+                    "HiCache L3 prefetch declined for rid=%s (len=%s); "
+                    "falling back to L2-only LoadingBack",
+                    req.rid,
+                    prefix_match.l3_storage_hit_length,
+                )
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -222,13 +257,34 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
-        new_indices, restored_node = self.tree_cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
-                req=dr.req,
+        # Base KV only: the SWA window and the Mamba state of a P/D decode
+        # request come from the prefill transfer, which lands in the slots
+        # registered at prealloc. A restored checkpoint would race it and is
+        # the wrong state for a prompt that runs past the checkpoint anyway.
+        # The promise was made KV-only too (L3 hit query), so locate the KV
+        # the same way: the all-component rematch ends at FULL nodes whose
+        # component state is tombstoned (a shared prefix whose SWA window
+        # belongs to other requests' tails) and would fail the coverage check.
+        full_len, full_node = self.tree_cache.match_full_prefix(
+            RadixKey(
+                dr.req.origin_input_ids[: pm.decode_prefix_len],
+                extra_key=dr.req.extra_key,
+                cache_salt=dr.req.cache_salt,
             )
         )
+        device_len = len(rematch.device_indices)
+        if full_len > device_len:
+            new_indices, restored_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=full_node,
+                    host_hit_length=full_len - device_len,
+                    req=dr.req,
+                    kv_only=True,
+                )
+            )
+        else:
+            new_indices = rematch.device_indices[:0]
+            restored_node = rematch.last_device_node
         # The rematch repointed req.last_node to feed init_load_back's device
         # boundary, but the prealloc lock and the receipt on the req still
         # belong to pm.last_device_node; restore the pairing so any release
@@ -251,16 +307,20 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
+        # The commit covers exactly [l1, decode_prefix_len).
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
+        )[: pm.decode_prefix_len - pm.l1_prefix_len]
         dr.hicache_restored_node = restored_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node
         ).to_dec_params()
 
-        if len(new_indices) == 0:
-            # Whole prefix already on device; no DMA needed.
+        if len(new_indices) == 0 or not self.tree_cache.has_ongoing_load_back(
+            restored_node
+        ):
+            # Whole prefix already on device (or only component state was
+            # host-resident, which a KV-only restore never fetches); no DMA.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
         return True

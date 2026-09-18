@@ -943,6 +943,38 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key = key[prefix_len:]
         return matched_len, node.id, pinned_len
 
+    def match_full_prefix(
+        self, key: RadixKey
+    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
+        """FULL-only match over device- or host-resident FULL KV, independent
+        of the component validators (a tombstoned SWA window or Mamba state
+        does not end it). The deepest node is split at the key end so the
+        returned node covers exactly the matched span. Returns
+        (matched_len, node_id, split_actions)."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched_len = 0
+        actions: list[CacheAction | ComponentAction] = []
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            cd = child.component_data[BASE_COMPONENT_TYPE]
+            if cd.value is None and cd.host_value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
+            if prefix_len < len(child.key):
+                child, action = self._split_node(child.key, child, prefix_len)
+                if action is not None:
+                    actions.append(action)
+            matched_len += prefix_len
+            node = child
+            key = key[prefix_len:]
+        return matched_len, node.id, actions
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -2289,9 +2321,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self, node_id: NodeId, req: Optional[Req] = None, kv_only: bool = False
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        """Build the H->D load-back KV transfer plus per-component aux transfers.
+
+        ``kv_only`` builds no component transfers: a KV-only consumer never
+        restores component state, and the node's may be tombstoned (neither
+        host nor device), which a component build rejects."""
         # Component hooks take primitives, not Req: extract its fields here.
         mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         node = self.node_by_id(node_id)
@@ -2300,7 +2336,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )[0]
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for comp in self.components:
-            if comp.component_type == BASE_COMPONENT_TYPE:
+            if comp.component_type == BASE_COMPONENT_TYPE or kv_only:
                 continue
             t = comp.build_hicache_transfers(
                 node, CacheTransferPhase.LOAD_BACK, mamba_pool_idx=mamba_pool_idx
