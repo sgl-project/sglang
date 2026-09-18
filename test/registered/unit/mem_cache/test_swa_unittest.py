@@ -813,9 +813,7 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
-        )
+        tree.cache_finished_req(req, is_insert=True, owned_kv_len=req._kv_committed_len)
 
         self.assertEqual(captured["prev_prefix_len"], req.kv.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -849,7 +847,7 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_segment = wrapped_free_segment
         tree.cache_finished_req(
-            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+            req2, is_insert=False, owned_kv_len=req2._kv_committed_len
         )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
@@ -1465,7 +1463,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
 
         # Finishing drops the locks, which sanity_check needs; the accounting
         # must survive the re-walk.
-        tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
+        tree.cache_finished_req(req, owned_kv_len=num_tokens)
         self.assertEqual(allocator.swa_available_size(), swa_before)
         self.assertEqual(
             tree.swa_evictable_size_ + tree.swa_protected_size_,
