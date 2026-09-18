@@ -5,10 +5,10 @@
 
 use crate::config::DecodePolicyKind;
 use crate::policies::admission::{
-    compare_decode_pressure, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
-    RoutingStage,
+    resolve_decode, CandidateDomain, DecisionReason, FinalDecision, RoutingStage,
 };
 use crate::policies::registry::select_decode_with_affinity;
+use crate::policies::state::engine_load::compare_decode_pressure;
 use crate::policies::state::engine_load::EngineLoadSnapshot;
 use crate::policies::{ProposalKind, SelectionProposal};
 use rand::Rng;

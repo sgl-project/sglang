@@ -572,13 +572,15 @@ mod tests {
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{
-        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
+        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
-    use crate::policies::state::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
+    use crate::policies::state::engine_load::{
+        compare_decode_pressure, EngineLoadSnapshot, FreshLoadLookup, NativeCacheWorkerLoad,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -868,7 +870,7 @@ mod tests {
         let a = worker("a");
         let z = worker("z");
         assert_eq!(
-            admission::compare_decode_pressure(&a, &z, None),
+            compare_decode_pressure(&a, &z, None),
             std::cmp::Ordering::Equal,
             "P2 must preserve random sampling when observable pressure is equal"
         );
