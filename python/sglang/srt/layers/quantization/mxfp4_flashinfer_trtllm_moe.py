@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -28,12 +29,15 @@ from sglang.srt.utils.common import next_power_of_2
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
 if is_flashinfer_available():
-    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
+    )
+    from flashinfer.utils import (
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
     )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,11 @@ from sglang.srt.utils.common import get_bool_env_var
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
     "SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", default="true"
 )
+
+
+def _shuffled_scale_name(name: str) -> str:
+    """Name of the kernel-layout copy kept next to a checkpoint-layout scale."""
+    return f"{name}_shuffled"
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
@@ -78,6 +87,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             )
             if swiglu_limit is not None
             else None
+        )
+        layer.register_buffer(
+            "_gemm1_clamp_limit_tensor",
+            self._gemm1_clamp_limit_tensor,
+            persistent=False,
         )
 
     def create_weights(
@@ -144,18 +158,23 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+        """Turn the freshly loaded checkpoint layout into what the kernel reads.
 
+        The kernel wants each expert's rows permuted, with ``w13`` reordered
+        from ``[w1, w3]`` to ``[w3, w1]`` first. For the weights that is a pure
+        row permutation of a tensor with the same shape and dtype, so it is
+        applied in place, one expert at a time; the parameters keep their
+        identity and storage, which is what ``load_weights`` (via
+        ``weight_loader``) and a captured CUDA graph both depend on. The
+        scales additionally change dtype, interleaving and extent, so their
+        kernel layout lives in separate ``*_shuffled`` parameters rebuilt from
+        the checkpoint-layout scales here; the checkpoint-layout scales are
+        never modified and stay loadable.
+        """
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
-
-        w13_w, w13_s = reorder_w1w3_to_w3w1(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
-        )
-        layer.w13_weight = Parameter(w13_w, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
 
         log_info_on_rank0(
             logger,
@@ -168,92 +187,87 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         w13_scale = layer.w13_weight_scale_inv.data
         w2_scale = layer.w2_weight_scale_inv.data
         num_experts = w13.shape[0]
+        device = w13.device
 
         if w13_scale.dtype == torch.float32:
             w13_scale = w13_scale.to(torch.float8_e8m0fnu)
             w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 
+        w13_u8 = w13.view(torch.uint8)
+        w13_s_u8 = w13_scale.view(torch.uint8)
+        w2_u8 = w2.view(torch.uint8)
+        w2_s_u8 = w2_scale.view(torch.uint8)
+
         epilogue_tile_m = 128
-        g1_w, g1_s, g2_w, g2_s = [], [], [], []
         if _USE_OFFICIAL_SHUFFLE:
             cache: dict = {}
-            for i in range(num_experts):
-                w13_u8 = w13[i].view(torch.uint8)
-                w13_s_u8 = w13_scale[i].view(torch.uint8)
-                w2_u8 = w2[i].view(torch.uint8)
-                w2_s_u8 = w2_scale[i].view(torch.uint8)
-
-                perm = _maybe_get_cached_w3_w1_permute_indices(
-                    cache,
-                    w13_u8,
-                    epilogue_tile_m,
-                )
-                g1_w.append(w13_u8[perm.to(w13_u8.device)].contiguous())
-                perm_sf = _maybe_get_cached_w3_w1_permute_indices(
-                    cache,
-                    w13_s_u8,
-                    epilogue_tile_m,
-                    num_elts_per_sf=16,
-                )
-                g1_s.append(
-                    block_scale_interleave(
-                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous()
-                    )
-                )
-
-                perm = get_w2_permute_indices_with_cache(
-                    cache,
-                    w2_u8,
-                    epilogue_tile_m,
-                )
-                g2_w.append(w2_u8[perm.to(w2_u8.device)].contiguous())
-                perm_sf = get_w2_permute_indices_with_cache(
-                    cache,
-                    w2_s_u8,
-                    epilogue_tile_m,
-                    num_elts_per_sf=16,
-                )
-                g2_s.append(
-                    block_scale_interleave(
-                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous()
-                    )
-                )
+            w13_rows = _maybe_get_cached_w3_w1_permute_indices(
+                cache, w13_u8[0], epilogue_tile_m
+            )
+            w13_sf_rows = _maybe_get_cached_w3_w1_permute_indices(
+                cache, w13_s_u8[0], epilogue_tile_m, num_elts_per_sf=16
+            )
+            w2_rows = get_w2_permute_indices_with_cache(
+                cache, w2_u8[0], epilogue_tile_m
+            )
+            w2_sf_rows = get_w2_permute_indices_with_cache(
+                cache, w2_s_u8[0], epilogue_tile_m, num_elts_per_sf=16
+            )
         else:
-            for i in range(num_experts):
-                g1_w.append(shuffle_matrix_a(w13[i].view(torch.uint8), epilogue_tile_m))
-                g1_s.append(
-                    shuffle_matrix_sf_a(w13_scale[i].view(torch.uint8), epilogue_tile_m)
-                )
-                g2_w.append(shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m))
-                g2_s.append(
-                    shuffle_matrix_sf_a(w2_scale[i].view(torch.uint8), epilogue_tile_m)
-                )
-
-        layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(
-            torch.stack(g1_s)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, w13.shape[1], -1),
-            requires_grad=False,
+            w13_rows = get_shuffle_matrix_a_row_indices(w13_u8[0], epilogue_tile_m)
+            w13_sf_rows = get_shuffle_matrix_sf_a_row_indices(
+                w13_s_u8[0], epilogue_tile_m
+            )
+            w2_rows = get_shuffle_matrix_a_row_indices(w2_u8[0], epilogue_tile_m)
+            w2_sf_rows = get_shuffle_matrix_sf_a_row_indices(
+                w2_s_u8[0], epilogue_tile_m
+            )
+        # [w1, w3] -> [w3, w1] is a row permutation as well; fold it into the
+        # gather so each expert is rewritten exactly once.
+        half = w13.shape[1] // 2
+        w3_w1_rows = torch.cat(
+            [
+                torch.arange(half, 2 * half, device=device),
+                torch.arange(0, half, device=device),
+            ]
         )
-        layer.w2_weight = Parameter(torch.stack(g2_w), requires_grad=False)
-        layer.w2_weight_scale_inv = Parameter(
-            torch.stack(g2_s)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, w2.shape[1], -1),
-            requires_grad=False,
+        w13_rows = w3_w1_rows[w13_rows.to(device)]
+        w13_sf_rows = w3_w1_rows[w13_sf_rows.to(device)]
+        w2_rows = w2_rows.to(device)
+        w2_sf_rows = w2_sf_rows.to(device)
+
+        g1_s, g2_s = [], []
+        for i in range(num_experts):
+            w13_u8[i].copy_(w13_u8[i][w13_rows])
+            w2_u8[i].copy_(w2_u8[i][w2_rows])
+            g1_s.append(block_scale_interleave(w13_s_u8[i][w13_sf_rows].contiguous()))
+            g2_s.append(block_scale_interleave(w2_s_u8[i][w2_sf_rows].contiguous()))
+
+        copy_or_rebind_param(
+            layer,
+            _shuffled_scale_name("w13_weight_scale_inv"),
+            torch.stack(g1_s).reshape(num_experts, w13.shape[1], -1),
+        )
+        copy_or_rebind_param(
+            layer,
+            _shuffled_scale_name("w2_weight_scale_inv"),
+            torch.stack(g2_s).reshape(num_experts, w2.shape[1], -1),
         )
 
         self._register_static_scale_ones(layer)
         torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
+        # Constant across reloads; created once so their addresses stay valid
+        # for a captured CUDA graph.
         device = layer.w13_weight.device
         for name in (
             "output1_scale_scalar",
             "output1_scale_gate_scalar",
             "output2_scale_scalar",
         ):
+            if getattr(layer, name, None) is not None:
+                continue
             layer.register_buffer(
                 name,
                 torch.ones(layer.num_local_experts, device=device, dtype=torch.float32),
@@ -273,8 +287,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale_inv
-        w2_scale = layer.w2_weight_scale_inv
+        w13_scale = getattr(layer, _shuffled_scale_name("w13_weight_scale_inv")).view(
+            torch.float8_e4m3fn
+        )
+        w2_scale = getattr(layer, _shuffled_scale_name("w2_weight_scale_inv")).view(
+            torch.float8_e4m3fn
+        )
 
         intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
         hidden_size = w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]

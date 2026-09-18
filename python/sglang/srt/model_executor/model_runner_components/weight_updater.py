@@ -380,21 +380,30 @@ class WeightUpdater:
 
         monkey_patch_torch_reductions()
         self._assert_weight_cache_inactive("update_weights_from_tensor")
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
+        # Two input shapes reach this point. The per-tensor formats hand over a
+        # list of (name, tensor) pairs, where a tensor may still be a
+        # LocalSerializedTensor carrying one CUDA IPC handle per TP rank: open
+        # this rank's handle and move the result to this device before loading.
+        # A flattened bucket is instead a dict holding one big device tensor and
+        # the metadata that says how to slice it; its loader below does that.
+        if load_format != "flattened_bucket":
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
+
+        if load_format == "flattened_bucket":
+            self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+        elif load_format == "direct":
             _model_load_weights_direct(self.get_model(), named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
@@ -403,6 +412,11 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        # Tensors deserialized from CUDA IPC handles alias storage owned by the
+        # sender, who may free or reuse it as soon as this call returns. The
+        # loads above only enqueue device-to-device copies, so wait for them
+        # before handing control back.
+        device_module.synchronize()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
