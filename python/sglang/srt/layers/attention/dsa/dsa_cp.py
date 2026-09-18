@@ -201,6 +201,16 @@ def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan
             f"(this one has {plan.num_tokens}); the slice would be mostly padding"
         )
         return None
+
+    # Say so when it engages, not only when it refuses. Absence of a refusal
+    # line proves nothing: an unset flag leaves this function before any of
+    # them. That gap is exactly how indexer query sharding stayed silently off
+    # for fifteen token counts in sixteen, for four weeks. The message is fixed
+    # rather than per-shape so it lands once; the shapes are in the refusals.
+    print_info_once(
+        f"DSA-CP is ON: the attention query is sharded across "
+        f"{parallel.attn_tp_size} ranks at extend"
+    )
     return plan
 
 
