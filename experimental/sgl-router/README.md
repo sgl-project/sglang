@@ -69,6 +69,148 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### Fleet-wide sampling contract
+
+`--override-sampling-params` fixes the sampling configuration for every client
+of this router, independently of what the engine's own defaults happen to be:
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 \
+  --override-sampling-params '{"temperature": 1, "top_p": 0.95, "n": 1}' \
+  --sampling-param-conflict reject
+```
+
+It takes one JSON object keyed by the request-body field names
+(`temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
+`frequency_penalty`, `presence_penalty`, `n`). A configured value is injected
+whenever the request omits that field, so the engine's defaults cannot drift
+from what the operator declared. `temperature`, `top_p`, `top_k`, `min_p` and
+`repetition_penalty` are the five the engine resolves from the model's own
+`generation_config`, which is what makes them drift when a deployed image
+changes; the rest have fixed API defaults.
+
+An explicit `null` counts as omitting the field, not as a client-supplied
+value: the OpenAI API types these parameters as nullable with a documented
+default, so `null` asks for the default — and on a governed fleet the
+configured value is what the default is.
+
+For a request that does send a value, `--sampling-param-conflict` decides:
+`reject` (the default) 400s a differing value before admission, while `allow`
+forwards the client's value untouched — the router never silently rewrites what
+a client sent. A `reject` response carries
+`x-router-error-code: sampling_contract_violation` and is counted in
+`sgl_router_sampling_contract_rejections_total{param}`, so a rollout's blast
+radius is visible per parameter rather than folded into `bad_request`.
+
+`reject` also 400s a value it cannot read as a number, on a governed parameter
+only. The engine coerces more than JSON numbers — a bool and a numeric string
+both become numbers — by rules that are undocumented and need not match across
+a fleet, so a value the router cannot read is one it cannot prove conforms, and
+waving it through would make the pin bypassable. The common coercions are
+matched exactly (`false` is 0, `"0.5"` and `"1_0"` are 0.5 and 10), so this
+refuses only genuine garbage. `allow` is unaffected: it promises nothing, so
+such a value keeps flowing to the engine, which owns the request schema.
+
+A value may also be an inclusive band, `{"min": LO, "max": HI}`, for a
+parameter that stays tunable inside a range. A band names no value to inject,
+so it constrains only the requests that name the parameter; one that omits it
+gets the model's own `generation_config` default, which the router cannot see.
+Because a band can only ever reject, combining one with `allow` is a startup
+error.
+
+Values are range-checked at startup, so a misconfiguration fails the launch
+instead of 400ing every request at the engine. Repeating a key in the flag is
+also a startup error, rather than silently enforcing whichever copy came last.
+
+| parameter | accepted | notes |
+| --- | --- | --- |
+| `temperature` | `[0, 2]` | |
+| `top_p` | `(0, 1]` | |
+| `top_k` | `>= 1`, or exactly `-1` | `-1` is the engine's "whole vocabulary" spelling and its default. Being non-contiguous it cannot bound a band. Note `top_k: 1` is greedy decoding, not "disabled". |
+| `min_p` | `[0, 1]` | not an OpenAI parameter; the engine's domain |
+| `repetition_penalty` | `(0, 2]` | not an OpenAI parameter; the engine's domain |
+| `frequency_penalty` | `[-2, 2]` | |
+| `presence_penalty` | `[-2, 2]` | |
+| `n` | `[1, 128]` | |
+
+The OpenAI domains are deliberately narrower than what the engine itself
+accepts (`SamplingParams.verify` would take `temperature: 5`): these values are
+injected into request bodies, and a fleet contract outside the range every
+OpenAI client library validates against is far more likely a typo than an
+intent.
+
+Cost: a request that named every configured field forwards its original bytes
+untouched. One that omits a field has the scalars spliced directly into the
+body bytes — no parse, no re-serialize — which on a 16 MiB body is ~0.24 ms
+against ~5.7 ms for a `serde_json` round-trip. Only `input_ids` and PD
+bootstrap injection still parse and re-serialize, because those may have to
+overwrite a key the client sent.
+
+### Relationship to the engine's own `--preferred-sampling-params`
+
+The engine has an inject-when-absent flag of its own,
+`--preferred-sampling-params`, merged in
+`python/sglang/srt/managers/tokenizer_manager.py` as
+`{**preferred, **obj.sampling_params}`. On `/v1/chat/completions` it is
+currently a no-op: `ChatCompletionRequest.to_sampling_params`
+(`python/sglang/srt/entrypoints/openai/protocol.py`) resolves every sampling
+key eagerly through `generation_config` and then its own defaults, so the
+right-hand side of that merge is always fully populated and always wins.
+(`/v1/responses`, in the same file, already omits `None` entries for exactly
+this reason.) If that is fixed engine-side, `--preferred-sampling-params`
+covers the inject-when-absent half for a single engine.
+
+What stays the router's to own either way is the enforcement half: the
+`reject` immutability contract with its 400 before admission — costing no
+queue slot and no engine round-trip — the `sampling_contract_violation` code
+and per-parameter counter, bands, and one contract applied at a shared ingress
+across engines whose own flags the router operator may not control.
+
+## Chat rendering
+
+The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
+HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
+for template-less models. Cache-aware routing hashes the rendered tokens so its
+prefix queries match the blocks the engine caches. Models the engine encodes in
+code but dynamo-render cannot tokenize here (Inkling, Kimi K3) route via raw prompt
+text, as does any model whose template fails to load or render.
+
+Plain text chat requests (string `content`, no tools, no template kwargs or
+reasoning controls or historical `reasoning_content`, no assistant continuation,
+no consecutive users or non-leading system turns) additionally forward the
+rendered tokens to the engine as `input_ids`, retaining the original messages,
+so the engine skips re-tokenizing. Every other request shape is rendered for
+routing only: the router renders with dynamo-render and does not replicate
+SGLang's request normalization, so forwarding is enabled shape by shape as
+parity is verified. Use matching model files on the router and workers; worker
+template overrides and default kwargs are not observable from the request.
+
+Set `--disable-input-ids-forwarding` for this router's model when worker-side
+rendering has not been verified to match. This disables router-generated IDs
+for every routing policy; cache-aware routing still renders and tokenizes
+locally, and the original messages reach the workers for engine processing.
+Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
+
+Forwarding logs its assumptions at startup. In particular, disable it for
+`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
+worker parser overrides such as `--tool-call-parser deepseekv32` that select a
+native encoder over a shipped template, or conversation templates with stop
+strings (the engine's `input_ids` path skips those template stops). These worker
+settings are not inferred from the router's environment. Disabling forwarding preserves
+engine behavior but does not establish parity for local routing hashes.
+
+Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
+string content into arrays differently from the worker. Dynamo 5.1.2 does not expose
+its conversion flag, so the router cannot automatically block these templates.
+Detailed content-format parity coverage follows in #39133.
+
+The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
+with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
 ## HTTP/2
 
 There is nothing to configure. The router negotiates per connection inbound and

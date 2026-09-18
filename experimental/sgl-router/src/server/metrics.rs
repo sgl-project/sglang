@@ -66,15 +66,22 @@
 //!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
 //!   all selections: a diverted curve skewing high means the gate is trading
 //!   large cached prefixes for short waits.
-//! - `all_queued` — the queue gate removed every owner AND every worker in
-//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
-//!   is the saturation signal for traffic the gate acted on, keyed on
-//!   saturation rather than on where the request landed: usually the request
-//!   kept its prefix, but when the re-admitted owners are also out of KV
-//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
-//!   saturation in the one state where it matters most. It deliberately
-//!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
-//!   must not absorb it, or a fully saturated fleet reads as a healthy one.
+//! - `all_queued` — the queue gate removed every owner and no diversion could
+//!   dodge a wait. Two conditions draw it. Without `--saturation-queue-floor`
+//!   it means every worker in the prefill fleet is queueing at or above
+//!   `--worker-queue-limit`. With a floor set, the saturation pin also draws
+//!   it on the weaker condition the floor names: no fleet worker reads
+//!   strictly below the floor. Since the floor may be lower than the limit, a
+//!   floor well under the limit widens this label to fleets that still hold
+//!   gate-admissible workers — read it against the configured floor, not as
+//!   "every worker is over the limit". It is keyed on saturation rather than
+//!   on where the request landed: usually the request kept its prefix, but
+//!   when the owners it would keep are also out of KV capacity it lands
+//!   off-owner and still books here. Reporting that case as `cache_miss`
+//!   would hide the saturation in the one state where it matters most. It
+//!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
+//!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
+//!   healthy one.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -728,15 +735,9 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
-    /// router's chat encoder failed: a chat request (`messages`) on a model with
-    /// a chat encoder that did not yield engine-equivalent ids. That request
-    /// silently fell back to engine-side tokenization, defeating the offload —
-    /// the actionable "offload broken" signal. It stays at ~0 in healthy
-    /// operation and climbs only on a real tokenizer problem; successful
-    /// forwards and expected omissions (tools / multimodal / thinking, whose
-    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
-    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    /// Count formatter failures only for chats eligible for `input_ids`
+    /// forwarding. Requests excluded by the guard are expected fallbacks.
+    /// Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
@@ -1190,7 +1191,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-formatter model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();

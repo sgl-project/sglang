@@ -350,6 +350,9 @@ pub struct ModelConfig {
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
+    /// Disable router-generated input IDs for this model; keep routing tokenization.
+    /// Use when workers have rendering defaults or template stops the router cannot see.
+    pub disable_input_ids_forwarding: bool,
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
@@ -466,6 +469,11 @@ pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
 /// Default external-indexer request limits.
 pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
+/// Default min-load sample size: the pre-existing power-of-2 behavior.
+/// Every code path that has no `AffinityConfig` to read must fall back to
+/// this, so the no-affinity path never drifts from the configured default.
+pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
+
 /// Controls whether admission may select a session-affinity backup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
@@ -534,7 +542,45 @@ pub struct AffinityConfig {
     /// Note the firing point scales with `dp_size`: the sample sums `waiting`
     /// across a worker's DP ranks while a request lands on one of them, so
     /// scale the limit with `--dp-size` on DP-attention deployments.
+    ///
+    /// The companion `saturation_queue_floor` cancels the gate's diversions
+    /// when they have no payoff (nothing in the fleet reads below the
+    /// floor).
     pub worker_queue_limit: Option<u64>,
+    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
+    /// diversions that have no payoff. When no cache candidate survives
+    /// both `worker_queue_limit` and hard admission, at least one was over
+    /// the limit, AND no worker in the routable fleet has a fresh queue
+    /// reading strictly below this floor, the diverted request would wait
+    /// wherever it lands — so it pins to the least-pressured prefix owner
+    /// instead of cold-prefilling on a non-owner (which evicts other
+    /// prefixes and manufactures the next round of misses). `None` — the
+    /// default — preserves the pure gate behavior.
+    ///
+    /// Polarity note: a worker with no fresh sample does NOT count as idle
+    /// — the opposite of the gate's fail-open, and deliberately so. The
+    /// gate keeps affinity because that is the safe default action; the
+    /// pin asks whether a *provably better* destination exists, and an
+    /// unknown queue is not proof. Both polarities leave the request with
+    /// its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker_queue_limit` and requires the
+    /// gate; like the limit, scale the floor with `dp_size`.
+    pub saturation_queue_floor: Option<u64>,
+    /// Number of random candidates sampled for the min-load fallback
+    /// (`--min-load-choices`); the least-pressured of the sample wins.
+    /// [`DEFAULT_MIN_LOAD_CHOICES`] is the pre-existing power-of-2
+    /// behavior, so upgrading changes nothing. `k >= pool` skips the
+    /// shuffle and returns the exact minimum, with ties broken randomly
+    /// (an idle fleet ties on every comparison, so a fixed order would pin
+    /// every fallback dispatch to one worker); `k = 1` is a uniform draw
+    /// within the tier, and its sample has no second member, so the
+    /// proposal carries no backup and admission loses its backup-admission
+    /// and pressure-guard paths. The
+    /// `--cache-candidate-*` knobs bound the cache-affinity OWNER candidate
+    /// set; this bounds the min-load FALLBACK sample used when no owner is
+    /// usable.
+    pub min_load_choices: usize,
 }
 
 impl Default for AffinityConfig {
@@ -558,6 +604,8 @@ impl Default for AffinityConfig {
             cache_candidate_max_workers: 32,
             cache_switch_margin_tokens: 1_024,
             worker_queue_limit: None,
+            saturation_queue_floor: None,
+            min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
         }
     }
 }

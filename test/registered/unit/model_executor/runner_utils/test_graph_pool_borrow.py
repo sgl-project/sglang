@@ -219,7 +219,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             ),
             patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             patch(
-                "sgl_kernel.tree_speculative_sampling_target_only",
+                "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
             ),
         ):
