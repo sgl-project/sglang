@@ -155,9 +155,9 @@ class DecodeHiCachePreallocMixin:
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
-            dr.prefix_match.restore_token_count
+            (dr.prefix_match.restore_token_count if dr.prefix_match else 0)
             for dr in self.transfer_queue.queue
-            if dr.prefix_match is not None
+            if (dr.prefix_match is not None or dr.l2_only_delta_len > 0)
             and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
             and dr.hicache_restored_node is None
         )
