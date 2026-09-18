@@ -202,10 +202,10 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
     def test_state_component_matching_uses_unique_type(self):
-        src_state_component_types = [StateType.SWA, StateType.C128_STATE]
+        src_state_component_types = [StateType.SWA, StateType.DSV4_REQUEST_STATE]
         dst_state_component_types = [
             StateType.SWA_RING,
-            StateType.C128_STATE,
+            StateType.DSV4_REQUEST_STATE,
             StateType.SWA,
         ]
 
@@ -232,7 +232,7 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_state_component_types_roundtrip(self):
         state_component_types = [
             StateType.SWA,
-            StateType.C128_STATE,
+            StateType.DSV4_REQUEST_STATE,
             StateType.SWA_RING,
         ]
 
