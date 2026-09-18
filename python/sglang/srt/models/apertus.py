@@ -51,6 +51,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -641,6 +642,7 @@ class ApertusForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -652,6 +654,7 @@ class ApertusForCausalLM(nn.Module):
     def get_embed(self):
         return self.model.embed_tokens.weight
 
+    @draft_shared_weight_spec(lm_head=None, check_hidden_size=True)
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
         if (

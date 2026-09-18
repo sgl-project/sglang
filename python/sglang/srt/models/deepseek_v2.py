@@ -156,6 +156,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
     resolve_rocm_forward_method,
@@ -3415,6 +3416,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight

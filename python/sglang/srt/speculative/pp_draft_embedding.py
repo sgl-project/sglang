@@ -19,6 +19,7 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_paths
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
@@ -230,12 +231,24 @@ def resolve_draft_embed_and_head(
     model_path: str,
     revision: Optional[str],
     load_config: LoadConfig,
+    is_eagle3: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Embed/head to bind into a draft; a stage without the target embedding
     loads the draft's own from the checkpoint."""
     embed, head = resolve_target_embed_and_head(target_model)
     if embed is None:
-        embed = load_draft_embedding_from_checkpoint(
-            draft_model, model_path, revision=revision, load_config=load_config
+        paths = draft_shared_weight_paths(draft_model, is_eagle3)
+        owned_embedding = (
+            find_draft_embedding_param(draft_model)
+            if paths is not None and paths[0] is None
+            else None
         )
+        if owned_embedding is not None:
+            # A checkpoint-provided MTP embedding (or an EAGLE embedding with
+            # a different width) must not be overwritten with target weights.
+            _, embed = owned_embedding
+        else:
+            embed = load_draft_embedding_from_checkpoint(
+                draft_model, model_path, revision=revision, load_config=load_config
+            )
     return embed, head

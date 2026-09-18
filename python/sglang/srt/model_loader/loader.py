@@ -42,6 +42,10 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.draft_shared_weights import (
+    draft_weight_loading_context,
+    is_shared_draft_module,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -793,6 +797,32 @@ class DefaultModelLoader(BaseModelLoader):
             )
         return tuple(resolved_sources)
 
+    def _draft_checkpoint_names(self, model_config, model):
+        """Read names from safetensors headers without materializing tensors."""
+        from safetensors import safe_open
+
+        sources = self.resolve_model_weights(model_config, model)
+        if not all(source.use_safetensors for source in sources):
+            return None
+        names = set()
+        for resolved in sources:
+            keys = set()
+            for path in resolved.weight_files:
+                with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                    keys.update(checkpoint.keys())
+            if self.load_config.draft_model_idx is None:
+                names.update(resolved.source.prefix + name for name in keys)
+            else:
+                names.update(
+                    name
+                    for name, _ in self._filter_mtp_weights(
+                        ((name, None) for name in keys),
+                        resolved.source.prefix,
+                        self.load_config.draft_model_idx,
+                    )
+                )
+        return frozenset(names)
+
     @staticmethod
     def start_checkpoint_prefetch(
         resolved_sources: Tuple[ResolvedSource, ...],
@@ -992,7 +1022,12 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
+        with (
+            set_default_torch_dtype(model_config.dtype),
+            draft_weight_loading_context(
+                target_device, enabled=type(self) is DefaultModelLoader
+            ) as draft_loading,
+        ):
             with target_device:
                 model = _initialize_model(
                     model_config,
@@ -1000,9 +1035,18 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            if draft_loading is not None:
+                checkpoint_names = (
+                    self._draft_checkpoint_names(model_config, model)
+                    if draft_loading.needs_checkpoint_names(model)
+                    else None
+                )
+                draft_loading.prepare(model, checkpoint_names)
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+            if draft_loading is not None:
+                draft_loading.finish(model)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -1072,6 +1116,10 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def postprocess_weights(model, target_device):
         for module, quant_method in _modules_with_quant_method(model):
+            # Shared vocabulary parameters remain metadata-only until binding.
+            # They must not enter device staging or quantization postprocessing.
+            if is_shared_draft_module(module):
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the

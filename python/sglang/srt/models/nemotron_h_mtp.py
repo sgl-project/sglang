@@ -30,6 +30,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.models.nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHForCausalLM,
@@ -411,6 +412,22 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
                     f"Incomplete standalone MTP lm_head: missing {sorted(missing)}"
                 )
 
+    def _draft_shared_weights_from_checkpoint(self, names):
+        if names is None:
+            owns_head = self._owns_lm_head
+        else:
+            names = {name.removeprefix("language_model.") for name in names}
+            owns_head = (
+                any(name.startswith("mtp.layers.") for name in names)
+                and not any(
+                    name.startswith(("backbone.layers.", "model.layers."))
+                    for name in names
+                )
+                and any(name.startswith("lm_head.") for name in names)
+            )
+        return True, not owns_head
+
+    @draft_shared_weight_spec(resolver="_draft_shared_weights_from_checkpoint")
     def set_embed_and_head(self, embed, head):
         if not self._owns_lm_head:
             return super().set_embed_and_head(embed, head)

@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weights_scope
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -160,7 +161,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Load draft model weights only.
+        self._shared_draft_models = set()
         with (
+            draft_shared_weights_scope(target_worker.model_runner.model),
             draft_pp_context(),
             speculative_moe_backend_context(),
             draft_model_build_scope(),
@@ -179,6 +182,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
         # Match `EagleDraftWorker.draft_runner` for generic draft-runner access.
         self.draft_runner: ModelRunner = self.draft_runner_list[0]
+        self.init_lm_head()
+        if self.device == "cuda":
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
@@ -358,17 +367,22 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def init_lm_head(self):
+        for runner in self.draft_runner_list:
+            self._share_embed_and_head(runner.model)
+
+    def _share_embed_and_head(self, draft_model):
+        if draft_model in self._shared_draft_models:
+            return
         target_runner = self.target_worker.model_runner
-        # Share the embedding and lm_head
-        for i in range(self.speculative_num_steps):
-            embed, head = resolve_draft_embed_and_head(
-                target_model=target_runner.model,
-                draft_model=self.draft_runner_list[i].model,
-                model_path=target_runner.model_config.model_path,
-                revision=target_runner.model_config.revision,
-                load_config=target_runner.load_config,
-            )
-            self.draft_runner_list[i].model.set_embed_and_head(embed, head)
+        embed, head = resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=draft_model,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
+        draft_model.set_embed_and_head(embed, head)
+        self._shared_draft_models.add(draft_model)
 
     def init_attention_backend(self):
         from sglang.srt.speculative.eagle_worker_v2 import (

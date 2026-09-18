@@ -109,6 +109,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
@@ -2530,6 +2531,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         # Share target embeddings and output head with the draft model.
         del self.model.embed_tokens.weight
@@ -2776,6 +2778,7 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.thinker.language_model.get_embed_and_head()
 
+    @draft_shared_weight_spec(delegate="thinker.language_model")
     def set_embed_and_head(self, embed, head):
         return self.thinker.language_model.set_embed_and_head(embed, head)
 

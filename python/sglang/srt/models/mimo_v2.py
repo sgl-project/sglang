@@ -74,6 +74,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -1650,6 +1651,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         assert self.model is not None and self.lm_head is not None, (
             "set_embed_and_head() is not available in encoder_only mode"

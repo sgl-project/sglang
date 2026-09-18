@@ -37,6 +37,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.parakeet import ProjectedParakeet
@@ -189,6 +190,7 @@ class NemotronH_Nano_VL_V2(EVS):
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 
+    @draft_shared_weight_spec(delegate="language_model")
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 

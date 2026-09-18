@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -34,6 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.model_loader.draft_shared_weights import defer_draft_vocab_weights
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -333,15 +335,23 @@ class VocabParallelEmbedding(torch.nn.Module):
             - self.shard_indices.added_vocab_start_index
         )
 
-        self.quant_method.create_weights(
-            self,
-            self.embedding_dim,
-            [self.num_embeddings_per_partition],
-            self.embedding_dim,
-            self.num_embeddings_padded,
-            params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
-        )
+        # Keep only metadata until the loader resolves the draft sharing plan.
+        # Shared weights never allocate storage; owned weights are materialized
+        # directly on the target device before checkpoint loading.
+        # Quantized layers retain their normal allocation/postprocessing path.
+        defer_weights = type(
+            self.quant_method
+        ) is UnquantizedEmbeddingMethod and defer_draft_vocab_weights(self)
+        with torch.device("meta") if defer_weights else nullcontext():
+            self.quant_method.create_weights(
+                self,
+                self.embedding_dim,
+                [self.num_embeddings_per_partition],
+                self.embedding_dim,
+                self.num_embeddings_padded,
+                params_dtype=params_dtype,
+                weight_loader=self.weight_loader,
+            )
 
     @classmethod
     def _get_indices(
@@ -382,6 +392,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        if getattr(param, "_shared_draft_weight", False):
+            return
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
 

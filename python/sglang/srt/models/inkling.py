@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.attn import (
     InklingAttention,
@@ -1897,6 +1898,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         # Every de-tied MTP head loads the same bf16 embed/unembed as the target,
         # so alias the target's tensors rather than keep one duplicate per head.

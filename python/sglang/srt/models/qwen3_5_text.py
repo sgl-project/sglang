@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.draft_shared_weights import draft_shared_weight_spec
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
@@ -149,6 +150,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         head = None if isinstance(self.lm_head, PPMissingLayer) else self.lm_head.weight
         return embed, head
 
+    @draft_shared_weight_spec()
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
