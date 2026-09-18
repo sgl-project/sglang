@@ -32,6 +32,23 @@ from typing import (
     runtime_checkable,
 )
 
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+)
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses import (
+    ResponseOutputText,
+    ResponseReasoningItem,
+    ResponseTextConfig,
+)
+from openai.types.responses.easy_input_message_param import EasyInputMessageParam
+from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_format_text_json_schema_config import (
+    ResponseFormatTextJSONSchemaConfig,
+)
+from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -43,22 +60,6 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-
-from openai.types.responses import (
-    ResponseFunctionToolCall,
-    ResponseInputItemParam,
-    ResponseOutputItem,
-    ResponseOutputText,
-    ResponseReasoningItem,
-    ResponseTextConfig,
-)
-from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
-from openai.types.responses.easy_input_message_param import EasyInputMessageParam
-from openai.types.responses.response import ToolChoice
-from openai.types.responses.response_format_text_json_schema_config import (
-    ResponseFormatTextJSONSchemaConfig,
-)
-from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 
 try:
     from xgrammar import StructuralTag
@@ -244,7 +245,9 @@ class LegacyStructuralTagResponseFormat(BaseModel):
     at_least_one: bool = False
 
 
-StructuralTagResponseFormat: TypeAlias = LegacyStructuralTagResponseFormat | StructuralTag
+StructuralTagResponseFormat: TypeAlias = (
+    LegacyStructuralTagResponseFormat | StructuralTag
+)
 
 ToolCallConstraint: TypeAlias = Union[
     tuple[Literal["structural_tag"], StructuralTagResponseFormat],
@@ -436,9 +439,7 @@ class SglExt(BaseModel):
 
     routed_experts: str | None = None
     cached_tokens_details: CachedTokensDetails | None = None
-    spec_tokens_details: SpecTokensDetails | list[SpecTokensDetails] | None = (
-        None
-    )
+    spec_tokens_details: SpecTokensDetails | list[SpecTokensDetails] | None = None
     input_ids: list[int] | None = None
     output_ids: list[list[int]] | None = None
 
@@ -623,7 +624,8 @@ class ChatCompletionMessageContentAudioInlinePart(BaseModel):
 
 
 def _to_audio_url_part(
-    part: ChatCompletionMessageContentAudioURLPart | ChatCompletionMessageContentAudioInlinePart,
+    part: ChatCompletionMessageContentAudioURLPart
+    | ChatCompletionMessageContentAudioInlinePart,
 ) -> ChatCompletionMessageContentAudioURLPart:
     if isinstance(part, ChatCompletionMessageContentAudioURLPart):
         return part
@@ -641,7 +643,8 @@ def _to_audio_url_part(
 # inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
 # the equivalent data URI as it validates.
 ChatCompletionMessageContentAudioPart = Annotated[
-    ChatCompletionMessageContentAudioURLPart | ChatCompletionMessageContentAudioInlinePart,
+    ChatCompletionMessageContentAudioURLPart
+    | ChatCompletionMessageContentAudioInlinePart,
     AfterValidator(_to_audio_url_part),
 ]
 
@@ -700,9 +703,7 @@ _GENERIC_MESSAGE_ROLES: tuple[str, ...] = get_args(_GenericMessageRole)
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: _GenericMessageRole
-    content: str | list[ChatCompletionMessageContentPart] | None = Field(
-        default=None
-    )
+    content: str | list[ChatCompletionMessageContentPart] | None = Field(default=None)
     tool_call_id: str | None = None
     name: str | None = None
     phase: Literal["commentary", "final_answer"] | None = None
@@ -900,7 +901,9 @@ class ChatCompletionRequest(BaseModel):
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
     )
-    task: Literal["action", "query", "authority", "domain", "title", "read_url"] | None = Field(
+    task: (
+        Literal["action", "query", "authority", "domain", "title", "read_url"] | None
+    ) = Field(
         default=None,
         description="DeepSeek-V4 quick instruction task. When set, the last "
         "user/developer message is treated as a single-shot classification prompt "
@@ -1207,7 +1210,12 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: LogProbs | ChoiceLogprobs | None = None
-    finish_reason: Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"] | None = None
+    finish_reason: (
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
+        | None
+    ) = None
     matched_stop: None | int | str = None
     hidden_states: object | None = None
     prompt_token_ids: list[int] | None = None
@@ -1265,7 +1273,12 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: LogProbs | ChoiceLogprobs | None = None
-    finish_reason: Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"] | None = None
+    finish_reason: (
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
+        | None
+    ) = None
     matched_stop: None | int | str = None
 
 
@@ -1364,9 +1377,7 @@ class EmbeddingResponse(BaseModel):
 
 
 class ScoringRequest(BaseModel):
-    query: str | list[int] | None = (
-        None  # Query text or pre-tokenized token IDs
-    )
+    query: str | list[int] | None = None  # Query text or pre-tokenized token IDs
     items: str | list[str] | list[list[int]] | None = (
         None  # Item text(s) or pre-tokenized token IDs
     )
@@ -1380,9 +1391,7 @@ class ScoringRequest(BaseModel):
     item_embed_overrides: list[list[list[float]] | None] | None = (
         None  # [num_items][num_item_embed_overrides][hidden_size]
     )
-    label_token_ids: list[int] | None = (
-        None  # Token IDs to compute probabilities for
-    )
+    label_token_ids: list[int] | None = None  # Token IDs to compute probabilities for
     apply_softmax: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
@@ -1465,8 +1474,8 @@ class TokenizeRequest(BaseModel):
     prompt: str | list[str] | None = None
     messages: list[ChatCompletionMessageParam] | None = None
     tools: list[Tool] | None = Field(default=None, examples=[None])
-    tool_choice: ToolChoice | Literal["auto", "required", "none"] | None = (
-        Field(default=None, examples=["auto"])
+    tool_choice: ToolChoice | Literal["auto", "required", "none"] | None = Field(
+        default=None, examples=["auto"]
     )
     reasoning_effort: ReasoningEffortType = None
     continue_final_message: bool = False
@@ -1607,7 +1616,19 @@ class ResponsesRequest(BaseModel):
 
     # Core OpenAI API fields (ordered by official documentation)
     background: bool | None = False
-    include: list[Literal["code_interpreter_call.outputs", "computer_call_output.output.image_url", "file_search_call.results", "message.input_image.image_url", "message.output_text.logprobs", "reasoning.encrypted_content"]] | None = None
+    include: (
+        list[
+            Literal[
+                "code_interpreter_call.outputs",
+                "computer_call_output.output.image_url",
+                "file_search_call.results",
+                "message.input_image.image_url",
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content",
+            ]
+        ]
+        | None
+    ) = None
     # Accept dict-shaped items as the loose arm; downstream normalization
     # handles replayed shapes that don't satisfy every openai TypedDict.
     input: str | list[ResponseInputOutputItem] | list[dict[str, Any]]
@@ -1905,7 +1926,10 @@ class ResponsesResponse(BaseModel):
     model: str
 
     output: list[
-        ResponseOutputMessage | ResponseOutputItem | ResponseReasoningItem | ResponseFunctionToolCall
+        ResponseOutputMessage
+        | ResponseOutputItem
+        | ResponseReasoningItem
+        | ResponseFunctionToolCall
     ] = Field(default_factory=list)
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
@@ -1965,7 +1989,10 @@ class ResponsesResponse(BaseModel):
         model_name: str,
         created_time: int,
         output: list[
-            ResponseOutputMessage | ResponseOutputItem | ResponseReasoningItem | ResponseFunctionToolCall
+            ResponseOutputMessage
+            | ResponseOutputItem
+            | ResponseReasoningItem
+            | ResponseFunctionToolCall
         ],
         status: str,
         usage: UsageInfo | None,
