@@ -26,8 +26,8 @@ user's raw input, kept **read-only** for debug and reproduction; what
 resolution decided lives in the declarations (``resolution_result``) and, for
 business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
-``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
-shims over this slot).
+``set_global_server_args_for_scheduler`` is a thin shim over this slot;
+``get_global_server_args`` is retired and raises).
 
 ``get_exec()`` / ``get_memory()`` / ``get_schedule()`` / ``get_device()`` /
 ``get_model()`` / ``get_spec()`` / ``get_lora()`` / ``get_mm()`` /
@@ -47,7 +47,6 @@ test-only ``override(**kw)``.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import logging
 import math
@@ -56,7 +55,12 @@ import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import msgspec
+
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
+
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.runner_utils.pool import GraphPoolBorrowState
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -162,7 +166,7 @@ def derive_parallel_widths(
 
     `world_size` is not among them: it is not a quotient, and `get_world_size()`
     answers with the live WORLD group, which stays right through an elastic
-    scale-up that a stamp taken at group build would not survive.
+    scale-up that a value fixed at group build would not survive.
     """
     return {
         "attn_dp_size": attn_dp_size,
@@ -266,7 +270,7 @@ class ParallelContext:
     def __init__(self):
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
-        self._derived = {}  # widths stamped when the groups are built
+        self._derived = {}  # widths overridden permanently, as the groups are built
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -289,14 +293,17 @@ class ParallelContext:
         overrides = self._overrides
         return overrides[name] if name in overrides else getter()
 
-    def stamp_derived_widths(self, **widths) -> None:
-        """Record the widths derived from the leaves, as the groups are built.
+    def override_permanently(self, **widths) -> None:
+        """Permanently correct a derived width the published bag can't answer
+        or no longer answers correctly -- not `RuntimeContext.override`,
+        because a derived width is not a resolved config leaf and this must
+        work with no config published at all (`multimodal_gen` lends a TP
+        group to `srt` layers with no `srt` config to publish against).
 
-        `initialize_model_parallel` computes the set through
-        `derive_parallel_widths` and hands it here; `initialize_dp_attention`
-        stamps `attn_dp_size` again once it knows the effective width, and
-        elastic EP restamps it where it already updates the live one. A stamped
-        width is what the readers answer with.
+        Lives beside, not inside, the `@contextmanager` `override` above -- a
+        name it cannot also have on this class -- because these are permanent
+        for the process, not scoped to a `with` block: none of the real
+        callers ever restore the value they set here.
         """
         self._derived.update(widths)
 
@@ -304,13 +311,13 @@ class ParallelContext:
         self._derived.clear()
 
     def _derived_width(self, name):
-        """A width the configuration implies: override, else stamp, else the
-        published leaf.
+        """A width the configuration implies: scoped override, else permanent
+        override, else the published leaf.
 
-        The leaf is computed at publish by `parallel_widths_of`; the stamp sits
-        above it because an elastic scale-up restamps `attn_dp_size` after
-        publish, and a scope that swaps in another TP group states the quotients
-        through `override`.
+        The leaf is computed at publish by `parallel_widths_of`; the permanent
+        override sits above it because an elastic scale-up corrects
+        `attn_dp_size` after publish, and a scope that swaps in another TP
+        group states the quotients through the scoped `override` above that.
 
         Nothing is recomputed on read, so overriding `tp_size` does not move
         `attn_tp_size`: name the width, or publish a config.
@@ -326,10 +333,10 @@ class ParallelContext:
             return getattr(config, name)
         raise RuntimeError(
             f"derived parallel width {name!r} is not available: it is computed "
-            "from the configured leaves at publish, and restamped when the "
-            "process groups are built. Nothing is published and nothing has "
-            "been stamped -- publish a parallel config, or state the width "
-            f"with get_parallel().override({name}=...)"
+            "from the configured leaves at publish, and permanently corrected "
+            "when the process groups are built. Nothing is published and "
+            "nothing has been set with override_permanently -- publish a "
+            f"parallel config, or state the width with get_parallel().override({name}=...)"
         )
 
     @contextmanager
@@ -461,28 +468,29 @@ def _install_derived_widths() -> None:
 _install_derived_widths()
 
 
-class _FlagGroupBase:
+class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
-    Groups are plain dataclasses; ``__dataclass_fields__`` is the single source
-    of truth for which leaves exist, so a mistyped name fails loudly instead of
-    creating a stray attribute.
+    ``__struct_fields__`` is the single source of truth for which leaves exist,
+    so a mistyped name fails loudly instead of creating a stray attribute. The
+    write goes through ``super().__setattr__``: a ``Struct`` keeps its fields in
+    its own layout, so ``object.__setattr__`` does not reach them.
     """
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name not in type(self).__dataclass_fields__:
+        if name not in type(self).__struct_fields__:
             raise AttributeError(
                 f"{type(self).__name__} has no flag '{name}' (leaves are "
-                "declared as dataclass fields; check for typos)"
+                "declared as struct fields; check for typos)"
             )
-        object.__setattr__(self, name, value)
+        super().__setattr__(name, value)
 
     @contextmanager
     def override(self, **kwargs):
         """Temporarily force flag values, restoring on exit. Transactional
         (keys validated before any write) — the test-only injection
         primitive."""
-        fields = type(self).__dataclass_fields__
+        fields = type(self).__struct_fields__
         unknown = set(kwargs) - set(fields)
         if unknown:
             raise ValueError(
@@ -490,15 +498,14 @@ class _FlagGroupBase:
             )
         saved = {name: getattr(self, name) for name in kwargs}
         for name, value in kwargs.items():
-            object.__setattr__(self, name, value)
+            setattr(self, name, value)
         try:
             yield self
         finally:
             for name, value in saved.items():
-                object.__setattr__(self, name, value)
+                setattr(self, name, value)
 
 
-@dataclasses.dataclass
 class CaptureFlags(_FlagGroupBase):
     """Capture-time flags; never frozen (written during cuda-graph capture)."""
 
@@ -512,7 +519,6 @@ class CaptureFlags(_FlagGroupBase):
     disable_dispose_tensor: bool = False
 
 
-@dataclasses.dataclass
 class MoeFlags(_FlagGroupBase):
     """MoE runtime flags, materialized by ``initialize_moe_config`` (scheduler
     init, after distributed setup). ``a2a_backend`` / ``runner_backend`` /
@@ -552,7 +558,6 @@ class MoeFlags(_FlagGroupBase):
     speculative_context: bool = False
 
 
-@dataclasses.dataclass
 class DpFlags(_FlagGroupBase):
     """DP-attention runtime flags, materialized by ``initialize_dp_attention``
     (after distributed setup; reads the model config). Topology values
@@ -565,6 +570,10 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # Set while the prefill CUDA graph runner captures; latched by the DP
+    # gather/scatter helpers, whose captured geometry needs one shared bucket.
+    capturing_prefill_graph: bool = False
+    prefill_graph_has_dp_gather: bool = False
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
@@ -572,7 +581,6 @@ class DpFlags(_FlagGroupBase):
     buffer_device: Any = None
 
 
-@dataclasses.dataclass
 class SpFlags(_FlagGroupBase):
     """LayerNorm sequence-parallelism flags, materialized by
     ``initialize_layernorm_sp`` (after distributed setup; reads the model
@@ -581,7 +589,6 @@ class SpFlags(_FlagGroupBase):
     enabled: bool = False
 
 
-@dataclasses.dataclass
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
@@ -591,13 +598,12 @@ class Flags(_FlagGroupBase):
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp`` / ``sp``).
     """
 
-    capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
-    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
-    dp: DpFlags = dataclasses.field(default_factory=DpFlags)
-    sp: SpFlags = dataclasses.field(default_factory=SpFlags)
+    capture: CaptureFlags = msgspec.field(default_factory=CaptureFlags)
+    moe: MoeFlags = msgspec.field(default_factory=MoeFlags)
+    dp: DpFlags = msgspec.field(default_factory=DpFlags)
+    sp: SpFlags = msgspec.field(default_factory=SpFlags)
 
 
-@dataclasses.dataclass
 class Resources(_FlagGroupBase):
     """Process-level resource handles: named slots with one reset lifecycle,
     scoped test injection via ``override()``, and the creation/publish
@@ -607,21 +613,23 @@ class Resources(_FlagGroupBase):
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
+    graph_pool_borrow: GraphPoolBorrowState | None = None
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
     # LPLB: layer_id -> solver.
-    lplb_solvers: dict = dataclasses.field(default_factory=dict)
+    lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
-    streams: dict = dataclasses.field(default_factory=dict)
+    streams: dict = msgspec.field(default_factory=dict)
     # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
-    buffers: dict = dataclasses.field(default_factory=dict)
+    buffers: dict = msgspec.field(default_factory=dict)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
-    tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    tbo_event_pool: dict = msgspec.field(default_factory=dict)
+    flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
@@ -1278,7 +1286,7 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            declare_late_resolution,
+            declare_resolution,
         )
 
         server_args = ServerArgs(model_path="dummy")
@@ -1286,7 +1294,7 @@ class _ServerArgsOverride:
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__dataclass_fields__
+            type(server_args).__struct_fields__
         )
         if unknown:
             raise ValueError(
@@ -1299,15 +1307,15 @@ class _ServerArgsOverride:
         # real field, and seeding it as a raw attribute would leave the earlier
         # declaration authoritative, so `resolution_result` and the bag would
         # both keep answering the pre-override value.
-        fields = set(type(server_args).__dataclass_fields__)
+        fields = set(type(server_args).__struct_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
-            declare_late_resolution(server_args, "override_server_args", **declared)
+            declare_resolution(server_args, "override_server_args", **declared)
         # What is left seeds the record's own private caches (`_model_config`
         # and friends), which are not configuration and never were.
         seeds = {n: v for n, v in self._fields.items() if n not in fields}
         for name, value in seeds.items():
-            object.__setattr__(server_args, name, value)
+            msgspec.Struct.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1676,7 +1684,7 @@ def set_global_dwdp_manager(manager: Any) -> None:
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
     """The leaf values of a flag group, recursively."""
     leaves: dict[str, Any] = {}
-    for name in type(group).__dataclass_fields__:
+    for name in type(group).__struct_fields__:
         value = getattr(group, name)
         if isinstance(value, _FlagGroupBase):
             leaves[name] = _group_leaves(value)
@@ -1751,9 +1759,10 @@ def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
-    ``parallel`` holds the stamped derived widths, which go with the lifecycle
-    that stamped them: `_derived_width` prefers the stamp over the leaves, so
-    leaving one behind lets the next test read the previous topology.
+    ``parallel`` holds the permanently-overridden derived widths, which go
+    with the lifecycle that set them: `_derived_width` prefers them over the
+    published leaves, so leaving one behind lets the next test read the
+    previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
@@ -1785,13 +1794,13 @@ def max_prefill_buffer_tokens() -> int:
     """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
     chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
 
-    Every input is a published leaf (``schedule`` plus the configured PP size),
-    so this derives from the bags and follows a post-publish override;
+    The default derives from published leaves (``schedule`` plus the configured
+    PP size), so it follows post-publish overrides;
     ``overrides.max_prefill_buffer_tokens`` is the pre-publish equivalent and
-    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal. Records with
+    a registered ceiling provider (see ``register_prefill_buffer_ceiling``)
+    answer through it.
     """
-    import math
-
     schedule = get_schedule()
     chunked = (
         schedule.chunked_prefill_size
@@ -1803,7 +1812,7 @@ def max_prefill_buffer_tokens() -> int:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
         )
-    return tokens
+    return prefill_buffer_ceiling_of(get_server_args(), tokens)
 
 
 def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:

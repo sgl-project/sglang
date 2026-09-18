@@ -1271,6 +1271,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
@@ -1513,6 +1514,13 @@
                     ]
                   },
                   {
+                    "group": "SenseNova",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
+                    ]
+                  },
+                  {
                     "group": "LongCat-Image",
                     "tag": "NEW",
                     "pages": [
@@ -1661,7 +1669,8 @@
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables"
+                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/production_metrics"
                 ]
               },
               {

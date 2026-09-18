@@ -19,6 +19,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 from torch.nn.utils import parametrize
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
@@ -121,12 +124,15 @@ def load_model_state_dict(
 
 def get_param_names_mapping(
     mapping_dict: dict[str, str | tuple[str, int, int]],
+    valid_target_names: set[str] | None = None,
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
 
     Args:
         mapping_dict (Dict[str, str]): Dictionary mapping regex patterns to replacement patterns
+        valid_target_names: Keep a valid intermediate mapping when a later
+            alias does not exist in the constructed model.
 
     Returns:
         Callable[[str], str]: A function that maps parameter names from source to target format
@@ -140,6 +146,7 @@ def get_param_names_mapping(
         max_steps = max(8, len(mapping_dict) * 2)
         applied_patterns: set[str] = set()
         visited_names: set[str] = {name}
+        valid_mapping = None
 
         for _ in range(max_steps):
             transformed = False
@@ -166,6 +173,8 @@ def get_param_names_mapping(
 
                     name = new_name
                     applied_patterns.add(pattern)
+                    if valid_target_names is not None and name in valid_target_names:
+                        valid_mapping = (name, merge_index, total_split_params)
                     if name in visited_names:
                         transformed = False
                         break
@@ -176,6 +185,16 @@ def get_param_names_mapping(
             if not transformed:
                 break
 
+        # Prefer the complete mapping. If a later alias does not exist in this
+        # model (e.g. INT8 weight_scale -> FP8 weight_scale_inv), retain the
+        # last valid intermediate name, including any required QKV merge.
+        if (
+            name
+            and valid_mapping is not None
+            and valid_target_names is not None
+            and name not in valid_target_names
+        ):
+            return valid_mapping
         return name, merge_index, total_split_params
 
     return mapping_fn
@@ -674,6 +693,8 @@ def component_residency_bytes(module) -> Dict[str, int]:
     for tensor in module.parameters():
         add(tensor)
     for tensor in module.buffers():
+        add(tensor)
+    for tensor in (weight_snapshot(module) or {}).values():
         add(tensor)
     for manager in getattr(module, "layerwise_offload_managers", None) or []:
         iter_cpu_weights = getattr(manager, "iter_cpu_weights", None)

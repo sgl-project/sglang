@@ -93,6 +93,9 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
 
 - **AMD GPUs**: Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). EAGLE speculative decoding is not currently supported on AMD for GLM-5.
 - For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
+
+- **Prefill CP on CUDA**: Zigzag (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5. Use `--enable-prefill-cp --cp-strategy interleave` with `--dp 1`.
+
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
 
 ## 4. Model Invocation
