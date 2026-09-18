@@ -76,6 +76,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
+from sglang.srt.layers.cp.base import is_zigzag
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
@@ -4618,13 +4619,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_pp_group().world_size != 1
-                or not get_moe_a2a_backend().is_none()
-            ):
+            if get_pp_group().world_size != 1 or not get_moe_a2a_backend().is_none():
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision currently supports TP/EP/DP without PP or MoE A2A"
+                )
+            if get_parallel().attn_cp_size != 1 and (_is_npu or is_zigzag()):
+                raise ValueError(
+                    "V4.1 vision context parallelism requires the CUDA interleave "
+                    "strategy; NPU and zigzag CP are not supported yet"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4786,6 +4788,34 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
 
+    def prepare_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.vision is None:
+            return input_ids, input_embeds
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.mm_inputs is not None
+            and any(x is not None for x in forward_batch.mm_inputs)
+        ):
+            if input_embeds is not None:
+                raise ValueError("Cannot combine input_embeds and image inputs")
+            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+        if not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Decode/verify IDs are already vocabulary IDs; remap prompt image
+            # hashes for Engram and routing.
+            input_ids = input_ids.masked_fill(
+                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+            )
+        return input_ids, input_embeds
+
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
         if not self.pp_group.is_last_rank:
             return
@@ -4839,25 +4869,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if (
-            self.vision is not None
-            and not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
-        ):
-            if input_embeds is not None:
-                raise ValueError("Cannot combine input_embeds and image inputs")
-            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            # Decode/verify IDs are already vocabulary IDs; remap prompt image
-            # hashes for Engram and routing.
-            input_ids = input_ids.masked_fill(
-                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
-            )
+        input_ids, input_embeds = self.prepare_model_inputs(
+            input_ids=input_ids, forward_batch=forward_batch, input_embeds=input_embeds
+        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(

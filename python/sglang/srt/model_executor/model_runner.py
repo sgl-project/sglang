@@ -1653,6 +1653,7 @@ class ModelRunner:
             forward_batch.replace_embeds is not None
             and forward_batch.replace_positions is not None
         ):
+            misc_utils.validate_replace_embeds_batch(forward_batch)
             # Token embedding overrides: get base embeddings, scatter replacements
             if "input_embeds" not in kwargs:
                 embed_layer = self.model.get_input_embeddings()

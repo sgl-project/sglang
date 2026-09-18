@@ -28,7 +28,13 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+import sglang.srt.managers.scheduler as scheduler_module
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -295,6 +301,139 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.NO_TOKEN,
         )
         self.assertEqual(adder.can_run_list, [first])
+
+    def test_embed_override_and_multimodal_requests_never_share_a_batch(self):
+        def tagged(rid, *, multimodal=False, overrides=False):
+            req = self.create_shared_req(rid)
+            req.multimodal_inputs = object() if multimodal else None
+            req.positional_embed_overrides = object() if overrides else None
+            return req
+
+        for first, second in (
+            (tagged("image", multimodal=True), tagged("override", overrides=True)),
+            (tagged("override", overrides=True), tagged("image", multimodal=True)),
+        ):
+            with self.subTest(first=first.rid):
+                adder = self.create_shared_adder()
+                self.assertTrue(adder.can_share_extend_batch(first))
+                adder.add_one_req(
+                    first, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(adder.can_run_list, [first])
+                self.assertFalse(adder.can_share_extend_batch(second))
+                self.assertTrue(adder.can_share_extend_batch(tagged("text")))
+
+        adder = self.create_shared_adder()
+        chunked = tagged("chunked-image", multimodal=True)
+        chunked.full_untruncated_fill_ids = list(range(64))
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        self.assertFalse(
+            adder.can_share_extend_batch(tagged("override", overrides=True))
+        )
+
+    def create_admission_scheduler(self, *, chunked_req) -> Scheduler:
+        allocator = self.create_token_allocator(available_size=4096)
+        allocator.page_size = 1
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_fast_match_prefix.return_value = False
+        self.mock_tree_cache.storage_prefetch_retries = None
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        scheduler.enable_priority_preemption = False
+        scheduler.enable_priority_scheduling = False
+        scheduler.is_hybrid_swa = False
+        scheduler.min_free_slots_delayer = None
+        scheduler.get_num_allocatable_reqs = lambda *args, **kwargs: 64
+        scheduler.policy = SchedulePolicy(
+            policy="fcfs",
+            tree_cache=self.mock_tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        scheduler.processed_tokens_counter = 0
+        scheduler.chunked_prefill_size = 16
+        scheduler.dynamic_chunk_sizer = None
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=object(), prefill_aware_swa=False)
+        )
+        scheduler.page_size = 1
+        scheduler.tree_cache = self.mock_tree_cache
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.max_prefill_tokens = 16384
+        scheduler.is_mixed_chunk = False
+        scheduler.priority_scheduling_preemption_threshold = 0
+        scheduler.max_prefill_bs = 64
+        scheduler.max_running_requests = 64
+        scheduler.dllm_config = None
+        scheduler.enable_lora = False
+        scheduler.req_to_token_pool = SimpleNamespace()
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.truncation_align_size = None
+        scheduler.model_config = None
+        scheduler.enable_overlap = False
+        scheduler.spec_algorithm = None
+        scheduler.load_inquirer = MagicMock()
+        scheduler.chunked_req = chunked_req
+        scheduler.waiting_queue = []
+        return scheduler
+
+    def run_admission_pass(self, scheduler: Scheduler) -> list:
+        running_batch = self.create_running_batch()
+        running_batch.batch_is_full = False
+        with (
+            patch.object(scheduler_module, "ScheduleBatch") as schedule_batch,
+            patch.object(scheduler_module, "PrefillStats"),
+            patch.object(scheduler_module, "set_time_batch"),
+        ):
+            new_batch, _ = scheduler._get_new_batch_prefill_raw(None, running_batch)
+        if new_batch is None:
+            return []
+        admitted = list(schedule_batch.init_new.call_args.args[0])
+        for req in admitted:
+            req.prefix_indices = list(range(req.extend_range.end))
+        return admitted
+
+    def test_fcfs_admits_override_request_once_image_continuation_drains(self):
+        """An override request at the queue head must be admitted once the image
+        chunk ahead of it drains, even while more image requests keep arriving."""
+
+        def tagged(rid, length, *, multimodal=False, overrides=False):
+            req = self.create_shared_req(rid)
+            req.origin_input_ids = list(range(length))
+            req.full_untruncated_fill_ids = list(range(length))
+            req.multimodal_inputs = object() if multimodal else None
+            req.positional_embed_overrides = object() if overrides else None
+            req.beam_group = None
+            req.inflight_middle_chunks = 0
+            return req
+
+        continuation = tagged("image-continuation", 20, multimodal=True)
+        continuation.prefix_indices = list(range(16))
+        scheduler = self.create_admission_scheduler(chunked_req=continuation)
+        override = tagged("override", 4, overrides=True)
+        scheduler.waiting_queue = [override]
+
+        admitted_at = None
+        for pass_index in range(6):
+            scheduler.waiting_queue.append(
+                tagged(f"image-{pass_index}", 16, multimodal=True)
+            )
+            admitted = self.run_admission_pass(scheduler)
+            self.assertFalse(
+                any(r.multimodal_inputs is not None for r in admitted)
+                and any(r.positional_embed_overrides is not None for r in admitted)
+            )
+            if any(r is override for r in admitted):
+                admitted_at = pass_index
+                break
+        self.assertIsNotNone(admitted_at)
+        self.assertNotIn(override, scheduler.waiting_queue)
 
     def test_shared_admission_rechecks_after_prefix_lock(self):
         adder = self.create_shared_adder()

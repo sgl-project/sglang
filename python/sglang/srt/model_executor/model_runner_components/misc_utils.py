@@ -18,6 +18,7 @@ from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACK
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -90,3 +91,24 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+def validate_replace_embeds_batch(forward_batch: ForwardBatch) -> None:
+    if forward_batch.mm_inputs is None:
+        return
+    for mm_inputs, prefix_len, extend_len in zip(
+        forward_batch.mm_inputs,
+        forward_batch.extend_prefix_lens_cpu,
+        forward_batch.extend_seq_lens_cpu,
+    ):
+        if mm_inputs is None:
+            continue
+        chunk_end = prefix_len + extend_len
+        for item in mm_inputs.mm_items:
+            for start, end in item.offsets or ():
+                if start < chunk_end and end >= prefix_len:
+                    # Placeholder rows carry hash IDs the base embedding lookup cannot index.
+                    raise ValueError(
+                        "Token embedding overrides cannot share an extend batch with "
+                        "multimodal placeholders"
+                    )
