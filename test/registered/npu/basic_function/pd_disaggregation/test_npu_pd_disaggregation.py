@@ -69,6 +69,14 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp-size",
             "2",
+            # Prefill takes devices 0,2 and decode 1,3 so each prefill rank
+            # shares one Ascend910 package with its decode peer: CANN only
+            # supports IPC memory sharing within one package (same PCIe
+            # switch), and prefill imports the decode peer's pre-allocated
+            # KV buffers via IPC (cross-package IpcOpenMemory fails with
+            # 507899 on 2-package 4-NPU runners).
+            "--gpu-id-step",
+            "2",
             "--enable-hierarchical-cache",
             "--hicache-io-backend",
             "kernel_ascend",
@@ -176,7 +184,11 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             2,
             "--mem-fraction-static",
             "0.9",
+            # Odd devices (1,3), pairing each rank with the prefill rank on
+            # the same package -- see start_prefill for the topology note.
             "--base-gpu-id",
+            1,
+            "--gpu-id-step",
             2,
             "--disaggregation-decode-enable-offload-kvcache",
             "--hicache-io-backend",
