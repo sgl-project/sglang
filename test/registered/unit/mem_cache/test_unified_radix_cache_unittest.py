@@ -1012,6 +1012,82 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         )
         cache.sanity_check()
 
+    def test_buffer_backup_snapshot_preserves_raw_bigram_key_and_namespace(self):
+        """The raw N+1 bigram tokens, the bigram flag and the (extra_key,
+        cache_salt) namespace all feed the storage hash, so a snapshot that
+        drops any of them backs the node up under a key no prefetch will find.
+        The snapshot also owns its copy of the key: the backup runs detached
+        from the tree, so a caller mutating it must not reach a later one."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        expected_tokens = tuple(tokens)
+        key = RadixKey(tokens, extra_key="adapter-a", cache_salt="tenant-a")
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=key, value=value))
+        leaf_id = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+        snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.key.token_ids, tokens)
+        self.assertTrue(snapshot.key.is_bigram)
+        self.assertEqual(snapshot.key.extra_key, "adapter-a")
+        self.assertEqual(snapshot.key.cache_salt, "tenant-a")
+        self.assertEqual(snapshot.prefix_keys, [])
+
+        snapshot.key.token_ids[0] = -1
+        fresh_snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertEqual(tuple(fresh_snapshot.key.token_ids), expected_tokens)
+
+    def test_sanity_check_reads_buffer_backup_node_id_from_snapshot(self):
+        """A buffer-mode backup entry keeps its node id inside the detached
+        snapshot; sanity_check must read it from there. It used to read
+        ``entry.intent.node_id``, an attribute the intent no longer has, so the
+        idle check raised AttributeError whenever a backup was in flight."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import (
+            BufferModePipeline,
+            _UnifiedBackupIntent,
+            _UnifiedBufferBackupEntry,
+        )
+
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        leaf_id = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+        snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=False
+        )
+        self.assertIsNotNone(snapshot)
+
+        # The post-launch entry pins its node, as sanity_check requires of
+        # every in-flight backup.
+        lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline.ongoing_write_through = {
+            leaf_id: _UnifiedBufferBackupEntry(
+                intent=_UnifiedBackupIntent(snapshot=snapshot),
+                host_indices=torch.empty(0, dtype=torch.int64),
+                aux_xfers=[],
+                lock_params=lock_params,
+            )
+        }
+        cache.buffer_pipeline = pipeline
+        cache.sanity_check()
+
+        cache.buffer_pipeline = None
+        cache.dec_lock_ref(leaf_id, lock_params)
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
