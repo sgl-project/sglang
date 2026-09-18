@@ -256,6 +256,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self._backup_nodes_per_step = envs.SGLANG_HICACHE_BACKUP_NODES_PER_STEP.get()
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -383,6 +384,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        # Write-through backups accepted at insert time (each node locked so it
+        # stays device-resident) and executed by flush_pending_backups; the
+        # insertion order is the execution order, ancestors before children.
+        self.queued_backups: dict[NodeId, Optional[DecLockRefParams]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -1289,7 +1294,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
             else:
-                self._execute_and_commit_kv_backup(action)
+                self._queue_write_through_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1542,27 +1547,46 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         written = 0
         for node_id in action.node_ids:
-            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            # Overlapping chain actions may revisit nodes with Full KV already
-            # backed up. Skip only when no transfer remains.
-            if device_value.numel() == 0 and not comp_xfers:
-                continue
-            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
-            host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
-            )
-            if host_indices is None:
+            node_written = self._backup_node(node_id, write_back=write_back)
+            if node_written is None:
                 return 0
-            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
-            lock_params = None
-            if not write_back:
-                lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
-            self._track_write_through_node(
-                node_id, lock_params, publish_node_ids=publish_node_ids
-            )
-            written = len(host_indices)
+            written = node_written or written
         return written
+
+    def _backup_node(
+        self,
+        node_id: NodeId,
+        *,
+        write_back: bool = False,
+        lock_params: Optional[DecLockRefParams] = None,
+    ) -> Optional[int]:
+        """Back one node up D->H and track the ack. Returns the tokens written
+        (0 when nothing was left to transfer), or None when the host allocation
+        failed. A write-through lock is taken here unless the caller already
+        holds one and passes its receipt."""
+        device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+        # Overlapping chain actions may revisit nodes with Full KV already
+        # backed up. Skip only when no transfer remains.
+        if device_value.numel() == 0 and not comp_xfers:
+            if lock_params is not None:
+                self.dec_lock_ref(node_id, lock_params)
+            return 0
+        sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+        host_indices = self._execute_kv_backup(
+            node_id, device_value, comp_xfers, sidecar_xfers
+        )
+        if host_indices is None:
+            if lock_params is not None:
+                self.dec_lock_ref(node_id, lock_params)
+            return None
+        self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+        if not write_back and lock_params is None:
+            lock_params = self.inc_lock_ref(node_id).to_dec_params()
+        publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+        self._track_write_through_node(
+            node_id, lock_params, publish_node_ids=publish_node_ids
+        )
+        return len(host_indices)
 
     @staticmethod
     def _backup_publish_node_ids(
@@ -3138,6 +3162,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
+            self._drain_queued_backups(0)
             cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
@@ -3352,10 +3377,34 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
-        """Submit pending D2H backups as a merged operation."""
+        """Execute queued write-through backups (up to the per-step cap) and
+        submit them, with anything else queued, as one merged D2H operation."""
         if self.linker is not None or self.cache_controller is None:
             return
+        if self.queued_backups:
+            self._drain_queued_backups(self._backup_nodes_per_step)
         self.cache_controller.start_writing()
+
+    def _queue_write_through_backup(self, action: BackupKV) -> None:
+        """With a per-step cap, lock the action's nodes now and leave the host
+        alloc, transfer build and submit to flush_pending_backups, off the
+        request-finish path; without one, back them up right here."""
+        if self.buffer_pipeline is not None or self._backup_nodes_per_step == 0:
+            self._execute_and_commit_kv_backup(action)
+            return
+        for node_id in action.node_ids:
+            if node_id in self.queued_backups or node_id in self.ongoing_write_through:
+                continue
+            self.queued_backups[node_id] = self.inc_lock_ref(node_id).to_dec_params()
+
+    def _drain_queued_backups(self, limit: int) -> None:
+        """Execute queued backups oldest first; limit 0 runs the whole queue."""
+        remaining = limit if limit > 0 else len(self.queued_backups)
+        while self.queued_backups and remaining > 0:
+            node_id = next(iter(self.queued_backups))
+            lock_params = self.queued_backups.pop(node_id)
+            self._backup_node(node_id, lock_params=lock_params)
+            remaining -= 1
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

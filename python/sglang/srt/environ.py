@@ -755,6 +755,11 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Write-through backups are queued at insert time and executed by
+    # flush_pending_backups; this caps how many queued nodes one step executes,
+    # so a request-finish wave's per-node backup bookkeeping spreads over the
+    # following steps instead of landing in one GPU bubble. 0 = no cap.
+    SGLANG_HICACHE_BACKUP_NODES_PER_STEP = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
