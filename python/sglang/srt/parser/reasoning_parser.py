@@ -1479,6 +1479,15 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         )
 
 
+class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
+    """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
+    so the unspaced V4 tool-start anchor never interrupts its reasoning."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
+
+
 class _MimoDetector(Qwen3Detector):
     """MIMO reuses Qwen3 tokens but requires explicit enable_thinking=True to enable."""
 
@@ -2187,6 +2196,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV41ReasoningDetector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,

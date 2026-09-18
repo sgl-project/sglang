@@ -163,6 +163,24 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
 
+    if cfg.radix_eviction_policy == "tlru":
+        tlru_config = cfg.radix_eviction_policy_config or {}
+        threshold = tlru_config.get("threshold", 0)
+        next_prompt_estimate = tlru_config.get("next_prompt_estimate", 0)
+        if threshold < 0 or next_prompt_estimate < 0:
+            raise ValueError(
+                "--radix-eviction-policy tlru requires non-negative 'threshold' and "
+                "'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} and {next_prompt_estimate}."
+            )
+        if threshold <= next_prompt_estimate:
+            raise ValueError(
+                "--radix-eviction-policy tlru needs 'threshold' greater than "
+                f"'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
+                "ever TEL-safe and T-LRU is exactly LRU."
+            )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -185,6 +203,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg._swa_full_tokens_ratio_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
@@ -192,6 +217,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # claimed the field, and the value to range-check is the effective one.
     if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    prefix_tails = resolved_view(server_args).swa_prefix_tails
+    if prefix_tails is not None and prefix_tails < 0:
+        raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:

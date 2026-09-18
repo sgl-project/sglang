@@ -70,34 +70,43 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: DeepSeek V3.2 format specification
     """
 
+    # Tag names after the DSML marker; subclasses override for newer formats.
+    dsml_token = "｜DSML｜"
+    tool_calls_block_name = "function_calls"
+    invoke_tag_name = "invoke"
+    parameter_tag_name = "parameter"
+
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜DSML｜function_calls>"
-        self.eot_token = "</｜DSML｜function_calls>"
-        self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
-        self.function_calls_regex = (
-            r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
+        block = f"{self.dsml_token}{self.tool_calls_block_name}"
+        invoke = f"{self.dsml_token}{self.invoke_tag_name}"
+        parameter = f"{self.dsml_token}{self.parameter_tag_name}"
+        self.bot_token = f"<{block}>"
+        self.eot_token = f"</{block}>"
+        self.invoke_start_token = f"<{invoke}"
+        self.invoke_end_token = f"</{invoke}>"
+        self.parameter_regex = (
+            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
         )
+        self.function_calls_regex = rf"<{block}>(.*?)</{block}>"
         # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
         # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
         # tools. The `end` group is empty when the closer hasn't streamed in.
         self.invoke_regex = (
-            r'<｜DSML｜invoke\s+name="(?P<name>[^"]+)"\s*'
+            rf'<{invoke}\s+name="(?P<name>[^"]+)"\s*'
             r"(?:(?P<self_close>/>)"
-            r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
+            rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text or "<｜DSML｜invoke" in text
+        return self.bot_token in text or self.invoke_start_token in text
 
-    @staticmethod
-    def _text_before_dsml(text: str) -> str:
+    def _text_before_dsml(self, text: str) -> str:
         """Prose preceding the first DSML tag, with the trailing blank line the
         chat template inserts before a tool call removed."""
-        idx = text.find("｜DSML｜")
+        idx = text.find(self.dsml_token)
         if idx == -1:
             return text
         if idx >= 2 and text[idx - 2 : idx] == "</":
@@ -171,7 +180,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         leftover.append(invoke_content[last_match_end:])
 
         leftover_text = "".join(leftover)
-        if "｜DSML｜" in leftover_text or (not param_matches and leftover_text.strip()):
+        if self.dsml_token in leftover_text or (
+            not param_matches and leftover_text.strip()
+        ):
             raise ValueError("Malformed DeepSeek tool parameter")
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -233,11 +244,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
+        bar = self.dsml_token[0]
+        dsml_markers = [self.dsml_token, f"<{bar}", f"</{bar}"]
         potentially_dsml = any(marker in current_text for marker in dsml_markers)
 
         # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
+        dsml_prefixes = ["<", f"<{bar}", "</", f"</{bar}"]
         ends_with_prefix = any(
             current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
         )
@@ -355,9 +367,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger="<｜DSML｜invoke",
+            begin=f'{self.invoke_start_token} name="{name}">',
+            end=self.invoke_end_token,
+            trigger=self.invoke_start_token,
         )
 
     def get_structural_tag_name(self) -> str:
