@@ -321,9 +321,6 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
-            # `_qsa_write_plan`'s capacity is a worst-case bound and can
-            # reserve more groups than this chunk has members for; clamp so
-            # the padding groups don't gather past `token_k` (#38346).
             group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
