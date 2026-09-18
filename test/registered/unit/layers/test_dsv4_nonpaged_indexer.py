@@ -134,6 +134,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             destination.compressed_seq_lens, source.compressed_seq_lens
         )
 
+
 class TestDSV4FlashInferTopK(CustomTestCase):
     def test_compact_page_transform_respects_fuse_topk(self):
         score_storage = torch.arange(160, dtype=torch.float32).reshape(2, 80)
