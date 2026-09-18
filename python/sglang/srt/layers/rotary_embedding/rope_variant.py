@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.utils import (
     rotate_neox,
 )
 from sglang.srt.layers.rotary_embedding.yarn import (
-    _compute_yarn_cache_extension,
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale,
     yarn_linear_ramp_mask,
@@ -421,19 +421,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         return cache
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
-        if needed_max_pos < self.cos_sin_cache.shape[0]:
-            return
-        rows = _compute_yarn_cache_extension(
-            self.cos_sin_cache,
-            self._compute_inv_freq(self.scaling_factor),
-            self.mscale,
-            needed_max_pos,
-        )
-        self.cos_sin_cache = torch.cat(
-            (self.cos_sin_cache, rows.to(self.cos_sin_cache.dtype)), dim=0
+        self.cos_sin_cache, rows = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
         )
         # NPU also consumes full-width cos/sin tables, built before dtype casting.
-        if self.cos_cached_total is not None:
+        if rows is not None and self.cos_cached_total is not None:
             cos, sin = rows.chunk(2, dim=-1)
             self.cos_cached_total = torch.cat(
                 (self.cos_cached_total, cos.repeat(1, 2).to(self.cos_cached_total)),

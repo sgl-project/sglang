@@ -257,6 +257,16 @@ class TestYaRNCacheExtension(CustomTestCase):
                 self.assertEqual(actual.dtype, torch.float32)
                 self.assertTrue(torch.equal(actual[: len(old)], old))
                 torch.testing.assert_close(actual, want, rtol=0, atol=2e-7)
+            # Repeating an in-range request must leave all three tables intact.
+            cache, cos, sin = (
+                rope.cos_sin_cache,
+                rope.cos_cached_total,
+                rope.sin_cached_total,
+            )
+            rope._ensure_cos_sin_cache_length(needed)
+            self.assertIs(rope.cos_sin_cache, cache)
+            self.assertIs(rope.cos_cached_total, cos)
+            self.assertIs(rope.sin_cached_total, sin)
 
     def test_default_rope(self):
         rope = RotaryEmbedding(64, 64, 4096, 10000, True, torch.float32)

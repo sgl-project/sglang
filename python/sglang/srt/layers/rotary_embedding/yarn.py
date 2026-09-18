@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -63,21 +63,29 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def _compute_yarn_cache_extension(
+def _extend_yarn_cache(
     cache: torch.Tensor,
-    inv_freq: torch.Tensor,
+    compute_inv_freq: Callable[[], torch.Tensor],
     mscale: float,
     needed_max_pos: int,
-) -> torch.Tensor:
-    """Continue a YaRN cache with its original frequencies and amplitude."""
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return the extended cache and uncast rows for auxiliary tables.
+
+    A no-op returns the original cache and None without computing frequencies.
+    The caller supplies YaRN frequencies using its scaling factor and unchanged
+    correction-range bound, rather than the base extension's theta argument.
+    """
+    if needed_max_pos < cache.shape[0]:
+        return cache, None
     align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
     new_len = ((needed_max_pos + align) // align) * align
-    inv_freq = inv_freq.to(cache.device)
+    inv_freq = compute_inv_freq().to(cache.device)
     positions = torch.arange(
         cache.shape[0], new_len, dtype=inv_freq.dtype, device=cache.device
     )
     freqs = torch.einsum("i,j->ij", positions, inv_freq)
-    return torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
+    rows = torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
+    return torch.cat((cache, rows.to(cache.dtype)), dim=0), rows
 
 
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
@@ -153,18 +161,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         return inv_freq
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
-        if needed_max_pos < self.cos_sin_cache.shape[0]:
-            return
-        # YaRN takes a scaling factor, whereas the base extension passes theta.
-        # Keep max_position_embeddings unchanged: it defines the correction ramp.
-        rows = _compute_yarn_cache_extension(
-            self.cos_sin_cache,
-            self._compute_inv_freq(self.scaling_factor),
-            self.mscale,
-            needed_max_pos,
-        )
-        self.cos_sin_cache = torch.cat(
-            (self.cos_sin_cache, rows.to(self.cos_sin_cache.dtype)), dim=0
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
