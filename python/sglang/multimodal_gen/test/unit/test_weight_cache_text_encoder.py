@@ -4,6 +4,7 @@
 import copy
 import json
 import pickle
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -136,6 +137,54 @@ def test_encoder_metadata_list_is_frozen(h3_both):
     assert component.consumed_files() == files
     with pytest.raises(FileNotFoundError):
         identity.checkpoint_identity(prepared, h3_both)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_meta_encoder_uses_ordinary_attention_fallback_policy(h3_both, explicit):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.layers.attention import selector
+    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    from sglang.multimodal_gen.test.unit.test_text_encoder_load_recipe import (
+        TinyEncoder,
+    )
+
+    if explicit:
+        h3_both = variant(h3_both, component_attention_backends={"text_encoder": "fa"})
+    component = prepare_pipeline(MiniMaxH3Pipeline, h3_both, required=True).component(
+        "text_encoder"
+    )
+
+    def construct(*args, **kwargs):
+        context = selector.get_component_attn_backend_context()
+        assert context.allow_global_backend_fallback
+        assert context.require_backend_selection is explicit
+        # H3 language layers select FA, while the head_size=72 vision tower
+        # selects SDPA. Only a component-specific override requires strict FA.
+        selector._record_component_attn_backend("fa", None)
+        selector._record_component_attn_backend("torch_sdpa", None)
+        with torch.device("meta"):
+            return TinyEncoder(SimpleNamespace(width=3))
+
+    with (
+        patch.object(text_encoder_loader, "get_folding_tp_group", return_value=None),
+        patch.object(
+            text_encoder_loader, "use_tensor_parallel_group", return_value=nullcontext()
+        ),
+        patch.object(text_encoder_loader, "initialize_model", side_effect=construct),
+    ):
+        if explicit:
+            with pytest.raises(
+                selector.ComponentAttentionBackendNotAppliedError, match="torch_sdpa"
+            ):
+                component.loader().build_prepared_meta(
+                    component.recipe, attention_backend=AttentionBackendEnum.FA
+                )
+        else:
+            model = component.loader().build_prepared_meta(
+                component.recipe, attention_backend=AttentionBackendEnum.FA
+            )
+            assert model.weight.is_meta and not model.training
 
 
 @pytest.mark.parametrize(

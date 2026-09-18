@@ -545,9 +545,6 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             )
 
     def build_prepared_meta(self, frozen, *, attention_backend):
-        from sglang.multimodal_gen.runtime.layers.attention.selector import (
-            component_attn_backend_context_manager,
-        )
         from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
             isolated_qwen_vl_rope_cache,
         )
@@ -557,8 +554,15 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         with (
             use_tensor_parallel_group(group),
             isolated_qwen_vl_rope_cache(),
-            component_attn_backend_context_manager(
-                attention_backend, component_name=recipe.component_name
+            self.component_attention_backend_context(
+                attention_backend,
+                recipe.component_name,
+                require_backend_selection=(
+                    recipe.server_args.requested_component_attention_backend(
+                        recipe.component_name
+                    )
+                    is not None
+                ),
             ),
         ):
             model = initialize_model(
