@@ -244,16 +244,13 @@ weights. Keep checkpoint access credentials in your environment.
 
 ### Two-GPU end-to-end test
 
-The standard two-GPU suite includes `qwen_image21_t2i_tp2`: TP 2 with sequence
+The `qwen_image21_t2i_tp2` case is temporarily disabled until the checkpoint is
+accessible to fork PR CI. Its configuration and pinned reference image are
+retained for re-enabling the test.
+
+The case uses TP 2 with sequence
 parallelism disabled, 1024 × 1024 PNG output, 40 steps, CFG 1, and seed 42.
 It sends two consecutive requests and checks the model API and image consistency.
-Run it on a Linux CUDA host with two GPUs and checkpoint access:
-
-```bash Command
-pytest -s python/sglang/multimodal_gen/test/server/test_server_2_gpu.py \
-  -k qwen_image21_t2i_tp2
-```
-
 This case does not enforce a latency baseline or run a component accuracy check.
 
 ### Transparent PNG output
