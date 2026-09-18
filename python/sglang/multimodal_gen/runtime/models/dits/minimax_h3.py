@@ -15,6 +15,9 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import torch
+from torch import nn
+from torch.distributed.tensor import DTensor
+
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
@@ -74,10 +77,12 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     MiniMaxH3AdalnCache,
-    native_adaln_weight_files,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     _plan_key as _adaln_plan_key,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    native_adaln_weight_files,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
@@ -91,8 +96,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
-from torch import nn
-from torch.distributed.tensor import DTensor
 
 logger = init_logger(__name__)
 
