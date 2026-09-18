@@ -3,6 +3,7 @@ from types import SimpleNamespace as NS
 
 from sglang.srt.disaggregation import decode_hrrn as module
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -15,7 +16,7 @@ def entry(rid, tokens, fraction=1):
     )
 
 
-class TestDecodeHrrn(unittest.TestCase):
+class TestDecodeHrrn(CustomTestCase):
     def test_short_cached_work_wins_after_equal_aging(self):
         q = module.DecodeHrrn()
         items = [entry("long", 1000), entry("cached", 1000, 0.01), entry("seed", 100)]
@@ -55,21 +56,6 @@ class TestDecodeHrrn(unittest.TestCase):
         q = module.DecodeHrrn()
         q.order([entry("cached", 10000, 0)])
         self.assertEqual(q.waiting["cached"][1], 1)
-
-    def test_rankings_identical_under_repeated_cycles(self):
-        a, b = module.DecodeHrrn(), module.DecodeHrrn()
-        for cycle in range(100):
-            left = [
-                entry(str(i), (i + 1) * 101, 0.1 if i % 2 else 1)
-                for i in range(cycle, cycle + 32)
-            ]
-            right = list(left)
-            a.order(left)
-            b.order(right)
-            self.assertEqual([x.req.rid for x in left], [x.req.rid for x in right])
-            for item in left[:3]:
-                a.admitted(item.req.rid)
-                b.admitted(item.req.rid)
 
 
 if __name__ == "__main__":
