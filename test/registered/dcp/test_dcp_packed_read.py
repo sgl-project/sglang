@@ -27,6 +27,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.dcp.layout import (
+    dcp_packed_causal_crop_is_dead,
     packed_row_of,
     plan_dcp_packed_read,
     remap_topk_to_packed,
@@ -126,6 +127,27 @@ class TestDcpPackedRead(CustomTestCase):
         self.assertEqual(out[1, 1].item(), plan.gathered_rows)
         self.assertEqual(out.shape, topk.shape)
         self.assertEqual(out.dtype, topk.dtype)
+
+    def test_the_causal_crop_gate(self):
+        """The packed read needs sparse_mode 0, which needs a causal top-k.
+
+        Measured on the box 2026-09-19: dropping the crop when the prefix is
+        short moved prefill logprobs by up to 2.09 against a 0.354 noise floor.
+        Below index_topk the top-k selects every key it is offered
+        (dsa_indexer.py:402), so it is not causal and the crop is what makes the
+        result so. The boundary case is the one worth pinning: the chunk's FIRST
+        query sees prefix_len keys before it plus itself.
+        """
+        topk = 2048
+        self.assertFalse(dcp_packed_causal_crop_is_dead(0, topk))
+        self.assertFalse(dcp_packed_causal_crop_is_dead(topk - 2, topk))
+        self.assertTrue(dcp_packed_causal_crop_is_dead(topk - 1, topk))
+        self.assertTrue(dcp_packed_causal_crop_is_dead(topk, topk))
+        # The shape this exists for: a 16k tail on a ~958k cached prefix.
+        self.assertTrue(dcp_packed_causal_crop_is_dead(958464, topk))
+        # And the second chunk of a two-chunk cold prefill at 16k chunks, which
+        # is what p12's 30k prompt exercises.
+        self.assertTrue(dcp_packed_causal_crop_is_dead(16384, topk))
 
     def test_remap_keeps_shape_and_dtype_for_int32(self):
         plan = plan_dcp_packed_read(4096, 64, 8)

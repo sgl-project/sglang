@@ -532,8 +532,15 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
-        packed_plan = dcp_packed_read_plan(forward_batch)
-        if packed_plan is not None and topk_indices is not None:
+        # index_topk from the tensor rather than from m.indexer: this is the
+        # width the operator will actually be handed, and the gate is a claim
+        # about that width.
+        packed_plan = (
+            dcp_packed_read_plan(forward_batch, topk_indices.shape[-1])
+            if topk_indices is not None
+            else None
+        )
+        if packed_plan is not None:
             # Remapped HERE, where the indexer produces it, and not at the
             # operator. Only 21 of 78 layers run the indexer; the other 57 reuse
             # what it returned, so this runs 21 times a forward instead of 78.
@@ -957,7 +964,7 @@ def _dcp_gather_extend_kv_npu(
     """
     parallel = get_parallel()
     md = forward_batch.attn_dcp_metadata
-    packed_plan = dcp_packed_read_plan(forward_batch)
+    packed_plan = dcp_packed_read_plan(forward_batch, m.indexer.index_topk)
     if packed_plan is not None:
         return _dcp_gather_extend_kv_packed_npu(
             m, forward_batch, k_nope, k_pe, packed_plan

@@ -1409,7 +1409,9 @@ class AscendAttnBackend(AttentionBackend):
                 key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
-                packed_plan = dcp_packed_read_plan(forward_batch)
+                packed_plan = dcp_packed_read_plan(
+                    forward_batch, topk_indices.shape[-1]
+                )
                 if packed_plan is not None:
                     # C1. The buffer is the all-gather's own rank-major output,
                     # so a row's index no longer says anything about its

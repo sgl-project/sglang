@@ -560,7 +560,42 @@ def dcp_packed_read_enabled() -> bool:
     return _enable_dcp_packed_read
 
 
-def dcp_packed_read_plan(forward_batch) -> Optional[DcpPackedReadPlan]:
+def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
+    """Whether the operator's causal crop can be dropped for this chunk.
+
+    THE PACKED READ NEEDS ``sparse_mode = 0``: the crop aligns query i to key
+    ``K - Q + i``, which means nothing once the keys are in rank-major order.
+    The first version of this claimed the top-k is causal by construction, so
+    the crop was redundant. That is false, and a stage-A run measured it --
+    scattered logprob differences up to 2.09 against a 0.354 noise floor,
+    starting at position 2 and confined to a region about ``index_topk`` wide.
+
+    The top-k is causal only where there is something to select FROM. Upstream
+    says it plainly at dsa_indexer.py:402 -- "topk_transform selects every valid
+    page slot when kv_len <= index_topk". At or below that length the top-k is
+    not a selection, it is everything, and the crop is the only thing making the
+    result causal. The NPU indexer itself leans on this: it calls
+    npu_lightning_indexer with sparse_mode=3 (dsa_npu_indexer.py:527), so the
+    indices it hands back are not pre-masked.
+
+    Above it, every query in the chunk has at least ``index_topk`` keys strictly
+    before it, the scores of later keys are -inf, and a top-k of that can only
+    name causal keys. Then, and only then, the crop is dead weight and dropping
+    it changes nothing.
+
+    The bound is on the FIRST query in the chunk, which is the one with the
+    least context: it sees ``prefix_len`` keys before it plus itself. Every
+    later query in the chunk sees more.
+
+    This is also exactly where the packed read pays: it exists for a 16-32k tail
+    on a ~958k cached prefix, where ``prefix_len`` clears 2048 by five hundred
+    times. At ``prefix_len = 0`` it saves nothing anyway -- there is no gathered
+    prefix to permute, and the remap is the identity.
+    """
+    return prefix_len + 1 >= index_topk
+
+
+def dcp_packed_read_plan(forward_batch, index_topk: int) -> Optional[DcpPackedReadPlan]:
     """This forward's packed-buffer plan, or None to keep the permuting path.
 
     Resolved once per forward and cached on the batch. It lives here, beside the
@@ -595,6 +630,16 @@ def dcp_packed_read_plan(forward_batch) -> Optional[DcpPackedReadPlan]:
             f"DCP packed read is off for multi-request extends "
             f"({len(extend_lens)} requests here); the all-gather is rank-major "
             "over the whole send, so no request is contiguous in it"
+        )
+    elif not dcp_packed_causal_crop_is_dead(prefix_lens[0], index_topk):
+        # Measured, stage A, 2026-09-19: dropping the crop below this bound
+        # moved prefill logprobs by up to 2.09 against a 0.354 noise floor.
+        # See dcp_packed_causal_crop_is_dead for why the bound is what it is.
+        print_info_once(
+            f"DCP packed read is off for chunks with a prefix under "
+            f"index_topk={index_topk} (this one has {prefix_lens[0]}); the "
+            "top-k selects every key it is offered there, so the operator's "
+            "causal crop is load-bearing and cannot be dropped"
         )
     else:
         plan = plan_dcp_packed_read(
