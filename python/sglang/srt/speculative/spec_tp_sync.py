@@ -44,7 +44,9 @@ class SpecTpSyncSite(IntEnum):
 
 _ALL = frozenset(SpecTpSyncSite)
 _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
-# Sites that draw from the RNG, so they can differ under identical logits.
+# Sites that draw from the RNG, so they can differ under identical logits. The
+# accept sites also consume top-p / top-k renorm output, which differs under
+# identical logits as well unless SGLANG_RENORM_DETERMINISTIC is set.
 _RNG = frozenset(
     {
         SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,

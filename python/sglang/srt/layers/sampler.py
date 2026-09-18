@@ -656,8 +656,10 @@ class Sampler(nn.Module):
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
-            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
+            # Not all of them are: the top-p / top-k renorm kernels pool with float atomics
+            # (SGLANG_RENORM_DETERMINISTIC=1 swaps in bit-identical ones), and the all-reduce order
+            # is only pinned under --enable-deterministic-inference. Enable this env variable to
+            # prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
             torch.distributed.all_reduce(
