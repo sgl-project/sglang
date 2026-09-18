@@ -96,7 +96,7 @@ async fn publish_health(reporter: &mut HealthReporter, healthy: bool) {
     } else {
         ServingStatus::NotServing
     };
-    for service in ["", "inference"] {
+    for service in ["", "sglang.runtime.v1.SglangService"] {
         reporter.set_service_status(service, status).await;
     }
 }

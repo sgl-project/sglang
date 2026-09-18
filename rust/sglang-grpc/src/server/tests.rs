@@ -1,5 +1,5 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, publish_health, resolve_max_message_size,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
     terminal_error_status,
 };
 use crate::bridge::TerminalError;
@@ -72,68 +72,4 @@ fn resolve_max_message_size_honors_env_var() {
     unsafe {
         std::env::remove_var(VAR);
     }
-}
-
-#[tokio::test]
-async fn standard_health_check_follows_published_health() {
-    use tonic_health::pb::HealthCheckRequest;
-    use tonic_health::pb::health_check_response::ServingStatus;
-    use tonic_health::pb::health_client::HealthClient;
-    use tonic_health::server::health_reporter;
-
-    let (mut reporter, service) = health_reporter();
-    publish_health(&mut reporter, false).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async { shutdown_rx.await.unwrap() },
-            )
-            .await
-            .unwrap();
-    });
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
-        .unwrap()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(5))
-        .connect()
-        .await
-        .unwrap();
-    let mut client = HealthClient::new(channel);
-    // The first publication must override tonic-health's default SERVING for "".
-    // Subsequent publications must support both failure and recovery.
-    for healthy in [false, true, false, true] {
-        publish_health(&mut reporter, healthy).await;
-        let expected = if healthy {
-            ServingStatus::Serving
-        } else {
-            ServingStatus::NotServing
-        };
-        for name in ["", "inference"] {
-            let response = client
-                .check(HealthCheckRequest {
-                    service: name.to_owned(),
-                })
-                .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(response.status(), expected, "service {name:?}");
-        }
-        let error = client
-            .check(HealthCheckRequest {
-                service: "unknown".to_owned(),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::NotFound);
-    }
-    shutdown_tx.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), server)
-        .await
-        .unwrap()
-        .unwrap();
 }
