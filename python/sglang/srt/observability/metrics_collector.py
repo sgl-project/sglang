@@ -2258,6 +2258,15 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
+        self.mamba_cache_skip_total = Counter(
+            name="sglang:mamba_cache_skip_total",
+            documentation="Total number of times a mamba cache donation/slot "
+            "allocation was gracefully skipped because the pool was exhausted "
+            "and eviction could not reclaim a slot (pool: bf16|int8). The "
+            "request continues but the prefix is not cached for that turn.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -2286,6 +2295,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def increment_mamba_cache_skip(self, pool: str) -> None:
+        self.mamba_cache_skip_total.labels(**self.labels, pool=pool).inc()
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
