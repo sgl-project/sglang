@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -99,7 +100,12 @@ def _allocate_decode_buffers(
         out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
         positions = torch.zeros((max_num_token,), dtype=torch.int64)
         mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        # Refreshed at replay only under expert parallelism.
+        num_token_non_padded = (
+            torch.zeros((1,), dtype=torch.int32)
+            if enable_num_token_non_padded()
+            else None
+        )
         custom_mask = torch.ones(
             (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
             dtype=torch.bool,
@@ -125,12 +131,17 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Sized in tokens, not requests: under speculative decoding the
+            # verify forward carries num_tokens_per_req tokens per request and
+            # _dummy_run slices these buffers to num_tokens (same as
+            # topk_indices below). Identical for plain decode where
+            # num_tokens_per_req == 1.
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                # [T, blocks, H]. Other models use [T, H].
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
@@ -481,7 +492,8 @@ class BaseRunner(ABC):
         positions = buffers.positions[:num_tokens]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        buffers.num_token_non_padded[...] = num_tokens
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
 
         # Batch-axis buffer views.
         req_pool_indices = buffers.req_pool_indices[:batch_size]

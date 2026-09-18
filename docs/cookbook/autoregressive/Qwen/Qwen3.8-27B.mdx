@@ -286,7 +286,7 @@ row back to Auto.
   candidates through the target `lm_head`,
   including quantized heads, so it runs on the NVFP4 checkpoint (whose head
   is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
-  The Ascend comparison in #35629 used a 910C with BF16 target weights,
+  The Ascend comparison in #35629 used an A3 Series device with BF16 target weights,
   `--tp-size 2 --attention-backend ascend --mamba-ssm-dtype bfloat16
   --mamba-radix-cache-strategy extra_buffer`, and disabled RadixCache for both
   baseline and DFlash2 to exclude cache warm-up and prefix reuse. The DFlash2

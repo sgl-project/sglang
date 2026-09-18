@@ -235,6 +235,12 @@ pub struct SamplingParams {
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
     #[serde(skip_deserializing)]
     pub is_normalized: bool,
+    /// Set by the OpenAI serving layer for generated full-assistant EBNF
+    /// constraints, which already cover reasoning; the scheduler skips the
+    /// reasoner grammar wrapper for them. Client-settable would let a request
+    /// strip that wrapper from its own grammar, so it is a pipeline output only.
+    #[serde(skip_deserializing)]
+    pub ebnf_full_assistant: bool,
     /// API fields present in the request object. Serde defaults erase this
     /// distinction, but preferred sampling parameters must not overwrite an
     /// explicit request value, including an explicit default or null.
@@ -380,6 +386,7 @@ impl Default for SamplingParams {
             stop_str_max_len: 0,
             stop_regex_max_len: 0,
             is_normalized: false,
+            ebnf_full_assistant: false,
             explicit_fields: BTreeSet::new(),
         }
     }
@@ -831,6 +838,7 @@ mod tests {
         "stop_str_max_len",
         "stop_regex_max_len",
         "is_normalized",
+        "ebnf_full_assistant",
     ];
 
     /// Every field reaches the wire, at the position Python expects.
@@ -907,6 +915,7 @@ mod tests {
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
+        assert_eq!(arr[at("ebnf_full_assistant")].as_bool(), Some(false));
     }
 
     #[test]
