@@ -133,6 +133,7 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     max_attempts = 3
     output_token_throughput = 2825
+    accept_rate = 0.5
 
     @classmethod
     def setUpClass(cls):
