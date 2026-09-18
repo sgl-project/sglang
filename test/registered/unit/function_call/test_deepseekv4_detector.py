@@ -123,6 +123,95 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(first.calls, [])
 
 
+class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
+    """Non-streaming turns must never return DSML markup as content.
+
+    When a generation carries tool markup the detector cannot convert, the
+    response comes back with no `tool_calls` and `finish_reason: "stop"`.
+    An OpenAI-compatible client reads that as "the model is done", ends the
+    turn, and the requested calls are dropped with no error anywhere.
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="record_note",
+                    description="Record a note",
+                    parameters={
+                        "type": "object",
+                        "properties": {"targets": {"type": "array"}},
+                    },
+                ),
+            ),
+        ]
+
+    def _parse(self, text):
+        return DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+    def test_invoke_without_tool_calls_section(self):
+        """A bare invoke block with no section wrapper is still a tool call."""
+        result = self._parse(
+            "Let me check.\n\n" + _invoke("get_weather", _param("city", "true", "SF"))
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_unterminated_tool_calls_section(self):
+        """An opened-but-unclosed section must not swallow its calls."""
+        result = self._parse(
+            f"<{DSML}tool_calls>\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_malformed_invoke_keeps_sibling_calls(self):
+        """One unparsable invoke must not discard the calls next to it."""
+        malformed = (
+            f'<{DSML}invoke name="record_note">\n{{"targets": ["a",}}\n</{DSML}invoke>'
+        )
+        result = self._parse(
+            _wrapped(
+                malformed + "\n" + _invoke("get_weather", _param("city", "true", "SF"))
+            )
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_unknown_tool_markup_is_not_returned_as_content(self):
+        """An unmatched tool name yields no call, but also no raw markup."""
+        result = self._parse(
+            _wrapped(_invoke("no_such_tool", _param("city", "true", "SF")))
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_prose_is_preserved_alongside_tool_call(self):
+        """Stripping markup must not eat the model's ordinary prose."""
+        result = self._parse("Checking the weather.\n\n" + _weather_call("SF"))
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertIn("Checking the weather.", result.normal_text)
+
+
 if __name__ == "__main__":
     import unittest
 

@@ -114,10 +114,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self.invoke_tag_name[-3:],
         ]
         self.current_tool_id = -1
+        # Any DSML tag, so leftovers never reach user-visible content.
+        self.residual_markup_regex = rf"</?{self.dsml_token}[^>]*>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or self.invoke_start_token in text
+
+    def _strip_residual_markup(self, text: str) -> str:
+        """Remove leftover DSML tags so they never reach ``message.content``.
+
+        Some generations contain markup this detector cannot turn into a
+        structured call, such as a malformed invoke body or an unknown tool
+        name. Echoing it back verbatim makes an OpenAI-compatible client read
+        the turn as ordinary prose and silently drop the requested work, so
+        strip it instead.
+        """
+        if self.dsml_token not in text:
+            return text
+        return re.sub(self.residual_markup_regex, "", text)
 
     @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
@@ -214,16 +229,30 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        if not self.has_tool_call(text):
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        # The section wrapper is not always present: generations sometimes
+        # emit a bare `<｜DSML｜invoke …>` block, or open the section and never
+        # close it. Anchor on whichever marker comes first so those calls are
+        # still recovered instead of returned as text.
+        idx = min(
+            pos
+            for pos in (
+                text.find(self.bot_token),
+                text.find(self.invoke_start_token),
+            )
+            if pos != -1
+        )
+        normal_text = text[:idx].removesuffix("\n\n")
 
         calls = []
         try:
             sections = re.findall(self.function_calls_regex, text, re.DOTALL)
             if not sections:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+                # No complete section: scan invoke blocks from the first
+                # marker so an unterminated section still yields its calls.
+                sections = [text[idx:]]
 
             # Find all invoke blocks
             for function_calls_content in sections:
@@ -233,19 +262,30 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     func_name, invoke_content, _ = self._unpack_invoke_match(
                         invoke_match
                     )
-                    func_args = self._parse_parameters_from_xml(invoke_content)
+                    try:
+                        func_args = self._parse_parameters_from_xml(invoke_content)
+                        parameters = json.loads(func_args)
+                    except (json.JSONDecodeError, ValueError) as e:
+                        # One malformed invoke must not discard its siblings.
+                        logger.warning(
+                            f"Skipping unparsable DSML invoke for '{func_name}': {e}"
+                        )
+                        continue
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": parameters,
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
+            return StreamingParseResult(
+                normal_text=self._strip_residual_markup(normal_text), calls=calls
+            )
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+            # Parsing failed: return the text without DSML markup rather than
+            # leaking raw tags to the client.
+            return StreamingParseResult(normal_text=self._strip_residual_markup(text))
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
