@@ -176,7 +176,7 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
             penalty_cumulated_len=0,
         )
         req1 = SimpleNamespace(
-            origin_input_ids=[20, 43], output_ids=[9], penalty_cumulated_len=0
+            origin_input_ids=[20, 43], output_ids=[], penalty_cumulated_len=0
         )
         orchestrator = MagicMock()
 
@@ -190,19 +190,92 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
 
         ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
         ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
-        assert torch.equal(ids, torch.tensor([[42, 1, 2, 3], [43, 9, 0, 0]]))
-        assert torch.equal(num_valid, torch.tensor([4, 2]))
+        assert torch.equal(ids, torch.tensor([[1, 2, 3], [0, 0, 0]]))
+        assert torch.equal(num_valid, torch.tensor([3, 0]))
+        assert req1.penalty_cumulated_len == 0
 
         orchestrator.reset_mock()
         req0.output_ids.extend([4, 5])
+        req1.output_ids.append(9)
         ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
         ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
-        assert torch.equal(ids, torch.tensor([[4, 5], [0, 0]]))
-        assert torch.equal(num_valid, torch.tensor([2, 0]))
+        assert torch.equal(ids, torch.tensor([[4, 5], [9, 0]]))
+        assert torch.equal(num_valid, torch.tensor([2, 1]))
+        assert req0.penalty_cumulated_len == 5
+        assert req1.penalty_cumulated_len == 1
 
         orchestrator.reset_mock()
         ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
         orchestrator.cumulate_output_tokens_multi.assert_not_called()
+
+    def test_schedule_batch_penalty_cursor_tolerates_output_ids_truncation(self):
+        # Session rewind truncates output_ids below the cursor
+        # (streaming_session trims to finished_len). The clamped cursor must
+        # not skip the tokens generated after the rewind.
+        req = SimpleNamespace(
+            origin_input_ids=[10, 42],
+            output_ids=[1, 2, 3],
+            penalty_cumulated_len=3,
+        )
+        orchestrator = MagicMock()
+
+        class FakeBatch:
+            pass
+
+        batch = FakeBatch()
+        batch.reqs = [req]
+        batch.device = torch.device("cpu")
+        batch.sampling_info = SimpleNamespace(penalizer_orchestrator=orchestrator)
+
+        req.output_ids = req.output_ids[:1]
+        ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
+        orchestrator.cumulate_output_tokens_multi.assert_not_called()
+        assert req.penalty_cumulated_len == 1
+
+        req.output_ids.extend([9, 8])
+        ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
+        ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
+        assert torch.equal(ids, torch.tensor([[9, 8]]))
+        assert torch.equal(num_valid, torch.tensor([2]))
+        assert req.penalty_cumulated_len == 3
+
+    def test_all_padding_rows_preserve_presence_and_repetition_state(self):
+        reqs = [
+            _make_req(repetition_penalty=1.5, presence_penalty=0.2),
+            _make_req(repetition_penalty=1.5, presence_penalty=0.2),
+        ]
+        orchestrator = _make_orchestrator(reqs)
+        orchestrator.cumulate_output_tokens(torch.tensor([0, 4]))
+        repetition = orchestrator.penalizers[BatchedRepetitionPenalizer]
+        presence = orchestrator.penalizers[BatchedPresencePenalizer]
+        previous_repetition = repetition.cumulated_repetition_penalties[1].clone()
+        previous_presence = presence.cumulated_presence_penalties[1].clone()
+
+        orchestrator.cumulate_output_tokens_multi(
+            torch.tensor([[7, 8], [0, 0]], dtype=torch.int64),
+            torch.tensor([2, 0], dtype=torch.int64),
+        )
+
+        assert torch.equal(
+            repetition.cumulated_repetition_penalties[1], previous_repetition
+        )
+        assert torch.equal(presence.cumulated_presence_penalties[1], previous_presence)
+
+    def test_valid_token_zero_is_not_treated_as_padding(self):
+        reqs = [
+            _make_req(repetition_penalty=1.5, presence_penalty=0.2),
+            _make_req(repetition_penalty=1.5, presence_penalty=0.2),
+        ]
+        orchestrator = _make_orchestrator(reqs)
+        orchestrator.cumulate_output_tokens_multi(
+            torch.tensor([[0, 7, 0], [0, 0, 0]], dtype=torch.int64),
+            torch.tensor([1, 0], dtype=torch.int64),
+        )
+
+        repetition = orchestrator.penalizers[BatchedRepetitionPenalizer]
+        presence = orchestrator.penalizers[BatchedPresencePenalizer]
+        assert repetition.cumulated_repetition_penalties[0, 0] == 1.5
+        assert presence.cumulated_presence_penalties[0, 0] == 0.2
 
     def test_spec_prepare_for_decode_gates_penalty_cumulate(self):
         calls = []

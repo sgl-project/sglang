@@ -3499,19 +3499,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def cumulate_penalty_output_tokens_since_last(self):
-        """Feed every token committed since the previous call (all accepted
-        speculative tokens, not only the last) to the penalizers. The first
-        call also feeds the last prompt token, matching the non-spec path."""
+        """Feed every output token committed since the previous call (all accepted
+        speculative tokens, not only the last). An overlap launch with no
+        resolved output submits nothing; it is picked up at the next call."""
         new_tokens = []
         for req in self.reqs:
-            seq_len = 1 + len(req.output_ids)
-            start = req.penalty_cumulated_len
-            if start == 0:
-                toks = [req.origin_input_ids[-1]] + list(req.output_ids)
-            else:
-                toks = list(req.output_ids[start - 1 :])
+            # Session rewind can truncate output_ids below the cursor
+            # (streaming_session trims to finished_len); clamp so re-generated
+            # tokens are fed instead of silently skipped.
+            toks = list(
+                req.output_ids[min(req.penalty_cumulated_len, len(req.output_ids)) :]
+            )
             new_tokens.append(toks)
-            req.penalty_cumulated_len = seq_len
+            req.penalty_cumulated_len = len(req.output_ids)
 
         k = max((len(t) for t in new_tokens), default=0)
         if k == 0:
