@@ -96,6 +96,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             sidecar_pool_specs=self._dsv4_specs(),
             host_pool_group=self._pool_group(kv_size=16, swa_size=8),
             swa_component=self._swa_component(),
+            mamba_component=None,
         )
 
     def test_stack_rejects_sidecar_smaller_than_source(self):
@@ -114,6 +115,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     override_size={PoolName.DEEPSEEK_V4_C4_INDEXER_STATE: 4},
                 ),
                 swa_component=self._swa_component(),
+                mamba_component=None,
             )
 
     def test_write_stages_and_persists_dsv4_full_and_swa_sidecars(self):

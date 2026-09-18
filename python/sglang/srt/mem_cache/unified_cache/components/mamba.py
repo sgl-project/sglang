@@ -687,6 +687,39 @@ class MambaComponent(TreeComponent):
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
 
+    # ---- Buffer-mode load-back handoff ----
+
+    def ensure_request_state_slot(self, req: Req) -> bool:
+        """Ensure a request slot, returning False if eviction cannot free one."""
+        if req.kv.mamba_pool_idx is not None:
+            return True
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            return False
+        req.kv.mamba_pool_idx = dst[0]
+        return True
+
+    def release_request_state_slot(self, req: Req) -> None:
+        """Roll back a request slot allocated for a cancelled load-back."""
+        self.cache.req_to_token_pool.mamba_allocator.free(
+            req.kv.mamba_pool_idx.unsqueeze(-1)
+        )
+        req.kv.mamba_pool_idx = None
+
+    def supersede_pending_state_copy(self, req: Req) -> None:
+        """Reset the replay cursor and discard CoW/clear superseded by H2D."""
+        write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None and req.kv.mamba_pool_idx is not None:
+            slot = self.cache.req_to_token_pool.translate_mamba_indices(
+                req.kv.mamba_pool_idx.unsqueeze(0)
+            )
+            write_pos[slot] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+
     def prepare_prefetch(
         self,
         node_id: NodeId,

@@ -83,3 +83,4 @@ class StagedPrefetchPlan:
     device_prefix_len: int
     full_tokens: int
     swa_tokens: int
+    mamba_slots: int = 0
