@@ -602,8 +602,11 @@ impl Tree {
         // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+            // Refresh existing tenants without registering the cold-start placeholder
+            // or resurrecting a tenant removed concurrently.
+            if let Some(mut timestamp) = curr.tenant_last_access_time.get_mut(&tenant) {
+                *timestamp = epoch;
+            }
         }
 
         // Compute input char count directly from input text.
@@ -1090,10 +1093,15 @@ mod tests {
     fn test_cold_start() {
         let tree = Tree::new();
 
-        let (matched_text, tenant) = tree.prefix_match("hello");
+        // Exercise a full timestamp refresh cycle even when this test runs alone.
+        for _ in 0..16 {
+            let (matched_text, tenant) = tree.prefix_match("hello");
 
-        assert_eq!(matched_text, "");
-        assert_eq!(tenant, "empty");
+            assert_eq!(matched_text, "");
+            assert_eq!(tenant, "empty");
+            assert!(tree.get_used_size_per_tenant().is_empty());
+            assert!(tree.tenant_char_count.is_empty());
+        }
     }
 
     #[test]
