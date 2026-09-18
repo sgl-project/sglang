@@ -235,6 +235,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # fmha_v2 prefill kernel supports SM90 and SM120
         self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
 
+        # FMHAv2 has no FP8 (e4m3) prefill kernel on SM120/SM121 -- flashinfer
+        # raises "FP8 (e4m3) is not yet supported for FMHAv2 on SM120" from
+        # trtllm_fmha_v2_prefill(). ModelOpt NVFP4 checkpoints commonly declare
+        # "kv_cache_quant_algo": "FP8", so --kv-cache-dtype auto lands here and
+        # the run dies deep in CUDA-graph capture with no hint at the fix.
+        # Fail at construction with an actionable message instead.
+        if (
+            self.use_fmha_v2
+            and get_platform().is_sm120
+            and self.data_type == torch.float8_e4m3fn
+        ):
+            raise ValueError(
+                "attention_backend=trtllm_mha does not support an FP8 (e4m3) KV "
+                "cache on SM120/SM121 (consumer Blackwell, e.g. RTX PRO 6000): "
+                "the FMHAv2 prefill kernel is SM90/SM100 only. Either use "
+                "--attention-backend flashinfer, which supports FP8 KV on these "
+                "parts, or force a wider KV cache with --kv-cache-dtype bfloat16. "
+                "Note that ModelOpt NVFP4 checkpoints often select FP8 KV "
+                "automatically via their kv_cache_quant_algo field."
+            )
+
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
         # head dims (power-of-2 pages). Mirror that precondition here so an
