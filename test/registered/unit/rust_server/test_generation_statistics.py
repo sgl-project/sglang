@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def payload(*, rust, details=False, rank=None):
+def payload(*, rust, details=False, rank=None, count=2):
     cache = SimpleNamespace(
         enable_hicache_storage=lambda: details,
         _get_storage_backend_type=lambda: "test",
@@ -42,7 +42,7 @@ def payload(*, rust, details=False, rank=None):
         current_weight_version=None,
         rust_server_mode=rust,
     )
-    for i in range(2):
+    for i in range(count):
         req = Req(
             rid=str(i),
             origin_input_text="hi",
@@ -63,7 +63,7 @@ def payload(*, rust, details=False, rank=None):
                 side_effect=AssertionError("Rust must not call Python detokenization")
             )
         accumulator.accept(req=req)
-    return accumulator.to_payload(dp_rank=rank, is_idle_batch=False)
+    return accumulator.to_payload(dp_rank=rank, is_idle_batch=count == 0)
 
 
 def encode(output):
@@ -118,6 +118,11 @@ class TestGenerationStatistics(CustomTestCase):
                             self.assertEqual(
                                 columns[4:6], [[1, 0], []] if extras else [[], []]
                             )
+
+    def test_idle_batch_has_empty_statistics_columns(self):
+        header, data = encode(payload(rust=True, count=0))
+        self.assertEqual(msgspec.msgpack.decode(header), [[] for _ in range(21)])
+        self.assertEqual(data, [b""])
 
     def test_incomplete_statistics_are_not_sent(self):
         for name in (
