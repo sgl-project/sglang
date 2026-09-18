@@ -11,11 +11,20 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_o_128,
 )
+from sglang.kernels.ops.attention.fla.chunk_intra import (
+    chunk_kda_fwd_kernel_intra_sub_chunk,
+)
+from sglang.kernels.ops.attention.fla.chunk_intra import (
+    is_gather_supported as intra_is_gather_supported,
+)
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.kda import (
+    _recompute_w_u_fwd_kernel,
     chunk_gla_fwd_kernel_o,
     chunk_gla_fwd_o_gk,
     chunk_kda,
+    recompute_w_u_fwd,
+    recompute_w_u_fwd_kernel,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -160,7 +169,7 @@ def _parse_profile_args():
     parser = argparse.ArgumentParser(description="Bounded KDA rocprof target")
     parser.add_argument(
         "--rocprof-target",
-        choices=("state", "output"),
+        choices=("state", "output", "recompute", "intra"),
         required=True,
     )
     parser.add_argument("--heads", type=int, choices=(8, 16), required=True)
@@ -179,6 +188,22 @@ def _parse_profile_args():
     parser.add_argument("--output-bv", type=int, choices=(64, 128), default=128)
     parser.add_argument("--output-warps", type=int, choices=(2, 4, 8), default=8)
     parser.add_argument("--output-stages", type=int, choices=(2, 3, 4), default=4)
+    parser.add_argument(
+        "--recompute-config",
+        choices=("auto", "static"),
+        default="auto",
+    )
+    parser.add_argument("--recompute-bk", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--recompute-bv", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--recompute-warps", type=int, choices=(2, 4, 8), default=8)
+    parser.add_argument("--recompute-stages", type=int, choices=(2, 3, 4), default=2)
+    parser.add_argument(
+        "--intra-config",
+        choices=("auto", "static"),
+        default="auto",
+    )
+    parser.add_argument("--intra-warps", type=int, choices=(1, 2, 4, 8), default=4)
+    parser.add_argument("--intra-stages", type=int, choices=(2, 3, 4), default=2)
     parser.add_argument("--launches", type=int, default=5)
     return parser.parse_args()
 
@@ -203,6 +228,7 @@ def _run_profile_target(args):
     v = randn(*shape)
     w = randn(*shape)
     g = randn(*shape, dtype=torch.float32, scale=0.001)
+    beta = torch.sigmoid(randn(1, args.tokens, args.heads).float())
     A = randn(1, args.tokens, args.heads, 64)
     state = randn(1, args.heads, 128, 128, scale=0.01)
     state_seed = state.clone()
@@ -275,7 +301,99 @@ def _run_profile_target(args):
             chunk_indices=chunk_indices,
         )
 
-    target_fn = state_fn if args.rocprof_target == "state" else output_fn
+    recompute_w = torch.empty_like(k)
+    recompute_u = torch.empty_like(v)
+    recompute_kg = torch.empty_like(k)
+
+    def recompute_fn():
+        if args.recompute_config == "static":
+            grid = (len(chunk_indices), args.heads)
+            _recompute_w_u_fwd_kernel[grid](
+                k=k,
+                kg=recompute_kg,
+                v=v,
+                beta=beta,
+                w=recompute_w,
+                u=recompute_u,
+                A=A,
+                gk=g,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                T=args.tokens,
+                H=args.heads,
+                K=128,
+                V=128,
+                BT=64,
+                BK=args.recompute_bk,
+                BV=args.recompute_bv,
+                STORE_KG=True,
+                IS_VARLEN=True,
+                DOT_PRECISION="ieee",
+                num_warps=args.recompute_warps,
+                num_stages=args.recompute_stages,
+            )
+            return recompute_w, recompute_u, recompute_kg
+        return recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+    intra_Aqk = torch.empty_like(A)
+    intra_Akk = torch.empty(
+        (1, args.tokens, args.heads, 16),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    def intra_fn():
+        grid = (len(chunk_indices), 4, args.heads)
+        kernel = (
+            chunk_kda_fwd_kernel_intra_sub_chunk.fn.fn
+            if args.intra_config == "static"
+            else chunk_kda_fwd_kernel_intra_sub_chunk
+        )
+        launch_kwargs = (
+            {
+                "num_warps": args.intra_warps,
+                "num_stages": args.intra_stages,
+            }
+            if args.intra_config == "static"
+            else {}
+        )
+        kernel[grid](
+            q=q,
+            k=k,
+            g=g,
+            beta=beta,
+            Aqk=intra_Aqk,
+            Akk=intra_Akk,
+            scale=128**-0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=args.tokens,
+            H=args.heads,
+            K=128,
+            BT=64,
+            BC=16,
+            BK=128,
+            IS_VARLEN=True,
+            USE_GATHER=intra_is_gather_supported,
+            **launch_kwargs,
+        )
+        return intra_Aqk, intra_Akk
+
+    target_functions = {
+        "state": state_fn,
+        "output": output_fn,
+        "recompute": recompute_fn,
+        "intra": intra_fn,
+    }
+    target_fn = target_functions[args.rocprof_target]
     range_name = f"kda_{args.rocprof_target}"
     try:
         for _ in range(10):
@@ -285,6 +403,16 @@ def _run_profile_target(args):
         torch.cuda.synchronize()
         selected_output_config = getattr(
             chunk_gla_fwd_kernel_o,
+            "best_config",
+            None,
+        )
+        selected_recompute_config = getattr(
+            recompute_w_u_fwd_kernel,
+            "best_config",
+            None,
+        )
+        selected_intra_config = getattr(
+            chunk_kda_fwd_kernel_intra_sub_chunk.fn,
             "best_config",
             None,
         )
@@ -317,6 +445,24 @@ def _run_profile_target(args):
                         "BV": args.output_bv,
                         "num_warps": args.output_warps,
                         "num_stages": args.output_stages,
+                    }
+                ),
+                "recompute_config": (
+                    str(selected_recompute_config)
+                    if args.recompute_config == "auto"
+                    else {
+                        "BK": args.recompute_bk,
+                        "BV": args.recompute_bv,
+                        "num_warps": args.recompute_warps,
+                        "num_stages": args.recompute_stages,
+                    }
+                ),
+                "intra_config": (
+                    str(selected_intra_config)
+                    if args.intra_config == "auto"
+                    else {
+                        "num_warps": args.intra_warps,
+                        "num_stages": args.intra_stages,
                     }
                 ),
             }
