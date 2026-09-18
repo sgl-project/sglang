@@ -17,12 +17,16 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
         layer.fuse_wqa_wkv = False
         layer.wq_a = mock.Mock(return_value=(torch.ones(2, 2), None))
         layer.q_norm = mock.Mock(side_effect=lambda value: value)
+        layer._normalize_q_lora = mock.Mock(
+            side_effect=lambda value: (value, value)
+        )
         q = torch.ones(2, 1, 2)
         layer._compute_q_b = mock.Mock(return_value=q)
         local_kv = torch.arange(8, dtype=torch.float32).view(2, 4)
         layer._compute_kv_bf16 = mock.Mock(return_value=local_kv)
         layer.indexer = None
         layer.compressor = None
+        layer.compress_ratio = 4
 
         forward_batch = SimpleNamespace(
             forward_mode=SimpleNamespace(
@@ -79,6 +83,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
         layer.sin_cache = torch.zeros(1)
         layer.indexer = None
         layer.compressor = None
+        layer.compress_ratio = 4
 
         qkv_a = torch.arange(24, dtype=torch.float32).view(4, 6)
         expected_kv = qkv_a[:, 2:].clone() + 100
@@ -94,7 +99,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
 
         token_to_kv_pool = SimpleNamespace(
             get_swa_raw_buffer=mock.Mock(return_value=object()),
-            swa_kv_pool=SimpleNamespace(page_size=256),
+            swa_page_size=256,
         )
         attn_backend = SimpleNamespace(
             get_swa_out_cache_loc=mock.Mock(return_value=torch.arange(4)),

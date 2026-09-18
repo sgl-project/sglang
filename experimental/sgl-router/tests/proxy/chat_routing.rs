@@ -467,10 +467,16 @@ async fn non_streaming_upstream_429_preserved() {
         res.headers().get("content-type").unwrap().to_str().unwrap(),
         "application/json",
     );
-    // Router envelope code header must NOT be set — this is upstream's response.
+    // Router envelope headers must NOT be set — this is upstream's response.
+    // Their absence is exactly how a gateway tells "the engine said this" from
+    // "the router said this".
     assert!(
         res.headers().get("x-router-error-code").is_none(),
         "router envelope header must NOT be set on upstream-passthrough responses",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "no status was synthesized over the worker, so no x-router-upstream-status",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -510,6 +516,11 @@ async fn non_streaming_upstream_500_preserved() {
     assert!(
         res.headers().get("x-router-error-code").is_none(),
         "router envelope must NOT wrap upstream 5xx — passthrough",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "a complete worker 500 is forwarded verbatim — distinct from a \
+         synthesized 502 mid-body drop, which DOES echo the worker status",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -670,12 +681,14 @@ async fn chat_rejects_string_body_400() {
 }
 
 #[tokio::test]
-async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
+async fn non_streaming_mid_body_drop_classified_as_upstream_body_incomplete() {
     // Regression: when the upstream replies with a status line and headers
     // but drops the connection mid-body, the failure is NOT
     // "upstream_unreachable" (the upstream demonstrably DID reply). It must
-    // be classified as `upstream_status` so the operator-visible envelope
-    // reflects that the worker partially served the request.
+    // be classified as `upstream_body_incomplete` so the operator-visible
+    // envelope reflects that the worker partially served the request — and the
+    // worker's own status must survive in `x-router-upstream-status` rather
+    // than being replaced by the router's synthesized 502.
     let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
         StatusCode::OK,
         b"{\"partial\": ",
@@ -705,8 +718,13 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
     );
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "upstream_status",
-        "mid-body drop must be upstream_status (worker DID reply), not upstream_unreachable",
+        "upstream_body_incomplete",
+        "mid-body drop must be upstream_body_incomplete (worker DID reply), not upstream_unreachable",
+    );
+    assert_eq!(
+        res.headers().get("x-router-upstream-status").unwrap(),
+        "200",
+        "the worker's own status must be echoed, not discarded behind the 502",
     );
 }
 
@@ -973,6 +991,61 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     assert!(
         !breaker.would_allow(),
         "stream drop must trip the breaker (threshold=1)"
+    );
+}
+
+/// Client-visible contract of a streaming mid-body drop, through `build_router`.
+/// This is the asymmetric half of the non-streaming case: headers were already
+/// sent as 200, so the client keeps a 200 (NOT the synthesized 502 of the
+/// non-streaming path), there is NO `x-router-error-code` /
+/// `x-router-upstream-status`, and `responses_total` counts it as a 200 (the
+/// breaker / duration metrics capture the mid-stream failure — see the breaker
+/// test above).
+#[tokio::test]
+async fn streaming_mid_body_drop_stays_200_with_no_router_headers() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: hi\n\n",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "streaming mid-drop: headers were already sent as 200, so the client keeps 200",
+    );
+    assert!(
+        res.headers().get("x-router-error-code").is_none(),
+        "a 200-then-drop stream is not router-originated — no x-router-error-code",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "no status was synthesized over the worker, so no x-router-upstream-status",
+    );
+    let _ = res.into_body().collect().await;
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        ),
+        "a streaming mid-drop counts as a 200 at the edge: {m}",
     );
 }
 
