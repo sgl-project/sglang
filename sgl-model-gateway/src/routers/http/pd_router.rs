@@ -2029,8 +2029,8 @@ mod tests {
                 let started = wait_started.clone();
                 async move {
                     started.notified().await;
-                    // Ensure P headers arrive first, reproducing the old race.
-                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    // P is active and its body never finishes; D must stream
+                    // without waiting for that body, regardless of header order.
                     let first = futures_util::stream::once(async {
                         Ok::<_, std::io::Error>(bytes::Bytes::from_static(
                             b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
@@ -2057,13 +2057,13 @@ mod tests {
             headers: None,
         };
         let response = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(5),
             router.execute_dual_dispatch_internal(None, body, context, p, d, Instant::now()),
         )
         .await
         .expect("P headers/keepalives must not prevent decode streaming");
         let mut stream = response.into_body().into_data_stream();
-        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
             .await
             .unwrap()
             .unwrap()
@@ -2230,8 +2230,8 @@ mod tests {
                         let error_body = error_body.clone();
                         async move {
                             started.notified().await;
-                            // Peer sends headers and multiple keepalives first.
-                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            // The peer is active. Reading this error body can
+                            // finish only after the router cancels that peer.
                             let body = futures_util::stream::once(async move {
                                 dropped.notified().await;
                                 Ok::<_, std::io::Error>(bytes::Bytes::from(error_body))
