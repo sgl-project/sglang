@@ -304,9 +304,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
+    ):
+        # The non-CP captured low-ratio indexer scores a static context width.
+        # CP BCG runs these sources eagerly with live prefix metadata, so this
+        # default would only force long-prefix CP batches back to eager.
+        # Explicit max_seq_len values still constrain both paths.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
