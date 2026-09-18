@@ -153,6 +153,7 @@ class BaseTpWorker(ABC):
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+            recv_req.m2n_manifest,
         )
         return success, message
 

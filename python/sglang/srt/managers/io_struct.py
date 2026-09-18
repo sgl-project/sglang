@@ -1852,6 +1852,10 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
+    # Ordered PP groups in one bounded M2N wave. None keeps the single-group API.
+    # Append new fields to preserve the existing array-like IPC field positions.
+    m2n_group_names: Optional[List[str]] = None
+
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
@@ -1971,6 +1975,8 @@ class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # Optional Miles NCCL M2N manifest. Ordinary broadcast groups omit it.
+    m2n_manifest: Optional[Dict[str, Any]] = None
 
 
 class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
