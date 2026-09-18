@@ -883,8 +883,19 @@ def forward_dsa_core_npu(
             # The indexer ran at full width, so its top-k is full width too;
             # take this rank's rows of it. Padded rows get index 0, which is a
             # valid position whose output is discarded on the way back.
-            topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
+            #
+            # A SEPARATE NAME, and this is load-bearing rather than style. This
+            # function RETURNS topk_indices (see the end), and the caller feeds
+            # it to the next layer as prev_topk_indices: only 21 of 78 layers
+            # run the indexer, the other 57 reuse what came before. Rebinding
+            # the name here handed the next layer this rank's slice instead of
+            # the full-width top-k -- and the layer after that would slice the
+            # slice, which for every rank above 0 starts past the end and so
+            # reads as all-zero: attend to position 0, for 57 layers.
+            attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
             attn_mqa = m.attn_mqa_for_dsa_cp
+        else:
+            attn_topk_indices = topk_indices
         attn_output = attn_mqa(
             q_nope_out.contiguous(),
             k_nope.contiguous(),
@@ -893,7 +904,7 @@ def forward_dsa_core_npu(
             save_kv_cache=not mla_preprocess_used,
             q_rope=q_pe.contiguous(),
             k_rope=k_pe.contiguous(),
-            topk_indices=topk_indices,
+            topk_indices=attn_topk_indices,
         )
         if dsa_cp_plan is not None:
             # Undo the swap before anything else sees it. w_vc, o_proj and the
