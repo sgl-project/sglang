@@ -12,11 +12,13 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
@@ -756,6 +758,256 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    @patch(
+        "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
+        return_value=4,
+    )
+    def test_ignore_eos_reserves_all_shard_class_pages(self, _shard_size):
+        """Disabled-radix admission must charge one page per shard class."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.page_size = 16
+        self.mock_token_allocator.shard_spec = SimpleNamespace(
+            max_prefix_tokens=1024, chunk_tokens=1024
+        )
+        self.mock_token_allocator.available_size.return_value = 64
+        adder = self.create_adder(self.create_running_batch(), page_size=16)
+
+        req = self.create_mock_req("ignore_eos", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(16))
+        req.full_untruncated_fill_ids = list(range(16))
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+
+    def create_sharded_adder(
+        self,
+        *,
+        chunk_tokens=16,
+        max_prefix_tokens=16,
+        shard_spec=None,
+        allocator_size=1024,
+        **kwargs,
+    ):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        if shard_spec is None:
+            shard_spec = PageShardSpec(
+                shard_rank=0,
+                shard_size=2,
+                page_size=4,
+                max_prefix_tokens=max_prefix_tokens,
+                chunk_tokens=chunk_tokens,
+            )
+        allocator = PageInterleavePoolAllocator(
+            size=allocator_size,
+            physical_page_size=shard_spec.page_size,
+            shard_size=shard_spec.shard_size,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+            shard_spec=shard_spec,
+        )
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=shard_spec.page_size,
+            rem_chunk_tokens=shard_spec.chunk_tokens,
+            token_to_kv_pool_allocator=allocator,
+            **kwargs,
+        )
+
+    def create_sharded_req(self, rid, *, prefix_len=12, extend_len=4):
+        req = self.create_shared_req(rid, max_new_tokens=1)
+        req.prefix_indices = list(range(prefix_len))
+        req.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
+        return req
+
+    def test_sharded_admission_defers_prefix_scratch_overflow(self):
+        adder = self.create_sharded_adder()
+        first = self.create_sharded_req("first")
+        second = self.create_sharded_req("second")
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        remaining = (adder.rem_total_tokens, adder.rem_chunk_tokens)
+
+        # Each 3-page prefix needs 2 pages per shard: 16 scratch tokens.
+        # Token capacity fits both requests, but prefix scratch only fits one.
+        self.assertEqual(
+            adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [first])
+        second.set_extend_range.assert_not_called()
+        self.assertEqual((adder.rem_total_tokens, adder.rem_chunk_tokens), remaining)
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 1)
+
+        # A rejected reservation must leave the remaining chunk scratch usable.
+        third = self.create_sharded_req("no-prefix", prefix_len=0)
+        self.assertEqual(
+            adder.add_one_req(third, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(adder.can_run_list, [first, third])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 2)
+
+    def test_eight_long_prefixes_fit_an_eight_k_chunk(self):
+        context_len = 16384
+        extend_len = 1024
+        prefix_len = context_len - extend_len
+        kvc = SimpleNamespace(
+            page_size=4,
+            model_config=SimpleNamespace(context_len=context_len),
+        )
+        for chunk_tokens in (8192, 16384):
+            with self.subTest(chunk_tokens=chunk_tokens):
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.page_interleave.get_kv_shard_group_info",
+                        return_value=(0, 2),
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.page_interleave.get_schedule",
+                        return_value=SimpleNamespace(chunked_prefill_size=chunk_tokens),
+                    ),
+                ):
+                    spec = make_page_shard_spec(kvc)
+                self.assertEqual(spec.max_prefix_tokens, 8 * context_len)
+                adder = self.create_sharded_adder(
+                    shard_spec=spec,
+                    allocator_size=8 * context_len,
+                    rem_input_tokens=32768,
+                )
+                reqs = [
+                    self.create_sharded_req(
+                        str(i), prefix_len=prefix_len, extend_len=extend_len
+                    )
+                    for i in range(9)
+                ]
+                for i, req in enumerate(reqs[:8]):
+                    result = adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    # The eighth request commits even when its verdict tells
+                    # the caller that the 8K compute budget is now exhausted.
+                    expected = (
+                        AddReqResult.OTHER
+                        if i == 7 and chunk_tokens == 8192
+                        else AddReqResult.CONTINUE
+                    )
+                    self.assertEqual(result, expected)
+                self.assertEqual(adder.can_run_list, reqs[:8])
+                self.assertEqual(adder.rem_chunk_tokens, chunk_tokens - 8192)
+                self.assertEqual(adder.kv_shard_chunk_pages * spec.page_size, 8192)
+                self.assertEqual(
+                    adder.kv_shard_block_bound_pages * spec.logical_page_size,
+                    8 * prefix_len,
+                )
+                remaining = (
+                    adder.rem_total_tokens,
+                    adder.rem_chunk_tokens,
+                    adder.kv_shard_block_bound_pages,
+                    adder.kv_shard_chunk_pages,
+                )
+                self.assertEqual(
+                    adder.add_one_req(
+                        reqs[8], has_chunked_req=False, truncation_align_size=None
+                    ),
+                    AddReqResult.OTHER,
+                )
+                self.assertEqual(adder.can_run_list, reqs[:8])
+                reqs[8].set_extend_range.assert_not_called()
+                self.assertEqual(
+                    (
+                        adder.rem_total_tokens,
+                        adder.rem_chunk_tokens,
+                        adder.kv_shard_block_bound_pages,
+                        adder.kv_shard_chunk_pages,
+                    ),
+                    remaining,
+                )
+                if chunk_tokens == 16384:
+                    # With compute capacity remaining, the ninth long prefix
+                    # is deferred solely by scratch capacity. That deferral
+                    # must leave room for a request without a cached prefix.
+                    no_prefix = self.create_sharded_req(
+                        "no-prefix", prefix_len=0, extend_len=extend_len
+                    )
+                    self.assertEqual(
+                        adder.add_one_req(
+                            no_prefix,
+                            has_chunked_req=False,
+                            truncation_align_size=None,
+                        ),
+                        AddReqResult.CONTINUE,
+                    )
+                    self.assertEqual(adder.can_run_list, reqs[:8] + [no_prefix])
+
+    def test_sharded_admission_reserves_only_selected_chunk(self):
+        # Normal admission page-rounds a partial remaining budget without a
+        # separate KV-sharding truncation alignment override.
+        for remaining, selected, verdict in (
+            (8, 8, AddReqResult.OTHER),
+            (7, 4, AddReqResult.CONTINUE),
+        ):
+            with self.subTest(remaining=remaining):
+                adder = self.create_sharded_adder(chunk_tokens=8)
+                adder.exact_chunk_fill = False
+                adder.rem_chunk_tokens = remaining
+                req = self.create_sharded_req("chunked", extend_len=28)
+
+                self.assertEqual(
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    ),
+                    verdict,
+                )
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertIs(adder.new_chunked_req, req)
+                self.assertEqual(req.extend_range, Range(12, 12 + selected))
+                self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+                self.assertEqual(adder.kv_shard_chunk_pages, selected // 4)
+
+    def test_sharded_admission_reserves_nothing_when_delayed(self):
+        delayer = _RecordingDelayer(allow=False)
+        adder = self.create_sharded_adder(prefill_delayer_single_pass=delayer)
+        req = self.create_sharded_req("delayed")
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.kv_shard_block_bound_pages, 0)
+        self.assertEqual(adder.kv_shard_chunk_pages, 0)
+
+        delayer.allow = True
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
     def _build_hybrid_swa_chunked_req(
         self,

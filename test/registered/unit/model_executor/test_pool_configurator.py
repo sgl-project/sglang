@@ -12,7 +12,13 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.mem_cache.page_interleave import (
+    compute_page_shard_scratch_bytes,
+    make_page_shard_spec,
+)
+from sglang.srt.model_executor.pool_configurator import create_memory_pool_configurator
 from sglang.srt.runtime_context import (
+    get_context,
     get_memory,
     get_parallel,
     get_schedule,
@@ -243,6 +249,71 @@ class TestDefaultConfigurator(CustomTestCase):
         available = 10_000_000
         _, _, config = self._run(available, page_size=128)
         self.assertEqual(config.max_total_num_tokens % 128, 0)
+
+    def test_eight_context_scratch_is_reserved_before_kv_pool_sizing(self):
+        page_size = 16
+        mr = _make_model_runner(
+            self,
+            use_mla_backend=True,
+            num_layers=3,
+            page_size=page_size,
+            chunked_prefill_size=1024,
+            max_running_requests=1,
+        )
+        mr.model_config.context_len = 8193
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.page_interleave.get_kv_shard_group_info",
+                return_value=(0, 4),
+            ),
+            get_context().override_server_args(
+                prefill_max_requests=1,
+                chunked_prefill_size=1024,
+                max_running_requests=1,
+            ),
+        ):
+            spec = make_page_shard_spec(mr)
+            # Each context rounds to 8256 tokens, a 64-token gather multiple,
+            # even with request limits of one. Only the prefix is multiplied.
+            self.assertEqual(spec.max_prefix_tokens, 8 * 8256)
+            self.assertEqual(spec.chunk_tokens, 1024)
+            row_bytes = (512 + 64) * KV_SIZE
+            scratch_bytes = 2 * (8 * 8256 + 1024 + page_size) * row_bytes
+            self.assertEqual(compute_page_shard_scratch_bytes(mr), scratch_bytes)
+
+            # Scratch has two one-layer slots; persistent KV spans all three
+            # layers. Charge the former before dividing by the latter's cost.
+            cell_bytes = row_bytes * mr.num_effective_layers
+            page_bytes = page_size * cell_bytes
+            configurator = create_memory_pool_configurator(mr)
+            for desired_tokens in (page_size, 128):
+                for slack_bytes in (0, page_bytes - 1):
+                    with self.subTest(
+                        desired_tokens=desired_tokens, slack_bytes=slack_bytes
+                    ):
+                        budget = (
+                            scratch_bytes + desired_tokens * cell_bytes + slack_bytes
+                        )
+                        config = configurator.calculate_pool_sizes(budget, page_size)
+                        self.assertEqual(config.max_total_num_tokens, desired_tokens)
+                        self.assertEqual(
+                            budget
+                            - scratch_bytes
+                            - config.max_total_num_tokens * cell_bytes,
+                            slack_bytes,
+                        )
+
+            # The fixed eight-context scratch is never silently reduced to
+            # leave room for persistent KV, including a sub-page remainder.
+            for budget in (
+                scratch_bytes - 1,
+                scratch_bytes,
+                scratch_bytes + page_bytes - 1,
+            ):
+                with self.subTest(insufficient_budget=budget):
+                    with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                        configurator.calculate_pool_sizes(budget, page_size)
 
     def test_constraint_respected(self):
         """calculate_pool_sizes_from_max_tokens respects the limit."""
