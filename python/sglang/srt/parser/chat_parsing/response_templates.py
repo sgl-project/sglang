@@ -1,4 +1,6 @@
 # Copyright 2026 The HuggingFace Team. All rights reserved.
+# ruff: noqa
+# fmt: off
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +24,7 @@ from typing import Any
 import regex as re
 
 from .content_parsers import CONTENT_PARSERS, validate_transform_strings
+
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +64,7 @@ class ResponseTemplate:
         for m in self.start_anchor_re.finditer(text):
             last_end = m.end()
         if last_end is None:
-            kind = (
-                "start_anchor"
-                if self.start_anchor_literals is not None
-                else "start_anchor_pattern"
-            )
+            kind = "start_anchor" if self.start_anchor_literals is not None else "start_anchor_pattern"
             logger.info(
                 f"response_template defines {kind} but the anchor was not found "
                 "in the prefix; the parser will process the entire prefix instead."
@@ -74,9 +73,7 @@ class ResponseTemplate:
         return text[last_end:]
 
 
-def _compile_anchor(
-    scope: str, field: dict, literal_key: str, pattern_key: str
-) -> tuple[Any, list[str] | None, bool]:
+def _compile_anchor(scope: str, field: dict, literal_key: str, pattern_key: str) -> tuple[Any, list[str] | None, bool]:
     """Compile a region's start/end anchor. An anchor can be:
 
     - a regex (`pattern_key`),
@@ -96,31 +93,21 @@ def _compile_anchor(
       buffer edge could still be lengthened by future input.
     """
     if literal_key in field and pattern_key in field:
-        raise ValueError(
-            f"{scope}: cannot specify both '{literal_key}' and '{pattern_key}'"
-        )
+        raise ValueError(f"{scope}: cannot specify both '{literal_key}' and '{pattern_key}'")
     if literal_key in field:
         raw = field[literal_key]
         if isinstance(raw, str):
             literals = [raw]
         elif isinstance(raw, list):
             if not raw:
-                raise ValueError(
-                    f"{scope}: '{literal_key}' list must contain at least one literal"
-                )
+                raise ValueError(f"{scope}: '{literal_key}' list must contain at least one literal")
             if not all(isinstance(s, str) for s in raw):
-                raise ValueError(
-                    f"{scope}: '{literal_key}' list must contain only strings"
-                )
+                raise ValueError(f"{scope}: '{literal_key}' list must contain only strings")
             literals = list(dict.fromkeys(raw))  # dedupe, preserve first-seen order
         else:
-            raise ValueError(
-                f"{scope}: '{literal_key}' must be a string or list of strings, got {type(raw).__name__}"
-            )
+            raise ValueError(f"{scope}: '{literal_key}' must be a string or list of strings, got {type(raw).__name__}")
         if any(s == "" for s in literals):
-            raise ValueError(
-                f"{scope}: '{literal_key}' literals cannot be empty strings"
-            )
+            raise ValueError(f"{scope}: '{literal_key}' literals cannot be empty strings")
         # Sort longest-first so alternation prefers the longer alternative when both could match.
         ordered = sorted(literals, key=len, reverse=True)
         can_extend = any(a != b and a.startswith(b) for a in literals for b in literals)
@@ -143,16 +130,8 @@ def _validate_template_shape(spec: dict) -> None:
     version = spec.get("version", 1)
     if version != 1:
         raise ValueError(f"Unsupported response_template version: {version}")
-    if unknown_template_keys := set(spec) - {
-        "version",
-        "defaults",
-        "fields",
-        "start_anchor",
-        "start_anchor_pattern",
-    }:
-        raise ValueError(
-            f"Unknown keys in response_template: {sorted(unknown_template_keys)}"
-        )
+    if unknown_template_keys := set(spec) - {"version", "defaults", "fields", "start_anchor", "start_anchor_pattern"}:
+        raise ValueError(f"Unknown keys in response_template: {sorted(unknown_template_keys)}")
     if not isinstance(spec.get("defaults", {}), dict):
         raise ValueError("response_template.defaults must be a dict")
     fields_raw = spec.get("fields", {})
@@ -183,15 +162,9 @@ def _build_field(name: str, field: dict) -> ResponseTemplateField:
         raise ValueError(f"{scope}: unknown keys {sorted(unknown_field_keys)}")
     content = field.get("content", "text")
     if content not in CONTENT_PARSERS:
-        raise ValueError(
-            f"{scope}: unknown content parser '{content}'. Available: {sorted(CONTENT_PARSERS)}"
-        )
-    open_re, open_literals, open_literal_can_extend = _compile_anchor(
-        scope, field, "open", "open_pattern"
-    )
-    close_re, close_literals, close_literal_can_extend = _compile_anchor(
-        scope, field, "close", "close_pattern"
-    )
+        raise ValueError(f"{scope}: unknown content parser '{content}'. Available: {sorted(CONTENT_PARSERS)}")
+    open_re, open_literals, open_literal_can_extend = _compile_anchor(scope, field, "open", "open_pattern")
+    close_re, close_literals, close_literal_can_extend = _compile_anchor(scope, field, "close", "close_pattern")
     join = field.get("join")
     if join is not None and not isinstance(join, str):
         raise ValueError(f"{scope}: 'join' must be a string, got {type(join).__name__}")
@@ -200,13 +173,9 @@ def _build_field(name: str, field: dict) -> ResponseTemplateField:
     transform = field.get("transform")
     transform_each = field.get("transform_each", False)
     if not isinstance(transform_each, bool):
-        raise ValueError(
-            f"{scope}: transform_each must be a bool, got {type(transform_each).__name__}"
-        )
+        raise ValueError(f"{scope}: transform_each must be a bool, got {type(transform_each).__name__}")
     if transform_each and transform is None:
-        raise ValueError(
-            f"{scope}: transform_each is set but no transform was provided"
-        )
+        raise ValueError(f"{scope}: transform_each is set but no transform was provided")
     if transform is not None:
         validate_transform_strings(scope, transform)
     else:
@@ -260,9 +229,7 @@ def load_response_template(spec: dict | ResponseTemplate) -> ResponseTemplate:
         "response_template", spec, "start_anchor", "start_anchor_pattern"
     )
     if start_anchor_re is None:
-        raise ValueError(
-            "response_template must define 'start_anchor' or 'start_anchor_pattern'."
-        )
+        raise ValueError("response_template must define 'start_anchor' or 'start_anchor_pattern'.")
 
     return ResponseTemplate(
         defaults=dict(spec.get("defaults", {})),
@@ -274,3 +241,4 @@ def load_response_template(spec: dict | ResponseTemplate) -> ResponseTemplate:
 
 
 __all__ = ["ResponseTemplate", "ResponseTemplateField", "load_response_template"]
+# fmt: on

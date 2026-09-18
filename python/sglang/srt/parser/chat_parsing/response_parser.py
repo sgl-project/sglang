@@ -1,4 +1,6 @@
 # Copyright 2026 The HuggingFace Team. All rights reserved.
+# ruff: noqa
+# fmt: off
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,11 +20,7 @@ import json
 from typing import Any
 
 from .content_parsers import STREAMABLE_PARSERS, process_field
-from .response_templates import (
-    ResponseTemplate,
-    ResponseTemplateField,
-    load_response_template,
-)
+from .response_templates import ResponseTemplate, ResponseTemplateField, load_response_template
 
 
 def _schema_types(schema: Any) -> tuple[str, ...]:
@@ -35,7 +33,7 @@ def _schema_types(schema: Any) -> tuple[str, ...]:
     for union_name in ("anyOf", "oneOf"):
         for choice in schema.get(union_name) or []:
             types.extend(_schema_types(choice))
-    if schema.get("nullable") and "null" not in types:
+    if schema.get("nullable") and "null" not in types:  # `nullable` is how get_json_schema marks Optionals
         types.append("null")
     return tuple(types)
 
@@ -51,12 +49,7 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
                     continue  # NaN / inf are not valid JSON numbers
                 # Preserve ints when the source text had no fractional part.
                 return int(number) if number.is_integer() and "." not in raw else number
-            if type_name == "boolean" and raw.strip().lower() in (
-                "true",
-                "1",
-                "false",
-                "0",
-            ):
+            if type_name == "boolean" and raw.strip().lower() in ("true", "1", "false", "0"):
                 return raw.strip().lower() in ("true", "1")
             if type_name == "null" and raw.strip() in ("null", "None"):
                 return None
@@ -76,13 +69,11 @@ def parse_response(
     prefix: str | None = None,
     tools: list[dict] | None = None,
 ) -> dict:
-    """Parse complete model output with a `response_template`.
+    """The main function for response parsing when you don't want streaming. Takes generated output
+    and the prompt prefix and parses them without streaming any events, then returns the parsed message.
 
-    `prefix` is the chat prompt sent before generation. Pass `""` when the
-    generation already contains the complete assistant message.
-
-    Pass `tools` (OpenAI-style dicts) to cast tool-call arguments from the
-    calling tool's JSON schema.
+    Pass OpenAI-style `tools` dictionaries to cast tool-call arguments
+    using the calling tool's JSON schema.
     """
     response_template = load_response_template(response_template)
     stream = ResponseParser(response_template, prefix=prefix, tools=tools)
@@ -108,20 +99,16 @@ class ResponseParser:
         for event in final_events:
             handle(event)
 
-    Pass `tools=` as OpenAI-style tool dicts to cast tool-call arguments
-    using each tool's JSON schema as each region closes.
+    Pass OpenAI-style `tools=` dictionaries to cast tool-call arguments
+    using the calling tool's JSON schema as each region closes.
 
-    Events are `region_open`, `region_chunk`, or `region_close`. Open and
-    close events also carry `raw`: the exact delimiter bytes that opened or
-    closed the region (`""` when the region opens implicitly or closes
-    because another region opened / the stream ended). Serving adapters use
-    that to reconstruct wire bytes for a downstream tool-call parser.
+    Events can be either "region_open", "region_chunk", or "region_close".
 
-    `prefix` is the chat prompt sent before generation. Chat templates can
-    pre-write part of the assistant message, so pass that prompt when you
-    have it. Pass `""` when the generation already contains the complete
-    message. Events produced while consuming the prefix are exposed as
-    `initial_events`.
+    ResponseParser requires the chat `prefix` (i.e. the chat history, the prefill before the current generation).
+    This is because chat templates or assistant prefills can sometimes write part of the message, and if we
+    only see the model output, and not the template, then we can't reliably parse the message in those cases.
+    Any events produced while consuming the prefix are exposed as `initial_events`, so renderers can show
+    prefill regions before the model writes anything; closed prefill regions also land in the output dict.
     """
 
     def __init__(
@@ -134,26 +121,19 @@ class ResponseParser:
         self._spec = load_response_template(response_template)
         if prefix is None:
             raise ValueError(
-                "`ResponseParser` requires `prefix` because chat templates can "
-                'pre-write part of the assistant message. Pass `prefix=""` when '
-                "the generation contains the complete message."
+                "`ResponseParser`/`parse_response` requires `prefix` (the chat prompt sent to the model before "
+                "generation), because chat templates often pre-write part of the assistant message (e.g. an "
+                "opening `<think>` tag) that the parser must see to parse the output correctly. If the generation "
+                'already contains the complete message, pass `prefix=""` to opt out explicitly.'
             )
         # Maps tool name -> schema `properties`, used to cast parsed tool-call arguments
         self._tool_params: dict[str, dict] = {}
         for tool in tools or []:
-            if not isinstance(tool, dict):
-                continue
-            fn = tool.get("function", tool)
+            fn = tool.get("function", tool) if isinstance(tool, dict) else None
             if isinstance(fn, dict) and isinstance(fn.get("name"), str):
                 parameters = fn.get("parameters")
-                properties = (
-                    parameters.get("properties")
-                    if isinstance(parameters, dict)
-                    else None
-                )
-                self._tool_params[fn["name"]] = (
-                    properties if isinstance(properties, dict) else {}
-                )
+                properties = parameters.get("properties") if isinstance(parameters, dict) else None
+                self._tool_params[fn["name"]] = properties if isinstance(properties, dict) else {}
         self._buffer: str = ""
         self._pos: int = 0
         self._output: dict[str, Any] = dict(self._spec.defaults)
@@ -170,16 +150,6 @@ class ResponseParser:
         self.initial_events: list[dict] = []
         if prefix:
             self._consume_prefix(prefix)
-
-    @property
-    def input_text(self) -> str:
-        """Raw parser input after start-anchor truncation."""
-        return self._buffer
-
-    @property
-    def consumed_offset(self) -> int:
-        """End of the input represented by emitted events."""
-        return self._pos
 
     def _consume_prefix(self, prefix: str) -> None:
         """Loads the prefix (the chat prefill sent to the model), right-truncates it to the start of the
@@ -219,19 +189,11 @@ class ResponseParser:
             raise RuntimeError("ResponseParser already finalized")
         events: list[dict] = []
         self._process(events, eos=True)
-        missing = [
-            n
-            for n, f in self._spec.fields.items()
-            if not f.optional and n not in self._output
-        ]
+        missing = [n for n, f in self._spec.fields.items() if not f.optional and n not in self._output]
         if missing:
-            raise ValueError(
-                f"Required response_template fields missing from parsed output: {missing}"
-            )
+            raise ValueError(f"Required response_template fields missing from parsed output: {missing}")
         defaults = self._spec.defaults
-        self._output = {
-            k: v for k, v in self._output.items() if k in defaults or not _is_empty(v)
-        }
+        self._output = {k: v for k, v in self._output.items() if k in defaults or not _is_empty(v)}
         self._finalized = True
         return self._output, events
 
@@ -251,7 +213,7 @@ class ResponseParser:
                 else:  # "close" (always the implicit region's close here,
                     #   since explicit regions only expose their own close)
                     had_content = self._opened
-                    self._close_current(events, raw=m.group(0))
+                    self._close_current(events)
                     # Zero-width close on an already-empty region would just
                     # re-fire next iteration -- bail out to make progress.
                     if not had_content and m.start() == m.end():
@@ -332,12 +294,7 @@ class ResponseParser:
                 # Pending: can't commit, and blocks emitting from its start onward.
                 hold_start = min(hold_start, m.start())
                 continue
-            key = (
-                m.start(),
-                -(m.end() - m.start()),
-                0 if kind == "open" else 1,
-                field.name,
-            )
+            key = (m.start(), -(m.end() - m.start()), 0 if kind == "open" else 1, field.name)
             if best_key is None or key < best_key:
                 best_key, best = key, (kind, field, m)
         # A committable match co-located with or after a pending one must wait too:
@@ -376,29 +333,20 @@ class ResponseParser:
             return
         field = self._spec.fields[self._current]
         if not self._opened:
-            events.append({"type": "region_open", "field": self._current, "raw": ""})
+            events.append({"type": "region_open", "field": self._current})
             self._opened = True
         self._body += text
         dirty = field.content not in STREAMABLE_PARSERS
-        events.append(
-            {
-                "type": "region_chunk",
-                "field": self._current,
-                "text": text,
-                "dirty": dirty,
-            }
-        )
+        events.append({"type": "region_chunk", "field": self._current, "text": text, "dirty": dirty})
 
-    def _open_explicit(
-        self, events: list[dict], field: ResponseTemplateField, m: Any
-    ) -> None:
+    def _open_explicit(self, events: list[dict], field: ResponseTemplateField, m: Any) -> None:
         self._current = field.name
         self._captures = {k: v for k, v in m.groupdict().items() if v is not None}
         self._body = ""
         self._opened = True
-        events.append({"type": "region_open", "field": field.name, "raw": m.group(0)})
+        events.append({"type": "region_open", "field": field.name})
 
-    def _close_current(self, events: list[dict], raw: str = "") -> None:
+    def _close_current(self, events: list[dict]) -> None:
         """Close the current region and reset to the implicit/null region.
         Skipped (aside from the reset) when the current region never opened --
         avoids vacuous open/close pairs at every explicit boundary."""
@@ -416,16 +364,12 @@ class ResponseParser:
                     f"got {type(value).__name__}."
                 )
             previous = self._output.get(self._current)
-            self._output[self._current] = (
-                value if previous is None else previous + field.join + value
-            )
+            self._output[self._current] = value if previous is None else previous + field.join + value
         elif field.repeats:
             self._output.setdefault(self._current, []).append(value)
         else:
             self._output[self._current] = value
-        events.append(
-            {"type": "region_close", "field": self._current, "value": value, "raw": raw}
-        )
+        events.append({"type": "region_close", "field": self._current, "value": value})
         self._reset_to_implicit()
 
     def _coerce_tool_calls(self, value: Any) -> Any:
@@ -439,19 +383,12 @@ class ResponseParser:
             return value
         if properties := self._tool_params.get(name):
             for key, argument in arguments.items():
-                if key not in properties or not (
-                    types := _schema_types(properties[key])
-                ):
+                if key not in properties or not (types := _schema_types(properties[key])):
                     continue
                 if isinstance(argument, str):
                     arguments[key] = _coerce(argument, types)
-                elif isinstance(
-                    argument, list
-                ):  # duplicate keys collected by `merge_duplicates`
-                    arguments[key] = [
-                        _coerce(item, types) if isinstance(item, str) else item
-                        for item in argument
-                    ]
+                elif isinstance(argument, list):  # duplicate keys collected by `merge_duplicates`
+                    arguments[key] = [_coerce(item, types) if isinstance(item, str) else item for item in argument]
         return value
 
     def _reset_to_implicit(self) -> None:
@@ -459,3 +396,4 @@ class ResponseParser:
         self._captures = {}
         self._body = ""
         self._opened = False
+# fmt: on

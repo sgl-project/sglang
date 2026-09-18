@@ -1,4 +1,6 @@
 # Copyright 2026 The HuggingFace Team. All rights reserved.
+# ruff: noqa
+# fmt: off
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,22 +13,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the ported `response_template` parser.
+"""Tests for the new declarative response_template parser.
 
-Ported from `transformers/tests/utils/test_chat_parsing.py`. Tokenizer
-integration tests are omitted; this file covers the parser itself.
-"""
+All six real-model template fixtures from the legacy test suite are re-expressed
+here in the new region-spec shape and asserted against the same expected
+output dicts. Any divergence indicates a regression in the new executor."""
 
 import copy
 import random
 import unittest
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
-from sglang.srt.parser.chat_parsing.content_parsers import parse_content
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
 
 cohere_template = {
     "defaults": {"role": "assistant"},
@@ -47,10 +49,7 @@ cohere_template = {
             "close": "<|END_ACTION|>",
             "content": "json",
             "transform_each": True,
-            "transform": {
-                "type": "function",
-                "function": {"name": "{tool_name}", "arguments": "{parameters}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{tool_name}", "arguments": "{parameters}"}},
         },
     },
 }
@@ -100,10 +99,7 @@ gpt_oss_template = {
             "close": "<|call|>",
             "repeats": True,
             "content": "json",
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         },
     },
 }
@@ -143,10 +139,7 @@ qwen3_template = {
                 "tag_pattern": r"<parameter=(?P<key>\w+)>\s*(?P<value>.*?)\s*</parameter>",
                 "value_parser": {"name": "json", "args": {"allow_non_json": True}},
             },
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         },
     },
 }
@@ -173,10 +166,7 @@ gemma4_template = {
                 "unquoted_keys": True,
                 "string_delims": [['<|"|>', '<|"|>']],
             },
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         },
         "content": {
             "close": ["<turn|>", "<|tool_response>", "<eos>"],
@@ -211,16 +201,14 @@ inkling_template = {
             "close": "<|end_message|>",
             "repeats": True,
             "content": "json",
-            "transform": {
-                "type": "function",
-                "function": {"name": "{content.name}", "arguments": "{content.args}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{content.name}", "arguments": "{content.args}"}},
         },
     },
 }
 
 
 class ChatResponseTemplateParserTest(unittest.TestCase):
+
     def test_cohere(self):
         model_out = (
             "<|START_THINKING|>I should call a tool.<|END_THINKING|>"
@@ -235,10 +223,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 "tool_calls": [
                     {
                         "type": "function",
-                        "function": {
-                            "name": "simple_tool",
-                            "arguments": {"temperature_format": "Celsius"},
-                        },
+                        "function": {"name": "simple_tool", "arguments": {"temperature_format": "Celsius"}},
                     }
                 ],
             },
@@ -270,10 +255,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 "tool_calls": [
                     {
                         "type": "function",
-                        "function": {
-                            "name": "get_current_temperature",
-                            "arguments": {"location": "Paris"},
-                        },
+                        "function": {"name": "get_current_temperature", "arguments": {"location": "Paris"}},
                     }
                 ],
             },
@@ -341,10 +323,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 "tool_calls": [
                     {
                         "type": "function",
-                        "function": {
-                            "name": "get_current_weather",
-                            "arguments": {"location": "San Francisco, CA"},
-                        },
+                        "function": {"name": "get_current_weather", "arguments": {"location": "San Francisco, CA"}},
                     }
                 ],
             },
@@ -411,13 +390,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             {
                 "role": "assistant",
                 "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": {"city": "Paris"},
-                        },
-                    }
+                    {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}
                 ],
             },
         )
@@ -489,11 +462,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                         "type": "function",
                         "function": {
                             "name": "get_current_temperature",
-                            "arguments": {
-                                "detail_level": 0,
-                                "location": "Paris, France",
-                                "unit": "celsius",
-                            },
+                            "arguments": {"detail_level": 0, "location": "Paris, France", "unit": "celsius"},
                         },
                     }
                 ],
@@ -550,10 +519,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 "tool_calls": [
                     {
                         "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": {"city": "Tokyo", "units": "C"},
-                        },
+                        "function": {"name": "get_weather", "arguments": {"city": "Tokyo", "units": "C"}},
                     }
                 ],
             },
@@ -571,10 +537,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                     "content": "json",
                     "transform": {
                         "type": "function",
-                        "function": {
-                            "name": "{content.name}",
-                            "arguments": "{content.args}",
-                        },
+                        "function": {"name": "{content.name}", "arguments": "{content.args}"},
                     },
                 },
             },
@@ -582,15 +545,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
         model_out = '<tool>{"name": "get_weather", "args": {"city": {"id": 7}}}</tool>'
         self.assertEqual(
             parse_response(model_out, template_spec, prefix="")["tool_calls"],
-            [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": {"city": {"id": 7}},
-                    },
-                }
-            ],
+            [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": {"id": 7}}}}],
         )
 
     def test_transform_dotted_paths_with_transform_each(self):
@@ -603,10 +558,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                     "close": "</actions>",
                     "content": "json",
                     "transform_each": True,
-                    "transform": {
-                        "type": "function",
-                        "function": {"name": "{fn.name}", "arguments": "{fn.args}"},
-                    },
+                    "transform": {"type": "function", "function": {"name": "{fn.name}", "arguments": "{fn.args}"}},
                 },
             },
         }
@@ -623,37 +575,20 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
         def spec_with(transform):
             return {
                 "start_anchor": "<|assistant|>",
-                "fields": {
-                    "x": {
-                        "open": "<x>",
-                        "close": "</x>",
-                        "content": "json",
-                        "transform": transform,
-                    }
-                },
+                "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json", "transform": transform}},
             }
 
         with self.assertRaisesRegex(ValueError, "missing key 'args'"):
-            parse_response(
-                '<x>{"name": "n"}</x>', spec_with({"a": "{content.args}"}), prefix=""
-            )
+            parse_response('<x>{"name": "n"}</x>', spec_with({"a": "{content.args}"}), prefix="")
         with self.assertRaisesRegex(ValueError, "cannot index into str"):
-            parse_response(
-                '<x>{"name": "n"}</x>', spec_with({"a": "{content.name.x}"}), prefix=""
-            )
+            parse_response('<x>{"name": "n"}</x>', spec_with({"a": "{content.name.x}"}), prefix="")
         with self.assertRaises(KeyError):
             parse_response("<x>{}</x>", spec_with({"a": "{missing}"}), prefix="")
 
     def test_transform_dotted_mixed_string_rejected(self):
         template_spec = {
             "start_anchor": "<|assistant|>",
-            "fields": {
-                "x": {
-                    "open": "<x>",
-                    "close": "</x>",
-                    "transform": {"v": "pre {content.args}"},
-                }
-            },
+            "fields": {"x": {"open": "<x>", "close": "</x>", "transform": {"v": "pre {content.args}"}}},
         }
         with self.assertRaisesRegex(ValueError, "mixes"):
             parse_response("", template_spec, prefix="")
@@ -663,21 +598,12 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
             "fields": {
-                "thinking": {
-                    "open": "<think>",
-                    "close": "</think>",
-                    "repeats": True,
-                    "join": " ",
-                },
+                "thinking": {"open": "<think>", "close": "</think>", "repeats": True, "join": " "},
                 "content": {"repeats": True, "join": " "},
             },
         }
         self.assertEqual(
-            parse_response(
-                "<think>first</think>middle<think>second</think>done",
-                template_spec,
-                prefix="",
-            ),
+            parse_response("<think>first</think>middle<think>second</think>done", template_spec, prefix=""),
             {"role": "assistant", "thinking": "first second", "content": "middle done"},
         )
         self.assertEqual(
@@ -686,33 +612,17 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
         )
 
     def test_join_validation(self):
-        no_repeats = {
-            "start_anchor": "a",
-            "fields": {"x": {"open": "<x>", "close": "</x>", "join": ""}},
-        }
+        no_repeats = {"start_anchor": "a", "fields": {"x": {"open": "<x>", "close": "</x>", "join": ""}}}
         with self.assertRaisesRegex(ValueError, "requires 'repeats'"):
             parse_response("", no_repeats, prefix="")
-        bad_type = {
-            "start_anchor": "a",
-            "fields": {
-                "x": {"open": "<x>", "close": "</x>", "repeats": True, "join": 7}
-            },
-        }
+        bad_type = {"start_anchor": "a", "fields": {"x": {"open": "<x>", "close": "</x>", "repeats": True, "join": 7}}}
         with self.assertRaisesRegex(ValueError, "must be a string"):
             parse_response("", bad_type, prefix="")
 
     def test_join_requires_string_matches(self):
         template_spec = {
             "start_anchor": "a",
-            "fields": {
-                "x": {
-                    "open": "<x>",
-                    "close": "</x>",
-                    "repeats": True,
-                    "join": "",
-                    "content": "json",
-                }
-            },
+            "fields": {"x": {"open": "<x>", "close": "</x>", "repeats": True, "join": "", "content": "json"}},
         }
         with self.assertRaisesRegex(ValueError, "parse to a string"):
             parse_response("<x>{}</x>", template_spec, prefix="")
@@ -746,10 +656,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 },
             },
         }
-        self.assertEqual(
-            parse_response("<n>42</n>", template_spec, prefix=""),
-            {"role": "assistant", "count": 42},
-        )
+        self.assertEqual(parse_response("<n>42</n>", template_spec, prefix=""), {"role": "assistant", "count": 42})
 
     def test_kv_lines_parser(self):
         template_spec = {
@@ -764,9 +671,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             },
         }
         self.assertEqual(
-            parse_response(
-                "<meta>name: alice\nage: 30</meta>", template_spec, prefix=""
-            ),
+            parse_response("<meta>name: alice\nage: 30</meta>", template_spec, prefix=""),
             {"role": "assistant", "metadata": {"name": "alice", "age": "30"}},
         )
 
@@ -774,9 +679,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
         bad_template = {
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
-            "fields": {
-                "x": {"open": "[", "close": "]", "content": "not-a-real-parser"}
-            },
+            "fields": {"x": {"open": "[", "close": "]", "content": "not-a-real-parser"}},
         }
         with self.assertRaises(ValueError) as cm:
             parse_response("[hi]", bad_template)
@@ -870,10 +773,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
             "fields": {
-                "content": {
-                    "close": ["<turn|>", "<|tool_response>", "<eos>"],
-                    "content": "text",
-                },
+                "content": {"close": ["<turn|>", "<|tool_response>", "<eos>"], "content": "text"},
             },
         }
         parser = ResponseParser(template_spec, prefix="")
@@ -888,7 +788,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
 
     def test_literal_list_defers_prefix_overlapping_literal(self):
         """If a literal is a strict prefix of another in the same list, an
-        edge match could still grow with more input, so we must defer to be safe."""
+        edge match could still grow with more input: we must defer to be safe."""
         template_spec = {
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
@@ -897,15 +797,13 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             },
         }
         parser = ResponseParser(template_spec, prefix="")
-        # "<x>hiEND" mid-stream: don't commit the close yet. "ENDX" might be coming.
+        # "<x>hiEND" mid-stream: don't commit the close yet: "ENDX" might be coming.
         events = parser.feed("<x>hiEND")
         self.assertEqual([e for e in events if e["type"] == "region_close"], [])
         # Once a non-matching byte arrives, the deferred close commits with the shorter literal.
         events.extend(parser.feed(" more"))
         message, _ = parser.finalize()
-        closes = [
-            e for e in events if e["type"] == "region_close" and e["field"] == "x"
-        ]
+        closes = [e for e in events if e["type"] == "region_close" and e["field"] == "x"]
         self.assertEqual(len(closes), 1)
         self.assertEqual(closes[0]["value"], "hi")
         self.assertEqual(message, {"role": "assistant", "x": "hi"})
@@ -935,7 +833,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
 
 
 # Fixtures shared by the streaming tests: one representative input per template,
-# reused for both the correctness invariant (any chunking → same dict) and the
+# re-used for both the correctness invariant (any chunking → same dict) and the
 # event-shape tests (do we emit the right events in the right order?).
 _STREAMING_FIXTURES = [
     (
@@ -1028,62 +926,6 @@ def _chunk_random(text: str, rng: random.Random):
 
 
 class ResponseEventStreamTest(unittest.TestCase):
-    def test_region_events_include_raw_delimiters(self):
-        spec = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {
-                    "open_pattern": r"<content id=\d+>",
-                    "close": "</content>",
-                }
-            },
-        }
-        parser = ResponseParser(spec, prefix="")
-        events = parser.feed("<content id=7>hello</content>")
-
-        self.assertEqual(parser.input_text, "<content id=7>hello</content>")
-        self.assertEqual(parser.consumed_offset, len(parser.input_text))
-        boundaries = [
-            (event["type"], event["raw"])
-            for event in events
-            if event["type"] != "region_chunk"
-        ]
-        self.assertEqual(
-            boundaries,
-            [
-                ("region_open", "<content id=7>"),
-                ("region_close", "</content>"),
-            ],
-        )
-
-    def test_implicit_and_boundary_closes_have_empty_raw_delimiters(self):
-        spec = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content_args": {"strip": False}},
-                "tag": {"open": "<tag>", "content_args": {"strip": False}},
-            },
-        }
-        parser = ResponseParser(spec, prefix="")
-        events = parser.feed("plain<tag>body")
-        _, final_events = parser.finalize()
-        events.extend(final_events)
-
-        boundaries = [
-            (event["type"], event["field"], event["raw"])
-            for event in events
-            if event["type"] != "region_chunk"
-        ]
-        self.assertEqual(
-            boundaries,
-            [
-                ("region_open", "content", ""),
-                ("region_close", "content", ""),
-                ("region_open", "tag", "<tag>"),
-                ("region_close", "tag", ""),
-            ],
-        )
-
     def test_stream_matches_whole_string_all_templates_fixed_chunking(self):
         """For every fixed chunking step we try, the streamed finalize()
         output must equal the whole-string parse. Regression coverage for
@@ -1134,23 +976,22 @@ class ResponseEventStreamTest(unittest.TestCase):
 
     def _assert_event_stream_well_formed(self, events: list[dict]) -> None:
         open_field: str | None = None
+        chunk_accum: dict[str, str] = {}
+        close_values: dict[str, object] = {}
         for ev in events:
             t = ev["type"]
             if t == "region_open":
                 self.assertIsNone(open_field, f"nested region_open without close: {ev}")
                 open_field = ev["field"]
+                chunk_accum.setdefault(open_field, "")
             elif t == "region_chunk":
-                self.assertEqual(
-                    open_field, ev["field"], f"chunk outside its region: {ev}"
-                )
+                self.assertEqual(open_field, ev["field"], f"chunk outside its region: {ev}")
                 # Every chunk carries a boolean `dirty` flag.
-                self.assertIsInstance(
-                    ev["dirty"], bool, f"missing/non-bool dirty: {ev}"
-                )
+                self.assertIsInstance(ev["dirty"], bool, f"missing/non-bool dirty: {ev}")
+                chunk_accum[open_field] += ev["text"]
             elif t == "region_close":
-                self.assertEqual(
-                    open_field, ev["field"], f"close for non-open region: {ev}"
-                )
+                self.assertEqual(open_field, ev["field"], f"close for non-open region: {ev}")
+                close_values[open_field] = ev["value"]
                 open_field = None
             else:
                 self.fail(f"unexpected event type: {ev!r}")
@@ -1159,7 +1000,7 @@ class ResponseEventStreamTest(unittest.TestCase):
     def test_region_chunks_reconstruct_text_regions(self):
         """For text-like regions (`dirty=False`), concatenating chunk texts
         reconstructs the final value reported in region_close. Structured
-        regions (`dirty=True`) still stream their raw bytes, concatenating
+        regions (`dirty=True`) still stream their raw bytes: concatenating
         those chunks yields the unparsed region body, while the parsed value
         is delivered only in region_close."""
         # Single representative case with a long text region and a JSON region.
@@ -1198,8 +1039,9 @@ class ResponseEventStreamTest(unittest.TestCase):
 
     def test_dirty_flag_marks_structured_regions(self):
         """A template with one text field and one structured field per parser
-        family: text and int stream with `dirty=False`, while json,
-        xml-inline, and kv-lines stream with `dirty=True`."""
+        family: text/int/float/bool stream chunks with `dirty=False`, while
+        json/xml-inline/kv-lines stream chunks with `dirty=True`, and those
+        dirty chunks concatenate to the raw region body before parsing."""
         spec = {
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
@@ -1238,15 +1080,13 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         # Clean (streamable) regions.
         for field in ("thinking", "score"):
-            self.assertEqual(
-                per_field_dirty[field], {False}, f"{field} should be clean"
-            )
+            self.assertEqual(per_field_dirty[field], {False}, f"{field} should be clean")
         # Dirty (structured) regions.
         for field in ("json_call", "xml_call", "kv_call"):
             self.assertEqual(per_field_dirty[field], {True}, f"{field} should be dirty")
 
         # Dirty chunks reconstruct the raw region body (un-parsed). Clean
-        # chunks reconstruct the verbatim body too. Stripping happens at close.
+        # chunks reconstruct the verbatim body too: stripping happens at close.
         self.assertEqual("".join(per_field_chunks["thinking"]), "hello world")
         self.assertEqual("".join(per_field_chunks["score"]), "42")
         self.assertEqual("".join(per_field_chunks["json_call"]), '{"a": 1, "b": 2}')
@@ -1267,9 +1107,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         expected = parse_response(text, gpt_oss_template, prefix="")
         # Sanity: the whole-string parse really does recover the tool call.
         self.assertEqual(len(expected["tool_calls"]), 1)
-        self.assertEqual(
-            expected["tool_calls"][0]["function"]["name"], "get_current_weather"
-        )
+        self.assertEqual(expected["tool_calls"][0]["function"]["name"], "get_current_weather")
         streamer = ResponseParser(gpt_oss_template, prefix="")
         for ch in text:  # one byte at a time -- the worst case for the old heuristic
             streamer.feed(ch)
@@ -1293,16 +1131,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual(result, {"role": "assistant"})
         self.assertEqual(final_events, [])
 
-
 class PrefixAndTruncationTest(unittest.TestCase):
-    def test_prefix_is_required(self):
-        spec = {
-            "start_anchor": "<assistant>",
-            "fields": {"content": {"content": "text"}},
-        }
-        with self.assertRaisesRegex(ValueError, "requires `prefix`"):
-            ResponseParser(spec)
-
     def test_prefix_lands_inside_explicit_region(self):
         """A Qwen-style template emits `<|im_start|>assistant\\n<think>\\n` as the
         assistant prefix. The model continues from inside the thinking block."""
@@ -1399,8 +1228,7 @@ class PrefixAndTruncationTest(unittest.TestCase):
     def test_history_bleed_is_guarded_by_prefix_not_by_response_anchor(self):
         """The `start_anchor` guards against history bleed only via `prefix=`; it is NOT
         applied to the response. The response is the generation and may legitimately contain
-        the anchor (for example, when every channel starts with the same
-        `<|start|>assistant` marker), so
+        the anchor (e.g. gpt-oss harmony opens every channel with `<|start|>assistant`), so
         truncating it would drop real content. Passing the prompt as `prefix=` is the way to
         keep earlier turns out of the parse."""
         spec = {
@@ -1417,7 +1245,9 @@ class PrefixAndTruncationTest(unittest.TestCase):
         self.assertEqual(parse_response(gen, spec, prefix=""), clean)
         # An anchor inside the response is treated as content, never as a history boundary:
         # gpt-oss re-emits `<|start|>assistant` between channels, and that content survives.
-        gpt_oss_gen = "<|channel|>analysis<|message|>thinking<|end|><|start|>assistant<|channel|>final<|message|>answer"
+        gpt_oss_gen = (
+            "<|channel|>analysis<|message|>thinking<|end|><|start|>assistant<|channel|>final<|message|>answer"
+        )
         self.assertEqual(
             parse_response(gpt_oss_gen, gpt_oss_template, prefix=""),
             {"role": "assistant", "thinking": "thinking", "content": "answer"},
@@ -1426,7 +1256,7 @@ class PrefixAndTruncationTest(unittest.TestCase):
     def test_prefix_with_open_close_inside_truncated_region(self):
         """Prefix opens AND closes a region. The full open/chunk/close event
         sequence is surfaced via initial_events, and the closed region lands
-        in the output dict, so renderers can show prefill content."""
+        in the output dict: so renderers can show prefill content."""
         spec = {
             "defaults": {"role": "assistant"},
             "start_anchor": "[BEGIN]",
@@ -1449,14 +1279,14 @@ class PrefixAndTruncationTest(unittest.TestCase):
     def test_prefix_lands_inside_implicit_region(self):
         """Prefix wrote plaintext into the implicit region (e.g. assistant
         prefill before the model continues). The region_open for the implicit
-        region must surface via initial_events so consumers don't miss it.
+        region must surface via initial_events so consumers don't miss it:
         `_opened` will already be True by the time feed runs."""
         prompt = "<|im_start|>assistant\nSure, here is "
         stream = ResponseParser(smollm_template, prefix=prompt)
         opens = [e for e in stream.initial_events if e["type"] == "region_open"]
         self.assertEqual([e["field"] for e in opens], ["content"])
         events = stream.feed("the answer<|im_end|>")
-        # No second region_open from feed. The implicit region was already
+        # No second region_open from feed: the implicit region was already
         # opened during prefill and surfaced via initial_events.
         self.assertNotIn("region_open", [e["type"] for e in events])
 
@@ -1473,23 +1303,13 @@ class PrefixAndTruncationTest(unittest.TestCase):
         stream.finalize()
         self.assertEqual(stream._output, {"role": "assistant", "thinking": "real body"})
 
-
-class ContentParserTest(unittest.TestCase):
-    def test_strict_xml_inline_rejects_unmatched_content(self):
-        args = {
-            "tag_pattern": r"<(?P<key>\w+)>(?P<value>.*?)</\1>",
-            "strict": True,
+    def test_prefix_is_required(self):
+        spec = {
+            "start_anchor": "<assistant>",
+            "fields": {"content": {"content": "text"}},
         }
-        self.assertEqual(
-            parse_content("<city>Paris</city>", "xml-inline", args),
-            {"city": "Paris"},
-        )
-        with self.assertRaisesRegex(ValueError, "unmatched non-whitespace content"):
-            parse_content(
-                "<city>Paris</city>trailing",
-                "xml-inline",
-                args,
-            )
+        with self.assertRaisesRegex(ValueError, "requires `prefix`"):
+            ResponseParser(spec)
 
 
 # xml-inline without a value_parser: parameter bodies stay raw strings until tools= coerces them.
@@ -1505,10 +1325,7 @@ _XML_STRING_ARGS_TEMPLATE = {
             "content_args": {
                 "tag_pattern": r"<parameter=(?P<key>\w+)>\s*(?P<value>.*?)\s*</parameter>",
             },
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         },
     },
 }
@@ -1523,10 +1340,7 @@ _KV_LINES_TOOLS_TEMPLATE = {
             "close": "</tool_call>",
             "repeats": True,
             "content": "kv-lines",
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         },
     },
 }
@@ -1585,10 +1399,7 @@ class ToolArgCoercionTest(unittest.TestCase):
             "already_typed": 7,
             "extra": "unscheduled",
         }
-        call = {
-            "type": "function",
-            "function": {"name": "set_alarm", "arguments": arguments},
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": arguments}}
         self.assertIs(_parser_with_tools(tools)._coerce_tool_calls(call), call)
         self.assertEqual(
             call["function"]["arguments"],
@@ -1612,13 +1423,7 @@ class ToolArgCoercionTest(unittest.TestCase):
 
     def test_coerce_booleans_match_bool_parser(self):
         # Accept the same literals as the `bool` content parser, case-insensitively.
-        for raw, expected in [
-            ("true", True),
-            ("True", True),
-            ("1", True),
-            ("false", False),
-            ("0", False),
-        ]:
+        for raw, expected in [("true", True), ("True", True), ("1", True), ("false", False), ("0", False)]:
             self.assertEqual(_coerce(raw, ("boolean",)), expected)
         # Non-boolean text stays a string rather than silently becoming False.
         self.assertEqual(_coerce("maybe", ("boolean",)), "maybe")
@@ -1633,76 +1438,39 @@ class ToolArgCoercionTest(unittest.TestCase):
 
     def test_coerce_tool_calls_handles_single_and_list(self):
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call = {
-            "type": "function",
-            "function": {"name": "set_alarm", "arguments": {"hour": "7"}},
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": "7"}}}
         self.assertIs(parser._coerce_tool_calls(call), call)
         self.assertEqual(call["function"]["arguments"], {"hour": 7})
         # A list of calls (as produced by `transform_each`) is coerced element-wise.
-        calls = [
-            {
-                "type": "function",
-                "function": {"name": "set_alarm", "arguments": {"hour": "9"}},
-            }
-        ]
-        self.assertEqual(
-            parser._coerce_tool_calls(calls)[0]["function"]["arguments"], {"hour": 9}
-        )
+        calls = [{"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": "9"}}}]
+        self.assertEqual(parser._coerce_tool_calls(calls)[0]["function"]["arguments"], {"hour": 9})
         # Non-tool-call values pass through untouched.
         self.assertEqual(parser._coerce_tool_calls("hello"), "hello")
 
     def test_schema_types_handles_get_json_schema_dialect(self):
         self.assertEqual(_schema_types({"type": "integer"}), ("integer",))
-        self.assertEqual(
-            _schema_types({"type": ["integer", "string"]}), ("integer", "string")
-        )
-        self.assertEqual(
-            _schema_types({"anyOf": [{"type": "boolean"}, {"type": "string"}]}),
-            ("boolean", "string"),
-        )
-        self.assertEqual(
-            _schema_types({"oneOf": [{"type": "number"}, {"type": "null"}]}),
-            ("number", "null"),
-        )
-        self.assertEqual(
-            _schema_types({"type": "integer", "nullable": True}), ("integer", "null")
-        )
+        self.assertEqual(_schema_types({"type": ["integer", "string"]}), ("integer", "string"))
+        self.assertEqual(_schema_types({"anyOf": [{"type": "boolean"}, {"type": "string"}]}), ("boolean", "string"))
+        self.assertEqual(_schema_types({"oneOf": [{"type": "number"}, {"type": "null"}]}), ("number", "null"))
+        self.assertEqual(_schema_types({"type": "integer", "nullable": True}), ("integer", "null"))
         # Undescribed parameters resolve to no candidate types, making coercion a no-op.
         self.assertEqual(_schema_types({"description": "no type"}), ())
 
     def test_parse_response_tools_coerces_xml_inline_string_args(self):
         # Without a value_parser, xml-inline argument bodies stay strings; tools= casts them.
         without = parse_response(_SET_ALARM_CALL, _XML_STRING_ARGS_TEMPLATE, prefix="")
-        with_tools = parse_response(
-            _SET_ALARM_CALL,
-            _XML_STRING_ARGS_TEMPLATE,
-            prefix="",
-            tools=_SET_ALARM_TOOLS,
-        )
-        self.assertEqual(
-            _first_tool_args(without),
-            {"hour": "7", "enabled": "true", "label": "wake up"},
-        )
-        self.assertEqual(
-            _first_tool_args(with_tools),
-            {"hour": 7, "enabled": True, "label": "wake up"},
-        )
+        with_tools = parse_response(_SET_ALARM_CALL, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)
+        self.assertEqual(_first_tool_args(without), {"hour": "7", "enabled": "true", "label": "wake up"})
+        self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True, "label": "wake up"})
 
     def test_parse_response_tools_coerces_one_of_string_args(self):
-        tools = _set_alarm_tools(
-            hour={"oneOf": [{"type": "integer"}, {"type": "null"}]}
-        )
-        parsed = parse_response(
-            _SET_ALARM_CALL, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=tools
-        )
+        tools = _set_alarm_tools(hour={"oneOf": [{"type": "integer"}, {"type": "null"}]})
+        parsed = parse_response(_SET_ALARM_CALL, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=tools)
         self.assertEqual(_first_tool_args(parsed)["hour"], 7)
 
     def test_streaming_tools_coerces_on_region_close(self):
         # Coercion must land on the region_close event during feed(), not only after finalize().
-        stream = ResponseParser(
-            _XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS
-        )
+        stream = ResponseParser(_XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)
         closes = [
             event["value"]
             for chunk in _chunk_fixed(_SET_ALARM_CALL, 8)
@@ -1710,10 +1478,7 @@ class ToolArgCoercionTest(unittest.TestCase):
             if event["type"] == "region_close" and event["field"] == "tool_calls"
         ]
         self.assertEqual(len(closes), 1)
-        self.assertEqual(
-            closes[0]["function"]["arguments"],
-            {"hour": 7, "enabled": True, "label": "wake up"},
-        )
+        self.assertEqual(closes[0]["function"]["arguments"], {"hour": 7, "enabled": True, "label": "wake up"})
 
     def test_qwen3_tools_coerces_strings_left_by_value_parser(self):
         # qwen3's json+allow_non_json value_parser types what it can (`true`) and leaves
@@ -1726,51 +1491,28 @@ class ToolArgCoercionTest(unittest.TestCase):
             "</function>\n</tool_call>"
         )
         without = parse_response(model_out, qwen3_template, prefix="")
-        with_tools = parse_response(
-            model_out, qwen3_template, prefix="", tools=_SET_ALARM_TOOLS
-        )
-        self.assertEqual(
-            _first_tool_args(without),
-            {"hour": "007", "enabled": True, "label": "wake up"},
-        )
-        self.assertEqual(
-            _first_tool_args(with_tools),
-            {"hour": 7, "enabled": True, "label": "wake up"},
-        )
+        with_tools = parse_response(model_out, qwen3_template, prefix="", tools=_SET_ALARM_TOOLS)
+        self.assertEqual(_first_tool_args(without), {"hour": "007", "enabled": True, "label": "wake up"})
+        self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True, "label": "wake up"})
 
     def test_coercion_never_reworks_already_typed_values(self):
         # Coercion only casts strings: values the value_parser already typed are final
         model_out = "<tool_call>\n<function=set_alarm>\n<parameter=label>\n1.50\n</parameter>\n</tool_call>"
         # qwen3's lax value_parser has already read 1.50 as the float 1.5, so the string-typed label stays a float ...
         self.assertEqual(
-            _first_tool_args(
-                parse_response(
-                    model_out, qwen3_template, prefix="", tools=_SET_ALARM_TOOLS
-                )
-            ),
+            _first_tool_args(parse_response(model_out, qwen3_template, prefix="", tools=_SET_ALARM_TOOLS)),
             {"label": 1.5},
         )
         # ... while without a value_parser the raw text reaches the schema cast intact
         self.assertEqual(
-            _first_tool_args(
-                parse_response(
-                    model_out,
-                    _XML_STRING_ARGS_TEMPLATE,
-                    prefix="",
-                    tools=_SET_ALARM_TOOLS,
-                )
-            ),
+            _first_tool_args(parse_response(model_out, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)),
             {"label": "1.50"},
         )
 
     def test_kv_lines_string_args_are_coerced(self):
-        model_out = (
-            "<tool_call>\n<function=set_alarm>\nhour: 7\nenabled: true\n</tool_call>"
-        )
+        model_out = "<tool_call>\n<function=set_alarm>\nhour: 7\nenabled: true\n</tool_call>"
         without = parse_response(model_out, _KV_LINES_TOOLS_TEMPLATE, prefix="")
-        with_tools = parse_response(
-            model_out, _KV_LINES_TOOLS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS
-        )
+        with_tools = parse_response(model_out, _KV_LINES_TOOLS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)
         self.assertEqual(_first_tool_args(without), {"hour": "7", "enabled": "true"})
         self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True})
 
@@ -1787,10 +1529,7 @@ class ToolArgCoercionTest(unittest.TestCase):
                     "content": "xml-inline",
                     "content_args": {
                         "tag_pattern": r"<(?P<key>\w+)>\s*(?P<value>.*?)\s*</\1>",
-                        "value_parser": {
-                            "name": "json",
-                            "args": {"allow_non_json": True},
-                        },
+                        "value_parser": {"name": "json", "args": {"allow_non_json": True}},
                     },
                     "transform": {"source": "{name}", "fields": "{content}"},
                 },
@@ -1798,13 +1537,9 @@ class ToolArgCoercionTest(unittest.TestCase):
         }
         model_out = "<cite source=set_alarm><label>1.50</label><hour>7</hour></cite>"
         expected = {"source": "set_alarm", "fields": {"label": 1.5, "hour": 7}}
+        self.assertEqual(parse_response(model_out, template, prefix="")["citation"], expected)
         self.assertEqual(
-            parse_response(model_out, template, prefix="")["citation"], expected
-        )
-        self.assertEqual(
-            parse_response(model_out, template, prefix="", tools=_SET_ALARM_TOOLS)[
-                "citation"
-            ],
+            parse_response(model_out, template, prefix="", tools=_SET_ALARM_TOOLS)["citation"],
             expected,
         )
 
@@ -1818,22 +1553,14 @@ class ToolArgCoercionTest(unittest.TestCase):
             "<parameter=hour>\n9\n</parameter>\n"
             "</function>\n</tool_call>"
         )
+        self.assertEqual(_first_tool_args(parse_response(model_out, template, prefix="")), {"hour": ["7", "9"]})
         self.assertEqual(
-            _first_tool_args(parse_response(model_out, template, prefix="")),
-            {"hour": ["7", "9"]},
-        )
-        self.assertEqual(
-            _first_tool_args(
-                parse_response(model_out, template, prefix="", tools=_SET_ALARM_TOOLS)
-            ),
+            _first_tool_args(parse_response(model_out, template, prefix="", tools=_SET_ALARM_TOOLS)),
             {"hour": [7, 9]},
         )
         # Elements that don't cast, and non-string elements, are left as they are.
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call = {
-            "type": "function",
-            "function": {"name": "set_alarm", "arguments": {"hour": ["7", "x", 9]}},
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": ["7", "x", 9]}}}
         parser._coerce_tool_calls(call)
         self.assertEqual(call["function"]["arguments"], {"hour": [7, "x", 9]})
 
@@ -1841,35 +1568,22 @@ class ToolArgCoercionTest(unittest.TestCase):
         # A transform can hand us a name parsed from model output, so a non-string name
         # must be ignored rather than raising on the schema lookup.
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call = {
-            "type": "function",
-            "function": {"name": ["set_alarm"], "arguments": {"hour": "7"}},
-        }
+        call = {"type": "function", "function": {"name": ["set_alarm"], "arguments": {"hour": "7"}}}
         self.assertEqual(parser._coerce_tool_calls(call), call)
         self.assertEqual(call["function"]["arguments"], {"hour": "7"})
 
     def test_union_with_container_still_keeps_scalar_text(self):
         model_out = "<tool_call>\n<function=set_alarm>\n<parameter=label>\n1.50\n</parameter>\n</tool_call>"
-        union = _set_alarm_tools(
-            label={"anyOf": [{"type": "string"}, {"type": "object"}]}
-        )
+        union = _set_alarm_tools(label={"anyOf": [{"type": "string"}, {"type": "object"}]})
         # `string` never casts, so the union keeps scalar-looking text as text ...
         self.assertEqual(
-            _first_tool_args(
-                parse_response(
-                    model_out, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=union
-                )
-            ),
+            _first_tool_args(parse_response(model_out, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=union)),
             {"label": "1.50"},
         )
         # ... while the `object` branch still decodes a body that really is an object.
         object_body = '<tool_call>\n<function=set_alarm>\n<parameter=label>\n{"a": 1}\n</parameter>\n</tool_call>'
         self.assertEqual(
-            _first_tool_args(
-                parse_response(
-                    object_body, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=union
-                )
-            ),
+            _first_tool_args(parse_response(object_body, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=union)),
             {"label": {"a": 1}},
         )
 
@@ -1881,12 +1595,11 @@ class ToolArgCoercionTest(unittest.TestCase):
             '"parameters": {"hour": 7, "enabled": true}}]<|END_ACTION|><|END_OF_TURN_TOKEN|>'
         )
         without = parse_response(model_out, cohere_template, prefix="")
-        with_tools = parse_response(
-            model_out, cohere_template, prefix="", tools=_SET_ALARM_TOOLS
-        )
+        with_tools = parse_response(model_out, cohere_template, prefix="", tools=_SET_ALARM_TOOLS)
         self.assertEqual(without, with_tools)
         self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True})
 
 
 if __name__ == "__main__":
     unittest.main()
+# fmt: on

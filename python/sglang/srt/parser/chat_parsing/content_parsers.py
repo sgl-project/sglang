@@ -1,4 +1,6 @@
 # Copyright 2026 The HuggingFace Team. All rights reserved.
+# ruff: noqa
+# fmt: off
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,9 +58,7 @@ def _json(text: str, args: dict) -> Any:
     unquoted_keys = args.get("unquoted_keys", False)
 
     if string_delims and (_LAX_OPEN in text or _LAX_CLOSE in text):
-        raise ValueError(
-            "json: input contains reserved sentinel characters (\\x01/\\x02); cannot parse safely."
-        )
+        raise ValueError("json: input contains reserved sentinel characters (\\x01/\\x02); cannot parse safely.")
 
     working = text
     captured: list[str] = []
@@ -83,9 +83,7 @@ def _json(text: str, args: dict) -> Any:
         if args.get("allow_non_json"):
             return _text(text, args)
         if working == text:
-            raise ValueError(
-                f"json parser could not parse region as JSON.\nContent: {text!r}\nError: {e}"
-            ) from e
+            raise ValueError(f"json parser could not parse region as JSON.\nContent: {text!r}\nError: {e}") from e
         raise ValueError(
             f"json: could not parse after dialect transforms.\n"
             f"Original: {text!r}\nTransformed: {working!r}\nError: {e}"
@@ -95,16 +93,13 @@ def _json(text: str, args: dict) -> Any:
 def _sub_parse(raw: str, value_parser: dict | None) -> Any:
     if value_parser is None:
         return raw
-    return parse_content(
-        raw, value_parser.get("name", "text"), value_parser.get("args", {})
-    )
+    return parse_content(raw, value_parser.get("name", "text"), value_parser.get("args", {}))
 
 
 def _xml_inline(text: str, args: dict) -> dict:
     """Parse shallow XML-ish tags into a dict. `tag_pattern` regex must have named
     groups `key` and `value`. Optional `value_parser` recurses; `merge_duplicates`
-    collects duplicate keys into a list. `strict` rejects unmatched non-whitespace
-    text."""
+    collects duplicate keys into a list."""
     tag_pattern = args.get("tag_pattern")
     if tag_pattern is None:
         raise ValueError("xml-inline: 'tag_pattern' content_arg is required")
@@ -112,17 +107,11 @@ def _xml_inline(text: str, args: dict) -> dict:
     merge = args.get("merge_duplicates", False)
 
     out: dict[str, Any] = {}
-    end = 0
     for m in re.finditer(tag_pattern, text, flags=re.DOTALL):
-        if args.get("strict") and text[end : m.start()].strip():
-            raise ValueError("xml-inline: unmatched non-whitespace content")
-        end = m.end()
         groups = m.groupdict()
         key = groups.get("key")
         if key is None:
-            raise ValueError(
-                f"xml-inline: tag_pattern must have a named group 'key'. Pattern: {tag_pattern}"
-            )
+            raise ValueError(f"xml-inline: tag_pattern must have a named group 'key'. Pattern: {tag_pattern}")
         value = _sub_parse(groups.get("value", ""), value_parser)
         if key in out and merge:
             if not isinstance(out[key], list):
@@ -130,8 +119,6 @@ def _xml_inline(text: str, args: dict) -> dict:
             out[key].append(value)
         else:
             out[key] = value
-    if args.get("strict") and text[end:].strip():
-        raise ValueError("xml-inline: unmatched non-whitespace content")
     return out
 
 
@@ -193,19 +180,13 @@ def _apply_transform(transform: Any, scope: dict) -> Any:
     path = whole.group(1)
     root, *keys = path.split(".")
     if root not in scope:
-        raise KeyError(
-            f"transform placeholder '{{{path}}}' is not defined. Available: {sorted(scope)}"
-        )
+        raise KeyError(f"transform placeholder '{{{path}}}' is not defined. Available: {sorted(scope)}")
     value = scope[root]
     for key in keys:
         if not isinstance(value, dict):
-            raise ValueError(
-                f"transform placeholder '{{{path}}}' cannot index into {type(value).__name__} at '{key}'"
-            )
+            raise ValueError(f"transform placeholder '{{{path}}}' cannot index into {type(value).__name__} at '{key}'")
         if key not in value:
-            raise ValueError(
-                f"transform placeholder '{{{path}}}' is missing key '{key}'. Available: {sorted(value)}"
-            )
+            raise ValueError(f"transform placeholder '{{{path}}}' is missing key '{key}'. Available: {sorted(value)}")
         value = value[key]
     return value
 
@@ -268,3 +249,4 @@ __all__ = [
     "process_field",
     "validate_transform_strings",
 ]
+# fmt: on
