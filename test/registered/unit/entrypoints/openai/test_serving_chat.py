@@ -28,7 +28,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -4388,6 +4390,99 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
+    """DSML tool markup must never be assembled into an assistant message.
+
+    Exercises _process_tool_calls with a real FunctionCallParser (not mocked):
+    when a generation carries tool markup the parser cannot convert, the reply
+    goes out as finish_reason "stop" with no tool_calls, which an
+    OpenAI-compatible client reads as a finished turn, silently dropping the
+    requested calls.
+    """
+
+    DSML = "\uff5cDSML\uff5c"
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "deepseekv4"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+    def _invoke(self):
+        return (
+            f'<{self.DSML}invoke name="get_weather">\n'
+            f'<{self.DSML}parameter name="city" string="true">SF'
+            f"</{self.DSML}parameter>\n</{self.DSML}invoke>"
+        )
+
+    def _run(self, text):
+        return self.chat._process_tool_calls(
+            text, self.tools, {"type": "stop", "matched": None}, tool_choice="auto"
+        )
+
+    def test_markup_becomes_tool_calls_not_content(self):
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "malformed sibling": (
+                f"<{self.DSML}tool_calls>\n"
+                f'<{self.DSML}invoke name="get_weather">\n{{"city": ,}}\n'
+                f"</{self.DSML}invoke>\n{invoke}\n</{self.DSML}tool_calls>"
+            ),
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                tool_calls, remaining_text, finish_reason = self._run(text)
+
+                self.assertNotIn(self.DSML, remaining_text or "")
+                self.assertEqual(finish_reason["type"], "tool_calls")
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0].function.name, "get_weather")
+                self.assertEqual(
+                    json.loads(tool_calls[0].function.arguments), {"city": "SF"}
+                )
+
+    def test_ordinary_turns_are_unaffected(self):
+        """Stripping markup must not disturb replies that carry none."""
+        for label, text in {
+            "plain prose": "Just a normal answer.",
+            "prose naming the format": "The parser looks for DSML markers.",
+        }.items():
+            with self.subTest(payload=label):
+                tool_calls, remaining_text, finish_reason = self._run(text)
+
+                self.assertIsNone(tool_calls)
+                self.assertEqual(remaining_text, text)
+                self.assertEqual(finish_reason["type"], "stop")
+
+    def test_preamble_survives_alongside_the_call(self):
+        tool_calls, remaining_text, finish_reason = self._run(
+            f"Checking the weather.\n\n<{self.DSML}tool_calls>\n"
+            f"{self._invoke()}\n</{self.DSML}tool_calls>"
+        )
+
+        self.assertIn("Checking the weather.", remaining_text)
+        self.assertNotIn(self.DSML, remaining_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(finish_reason["type"], "tool_calls")
 
 
 class TestNormalizeToolContent(unittest.TestCase):
