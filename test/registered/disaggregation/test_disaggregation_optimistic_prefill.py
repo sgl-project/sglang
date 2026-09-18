@@ -433,6 +433,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
+                enable_mamba_extra_buffer=True,
             )
         )
         return tree, allocator, req_to_token_pool
