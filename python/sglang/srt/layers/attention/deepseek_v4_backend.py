@@ -19,7 +19,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+from sglang.kernels.ops.attention.dsv4 import (
+    topk_transform_paged_v2,
+    topk_transform_ragged_v2,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -30,7 +33,11 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    fp4_index_logits_candidate_blocks,
+    fp4_index_logits_decode,
+    fp4_index_logits_req_to_token,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -78,6 +85,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     deep_gemm_fp4_paged_mqa_logits,
+    select_candidate_block_indices,
+    select_candidate_blocks,
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -1017,6 +1026,9 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+
+    # Source-produced sorted blocks, valid position counts, and compact Top-K plan.
+    sm90_candidates: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1985,6 +1997,8 @@ class DeepseekV4AttnBackend(
             ),
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
             c128_compress_metadata=c128_compress_metadata,
+            low_ratio_req_indices=req_pool_indices_repeated.to(torch.int64),
+            low_ratio_pos_i64=core_attn_metadata.positions_casual.to(torch.int64),
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -2887,7 +2901,10 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() or (
+            forward_batch.forward_mode.is_target_verify()
+            and not layer.compressor.use_fused_compress
+        ):
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
             forward_batch.forward_mode.is_target_verify()
@@ -3185,7 +3202,9 @@ class DeepseekV4AttnBackend(
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
-                self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+                self._low_ratio_index_topk_sm90(
+                    layer, x, q_lora, req, pos, forward_batch
+                )
         elif (
             self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
         ):
@@ -3514,9 +3533,10 @@ class DeepseekV4AttnBackend(
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 
-    # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
-    # top-k); move into the candidate indexer with the prefill paths.
-    def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk_sm90(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ) -> None:
+        """Score visible FP4 positions and retain global order in sparse attention slots."""
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3528,7 +3548,8 @@ class DeepseekV4AttnBackend(
             raw_indices.fill_(-1)
         bs = req.shape[0]
         assert pos.shape[0] == bs, (
-            f"decode expects one token per request, {pos.shape=} {bs=}"
+            f"SM90 indexer requires aligned request and position rows, "
+            f"{req.shape=} {pos.shape=}"
         )
         if bs == 0:
             return
@@ -3546,44 +3567,130 @@ class DeepseekV4AttnBackend(
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
-        j = torch.arange(lmax, device=pos.device)
-        valid = j[None, :] < lens[:, None]
-        slots = (
-            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
-            // ratio
+        logical_forward_mode = _get_logical_forward_mode(forward_batch)
+        compact = (
+            (
+                logical_forward_mode.is_decode()
+                or logical_forward_mode.is_target_verify()
+            )
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+            and lmax
+            >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
         )
-        slots = slots.masked_fill(~valid, 0)
-        table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        s = fp4_index_logits_decode(
-            q, weights, slots, lens, table, table.shape[1] // 68
-        )
-        if indexer.is_candidate_source:
-            mask = select_candidate_blocks(
+        candidate_blocks = None
+        score_lens = lens
+        compact_topk_metadata = None
+
+        if compact:
+            if indexer.is_candidate_source:
+                table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+                candidate_scores, candidate_lens = fp4_index_logits_req_to_token(
+                    q,
+                    weights,
+                    self.req_to_token,
+                    req,
+                    lens,
+                    table,
+                    table.shape[1] // 68,
+                    ratio,
+                    lmax,
+                    candidate_block_size=indexer.candidate_block_size,
+                    write_logits=False,
+                )
+                from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+                    candidate_block_state,
+                )
+
+                self.forward_metadata.sm90_candidates = candidate_block_state(
+                    candidate_scores,
+                    candidate_lens,
+                    lens,
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                )
+            candidates = self.forward_metadata.sm90_candidates
+            assert candidates is not None and candidates[0].shape[0] == bs, (
+                "candidate blocks missing for SM90 indexer"
+            )
+            candidate_blocks, score_lens, compact_topk_metadata = candidates
+            table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+            s = fp4_index_logits_candidate_blocks(
+                q,
+                weights,
+                self.req_to_token,
+                req,
+                candidate_blocks,
+                score_lens,
+                table,
+                table.shape[1] // 68,
+                ratio,
+                indexer.candidate_block_size,
+            )
+        else:
+            table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+            s = fp4_index_logits_req_to_token(
+                q,
+                weights,
+                self.req_to_token,
+                req,
+                lens,
+                table,
+                table.shape[1] // 68,
+                ratio,
+                lmax,
+            )
+        if indexer.is_candidate_source and not compact:
+            self.candidate_masks = select_candidate_blocks(
                 s,
                 lens[:, None],
                 topk_blocks=indexer.candidate_topk_blocks,
                 block_size=indexer.candidate_block_size,
             )
-            self.forward_metadata.candidate_metadata = CandidateMasks(mask=mask)
-        elif indexer.uses_candidates:
-            # Published this step by the candidate-source layer's decode pass above.
-            consume = published_masks(self.forward_metadata.candidate_metadata).mask
+        elif indexer.uses_candidates and not compact:
+            consume = self.candidate_masks
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
-                "candidate mask missing for decode"
+                "candidate mask missing for SM90 indexer"
             )
             s = s.masked_fill(~consume[:, :lmax], -torch.inf)
-        k = min(indexer.index_topk, lmax)
-        idx = s.topk(k, dim=-1, sorted=False).indices
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            idx = mask_topk_scores(s, idx)
-            idx = idx.masked_fill(idx < 0, lmax)
-        idx = idx.sort(dim=-1).values
-        reach = idx < lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
-        ).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
+        width = s.shape[1]
+        k = min(indexer.index_topk, width)
+        topk_metadata = (
+            metadata.topk_metadata
+            if candidate_blocks is None and metadata.use_topk_v2
+            else compact_topk_metadata
+        )
+        if topk_metadata is not None:
+            topk_seq_lens = (
+                metadata.compressed_seq_lens if candidate_blocks is None else score_lens
+            )
+            selected = torch.empty_like(page_indices)
+            topk_transform_paged_v2(
+                s,
+                topk_seq_lens,
+                None,
+                selected,
+                1,
+                topk_metadata,
+            )
+            idx = selected[:bs, :k]
+        else:
+            idx = s.topk(k, dim=-1, sorted=False).indices
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            finalize_candidate_topk,
+        )
+
+        finalize_candidate_topk(
+            idx,
+            s,
+            score_lens,
+            self.req_to_token,
+            req,
+            page_indices[:bs],
+            raw_indices[:bs] if raw_indices is not None else None,
+            ratio=ratio,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=indexer.candidate_block_size,
+        )
 
     # TODO(candidate): torch prefill still publishes / consumes masks inline; same
     # move as above.
