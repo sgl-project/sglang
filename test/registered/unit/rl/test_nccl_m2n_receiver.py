@@ -110,7 +110,7 @@ def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
         ("down", "expert_fc2", "w2_weight"),
     ):
         pair = f"model.layers.0.mlp.experts.{component}_proj.weight"
-        for scale in ((False, True) if fp8 else (False,)):
+        for scale in (False, True) if fp8 else (False,):
             size = 2 if scale else 256
             suffix = "_scale" if scale else ""
             dim = (2 if component == "down" else 1) if moe_tp else 0
@@ -264,9 +264,9 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
 
         def complete():
             tensor = reference()
-            assert (
-                tensor is not None
-            ), "receive buffer released before its stream completed"
+            assert tensor is not None, (
+                "receive buffer released before its stream completed"
+            )
             tensor.fill_(2 ** (comm_ptr - 100 + update))
 
         pending[comm_ptr].append(complete)

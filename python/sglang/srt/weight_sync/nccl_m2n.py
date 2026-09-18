@@ -548,7 +548,9 @@ class NcclM2NReceiver:
                 expected_recipes = (
                     _FP8_WEIGHT_RECIPES
                     if tensor_role == "weight"
-                    else _FP8_SCALE_RECIPES if tensor_role == "scale" else None
+                    else _FP8_SCALE_RECIPES
+                    if tensor_role == "scale"
+                    else None
                 )
                 expected_dtype = (
                     "float8_e4m3fn" if tensor_role == "weight" else "float32"
