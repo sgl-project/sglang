@@ -7,7 +7,7 @@ from torch import nn
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 
 class _BoundaryBlock(nn.Module):

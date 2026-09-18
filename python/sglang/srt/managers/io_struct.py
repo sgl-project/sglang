@@ -105,6 +105,12 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Request-local multimodal input failure produced after tokenizer fanout."""
+
+    message: str
+
+
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
 
@@ -448,8 +454,18 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+                # Session history may supply the entire prompt. The scheduler
+                # rejects requests that are still empty after reconstruction.
+                session_id = (
+                    self.session_params.get("id")
+                    if isinstance(self.session_params, dict)
+                    else None
+                )
+                if not session_id:
+                    raise ValueError("input_ids cannot be empty.")
+                self.is_single = True
+                self.batch_size = 1
+            elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -2033,6 +2049,24 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
+
+
+class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
+
+
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
@@ -2045,6 +2079,13 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
+
+    error_msg: str
+    error_code: int
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

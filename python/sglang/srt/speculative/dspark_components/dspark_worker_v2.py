@@ -1,7 +1,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Optional
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -88,8 +89,42 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-class DSparkWorkerV2(BaseSpecWorker):
+@runtime_checkable
+class _SupportsDSparkTargetHiddenProjection(Protocol):
+    def set_dspark_target_hidden_projector(
+        self,
+        projector: Callable[[torch.Tensor], torch.Tensor],
+        *,
+        num_context_features: int,
+    ) -> bool: ...
 
+    def should_project_dspark_target_hidden(
+        self,
+        *,
+        forward_mode: ForwardMode,
+        capture_hidden_mode: CaptureHiddenMode,
+    ) -> bool: ...
+
+
+def _configure_target_hidden_projection(
+    *, target_model, draft_model, is_deepseek_v4_draft: bool
+) -> bool:
+    """Install the optional token-major projection before the target SP gather."""
+    if is_deepseek_v4_draft:
+        return False
+    if not draft_model.supports_pre_gather_target_hidden_projection:
+        return False
+    if not isinstance(target_model, _SupportsDSparkTargetHiddenProjection):
+        return False
+    return bool(
+        target_model.set_dspark_target_hidden_projector(
+            draft_model.project_target_hidden,
+            num_context_features=int(draft_model.num_context_features),
+        )
+    )
+
+
+class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -227,6 +262,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 lm_head=lm_head,
             )
+        self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -377,6 +413,16 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        self._target_hidden_projection_enabled = _configure_target_hidden_projection(
+            target_model=self.target_worker.model_runner.model,
+            draft_model=self.draft_model,
+            is_deepseek_v4_draft=self._draft_is_moe,
+        )
+        if self._target_hidden_projection_enabled and self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark prefill target-hidden projection runs before "
+                "sequence-parallel gather."
+            )
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -487,6 +533,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
+        target_hidden_is_projected = (
+            self._target_hidden_projection_enabled
+            and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
+                forward_mode=batch.forward_mode,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+        )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
@@ -542,6 +596,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
+            target_hidden_is_projected=target_hidden_is_projected,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -858,9 +913,32 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
+        mamba_track_indices = batch.mamba_track_indices
 
-        if batch.mamba_track_indices is not None:
+        if mamba_track_indices is not None:
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+            seq_lens_cpu = batch.seq_lens_cpu
+            if (
+                _is_npu
+                and seq_lens_cpu is not None
+                and seq_lens_cpu.device.type == "cpu"
+                and seq_lens_cpu.ndim == 1
+                and seq_lens_cpu.numel() == seq_lens_pre_verify.numel()
+                and seq_lens_cpu.dtype in (torch.int32, torch.int64)
+            ):
+                # Verify restores the CPU prefix lengths before the forward.
+                # Acceptance can commit at most this many tokens, so this
+                # check needs no device readback. Passing None also avoids
+                # the NPU backend's conv-state self-copy for untracked rows.
+                if all(
+                    seq_len >= 0
+                    and seq_len // mamba_track_interval
+                    == (seq_len + self.verify_num_draft_tokens) // mamba_track_interval
+                    for seq_len in seq_lens_cpu.tolist()
+                ):
+                    mamba_track_indices = None
+
+        if mamba_track_indices is not None:
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -880,7 +958,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
             req_pool_indices=batch.req_pool_indices,

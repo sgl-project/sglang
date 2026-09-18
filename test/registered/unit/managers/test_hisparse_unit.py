@@ -14,11 +14,14 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -49,7 +52,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         output_ids=output_ids,
         fill_ids=origin_input_ids + output_ids,
         seqlen=len(origin_input_ids) + len(output_ids),
-        kv=SimpleNamespace(req_pool_idx=None, kv_allocated_len=0, kv_committed_len=0),
+        kv=ReqKvInfo(),
         finished_reason=None,
         hisparse_staging=False,
         staging=False,
@@ -164,7 +167,14 @@ class TestHiSparseUnit(unittest.TestCase):
 
         Without this, a mid-test assertion failure skips cleanup and leaks
         resources, causing unrelated failures in later tests.
+
+        The code under test reads its configuration from the bags -- the PD
+        decode prealloc path asks whether the decode radix cache is on -- so a
+        case here needs a published config, the way a real process has one.
         """
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
         self.allocator.clear()
         self.req_to_token_pool.clear()
         self.coordinator.mem_pool_host.clear()
@@ -757,7 +767,6 @@ class TestHiSparseUnit(unittest.TestCase):
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
             hisparse_coordinator=self.coordinator,
-            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )
 
         host_indices = queue._pre_alloc(req)

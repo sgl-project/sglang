@@ -92,7 +92,6 @@ def _aiter_supports_mxfp8_dispatch() -> bool:
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
-
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
             hook_fun(dispatcher)
@@ -319,6 +318,15 @@ def init_mori_op(
             else:
                 block_num = 256
                 warp_num_per_block = 16
+
+    if kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode:
+        # mori's intranode combine ends in a grid-wide barrier every block spins
+        # on. A 256-block grid deadlocks on a 192-CU device; clamping to the CU
+        # count is a conservative bound, not the measured residency limit.
+        cu_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        block_num = min(block_num, cu_count)
 
     # Fp8 blockwise combine uses its own internal scale_dim driven which can be
     # overridden by env ``MORI_FP8_COMBINE_SCALE_DIM`` (default 56)
@@ -782,7 +790,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     compute_stream.wait_stream(comm_stream)
 
         else:
-
             (
                 packed_recv_hidden,
                 recv_topk_weights,

@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=43, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"

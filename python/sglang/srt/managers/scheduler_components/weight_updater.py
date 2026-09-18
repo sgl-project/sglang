@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.runtime_context import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,7 @@ class SchedulerWeightUpdaterManager:
         freeing them would leave the daemon and every peer pointing at released
         memory.
         """
-        mode = self.tp_worker.model_runner.server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} of model weights is not supported while the "
@@ -209,9 +210,9 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+        assert self.is_fully_idle(), (
+            "release_memory_occupation should be called only when server is idle."
+        )
 
         tags = recv_req.tags
 
@@ -338,9 +339,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
+            assert draft_url is not None, (
+                "draft_url must be provided when draft model is enabled"
+            )
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):

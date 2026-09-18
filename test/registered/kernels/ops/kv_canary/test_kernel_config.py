@@ -135,15 +135,15 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
         snapshot_bufs.append(cuda_buf.clone())
 
     for i in range(1, num_launches):
-        assert torch.equal(
-            snapshot_rings[0], snapshot_rings[i]
-        ), f"violation_ring differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_write_indices[0], snapshot_write_indices[i]
-        ), f"violation_write_index differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_bufs[0], snapshot_bufs[i]
-        ), f"canary_buf differs between launch 0 and {i}"
+        assert torch.equal(snapshot_rings[0], snapshot_rings[i]), (
+            f"violation_ring differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_write_indices[0], snapshot_write_indices[i]), (
+            f"violation_write_index differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_bufs[0], snapshot_bufs[i]), (
+            f"canary_buf differs between launch 0 and {i}"
+        )
 
 
 def test_write_byte_equal_across_repeated_launches_10x() -> None:
@@ -190,15 +190,15 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
         snapshot_counters.append(cuda_log.slot_run_counter.clone())
 
     for i in range(1, num_launches):
-        assert torch.equal(
-            snapshot_bufs[0], snapshot_bufs[i]
-        ), f"canary_buf differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_rings[0], snapshot_rings[i]
-        ), f"violation_ring differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_counters[0], snapshot_counters[i]
-        ), f"slot_run_counter differs between launch 0 and {i}"
+        assert torch.equal(snapshot_bufs[0], snapshot_bufs[i]), (
+            f"canary_buf differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_rings[0], snapshot_rings[i]), (
+            f"violation_ring differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_counters[0], snapshot_counters[i]), (
+            f"slot_run_counter differs between launch 0 and {i}"
+        )
 
 
 def test_plan_byte_equal_across_repeated_launches_10x() -> None:
@@ -254,18 +254,18 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
         snapshot_write_offsets.append(triton_w.write_offsets.clone())
 
     for i in range(1, num_launches):
-        assert torch.equal(
-            snapshot_slots[0], snapshot_slots[i]
-        ), f"verify_slot_indices differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_positions[0], snapshot_positions[i]
-        ), f"verify_expected_positions differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_prevs[0], snapshot_prevs[i]
-        ), f"verify_prev_slot_indices differs between launch 0 and {i}"
-        assert torch.equal(
-            snapshot_write_offsets[0], snapshot_write_offsets[i]
-        ), f"write_offsets differs between launch 0 and {i}"
+        assert torch.equal(snapshot_slots[0], snapshot_slots[i]), (
+            f"verify_slot_indices differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_positions[0], snapshot_positions[i]), (
+            f"verify_expected_positions differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_prevs[0], snapshot_prevs[i]), (
+            f"verify_prev_slot_indices differs between launch 0 and {i}"
+        )
+        assert torch.equal(snapshot_write_offsets[0], snapshot_write_offsets[i]), (
+            f"write_offsets differs between launch 0 and {i}"
+        )
 
 
 def test_verify_multi_launch_100x_counter_linear() -> None:
@@ -301,9 +301,9 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
 
     torch.cuda.synchronize()
 
-    assert (
-        int(cuda_log.kernel_run_counter[0].item()) == num_launches
-    ), f"kernel_run_counter expected {num_launches}, got {cuda_log.kernel_run_counter[0].item()}"
+    assert int(cuda_log.kernel_run_counter[0].item()) == num_launches, (
+        f"kernel_run_counter expected {num_launches}, got {cuda_log.kernel_run_counter[0].item()}"
+    )
     assert int(cuda_log.slot_run_counter[0].item()) == num_launches, (
         f"slot_run_counter expected {num_launches} (1 active entry x 100 launches), "
         f"got {cuda_log.slot_run_counter[0].item()}"

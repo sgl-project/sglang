@@ -12,7 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -62,6 +62,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         )
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
+        )
+        # Reuse one device-bound worker for graph input updates.
+        self._update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="npu-graph-update",
+            initializer=self._device_module.set_device,
+            initargs=(self._device_id,),
         )
 
     @contextmanager
@@ -150,8 +157,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa.
+        """Rebind seq_lens on the recorded NPU graph, then replay.
+
+        NPUGraph.update must complete before replay can consume the updated
+        KV lengths. Used when the model is not deepseek-nsa.
 
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
@@ -166,17 +175,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
-        def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
-
-        thread = threading.Thread(target=_update)
-        thread.start()
+        update_future = self._update_executor.submit(
+            graph.update, cpu_update_input=cpu_update_input
+        )
+        update_future.result()
         graph.replay()
-        thread.join()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
