@@ -8,6 +8,7 @@
 //! accept the request. Bucket resolution and ordering live one layer up.
 
 pub mod admission;
+pub mod buckets;
 pub mod cache_aware;
 pub mod least_load;
 pub mod power_of_two;

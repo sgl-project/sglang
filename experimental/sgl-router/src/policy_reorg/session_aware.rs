@@ -5,7 +5,8 @@
 //! power-of-two choice. Admission never rewrites an existing binding.
 
 use super::{
-    power_of_two, ready, Admission, Pick, PickError, PickMode, PickRequest, PickResult, Policy,
+    power_of_two, ready, Admission, AdmissionReason, EngineRejection, Pick, PickError, PickMode,
+    PickRequest, PickResult, Policy,
 };
 use crate::policies::state::AffinityStore;
 use crate::workers::Worker;
@@ -46,7 +47,17 @@ impl SessionAwarePolicy {
                 Err(_) => self.fallback(engines, request, "session_admission_fallback"),
             };
         }
-        if request.mode == PickMode::HitRequired || engines.is_empty() {
+        if request.mode == PickMode::HitRequired {
+            // A binding whose engine is not here is reported so the resolver can preserve it.
+            return Err(match self.store.binding(&key) {
+                Some(engine) => PickError::AdmissionRejected(EngineRejection {
+                    engine,
+                    reason: AdmissionReason::NotACandidate,
+                }),
+                None => PickError::NoCandidates,
+            });
+        }
+        if engines.is_empty() {
             return Err(PickError::NoCandidates);
         }
         let admitted = self.admission.admit(engines, &ctx)?;
