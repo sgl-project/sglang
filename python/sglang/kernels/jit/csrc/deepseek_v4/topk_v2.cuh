@@ -19,6 +19,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <bit>
 #include <climits>
 #include <cstdint>
@@ -551,17 +552,34 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
 constexpr uint32_t kSplitMax = 32;  ///< most blocks one row may take
 constexpr uint32_t kSplitMin = 4;   ///< fewest that pays for the second launch
 
-/// Shortest row worth splitting, given how many ways it would be spread.
+/// Blocks a whole launch may spread its rows over -- a cost cap, not an
+/// occupancy target, which is why it is well under the CU count.
+///
+/// Every block folds a histogram in with global atomics and takes its slots
+/// with more, so the cross-block cost grows with rows * split while the scan it
+/// buys back shrinks as L / split. Past ~64 blocks the first wins: measured at
+/// 128K rows, 64 rows spread 32 ways takes 115 us against 34 us spread 4 ways,
+/// and 16 rows spread 16 ways takes 28 us against 22 us spread 4. Capping the
+/// product lands on the measured optimum, or within 0.1 us of it, at every
+/// batch from 1 to 64. The machine is not the limit here -- one block per row
+/// leaves the rows latency bound long before the CUs run out, which is what the
+/// split is for.
+constexpr uint32_t kSplitBlocks = 64;
+
+/// Shortest row worth splitting, given how many rows the launch carries.
 ///
 /// Splitting trades (split-1)/split of one block's two scans for a second
 /// launch and a cross-block epilogue, so it needs the scan it is shortening to
-/// be long enough to cover that -- and the narrower the spread, the less it
-/// saves, so the longer the row has to be. Measured, the trade turns positive
-/// around 48K elements when the row goes 16 or more ways, 64K at eight, and
-/// 80K at four. Going below these costs real time: at 40K spread 32 ways the
-/// split path came out 4 us behind not splitting at all.
-inline constexpr uint32_t split_floor(uint32_t split) {
-  return split >= 16 ? 49152 : split >= 8 ? 65536 : 81920;
+/// be long enough to cover that. What it has to cover scales with the batch and
+/// not with the spread: one block per row costs the same wall time whether the
+/// batch is 1 or 64 -- they run side by side -- while the split path runs its
+/// epilogue once per row. Measured on MI355X at k=2048, the trade turns
+/// positive at 40K elements for a batch up to eight, 49K at sixteen, 62K at 32
+/// and 111K at 64; the rungs below sit at or just above each. Going under them
+/// costs real time -- a 24K row spread 32 ways came out 3 us behind not
+/// splitting at all -- and a batch over 32 barely clears even at 128K.
+inline constexpr uint32_t split_floor(uint32_t batch_size) {
+  return batch_size <= 8 ? 40960 : batch_size <= 16 ? 49152 : batch_size <= 32 ? 65536 : 114688;
 }
 
 /// A cache line each: rows reserve their output slots with atomics on these,
@@ -582,9 +600,22 @@ struct SplitWorkspace {
   uint32_t floor;  ///< same value the host dispatched on
 };
 
-struct TopKSplit : impl::TopKRadixBase<10> {
-  using Base = impl::TopKRadixBase<10>;
-  static_assert(kHistSize == kBlockSize, "the histogram is transferred one bin per thread");
+/// 12 histogram bits, the width TopKStreaming uses, NOT the 10 the cluster path
+/// uses. The threshold bin is resolved from at most kMaxNumTie staged
+/// candidates, so a bin holding more than that many *unequal* scores loses the
+/// ones that did not fit, and a 10-bit bin is four times as wide. Streaming is
+/// the path being replaced here, so it is the accuracy that has to be matched:
+/// measured on 128K rows of `randint(0, n)` scores, 10 bits starts returning
+/// wrong values at n = 64 while 12 bits and Streaming stay exact to n = 16384.
+/// The extra width is free in LDS -- the histogram overlays tie_values, which
+/// is 16 KB either way -- and costs 1 MB of the global scratch.
+struct TopKSplit : impl::TopKRadixBase<12> {
+  using Base = impl::TopKRadixBase<12>;
+  static_assert(kHistSize % kBlockSize == 0, "the histogram is transferred kHistItems bins per thread");
+  /// Bins per thread, in the contiguous tx * kHistItems layout the base's
+  /// init_histogram and find_threshold already use, so the transfers below are
+  /// the same 16-byte accesses.
+  static constexpr uint32_t kHistItems = kHistSize / kBlockSize;
   static constexpr uint32_t kWarp = kBlockSize / impl::TopKConfig::kNumWarps;
 
   struct Smem : Base::Smem {
@@ -617,7 +648,18 @@ struct TopKSplit : impl::TopKRadixBase<10> {
     });
     __syncthreads();
     // One atomic per bin per rank, so `split` of them per address at worst.
-    if (const auto n = smem->histogram[tx]; n != 0) atomicAdd(&row_hist[tx], n);
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      if (const auto n = smem->histogram[bin]; n != 0) atomicAdd(&row_hist[bin], n);
+    }
+  }
+
+  /// Hand a row's histogram back zeroed, so the next launch needs no reset.
+  SGL_DEVICE static void clear_row(uint32_t* __restrict__ row_hist) {
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i)
+      row_hist[threadIdx.x * kHistItems + i] = 0;
   }
 
   /// Scan this rank's chunk and append what clears the threshold.
@@ -637,7 +679,11 @@ struct TopKSplit : impl::TopKRadixBase<10> {
       impl::TieValue* __restrict__ ties,
       Smem* smem) {
     const auto tx = threadIdx.x;
-    smem->histogram[tx] = row_hist[tx];
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      smem->histogram[bin] = row_hist[bin];
+    }
     if (tx == 0) {
       smem->count_eq = 0;
       smem->count_gt = 0;
@@ -789,8 +835,7 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
   TopKSplit::select_chunk(problem, chunk, row_hist, ctr, ties, split_smem);
   if (!TopKSplit::arrive_last(ctr, ws.split, split_smem)) return;
 
-  // Hand the row's histogram back zeroed, so the next launch needs no reset.
-  row_hist[threadIdx.x] = 0;
+  TopKSplit::clear_row(row_hist);
   TopKSplit::finish_ties(problem, ties, split_smem);
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
@@ -869,19 +914,20 @@ inline const SplitResources& split_resources(int device_id) {
 /// How many blocks to give each row, and the scratch they share. Zero means the
 /// ordinary one-block-per-row dispatch.
 ///
-/// Splitting pays when the row is long enough to be bandwidth bound and there
-/// are too few rows to fill the machine: one block per row occupies R of the
-/// CUs, and what is left over is what the second launch is buying. kSplitMin
-/// is where the extra launch stops being worth it.
+/// Splitting pays when the row is long enough that one block's two scans of it
+/// dominate, and there are few enough rows that the cross-block cost of taking
+/// it apart stays small. Both bounds are measured: split_floor for the length,
+/// kSplitBlocks for how far it is worth spreading.
 inline auto split_plan(uint32_t batch_size, uint32_t max_seq_len, DLDevice device)
     -> std::pair<uint32_t, SplitWorkspace> {
   const auto& res = split_resources(device.device_id);
   if (res.cu <= 0 || batch_size == 0 || batch_size > res.max_rows) return {0, {}};
-  const auto split = std::min<uint32_t>(res.cu / batch_size, kSplitMax);
-  if (split < kSplitMin || max_seq_len <= split_floor(split)) return {0, {}};
+  const auto split = std::clamp<uint32_t>(kSplitBlocks / batch_size, kSplitMin, kSplitMax);
+  const auto floor = split_floor(batch_size);
+  if (split < kSplitMin || max_seq_len <= floor) return {0, {}};
   auto ws = res.ws;
   ws.split = split;
-  ws.floor = split_floor(split);
+  ws.floor = floor;
   return {split, ws};
 }
 #endif  // USE_ROCM
@@ -1079,10 +1125,10 @@ struct TopKKernel {
         }
       }
 #elif defined(USE_ROCM)
-      // Split dispatch. Splitting is worth it exactly when the row is long
-      // enough to be bandwidth bound and there are too few rows to fill the
-      // machine: with one block per row a batch of R occupies R of the CUs, so
-      // the spare capacity is what pays for the second launch.
+      // Split dispatch. One block per row leaves a long row latency bound on a
+      // single CU however idle the rest of the machine is, so the second launch
+      // is buying parallelism the first dispatch cannot reach; split_plan is
+      // where the shapes that pays for are decided.
       if (const auto [split, split_ws] = split_plan(batch_size, max_seq_len, device); split >= kSplitMin) {
         LaunchKernel({batch_size, split}, kBlockSize, device)
             .config({.use_pdl = kUsePDL})

@@ -465,5 +465,32 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm split path")
+@pytest.mark.parametrize("nvals", [64, 1024, 16384])
+@pytest.mark.parametrize("batch,seq", [(1, 131072), (8, 131072)])
+@torch.inference_mode()
+def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> None:
+    """Duplicate-heavy rows: the cross-block tie merge must stay exact.
+
+    The split path resolves the threshold bin in whichever block arrives last,
+    out of a tie list that every block appended to, so it is exact only while
+    that bin holds no more candidates than the list. Rows of ``nvals`` distinct
+    scores put ``seq / nvals`` exact duplicates at the cut, which is what fills
+    it; the shapes are long and narrow enough to reach the split gate. CUDA
+    runs its cluster path here, whose coarser histogram makes the same bin four
+    times as wide, so this is the ROCm path's test.
+    """
+    k = 2048
+    g = torch.Generator(device="cuda").manual_seed(nvals * 7 + seq)
+    scores = torch.randint(0, nvals, (batch, seq), generator=g, device="cuda").float()
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    out = torch.full((batch, k), -2, dtype=torch.int32, device="cuda")
+
+    topk_transform_paged_v2(scores, seq_lens, None, out, PAGE_SIZE, _plan(seq_lens))
+
+    for row in range(batch):
+        _assert_topk_values(scores[row], out[row], k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
