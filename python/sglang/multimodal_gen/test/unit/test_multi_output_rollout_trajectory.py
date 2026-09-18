@@ -2,15 +2,11 @@ import unittest
 
 import torch
 
-from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-    _select_output_rollout_trajectory,
-)
-from sglang.multimodal_gen.runtime.managers.gpu_worker import (
-    _concat_rollout_trajectory_data,
-)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDitTrajectory,
     RolloutTrajectoryData,
+    concat_rollout_trajectory_data,
+    select_output_rollout_trajectory,
 )
 
 _STEPS = 4
@@ -30,17 +26,10 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
 
 
 class TestMultiOutputRolloutTrajectory(unittest.TestCase):
-    """Guards per-sample rollout trajectories across the multi-output merge.
-
-    A ``num_outputs_per_prompt=K`` request runs as K per-output forwards, each
-    producing its own trajectory. The merge used to keep only the first
-    (``if merged.rollout_trajectory_data is None``) and the per-output result
-    assembly never narrowed it, so all K samples reported output 0's log-probs.
-    For GRPO that makes the group's advantages cancel and the gradient vanish.
-    """
+    """Guard per-sample rollout trajectories across the multi-output merge."""
 
     def test_merge_concatenates_per_output_trajectories(self):
-        merged = _concat_rollout_trajectory_data(
+        merged = concat_rollout_trajectory_data(
             [_per_output_trajectory(i) for i in range(3)]
         )
 
@@ -51,7 +40,7 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
         self.assertEqual(tuple(merged.dit_trajectory.latents.shape), (3, _STEPS + 1, 2))
 
     def test_merge_keeps_group_shared_schedule_from_first_output(self):
-        merged = _concat_rollout_trajectory_data(
+        merged = concat_rollout_trajectory_data(
             [_per_output_trajectory(i) for i in range(3)]
         )
 
@@ -61,29 +50,25 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
         self.assertEqual(tuple(merged.dit_trajectory.sigmas.shape), (_STEPS + 1,))
 
     def test_merge_drops_trajectory_when_only_some_outputs_have_one(self):
-        """A partial group cannot be aligned to ``[K, ...]``, so drop it.
-
-        Returning the one present row would silently label it as the whole
-        group's trajectory -- the same broadcast bug in a different disguise.
-        """
+        """Drop a partial trajectory group that cannot stay output-aligned."""
         partial = [_per_output_trajectory(0), None, _per_output_trajectory(2)]
 
-        self.assertIsNone(_concat_rollout_trajectory_data(partial))
+        self.assertIsNone(concat_rollout_trajectory_data(partial))
 
     def test_single_output_group_is_passed_through(self):
         only = _per_output_trajectory(0)
 
-        merged = _concat_rollout_trajectory_data([only])
+        merged = concat_rollout_trajectory_data([only])
 
         self.assertIs(merged, only)
 
     def test_each_output_index_selects_its_own_row(self):
-        merged = _concat_rollout_trajectory_data(
+        merged = concat_rollout_trajectory_data(
             [_per_output_trajectory(i) for i in range(3)]
         )
 
         selected = [
-            _select_output_rollout_trajectory(merged, index) for index in range(3)
+            select_output_rollout_trajectory(merged, index) for index in range(3)
         ]
 
         values = [entry.rollout_log_probs.flatten()[0].item() for entry in selected]
@@ -96,14 +81,14 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             )
 
     def test_select_without_output_index_returns_group_trajectory(self):
-        merged = _concat_rollout_trajectory_data(
+        merged = concat_rollout_trajectory_data(
             [_per_output_trajectory(i) for i in range(3)]
         )
 
-        self.assertIs(_select_output_rollout_trajectory(merged, None), merged)
+        self.assertIs(select_output_rollout_trajectory(merged, None), merged)
 
     def test_select_tolerates_missing_trajectory(self):
-        self.assertIsNone(_select_output_rollout_trajectory(None, 0))
+        self.assertIsNone(select_output_rollout_trajectory(None, 0))
 
 
 if __name__ == "__main__":

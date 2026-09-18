@@ -81,9 +81,8 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutDebugTensors,
-    RolloutDitTrajectory,
     RolloutTrajectoryData,
+    concat_rollout_trajectory_data,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.realtime.video import (
@@ -125,77 +124,6 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
     rollout_trajectory_data: list[RolloutTrajectoryData | None] = field(
         default_factory=list
-    )
-
-
-def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
-    """Concat per-output tensors along the batch dim, or ``None`` if any is unset.
-
-    A field that only some outputs carry cannot be assembled into a coherent
-    ``[K, ...]`` batch, so it is dropped rather than silently misaligned.
-    """
-    if not tensors or any(tensor is None for tensor in tensors):
-        return None
-    return torch.cat(tensors, dim=0)
-
-
-def _concat_rollout_trajectory_data(
-    per_output: list[RolloutTrajectoryData | None],
-) -> RolloutTrajectoryData | None:
-    """Assemble K per-output trajectories into one batch-dim-``K`` trajectory.
-
-    Each per-output forward produces its own trajectory with batch dim 1 (its
-    own x_T slice and per-step SDE noise), so the group's trajectory is their
-    concatenation along dim 0 -- mirroring how ``output`` and
-    ``trajectory_latents`` are already merged.
-
-    ``timesteps`` and ``sigmas`` describe the shared denoising schedule, and
-    ``denoising_env`` the shared conditioning, so those come from the first
-    output. Returns ``None`` unless every output carried a trajectory, since a
-    partial group cannot be assembled into an aligned ``[K, ...]`` batch.
-    """
-    if any(data is None for data in per_output):
-        return None
-
-    first = per_output[0]
-    if len(per_output) == 1:
-        return first
-
-    debug_tensors = None
-    if all(data.rollout_debug_tensors is not None for data in per_output):
-        debug = [data.rollout_debug_tensors for data in per_output]
-        debug_tensors = RolloutDebugTensors(
-            rollout_variance_noises=_cat_per_output(
-                [entry.rollout_variance_noises for entry in debug]
-            ),
-            rollout_prev_sample_means=_cat_per_output(
-                [entry.rollout_prev_sample_means for entry in debug]
-            ),
-            rollout_noise_std_devs=_cat_per_output(
-                [entry.rollout_noise_std_devs for entry in debug]
-            ),
-            rollout_model_outputs=_cat_per_output(
-                [entry.rollout_model_outputs for entry in debug]
-            ),
-        )
-
-    dit_trajectory = None
-    if all(data.dit_trajectory is not None for data in per_output):
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_cat_per_output(
-                [data.dit_trajectory.latents for data in per_output]
-            ),
-            timesteps=first.dit_trajectory.timesteps,
-            sigmas=first.dit_trajectory.sigmas,
-        )
-
-    return RolloutTrajectoryData(
-        rollout_log_probs=_cat_per_output(
-            [data.rollout_log_probs for data in per_output]
-        ),
-        rollout_debug_tensors=debug_tensors,
-        denoising_env=first.denoising_env,
-        dit_trajectory=dit_trajectory,
     )
 
 
@@ -1474,7 +1402,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 for decoded_step in parts.trajectory_decoded_parts
             ]
         if any(data is not None for data in parts.rollout_trajectory_data):
-            merged.rollout_trajectory_data = _concat_rollout_trajectory_data(
+            merged.rollout_trajectory_data = concat_rollout_trajectory_data(
                 parts.rollout_trajectory_data
             )
 
