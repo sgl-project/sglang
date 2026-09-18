@@ -78,6 +78,7 @@ class SamplingBatchInfo:
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
+    sampling_mask_max_top_k: int = 1
 
     # Device
     device: str = "cuda"
@@ -154,6 +155,10 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        sampling_mask_max_top_k = max(
+            (int(r.sampling_params.top_k) for r in reqs if r.return_sampling_mask),
+            default=1,
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -223,6 +228,7 @@ class SamplingBatchInfo:
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -488,6 +494,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = (
                 self.return_sampling_masks or [False] * self_len
             ) + (other.return_sampling_masks or [False] * other_len)
+            self.sampling_mask_max_top_k = max(
+                self.sampling_mask_max_top_k,
+                other.sampling_mask_max_top_k,
+            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
