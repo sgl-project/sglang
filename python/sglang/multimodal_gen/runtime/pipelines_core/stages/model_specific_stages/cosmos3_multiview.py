@@ -122,6 +122,48 @@ COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT = (
     "camera's viewpoint, shared ego motion, road layout, object identity and motion, "
     "weather, lighting, cross-view consistency, and camera-LiDAR alignment."
 )
+# The training text tokenizer changed the AV system prompts on Sep 15 2026
+# (imaginaire4 86041fb1b52): WSM is named explicitly and a control-adherence
+# paragraph follows. Exports trained after that (the maskless phase-2.2 run)
+# read these; earlier exports read the two above. See ``system_prompt_variant``.
+COSMOS3_AV_WSM_CONTROL_INSTRUCTION = (
+    "Follow WSM controls for vehicles (including trucks), cyclists, pedestrians, "
+    "traffic lights, traffic signs, road markings, lane boundaries, and road boundaries. "
+    "Do not add objects or road features in these categories that are absent from WSM. "
+    "Use captions for appearance and unconstrained background details; WSM takes "
+    "precedence in any conflict."
+)
+COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM = (
+    "You are a helpful assistant that generates temporally synchronized, geometrically "
+    "consistent autonomous-driving videos from per-camera scene descriptions and World "
+    "Scenario Map (WSM) control videos depicting the controlled objects and road layout. "
+    "Treat all camera views as simultaneous observations of the same driving scene, "
+    "preserving each camera's viewpoint, shared ego motion, road layout, object identity "
+    "and motion, weather, lighting, and cross-view consistency.\n\n"
+    f"{COSMOS3_AV_WSM_CONTROL_INSTRUCTION}"
+)
+COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM = (
+    "You are a helpful assistant that jointly generates temporally synchronized, "
+    "geometrically consistent autonomous-driving camera videos and LiDAR range-view "
+    "sequences from per-camera scene descriptions and provided control signals: "
+    "per-camera World Scenario Map (WSM) control videos depicting the controlled objects "
+    "and road layout, and an HD-map control for LiDAR. Treat all camera views and LiDAR "
+    "sweeps as synchronized observations of the same driving scene, preserving each "
+    "camera's viewpoint, shared ego motion, road layout, object identity and motion, "
+    "weather, lighting, cross-view consistency, and camera-LiDAR alignment.\n\n"
+    f"{COSMOS3_AV_WSM_CONTROL_INSTRUCTION}"
+)
+AV_SYSTEM_PROMPTS_BY_VARIANT: dict[str, tuple[str, str]] = {
+    # variant -> (camera-only transfer, joint camera+LiDAR transfer)
+    "provided_controls": (
+        COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
+        COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT,
+    ),
+    "wsm_controls": (
+        COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM,
+        COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM,
+    ),
+}
 # Control-adherence sentences appended to every caption after the metadata.
 COSMOS3_MULTIVIEW_EMPHASIS = (
     "Follow the wsm control videos precisely for every camera view: shape, contour, "
@@ -311,6 +353,7 @@ def apply_metadata_templates(
     duration_template: str | None,
     resolution_template: str | None,
     force_duration_template: bool = False,
+    truncate_duration: bool = False,
 ) -> str:
     """Append duration and resolution sentences to a prose caption."""
     prompt = prompt.strip()
@@ -321,7 +364,12 @@ def apply_metadata_templates(
     if head:
         parts.append(head)
     if duration_template is not None and (num_frames > 1 or force_duration_template):
-        duration = num_frames / fps
+        duration: float = num_frames / fps
+        if truncate_duration:
+            # The training augmentor (DurationFPSTextTimeStamps) writes whole
+            # seconds unless fractional_duration is set, which the multiview
+            # datasets do not; 17 frames at 30 fps reads "0.0 seconds".
+            duration = float(int(duration))
         parts.append(duration_template.format(duration=duration, fps=fps).rstrip("."))
     if resolution_template is not None:
         parts.append(resolution_template.format(height=height, width=width).rstrip("."))
@@ -495,6 +543,7 @@ def format_per_view_prompts(
             width=width,
             duration_template=DURATION_TEMPLATE,
             resolution_template=RESOLUTION_TEMPLATE,
+            truncate_duration=True,
         )
         if emphasis:
             prompt = f"{prompt.rstrip()} {emphasis}"
@@ -868,11 +917,10 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
                 width=width,
                 emphasis=emphasis,
             )
-            system_prompt = (
-                COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT
-                if joint
-                else COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT
-            )
+            camera_prompt, joint_prompt = AV_SYSTEM_PROMPTS_BY_VARIANT[
+                self.deployment.system_prompt_variant
+            ]
+            system_prompt = joint_prompt if joint else camera_prompt
             cond_ids, cond_lengths = self._tokenize_compact(
                 prompts, cap, device, system_prompt
             )
@@ -1170,6 +1218,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             backend=self.attention_backend,
             max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate else 1),
             items=tuple(items),
+            lidar_attends_captions=deployment.lidar_attends_captions,
         )
         temporal_position_period = (
             latent_frames_per_view

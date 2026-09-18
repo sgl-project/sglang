@@ -25,6 +25,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_maskless import (
+    maskless_unavailable_reason,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -33,7 +36,15 @@ MULTIVIEW_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEN
 
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 COSMOS3_MULTIVIEW_ATTENTION_SCOPES = ("all_views", "same_view", "decomposed")
-COSMOS3_MULTIVIEW_ATTENTION_BACKENDS = ("triton", "fa4")
+COSMOS3_MULTIVIEW_ATTENTION_BACKENDS = ("triton", "fa4", "maskless")
+# ``triton``/``fa4`` project the same masked predicate; ``maskless`` is a
+# different attention (two overlapping dense folds merged by log-sum-exp), so
+# a checkpoint exported for one family is not served faithfully by the other.
+COSMOS3_MULTIVIEW_MASKED_BACKENDS = ("triton", "fa4")
+# AV system prompt wordings: "provided_controls" is the text the Sep-15 (masked)
+# exports were trained with, "wsm_controls" the Sep-15-onward training text the
+# maskless exports were trained with (names WSM, adds a control-adherence paragraph).
+COSMOS3_SYSTEM_PROMPT_VARIANTS = ("provided_controls", "wsm_controls")
 
 # The fixed 11-camera MADS rig order the v1 checkpoint was exported with.
 COSMOS3_MADS_CAMERAS = (
@@ -174,6 +185,11 @@ class Cosmos3MultiviewDeploymentConfig(msgspec.Struct, frozen=True):
     variable_view_count: bool = False
     inference_defaults: dict[str, Any] | None = None
     lidar: dict[str, Any] | None = None
+    lidar_attends_captions: bool = True
+    #: Which AV system prompt wording the captions were trained under; the
+    #: export does not record it, so it follows the export vintage (see
+    #: ``COSMOS3_SYSTEM_PROMPT_VARIANTS``) unless ``system_prompt_variant`` is set.
+    system_prompt_variant: str = "provided_controls"
 
     @property
     def num_views(self) -> int:
@@ -465,6 +481,33 @@ def parse_multiview_deployment_config(
             "Cosmos3 multiview backend must be one of "
             f"{list(COSMOS3_MULTIVIEW_ATTENTION_BACKENDS)}, got {backend!r}."
         )
+    lidar_attends_captions = raw.get("lidar_attends_captions", True)
+    if not isinstance(lidar_attends_captions, bool):
+        raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
+    # The Sep-15 training prompt change landed with the maskless recipe, so the
+    # backend is the only vintage marker an export carries.
+    system_prompt_variant = raw.get(
+        "system_prompt_variant",
+        "wsm_controls" if backend == "maskless" else "provided_controls",
+    )
+    if system_prompt_variant not in COSMOS3_SYSTEM_PROMPT_VARIANTS:
+        raise ValueError(
+            "Cosmos3 multiview system_prompt_variant must be one of "
+            f"{list(COSMOS3_SYSTEM_PROMPT_VARIANTS)}, got {system_prompt_variant!r}."
+        )
+    if backend == "maskless":
+        if schema_version != 2:
+            raise ValueError(
+                "Cosmos3 multiview backend 'maskless' requires schema_version=2 metadata; "
+                "re-export the checkpoint."
+            )
+        reason = maskless_unavailable_reason(
+            attention_scope=attention_scope,
+            decomposed_temporal_window_seconds=temporal_window,
+            control_attends_sensor=bool(raw["control_attends_sensor"]),
+        )
+        if reason is not None:
+            raise ValueError(f"Cosmos3 multiview backend 'maskless': {reason}")
 
     return Cosmos3MultiviewDeploymentConfig(
         cameras=tuple(cameras),
@@ -481,6 +524,8 @@ def parse_multiview_deployment_config(
         variable_view_count=variable_view_count,
         inference_defaults=inference_defaults,
         lidar=lidar,
+        lidar_attends_captions=lidar_attends_captions,
+        system_prompt_variant=system_prompt_variant,
     )
 
 
@@ -497,10 +542,10 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
     use_duration_template: bool = True
     use_system_prompt: bool = True
 
-    # Sparse attention kernel. ``None`` follows the checkpoint's
-    # ``multiview.backend``; ``"fa4"`` needs an SM90/SM100 GPU, CUDA 13, and flash-attn-4.
-    # Both backends project the same visibility predicate, so overriding is
-    # safe for A/B measurement without editing the checkpoint.
+    # Attention kernel. ``None`` follows the checkpoint's ``multiview.backend``;
+    # ``"fa4"`` needs an SM90/SM100 GPU, CUDA 13, and flash-attn-4. Swapping
+    # ``triton`` and ``fa4`` is safe for A/B measurement; the masked family and
+    # ``maskless`` are different attention patterns and cannot be swapped.
     multiview_attention_backend: str | None = None
 
     # Parsed once from transformer/config.json in update_config_from_dict.
@@ -543,6 +588,16 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
                 "Cosmos3 multiview attention backend must be one of "
                 f"{list(COSMOS3_MULTIVIEW_ATTENTION_BACKENDS)}, got {backend!r} "
                 f"(from {source})."
+            )
+        exported = self.multiview_deployment.backend
+        if (backend == "maskless") != (exported == "maskless"):
+            # triton <-> fa4 is a kernel swap; masked <-> maskless changes the
+            # attention the weights were trained with, so it is not an override.
+            raise ValueError(
+                f"Cosmos3 multiview attention backend {backend!r} (from {source}) is not "
+                f"the family the checkpoint was exported for ({exported!r}). The masked "
+                "(triton/fa4) and maskless backends are different attention patterns; "
+                "pick a backend from the checkpoint's family or re-export the checkpoint."
             )
         return backend, source
 

@@ -142,7 +142,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         logger.info(
             "Cosmos3 multiview pipeline stages created (%d cameras, scope=%s, "
             "control_attends_sensor=%s, backend=%s, schema=%s, per-camera captions=%s, "
-            "lidar=%s)",
+            "lidar=%s, system prompt=%s)",
             deployment.num_views,
             deployment.attention_scope,
             deployment.control_attends_sensor,
@@ -150,6 +150,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             deployment.schema_version,
             deployment.separate_view_text_tokenization,
             deployment.supports_lidar,
+            deployment.system_prompt_variant,
         )
 
 

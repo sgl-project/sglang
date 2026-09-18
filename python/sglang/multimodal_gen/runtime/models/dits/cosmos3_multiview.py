@@ -41,6 +41,10 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
     MultiviewLayout,
     padded_multiview_flex_attention,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_maskless import (
+    MASKLESS_BACKEND,
+    multiview_maskless_attention,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3CrossAttention,
     Cosmos3OmniTransformer,
@@ -89,6 +93,8 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 "Cosmos3 multiview cross-attention expected MultiviewAttentionContext, "
                 f"got {type(multiview_layout).__name__}."
             )
+        if multiview_layout.layout.backend == MASKLESS_BACKEND:
+            return multiview_maskless_attention(q, k, v, k_und, v_und, multiview_layout)
         return padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
 
 
