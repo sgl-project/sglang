@@ -284,11 +284,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.kv.mamba_pool_idx = None
         return
 
-    effective_kv_committed_len = req.effective_kv_committed_len()
+    should_insert = is_insert and not getattr(req, "skip_radix_cache_insert", False)
+    kv_len_to_handle = (
+        req.effective_kv_committed_len() if should_insert else req.kv.kv_committed_len
+    )
     tree_cache.cache_finished_req(
         req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
+        is_insert=should_insert,
+        kv_len_to_handle=kv_len_to_handle,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
@@ -297,7 +300,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if not req.kv.holds_kv:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    start_p, end_p = kv_len_to_handle, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
@@ -321,11 +324,12 @@ def _release_overallocated_kv_indices(
     page_size = allocator.page_size
     spec_algo = get_spec().speculative_algorithm
 
-    # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
+    # The cacheable prefix can be shorter than the physical committed KV;
+    # strip_thinking_cache widens that gap on purpose (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
-            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        assert req.kv.kv_committed_len == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, "
+            f"{req.kv.kv_allocated_len=}, {req.seqlen=}"
         )
 
     # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
