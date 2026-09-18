@@ -3704,7 +3704,7 @@ class UnifiedRadixCacheSuite:
         # Simulate polling check_hicache_events.
         # There will be a sequence of events populated from queue:
         # 1. a storage hit notification (from cc.prefetch_hit_queue).
-        # 2. a HiCacheAck, indicating the copmletion of KV pool read.
+        # 2. a HiCacheAck, indicating the completion of KV pool read.
         # 3. a HiCacheAck, indicating the completion of SWA pool read.
         # 4. a HiCacheACk, idnicating the completion of entire prefetch request.
         # We are going to stop at the exact timing-window between 3 and 4.  So we have to
@@ -10177,7 +10177,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         cache.dec_host_lock_ref.assert_not_called()
         self.assertEqual(controller.prefetch_tokens_occupied, 8)
 
-    def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
+    def test_positive_hit_with_lost_anchor_reports_anchor_lost(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache.ongoing_prefetch = {
@@ -10191,7 +10191,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         cache._handle_storage_prefetch_anchor_loss(self._REQ)
 
         cache._finish_storage_prefetch.assert_called_once_with(
-            self._REQ, fulfilled_tokens=0, reason="shrunk"
+            self._REQ, fulfilled_tokens=0, reason="anchor_lost"
         )
         # The eviction widened the span, so the request replans over it --
         # skipping the query, the prior hit having proved it stored, and the
