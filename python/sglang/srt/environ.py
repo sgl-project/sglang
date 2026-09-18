@@ -948,8 +948,20 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
+    # routed front / DeepEP dispatch / routed GEMMs, respectively.
+    SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
+    # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
+    SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
+    # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
+    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
+    # BF16 wo_a: use F.linear for single-local-group decode (Flash TP8),
+    # retaining the original weight layout. Opt-in for A/B.
+    SGLANG_OPT_NPU_BF16_WO_A_GEMM = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
@@ -1041,7 +1053,7 @@ class Envs:
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
-    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(True)
+    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1945,6 +1957,10 @@ def third_party_cache_defaults() -> Dict[str, str]:
         "TRITON_CACHE_DIR": os.path.join(base, "triton"),
         "TORCHINDUCTOR_CACHE_DIR": os.path.join(base, "inductor"),
         "CUDA_CACHE_PATH": os.path.join(base, "nv"),
+        # TileLang compiles the DeepSeek-V4 MHC prenorm kernels; left at its own
+        # default the burst is invisible to anyone warming, mounting or baking
+        # SGLANG_CACHE_DIR, and gets paid again on every cold container.
+        "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,

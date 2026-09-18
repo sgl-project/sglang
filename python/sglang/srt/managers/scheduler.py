@@ -3921,6 +3921,12 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                self.chunked_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
