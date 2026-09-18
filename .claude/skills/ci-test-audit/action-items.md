@@ -12,7 +12,23 @@ sections are about the pipeline around the tests.
 
 ## A. Should this test exist in this form?
 
-**A1. A variant whose configuration is a strict subset of another variant's is redundant.**
+**A1. Every case answers "what future diff would turn this red?"; if the only answer is editing the test, delete it.**
+The admission criteria in `../../rules/unit-test-admission.md` apply to existing cases as
+much as new ones. Spot: a test for a code path or kernel that no longer exists;
+assertions that only check a mock was called; a stress loop that cannot reproduce the
+failure it claims to guard; a case whose every assertion is also made by another case in
+the group. Examples: #34464, #34667, #39013, #38881, #38259.
+
+**A2. A test earns its cost by what it protects; a guard on a standalone, rarely touched, rarely used surface can be deleted outright.**
+Tests exist to stop other people's changes from breaking code. That value scales with
+how often the code changes, how many users hit it, and how entangled it is with other
+paths. Spot: the module under test has had no non-test commits in months; it has few
+importers; the feature sits behind a flag almost nobody enables or serves one model few
+people run. The heavier the test (server launch, multi-GPU), the higher this bar.
+Examples: none applied on this ground yet; #37990 (cases for models nobody runs) and
+#38011 (low-signal model tests demoted from the PR gate) are partial.
+
+**A3. A variant whose configuration is a strict subset of another variant's is redundant.**
 Holds when three things are true: the configs differ by one dimension; that dimension is
 additive (it adds load or a knob position rather than gating a path or skipping
 assertions); and the heavier variant's assertions cover the lighter one's. Watch for
@@ -20,20 +36,20 @@ variants that override a test method, and for looser expectations in the heavier
 (a longer timeout or relaxed bound), which make the lighter one still worth keeping.
 Examples: #38093, #39544, #33745, #33586, #34070, #33763, #34464, #33752, #39013, #34882.
 
-**A2. Suites that differ only in launch arguments should share one server or engine.**
+**A4. Suites that differ only in launch arguments should share one server or engine.**
 Spot: several classes in a group whose `setUpClass` differs by a flag. Launch cost usually
 dominates the cases themselves, so this saves more than the case count suggests.
 Examples: #33641, #33756, #33944, #36736, #38014, #37252.
 
-**A3. An end-to-end matrix whose only varying dimension is one layer belongs in a layer-level unit test.**
+**A5. An end-to-end matrix whose only varying dimension is one layer belongs in a layer-level unit test.**
 Spot: a full server launch matrix that exists to select a kernel or backend. Examples: #33596, #33611.
 
-**A4. A skip or disable carries a reason and an expiry; long-lived ones are dead coverage.**
+**A6. A skip or disable carries a reason and an expiry; long-lived ones are dead coverage.**
 Spot: `disabled=` registrations or `skipTest` calls with no reference to what would
 un-skip them; skips older than the issue they were waiting on. Examples: #32324, #39368,
 #38585, #34377, #33772, #34779.
 
-**A5. A registration with no live runner or no reachable test is noise.**
+**A7. A registration with no live runner or no reachable test is noise.**
 Spot: registrations naming a retired `runner_config`; registered files whose TestCase
 classes never execute. Examples: #33654, #34070.
 
