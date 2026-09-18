@@ -5,16 +5,18 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,
+    DEFAULT_IMG_CFG_SCALE,
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -135,20 +137,23 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
     def _cache_dit_blocked_reason(
         self,
-        batch: Req,
         server_args: ServerArgs,
         *,
+        guidance_profile: SenseNovaGuidanceProfile,
         cfg_interval: tuple[float, float],
     ) -> str | None:
         """Why a request that asked for Cache-DiT cannot mount it; None when it can."""
         if server_args.enable_breakable_cuda_graph:
             return "breakable CUDA graphs are enabled"
-        # cache-dit's separate-CFG context expects a stable pair of forwards
-        # per diffusion step.  SenseNova can gate CFG by timestep, producing
-        # a 1 -> 2 -> 1 call rhythm; do not let that rhythm advance a generic
-        # cache context incorrectly.  Full-interval CFG has a stable pair and
-        # is supported.  A future branch-aware adapter can lift this guard.
-        if float(batch.guidance_scale) > 1.0 and tuple(cfg_interval) != (0.0, 1.0):
+        if guidance_profile.branch_count > 2:
+            return "three conditioning branches are not supported"
+        # cache-dit's separate-CFG context expects a stable pair of forwards per
+        # diffusion step. T2I and IT2I use different interval predicates
+        # (inclusive + cfg_scale > 1 versus strict bounds + a lo == 0 escape),
+        # so the only shared, unambiguous multi-branch schedule is (0, 1).
+        # Reject other intervals instead of letting a varying call rhythm
+        # advance the cache context on the wrong branch.
+        if guidance_profile.branch_count > 1 and tuple(cfg_interval) != (0.0, 1.0):
             return "timestep-gated CFG is not supported; cfg_interval must be (0, 1)"
         return None
 
@@ -158,6 +163,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         server_args: ServerArgs,
         *,
         cfg_interval: tuple[float, float],
+        guidance_profile: SenseNovaGuidanceProfile,
     ) -> None:
         """Mount or refresh the pure-image Cache-DiT path for one request."""
         if self._cache_dit_cleanup_required:
@@ -166,7 +172,9 @@ class SenseNovaU1GenerationStage(PipelineStage):
         requested = self._cache_dit_requested(batch)
         if requested:
             blocked_reason = self._cache_dit_blocked_reason(
-                batch, server_args, cfg_interval=cfg_interval
+                server_args,
+                guidance_profile=guidance_profile,
+                cfg_interval=cfg_interval,
             )
             if blocked_reason is not None:
                 logger.warning_once(
@@ -181,9 +189,11 @@ class SenseNovaU1GenerationStage(PipelineStage):
             self._unmount_cache_dit()
             return
 
-        self._mount_or_refresh_cache_dit(batch)
+        self._mount_or_refresh_cache_dit(batch, guidance_profile=guidance_profile)
 
-    def _mount_or_refresh_cache_dit(self, batch: Req) -> None:
+    def _mount_or_refresh_cache_dit(
+        self, batch: Req, *, guidance_profile: SenseNovaGuidanceProfile
+    ) -> None:
         """Reuse the mounted Cache-DiT context, or mount one for this request."""
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
             CACHE_DIT_DBCACHE_KEYS,
@@ -206,7 +216,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         # Compare effective settings so omitted and explicit defaults share a mount.
         effective_config = cache_dit_env_defaults()
         effective_config.update(overrides)
-        has_separate_cfg = float(batch.guidance_scale) > 1.0
+        has_separate_cfg = guidance_profile.has_separate_cfg
         desired_key = (cache_dit_overrides_key(effective_config), has_separate_cfg)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
@@ -268,8 +278,9 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 transformer,
                 config,
                 model_name="sensenova-qwen3-image",
-                # Full-interval CFG issues a stable cond/uncond pair at every
-                # step; timestep-gated CFG was rejected before mounting.
+                # A full-interval two-branch schedule issues a stable pair at
+                # every step; timestep-gated and three-branch schedules were
+                # rejected before mounting.
                 has_separate_cfg=has_separate_cfg,
             )
         except Exception:
@@ -296,8 +307,16 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
         options = SenseNovaU1GenerationOptions.from_batch(batch)
+        guidance_profile = derive_guidance_profile(
+            is_edit=False,
+            cfg_scale=float(batch.guidance_scale),
+            img_cfg_scale=DEFAULT_IMG_CFG_SCALE,
+        )
         self._maybe_enable_cache_dit(
-            batch, server_args, cfg_interval=options.cfg_interval
+            batch,
+            server_args,
+            guidance_profile=guidance_profile,
+            cfg_interval=options.cfg_interval,
         )
         seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 

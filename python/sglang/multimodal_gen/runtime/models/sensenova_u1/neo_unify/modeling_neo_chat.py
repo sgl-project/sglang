@@ -6,6 +6,11 @@ from typing import List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
 import transformers
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_IMG_CFG_SCALE,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
+)
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig
@@ -1893,11 +1898,11 @@ class NEOChatModel(PreTrainedModel):
         merge_size = int(1 / self.downsample_ratio)
         question_condition = f"{prompt}"
         think_text = ""
-        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_img_condition = needs_cfg and (
-            img_cfg_scale == 1 or cfg_scale != img_cfg_scale
+        guidance_profile = derive_guidance_profile(
+            is_edit=True,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=img_cfg_scale,
         )
-        needs_uncondition = needs_cfg and img_cfg_scale != 1
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -1909,12 +1914,12 @@ class NEOChatModel(PreTrainedModel):
         )
         query_img_condition = (
             self._build_t2i_query("<image>" * len(images), append_text=IMG_START_TOKEN)
-            if needs_img_condition
+            if guidance_profile.needs_image_condition
             else None
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_uncondition
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2183,11 +2188,9 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if not use_cfg:
+            if not use_cfg or guidance_profile is SenseNovaGuidanceProfile.CONDITION:
                 v_pred = out_cond
-            elif cfg_scale == 1 and img_cfg_scale == 1:
-                v_pred = out_cond
-            elif img_cfg_scale == 1:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_IMAGE:
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2200,7 +2203,7 @@ class NEOChatModel(PreTrainedModel):
                     image_size=image_size,
                 )
                 v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
-            elif cfg_scale == img_cfg_scale:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL:
                 out_uncond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
@@ -2214,6 +2217,10 @@ class NEOChatModel(PreTrainedModel):
                 )
                 v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
+                assert (
+                    guidance_profile
+                    is SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL
+                )
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2305,7 +2312,11 @@ class NEOChatModel(PreTrainedModel):
         # question_condition += f"\nThe resolution of the image should be {image_size}"
 
         think_text = ""
-        needs_cfg = cfg_scale > 1
+        guidance_profile = derive_guidance_profile(
+            is_edit=False,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=DEFAULT_IMG_CFG_SCALE,
+        )
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -2317,7 +2328,7 @@ class NEOChatModel(PreTrainedModel):
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_cfg
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2517,7 +2528,11 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+            if (
+                t >= cfg_interval[0]
+                and t <= cfg_interval[1]
+                and guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL
+            ):
                 v_pred_uncondition = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,

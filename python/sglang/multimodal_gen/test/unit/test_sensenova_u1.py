@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import itertools
 import json
 import sys
 import types
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from PIL import Image
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
@@ -18,6 +19,8 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -159,24 +162,110 @@ def _cache_dit_batch(
     )
 
 
+def _t2i_guidance_profile(cfg_scale: float) -> SenseNovaGuidanceProfile:
+    return derive_guidance_profile(
+        is_edit=False,
+        cfg_scale=cfg_scale,
+        img_cfg_scale=1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_edit", "cfg_scale", "img_cfg_scale", "expected_profile"),
+    [
+        (False, 0.5, 1.0, SenseNovaGuidanceProfile.CONDITION),
+        (False, 4.0, 1.0, SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL),
+        (True, 0.5, 1.0, SenseNovaGuidanceProfile.CONDITION_IMAGE),
+        (True, 1.0, 1.0, SenseNovaGuidanceProfile.CONDITION),
+        (True, 4.0, 1.0, SenseNovaGuidanceProfile.CONDITION_IMAGE),
+        (True, 4.0, 4.0, SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL),
+        (
+            True,
+            4.0,
+            2.0,
+            SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL,
+        ),
+    ],
+)
+def test_sensenova_u1_guidance_profile_matches_generation_schedule(
+    is_edit, cfg_scale, img_cfg_scale, expected_profile
+):
+    profile = derive_guidance_profile(
+        is_edit=is_edit,
+        cfg_scale=cfg_scale,
+        img_cfg_scale=img_cfg_scale,
+    )
+    assert profile is expected_profile
+    assert profile.branch_count == len(expected_profile.value)
+
+
+@pytest.mark.parametrize(
+    ("profile", "cfg_interval", "expected_enabled"),
+    [
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.0, 1.0), True),
+        (SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL, (0.0, 1.0), True),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL, (0.0, 1.0), False),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.2, 0.8), False),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.0, 0.5), False),
+    ],
+)
+def test_sensenova_u1_it2i_cache_dit_fails_closed_for_unsupported_schedules(
+    monkeypatch, profile, cfg_interval, expected_enabled
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+
+    stage._maybe_enable_cache_dit(
+        _cache_dit_batch(),
+        _cache_dit_server_args(),
+        guidance_profile=profile,
+        cfg_interval=cfg_interval,
+    )
+
+    assert bool(calls["enable"]) is expected_enabled
+    if expected_enabled:
+        assert calls["enable"][0][2]["has_separate_cfg"] is profile.has_separate_cfg
+
+
+def test_sensenova_u1_cache_dit_requires_an_explicit_guidance_profile():
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+
+    with pytest.raises(TypeError, match="guidance_profile"):
+        stage._maybe_enable_cache_dit(
+            _cache_dit_batch(),
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+        )
+
+
 class _CacheDitRecordingBlock(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, transform=None):
         super().__init__()
         self.calls = []
         self.attention_type = "full_attention"
+        self.transform = transform or (lambda hidden_states: hidden_states + 1)
 
     def forward(self, hidden_states, *, sensenova_marker=None, **kwargs):
         self.calls.append((sensenova_marker, kwargs))
-        return hidden_states + 1
+        return self.transform(hidden_states)
 
 
 class _CacheDitSenseNovaTransformer(torch.nn.Module):
     """Small SenseNova-shaped transformer for the real cache-dit wrapper test."""
 
-    def __init__(self):
+    def __init__(self, layers=None):
         super().__init__()
         self.layers = torch.nn.ModuleList(
-            [_CacheDitRecordingBlock(), _CacheDitRecordingBlock()]
+            layers
+            if layers is not None
+            else [_CacheDitRecordingBlock(), _CacheDitRecordingBlock()]
         )
         self.config = SimpleNamespace(num_hidden_layers=2)
         self.used_native_layers = []
@@ -812,7 +901,10 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
     )
 
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
 
     assert len(calls["enable"]) == 1
@@ -830,7 +922,10 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
     # A sequential n>1 request enters the generation stage once per output.
     # The second output refreshes the context instead of remounting Cache-DiT.
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     assert len(calls["refresh"]) == 1
     refreshed_transformer, refreshed_steps, refreshed_config = calls["refresh"][0]
@@ -841,7 +936,10 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
 
     batch.sampling_params.enable_cache_dit = False
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     assert calls["disable"] == [transformer]
     assert stage._cache_dit_active_config is None
@@ -867,7 +965,12 @@ def test_sensenova_u1_disabled_cache_ignores_params(
     server_args = _cache_dit_server_args()
     cfg_interval = (0.0, 1.0)
     if prior_enabled:
-        stage._maybe_enable_cache_dit(batch, server_args, cfg_interval=cfg_interval)
+        stage._maybe_enable_cache_dit(
+            batch,
+            server_args,
+            cfg_interval=cfg_interval,
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
 
     # A shared client config may retain knobs that SenseNova does not support.
     batch.sampling_params.cache_dit_params = {"enable_taylorseer": False}
@@ -878,7 +981,12 @@ def test_sensenova_u1_disabled_cache_ignores_params(
     else:
         cfg_interval = (0.2, 0.8)
 
-    stage._maybe_enable_cache_dit(batch, server_args, cfg_interval=cfg_interval)
+    stage._maybe_enable_cache_dit(
+        batch,
+        server_args,
+        cfg_interval=cfg_interval,
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
 
     assert len(calls["enable"]) == int(prior_enabled)
     assert calls["disable"] == ([transformer] if prior_enabled else [])
@@ -932,7 +1040,10 @@ def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
 
     with pytest.raises(RuntimeError, match="cache-dit mount failed"):
         stage._maybe_enable_cache_dit(
-            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
         )
 
     assert calls["disable"] == [transformer]
@@ -961,7 +1072,10 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
     # Preserve the original mount error even when its rollback also fails.
     with pytest.raises(RuntimeError, match="cache-dit mount failed"):
         stage._maybe_enable_cache_dit(
-            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
         )
 
     assert stage._cache_dit_enabled is False
@@ -975,7 +1089,10 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
     batch.sampling_params.enable_cache_dit = False
     with pytest.raises(RuntimeError, match="cache-dit cleanup failed"):
         stage._maybe_enable_cache_dit(
-            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
         )
 
     assert calls["disable"] == [transformer, transformer]
@@ -1002,11 +1119,17 @@ def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
     )
 
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     batch.guidance_scale = second_guidance_scale
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
 
     assert len(calls["enable"]) == 2
@@ -1036,7 +1159,10 @@ def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
     )
 
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     try:
         inputs = torch.zeros(1, 2, 4)
@@ -1073,6 +1199,62 @@ def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
     assert not hasattr(transformer, "_original_forward")
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
     assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+def test_sensenova_u1_real_cache_dit_wrapper_isolates_cfg_residuals():
+    pytest.importorskip("cache_dit")
+
+    transformer = _CacheDitQwen3Model(
+        layers=[
+            _CacheDitRecordingBlock(transform=lambda hidden_states: hidden_states),
+            _CacheDitRecordingBlock(transform=lambda hidden_states: hidden_states * 2),
+        ]
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch(
+        guidance_scale=4.0,
+        num_inference_steps=2,
+        cache_dit_params={
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 1,
+            # Force the second visit to each branch to consume its cached
+            # residual, making cross-branch state immediately observable.
+            "residual_diff_threshold": 1.0,
+        },
+    )
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL,
+    )
+    try:
+        indicators = torch.ones(1, 1, dtype=torch.bool)
+
+        def denoise(value, marker):
+            return transformer(
+                torch.full((1, 1, 1), value),
+                image_gen_indicators=indicators,
+                update_cache=False,
+                sensenova_marker=marker,
+            )
+
+        # First pair populates residuals: +1 for condition, +10 for uncondition.
+        torch.testing.assert_close(denoise(1.0, "condition-0"), torch.tensor([[[2.0]]]))
+        torch.testing.assert_close(
+            denoise(10.0, "uncondition-0"), torch.tensor([[[20.0]]])
+        )
+
+        # Each second-pass result must use its own branch's previous residual.
+        torch.testing.assert_close(denoise(2.0, "condition-1"), torch.tensor([[[3.0]]]))
+        torch.testing.assert_close(
+            denoise(20.0, "uncondition-1"), torch.tensor([[[30.0]]])
+        )
+    finally:
+        stage._unmount_cache_dit()
 
 
 def test_sensenova_u1_invalid_output_count_does_not_mount_cache_dit(monkeypatch):
@@ -1313,6 +1495,135 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.finish_count == 1
 
 
+_GUIDANCE_SCALE_MATRIX = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0]
+
+
+def _expected_it2i_branches(cfg_scale, img_cfg_scale, use_cfg):
+    """Independent oracle for the public IT2I guidance semantics."""
+    if not use_cfg or (cfg_scale == 1 and img_cfg_scale == 1):
+        return ("condition",)
+    if img_cfg_scale == 1:
+        return ("condition", "image_condition")
+    if cfg_scale == img_cfg_scale:
+        return ("condition", "uncondition")
+    return ("condition", "image_condition", "uncondition")
+
+
+@pytest.mark.parametrize(
+    ("cfg_interval", "cfg_active_by_step"),
+    [
+        ((0.0, 1.0), (True, True, True, True, True)),
+        ((0.25, 0.75), (False, False, True, True, False)),
+        # IT2I's lo == 0 escape deliberately makes every step active.
+        ((0.0, 0.5), (True, True, True, True, True)),
+    ],
+)
+@pytest.mark.parametrize(
+    ("cfg_scale", "img_cfg_scale"),
+    list(itertools.product(_GUIDANCE_SCALE_MATRIX, repeat=2)),
+)
+def test_sensenova_it2i_guidance_profile_drives_real_loop_branches(
+    monkeypatch,
+    cfg_scale,
+    img_cfg_scale,
+    cfg_interval,
+    cfg_active_by_step,
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    forward_globals = NEOChatModel.it2i_generate.__wrapped__.__globals__
+    monkeypatch.setitem(forward_globals, "prepare_flash_kv_cache", lambda *a, **k: None)
+    monkeypatch.setitem(forward_globals, "clear_flash_kv_cache", lambda *a: None)
+    monkeypatch.setitem(
+        forward_globals,
+        "load_image_native",
+        lambda *a, **k: (torch.zeros(1, 3), torch.tensor([[1, 1]])),
+    )
+
+    branch_ids = {
+        "condition": 1.0,
+        "image_condition": 2.0,
+        "uncondition": 3.0,
+    }
+    branch_names = {int(value): key for key, value in branch_ids.items()}
+    calls = []
+
+    def build_query(question, *, system_message=None, append_text=None):
+        if system_message is not None:
+            return "condition"
+        return "image_condition" if question else "uncondition"
+
+    def build_inputs(_tokenizer, query, *_args):
+        inputs = torch.full((1, 1, 3), branch_ids[query])
+        indexes = torch.zeros(3, 1, dtype=torch.long)
+        return inputs, indexes, None
+
+    def prefix_forward(inputs, *_args):
+        branch = branch_names[int(inputs[0, 0, 0].item())]
+        return SimpleNamespace(branch=branch, layers=[]), torch.zeros(1)
+
+    def predict(_image_embeds, _indexes, _mask, past_key_values, t, *_args, **_kwargs):
+        calls.append(
+            (
+                round(float(t), 6),
+                None if past_key_values is None else past_key_values.branch,
+            )
+        )
+        return torch.zeros_like(_image_embeds)
+
+    class _ZeroEmbedder(torch.nn.Module):
+        def forward(self, values):
+            return torch.zeros(values.numel(), 3, device=values.device)
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        config=SimpleNamespace(),
+        patch_size=1,
+        downsample_ratio=1,
+        noise_scale=0.0,
+        noise_scale_mode="constant",
+        noise_scale_max_value=1.0,
+        add_noise_scale_embedding=False,
+        fm_modules={"timestep_embedder": _ZeroEmbedder()},
+        _notify_layer_offload_phase=lambda _phase: None,
+        _build_t2i_query=build_query,
+        _build_it2i_inputs=build_inputs,
+        _build_t2i_image_indexes=lambda h, w, *a, **k: torch.zeros(3, h * w),
+        _it2i_prefix_forward=prefix_forward,
+        patchify=lambda x, *a, **k: x.flatten(2).transpose(1, 2).contiguous(),
+        extract_feature=lambda x, **k: torch.zeros_like(x),
+        _t2i_predict_v=predict,
+        unpatchify=lambda z, patch, h, w: z.transpose(1, 2).reshape(-1, 3, h, w),
+    )
+    tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 0)
+
+    output = NEOChatModel.it2i_generate(
+        model,
+        tokenizer,
+        "prompt",
+        [Image.new("RGB", (2, 2))],
+        image_size=(2, 2),
+        num_steps=len(cfg_active_by_step),
+        cfg_scale=cfg_scale,
+        img_cfg_scale=img_cfg_scale,
+        cfg_interval=cfg_interval,
+        enable_timestep_shift=False,
+    )
+
+    expected_by_step = [
+        _expected_it2i_branches(cfg_scale, img_cfg_scale, use_cfg)
+        for use_cfg in cfg_active_by_step
+    ]
+    actual_by_step = [
+        tuple(branch for _, branch in grouped_calls)
+        for _, grouped_calls in itertools.groupby(calls, key=lambda call: call[0])
+    ]
+    assert actual_by_step == expected_by_step
+    assert output.shape == (1, 3, 2, 2)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("num_steps", [0, 1, 4])
 @pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
@@ -1431,12 +1742,18 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
         cache_dit_params=explicit if explicit_first else None,
     )
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     batch.sampling_params.cache_dit_params = None if explicit_first else explicit
     batch.num_inference_steps = 12
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     assert len(calls["enable"]) == 1
     assert calls["enable"][0][1].kwargs["residual_diff_threshold"] == 0.24
@@ -1445,7 +1762,10 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
 
     batch.sampling_params.cache_dit_params = {"residual_diff_threshold": 0.1}
     stage._maybe_enable_cache_dit(
-        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
     )
     assert len(calls["enable"]) == 2
     assert calls["enable"][1][1].kwargs["residual_diff_threshold"] == 0.1
@@ -1470,7 +1790,10 @@ def test_sensenova_cache_dit_rejects_invalid_attention_before_mount(
     batch = _cache_dit_batch()
     with pytest.raises(ValueError, match="attention type"):
         stage._maybe_enable_cache_dit(
-            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
         )
     assert calls == {"enable": [], "disable": [], "refresh": []}
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
