@@ -27,7 +27,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_exec,
     get_model,
     get_schedule,
@@ -359,14 +358,7 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    is_pd_prefill_target = (
-        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
-    )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
+    if not mr.is_generation or mr.is_draft_worker:
         return
     # Multimodal generation wrappers can still run this text-only EXTEND dummy;
     # an incompatible model should fail the explicit opt-in visibly.
