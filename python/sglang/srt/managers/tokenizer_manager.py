@@ -244,6 +244,8 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    admission_wait_seconds: Optional[float] = None
+    admission_ttft_observed: bool = False
 
     dispatched: bool = False
     abort_sent: bool = False
@@ -3049,6 +3051,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
 
+        if (
+            state.admission_wait_seconds is not None
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            timing_labels = {
+                **labels,
+                "is_streaming": str(bool(getattr(state.obj, "stream", False))).lower(),
+            }
+            if completion_tokens > 0 and not state.admission_ttft_observed:
+                state.admission_ttft_observed = True
+                self.metrics_collector.histogram_admission_inclusive_ttft.labels(
+                    **timing_labels
+                ).observe(
+                    state.admission_wait_seconds
+                    + state.time_stats.get_first_token_latency()
+                )
+            if state.finished:
+                self.metrics_collector.histogram_admission_inclusive_e2e.labels(
+                    **timing_labels
+                ).observe(
+                    state.admission_wait_seconds + state.time_stats.get_e2e_latency()
+                )
+
         if state.finished:
             # Get detailed cache breakdown if available
             cached_tokens_details = None
@@ -3607,6 +3632,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if envs.SGLANG_TRUST_SMG_ADMISSION_TIMING.get() and request:
+                from sglang.srt.observability.admission_timing import parse_admission_wait
+
+                state.admission_wait_seconds = parse_admission_wait(
+                    request.headers.get("x-smg-admission-wait-seconds")
+                )
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)

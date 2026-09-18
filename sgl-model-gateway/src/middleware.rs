@@ -490,11 +490,21 @@ impl ConcurrencyLimiter {
 }
 
 /// Middleware function for concurrency limiting with optional queuing
+fn set_admission_wait(request: &mut Request<Body>, wait: Duration) {
+    request.headers_mut().insert(
+        "x-smg-admission-wait-seconds",
+        HeaderValue::from_str(&format!("{:.9}", wait.as_secs_f64()))
+            .expect("finite duration is a valid header"),
+    );
+}
+
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Never accept client-supplied queue timing, including with admission disabled.
+    set_admission_wait(&mut request, Duration::ZERO);
     // Check mesh global rate limit first if mesh is enabled
     // If mesh is not enabled, this check is skipped and local rate limiting is used
     if let Some(sync_manager) = &app_state.mesh_sync_manager {
@@ -550,8 +560,9 @@ pub async fn concurrency_limit_middleware(
             // Create a channel for the token response
             let (permit_tx, permit_rx) = oneshot::channel();
 
+            let queued_at = Instant::now();
             let queued = QueuedRequest {
-                queued_at: Instant::now(),
+                queued_at,
                 permit_tx,
             };
 
@@ -573,6 +584,7 @@ pub async fn concurrency_limit_middleware(
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
 
+                            set_admission_wait(&mut request, queued_at.elapsed());
                             let response = next.run(request).await;
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
@@ -1045,5 +1057,29 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+}
+
+#[cfg(test)]
+mod admission_timing_tests {
+    use super::*;
+
+    #[test]
+    fn queue_timing_overwrites_untrusted_headers() {
+        let mut request = Request::new(Body::empty());
+        request.headers_mut().insert(
+            "x-smg-admission-wait-seconds",
+            HeaderValue::from_static("1000"),
+        );
+        set_admission_wait(&mut request, Duration::ZERO);
+        assert_eq!(
+            request.headers()["x-smg-admission-wait-seconds"],
+            "0.000000000"
+        );
+        set_admission_wait(&mut request, Duration::from_millis(1250));
+        assert_eq!(
+            request.headers()["x-smg-admission-wait-seconds"],
+            "1.250000000"
+        );
     }
 }
