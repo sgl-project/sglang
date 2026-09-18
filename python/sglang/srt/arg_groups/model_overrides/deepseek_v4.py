@@ -43,8 +43,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
         logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
 
-    # DeepSeek-V4 keeps the ratio sizing; V4.1 leaves the ratio unset so the pool
-    # configurator sizes the SWA pool from the request cap instead.
+    # Left unset, the pool configurator sizes the SWA pool from the request cap.
     if (
         cfg.swa_full_tokens_ratio is None
         and getattr(hf_config, "model_type", None) != "deepseek_v41"

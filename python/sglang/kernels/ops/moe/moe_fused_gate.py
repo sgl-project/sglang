@@ -190,8 +190,7 @@ def _router_triton_kernel(
             sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
             activated = libdevice.sqrt(sp)
         else:
-            # sqrt(softplus(x)) with log1p recovered from log via z*log(u)/(u-1);
-            # the DeepSeek-V4 numerics.
+            # Open-coded log1p; reproduces the DeepSeek-V4 sqrtsoftplus numerics.
             z = tl.exp(-tl.abs(scores))
             u = 1.0 + z
             exact = u == 1.0

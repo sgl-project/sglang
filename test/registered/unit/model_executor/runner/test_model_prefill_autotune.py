@@ -24,8 +24,8 @@ class TestModelPrefillAutotune(CustomTestCase):
             dtype=torch.bfloat16,
         )
         self.runner = SimpleNamespace(model_runner=self.mr)
-        # Deliberately no dummy-buffer or attention APIs: this path must not
-        # construct a TARGET_VERIFY batch or mutate request/KV state.
+        # No dummy-buffer or attention APIs: this path must not build a
+        # TARGET_VERIFY batch or mutate request/KV state.
         for target, kwargs in (
             ("max_prefill_buffer_tokens", {"return_value": 65536}),
             (

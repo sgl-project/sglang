@@ -656,8 +656,8 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
     # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
-    # off the memory the reduction touches. The fused kernel is a caller opt-in
-    # (V4.1): it does not reproduce torch.argmax's NaN selection.
+    # off the memory the reduction touches. The fused kernel does not reproduce
+    # torch.argmax's NaN selection, hence the opt-in.
     if (
         fused
         and logits.is_cuda

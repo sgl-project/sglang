@@ -1,3 +1,6 @@
+"""A TP-sharded MXFP4 trtllm-gen MoE whose per-rank intermediate size needs
+padding must sum to the unsharded experts' output."""
+
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace

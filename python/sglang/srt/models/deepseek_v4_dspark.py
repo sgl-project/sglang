@@ -393,8 +393,6 @@ class DSparkV4MarkovHead(nn.Module):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
-        # The sharded greedy fold and the NVLink vocab gather ship with V4.1;
-        # a V4 head keeps the block sampler and the NCCL all-gather.
         self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(

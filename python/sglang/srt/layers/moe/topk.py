@@ -1608,8 +1608,8 @@ def _fused_gate_emits_packed_ids(
     routing_overridden: bool,
     enabled: bool,
 ) -> bool:
-    # The pack is taken from the router's final values, so every condition here
-    # rules out a later rewrite of ids or weights.
+    # The pack is taken from the router's final values, so every condition past
+    # the caller's opt-in rules out a later rewrite of ids or weights.
     return (
         enabled
         and _fused_gate_masks_padded_rows(scoring_func)

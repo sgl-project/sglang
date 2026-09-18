@@ -455,7 +455,6 @@ def _apply_wo_a_bf16_matmul(
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
-    # fast_path is the caller's opt-in (V4.1); off, the einsum / aiter path runs.
     global _wo_a_aiter_batched_gemm_disabled
     if (
         fast_path
