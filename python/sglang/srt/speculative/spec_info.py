@@ -403,6 +403,10 @@ class SpecInput(ABC):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
+    # Dataclasses assign fields before __post_init__ calls this base's __init__;
+    # assigning None there would overwrite the constructor's custom_mask.
+    custom_mask: Optional[torch.Tensor] = None
+
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
