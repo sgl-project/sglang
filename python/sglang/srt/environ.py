@@ -1041,7 +1041,7 @@ class Envs:
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
-    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(True)
+    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
