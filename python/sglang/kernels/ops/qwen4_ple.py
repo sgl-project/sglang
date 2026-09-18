@@ -574,3 +574,153 @@ def fused_qwen4_verify_conv(
         enable_fp_fusion=False,
     )
     return output
+
+
+def can_fuse_qwen4_ple(
+    key,
+    query,
+    value,
+    hidden,
+    kw,
+    qw,
+    cw,
+    weight,
+    state,
+    indices,
+    valid,
+    width,
+    intermediate=None,
+):
+    if width not in (1, 4) or not key.is_cuda or key.dtype != torch.bfloat16:
+        return False
+    if key.ndim != 2 or key.shape[1] != 10240 or not 0 < key.shape[0] <= 32:
+        return False
+    tokens = key.shape[0]
+    if indices.ndim != 1 or indices.numel() * width != tokens:
+        return False
+    tensors = (key, query, value, hidden, kw, qw, cw, weight)
+    if any(
+        x.device != key.device
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or x.data_ptr() % 16
+        for x in tensors
+    ):
+        return False
+    if (
+        query.shape != key.shape
+        or hidden.shape != key.shape
+        or value.shape != (tokens, 2560)
+    ):
+        return False
+    if any(x.shape != (10240,) for x in (kw, qw, cw)) or weight.shape != (10240, 1, 4):
+        return False
+    if (
+        state.ndim != 3
+        or state.shape[0] == 0
+        or state.shape[1:] != (10240, 9)
+        or state.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return False
+    if width == 1:
+        span = 1
+        for stride, size in sorted(zip(state.stride(), state.shape)):
+            if size > 1 and stride < span:
+                return False
+            span += (size - 1) * stride
+    if (
+        indices.dtype != torch.int64
+        or valid.dtype != torch.bool
+        or valid.shape != (tokens,)
+        or not valid.is_contiguous()
+    ):
+        return False
+    if any(x.device != key.device for x in (state, indices, valid)):
+        return False
+    if intermediate is not None and (
+        intermediate.device != key.device
+        or intermediate.dtype != state.dtype
+        or intermediate.ndim != 4
+        or intermediate.shape[0] < indices.numel()
+        or intermediate.shape[1] < width
+        or intermediate.shape[2:] != (10240, 9)
+    ):
+        return False
+    if intermediate is not None:
+        span = 1
+        for stride, size in sorted(zip(intermediate.stride(), intermediate.shape)):
+            if size > 1 and stride < span:
+                return False
+            span += (size - 1) * stride
+    if key.device.index != torch.cuda.current_device():
+        return False
+    return torch.cuda.get_device_capability(key.device) == (10, 0)
+
+
+def fused_qwen4_ple(
+    key,
+    query,
+    value,
+    hidden,
+    kw,
+    qw,
+    cw,
+    weight,
+    state,
+    indices,
+    valid,
+    width,
+    intermediate=None,
+    *,
+    track_indices=None,
+    track_mask=None,
+):
+    if not can_fuse_qwen4_ple(
+        key,
+        query,
+        value,
+        hidden,
+        kw,
+        qw,
+        cw,
+        weight,
+        state,
+        indices,
+        valid,
+        width,
+        intermediate,
+    ):
+        raise ValueError("unsupported input for fused Qwen4 PLE")
+    if track_indices is not None and (
+        width != 1
+        or track_indices.shape != indices.shape
+        or track_indices.device != key.device
+        or track_indices.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("unsupported PLE decode tracking indices")
+    if track_mask is not None and (
+        track_indices is None
+        or track_mask.shape != indices.shape
+        or track_mask.device != key.device
+        or track_mask.dtype != torch.bool
+    ):
+        raise ValueError("unsupported PLE decode tracking mask")
+    from sglang.kernels.kda_kernels.qwen4_ple_fusion import fused_ple
+
+    return fused_ple(
+        key,
+        query,
+        value,
+        hidden,
+        kw,
+        qw,
+        cw,
+        weight,
+        state,
+        indices,
+        valid,
+        width,
+        intermediate,
+        track_indices,
+        track_mask,
+    )
