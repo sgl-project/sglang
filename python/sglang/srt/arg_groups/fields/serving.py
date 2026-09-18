@@ -33,9 +33,14 @@ class Serving(msgspec.Struct):
     enable_response_store: A[
         bool,
         "Enable in-memory Responses storage for retrieval, chaining, and background "
-        "requests. Disabled by default; unsupported with prefill-decode "
-        "disaggregation. Storage has no TTL or size limit.",
+        "requests. Disabled by default; PD requires responses-generation-url. "
+        "Storage has no TTL or size limit.",
     ] = False
+    responses_generation_url: A[
+        Optional[str],
+        "Trusted HTTP router origin for expanded native Responses generation turns. "
+        "The receiving frontend retains Responses state; /generate selects P and D.",
+    ] = None
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,

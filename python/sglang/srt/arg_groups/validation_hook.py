@@ -27,7 +27,27 @@ logger = logging.getLogger(__name__)
 
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
-    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+    if cfg.responses_generation_url:
+        from urllib.parse import urlsplit
+
+        origin = urlsplit(cfg.responses_generation_url)
+        if (
+            origin.scheme not in ("http", "https")
+            or not origin.hostname
+            or origin.username is not None
+            or origin.password is not None
+            or origin.path not in ("", "/")
+            or origin.query
+            or origin.fragment
+        ):
+            raise ValueError(
+                "responses_generation_url must be a trusted HTTP router origin"
+            )
+    if (
+        cfg.enable_response_store
+        and cfg.disaggregation_mode != "null"
+        and not cfg.responses_generation_url
+    ):
         raise ValueError(
             "--enable-response-store is not supported with "
             "--disaggregation-mode=prefill or decode; response storage must "
