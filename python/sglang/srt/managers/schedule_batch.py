@@ -2386,6 +2386,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
+    encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2723,6 +2724,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            for req in reqs:
+                if (
+                    req.multimodal_inputs is not None
+                    or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    raise ValueError(
+                        "encoder SWA replay currently supports token-only text requests"
+                    )
+                if req.return_logprob and req.logprob_start_len not in (
+                    -1,
+                    len(req.origin_input_ids),
+                ):
+                    raise ValueError(
+                        "encoder SWA replay cannot return cached prompt logprobs"
+                    )
+            self.encoder_swa_reset = [
+                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
+            ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
