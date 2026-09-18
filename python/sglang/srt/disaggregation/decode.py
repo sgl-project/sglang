@@ -2237,6 +2237,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
+        if not replayed_boundary and not _is_fake_transfer(decode_req.req):
+            customized_info = self.metadata_buffers.get_customized_info(idx)
+            if customized_info is not None:
+                if decode_req.req.customized_info is None:
+                    decode_req.req.customized_info = {}
+                for key, values in customized_info.items():
+                    decode_req.req.customized_info.setdefault(key, []).extend(values)
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None

@@ -2210,6 +2210,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if not (
+            len(prefill_aux_ptrs) == len(prefill_aux_item_lens) == len(dst_aux_ptrs)
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer count mismatch: "
+                f"prefill={len(prefill_aux_ptrs)}, "
+                f"prefill lengths={len(prefill_aux_item_lens)}, "
+                f"decode={len(dst_aux_ptrs)}. "
+                "Prefill and decode must use matching builds and metadata options."
+            )
 
         for i, _ in enumerate(dst_aux_ptrs):
             length = prefill_aux_item_lens[i]

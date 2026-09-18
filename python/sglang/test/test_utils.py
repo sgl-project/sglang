@@ -869,16 +869,15 @@ def popen_launch_pd_server(
     other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    launch_module: str = "sglang.launch_server",
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    command = "sglang.launch_server"
-
     command = [
         "python3",
         "-m",
-        command,
+        launch_module,
         "--model-path",
         model,
         *[str(x) for x in other_args],

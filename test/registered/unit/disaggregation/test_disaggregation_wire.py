@@ -1,3 +1,4 @@
+import os
 import struct
 import threading
 import unittest
@@ -544,6 +545,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
+            customized_info=None,
             cached_tokens=0,
             cached_tokens_device=0,
             cached_tokens_host=0,
@@ -564,14 +566,18 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             bootstrap_room=9,
         )
 
-    def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
-        buffers = MetadataBuffers(
+    @staticmethod
+    def _make_buffers():
+        return MetadataBuffers(
             size=2,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
             max_sampling_mask_tokens=16,
             output_dsa_topk_indices_dim=3,
         )
+
+    def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
+        buffers = self._make_buffers()
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
@@ -587,6 +593,47 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+        req = self._make_req(None)
+        for value in (None, {}):
+            with self.subTest(customized_info=value):
+                req.customized_info = {"scores": [0.25]}
+                buffers.set_buf(req)
+                req.customized_info = value
+                buffers.set_buf(req)
+                self.assertEqual(buffers.get_customized_info(0), value)
+
+    def test_customized_info_capacity_override_and_overflow(self):
+        with patch.dict(os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES="8192"):
+            buffers = self._make_buffers()
+        req = self._make_req(None)
+        req.customized_info = {"payload": ["x" * 5000]}
+        buffers.set_buf(req)
+        self.assertEqual(buffers.get_customized_info(0), req.customized_info)
+        req.customized_info = {"payload": ["x" * 8192]}
+        with self.assertRaisesRegex(ValueError, "exceeds disaggregation"):
+            buffers.set_buf(req)
+
+    def test_customized_info_tensor_roundtrip(self):
+        buffers = self._make_buffers()
+        req = self._make_req(None)
+        tensor = torch.tensor([0.25, 0.5], dtype=torch.bfloat16, requires_grad=True)
+        req.customized_info = {"tensor": [tensor]}
+        buffers.set_buf(req)
+        restored = buffers.get_customized_info(0)["tensor"][0]
+        torch.testing.assert_close(restored, tensor.detach())
+        self.assertEqual(restored.device.type, "cpu")
+
+    def test_customized_info_capacity_rejects_invalid_values(self):
+        for capacity in ("0", "many"):
+            with (
+                self.subTest(capacity=capacity),
+                patch.dict(
+                    os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES=capacity
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    self._make_buffers()
 
     def test_sampling_mask_metadata_is_opt_in(self):
         """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
