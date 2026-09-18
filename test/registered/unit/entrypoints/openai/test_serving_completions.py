@@ -368,8 +368,19 @@ class ServingCompletionTestCase(unittest.TestCase):
         loop = get_or_create_event_loop()
         chunks = loop.run_until_complete(run_stream())
 
+        # Assert on the payload, not just termination: a regression that
+        # silently drops logprobs still produces a well-formed stream.
+        self.assertNotIn("error", chunks[0])
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-        self.assertFalse(any("error" in c for c in chunks))
+
+        choice = json.loads(chunks[0][len("data: ") :])["choices"][0]
+        self.assertTrue(choice["text"].startswith("Hi"))
+        logprobs = choice["logprobs"]
+        # logprobs=0 asks for token logprobs but no top-logprobs, and the echoed
+        # prompt contributes none because input logprobs were never requested.
+        self.assertEqual(logprobs["tokens"], ["Hello", " world"])
+        self.assertEqual(logprobs["token_logprobs"], [-0.1, -0.2])
+        self.assertEqual(logprobs["top_logprobs"], [])
 
     def test_echo_with_zero_logprobs_non_streaming(self):
         """Same contract on the non-streaming path."""
