@@ -471,6 +471,18 @@ class TpModelWorker(BaseTpWorker):
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode cuda graphs for all model runners (used
+        for the on-flip capture during a runtime PD role switch)."""
+        self.model_runner.ensure_decode_cuda_graphs(capture_bs)
+        for mr in self.model_runner_list[1:]:
+            mr.ensure_decode_cuda_graphs(capture_bs)
+
+    def get_decode_cuda_graph_bs(self) -> List[int]:
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill,
+        or on a runner that never allocates a KV pool, e.g. the MLX stub)."""
+        return list(getattr(self.model_runner, "decode_cuda_graph_capture_bs", []))
+
     def start_startup_weight_load(self) -> None:
         """Start deferred checkpoint prefetching for all model runners."""
         self.model_runner.start_startup_weight_load()
@@ -629,6 +641,14 @@ class TpModelWorker(BaseTpWorker):
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
+
+            if get_exec().features.enable_encoder_swa_bounded_replay:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    run_encoder_swa_replay,
+                )
+
+                # Replay reads restored main/indexer KV before the normal extend.
+                run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
                 batch,

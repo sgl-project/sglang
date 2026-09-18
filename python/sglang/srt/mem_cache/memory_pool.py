@@ -273,6 +273,10 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
+    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
+    # positive value. Declared here so callers can read it without getattr.
+    pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
@@ -750,15 +754,8 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
