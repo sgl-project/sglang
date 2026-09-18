@@ -359,6 +359,7 @@ class DSparkAttention(MqaAttentionBase):
                 wo_a,
                 is_decode=forward_batch.forward_mode.is_decode(),
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
@@ -852,7 +853,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.moe_routed_quant_stream = (
             torch.cuda.Stream()
-            if use_multi_stream and torch.version.cuda is not None
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
             else None
         )
         self.hc_stats_stream = (

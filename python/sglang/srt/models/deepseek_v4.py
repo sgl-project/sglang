@@ -451,12 +451,15 @@ def _apply_wo_a_bf16_matmul(
     is_target_verify: bool = False,
     fuse_mxfp8_quant: bool = False,
     is_prefill: bool = False,
+    fast_path: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
+    # fast_path is the caller's opt-in (V4.1); off, the einsum / aiter path runs.
     global _wo_a_aiter_batched_gemm_disabled
     if (
-        _is_cuda
+        fast_path
+        and _is_cuda
         and (
             (
                 is_decode
@@ -752,6 +755,7 @@ class MqaAttentionBase(nn.Module):
         rope_original_seq_len: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if attn_tp_rank is None or attn_tp_size is None:
             attn_tp_rank = get_parallel().attn_tp_rank
@@ -1083,7 +1087,6 @@ class MQALayer(MqaAttentionBase):
             self.register_buffer("cos_cache", cos_cache, persistent=False)
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
-        self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
         if alt_streams is not None and (
             (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
@@ -2449,6 +2452,7 @@ class MQALayer(MqaAttentionBase):
                         is_decode=forward_batch.forward_mode.is_decode(),
                         is_target_verify=forward_batch.forward_mode.is_target_verify(),
                         is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
+                        fast_path=self.is_dsv41,
                         fuse_mxfp8_quant=(
                             not get_forward().sp_active
                             and getattr(
