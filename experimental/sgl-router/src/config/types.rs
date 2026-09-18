@@ -52,8 +52,9 @@ impl Default for ActiveLoadConfig {
     }
 }
 
-/// Routing strategies accepted by `--policy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+/// Routing strategies accepted by `--policy` and by a bucket's `policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     #[default]
     #[value(name = "round_robin")]
@@ -80,6 +81,16 @@ pub enum PolicyKind {
     /// Pin a request-header routing key to a worker.
     #[value(name = "sticky")]
     Sticky,
+}
+
+/// Which engine-selection implementation serves requests while the bucket
+/// engine replaces the legacy selection ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SelectionEngine {
+    #[default]
+    Legacy,
+    /// Bucket-attached policies (`POLICY_DESIGN.md`).
+    Reorg,
 }
 
 /// Policy used to select decode workers for PD requests.
@@ -145,6 +156,9 @@ pub struct BucketSpec {
     pub tps_p05_at_capacity: Option<f64>,
     #[serde(default)]
     pub max_pending_prefill_tokens: Option<u64>,
+    /// Policy attached to this bucket; the model policy when omitted.
+    #[serde(default)]
+    pub policy: Option<PolicyKind>,
 }
 
 impl std::fmt::Display for PolicyKind {

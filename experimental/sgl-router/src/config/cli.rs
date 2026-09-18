@@ -14,8 +14,8 @@ use crate::config::{
     ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig, CachePrefixProvider,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
     FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    ObservabilityConfig, PolicyKind, ProxyConfig, SelectionEngine, ServerConfig,
+    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -166,6 +166,11 @@ pub struct RoutingArgs {
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
+
+    /// Engine-selection implementation. `reorg` runs the bucket-attached
+    /// policies; `legacy` keeps the current selection ladder.
+    #[arg(long, value_enum, default_value = "legacy")]
+    pub selection_engine: SelectionEngine,
 
     /// Weighted scoring terms, e.g. prefix_cache=2.0,load_based=0.3.
     /// Defaults to prefix_cache,load_based for score_policy or fused_score.
