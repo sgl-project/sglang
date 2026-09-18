@@ -2542,6 +2542,8 @@ class TestDeepEPv2Args(CustomTestCase):
             "DeepseekV3ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
             args._model_config.hf_config.architectures = [architecture]
@@ -2712,6 +2714,38 @@ class TestDeepEPv2Args(CustomTestCase):
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
             with self.assertRaisesRegex(ValueError, "required=1280"):
                 validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_divides_by_scatter_ranks(self):
+        # Budget divides by tp_size // attn_dp_size; dp=2 -> 2048/(16/2)=256.
+        # Pin the exact required value: a looser cap would pass for a wrong divisor.
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            dp_size=2,
+            enable_dp_attention=True,
+            max_running_requests=16,
+        )
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
+            with self.assertRaisesRegex(ValueError, "required=256"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(256):
+            validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_divides_under_pure_tp(self):
+        # Pure TP still scatters the dispatch input across all tp_size ranks, so
+        # the budget divides by tp_size: 2048/16=128, cap 127 must raise.
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            dp_size=1,
+            enable_dp_attention=False,
+            max_running_requests=16,
+        )
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
+            with self.assertRaisesRegex(ValueError, "required=128"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_deepep_v2_dispatch_token_budget(args)
 
     def test_disabled_chunking_uses_max_prefill_tokens(self):
         for disabled in (None, 0, -1):

@@ -73,6 +73,36 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
+def prebuild_deepep_v2_buffers(*, model) -> None:
+    """Build every deepep_v2 dispatcher's ElasticBuffer at deployment time.
+
+    No-op unless the a2a backend is deepep_v2. The per-rank cap is validated in
+    validate_deepep_v2_dispatch_token_budget at server-args time.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    num_prebuilt = 0
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        dispatcher = module.dispatcher
+        if not isinstance(dispatcher, DeepEPv2Dispatcher):
+            continue
+        dispatcher.prebuild()
+        num_prebuilt += 1
+    if num_prebuilt:
+        log_info_on_rank0(
+            logger,
+            f"Prebuilt the DeepEP-V2 ElasticBuffer for {num_prebuilt} MoE layer(s) "
+            "at startup.",
+        )
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.distributed import get_moe_ep_group

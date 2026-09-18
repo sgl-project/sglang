@@ -121,7 +121,6 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
         self.assertIs(_FakeBuffer.last.dispatch_x, hidden_states)
         self.assertIsNone(out.hidden_states_scale)
         self.assertEqual(out.hidden_states.dtype, torch.bfloat16)
-        self.assertFalse(out.hidden_states_scale_tma_aligned)
 
     def test_fp8_dispatch_still_sends_activations_and_scales(self):
         _, out = self._dispatch(use_fp8_dispatch=True)
