@@ -4,8 +4,8 @@
 //! Builds bounded cache-aware candidates from ingress Indexer results.
 
 use crate::config::AffinityConfig;
-use crate::policies::admission::FreshLoadLookup;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+use crate::policies::state::engine_load::FreshLoadLookup;
 use crate::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,

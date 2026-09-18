@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::admission::compare_prefill_pressure;
+use crate::policies::state::engine_load::compare_prefill_pressure;
 use crate::policies::state::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;

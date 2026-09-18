@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::admission::FreshLoadLookup;
 use crate::policies::scoring::ScoringPolicy;
+use crate::policies::state::engine_load::FreshLoadLookup;
 use crate::policies::SelectionContext;
 use crate::workers::Worker;
 use std::sync::Arc;
