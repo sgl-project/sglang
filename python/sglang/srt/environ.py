@@ -1275,13 +1275,10 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
-    # Used by sglang.srt.layers.sampling_renorm: when true (default) the top-p /
-    # top-k renormalization used by the sampler and speculative verification runs
-    # on kernels whose output is bit-identical call to call. The flashinfer defaults accumulate with float
-    # atomics and can differ in the last bits between TP ranks running the same
-    # input, which desynchronizes committed tokens / speculative accept lengths
-    # across ranks and eventually deadlocks a collective (#33549, #33289). Set to
-    # 0 to opt back into the faster non-deterministic kernels.
+    # Renormalize top-p / top-k on kernels that are bit-identical call to call;
+    # the flashinfer defaults accumulate with float atomics, so TP ranks can
+    # disagree in the last bits and desynchronize (#33549, #33289). Set to 0 for
+    # the faster non-deterministic kernels.
     SGLANG_RENORM_DETERMINISTIC = EnvBool(True)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
