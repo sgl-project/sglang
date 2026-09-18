@@ -34,6 +34,13 @@ additive (it adds load or a knob position rather than gating a path or skipping
 assertions); and the heavier variant's assertions cover the lighter one's. Watch for
 variants that override a test method, and for looser expectations in the heavier variant
 (a longer timeout or relaxed bound), which make the lighter one still worth keeping.
+This is the pattern with the highest false-positive rate in practice; sharing a helper or
+fixture does not make one variant a subset of another. Not a subset when: the flag the
+variant flips is itself the feature under test (e.g. an overlap-loading toggle), which
+fails the additive condition; the variants drive different integration layers of the
+same model (engine input format vs. server endpoint), so neither's assertions cover the
+other's; or the lighter class is skip-decorated and launches nothing, so it costs
+nothing to keep and its skip is an A6 question instead.
 Examples: #38093, #39544, #33745, #33586, #34070, #33763, #34464, #33752, #39013, #34882.
 
 **A4. Suites that differ only in launch arguments share one server or engine.**
