@@ -1702,13 +1702,41 @@ class OpenAIServingChat(OpenAIServingBase):
                 rendered_prompt, prompt_ids, decoded_prompt = cached
                 return rendered_prompt, list(prompt_ids), decoded_prompt
 
-        rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-            messages,
+        render_kwargs = dict(
             tokenize=False,
             add_generation_prompt=True,
             tools=tools,
             return_dict=False,
             **template_kwargs,
+        )
+        developer_indices = [
+            i for i, message in enumerate(messages) if message["role"] == "developer"
+        ]
+        if developer_indices:
+            # Some templates silently omit unsupported roles instead of raising.
+            # Probe this conversation's positions without changing the real prompt.
+            probe_messages = copy.deepcopy(messages)
+            sentinels = {}
+            for i in developer_indices:
+                sentinel = f"__sglang_developer_{uuid.uuid4().hex}__"
+                sentinels[i] = sentinel
+                probe_messages[i]["content"] = (
+                    [{"type": "text", "text": sentinel}]
+                    if isinstance(messages[i].get("content"), list)
+                    else sentinel
+                )
+            probe = self.tokenizer_manager.tokenizer.apply_chat_template(
+                probe_messages, **render_kwargs
+            )
+            for i, sentinel in sentinels.items():
+                if sentinel not in probe:
+                    raise ValueError(
+                        f"The chat template does not render the developer message "
+                        f"at index {i}. Use a template that supports developer "
+                        "messages or a supported message role."
+                    )
+        rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+            messages, **render_kwargs
         )
         prompt_ids = self.tokenizer_manager.tokenizer.encode(
             rendered_prompt, **encode_kwargs
