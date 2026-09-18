@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,18 +42,6 @@ def _make_runtime_handle(responses):
     handle = RuntimeHandle.__new__(RuntimeHandle)
     handle.tokenizer_manager = _FakeTokenizerManager(responses)
     return handle
-
-
-class TestNativeGrpcReadiness(CustomTestCase):
-    def test_readiness_comes_from_tokenizer_manager(self):
-        tokenizer_manager = SimpleNamespace(is_ready=lambda: True)
-        handle = RuntimeHandle.__new__(RuntimeHandle)
-        handle.tokenizer_manager = tokenizer_manager
-
-        self.assertTrue(handle.get_is_ready())
-
-        tokenizer_manager.is_ready = lambda: False
-        self.assertFalse(handle.get_is_ready())
 
 
 class TestNativeGrpcParallelResponses(CustomTestCase):
@@ -121,6 +110,52 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+
+
+class TestEngineStateNotifications(CustomTestCase):
+    def setUp(self):
+        self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager._engine_state_changed_callback = None
+        self.manager._server_status = ServerStatus.Starting
+        self.manager._gracefully_exit = False
+        self.manager._is_pause = False
+        self.notifications = 0
+        self.manager.set_engine_state_changed_callback(self._notify)
+
+    def _notify(self):
+        self.notifications += 1
+
+    def test_observable_state_notifies_only_on_changes(self):
+        self.manager.is_pause = False
+        self.manager.server_status = ServerStatus.Starting
+        self.manager.gracefully_exit = False
+        self.assertEqual(self.notifications, 0)
+
+        self.manager.is_pause = True
+        self.manager.server_status = ServerStatus.Up
+        self.manager.gracefully_exit = True
+        self.assertEqual(self.notifications, 3)
+
+    def test_runtime_handle_registers_callback_with_manager(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = self.manager
+        callback = object()
+
+        handle.set_engine_state_changed_callback(callback)
+
+        self.assertIs(self.manager._engine_state_changed_callback, callback)
+
+    def test_graceful_exit_notifies_and_changes_computed_health(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = self.manager
+        self.manager.server_status = ServerStatus.Up
+        self.notifications = 0
+
+        self.assertTrue(handle.health_check())
+        self.manager.gracefully_exit = True
+
+        self.assertEqual(self.notifications, 1)
+        self.assertFalse(handle.health_check())
 
 
 if __name__ == "__main__":
