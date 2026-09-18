@@ -80,6 +80,49 @@ if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
     )
 
 
+_enable_dsa_cp_multi_request = envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
+
+
+def dsa_cp_multi_request_enabled() -> bool:
+    """Whether DSA-CP also shards batches carrying more than one request.
+
+    **The lift is smaller than the restriction made it look.** The original
+    refusal was not about the query arithmetic -- ``plan_dsa_cp_shard`` already
+    computes a correct per-request query length for a slice that straddles
+    request boundaries, and that is the part with 1,980 exhaustive cases behind
+    it. It was about ``actual_seq_lengths_kv``: DSA-CP SHORTENED each request's
+    entry so the operator's right-down causal crop would align query ``j`` to
+    key ``K - Q + j``, and because those lengths are cumulative, shortening one
+    moves where the next request starts in the buffer.
+
+    So do not shorten them. Pass the full per-request lengths -- which is
+    exactly what the non-DSA-CP path already passes, ``dcp_kv_indptr[1:]`` --
+    and set ``sparse_mode`` to 0 so there is no crop to align. Causality does
+    not come from the crop: the indexer selects the top-k over positions with
+    visibility already applied, so the set handed to the operator is causal by
+    construction. The DCP **decode** branch has relied on precisely that since
+    the port began, for the same reason and with the same ``sparse_mode`` 0.
+
+    What the rank does not touch costs nothing: a request outside its slice gets
+    query length 0, its KV rows stay in the buffer, and no query names them.
+
+    **When this is on it applies to single-request extends too**, deliberately.
+    One convention is easier to reason about than two, the shortening it
+    replaces was never doing anything useful there, and -- the practical point
+    -- it means the flag can be tested on an ordinary one-request tail with
+    ``p12_logprob_cross_config.sh`` before anyone has to arrange a batch that
+    carries several. A single-request run is the FIRST test of this flag, not an
+    unaffected control.
+
+    Worth ~31-40 s of AISBench phase 2 (110.2 s), where 84.7% of prefill tokens
+    currently decline. Not composable with the packed read, which refuses
+    multi-request batches for a different reason -- the all-gather is rank-major
+    over the whole send, so no request is contiguous in it -- so those batches
+    take the permuting gather and this takes the query sharding.
+    """
+    return _enable_dsa_cp_multi_request
+
+
 class _Missing:
     """Distinguishes "no plan cached yet" from "cached, and it is None"."""
 
@@ -170,9 +213,9 @@ def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan
         parallel.attn_tp_size,
         parallel.attn_tp_rank,
     )
-    if sum(1 for n in extend_lens if n > 0) > 1:
-        # ONE REQUEST PER EXTEND FORWARD, for this first version, and the reason
-        # is the KV layout rather than the query arithmetic.
+    if not _enable_dsa_cp_multi_request and sum(1 for n in extend_lens if n > 0) > 1:
+        # ONE REQUEST PER EXTEND FORWARD unless the lift is enabled, and the
+        # reason is the KV layout rather than the query arithmetic.
         #
         # At DCP extend the operator reads a non-paged TND buffer whose
         # ``actual_seq_lengths_kv`` is CUMULATIVE, so those offsets double as the
@@ -183,17 +226,14 @@ def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan
         # there is no next request: its shortened length is a true prefix of the
         # buffer and the read is exact.
         #
-        # vLLM-Ascend does not hit this because it reads PA_BSND with a block
-        # table, where the per-request length is independent of the layout
-        # (``sfa_cp.py`` passes ``actual_seq_lengths_key`` un-cumulated). Lifting
-        # the restriction means either that layout or gathering only the KV each
-        # rank can see -- both real work, neither needed for the served shape,
-        # which the scheduler already runs one request at a time ("#new-seq: 1").
+        # ``SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST`` lifts it by not shortening
+        # anything: see ``dsa_cp_multi_request_enabled``. Measured on AISBench
+        # 2026-09-18, this refusal costs 84.7% of phase 2's tokens.
         print_info_once(
             "DSA-CP is off for multi-request extends "
             f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
             "cumulative KV lengths it would need describe the buffer's own "
-            "request boundaries"
+            "request boundaries. SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST lifts this"
         )
         return None
 

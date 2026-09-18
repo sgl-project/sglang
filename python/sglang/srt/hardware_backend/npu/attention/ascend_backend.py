@@ -26,6 +26,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_cp import (
     dsa_cp_cumulative_lens,
+    dsa_cp_multi_request_enabled,
     get_dsa_cp_plan,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -1430,16 +1431,25 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch, packed_plan, q.device
                     )
                     sparse_mode = 0
+                elif dsa_cp_plan is not None and dsa_cp_multi_request_enabled():
+                    # The lift. Do NOT shorten the per-request KV lengths -- keep
+                    # dcp_kv_indptr[1:], the same full lengths the unsharded path
+                    # passes, so no request's start moves -- and drop the causal
+                    # crop that the shortening existed to satisfy. The top-k is
+                    # already causal, which is what the DCP decode branch above
+                    # has relied on since the port began. A request this rank's
+                    # slice does not reach simply gets query length 0.
+                    sparse_mode = 0
                 else:
                     if dsa_cp_plan is not None:
                         # This rank's queries end partway through the request, so
                         # they see fewer keys than the buffer holds. These lengths
                         # are cumulative and therefore double as the request
                         # boundaries inside the buffer -- which is exactly why
-                        # DSA-CP refuses multi-request extends: shortening one
-                        # request's entry would move where the next one starts.
-                        # With a single request the shortened length is a true
-                        # prefix of the buffer and the read is exact.
+                        # DSA-CP refuses multi-request extends without the lift:
+                        # shortening one request's entry would move where the next
+                        # one starts. With a single request the shortened length
+                        # is a true prefix of the buffer and the read is exact.
                         seq_lengths_kv = dsa_cp_kvlen
                     sparse_mode = 3
                 # layout_kv must equal layout_query unless it is PA_BSND
