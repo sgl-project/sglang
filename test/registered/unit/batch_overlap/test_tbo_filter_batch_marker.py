@@ -53,6 +53,15 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_preserves_media_prefill_mode(self):
+        """Splitting a batch must retain its scoped media-prefill mode."""
+        for kv_only in (False, True):
+            with self.subTest(kv_only=kv_only):
+                parent = _make_target_verify_batch(8)
+                parent.mediagen_prefill_kv_only = kv_only
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.mediagen_prefill_kv_only, kv_only)
+
     def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
         # MLP-sync padding records _original_batch_size/_original_num_tokens
         # before TBO splits the batch (prepare_mlp_sync_batch pads first, then

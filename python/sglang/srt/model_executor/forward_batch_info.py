@@ -641,6 +641,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_tp_sequence_sharded: bool = False
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # Media generation consumes prefix KV, not the final prefill hidden states.
+    # Scoped to the worker's prefill call; diffusion still runs the full stack.
+    mediagen_prefill_kv_only: bool = False
+
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 

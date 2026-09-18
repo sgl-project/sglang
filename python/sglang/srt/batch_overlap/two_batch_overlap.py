@@ -758,6 +758,7 @@ class TboForwardBatchPreparer:
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
+            "mediagen_prefill_kv_only",
             "spec_algorithm",
             "capture_hidden_mode",
             "split_index",  # for split prefill
