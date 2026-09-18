@@ -260,6 +260,7 @@ def get_default_hidden_dim(
 
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -285,6 +286,11 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
         "in_proj_b": "in_proj_ba",
         "in_proj_a": "in_proj_ba",
         "out_proj": "out_proj",
@@ -307,6 +313,11 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
+        # Models may fuse adapter projections differently from the common HF layout.
+        if base_model is not None and hasattr(
+            base_model, "get_lora_target_module_name"
+        ):
+            name = base_model.get_lora_target_module_name(name)
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
@@ -462,7 +473,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             else:
                 raw_names.add(leaf_name)
 
-    normalized = get_normalized_target_modules(raw_names)
+    normalized = get_normalized_target_modules(raw_names, base_model=model)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
     # Allow models to declare additional LoRA-compatible modules that

@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -64,6 +65,9 @@ class LoRAAdapter(nn.Module):
         super().__init__()
         self.uid: str = uid
         self.config: LoRAConfig = config
+        self.normalized_target_modules = get_normalized_target_modules(
+            config.target_modules, base_model=base_model
+        )
         assert self.config.hf_config["peft_type"].lower() == "lora"
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
@@ -162,12 +166,6 @@ class LoRAAdapter(nn.Module):
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
-
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
-        )
-
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -183,8 +181,8 @@ class LoRAAdapter(nn.Module):
             # --lora-target-modules will govern which modules are active.
             module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
             if (
-                "all" in normalized_target_modules
-                or module_name in normalized_target_modules
+                "all" in self.normalized_target_modules
+                or module_name in self.normalized_target_modules
             ):
                 self.embedding_layers[name] = loaded_weight.cpu()
             else:
