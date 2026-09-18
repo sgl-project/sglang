@@ -406,12 +406,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         draft = SimpleNamespace(
             token_to_kv_pool=object(),
+            req_to_token_pool=None,
             model_config=SimpleNamespace(
                 num_nextn_predict_layers=0,
                 hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             ),
         )
-        target = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
+        target = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE, req_to_token_pool=None
+        )
         worker = SimpleNamespace(
             target_worker=SimpleNamespace(model_runner=target),
             _draft_model_runners=lambda: (draft,),
