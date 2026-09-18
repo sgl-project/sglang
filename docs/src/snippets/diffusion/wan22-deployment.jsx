@@ -273,12 +273,14 @@ const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark 
               )}
               {availableLoras.map((lora) => {
                 const isSelected = values.selectedLoraPath === lora.path;
+                const isDisabled = values.hardware === 'xeon';
                 return (
                   <label
                     key={lora.id}
-                    style={{ ...labelBaseStyle, ...(isSelected ? checkedStyle : {}) }}
+                    style={{ ...labelBaseStyle, ...(isSelected ? checkedStyle : {}), ...(isDisabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}
                     onClick={(event) => {
                       event.preventDefault();
+                      if (isDisabled) return;
                       handleLoraToggle(lora.path);
                     }}
                   >
@@ -286,6 +288,7 @@ const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark 
                       type="radio"
                       name="loraModelSelection"
                       checked={isSelected}
+                      disabled={isDisabled}
                       readOnly
                       style={{ display: 'none' }}
                     />

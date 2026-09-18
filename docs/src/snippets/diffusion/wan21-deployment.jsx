@@ -383,12 +383,14 @@ export const Wan21Deployment = () => {
           <div style={itemsStyle}>
             {availableLoras.map((lora) => {
               const isChecked = values.selectedLoraPath === lora.path;
+              const isDisabled = values.hardware === 'xeon';
               return (
                 <label
                   key={lora.id}
-                  style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}
+                  style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
                   onClick={(event) => {
                     event.preventDefault();
+                    if (isDisabled) return;
                     handleLoraToggle(lora.path);
                   }}
                 >
@@ -397,6 +399,7 @@ export const Wan21Deployment = () => {
                     name="selectedLoraPath"
                     value={lora.path}
                     checked={isChecked}
+                    disabled={isDisabled}
                     readOnly
                     style={{ display: 'none' }}
                   />
