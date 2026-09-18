@@ -532,15 +532,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
-            if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
-                # The A5 backend expects the ue8m0 weight layout installed by
-                # the arch35 load path; keep plain block-FP8 checkpoints on
-                # the generic triton backend.
-                from sglang.srt.layers.quantization.fp8_utils import (
-                    triton_w8a8_block_fp8_linear,
-                )
-
-                self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
@@ -754,11 +745,14 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
-        elif _is_npu and is_npu_arch35() and self.quant_config.scale_fmt == "ue8m0":
+        elif _is_npu and is_npu_arch35():
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
 
+            # UE8M0 checkpoints only need re-layout; plain block-FP8 ones
+            # (fp32 block scales) get requantized inside. Either way the
+            # layer ends up in the MXFP8 layout for npu_w8a8_mxfp8_linear.
             process_npu_arch35_mxfp8_linear_weights(
                 layer,
                 self.weight_block_size,

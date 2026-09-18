@@ -148,6 +148,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64
         ).reshape(8, 16)

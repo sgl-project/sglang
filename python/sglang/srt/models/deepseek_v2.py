@@ -52,11 +52,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_glm_moe_dsa,
 )
-from sglang.srt.distributed import (
-    divide,
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import divide, get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -96,6 +92,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    post_experts_all_reduce,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -1177,12 +1174,8 @@ class DeepseekV2MoE(nn.Module):
                 self.routed_scaling_factor,
             )
 
-        if (
-            self.tp_size > 1
-            and not all_reduce_done
-            and not should_skip_post_experts_all_reduce(is_tp_path=True)
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if not all_reduce_done:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1328,10 +1321,7 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
@@ -1389,10 +1379,7 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
