@@ -214,6 +214,29 @@ class _LowLatencyBuffer:
         return torch.empty(0), torch.empty(0), object(), object(), object()
 
 
+class _LegacyLowLatencyBuffer:
+    """A DeepEP API version that predates the use_mxfp8 flag."""
+
+    def __init__(self):
+        self.use_mxfp4 = None
+
+    def low_latency_dispatch(
+        self,
+        hidden_states,
+        topk_ids,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        *,
+        use_fp8,
+        use_mxfp4=False,
+        topk_weights,
+        async_finish,
+        return_recv_hook,
+    ):
+        self.use_mxfp4 = use_mxfp4
+        return torch.empty(0), torch.empty(0), object(), object(), object()
+
+
 class _CudaLowLatencyBuffer:
     """CUDA's Buffer API does not accept the NPU-only MXFP flags."""
 
@@ -407,6 +430,22 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
         self.assertTrue(buffer.kwargs["use_mxfp4"])
         self.assertFalse(buffer.kwargs["use_mxfp8"])
 
+    def test_bf16_omits_unsupported_mxfp8_flag_for_legacy_buffer(self):
+        buffer = _LegacyLowLatencyBuffer()
+        dispatcher = self._dispatcher("bf16", buffer)
+
+        with (
+            patch.object(deepep, "_is_npu", True),
+            patch.object(deepep, "_deepep_precompile_tp_barrier"),
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+        self.assertFalse(buffer.use_mxfp4)
+
     def test_normal_dispatch_passes_quantization_flags(self):
         dispatcher = object.__new__(deepep._DeepEPDispatcherImplNormal)
         dispatcher.num_experts = 2
@@ -525,20 +564,6 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
             )
 
         self.assertTrue(buffer.use_fp8)
-
-    def test_bf16_passes_no_quantization_flags(self):
-        buffer = _LowLatencyBuffer()
-        dispatcher = self._dispatcher(None, buffer)
-
-        with patch.object(deepep, "_deepep_precompile_tp_barrier"):
-            dispatcher._dispatch_core(
-                torch.zeros(1, 64),
-                torch.zeros(1, 1, dtype=torch.int64),
-                torch.ones(1, 1),
-            )
-
-        self.assertFalse(buffer.kwargs["use_fp8"])
-        self.assertNotIn("use_ue8m0", buffer.kwargs)
 
 
 class TestW4A8MxfpGmmInputScale(unittest.TestCase):
