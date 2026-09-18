@@ -2677,8 +2677,9 @@ class ServingChatTestCase(unittest.TestCase):
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -2691,6 +2692,8 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
+            logprobs=True,
+            top_logprobs=5,
         )
 
         with patch(
