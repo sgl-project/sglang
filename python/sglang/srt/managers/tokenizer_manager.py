@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -396,8 +406,62 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
+# Grace period from ShutdownReq to SIGKILL for each scheduler.
+_SCHEDULER_EXIT_TIMEOUT_SECS = 15
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    # Set by whoever owns the event loop, and left None for Engine and grpc,
+    # which own no server. Class-level to leave the frozen __init__ alone.
+    _server_stop_hook: Optional[Callable[[], None]] = None
+    _engine_state_changed_callback: Optional[Callable[[], None]] = None
+
+    def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
+        self._server_stop_hook = hook
+
+    def _notify_engine_state_changed(self) -> None:
+        callback = self._engine_state_changed_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("Engine-state change callback failed")
+
+    def _set_engine_state_field(self, name: str, value: Any) -> None:
+        if value == getattr(self, name, None):
+            return
+        setattr(self, name, value)
+        self._notify_engine_state_changed()
+
+    def set_engine_state_changed_callback(self, callback: Callable[[], None]) -> None:
+        self._engine_state_changed_callback = callback
+
+    @property
+    def server_status(self):
+        return self._server_status
+
+    @server_status.setter
+    def server_status(self, value) -> None:
+        self._set_engine_state_field("_server_status", value)
+
+    @property
+    def gracefully_exit(self) -> bool:
+        return self._gracefully_exit
+
+    @gracefully_exit.setter
+    def gracefully_exit(self, value: bool) -> None:
+        self._set_engine_state_field("_gracefully_exit", value)
+
+    @property
+    def is_pause(self) -> bool:
+        return self._is_pause
+
+    @is_pause.setter
+    def is_pause(self, value: bool) -> None:
+        self._set_engine_state_field("_is_pause", value)
 
     @property
     def serving_chat_class(self):
@@ -604,6 +668,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+    def is_ready(self) -> bool:
+        """Return whether this server should receive new requests."""
+        return (
+            not self.is_pause
+            and not self.gracefully_exit
+            and self.server_status == ServerStatus.Up
+        )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -976,6 +1048,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        contains_mm_input = obj.contains_mm_input()
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -998,9 +1071,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "the engine with skip_tokenizer_init=False."
                 )
 
+            # Avoid tokenizing a raw multimodal prompt when the processor will
+            # expand its placeholders and replace input_ids below.
+            if (
+                self.mm_processor
+                and contains_mm_input
+                and getattr(
+                    self.mm_processor,
+                    "generates_input_ids_from_raw_prompt",
+                    False,
+                )
+            ):
+                input_ids = None
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
-            if not input_text and self.mm_processor and obj.contains_mm_input():
+            elif not input_text and self.mm_processor and contains_mm_input:
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
@@ -1008,7 +1093,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
-        contains_mm_input = obj.contains_mm_input()
         if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(
                 "Multimodal inputs are not supported when --language-model-only "
@@ -1333,24 +1417,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
-                )
-
-    def _validate_input_ids_in_vocab(
-        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
-    ) -> None:
-        # Handle both single sequence and batch of sequences
-        if isinstance(input_ids[0], list):
-            # Batch of sequences
-            for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
-                    raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
-                    )
-        else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
     def _create_tokenized_object(
@@ -2258,7 +2324,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
-                logger.error(
+                logger.warning(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
@@ -2494,11 +2560,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_first_token_time()
 
             if state.finished:
-                if state.time_stats.trace_ctx.tracing_enable:
-                    state.time_stats.trace_ctx.trace_set_root_attrs(
-                        self.convert_to_span_attrs(state, recv_obj, i)
-                    )
-                state.time_stats.set_finished_time()
+                span_attrs = (
+                    self.convert_to_span_attrs(state, recv_obj, i)
+                    if state.time_stats.trace_ctx.tracing_enable
+                    else None
+                )
+                state.time_stats.set_finished_time(span_attrs=span_attrs)
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if get_spec().speculative_algorithm:
@@ -3233,10 +3300,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
+        stragglers = [proc.pid for proc in collect_scheduler_processes()]
+        if stragglers:
+            # SIGKILL here lands mid-release,
+            # which is how GPU memory survives a shutdown. Name the pids.
+            logger.warning(
+                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+                f"ShutdownReq, killing them before they released: {stragglers}"
+            )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        if self._server_stop_hook is not None:
+            # sys.exit() here raises SystemExit into the loop and kills it,
+            # so the ASGI server never runs its lifespan shutdown.
+            # The loop outlives this coroutine now, so drop our own tasks first;
+            # a pending handle_loop would be reported as destroyed-while-pending.
+            current = asyncio.current_task()
+            for task in self.asyncio_tasks:
+                if task is not current:
+                    task.cancel()
+            self._server_stop_hook()
+            return
         sys.exit(0)
 
     def force_exit_handler(self):
@@ -3658,8 +3744,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 [finish_reason]
             )
 
-        # Latency attributes
-        span_attrs.update(state.time_stats.convert_to_gen_ai_span_attrs())
+        # Latency attributes are added by set_finished_time(), which stamps
+        # finished_time before deriving them.
 
         return span_attrs
 

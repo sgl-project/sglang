@@ -23,6 +23,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
+    SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
+    SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
@@ -34,6 +38,10 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
+    SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
+        "~/.cache/sglang/diffusion/host_spill"
+    )
+    SGLANG_DIFFUSION_DISABLE_HOST_SPILL: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
@@ -79,6 +87,7 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
@@ -220,6 +229,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
+    # MXFP8 Attention quantization
+    # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
+    # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
+    # Otherwise rotation matrix are generating online
+    "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "false"
+    ),
+    # Number of attention heads processed by each MXFP8 FA call.
+    # Smaller chunks can improve performance for large head counts
+    # The default value set to 4 is better for video generation
+    # For image generation task depends on image quality and the model config
+    "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
@@ -247,6 +270,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # synchronous copy on any failure; this forces that path up front.
     "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER"
+    ),
+    # Where transformed weight copies (fused q/k/v, reordered rows) live as
+    # file mappings when host copies must stay reclaimable; reused across
+    # starts of the same checkpoint.
+    "SGLANG_DIFFUSION_HOST_SPILL_DIR": _lazy_str(
+        "SGLANG_DIFFUSION_HOST_SPILL_DIR",
+        os.path.expanduser("~/.cache/sglang/diffusion/host_spill"),
+    ),
+    "SGLANG_DIFFUSION_DISABLE_HOST_SPILL": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_HOST_SPILL"
     ),
     # Test hook: make the host memory budget behave as if the machine had this
     # many GiB of RAM (available = this figure minus the process's own
@@ -303,6 +336,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory instead of a file-backed cache mapping the page cache can drop.
     "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: do not madvise(MADV_WILLNEED) mapped layers ahead of the
+    # courier; their pages arrive at fault-time readahead beats instead.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED"
+    ),
+    # Kill-switch: on a shared host/device pool the courier reads mapped layers
+    # from their checkpoint files with O_DIRECT instead of through the page
+    # cache. This forces the mmap path.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ"
+    ),
+    # Debug: after auto residency settles, log where this process's host memory
+    # sits -- per component and per kind (anonymous, mapped, pinned) -- next to
+    # the kernel's view of the process.
+    "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY"
+    ),
+    # Debug: at the end of every layerwise stage, log where the courier and the
+    # compute thread spent their time (populate, memcpy, H2D, waits).
+    "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING"
     ),
     # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
     # of the file-backed LoRA merge cache.

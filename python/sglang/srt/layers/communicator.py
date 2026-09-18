@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -38,8 +37,8 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.cp.utils import (
-    is_mla_prefill_cp_enabled,
-    mla_use_prefill_cp,
+    is_mla_cp_active,
+    is_mla_cp_enabled,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -60,6 +59,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -238,7 +239,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
+        if is_dsa_enable_prefill_cp() or is_mla_cp_enabled():
             return ScatterMode.SCATTERED
 
         return ScatterMode.TP_ATTN_FULL
@@ -432,7 +433,7 @@ class LayerScatterModes:
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
             if is_enable_moe_cp_allgather() and not (
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
@@ -444,7 +445,7 @@ class LayerScatterModes:
             # first or the all-reduce sums different tokens' partial outputs.
             # MLA/DSA CP models do this in DSACPLayerCommunicator instead.
             if _generic_prefill_cp_shards_tokens() and not (
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
@@ -487,11 +488,8 @@ def enable_moe_dense_fully_dp():
 
 def _generic_prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
-    # Local import: module-level CP helper imports here are circular (#27014).
-    from sglang.srt.layers.cp.utils import enable_cp_v2
-
     parallel = get_parallel()
-    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp and enable_cp_v2()
+    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
 
 
 def enable_dwdp():
@@ -727,7 +725,9 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    # Fusion was published but this shape can't use the kernel,
+                    # so run the deferred reduction inline.
+                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -918,7 +918,10 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        # Prefill CP predicates must stay out of decode graph capture.
+        if forward_batch.forward_mode.is_context_parallel_extend() and (
+            dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)
+        ):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
@@ -938,16 +941,16 @@ class LayerCommunicator:
         ):
             return False
 
-        # Fusing makes the next layer's residual+LN absorb the post-experts
-        # all-reduce, and that fused kernel reduces over a single group. Under
-        # hybrid EP+TP the post-experts reduction spans two disjoint groups
-        # (moe_expert_parallel_all_reduce over _MOE_EP, then
-        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-        # should_skip_post_experts_all_reduce() skips *both* once fusion is
-        # published -- so the fused reduce would cover only half the peers and
-        # silently return under-reduced activations.
+        # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
+        # two disjoint groups; post_experts_all_reduce() merges them into one
+        # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
+        # When merging is blocked, no single group covers both, so fusion stays off.
         parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        if (
+            parallel.moe_ep_size > 1
+            and parallel.moe_tp_size > 1
+            and not can_merge_post_experts_all_reduce()
+        ):
             return False
 
         if (
@@ -1378,7 +1381,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
         # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-        # - CUDA graph warmup: not applicable when --disable-piecewise-cuda-graph is used.
+        # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
 
