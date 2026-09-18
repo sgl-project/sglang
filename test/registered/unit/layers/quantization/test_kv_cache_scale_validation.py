@@ -51,6 +51,21 @@ class TestKVCacheScaleValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must be finite"):
             self.method.process_weights_after_loading(layer)
 
+    def test_multi_element_scale_rejected_with_value_error(self):
+        layer = _layer_with_scales(1.0, 1.0)
+        layer.k_scale = torch.nn.Parameter(
+            torch.tensor([1.0, math.nan]), requires_grad=False
+        )
+        with self.assertRaisesRegex(ValueError, "per-tensor"):
+            self.method.process_weights_after_loading(layer)
+
+        layer = _layer_with_scales(1.0, 1.0)
+        layer.k_scale = torch.nn.Parameter(
+            torch.tensor([1.0, 2.0]), requires_grad=False
+        )
+        with self.assertRaisesRegex(ValueError, "per-tensor"):
+            self.method.process_weights_after_loading(layer)
+
     def test_finite_scales_accepted(self):
         layer = _layer_with_scales(1.0, 1.0)
         self.method.process_weights_after_loading(layer)

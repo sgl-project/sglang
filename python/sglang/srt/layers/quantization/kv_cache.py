@@ -50,10 +50,20 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
     def process_weights_after_loading(self, layer) -> None:
-        if not torch.isfinite(layer.k_scale) or not torch.isfinite(layer.v_scale):
+        if layer.k_scale.numel() != 1 or layer.v_scale.numel() != 1:
+            raise ValueError(
+                "Only support per-tensor scaling factor for fp8 KV cache, got "
+                f"k_scale shape={tuple(layer.k_scale.shape)} "
+                f"v_scale shape={tuple(layer.v_scale.shape)}"
+            )
+        k_scale_cpu = layer.k_scale.to("cpu")
+        v_scale_cpu = layer.v_scale.to("cpu")
+        if not (
+            torch.isfinite(k_scale_cpu).all() and torch.isfinite(v_scale_cpu).all()
+        ):
             raise ValueError(
                 "fp8 KV cache scales must be finite, got "
-                f"k_scale={layer.k_scale.item()} v_scale={layer.v_scale.item()}"
+                f"k_scale={k_scale_cpu.item()} v_scale={v_scale_cpu.item()}"
             )
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
