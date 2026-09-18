@@ -753,7 +753,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        if not (_is_npu and not _use_zbal):
+            # GPU DeepEP requires int64 expert ids. The NPU DeepEP runtime
+            # takes int32 (its strategy layer calls .int() internally), and
+            # npu_moe_gating_top_k already emits int32 ids — skip the
+            # int32→int64→int32 round-trip casts.
+            topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
