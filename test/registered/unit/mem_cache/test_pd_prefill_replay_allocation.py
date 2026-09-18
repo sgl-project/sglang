@@ -1,5 +1,6 @@
 """Verify-only replay buffers are unnecessary on a PD prefill target."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -74,3 +75,7 @@ def test_prefill_pool_does_not_allocate_speculative_replay(
     # Persistent state remains available for chunked prefill and PD handoff.
     assert kwargs["mamba_size"] == 256
     assert kwargs["mamba_layer_ids"] == [0]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
