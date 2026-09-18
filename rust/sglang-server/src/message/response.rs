@@ -121,8 +121,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; trailing fields default empty for older producers. New producers
-/// include the scheduler statistics even without logprob/hidden columns.
+/// required; trailing extras default empty and omitted statistics default absent
+/// for older producers. New producers include the scheduler statistics even
+/// without logprob/hidden columns.
 /// Field order is the wire ABI and must match `RustServer.push_generation` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
@@ -166,16 +167,26 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
-    #[serde(default)]
-    pub cached_tokens: Vec<u64>,
-    #[serde(default)]
-    pub cached_tokens_details: Vec<Option<BTreeMap<String, CacheDetailValue>>>,
-    #[serde(default)]
-    pub reasoning_tokens: Vec<u64>,
-    #[serde(default)]
-    pub retraction_counts: Vec<u64>,
-    #[serde(default)]
-    pub dp_ranks: Vec<Option<u32>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub cached_tokens: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub cached_tokens_details: Option<Vec<Option<BTreeMap<String, CacheDetailValue>>>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub reasoning_tokens: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub retraction_counts: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub dp_ranks: Option<Vec<Option<u32>>>,
+}
+
+/// Only an omitted tail column is absent. A supplied column must be an array,
+/// including on idle batches; `null` is allowed inside nullable columns only.
+fn present_column<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -280,14 +291,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // A snapshot is all-or-nothing. Null details/ranks are entries, not absent
     // columns; accepting a partial snapshot would fabricate metadata defaults.
     let stats_lengths = [
-        h.cached_tokens.len(),
-        h.cached_tokens_details.len(),
-        h.reasoning_tokens.len(),
-        h.retraction_counts.len(),
-        h.dp_ranks.len(),
+        h.cached_tokens.as_ref().map(Vec::len),
+        h.cached_tokens_details.as_ref().map(Vec::len),
+        h.reasoning_tokens.as_ref().map(Vec::len),
+        h.retraction_counts.as_ref().map(Vec::len),
+        h.dp_ranks.as_ref().map(Vec::len),
     ];
-    let has_stats = stats_lengths.iter().any(|&len| len != 0);
-    if has_stats && stats_lengths.iter().any(|&len| len != n) {
+    let has_stats = stats_lengths.iter().any(Option::is_some);
+    if has_stats && stats_lengths.iter().any(|&len| len != Some(n)) {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -475,11 +486,12 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
             stats: has_stats.then(|| GenerationStats {
-                cached_tokens: h.cached_tokens[i],
-                cached_tokens_details: h.cached_tokens_details[i].take(),
-                reasoning_tokens: h.reasoning_tokens[i],
-                num_retractions: h.retraction_counts[i],
-                dp_rank: h.dp_ranks[i],
+                // Presence and lengths were checked before any request is routed.
+                cached_tokens: h.cached_tokens.as_ref().unwrap()[i],
+                cached_tokens_details: h.cached_tokens_details.as_mut().unwrap()[i].take(),
+                reasoning_tokens: h.reasoning_tokens.as_ref().unwrap()[i],
+                num_retractions: h.retraction_counts.as_ref().unwrap()[i],
+                dp_rank: h.dp_ranks.as_ref().unwrap()[i],
             }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -722,14 +734,14 @@ mod tests {
             finish_reasons: vec![None, None],
             prompt_tokens: vec![2, 3],
             tok_lens: vec![0, 0],
-            cached_tokens: vec![0, 7],
-            cached_tokens_details: vec![
+            cached_tokens: Some(vec![0, 7]),
+            cached_tokens_details: Some(vec![
                 None,
                 Some([("device".into(), CacheDetailValue::Count(7))].into()),
-            ],
-            reasoning_tokens: vec![0, 4],
-            retraction_counts: vec![0, 2],
-            dp_ranks: vec![None, Some(1)],
+            ]),
+            reasoning_tokens: Some(vec![0, 4]),
+            retraction_counts: Some(vec![0, 2]),
+            dp_ranks: Some(vec![None, Some(1)]),
             ..Default::default()
         };
         let bytes = rmp_serde::to_vec(&header).unwrap();
@@ -790,6 +802,23 @@ mod tests {
                 let bytes = rmp_serde::to_vec(&columns[..count]).unwrap();
                 let frame = frame_decode_batch_cols(&bytes, &[&data]);
                 assert!(!for_each_chunk(&frame[1..], |_| panic!("partial header")).ok);
+            }
+        }
+
+        // Empty supplied columns are valid only for an empty batch. Partial
+        // tails remain malformed even when every supplied column is empty.
+        for requests in [false, true] {
+            let mut empty = vec![rmpv::Value::Array(vec![]); 21];
+            if requests {
+                empty[..4].clone_from_slice(&columns[..4]);
+            }
+            for count in 17..=21 {
+                let bytes = rmp_serde::to_vec(&empty[..count]).unwrap();
+                let frame = frame_decode_batch_cols(&bytes, &[]);
+                assert_eq!(
+                    for_each_chunk(&frame[1..], |_| panic!("empty statistics were routed")).ok,
+                    !requests && count == 21
+                );
             }
         }
     }
