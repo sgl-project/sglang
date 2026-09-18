@@ -87,16 +87,16 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-hierarchical-cache: the host-offload path "
             "is not int8-aware. Disable one of them."
         )
-    if cfg.enable_lmcache:
-        raise ValueError(
-            "--enable-int8-mamba-checkpoint is not supported together with "
-            "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
-        )
     if cfg.radix_cache_backend is not None:
         raise ValueError(
             "--enable-int8-mamba-checkpoint only supports the built-in mamba "
             f"radix cache; --radix-cache-backend={cfg.radix_cache_backend!r} "
             "is not int8-aware. Omit --radix-cache-backend."
+        )
+    if cfg.enable_lmcache:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
         )
 
 
