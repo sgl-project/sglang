@@ -30,8 +30,16 @@ from cache_dit import (
     TaylorSeerCalibratorConfig,
     steps_mask,
 )
-from cache_dit.caching.block_adapters import BlockAdapterRegister
-from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
+
+try:
+    from cache_dit import (
+        BlockAdapterRegister,
+        ParallelismBackend,
+        ParallelismConfig,
+    )
+except ImportError:
+    from cache_dit.caching.block_adapters import BlockAdapterRegister
+    from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
