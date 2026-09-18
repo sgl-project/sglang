@@ -995,7 +995,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Failed,
                 ):
                     logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"PP rank {get_parallel().pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
@@ -1075,7 +1075,7 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
-            f"Prefill transfer failed for request rank={self.ps.tp_rank} "
+            f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
@@ -1141,7 +1141,7 @@ class SchedulerDisaggregationPrefillMixin:
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
         error_message = (
-            f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
+            f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
         is_propagated = False

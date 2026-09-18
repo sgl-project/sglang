@@ -3,7 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -30,6 +34,24 @@ def _make_ps(**overrides) -> ParallelState:
     )
     defaults.update(overrides)
     return ParallelState.trivial(**defaults)
+
+
+def _published_topology():
+    """The topology `_make_ps` describes, published instead of stood in.
+
+    `tp_rank=4` is what puts this process at `attn_dp_rank=1` with
+    `attn_tp_rank=0`: the context derives both from the rank and the widths,
+    where the record above had to be handed each of them.
+    """
+    return published_topology(
+        role="scheduler",
+        ranks={"tp_rank": 4, "pp_rank": 1, "dp_rank": 1},
+        tp_size=8,
+        pp_size=2,
+        dp_size=2,
+        attn_cp_size=2,
+        enable_dp_attention=True,
+    )
 
 
 def _fake_group() -> SimpleNamespace:
@@ -176,6 +198,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
         ps = _make_ps()
+        enter_scope(self, _published_topology())
         scheduler = SchedulerPPMixin()
         scheduler.ps = ps
         scheduler.world_group = _fake_group()
