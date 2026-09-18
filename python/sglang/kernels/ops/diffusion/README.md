@@ -143,7 +143,7 @@ tensor copy per residual site.
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_qknorm_rope_out_of_place` | JIT CUDA | as above, bit-equal to the in-place kernel; reads strided q/k and writes contiguous copies, inputs untouched (VDN-H3 keeps the raw q/k for its linear branch) |
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
-| `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM100+ |
+| `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
