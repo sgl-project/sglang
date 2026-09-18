@@ -109,7 +109,14 @@ class RedactedThinkingBlock(BaseModel):
 
 
 AnthropicContentBlock = Annotated[
-    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ToolReferenceBlock | SearchResultBlock | ThinkingBlock | RedactedThinkingBlock,
+    TextBlock
+    | ImageBlock
+    | ToolUseBlock
+    | ToolResultBlock
+    | ToolReferenceBlock
+    | SearchResultBlock
+    | ThinkingBlock
+    | RedactedThinkingBlock,
     Field(discriminator="type"),
 ]
 
@@ -212,7 +219,11 @@ def _tool_discriminator(v) -> str:
 
 
 AnthropicTool = Annotated[
-    Annotated[AnthropicCustomTool, Tag("custom")] | Annotated[AnthropicWebSearchTool, Tag("web_search")] | Annotated[AnthropicComputerTool, Tag("computer")] | Annotated[AnthropicBashTool, Tag("bash")] | Annotated[AnthropicTextEditorTool, Tag("text_editor")],
+    Annotated[AnthropicCustomTool, Tag("custom")]
+    | Annotated[AnthropicWebSearchTool, Tag("web_search")]
+    | Annotated[AnthropicComputerTool, Tag("computer")]
+    | Annotated[AnthropicBashTool, Tag("bash")]
+    | Annotated[AnthropicTextEditorTool, Tag("text_editor")],
     Discriminator(_tool_discriminator),
 ]
 
@@ -415,7 +426,9 @@ class AnthropicMessageEndDelta(BaseModel):
     Stop reason and stop sequence are the only fields.
     """
 
-    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
+    stop_reason: (
+        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None
+    ) = None
     stop_sequence: str | None = None
 
 
@@ -464,7 +477,14 @@ class ErrorEvent(BaseModel):
 
 
 AnthropicStreamEvent = Annotated[
-    MessageStartEvent | MessageDeltaEvent | MessageStopEvent | ContentBlockStartEvent | ContentBlockDeltaEvent | ContentBlockStopEvent | PingEvent | ErrorEvent,
+    MessageStartEvent
+    | MessageDeltaEvent
+    | MessageStopEvent
+    | ContentBlockStartEvent
+    | ContentBlockDeltaEvent
+    | ContentBlockStopEvent
+    | PingEvent
+    | ErrorEvent,
     Field(discriminator="type"),
 ]
 
@@ -477,7 +497,9 @@ class AnthropicMessagesResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: list[AnthropicContentBlock]
     model: str
-    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
+    stop_reason: (
+        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None
+    ) = None
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
 

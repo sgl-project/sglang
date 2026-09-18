@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
+
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
