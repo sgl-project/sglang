@@ -3979,6 +3979,12 @@ class HybridLinearKVPool(KVCache):
     def slots_per_page(self) -> int:
         return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
 
+    @property
+    def pooled_slots_per_page(self) -> int:
+        return getattr(
+            self.full_kv_pool, "pooled_slots_per_page", self.slots_per_page
+        )
+
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
@@ -4861,7 +4867,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
+        # Keep one physical index-cache envelope per KV page. KPool only fills
+        # the first page_size / index_kpool entries in each envelope; folding
+        # several KV pages into one index page breaks page-wise move/offload.
         self.slots_per_page = self.page_size
+        self.pooled_slots_per_page = (
+            self.page_size // self.index_kpool
+            if self.index_kpool > 1 and self.index_kpool_compress
+            else self.page_size
+        )
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
