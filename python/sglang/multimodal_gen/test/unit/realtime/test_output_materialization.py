@@ -10,9 +10,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    build_raw_rgb_frame_batches,
-)
+from sglang.multimodal_gen.runtime.realtime.video import build_raw_rgb_frame_batches
 
 
 def test_materialize_output_sample_converts_tensor_to_uint8_frames():
@@ -60,7 +58,7 @@ def test_save_outputs_can_materialize_without_saving(tmp_path):
 
 def test_file_path_transport_clears_in_memory_outputs():
     worker = GPUWorker.__new__(GPUWorker)
-    worker.rank = 0
+    worker.is_output_rank = True
     output_batch = OutputBatch(
         output=[object()],
         audio=torch.zeros(1),

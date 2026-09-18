@@ -15,12 +15,17 @@ on:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
+      build_only:
+        description: "Build and validate one Linux AMD64 CUDA 13 image locally on the runner without logging in or pushing."
+        required: false
+        type: boolean
+        default: false
       overlay_dockerfile:
         description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Note: this job has no repo checkout, so only FROM + RUN work — you cannot COPY files from this repo. Leave empty to skip overlay."
         required: false
         default: ""
       overlay_cudas:
-        description: "Comma-separated cuda variants to overlay onto (cu12, cu13). Default 'cu13'."
+        description: "Comma-separated cuda variants to overlay onto (cu13). Default 'cu13'."
         required: false
         default: "cu13"
       overlay_tag_suffix:
@@ -63,7 +68,7 @@ jobs:
 
           # Determine extra build args
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           else
             echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           fi
@@ -81,9 +86,9 @@ jobs:
           # consumers pinned to the pre-flip names.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
@@ -92,7 +97,7 @@ jobs:
           # SUFFIX was computed above from inputs.tag / inputs.pr_number.
           if [ -n "${OVERLAY_DOCKERFILE_INPUT}" ]; then
             # Refuse to overlay without a tag/pr_number: SUFFIX would be empty,
-            # so base would point at the moving 'dev'/'dev-cu12'/'dev-cu13'
+            # so base would point at the moving 'dev'/'dev-cu13'
             # latest tags and overwrite mode would clobber them.
             if [ -z "${SUFFIX}" ]; then
               echo "overlay_dockerfile is set but neither 'tag' nor 'pr_number' was given." >&2
@@ -107,10 +112,8 @@ jobs:
               C="$(echo "${C}" | xargs)"
               if [ "${C}" = "cu13" ]; then
                 BASES='["dev'"${SUFFIX}"'","dev-cu13'"${SUFFIX}"'"]'
-              elif [ "${C}" = "cu12" ]; then
-                BASES='["dev-cu12'"${SUFFIX}"'"]'
               else
-                echo "Unknown overlay cuda variant: ${C} (expected cu12 or cu13)" >&2
+                echo "Unknown overlay cuda variant: ${C} (expected cu13)" >&2
                 exit 1
               fi
               if [ -n "${OVERLAY_SUFFIX_INPUT}" ]; then
@@ -135,6 +138,7 @@ jobs:
 
   build-and-publish:
     needs: prepare
+    if: ${{ !inputs.build_only }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
@@ -144,18 +148,76 @@ jobs:
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
+  build-only:
+    needs: prepare
+    if: ${{ inputs.build_only && github.repository == 'sgl-project/sglang' }}
+    runs-on: x64-docker-build-node
+    env:
+      IMAGE: sglang-diffusion-build-only:${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE_DIR: source-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref || github.ref }}
+          path: ${{ env.SOURCE_DIR }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CUDA 13 diffusion image locally (no push)
+        run: |
+          cd "$SOURCE_DIR"
+          docker buildx build \
+            --target framework_final \
+            --platform linux/amd64 \
+            --load \
+            -t "$IMAGE" \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.3 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${{ needs.prepare.outputs.extra_build_args }} \
+            --no-cache \
+            .
+
+      - name: Verify diffusion dependencies
+        run: |
+          docker run --rm "$IMAGE" python3 -c '
+          import importlib
+          modules = (
+              "av",
+              "cache_dit",
+              "cv2",
+              "diffusers",
+              "imageio_ffmpeg",
+              "moviepy",
+              "msgpack",
+              "sglang.multimodal_gen",
+              "soundfile",
+              "trimesh",
+          )
+          for module in modules:
+              importlib.import_module(module)
+          print("diffusion dependency smoke check passed")
+          '
+
+      - name: Remove local test image
+        if: always()
+        run: docker image rm "$IMAGE" || true
+
   cleanup-nightly:
     needs: build-and-publish
-    if: ${{ !inputs.tag && !inputs.pr_number }}
+    if: ${{ !inputs.build_only && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
   build-overlay:
     needs: [prepare, build-and-publish]
-    if: ${{ inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !inputs.build_only && inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

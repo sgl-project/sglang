@@ -68,11 +68,10 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
-    # SGLANG_OPT_MOE_QUANT_ONCE: optional pre-quantized (q, scale) pair for
-    # ``hidden_states`` (per-token-group-128 fp8, q rows possibly padded to a
-    # multiple of 4). Consumed by the standard->triton fused runner so it can
-    # skip its own activation quant; ``hidden_states`` itself stays bf16.
-    hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
+    # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
+    # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
+    hidden_states_pre_quant: Optional[Tuple] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -112,6 +111,7 @@ class StandardDispatcher(BaseDispatcher):
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
         # - hpc_ops consumes global ids together with rank_ep / num_expert_total
+        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
@@ -119,6 +119,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
+            or backend.is_flashinfer_megamoe()
             or self.enable_flashinfer_mxfp4_moe
         )
         self.num_experts = moe_runner_config.num_experts
@@ -194,8 +195,9 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                    self.moe_ep_rank * self.num_local_routed_experts : (
+                        self.moe_ep_rank + 1
+                    )
                     * self.num_local_routed_experts
                 ] = torch.arange(
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device

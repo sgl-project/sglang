@@ -42,6 +42,10 @@ class CausalSelfAttentionKVCache:
         if self.attention_window_size == 0:
             self.attention_window_size = self.cache_size
 
+    @property
+    def num_cache_heads(self) -> int:
+        return self.k.shape[2]
+
     def reset_indices(self) -> None:
         self.global_end_index.zero_()
         self.local_end_index.zero_()
@@ -217,8 +221,7 @@ class CausalSelfAttentionKVCache:
                         self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
                             self.k[
                                 :,
-                                sink_tokens
-                                + num_evicted_tokens : sink_tokens
+                                sink_tokens + num_evicted_tokens : sink_tokens
                                 + num_evicted_tokens
                                 + num_rolled_tokens,
                             ].clone()
@@ -226,8 +229,7 @@ class CausalSelfAttentionKVCache:
                         self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
                             self.v[
                                 :,
-                                sink_tokens
-                                + num_evicted_tokens : sink_tokens
+                                sink_tokens + num_evicted_tokens : sink_tokens
                                 + num_evicted_tokens
                                 + num_rolled_tokens,
                             ].clone()
@@ -240,8 +242,7 @@ class CausalSelfAttentionKVCache:
                             :,
                         ] = self.k[
                             :,
-                            sink_tokens
-                            + num_evicted_tokens : sink_tokens
+                            sink_tokens + num_evicted_tokens : sink_tokens
                             + num_evicted_tokens
                             + num_rolled_tokens,
                             cache_head_slice,
@@ -254,8 +255,7 @@ class CausalSelfAttentionKVCache:
                             :,
                         ] = self.v[
                             :,
-                            sink_tokens
-                            + num_evicted_tokens : sink_tokens
+                            sink_tokens + num_evicted_tokens : sink_tokens
                             + num_evicted_tokens
                             + num_rolled_tokens,
                             cache_head_slice,

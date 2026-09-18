@@ -9,7 +9,20 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_temb_table_slices,
+    can_use_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    fused_temb_table_slices,
+    mark_fused_gelu_site,
+    mark_nvfp4_bias_gelu_site,
+    nvfp4_bias_gelu_active,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -37,6 +50,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -67,6 +83,45 @@ _is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+
+class _WanGELUMLP(MLP):
+    """Wan FFN with request-scoped GELU fast paths."""
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        prefix: str,
+        quant_config: QuantizationConfig | None,
+    ):
+        super().__init__(
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=prefix,
+            quant_config=quant_config,
+            fuse_bias_gelu_tanh=False,
+        )
+        mark_fused_gelu_site(self, "fc_in")
+        self.fuse_bias_gelu_tanh = isinstance(
+            self.fc_in.quant_method, ModelOptFp4LinearMethod
+        )
+        if self.fuse_bias_gelu_tanh:
+            mark_nvfp4_bias_gelu_site(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+            x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
+        else:
+            x, bias = self.fc_in(x)
+            x = self._apply_activation(
+                x,
+                bias,
+                use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
+            )
+        x, _ = self.fc_out(x)
+        return x
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -195,6 +250,7 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=is_cross_attention,
+            is_cross_attention=is_cross_attention,
             quant_config=quant_config,
         )
 
@@ -330,6 +386,54 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
+_WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
+
+
+def _eager_temb_table_slices(
+    table: torch.Tensor, temb: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    parts = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
+    return tuple(part.squeeze(2) for part in parts)
+
+
+def _wan_temb_table_slices(
+    table: torch.Tensor, temb: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Per-token adaLN slices ``(table + temb.float()).chunk(6)`` in one pass.
+
+    The fused kernel writes each ``(B, S, D)`` slice contiguously, so the
+    downstream fused-norm wrappers' ``.contiguous()`` calls stop copying the
+    full activation.  A float32 add of widened values involves no rounding,
+    so the result is bit-identical to the eager chain; the first call still
+    verifies ``torch.equal`` and falls back permanently on mismatch.
+    """
+    verified = _WAN_TEMB_SLICES.verified
+    if (
+        not _WAN_TEMB_SLICES.disabled
+        and can_use_fused_temb_table_slices(table, temb)
+        and (verified or _WAN_TEMB_SLICES.can_attempt_once())
+    ):
+        try:
+            buf = fused_temb_table_slices(table, temb)
+        except Exception as exc:
+            _WAN_TEMB_SLICES.on_exception(exc, logger=logger)
+        else:
+            out = tuple(buf[j] for j in range(6))
+            if verified:
+                return out
+            return _WAN_TEMB_SLICES.accept_or_fallback(
+                out,
+                _eager_temb_table_slices(table, temb),
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "Wan fused temb-table slices are not bit-exact on this "
+                    "platform; falling back to eager"
+                ),
+            )
+    return _eager_temb_table_slices(table, temb)
+
+
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -388,6 +492,11 @@ class WanTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("to_out", prefix),
         )
+        self.hidden_dim = dim
+        self.num_attention_heads = num_heads
+        self.dim_head = dim // num_heads
+        self.use_offline_qk_rotation = False
+
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
@@ -405,6 +514,36 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
+            # TODO Need to create mxfp8 attention scheme and port the code below
+            from sglang.multimodal_gen import envs
+
+            quant_description = getattr(quant_config, "quant_description", {})
+            self.use_offline_qk_rotation = (
+                quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
+                and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
+                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+            )
+            if self.use_offline_qk_rotation:
+                self.register_buffer(
+                    "q_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                self.register_buffer(
+                    "k_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                quant_config.use_offline_qk_rotation = True
+
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
@@ -415,9 +554,6 @@ class WanTransformerBlock(nn.Module):
                 is_cross_attention=False,
             )
 
-        self.hidden_dim = dim
-        self.num_attention_heads = num_heads
-        self.dim_head = dim // num_heads
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(self.dim_head, eps=eps)
             self.norm_k = RMSNorm(self.dim_head, eps=eps)
@@ -472,10 +608,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(
+        self.ffn = _WanGELUMLP(
             dim,
             ffn_dim,
-            act_type="gelu_pytorch_tanh",
             prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )
@@ -489,6 +624,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -496,16 +632,14 @@ class WanTransformerBlock(nn.Module):
         orig_dtype = hidden_states.dtype
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
-            ).chunk(6, dim=2)
-            # batch_size, seq_len, 1, inner_dim
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                c_gate_msa,
+            ) = _wan_temb_table_slices(self.scale_shift_table, temb)
         else:
             # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
             e = self.scale_shift_table + temb.float()
@@ -543,13 +677,17 @@ class WanTransformerBlock(nn.Module):
         # Apply rotary embeddings
         cos, sin = freqs_cis
         if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+            # The concatenated cache only depends on freqs_cis, which is fixed
+            # for the whole forward; the transformer builds it once per call.
+            cos_sin_cache = rope_cos_sin_cache
+            if cos_sin_cache is None:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
@@ -573,9 +711,23 @@ class WanTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
+
+        if (
+            self.use_offline_qk_rotation
+            and self.attn1.backend is AttentionBackendEnum.FA
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        ):
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -587,9 +739,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -598,9 +751,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -739,10 +893,9 @@ class WanTransformerBlock_VSA(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(
+        self.ffn = _WanGELUMLP(
             dim,
             ffn_dim,
-            act_type="gelu_pytorch_tanh",
             prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )
@@ -756,6 +909,7 @@ class WanTransformerBlock_VSA(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -790,13 +944,17 @@ class WanTransformerBlock_VSA(nn.Module):
         # Apply rotary embeddings
         cos, sin = freqs_cis
         if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+            # The concatenated cache only depends on freqs_cis, which is fixed
+            # for the whole forward; the transformer builds it once per call.
+            cos_sin_cache = rope_cos_sin_cache
+            if cos_sin_cache is None:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
@@ -820,9 +978,10 @@ class WanTransformerBlock_VSA(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
@@ -833,9 +992,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -844,9 +1004,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -857,9 +1018,8 @@ class WanTransformerBlock_VSA(nn.Module):
 
 
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -1010,6 +1170,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
+        enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -1143,25 +1304,43 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
-        # if caching is enabled, we might be able to skip the forward pass
+        run_transformer_blocks = self.begin_spectrum_step()
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
 
-        if should_skip_forward:
+        if enable_spectrum and not run_transformer_blocks:
+            hidden_states = self.spectrum_predict_features(hidden_states)
+        elif should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            rope_cos_sin_cache = None
+            if _is_cuda and freqs_cis is not None:
+                cos, sin = freqs_cis
+                rope_cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
             for block in self.blocks:
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
+                    rope_cos_sin_cache=rope_cos_sin_cache,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+            if enable_spectrum:
+                self.spectrum_record_features(hidden_states)
         self.cnt += 1
 
         if sequence_shard_enabled:

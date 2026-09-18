@@ -31,6 +31,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -78,11 +82,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -322,8 +322,7 @@ class MiMoV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -376,7 +375,6 @@ class MoEGate(nn.Module):
 
 
 class MiMoV2MoE(nn.Module):
-
     def __init__(
         self,
         config: MiMoV2Config,
@@ -413,7 +411,7 @@ class MiMoV2MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -448,7 +446,7 @@ class MiMoV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -879,10 +877,16 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -1000,6 +1004,7 @@ class MiMoV2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1059,7 +1064,8 @@ class MiMoV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if forward_batch.can_run_tbo:
+        aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
+        if forward_batch.can_run_tbo and not self.layers_to_capture:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 
@@ -1094,7 +1100,21 @@ class MiMoV2Model(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                 )
+
+        # A draft targeting the final layer ("after layer
+        # num_hidden_layers-1") maps to capture index num_hidden_layers,
+        # past the layer loop; capture the pre-norm output here instead.
+        if (
+            self.pp_group.is_last_rank
+            and self.config.num_hidden_layers in self.layers_to_capture
+        ):
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
@@ -1115,7 +1135,9 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states, hidden_states_before_norm
+        if len(aux_hidden_states) == 0:
+            return hidden_states, hidden_states_before_norm
+        return hidden_states, hidden_states_before_norm, aux_hidden_states.finalize()
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -1137,7 +1159,7 @@ class MiMoV2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -1191,7 +1213,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1202,6 +1224,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
@@ -1239,9 +1262,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.model is not None
-        ), "get_input_embedding() is not available in encoder_only mode"
+        assert self.model is not None, (
+            "get_input_embedding() is not available in encoder_only mode"
+        )
         return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -1355,11 +1378,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        assert (
-            not self.config.encoder_only
-        ), "forward() should not be called in encoder_only mode"
+        assert not self.config.encoder_only, (
+            "forward() should not be called in encoder_only mode"
+        )
 
-        if self._is_multimodal:
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -1384,6 +1416,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 self.lm_head,
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
@@ -1395,6 +1428,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     @property
     def end_layer(self):
         return self.model.end_layer if self.model is not None else 0
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # target_layer_ids are "after layer X" ids; capture before layer X+1,
+        # matching the draft's extract_context_feature (offset=1).
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1588,6 +1635,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # mxfp4 ckpts store expert scales without the `_inv` suffix,
+                    # while Fp8MoEMethod registers them as *_weight_scale_inv.
+                    if name.endswith("weight_scale") and (name + "_inv" in params_dict):
+                        name = name + "_inv"
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1628,15 +1679,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             )
 
     def get_embed_and_head(self):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "get_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "get_embed_and_head() is not available in encoder_only mode"
+        )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "set_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "set_embed_and_head() is not available in encoder_only mode"
+        )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

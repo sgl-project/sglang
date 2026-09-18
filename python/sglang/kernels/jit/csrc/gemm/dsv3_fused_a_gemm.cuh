@@ -29,7 +29,7 @@
 #include <cuda_bf16.h>
 #include <utility>
 
-namespace {
+namespace sglang {
 
 using bf16_t = __nv_bfloat16;
 
@@ -419,7 +419,7 @@ struct MmaComputer {
           }
         }
       }
-      ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
+      arrive_barrier(smem_barrier + 1 + stage_idx * 2);
       stage_idx += 1;
       phase_bit = stage_idx == stage_cnt ? phase_bit ^ 1 : phase_bit;
       stage_idx = stage_idx == stage_cnt ? 0 : stage_idx;
@@ -647,4 +647,4 @@ struct DSV3FusedAGemmKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
