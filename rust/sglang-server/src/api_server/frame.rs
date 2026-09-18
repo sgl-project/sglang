@@ -161,20 +161,36 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
 
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
-/// just the shard routing key.
-pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+/// just the shard routing key. Content comes from `out`; request-wide counts
+/// and scheduler statistics come from `cumulative`, even for incremental SSE.
+pub(super) fn frame_value(
+    out: &ChunkEvent,
+    cumulative: &ChunkEvent,
+    rid: &str,
+) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
             "id": rid,
             "prompt_tokens": out.prompt_tokens,
-            "completion_tokens": out.completion_tokens,
+            "completion_tokens": cumulative.completion_tokens,
             // Full dict (type + matched + message + status_code + …), or null.
             "finish_reason": out.finish_reason,
         },
     });
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
+    }
+    if let Some(stats) = &cumulative.stats {
+        let serde_json::Value::Object(fields) =
+            serde_json::to_value(stats).expect("statistics contain only JSON values")
+        else {
+            unreachable!("statistics serialize as an object");
+        };
+        v["meta_info"]
+            .as_object_mut()
+            .expect("meta_info is an object")
+            .extend(fields);
     }
     // Logprobs + hidden states ride behind the boxed extras (absent for a plain
     // token/text frame). `[logprob, token_id, text|null]` tuples; text
@@ -254,10 +270,17 @@ pub(super) fn cumulative_frame_json(
     // quirk is reproduced instead of re-derived.
     let finish = serde_json::to_value(&o.finish_reason).ok()?.to_string();
 
-    // Alphabetical by convention only — a stable order that is easy to extend and
-    // diff.
-    let mut m = String::new();
-    let _ = write!(m, "{{\"completion_tokens\":{}", o.completion_tokens);
+    // Scheduler statistics share their typed serialization with the Value path;
+    // the remaining fields keep their stable order.
+    let mut m = String::from("{");
+    if let Some(stats) = &o.stats {
+        // The typed snapshot serializes as an object. Append only its members;
+        // both frame builders use this same schema, including explicit nulls.
+        let fields = serde_json::to_string(stats).ok()?;
+        m.push_str(&fields[1..fields.len() - 1]);
+        m.push(',');
+    }
+    let _ = write!(m, "\"completion_tokens\":{}", o.completion_tokens);
     let _ = write!(m, ",\"finish_reason\":{finish}");
     if let Some(h) = &acc.hidden_json {
         let _ = write!(m, ",\"hidden_states\":{h}");
@@ -338,7 +361,7 @@ pub(super) fn cumulative_frame_string(
     index: Option<usize>,
 ) -> String {
     cumulative_frame_json(acc, rid_str, index)
-        .unwrap_or_else(|| tag_value(frame_value(acc.snapshot(), rid_str), index))
+        .unwrap_or_else(|| tag_value(frame_value(acc.snapshot(), acc.snapshot(), rid_str), index))
 }
 
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
@@ -350,11 +373,9 @@ pub(super) fn stream_frame_value(
     rid_str: &str,
 ) -> serde_json::Value {
     if incremental {
-        let mut d = delta;
-        d.completion_tokens = acc.snapshot().completion_tokens;
-        frame_value(&d, rid_str)
+        frame_value(&delta, acc.snapshot(), rid_str)
     } else {
-        frame_value(acc.snapshot(), rid_str)
+        frame_value(acc.snapshot(), acc.snapshot(), rid_str)
     }
 }
 
@@ -434,6 +455,9 @@ impl OutputAccumulator {
         o.prompt_tokens = d.prompt_tokens; // constant across the request
         if d.finish_reason.is_some() {
             o.finish_reason = d.finish_reason.clone();
+        }
+        if d.stats.is_some() {
+            o.stats.clone_from(&d.stats);
         }
         // Logprobs/hidden ride behind the boxed extras — most frames have none, so
         // only allocate the accumulator's box once a delta actually carries some.
@@ -547,6 +571,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn statistics_are_latest_snapshots_in_both_frame_paths() {
+        use crate::message::response::{CacheDetailValue, GenerationStats};
+
+        let mut acc = OutputAccumulator::default();
+        let mut populated = GenerationStats {
+            cached_tokens: 7,
+            reasoning_tokens: 4,
+            num_retractions: 2,
+            dp_rank: Some(1),
+            cached_tokens_details: Some(
+                [
+                    ("device".into(), CacheDetailValue::Count(3)),
+                    ("host".into(), CacheDetailValue::Count(2)),
+                    ("storage".into(), CacheDetailValue::Count(2)),
+                    (
+                        "storage_backend".into(),
+                        CacheDetailValue::Text("test\"store".into()),
+                    ),
+                    ("nullable_backend".into(), CacheDetailValue::Null),
+                ]
+                .into(),
+            ),
+        };
+        // Full snapshots replace previous values, even if a value decreases or
+        // changes to null. The API must not clamp or recompute scheduler data.
+        let snapshots = [
+            None,
+            Some(GenerationStats::default()),
+            Some(populated.clone()),
+            None,
+            Some({
+                populated.reasoning_tokens = 8;
+                populated.clone()
+            }),
+            Some(GenerationStats::default()),
+        ];
+        let mut expected = None;
+        for stats in snapshots {
+            let delta = ChunkEvent {
+                stats,
+                text: "x".into(),
+                completion_tokens: 1,
+                ..Default::default()
+            };
+            if delta.stats.is_some() {
+                expected.clone_from(&delta.stats);
+            }
+            acc.fold(&delta);
+            assert_eq!(acc.snapshot().stats, expected);
+            for incremental in [false, true] {
+                let v = stream_frame_value(delta.clone(), &acc, incremental, "r");
+                if let Some(stats) = &expected {
+                    for (key, value) in serde_json::to_value(stats).unwrap().as_object().unwrap() {
+                        assert_eq!(v["meta_info"].get(key), Some(value), "{key}");
+                    }
+                } else {
+                    assert!(v["meta_info"].get("cached_tokens").is_none());
+                }
+            }
+            for index in [None, Some(2)] {
+                let slow = tag_value(frame_value(acc.snapshot(), acc.snapshot(), "r"), index);
+                let fast = cumulative_frame_json(&acc, "r", index).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&fast).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(&slow).unwrap()
+                );
+                acc.extras_memo_broken = true;
+                assert_eq!(cumulative_frame_string(&acc, "r", index), slow);
+                acc.extras_memo_broken = false;
+            }
+        }
+    }
+
+    #[test]
     fn flat_logprob_tuples_shape() {
         let v = logprob_tuples(&[-0.5, -1.5], &[10, 20], None);
         assert_eq!(
@@ -620,7 +718,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let frame = frame_value(&out, "1");
+        let frame = frame_value(&out, &out, "1");
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -724,7 +822,7 @@ mod tests {
             for d in &deltas {
                 acc.fold(d);
                 let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
-                let slow = tag_value(frame_value(acc.snapshot(), "7"), index);
+                let slow = tag_value(frame_value(acc.snapshot(), acc.snapshot(), "7"), index);
                 println!("fast={fast:?}");
                 println!("slow={slow:?}");
                 assert_eq!(
@@ -795,6 +893,7 @@ mod tests {
                 },
                 ChunkEvent {
                     rid: "9".into(),
+                    stats: None,
                     text: " 世界".into(),
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
@@ -829,7 +928,7 @@ mod tests {
                     acc.fold(d);
                     let fast = cumulative_frame_json(&acc, "9", index)
                         .expect("the extras memo must stay valid for a well-formed request");
-                    let slow = tag_value(frame_value(acc.snapshot(), "9"), index);
+                    let slow = tag_value(frame_value(acc.snapshot(), acc.snapshot(), "9"), index);
                     assert_eq!(
                         as_json(&fast),
                         as_json(&slow),
