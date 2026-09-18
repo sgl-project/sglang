@@ -95,6 +95,112 @@ def _mute_diffusers_torchao_probe():
 # ---------------------------------------------------------------------------
 
 
+def normalize_deepseek_v4_compat(config) -> None:
+    """Rebuild the DeepSeek V4 legacy ``compress_ratios`` list from the new
+    ``compress_rates`` mapping + ``layer_types`` schedule introduced in
+    transformers >= 4.57 (#34092).
+
+    Upstream renamed the field *and reshaped it*:
+
+    - old (transformers < 4.57): ``compress_ratios: list[int]``, indexed by
+      layer id. Values follow upstream's
+      ``_COMPRESS_RATIO_TO_LAYER_TYPE = {0: "sliding_attention",
+      4: "compressed_sparse_attention", 128: "heavily_compressed_attention"}``
+      — i.e. ``0`` marks a sliding-window layer (no compression), ``4`` /
+      ``128`` mark the two compressed attention types.
+    - new (>= 4.57): ``compress_rates: dict[str, int]`` keyed by layer-type
+      label, paired with ``layer_types: list[str]`` giving the per-layer
+      schedule. ``compress_rates`` only carries the two compressed types;
+      sliding-attention layers are not entries in that dict.
+
+    sglang readers still consume the legacy ``list[int]`` shape
+    (``models/deepseek_v4.py`` does ``config.compress_ratios[layer_id]``;
+    ``configs/model_config.py`` filters it by ``== 4``; the NPU backend
+    checks ``4 in ...`` / ``128 in ...``). Rebuild that per-layer list
+    here: sliding-attention layers emit ``0`` (matching the legacy
+    encoding), the two compressed types resolve through ``compress_rates``.
+
+    sglang currently aliases the ``deepseek_v4`` model_type onto upstream's
+    ``DeepseekV3Config`` (see ``hf_transformers/common.py``), so upstream's
+    own ``DeepseekV4Config.__post_init__`` legacy-input path does not run
+    and the reconstruction has to happen here.
+    """
+
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    _flatten_deepseek_v4_rope(config)
+
+    # ``hasattr`` alone is not enough here: some configs may carry an
+    # explicit ``compress_ratios = None``, which would short-circuit the
+    # rebuild and hand downstream a ``None`` that then explodes at
+    # ``for r in ...`` / ``[layer_id]``. Treat only a real non-None value as
+    # "already legacy-shaped, keep as is". (See vLLM's harden pass in
+    # vllm-project/vllm#43443 for the same lesson.)
+    if getattr(config, "compress_ratios", None) is not None:
+        return
+
+    rates = getattr(config, "compress_rates", None)
+    layer_types = getattr(config, "layer_types", None)
+    if not isinstance(rates, dict) or not isinstance(layer_types, (list, tuple)):
+        return
+
+    def _legacy_ratio(lt: str) -> int:
+        # ``sliding_attention`` layers are absent from ``compress_rates`` by
+        # design (SWA has no compression rate) — encode them as ``0`` to
+        # preserve the legacy shape. Any other layer type that the loaded
+        # ``compress_rates`` does not name falls back to ``0`` too: the
+        # downstream sglang readers (``sum(r == 4)``, ``4 in ...`` /
+        # ``128 in ...``, and per-layer indexing) all treat ``0`` as a
+        # non-compressed layer, so a silently unknown type degrades to
+        # "run as an uncompressed layer" rather than crashing config load.
+        # This matches the community consensus reached in vLLM's harden
+        # pass (vllm-project/vllm#43443).
+        if lt == "sliding_attention":
+            return 0
+        return rates.get(lt, 0)
+
+    config.compress_ratios = [_legacy_ratio(lt) for lt in layer_types]
+
+
+def _flatten_deepseek_v4_rope(config) -> None:
+    """Flatten upstream V4's nested ``rope_parameters`` into the flat shape
+    sglang's DSv4 attention expects.
+
+    Upstream ``DeepseekV4Config.__post_init__`` reshapes ``rope_parameters``
+    into ``{"main": {...yarn params...}, "compress": {...compress yarn...}}``.
+    sglang consumes it as a flat dict — ``get_rope_config()`` returns the
+    top-level dict, and ``deepseek_v4.py::MqaAttentionBase.__init__`` reads
+    ``scaling["original_max_position_embeddings"]``, ``scaling.get("factor")``,
+    ``scaling.get("beta_fast" / "beta_slow")``, all of which upstream nests
+    under ``main``. A nested config would otherwise silently degrade yarn to
+    the ``.get(..., 1.0)`` defaults.
+
+    Prefer the ``main`` branch (the standard-attention rope; ``compress`` is
+    for CSA / HCA layers, whose base is already ``config.compress_rope_theta``
+    handled separately downstream). Lift ``rope_theta`` in if it is missing so
+    ``get_rope_config()`` — which reads ``rp["rope_theta"]`` when
+    ``rope_parameters`` is non-None — succeeds. Setting ``config.rope_scaling``
+    also updates ``config.rope_parameters`` via ``PretrainedConfig``'s
+    bidirectional alias, so both attributes agree on the flat shape after
+    this normalizer runs.
+    """
+
+    rp = getattr(config, "rope_parameters", None)
+    if not isinstance(rp, dict):
+        return
+    main = rp.get("main")
+    compress = rp.get("compress")
+    if not (isinstance(main, dict) and isinstance(compress, dict)):
+        return
+    flat = dict(main)
+    if "rope_theta" not in flat:
+        flat["rope_theta"] = getattr(config, "rope_theta", 10000)
+    # PretrainedConfig aliases rope_parameters <-> rope_scaling, so this
+    # single set covers both attribute paths downstream.
+    config.rope_scaling = flat
+
+
 def normalize_rope_scaling_compat(config) -> None:
     """Ensure rope_scaling dicts have ``"type"`` alongside ``"rope_type"``.
 
