@@ -164,9 +164,10 @@ class QwenImage21RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        normalized = F.normalize(x.float(), dim=1 if self.channel_first else -1).to(
-            x.dtype
-        )
+        normalized = F.normalize(
+            x if x.dtype == torch.float64 else x.float(),
+            dim=1 if self.channel_first else -1,
+        ).to(x.dtype)
         return normalized * self.scale * self.gamma + self.bias
 
 
