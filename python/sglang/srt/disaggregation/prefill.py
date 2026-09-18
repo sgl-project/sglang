@@ -420,21 +420,14 @@ class PrefillBootstrapQueue:
         req.sampling_params.max_new_tokens = 1
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(
-        self,
-        return_failed_reqs: bool = False,
-    ) -> List[Req] | tuple[List[Req], List[Req]]:
+    def pop_bootstrapped(self) -> List[Req]:
         """Pop the reqs which have finished bootstrapping."""
 
         bootstrapped_reqs = []
-        failed_reqs = []
         indices_to_remove = set()
 
         if len(self.queue) == 0:
-            if return_failed_reqs is False:
-                return []
-            else:
-                return [], []
+            return []
 
         if self.pp_size > 1:
             polls = poll_and_all_reduce_pp2(
@@ -457,7 +450,6 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
-                failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
                     req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
@@ -492,10 +484,7 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        if return_failed_reqs is False:
-            return bootstrapped_reqs
-        else:
-            return bootstrapped_reqs, failed_reqs
+        return bootstrapped_reqs
 
     def release_memory_occupation(self):
         self.queue.clear()
