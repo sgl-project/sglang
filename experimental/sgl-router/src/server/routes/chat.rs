@@ -13,6 +13,9 @@ use crate::policies::selection::{
 use crate::policies::state::engine_load::EngineLoadSnapshot;
 use crate::policies::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::policy_reorg::buckets::{BucketResolver, SelectError, SelectionRequest};
+use crate::policy_reorg::cache_aware::PrefixMemo;
+use crate::policy_reorg::{PickError, RoutingStage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -48,6 +51,13 @@ pub async fn chat_completions(
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
 
+    if let Some(resolver) = &ctx.bucket_resolver {
+        return select_and_forward_with_buckets(
+            &ctx, resolver, model, fields, body, headers, start,
+        )
+        .await;
+    }
+
     // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
     let candidates = resolver
@@ -74,6 +84,82 @@ pub async fn chat_completions(
 
     // PD sends to both workers and returns the decode response.
     forward_chat_request(&ctx, request, workers, headers, start).await
+}
+
+/// The bucket-engine path: one pick per stage, then the same forwarding.
+async fn select_and_forward_with_buckets(
+    ctx: &AppContext,
+    resolver: &BucketResolver,
+    model: ModelId,
+    fields: preparation::RoutingFields,
+    body: Bytes,
+    headers: HeaderMap,
+    start: Instant,
+) -> Result<Response<Body>, ApiError> {
+    if model.0 != ctx.config.model.id {
+        return Err(ApiError::ModelNotFound(model.0));
+    }
+    let request =
+        PreparedChatRequest::prepare(ctx, model, fields, body, resolver.needs_request_tokens())?;
+    let routing = RoutingContext::from_headers(ctx, &headers)?;
+    let prefix = PrefixMemo::new();
+    let selection = SelectionRequest {
+        model: &request.model,
+        input_tokens: request.input_token_count as u64,
+        max_output_tokens: request.max_output_tokens,
+        ttft_slo_ms: routing.ttft_slo_ms,
+        tps_slo: routing.tps_slo,
+        session_id: routing.session_id,
+        routing_key: routing.routing_key,
+        tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        prefix: &prefix,
+    };
+    let prefill = resolver
+        .pick(RoutingStage::Prefill, &selection)
+        .await
+        .map_err(|error| select_error(ctx, &request.model, error))?
+        .engine;
+    let decode = match prefill.mode() {
+        WorkerMode::Prefill => Some(
+            resolver
+                .pick(RoutingStage::Decode, &selection)
+                .await
+                .map_err(|error| match error {
+                    SelectError::Pool(error) => pool_error(error, &request.model),
+                    _ => ApiError::NoDecodeWorkersAvailable {
+                        model: request.model.0.clone(),
+                    },
+                })?
+                .engine,
+        ),
+        _ => None,
+    };
+    let workers = SelectedWorkers {
+        prefill,
+        decode,
+        track_dispatch_timestamps: resolver.needs_dispatch_timestamps(),
+    };
+    forward_chat_request(ctx, request, workers, headers, start).await
+}
+
+fn select_error(ctx: &AppContext, model: &ModelId, error: SelectError) -> ApiError {
+    match error {
+        SelectError::Pool(error) => pool_error(error, model),
+        SelectError::Exhausted(PickError::NoCandidates) => {
+            policy_selection_failed(ctx, &model.0, PolicySelectionFailureReason::ProposalEmpty)
+        }
+        SelectError::Exhausted(_) => policy_selection_failed(
+            ctx,
+            &model.0,
+            PolicySelectionFailureReason::PrefillAdmissionExhausted,
+        ),
+        SelectError::InvalidSignal(_) | SelectError::OutOfSet(_) => {
+            tracing::warn!(model = %model, ?error, "prefill policy selection failed");
+            ApiError::PolicySelectionFailed {
+                model: model.0.clone(),
+            }
+        }
+    }
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {

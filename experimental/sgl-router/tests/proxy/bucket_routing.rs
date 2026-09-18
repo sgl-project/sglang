@@ -95,7 +95,9 @@ fn build_ctx(
     policy: PolicyKind,
     affinity: Option<AffinityConfig>,
 ) -> Arc<AppContext> {
-    Arc::new(build_app_context(specs, bucket_config, policy, affinity))
+    let mut context = build_app_context(specs, bucket_config, policy, affinity);
+    context.enable_bucket_engine().unwrap();
+    Arc::new(context)
 }
 
 struct FakePrefixIndex {
@@ -207,6 +209,7 @@ fn build_cache_ctx_with_affinity(
     });
     context.prefix_index = Some(prefix_index);
     context.block_size_oracle.try_set(1).unwrap();
+    context.enable_bucket_engine().unwrap();
     Arc::new(context)
 }
 

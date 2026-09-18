@@ -378,7 +378,7 @@ mod tests {
     use super::super::{ready, AdmissionReason, AffinityScope, EngineRejection, PickResult};
     use super::*;
     use crate::config::{AffinityConfig, SamplingOverrides};
-    use crate::policies::state::kv_events::KvEventIndex;
+    use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex};
     use crate::policies::state::AffinityStore;
     use futures::future::BoxFuture;
     use std::time::Duration;
@@ -430,8 +430,9 @@ mod tests {
         let deps = PolicyDependencies {
             metrics: MetricsRegistry::new(),
             affinity: AffinityStore::new(Duration::from_secs(60)),
-            kv_index: KvEventIndex::new(),
+            local_cache: Some(KvEventIndex::new()),
             remote_cache: None,
+            block_size: BlockSizeOracle::new(),
         };
         BucketResolver::from_config(&model, Arc::default(), EngineLoadTable::new(), &deps).unwrap()
     }

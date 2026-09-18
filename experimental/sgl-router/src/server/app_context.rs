@@ -7,8 +7,12 @@ use crate::policies::buckets::BucketSelector;
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::state::engine_load::ActiveLoadRegistry;
 use crate::policies::state::engine_load::EngineLoadTable;
-use crate::policies::state::kv_events::{BlockSizeOracle, KvIndexMetrics};
+use crate::policies::state::engine_load::JanitorHandle;
+use crate::policies::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
+use crate::policies::state::AffinityStore;
 use crate::policies::PolicyRegistry;
+use crate::policy_reorg::buckets::BucketResolver;
+use crate::policy_reorg::{BuildError, PolicyDependencies};
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
@@ -16,6 +20,7 @@ use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// `/readyz` readiness as a one-way door: `NOT_READY -> READY -> DRAINING`,
 /// and never backwards. One atomic rather than a pair of bools so the latch is
@@ -51,6 +56,12 @@ pub struct AppContext {
     /// Indexer), where those series would all be a structural zero — see
     /// [`crate::policies::state::kv_events::KvEventIndex::metrics_source`].
     pub kv_metrics: Option<KvIndexMetrics>,
+    /// Local KV-event index, when this router maintains one.
+    pub kv_index: Option<Arc<KvEventIndex>>,
+    /// Bucket engine, when `--selection-engine reorg` is set; replaces the
+    /// selection ladder for every request.
+    pub bucket_resolver: Option<Arc<BucketResolver>>,
+    affinity_sweeper: Option<JanitorHandle>,
     /// Open HTTP exchanges, on every route. What axum's graceful shutdown
     /// is actually waiting on during the drain — `active_load` sees only the
     /// proxied subset.
@@ -111,10 +122,49 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
+            bucket_resolver: None,
+            affinity_sweeper: None,
             engine_load: EngineLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
+    }
+
+    /// Builds the bucket engine over the already wired load table, caches and
+    /// metrics. Call after those fields are set.
+    pub fn enable_bucket_engine(&mut self) -> Result<(), BuildError> {
+        let model = &self.config.model;
+        let (idle, eviction) = match model.policy {
+            crate::config::PolicyKind::Sticky => {
+                let sticky = model.sticky.clone().unwrap_or_default();
+                (sticky.idle_secs, sticky.eviction_interval_secs)
+            }
+            _ => {
+                let affinity = model.affinity.clone().unwrap_or_default();
+                (
+                    affinity.session_idle_secs,
+                    affinity.session_eviction_interval_secs,
+                )
+            }
+        };
+        let affinity = AffinityStore::new(Duration::from_secs(idle));
+        self.affinity_sweeper = affinity.spawn_sweeper(Duration::from_secs(eviction));
+        let deps = PolicyDependencies {
+            metrics: Arc::clone(&self.metrics),
+            affinity,
+            local_cache: self.kv_index.clone(),
+            remote_cache: self.prefix_index.clone(),
+            block_size: Arc::clone(&self.block_size_oracle),
+        };
+        let resolver = BucketResolver::from_config(
+            model,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.engine_load),
+            &deps,
+        )?;
+        self.bucket_resolver = Some(Arc::new(resolver));
+        Ok(())
     }
 
     /// Report bootstrap as finished, unless the pod has already begun draining.
@@ -189,7 +239,7 @@ impl AppContext {
                 active_load: crate::config::ActiveLoadConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
-            proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
+            proxy: Arc::new(Proxy::new(Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             bucket_selector: Arc::new(BucketSelector::new(None)),
@@ -199,6 +249,9 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
+            bucket_resolver: None,
+            affinity_sweeper: None,
             engine_load: EngineLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
