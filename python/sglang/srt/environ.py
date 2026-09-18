@@ -958,7 +958,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
-    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(False)
+    # ON: measured 1M TTFT 2011 -> 491 s and a 960k warm-up 456 s against ~33
+    # minutes. Set 0 to restore the unsharded indexer for an A/B.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
     # DSA prefill: shard the whole attention block's TOKENS across the
     # attention-TP group -- every rank computes every head for its own slice,
     # instead of its own heads for every token. Consumes no ranks, so it
@@ -966,7 +968,10 @@ class Envs:
     # replacing it. No weight is resharded: the query is redistributed across
     # attention TP by all-to-all and put back after attention. Read at startup
     # because it decides whether the full-head RadixAttention gets built.
-    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(False)
+    # ON: measured a 16k tail on a 958k cached prefix 7.699 -> 4.757 s (-38.2%)
+    # against a same-session control, with prefill logprobs bitwise identical at
+    # all 44,062 paired positions. Set 0 to restore the unsharded attention.
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
     # DSA-CP: also shard batches that carry more than one request. Shards each
     # request's tokens separately and drops the operator's causal crop, which
     # the top-k already enforces -- see dsa_cp_layout.plan_dsa_cp_shard_per_req.

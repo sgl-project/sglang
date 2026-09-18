@@ -55,7 +55,7 @@ from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
 )
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import print_info_once
+from sglang.srt.utils import is_npu, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -73,10 +73,23 @@ if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
     # is the sliced one -- so the rows the slice does not own never get
     # written. Untested here either way; refuse rather than find out in an
     # accuracy run.
-    raise ValueError(
-        "SGLANG_NPU_ENABLE_DSA_CP does not compose with SGLANG_NPU_USE_MLAPO. "
-        "The fused MLA preprocess writes the KV cache itself, at a slot mapping "
-        "DSA-CP has already sliced."
+    #
+    # Which one yields depends on who asked. DSA-CP defaults ON, so a user who
+    # set only MLAPO never asked for this pair and must not be met with a hard
+    # failure for a flag they did not touch -- DSA-CP steps aside and says so.
+    # A user who set BOTH explicitly gets the error, because silently dropping
+    # one of two things someone deliberately turned on is worse.
+    if envs.SGLANG_NPU_ENABLE_DSA_CP.is_set():
+        raise ValueError(
+            "SGLANG_NPU_ENABLE_DSA_CP does not compose with "
+            "SGLANG_NPU_USE_MLAPO. The fused MLA preprocess writes the KV cache "
+            "itself, at a slot mapping DSA-CP has already sliced."
+        )
+    _enable_dsa_cp = False
+    print_info_once(
+        "DSA-CP is off because SGLANG_NPU_USE_MLAPO is on: the fused MLA "
+        "preprocess writes the KV cache at a slot mapping DSA-CP would have "
+        "sliced. Unset SGLANG_NPU_USE_MLAPO to get the sharded attention back"
     )
 
 
@@ -135,8 +148,15 @@ def dsa_cp_enabled() -> bool:
 
     Both sides must agree, so both ask here rather than reading the env var
     twice.
+
+    ``is_npu()`` guards it because this is asked from ``deepseek_v2.py``, which
+    every backend shares, and a true answer builds an extra full-head
+    ``RadixAttention`` at the same ``layer_id``. The forward path that would use
+    it exists only under ``hardware_backend/npu``, so on any other device that
+    module is dead weight registered with the attention backend. Harmless while
+    the flag defaulted off; not something to discover by flipping the default.
     """
-    return _enable_dsa_cp and get_parallel().attn_tp_size > 1
+    return _enable_dsa_cp and is_npu() and get_parallel().attn_tp_size > 1
 
 
 def get_dsa_cp_plan(
