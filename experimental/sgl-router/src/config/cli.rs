@@ -211,6 +211,22 @@ pub struct Cli {
     /// `--dp-size` like the limit.
     #[arg(long)]
     pub saturation_queue_floor: Option<u64>,
+    /// Number of random candidates sampled for the min-load fallback; the
+    /// least-pressured of the sample wins. The default 2 keeps today's
+    /// power-of-2 behavior unchanged. `k >= pool` skips the shuffle and
+    /// returns the exact minimum, with ties broken randomly — an idle
+    /// fleet ties on every comparison, so a fixed order would pin every
+    /// fallback dispatch to one worker; `k = 1` is a uniform draw within
+    /// the tier, and because a one-member sample has no runner-up the
+    /// proposal carries no backup, which disables the backup-admission
+    /// and pressure-guard paths. Note
+    /// the division of labor with `--cache-candidate-min-workers`,
+    /// `--cache-candidate-ratio`, and `--cache-candidate-max-workers`:
+    /// those bound the cache-affinity OWNER candidate set; this flag
+    /// bounds the min-load FALLBACK sample used when no owner is usable.
+    /// Requires `--policy cache_aware`.
+    #[arg(long)]
+    pub min_load_choices: Option<usize>,
 
     // ---- score composition ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -399,7 +415,8 @@ impl Cli {
             || self.cache_candidate_max_workers.is_some()
             || self.cache_switch_margin_tokens.is_some()
             || self.worker_queue_limit.is_some()
-            || self.saturation_queue_floor.is_some();
+            || self.saturation_queue_floor.is_some()
+            || self.min_load_choices.is_some();
         // Value checks before the policy check: a value that is wrong under
         // every policy should say so, rather than pointing at --policy.
         if self.worker_queue_limit == Some(0) {
@@ -426,6 +443,9 @@ impl Cli {
                      ({limit})"
                 ));
             }
+        }
+        if self.min_load_choices == Some(0) {
+            return Err(anyhow!("--min-load-choices must be at least 1"));
         }
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
@@ -652,6 +672,7 @@ impl Cli {
                     .unwrap_or(d.cache_switch_margin_tokens),
                 worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
                 saturation_queue_floor: self.saturation_queue_floor.or(d.saturation_queue_floor),
+                min_load_choices: self.min_load_choices.unwrap_or(d.min_load_choices),
             })
         } else {
             None
@@ -2089,6 +2110,43 @@ mod tests {
 
         let err = cfg_of("--policy power_of_two --worker-queue-limit 4 --saturation-queue-floor 2")
             .expect_err("the pin only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn min_load_choices_is_plumbed_and_validated() {
+        let config = cfg_of("--policy cache_aware --min-load-choices 5").unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .min_load_choices,
+            5
+        );
+
+        // Unset keeps the pre-existing power-of-2 behavior.
+        let defaults = cfg_of("--policy cache_aware").unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .min_load_choices,
+            2
+        );
+
+        let err = cfg_of("--policy cache_aware --min-load-choices 0")
+            .expect_err("a zero sample size would select nothing")
+            .to_string();
+        assert!(err.contains("--min-load-choices"), "got: {err}");
+
+        let err = cfg_of("--policy power_of_two --min-load-choices 3")
+            .expect_err("the knob only tunes the cache-aware fallback")
             .to_string();
         assert!(
             err.contains("cache candidate tuning flags require --policy cache_aware"),
