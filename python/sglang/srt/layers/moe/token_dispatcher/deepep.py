@@ -587,6 +587,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 quant_mode = "bf16"
             return {"quant_mode": quant_mode}
 
+        if not self.use_mxfp4 and not self.use_mxfp8:
+            # A3's legacy pybind Buffer does not expose its dispatch signature.
+            # It selects BF16/INT8 dispatch through the DeepEP runtime instead.
+            return {}
+
         raise RuntimeError(
             "Installed DeepEP normal dispatch does not support either "
             "use_fp8/use_mxfp4/use_mxfp8 or quant_mode."
