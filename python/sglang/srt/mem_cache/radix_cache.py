@@ -477,7 +477,7 @@ class RadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_end: int
     ):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -487,7 +487,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_end
             ]
             self.token_to_kv_pool_allocator.free_segment(
                 kv_indices, start_pos=req.kv.cache_protected_len
@@ -498,7 +498,7 @@ class RadixCache(BasePrefixCache):
             # Frees committed slots that no token id names, which the insert
             # path below cannot reach; the protected prefix stays with the cache.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_end
             ]
             self.token_to_kv_pool_allocator.free_segment(
                 kv_indices, start_pos=req.kv.cache_protected_len
@@ -507,7 +507,7 @@ class RadixCache(BasePrefixCache):
                 self.dec_lock_ref(req.last_node)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_end]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]

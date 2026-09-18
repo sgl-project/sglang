@@ -1445,7 +1445,7 @@ class Req(ReqDllmMixin):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
 
-    def effective_kv_committed_len(self) -> int:
+    def owned_kv_end(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:

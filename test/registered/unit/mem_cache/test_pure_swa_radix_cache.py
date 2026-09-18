@@ -48,7 +48,7 @@ class TestPureSWARadixCache(CustomTestCase):
             ),
         )
 
-        cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=8)
+        cache.cache_finished_req(req, is_insert=False, owned_kv_end=8)
 
         self.assertEqual(allocator.freed, [[0, 1, 2, 3], [4, 5, 6, 7]])
 
