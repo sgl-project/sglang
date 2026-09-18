@@ -593,7 +593,7 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
 
 
 def _dsv4_low_ratio_entries(
-    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_num: int
+    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
 ):
     """Mirror each shared source once, in FULL-page units. Prefixes end on an even
     page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
@@ -665,7 +665,7 @@ def _dsv4_low_ratio_entries(
                     ),
                     device_pool=device_pool,
                     layer_mapping=layer_mapping,
-                    transfer_layer_num=transfer_layer_num,
+                    transfer_layer_id_max=transfer_layer_id_max,
                 )
             )
     return entries
@@ -699,7 +699,7 @@ def _build_dsv4_rope_entry(
     layer_mapping: dict[int, int],
     num_host_pages: int,
     slot_page_size: int,
-    transfer_layer_num: int,
+    transfer_layer_id_max: int,
 ) -> Optional[PoolEntry]:
     sibling = _dsv4_rope_sibling(kvcache, ratio)
     if sibling is None:
@@ -719,7 +719,7 @@ def _build_dsv4_rope_entry(
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
-        transfer_layer_num=transfer_layer_num,
+        transfer_layer_id_max=transfer_layer_id_max,
     )
 
 
@@ -884,7 +884,7 @@ def build_deepseek_v4_hicache_stack(
             layer_mapping=c4_layer_mapping,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_id_max=transfer_layer_id_max,
         )
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
@@ -989,13 +989,15 @@ def build_deepseek_v4_hicache_stack(
             layer_mapping=c128_layer_mapping,
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_id_max=transfer_layer_id_max,
         )
         if c128_rope_entry is not None:
             entries.append(c128_rope_entry)
 
     entries.extend(
-        _dsv4_low_ratio_entries(kvcache, page_size, num_host_pages, transfer_layer_num)
+        _dsv4_low_ratio_entries(
+            kvcache, page_size, num_host_pages, transfer_layer_id_max
+        )
     )
 
     host_pool_group = HostPoolGroup(entries)
