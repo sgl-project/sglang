@@ -107,6 +107,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -115,6 +116,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+if _is_xpu:
+    from sgl_kernel import store_cache_xpu
 
 
 def conv_window_dedup_enabled(
@@ -167,6 +171,15 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
             v_row_bytes=v_row_bytes,
             size_limit=size_limit,
+        )
+
+    if _is_xpu and v_row_dim == row_dim:
+        return store_cache_xpu(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
         )
 
     # store_cache_cpu takes a single row_dim for both K and V, so it only serves
@@ -260,6 +273,10 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
+    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
+    # positive value. Declared here so callers can read it without getattr.
+    pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
@@ -737,15 +754,8 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -3981,6 +3991,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_mla and _is_npu and layer_ids:
+            data_ptrs, _, _ = self.get_contiguous_buf_infos()
+            return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
