@@ -593,10 +593,34 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         elif _is_npu:
-            # To reduce a time-costing split operation
-            get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
+            if (
+                forward_batch.attn_cp_metadata is not None
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            ):
+                # CP V2: each rank holds only its shard of kv_a/k_pe while
+                # out_cache_loc spans the full sequence; gather to full order
+                # before writing (idempotent across ranks, like the indexer's
+                # K store).
+                from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+
+                kv_a_full = cp_gather_full_sequence_states(
+                    kv_a.unsqueeze(1).contiguous(),
+                    forward_batch,
+                    torch.npu.current_stream(),
+                )
+                k_pe_full = cp_gather_full_sequence_states(
+                    k_pe.contiguous(),
+                    forward_batch,
+                    torch.npu.current_stream(),
+                )
+                get_token_to_kv_pool().set_kv_buffer(
+                    self.attn_mha, forward_batch.out_cache_loc, kv_a_full, k_pe_full
+                )
+            else:
+                # To reduce a time-costing split operation
+                get_token_to_kv_pool().set_kv_buffer(
+                    self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
