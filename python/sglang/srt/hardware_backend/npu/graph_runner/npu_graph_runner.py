@@ -243,100 +243,129 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         if forward_batch.needs_forward_metadata_init():
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
-            # In speculative decoding, these two fields are still needed.
-            # NPU skips the DFLASH verify pre-planning, so load_batch may
-            # never have recorded the padded batch shapes; recompute them on
-            # every batch (the verify batch size varies with concurrency).
-            raw_bs = forward_batch.batch_size
-            if self.require_mlp_tp_gather:
-                bs = self._pad_to_bucket(
-                    self._max_dp_batch_size(forward_batch), self.capture_bs
+            if not self.model_runner.spec_algorithm.is_dflash():
+                # In speculative decoding, these two fields are still needed.
+                # Non-DFlash keeps the historical pre-planned replay path: no
+                # attention-metadata refresh, no seq_lens_cpu work, and no
+                # device sync (DSA/DSV4 rely on this staying sync-free).
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
                 )
-            else:
-                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
-            self.raw_bs = raw_bs
-            self.raw_num_token = raw_bs * self.captured_req_width
-            self.bs = bs
-            # Restore the DeepEP dispatch mode recorded at capture time
-            # (mirrors load_batch); an interleaved eager extend may have
-            # switched it.
-            self.deepep_adapter.replay()
-            # Refresh the static DP token buffers bound by the captured
-            # graph (stale values misalign dp-gather segments across ranks);
-            # mirror the capture-side uniform [padded_num_tokens] * dp_size.
-            if self.require_mlp_tp_gather:
-                _padded_num_tokens = bs * self.captured_req_width
-                self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
-                self.buffers.global_num_tokens_for_logprob_gpu.fill_(_padded_num_tokens)
-            if (
-                enable_num_token_non_padded()
-                and self.require_gathered_buffer
-                and not self.enable_prefill_cp
-            ):
-                self.buffers.num_token_non_padded.fill_(
-                    compute_local_num_token_non_padded_cpu(
-                        global_num_token_non_padded=(
-                            forward_batch.global_num_token_non_padded_cpu
-                        ),
-                        num_tokens_per_dp=bs * self.captured_req_width,
-                        sharded=self.model_runner.attn_tp_sequence_sharded(
-                            bs * self.captured_req_width
-                        ),
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
+                if (
+                    envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+                    and forward_batch.mrope_positions is not None
+                ):
+                    self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
+                        forward_batch.mrope_positions
                     )
+            else:
+                # NPU skips the DFLASH verify pre-planning, so load_batch may
+                # never have recorded the padded batch shapes; recompute them
+                # on every batch (the verify batch size varies with
+                # concurrency).
+                raw_bs = forward_batch.batch_size
+                if self.require_mlp_tp_gather:
+                    bs = self._pad_to_bucket(
+                        self._max_dp_batch_size(forward_batch), self.capture_bs
+                    )
+                else:
+                    bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+                self.raw_bs = raw_bs
+                self.raw_num_token = raw_bs * self.captured_req_width
+                self.bs = bs
+                # Restore the DeepEP dispatch mode recorded at capture time
+                # (mirrors load_batch); an interleaved eager extend may have
+                # switched it.
+                self.deepep_adapter.replay()
+                # Refresh the static DP token buffers bound by the captured
+                # graph (stale values misalign dp-gather segments across
+                # ranks); mirror the capture-side uniform
+                # [padded_num_tokens] * dp_size.
+                if self.require_mlp_tp_gather:
+                    _padded_num_tokens = bs * self.captured_req_width
+                    self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
+                    self.buffers.global_num_tokens_for_logprob_gpu.fill_(
+                        _padded_num_tokens
+                    )
+                if (
+                    enable_num_token_non_padded()
+                    and self.require_gathered_buffer
+                    and not self.enable_prefill_cp
+                ):
+                    self.buffers.num_token_non_padded.fill_(
+                        compute_local_num_token_non_padded_cpu(
+                            global_num_token_non_padded=(
+                                forward_batch.global_num_token_non_padded_cpu
+                            ),
+                            num_tokens_per_dp=bs * self.captured_req_width,
+                            sharded=self.model_runner.attn_tp_sequence_sharded(
+                                bs * self.captured_req_width
+                            ),
+                        )
+                    )
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
                 )
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.is_draft_worker
-                and forward_batch.input_embeds is not None
-            ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
                 )
-            if (
-                envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
-                and forward_batch.mrope_positions is not None
-            ):
-                self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
-                    forward_batch.mrope_positions
-                )
+                if (
+                    self.model_runner.is_draft_worker
+                    and forward_batch.input_embeds is not None
+                ):
+                    self.buffers.input_embeds[: self.raw_num_token].copy_(
+                        forward_batch.input_embeds
+                    )
+                if (
+                    envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+                    and forward_batch.mrope_positions is not None
+                ):
+                    self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
+                        forward_batch.mrope_positions
+                    )
 
-            # The pre-planned path skipped init_forward_metadata_out_graph;
-            # refresh attention metadata so replay reads correct KV pages.
-            self.buffers.seq_lens[: self.raw_bs].copy_(
-                forward_batch.seq_lens_cpu[: self.raw_bs]
-            )
-            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(self.seq_len_fill_value)
-            self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
-                forward_batch.seq_lens_cpu[: self.raw_bs]
-            )
-            self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
-                self.seq_len_fill_value
-            )
-            self.buffers.req_pool_indices[: self.raw_bs].copy_(
-                forward_batch.req_pool_indices[: self.raw_bs]
-            )
-            self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
-            # Refresh the static out_cache_loc bound by the captured graph
-            # for full-pool KV writes in save_kv_cache (replay would
-            # otherwise write verify KV to stale capture-time slots).
-            if forward_batch.out_cache_loc is not None:
-                _padded_num_token = self.bs * self.captured_req_width
-                _n = min(self.raw_num_token, forward_batch.out_cache_loc.shape[0])
-                self.buffers.out_cache_loc[:_n].copy_(forward_batch.out_cache_loc[:_n])
-                self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
-            fb_view = build_replay_fb_view(
-                forward_batch=forward_batch,
-                buffers=self.buffers,
-                bs=self.bs,
-                raw_bs=self.raw_bs,
-                num_tokens=self.bs * self.captured_req_width,
-                seq_len_fill_value=self.seq_len_fill_value,
-                capture_forward_mode=self.capture_forward_mode,
-                is_encoder_decoder=self.is_encoder_decoder,
-            )
-            self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+                # The pre-planned path skipped init_forward_metadata_out_graph;
+                # refresh attention metadata so replay reads correct KV pages.
+                self.buffers.seq_lens[: self.raw_bs].copy_(
+                    forward_batch.seq_lens_cpu[: self.raw_bs]
+                )
+                self.buffers.seq_lens[self.raw_bs : self.bs].fill_(
+                    self.seq_len_fill_value
+                )
+                self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
+                    forward_batch.seq_lens_cpu[: self.raw_bs]
+                )
+                self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
+                    self.seq_len_fill_value
+                )
+                self.buffers.req_pool_indices[: self.raw_bs].copy_(
+                    forward_batch.req_pool_indices[: self.raw_bs]
+                )
+                self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
+                # Refresh the static out_cache_loc bound by the captured graph
+                # for full-pool KV writes in save_kv_cache (replay would
+                # otherwise write verify KV to stale capture-time slots).
+                if forward_batch.out_cache_loc is not None:
+                    _padded_num_token = self.bs * self.captured_req_width
+                    _n = min(self.raw_num_token, forward_batch.out_cache_loc.shape[0])
+                    self.buffers.out_cache_loc[:_n].copy_(
+                        forward_batch.out_cache_loc[:_n]
+                    )
+                    self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
+                fb_view = build_replay_fb_view(
+                    forward_batch=forward_batch,
+                    buffers=self.buffers,
+                    bs=self.bs,
+                    raw_bs=self.raw_bs,
+                    num_tokens=self.bs * self.captured_req_width,
+                    seq_len_fill_value=self.seq_len_fill_value,
+                    capture_forward_mode=self.capture_forward_mode,
+                    is_encoder_decoder=self.is_encoder_decoder,
+                )
+                self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
 
@@ -345,9 +374,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                _attn = self._replay_attn_backend()
-                _meta = getattr(_attn, "forward_metadata", None)
-                _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
+                # replay; other algorithms keep the capture-time list, so
+                # recompute from the live batch as before — reading the
+                # backend list there would replay stale capture-time lengths.
+                if self.model_runner.spec_algorithm.is_dflash():
+                    _attn = self._replay_attn_backend()
+                    _meta = getattr(_attn, "forward_metadata", None)
+                    _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                else:
+                    _meta_list = None
                 if _meta_list is not None:
                     # graph.update must carry the exact KV length already
                     # computed in forward_metadata.seq_lens_cpu_list (it
