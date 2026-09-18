@@ -4484,6 +4484,67 @@ class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(finish_reason["type"], "tool_calls")
 
+    def test_serialized_response_never_carries_markup(self):
+        """The wire payload itself, as a client parses it, must be clean.
+
+        Builds the real ChatCompletionResponse and serializes it, so the
+        assertion covers `message.content`, `tool_calls` and `finish_reason`
+        together rather than the parser's return value.
+        """
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather in SF?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, generated in cases.items():
+            with self.subTest(payload=label):
+                ret = [
+                    {
+                        "text": generated,
+                        "meta_info": {
+                            "id": "req-1",
+                            "finish_reason": {"type": "stop", "matched": None},
+                            "prompt_tokens": 10,
+                            "completion_tokens": 20,
+                            "cached_tokens": 0,
+                            "weight_version": "v1",
+                        },
+                    }
+                ]
+
+                payload = json.loads(
+                    self.chat._build_chat_response(req, ret, 0).model_dump_json()
+                )
+
+                choice = payload["choices"][0]
+                self.assertNotIn(self.DSML, json.dumps(payload))
+                self.assertEqual(choice["finish_reason"], "tool_calls")
+                self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+                self.assertEqual(
+                    json.loads(
+                        choice["message"]["tool_calls"][0]["function"]["arguments"]
+                    ),
+                    {"city": "SF"},
+                )
+
 
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
