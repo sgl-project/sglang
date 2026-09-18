@@ -381,12 +381,8 @@ jobs:
 
 
   # ==================== Recommend Tests from Coverage ==================== #
-  # Reads the pre-built coverage baseline (test_case_map.json + covstub)
-  # from the 800t shared disk (published by the setup-covstub job of the
-  # coverage-collection pipeline) and runs test_selector.py to recommend
-  # affected test cases for the current PR. Must run on an 800t runner to
-  # access the shared disk. continue-on-error: true so it never blocks the
-  # PR gate.
+  # Reads the coverage baseline from the 800t shared disk and recommends
+  # affected tests for the current PR. continue-on-error: true (non-blocking).
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     needs: set-image-config
@@ -470,13 +466,10 @@ jobs:
           fi
 
   # ==================== Analyze Failure Report ==================== #
-  # Runs after all test jobs and the coverage-based test recommender.
-  # Calls the reusable failure-analysis workflow to collect logs, cross-
-  # reference them with the recommended test paths, and produce a report.
-  # if: !cancelled() && (success() || failure()) so it runs when tests pass or
-  # fail, but is skipped when the run is cancelled (e.g. superseded by a new
-  # push in the same concurrency group) — prevents zombie jobs that hold the
-  # concurrency group and block the new run.
+  # Cross-references test failures with coverage recommendations.
+  # !cancelled() only: success()/failure() are unusable here because needs
+  # always contain coverage_mode-skipped jobs (base-a, multimodal-gen), which
+  # poison the transitive status chain.
   analyze-failure-report:
     name: Analyze failure report
     needs:
@@ -498,19 +491,16 @@ jobs:
 
         recommend-tests-from-coverage,
       ]
-    if: ${{ !cancelled() && (success() || failure()) && inputs.coverage_mode == true }}
+    if: ${{ !cancelled() && inputs.coverage_mode == true }}
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
 
   # ==================== Coverage Assembly & Publish ==================== #
-  # Runs after all test jobs only when every need succeeded (skipped on any
-  # failure or cancellation). Uses a runner that shares /root/.cache with
-  # the test jobs. Assembles covstub, builds test_case_map.json, archives
-  # outputs.tar.gz and publishes both to the 800t shared disk at a fixed
-  # path (no RUN_DIR layer) so other pipelines can read them. Only runs in
-  # coverage mode (coverage_mode == true).
+  # Assembles covstub, builds test_case_map.json, publishes to the 800t
+  # shared disk. !failure() && !cancelled() (not success()): coverage_mode
+  # always skips pr-gate/base-a upstream, which poisons transitive success().
   setup-covstub:
     needs:
       [
@@ -525,7 +515,7 @@ jobs:
         base-c-test-perf-2-npu-a3,
         base-c-test-perf-16-npu-a3,
       ]
-    if: ${{ !cancelled() && success() && inputs.coverage_mode == true }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode == true }}
     runs-on: linux-aarch64-a3-800t-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -635,11 +625,7 @@ jobs:
           du -h "${PUBLISH_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/test_case_map.json"
 
       - name: Clean up per-run directory
-        # Runs when the publish step succeeded (including the no-data skip),
-        # so the shared disk does not accumulate one sglang source copy per
-        # coverage run. On publish failure it is skipped, keeping RUN_DIR
-        # for manual recovery. Raw data stays available inside the published
-        # outputs.tar.gz.
+        # Skipped on publish failure, keeping RUN_DIR for manual recovery.
         shell: bash
         run: |
           set -euo pipefail
