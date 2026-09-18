@@ -1,5 +1,6 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -210,6 +211,57 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
 
         self.assertEqual([c.name for c in result.calls], ["get_weather"])
         self.assertIn("Checking the weather.", result.normal_text)
+
+    def test_v32_function_calls_block_is_not_leaked(self):
+        """V4 sometimes emits the older `function_calls` block name.
+
+        The V4 detector keys on `tool_calls`, so before the fix the whole
+        section came back as content. Anchoring on the invoke marker
+        recovers the call regardless of which block name wraps it.
+        """
+        result = self._parse(
+            f"<{DSML}function_calls>\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+            + f"\n</{DSML}function_calls>"
+        )
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_generated_markup_round_trips_through_the_encoder(self):
+        """Arguments built by the model's own DSML encoder must come back intact.
+
+        Uses `encoding_dsv4.encode_arguments_to_dsml` rather than hand-written
+        markup, so the parser is checked against the format the model is
+        actually prompted to emit, including the string/JSON type split.
+        """
+        from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+            encode_arguments_to_dsml,
+        )
+
+        payloads = [
+            {"city": "SF"},
+            {"statement": "multi\nline\nvalue", "source": "alert"},
+            {"targets": [{"id": "pr_001", "polarity": "supports"}]},
+            {"count": 7, "enabled": True, "ratio": 0.5},
+            {"text": 'quotes " and <angle> inside'},
+            {"unicode": "日本語 café"},
+            {"nested": {"a": [1, 2, {"b": None}]}},
+        ]
+        for arguments in payloads:
+            with self.subTest(arguments=arguments):
+                body = encode_arguments_to_dsml(
+                    {"name": "get_weather", "arguments": arguments}
+                )
+                result = self._parse(
+                    _wrapped(
+                        f'<{DSML}invoke name="get_weather">\n{body}\n</{DSML}invoke>'
+                    )
+                )
+
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(json.loads(result.calls[0].parameters), arguments)
+                self.assertNotIn(DSML, result.normal_text)
 
 
 if __name__ == "__main__":
