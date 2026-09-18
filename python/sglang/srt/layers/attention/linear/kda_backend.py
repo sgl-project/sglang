@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
@@ -199,6 +202,12 @@ class KDAKernelDispatcher:
                 "SM100, ptx_kda SM103)."
             )
 
+        self.decode_kernel = LinearAttnKernelBase.resolve_oot_kernel(
+            "kda", "decode", self.decode_kernel
+        )
+        self.extend_kernel = LinearAttnKernelBase.resolve_oot_kernel(
+            "kda", "extend", self.extend_kernel
+        )
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )

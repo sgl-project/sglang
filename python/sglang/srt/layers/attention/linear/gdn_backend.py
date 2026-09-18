@@ -12,6 +12,9 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -359,6 +362,12 @@ class GDNKernelDispatcher:
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
 
+        self.decode_kernel = LinearAttnKernelBase.resolve_oot_kernel(
+            "gdn", "decode", self.decode_kernel
+        )
+        self.extend_kernel = LinearAttnKernelBase.resolve_oot_kernel(
+            "gdn", "extend", self.extend_kernel
+        )
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )

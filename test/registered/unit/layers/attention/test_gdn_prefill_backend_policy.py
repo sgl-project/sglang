@@ -7,7 +7,6 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
-from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
@@ -19,6 +18,9 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
@@ -294,6 +296,61 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
+
+    def test_oot_registry_can_replace_decode_and_extend_kernels(self):
+        decode_kernel = MagicMock(supports_packed_decode=True)
+        extend_kernel = MagicMock()
+        with patch.object(
+            LinearAttnKernelBase,
+            "resolve_oot_kernel",
+            side_effect=(decode_kernel, extend_kernel),
+        ) as resolve_kernel:
+            dispatcher = GDNKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.TRITON,
+            )
+
+        decode_call, extend_call = resolve_kernel.call_args_list
+        self.assertEqual(decode_call.args[:2], ("gdn", "decode"))
+        self.assertEqual(extend_call.args[:2], ("gdn", "extend"))
+        self.assertIs(decode_call.args[2], extend_call.args[2])
+        self.assertIs(dispatcher.decode_kernel, decode_kernel)
+        self.assertIs(dispatcher.extend_kernel, extend_kernel)
+        self.assertTrue(dispatcher.supports_packed_decode)
+
+    def test_oot_kernel_registry_uses_platform_dispatch_key(self):
+        fallback = MagicMock()
+        replacement = MagicMock()
+        factory = MagicMock(return_value=replacement)
+        platform = MagicMock()
+        platform.is_out_of_tree.return_value = True
+        platform.get_dispatch_key_name.return_value = "test"
+
+        with (
+            patch.dict(
+                LinearAttnKernelBase._oot_kernel_registry, {}, clear=True
+            ),
+            patch("sglang.srt.platforms.current_platform", platform),
+        ):
+            self.assertIs(
+                LinearAttnKernelBase.resolve_oot_kernel("kda", "decode", fallback),
+                fallback,
+            )
+            LinearAttnKernelBase.register_oot_kernel(
+                "gdn", "extend", factory, "test"
+            )
+            platform.is_out_of_tree.return_value = False
+            self.assertIs(
+                LinearAttnKernelBase.resolve_oot_kernel("gdn", "extend", fallback),
+                fallback,
+            )
+            platform.is_out_of_tree.return_value = True
+            actual = LinearAttnKernelBase.resolve_oot_kernel(
+                "gdn", "extend", fallback
+            )
+
+        self.assertIs(actual, replacement)
+        factory.assert_called_once_with(fallback)
 
     def test_helion_backend_reports_kda_only(self):
         cases = (

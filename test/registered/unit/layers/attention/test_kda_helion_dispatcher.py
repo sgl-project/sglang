@@ -7,6 +7,9 @@ from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
@@ -80,6 +83,28 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+
+    def test_oot_registry_can_replace_decode_and_extend_kernels(self):
+        decode_kernel = MagicMock(supports_packed_decode=True)
+        extend_kernel = MagicMock()
+        with patch.object(
+            LinearAttnKernelBase,
+            "resolve_oot_kernel",
+            side_effect=(decode_kernel, extend_kernel),
+        ) as resolve_kernel:
+            dispatcher = KDAKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.TRITON,
+            )
+
+        decode_call, extend_call = resolve_kernel.call_args_list
+        self.assertEqual(decode_call.args[:2], ("kda", "decode"))
+        self.assertEqual(extend_call.args[:2], ("kda", "extend"))
+        self.assertIs(decode_call.args[2], extend_call.args[2])
+        self.assertIs(dispatcher.decode_kernel, decode_kernel)
+        self.assertIs(dispatcher.extend_kernel, extend_kernel)
+        self.assertTrue(dispatcher.supports_packed_decode)
 
     def test_enum_recognizes_helion(self):
         backend = LinearAttnKernelBackend("helion")

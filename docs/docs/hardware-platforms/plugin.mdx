@@ -638,6 +638,11 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
   </tbody>
 </table>
 
+Linear-attention plugins register GDN or KDA kernel factories with
+`LinearAttnKernelBase.register_oot_kernel()` from the linear-attention kernel
+backend.
+Resolution uses the platform dispatch key after the built-in backend is selected.
+
 #### Lifecycle Hooks (from SRTPlatform)
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
