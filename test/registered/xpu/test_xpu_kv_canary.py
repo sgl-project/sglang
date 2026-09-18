@@ -20,9 +20,8 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
 
-# --disable-cuda-graph is mandatory, not tuning: install_canary refuses a captured
-# decode on a device that routes to the torch reference, since the reference's host
-# work and D2H leave nothing in the graph for replay to check.
+# --disable-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
+# on a device that routes to the torch reference (host work and D2H, so replay checks nothing).
 _XPU_SERVER_ARGS = ("--device", "xpu", "--disable-cuda-graph")
 
 

@@ -36,12 +36,11 @@ logger = logging.getLogger(__name__)
 def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
     """Whether ``device`` would capture a decode graph over the canary torch reference.
 
-    install_canary runs before decode graph capture, so on a device without the canary
-    CUDA kernels the reference launches fall inside the captured region -- except they
-    do host work and D2H, so nothing lands in the graph and every replayed decode
-    verifies clean. A silently inert canary reporting "no violations" is worse than a
-    refusal, hence the caller raises.
+    install_canary runs before capture, and the reference does host work and D2H, so its
+    launches never land in the graph and every replayed decode verifies clean.
     """
+    # An unpublished cuda_graph_config reads as "not disabled" here, so this refuses rather
+    # than waves through: a startup error beats a canary that reports clean forever.
     return (
         use_torch_reference(device)
         and current_platform.support_cuda_graph()

@@ -220,8 +220,7 @@ def materialize_real_kv_sources(
 ) -> tuple[_MaterializedRealKvSource, ...]:
     """Gather each source's read rows onto ``work_device`` once per launch.
 
-    Returns an empty tuple when nothing is to be hashed (mode NONE, no sources, no
-    slots), so callers can cheaply skip the per-slot fold."""
+    An empty tuple means nothing to hash; callers skip the per-slot fold."""
     mode = int(real_kv_hash_mode)
     if (
         mode == int(consts.RealKvHashMode.NONE)
@@ -232,9 +231,8 @@ def materialize_real_kv_sources(
 
     materialized: list[_MaterializedRealKvSource] = []
     for source in real_kv_sources:
-        # Only the rows holding this launch's slots are ever read, so gather them on
-        # device first: copying the whole source is a KV-layer-sized transfer (one row
-        # per token of the pool) on every launch.
+        # Gather on device first: copying the whole source is a KV-layer-sized transfer
+        # (one row per token of the pool) on every launch.
         rows = sorted({slot_idx // source.page_size for slot_idx in slot_indices})
         row_index = torch.tensor(rows, dtype=torch.int64, device=source.tensor.device)
         tensor_u8 = (

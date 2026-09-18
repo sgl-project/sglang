@@ -589,10 +589,8 @@ def device_stream_context(stream):
 
 def is_device_stream_capturing(device: torch.device) -> bool:
     """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
-    # Asked of the platform rather than a device-name list, so a backend that gains
-    # graph capture is covered without editing here. Every platform answering True
-    # already needs device_module.is_current_stream_capturing() during capture
-    # (decode_cuda_graph_runner.py:470), so the call below cannot be missing.
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
     if device.type != current_platform.device_type:
         return False
     if not current_platform.support_cuda_graph():

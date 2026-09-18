@@ -121,9 +121,8 @@ class RealKvSource:
                 f"got {row_stride_bytes} bytes (shape={tuple(self.tensor.shape)}, "
                 f"dtype={self.tensor.dtype})"
             )
-        # A row too narrow for its page hashes fewer bytes than asked and still reports the
-        # chain clean: the CUDA fold reads past the row, the torch fold's dim-1 slice clamps
-        # to the row end (0 bytes for the tail slots). Neither raises, so reject at attach.
+        # A row is addressed as page_size slots of num_bytes_per_token, unchecked at fold time;
+        # a narrower row hashes fewer bytes than asked and still reports the chain clean.
         min_row_bytes = self.page_size * self.num_bytes_per_token
         if row_stride_bytes < min_row_bytes:
             raise ValueError(
@@ -313,9 +312,8 @@ def launch_canary_verify_kernel(
         - Pure side-effect; never raises. Host polls violation_write_index[0] > 0 for is_errored and
           violation_ring[0] for the first violation.
         - kernel_run_counter is bumped every call (canary-ran health signal).
-        - Safe in cuda-graph capture; caller refills plan in-place before replay. The
-          torch reference is not: it does host work and D2H, so install_canary refuses
-          a captured decode on a device that routes to it.
+        - Safe in cuda-graph capture; caller refills plan in-place before replay. The reference
+          path is not (host work, D2H) and must not be launched under capture.
 
     Pinned by torch reference
     :func:`sglang.kernels.ops.kv_canary.verify_ref.launch_canary_verify_kernel_torch_reference`; CUDA must match
