@@ -39,10 +39,11 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-_TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
+_TEST_KINDS = {"unit", "e2e", "accuracy", "perf", "stress"}
+_KERNEL_ROOT = "kernels"
 
 # Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
-# carries the `-kernel-` infix `kernel` needs, and these launch device work.
+# carries the `-kernel-` infix the kernel tree needs, and these launch device work.
 _VENDOR_DIRS = {"amd", "mlx", "musa", "npu", "xpu"}
 
 
@@ -132,26 +133,38 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
     if relative_parts and relative_parts[0] in _VENDOR_DIRS:
         return []
+    if relative_parts and relative_parts[0] == _KERNEL_ROOT:
+        errors = []
+        if len(relative_parts) < 4 or relative_parts[1] not in {"ops", "benchmark"}:
+            errors.append(
+                f"{path}: kernel tests must live under "
+                "test/registered/kernels/{ops,benchmark}/<group>/"
+            )
+        if any("-kernel-" not in (r.effective_suite or "") for r in registries):
+            errors.append(f"{path}: kernel tests must use a *-kernel-* suite")
+        return errors
     if len(relative_parts) < 3 or relative_parts[0] not in _TEST_KINDS:
         return [
             f"{path}: registered tests must live under "
             "test/registered/<kind>/<subsystem>/; kind must be one of "
             + ", ".join(sorted(_TEST_KINDS))
+            + "; kernel tests use test/registered/kernels/{ops,benchmark}/<group>/"
         ]
 
     kind = relative_parts[0]
     errors = []
     if kind == "unit":
-        non_cpu = [r for r in registries if r.backend.name != "CPU"]
-        if non_cpu:
-            errors.append(f"{path}: unit tests may register only CPU suites")
+        invalid = [
+            r
+            for r in registries
+            if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
+        ]
+        if invalid:
+            errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
         if any(r.est_time > 60 for r in registries):
             errors.append(f"{path}: unit test est_time must be <= 60 seconds")
         if _contains_call(tree, "popen_launch_server"):
             errors.append(f"{path}: unit tests may not launch a server")
-    elif kind == "kernel":
-        if any("-kernel-" not in (r.effective_suite or "") for r in registries):
-            errors.append(f"{path}: kernel tests must use a *-kernel-* suite")
     elif kind in {"accuracy", "perf"}:
         invalid = [
             r

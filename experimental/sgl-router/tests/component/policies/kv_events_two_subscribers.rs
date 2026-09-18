@@ -84,8 +84,8 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         let mb = router_b.tree().match_prefix(None, &hashes);
         let converged = ma.matched_blocks == target
             && mb.matched_blocks == target
-            && ma.workers.contains(&key)
-            && mb.workers.contains(&key);
+            && ma.workers().contains(&key)
+            && mb.workers().contains(&key);
         if converged {
             // Both trees agree on count AND on the worker that holds the
             // prefix. This is what the Radix Tree provider reads to
@@ -96,7 +96,8 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
                 "subscribers disagreed on matched_blocks",
             );
             assert_eq!(
-                ma.workers, mb.workers,
+                ma.workers(),
+                mb.workers(),
                 "subscribers disagreed on worker set",
             );
             break;
@@ -106,7 +107,10 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
                 "subscribers did not converge within 3s: \
                  router_a={{matched={}, workers={:?}}}, \
                  router_b={{matched={}, workers={:?}}}, target={target}",
-                ma.matched_blocks, ma.workers, mb.matched_blocks, mb.workers,
+                ma.matched_blocks,
+                ma.workers(),
+                mb.matched_blocks,
+                mb.workers(),
             );
         }
         sequence += 1;
@@ -249,34 +253,34 @@ async fn two_subscribers_merge_events_from_two_publishers() {
             && ay.matched_blocks == target_y
             && bx.matched_blocks == target_x
             && by.matched_blocks == target_y
-            && ax.workers.contains(&key_x)
-            && ay.workers.contains(&key_y)
-            && bx.workers.contains(&key_x)
-            && by.workers.contains(&key_y);
+            && ax.workers().contains(&key_x)
+            && ay.workers().contains(&key_y)
+            && bx.workers().contains(&key_x)
+            && by.workers().contains(&key_y);
         if converged {
             // Negative attribution: prefix X must not be attributed to
             // worker_y in either tree, and vice versa. A regression that
             // keyed events by arriving socket rather than announced
             // worker URL would set BOTH worker keys on each prefix.
             assert!(
-                !ax.workers.contains(&key_y),
+                !ax.workers().contains(&key_y),
                 "router_a cross-attributed worker_y to prefix X: {:?}",
-                ax.workers,
+                ax.workers(),
             );
             assert!(
-                !ay.workers.contains(&key_x),
+                !ay.workers().contains(&key_x),
                 "router_a cross-attributed worker_x to prefix Y: {:?}",
-                ay.workers,
+                ay.workers(),
             );
             assert!(
-                !bx.workers.contains(&key_y),
+                !bx.workers().contains(&key_y),
                 "router_b cross-attributed worker_y to prefix X: {:?}",
-                bx.workers,
+                bx.workers(),
             );
             assert!(
-                !by.workers.contains(&key_x),
+                !by.workers().contains(&key_x),
                 "router_b cross-attributed worker_x to prefix Y: {:?}",
-                by.workers,
+                by.workers(),
             );
             break;
         }
@@ -287,13 +291,13 @@ async fn two_subscribers_merge_events_from_two_publishers() {
                  router_b: X={{matched={}, workers={:?}}}, Y={{matched={}, workers={:?}}}\n  \
                  targets: X={target_x}, Y={target_y}",
                 ax.matched_blocks,
-                ax.workers,
+                ax.workers(),
                 ay.matched_blocks,
-                ay.workers,
+                ay.workers(),
                 bx.matched_blocks,
-                bx.workers,
+                bx.workers(),
                 by.matched_blocks,
-                by.workers,
+                by.workers(),
             );
         }
         sequence += 1;
