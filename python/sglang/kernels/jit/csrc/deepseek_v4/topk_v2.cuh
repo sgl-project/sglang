@@ -609,8 +609,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     return {start, min(start + size, seq_len) - start};
   }
 
-  SGL_DEVICE static void histogram_chunk(
-      const TopKProblem& problem, Chunk chunk, uint32_t* __restrict__ row_hist, Smem* smem) {
+  SGL_DEVICE static void
+  histogram_chunk(const TopKProblem& problem, Chunk chunk, uint32_t* __restrict__ row_hist, Smem* smem) {
     const auto tx = threadIdx.x;
     init_histogram(smem->histogram, tx);
     __syncthreads();
@@ -679,10 +679,12 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1u);
         // The whole row has fewer than topk of these, so this rank has too.
-        if (pos < topk) [[likely]] smem->staged[pos] = static_cast<int32_t>(idx);
+        if (pos < topk) [[likely]]
+          smem->staged[pos] = static_cast<int32_t>(idx);
       } else if (val >= v_lo) {
         const auto slot = atomicAdd(&smem->count_eq, 1u);
-        if (slot < kMaxNumTie) [[likely]] smem->tie_values[slot] = {val, idx};
+        if (slot < kMaxNumTie) [[likely]]
+          smem->tie_values[slot] = {val, idx};
       }
     });
     __syncthreads();
@@ -738,7 +740,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto above_count = smem->total_gt;
     const auto tie_count = min(smem->total_eq, kMaxNumTie);
     const auto remain_topk = above_count < problem.topk ? problem.topk - above_count : 0;
-    for (uint32_t t = tx; t < tie_count; t += kBlockSize) smem->tie_values[t] = ties[t];
+    for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+      smem->tie_values[t] = ties[t];
     __syncthreads();
     handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle);
   }
