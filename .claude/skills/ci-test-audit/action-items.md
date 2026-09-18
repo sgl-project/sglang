@@ -17,10 +17,10 @@ The admission criteria in `.claude/rules/unit-test-admission.md` apply to existi
 much as new ones. Spot: a test for a code path or kernel that no longer exists;
 assertions that only check a mock was called; a stress loop that cannot reproduce the
 failure it claims to guard; a case whose every assertion is also made by another case in
-the group. Not a tautology: the rule's own carve-outs -- an external-source literal, or a
-completeness / negative-branch contract -- are bookkeeping, even when the code is a
-one-liner. A path that was renamed is not a path that no longer exists; check before
-declaring a test orphaned. Examples: #34464, #34667, #39013, #38881, #38259.
+the group. Not this pattern: the rule's own carve-outs -- an external-source literal, or
+a completeness / negative-branch contract -- are bookkeeping, even when the code is a
+one-liner; and a path that was renamed is not a path that no longer exists, so check
+before declaring a test orphaned. Examples: #34464, #34667, #39013, #38881, #38259.
 
 **A2. A test earns its cost by what it protects; a guard on a standalone, rarely touched, rarely used surface can be deleted outright.**
 Tests exist to stop other people's changes from breaking code. That value scales with
@@ -28,46 +28,48 @@ how often the code changes, how many users hit it, and how entangled it is with 
 paths. Spot: the module under test has had no non-test commits in months; it has few
 importers; the feature sits behind a flag almost nobody enables or serves one model few
 people run. The heavier the test (server launch, multi-GPU), the higher this bar.
-Low churn alone is not low value: a stable, load-bearing path (cache eviction, PD
-transfer) is where a regression hurts most. All three signals -- little churn, few
+Not this pattern: low churn alone. A stable, load-bearing path (cache eviction, PD
+transfer) is where a regression hurts most; all three signals -- little churn, few
 users, little entanglement -- must hold before deleting on this ground.
 Examples: none applied on this ground yet; #37990 (cases for models nobody runs) and
 #38011 (low-signal model tests demoted from the PR gate) are partial.
 
 **A3. A variant whose configuration is a strict subset of another variant's is redundant.**
-Holds when three things are true: the configs differ by one dimension; that dimension is
-additive (it adds load or a knob position rather than gating a path or skipping
+Spot: several classes in one file whose launch configs differ by a single flag or env
+var. Holds when three things are true: the configs differ by one dimension; that
+dimension is additive (it adds load or a knob position rather than gating a path or skipping
 assertions); and the heavier variant's assertions cover the lighter one's. Watch for
 variants that override a test method, and for looser expectations in the heavier variant
 (a longer timeout or relaxed bound), which make the lighter one still worth keeping.
-This is the pattern with the highest false-positive rate in practice; sharing a helper or
-fixture does not make one variant a subset of another. Not a subset when: the flag the
-variant flips is itself the feature under test (e.g. an overlap-loading toggle), which
-fails the additive condition; the variants drive different integration layers of the
-same model (engine input format vs. server endpoint), so neither's assertions cover the
-other's; or the lighter class is skip-decorated and launches nothing, so it costs
-nothing to keep and its skip is an A6 question instead.
+Not this pattern (and this one has the highest false-positive rate of the catalog):
+sharing a helper or fixture, which does not make one variant a subset of another; a
+variant whose flipped flag is itself the feature under test (e.g. an overlap-loading
+toggle), which fails the additive condition; variants that drive different integration
+layers of the same model (engine input format vs. server endpoint), so neither's
+assertions cover the other's; or a lighter class that is skip-decorated and launches
+nothing, so it costs nothing to keep and its skip is an A6 question instead.
 Examples: #38093, #39544, #33745, #33586, #34070, #33763, #34464, #33752, #39013, #34882.
 
-**A4. Suites that differ only in launch arguments share one server or engine.**
-Spot: several classes in a group whose `setUpClass` differs by a flag. Launch cost usually
-dominates the cases themselves, so this saves more than the case count suggests. Only
-request-level differences can share: a flag that changes server state (attention
-backend, page size, speculative decoding on or off) needs its own launch. Sharing also
-couples the classes, so one crash takes the others down with it.
+**A4. Classes that can run against one server configuration share the launch.**
+Spot: several classes in a group each launching a server in `setUpClass` with the same
+or request-equivalent arguments. Launch cost usually dominates the cases themselves, so
+this saves more than the case count suggests. Not this pattern: a flag that changes
+server state (attention backend, page size, speculative decoding on or off) needs its
+own launch; and sharing couples the classes, so one crash takes the others down with it.
 Examples: #33641, #33756, #33944, #36736, #38014, #37252.
 
 **A5. An end-to-end matrix whose only varying dimension is one layer belongs in a layer-level unit test.**
-Spot: a full server launch matrix that exists to select a kernel or backend. The unit
-test covers the numerics; backend selection can still change integration (graph capture,
-memory pool layout), so keep one end-to-end smoke per backend. Examples: #33596, #33611.
+Spot: a full server launch matrix that exists to select a kernel or backend. Not this
+pattern: the one end-to-end smoke per backend that stays -- the unit test covers the
+numerics, but backend selection can still change integration (graph capture, memory pool
+layout). Examples: #33596, #33611.
 
 **A6. Skipped, disabled, or unreachable registrations are dead coverage; each carries a reason and an expiry, or is deleted.**
 Spot: `disabled=` registrations or `skipTest` calls with no reference to what would
 un-skip them; skips older than the issue they were waiting on; registrations naming a
-retired `runner_config`; registered files whose TestCase classes never execute. A
-hardware-conditional skip (`skipUnless` on compute capability) is a gate, not dead
-coverage, and a `disabled=` whose linked issue is still open is doing its job.
+retired `runner_config`; registered files whose TestCase classes never execute. Not
+this pattern: a hardware-conditional skip (`skipUnless` on compute capability), which is
+a gate; or a `disabled=` whose linked issue is still open, which is doing its job.
 Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 
 ---
@@ -76,23 +78,23 @@ Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 
 **B1. A test runs on the stage and runner its resources actually require.**
 Spot: CPU-only tests registered to a GPU `runner_config`; multi-GPU registrations for a
-test that launches one server. "Does not use a GPU" is not "can run on a CPU runner":
-check whether the file imports a CUDA-only module or `sgl_kernel` at import time before
-moving it. Examples: #34074, #33654, #33605, #34913, #35220.
+test that launches one server. Not this pattern: a test that does not use a GPU but
+imports a CUDA-only module or `sgl_kernel` at import time; check before moving it.
+Examples: #34074, #33654, #33605, #34913, #35220.
 
 **B2. Trigger frequency matches signal per unit of cost: per-commit for fast, high-signal checks; nightly for model-level accuracy and perf; weekly or a shadow cadence for slow-moving coverage.**
 Spot: a multi-GPU accuracy suite registered per-commit whose failures have never been
-PR-specific; a nightly job whose result has not changed in weeks and that a weekly run
-would catch just as well; a retired platform still running daily. Demoting is not
+PR-specific; a nightly job that has been green for weeks, occupies several GPUs per run,
+and whose coverage a weekly run would hold just as well; a retired platform still
+running daily. Demoting is not
 deleting -- the nightly and weekly grids exist to hold this coverage at the right cost.
 Examples: #38011, #37990, #33809, #36814, #37532, #34204, #37586, #31749.
 
 **B3. Declared cost matches measured cost; shard counts and timeouts derive from it.**
-Spot: an `est_time` off from the measured run by more than a small factor (the
-partitioner packs shards with it when live stats are missing); a shard count or job
-timeout that has not moved while the suite's contents have. Live stats override
-`est_time` once they exist, so drift matters on files that lack them (new or renamed),
-and only when it is off by an order of magnitude. Examples: #35407, #36242,
+Spot: an `est_time` off from the measured run by an order of magnitude (the partitioner
+packs shards with it when live stats are missing); a shard count or job timeout that has
+not moved while the suite's contents have. Not this pattern: small drift on a file that
+already has live stats, which override `est_time`. Examples: #35407, #36242,
 #38238, #32408, #37435, #37452, #39194, #37532.
 
 ---
@@ -100,16 +102,16 @@ and only when it is off by an order of magnitude. Examples: #35407, #36242,
 ## C. Does it test the right thing?
 
 **C1. Fixtures go through the real production path; the oracle is written independently.**
-Weights through the real weight loader, configs through the real override entry points,
-inputs derived from what the model or config already declares rather than duplicated as
-literals -- so the logic that builds the fixture stays inside the tested surface. The
-reference value must not come from the implementation under test, or a shared bug makes
-both sides agree. Mocks must carry every field the code under test reads; a hand-built
-fake of an internal structure that needs patching after every refactor is the signal to
-stop hand-building it and construct it through the real constructor or a shared helper.
-The signal is repeated patching, not the existence of a fake: a deliberately minimal fake
-that isolates one unit is what a unit test is. The oracle is the one thing that must stay
-independent; harnesses, fixtures and eval entry points are shared (C6).
+The logic that builds a fixture should stay inside the tested surface, and the reference
+value must not come from the implementation under test, or a shared bug makes both sides
+agree. Spot: weights copied into parameters by hand instead of through the weight
+loader; a config assembled without the override entry points; literals that duplicate
+what the model or config already declares; a mock missing a field the code under test
+reads; a hand-built fake of an internal structure that has been patched in several
+fix-up PRs, which is the signal to construct it through the real constructor or a
+shared helper. Not this pattern: a deliberately minimal fake that isolates one unit --
+the signal is repeated patching, not the existence of a fake. The oracle is the one thing
+that must stay independent; harnesses, fixtures and eval entry points are shared (C6).
 Examples: #33615, #37339, #34100, #33509, #33179, #34746, #36424, #37148, #37182,
 #38314, #38315, #38418, #39019, #39100, #39101.
 
@@ -118,9 +120,9 @@ Spot: a test that relies on defaults to select an execution mode, capture range 
 fraction, so a default change silently moves what is covered; a job-level env var that
 changes which strategy a class exercises, so the class tests the wrong thing on every run
 of that lane; a filter or setting leaking from one suite into the next; cached process
-state that an env pin cannot override. A test that exists to check the defaults work is
-not this pattern; pinning it would delete that coverage. Examples: #34146, #33776, #33847, #38221, #33772,
-#34300, #39411.
+state that an env pin cannot override. Not this pattern: a test that exists to check the
+defaults work; pinning it would delete that coverage. Examples: #34146, #33776, #33847,
+#38221, #33772, #34300, #39411.
 
 **C3. The assertion matches the semantics under test.**
 Spot: exit-code assertions on a process expected to abort; equality assertions where the
@@ -129,21 +131,22 @@ Examples: #34017, #37873, #32410, #34272, #35795.
 
 **C4. Thresholds come from a measured distribution; derived metrics are gated on the primary one.**
 Spot: round-number thresholds with no recorded basis; a derived quantity asserted without
-the accuracy result it depends on. A deliberately loose bound whose job is "the model
-did not fall apart" is a design choice, not an unmeasured threshold; flag the ones with
-no margin or that keep being adjusted. Examples: #36570, #34145, #31702, #31748, #38725, #36290.
+the accuracy result it depends on. Not this pattern: a deliberately loose bound whose job
+is "the model did not fall apart", which is a design choice; flag the ones with no margin
+or that keep being adjusted. Examples: #36570, #34145, #31702, #31748, #38725, #36290.
 
 **C5. Randomness is removed before a tolerance is loosened.**
 Spot: a kernel test with unseeded random inputs whose bound was widened to make it pass;
 a comparison that could be bit-exact but asserts within an epsilon. Seed the inputs, pin
-the RNG, or make the guard exact. Where the kernel itself is nondeterministic (atomic
-or split-K reduction order), seeding does not help and a tolerance is the correct
-assertion. Examples: #32126, #37343, #30026, #35787, #34356, #34607.
+the RNG, or make the guard exact. Not this pattern: a kernel that is itself
+nondeterministic (atomic or split-K reduction order), where seeding does not help and a
+tolerance is the correct assertion. Examples: #32126, #37343, #30026, #35787, #34356,
+#34607.
 
 **C6. Shared test infrastructure has one implementation.**
 Spot: the same eval, mixin or fixture reimplemented locally in several files, each with
-its own threshold or drift. This is about harnesses, not oracles: a reference
-implementation written independently inside a test is required by C1, not a duplicate.
+its own threshold or drift. Not this pattern: a reference implementation written
+independently inside a test, which C1 requires; this is about harnesses, not oracles.
 Examples: #34477, #36979, #39906.
 
 ---
@@ -177,7 +180,8 @@ image, deps or env instead of reusing the stage's. Examples: #34186, #33329, #31
 
 **E2. An expensive artifact is built once per run and reused downstream.**
 Spot: the same build or setup block appearing in several jobs of the same run; the same
-compile happening in every job of a matrix. Examples: #33461, #33384, #33597, #33460, #37258.
+compile happening in every job of a matrix. Examples: #33461, #33384, #33597, #33460,
+#37258.
 
 **E3. Runner-pool availability is a single configuration switch, not a recurring workflow edit.**
 Spot: the same job disabled and re-enabled by separate PRs, each touching the workflow
@@ -207,7 +211,7 @@ Spot: caches rebuilt per job; a cache miss that fails the job instead of falling
 cache key that does not change when its inputs do. Examples: #33361, #33619, #33460,
 #34231, #33597, #35337, #33512, #32243.
 
-**F2. The toolchain and critical dependencies are pinned and verified after later installs, and nothing installed shadows the checkout.**
+**F2. The environment is pinned: toolchain and critical dependencies are fixed, survive later installs, and the checkout is what runs.**
 Spot: build steps with no explicit toolchain, so an image bump silently changes output; a
 transitive dependency that a later `pip install` upgrades or downgrades; an image built
 from whatever main was at build time rather than the workflow commit; a site-packages
