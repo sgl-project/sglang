@@ -12,6 +12,7 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_tp_group,
@@ -78,6 +79,7 @@ from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
+    process_model_config,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -209,6 +211,11 @@ def create_moe_dispatcher(
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             use_fp8_dispatch=output_dtype is DispatcherOutputDtype.FP8,
+            activation_scale_block_size=(
+                32
+                if isinstance(quant_method, Fp8MoEMethod) and quant_method.use_mxfp8
+                else 128
+            ),
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -267,18 +274,19 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     reason = None
     if not isinstance(quant_method, Fp8MoEMethod):
         reason = f"selected {type(quant_method).__name__}"
-    elif quant_method.use_mxfp8:
-        reason = "selected MXFP8 weights"
     elif quant_method.is_fp4_expert:
         reason = "selected FP4 experts"
-    elif list(quant_method.weight_block_size or []) != [128, 128]:
-        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif list(quant_method.weight_block_size or []) != (
+        [1, 32] if quant_method.use_mxfp8 else [128, 128]
+    ):
+        quant_format = "MXFP8 " if quant_method.use_mxfp8 else ""
+        reason = f"has {quant_format}weight_block_size={quant_method.weight_block_size}"
     elif config.activation_scheme != "dynamic":
         reason = f"has activation_scheme={config.activation_scheme!r}"
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires either 128x128 blockwise FP8 "
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
             "experts with dynamic activation scaling or unquantized BF16 "
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
@@ -479,6 +487,14 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
+        if (
+            get_moe_a2a_backend().is_deepep_v2()
+            and isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_mxfp8
+        ):
+            self.moe_runner_config.silu_mul_keep_fp32 = model_requires_fp32_silu_mul(
+                process_model_config().hf_config
+            )
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         )
