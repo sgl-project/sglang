@@ -29,7 +29,6 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _start_owner,
     _stop_owner,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
 from sglang.weight_cache_common.liveness import ProcessIdentity
 
@@ -86,7 +85,9 @@ def generate_minimax_h3(context, model, case, *, steps=4):
 @pytest.mark.parametrize("cache_text_encoder", [False, True], ids=["dit", "dit-te"])
 def test_minimax_h3_weight_cache_recovery(tmp_path, cache_text_encoder):
     model = maybe_download_model(
-        envs.SGLANG_TEST_WEIGHT_CACHE_MINIMAX_MODEL.get(),
+        os.environ.get(
+            "SGLANG_TEST_WEIGHT_CACHE_MINIMAX_MODEL", "MiniMaxAI/MiniMax-H3"
+        ),
         allow_patterns=["FL2VA/**"],
         revision="42ed227ee7df40d41602854ae760620d6eb651fe",
     )

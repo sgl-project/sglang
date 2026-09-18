@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.test_utils import (
     extract_key_frames_from_video,
     get_video_frame_count,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
 from sglang.weight_cache_common.liveness import ProcessIdentity
 
@@ -221,7 +220,9 @@ def _weights_checksum(context, *, timeout=60):
 
 def check_wan_weight_cache_recovery(tmp_path, warmup, *, count=5):
     model = maybe_download_model(
-        envs.SGLANG_TEST_WEIGHT_CACHE_MODEL.get(),
+        os.environ.get(
+            "SGLANG_TEST_WEIGHT_CACHE_MODEL", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        ),
         force_diffusers_model=True,
         revision="0fad780a534b6463e45facd96134c9f345acfa5b",
     )

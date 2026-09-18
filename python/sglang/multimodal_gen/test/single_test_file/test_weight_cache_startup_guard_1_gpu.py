@@ -26,7 +26,6 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
 from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import (
     pytestmark as pytestmark,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
 
 
@@ -42,7 +41,9 @@ def test_complete_warm_start_has_no_cached_tensor_reads_and_two_consumers_are_im
     tmp_path,
 ):
     model = maybe_download_model(
-        envs.SGLANG_TEST_WEIGHT_CACHE_MODEL.get(),
+        os.environ.get(
+            "SGLANG_TEST_WEIGHT_CACHE_MODEL", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        ),
         force_diffusers_model=True,
         revision="0fad780a534b6463e45facd96134c9f345acfa5b",
     )
