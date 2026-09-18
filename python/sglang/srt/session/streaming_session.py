@@ -172,18 +172,19 @@ class StreamingSession(BasePrefixCache):
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
         """Returns an active slot for this req, or None.
 
-        Side effect: if req is pre-aborted (to_finish set, e.g. input too
-        long), detach it from the session so cache_finished_req treats it
-        as a normal req. The slot stays intact for the next request.
+        Side effect: if req is pre-aborted (to_finish set), detach it from
+        the session so cache_finished_req treats it as a normal req. This
+        happens before slot lookup, and the slot stays intact for the next
+        request.
         """
         if not _is_streaming(req):
-            return None
-        slot = self.slots.get(req.session.session_id)
-        if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
             req.session.abort_req(req.rid)
             req.session = None
+            return None
+        slot = self.slots.get(req.session.session_id)
+        if slot is None or not slot.kv.holds_kv:
             return None
         return slot
 
