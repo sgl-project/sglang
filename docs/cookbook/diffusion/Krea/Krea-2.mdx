@@ -25,11 +25,19 @@ SGLang-diffusion offers multiple installation methods. You can choose the most s
 
 Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section covers deploying Krea-2-Turbo for fast, high-quality image generation.
 
 ### 3.1 Basic Configuration
+
+Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected Krea-2 checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path krea/Krea-2-Turbo
+```
 
 Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the server with:
 

@@ -44,6 +44,7 @@ export const Wan21Deployment = () => {
         { id: 'b300', label: 'B300', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'h100', label: 'H100', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
@@ -134,7 +135,14 @@ export const Wan21Deployment = () => {
 
   const handleRadioChange = (optionName, itemId) => {
     setValues((prev) => {
+      if (optionName === 'bestPractice' && prev.hardware === 'xeon') {
+        return prev;
+      }
       let next = { ...prev, [optionName]: itemId };
+
+      if (optionName === 'hardware' && itemId === 'xeon') {
+        next.bestPractice = 'off';
+      }
 
       if (optionName === 'task') {
         const sizes = modelSizeItemsForTask(itemId);
@@ -178,6 +186,16 @@ export const Wan21Deployment = () => {
 
     if (!config) {
       return '# Error: Invalid configuration';
+    }
+
+    if (hardware === 'xeon') {
+      let command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size 4`;
+      if (selectedLoraPath) {
+        command += ` \\\n  --lora-path ${selectedLoraPath}`;
+      }
+      return command;
     }
 
     if (hardware === 'a2' || hardware === 'a3') {
@@ -333,14 +351,16 @@ export const Wan21Deployment = () => {
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
             {(key === 'modelsize' ? modelSizeItems : option.items).map((item) => {
+              const isDisabled = key === 'bestPractice' && values.hardware === 'xeon';
               const isChecked = values[option.name] === item.id;
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
                   <input
                     type="radio"
                     name={option.name}
                     value={item.id}
                     checked={isChecked}
+                    disabled={isDisabled}
                     onChange={() => handleRadioChange(option.name, item.id)}
                     style={{ display: 'none' }}
                   />

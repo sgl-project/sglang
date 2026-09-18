@@ -8,6 +8,7 @@ export const MOVADeployment = () => {
         { id: 'b200', label: 'B200', default: true },
         { id: 'h200', label: 'H200', default: false },
         { id: 'h100', label: 'H100', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
         { id: 'a100', label: 'A100', default: false }
       ]
     },
@@ -16,7 +17,9 @@ export const MOVADeployment = () => {
       title: 'Resolution',
       items: [
         { id: '360p', label: '360p', subtitle: 'Fast inference, lower VRAM', default: true },
-        { id: '720p', label: '720p', subtitle: 'Higher resolution', default: false }
+        { id: '720p', label: '720p', subtitle: 'Higher resolution', default: false,
+          disabledWhen: (v) => v.hardware === 'xeon',
+          disabledReason: 'CPU support for MOVA-720p is still being fixed' }
       ]
     }
   };
@@ -50,7 +53,14 @@ export const MOVADeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      const resolutionItem = options.resolution.items.find(item => item.id === next.resolution);
+      if (resolutionItem && typeof resolutionItem.disabledWhen === 'function' && resolutionItem.disabledWhen(next)) {
+        next.resolution = '360p';
+      }
+      return next;
+    });
   };
 
   // Generate command
@@ -59,6 +69,11 @@ export const MOVADeployment = () => {
     const modelPath = resolution === '720p'
       ? 'OpenMOSS-Team/MOVA-720p'
       : 'OpenMOSS-Team/MOVA-360p';
+
+    if (values.hardware === 'xeon') {
+      return `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve \\
+  --model-path ${modelPath}`;
+    }
 
     return `export SG_OUTPUT_DIR=/root/output_mova
 mkdir -p "$SG_OUTPUT_DIR"
@@ -95,9 +110,10 @@ sglang serve \\
           <div style={itemsStyle}>
             {option.items.map(item => {
               const isChecked = values[option.name] === item.id;
+              const isDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                  <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                <label key={item.id} title={isDisabled ? item.disabledReason : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}>
+                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                   {item.label}
                   {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                 </label>
