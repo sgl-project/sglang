@@ -3,6 +3,7 @@
 
 use crate::config::{
     ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides, SessionAffinityMode,
+    DEFAULT_MIN_LOAD_CHOICES,
 };
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
@@ -10,7 +11,9 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
-use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens};
+use crate::policies::{
+    has_caller_input_ids, request_tokens_for, ExternalPrefixSignal, RequestTokens,
+};
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -644,6 +647,16 @@ pub async fn chat_completions(
         .affinity
         .as_ref()
         .and_then(|config| config.saturation_queue_floor);
+    // Sample size for the min-load fallback beneath admission
+    // (`--min-load-choices`). A policy with no affinity config never reaches
+    // the cache-aware paths, so it keeps the pre-existing power-of-2 default.
+    let min_load_choices = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.min_load_choices)
+        .unwrap_or(DEFAULT_MIN_LOAD_CHOICES);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -664,6 +677,7 @@ pub async fn chat_completions(
         session_affinity_mode,
         worker_queue_limit,
         saturation_queue_floor,
+        min_load_choices,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
@@ -1409,7 +1423,8 @@ fn build_outgoing_body(
 /// Forward generated IDs only for request shapes verified against the engine.
 /// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
-/// Exclude requests that may render differently with dynamo-render:
+/// Preserve caller-provided IDs. Exclude requests that may render differently
+/// with dynamo-render:
 /// - Non-leading system turns or consecutive users, which strict templates rewrite.
 /// - Historical `reasoning_content`, which may be injected into message content.
 /// - Tools and tool-call history, which the engine merges and normalizes
@@ -1422,7 +1437,8 @@ fn build_outgoing_body(
 /// overrides and default kwargs cannot be inferred from the request.
 /// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value)
+    if has_caller_input_ids(value)
+        || request_has_tools(value)
         || request_has_non_text_content(value)
         || request_has_reasoning_content(value)
         || request_has_role_rewrites(value)
@@ -1947,6 +1963,8 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
         ];
         for b in blockers {
             assert!(
@@ -1964,6 +1982,7 @@ mod tests {
             "chat_template": null,
             "reasoning_effort": null,
             "chat_template_kwargs": null,
+            "input_ids": null,
             "continue_final_message": false
         })));
     }
