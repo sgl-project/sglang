@@ -43,12 +43,16 @@ What is kept is the entire reason for the exercise: ``SparseFlashAttention``,
 by ``attn_tp_size`` when the queries do.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import DsaCpPlan, plan_dsa_cp_shard
+from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
+    DsaCpPlan,
+    cumulative,
+    plan_dsa_cp_shard,
+)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import print_info_once
@@ -212,6 +216,35 @@ def _build_dsa_cp_plan(forward_batch, layer_scatter_modes) -> Optional[DsaCpPlan
         f"{parallel.attn_tp_size} ranks at extend"
     )
     return plan
+
+
+def dsa_cp_cumulative_lens(
+    forward_batch: "ForwardBatch", plan: DsaCpPlan, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The operator's two length vectors as device tensors, built ONCE per forward.
+
+    Returns ``(cumulative query lengths, cumulative key lengths)``. Both carry
+    one entry per request, and neither varies by layer -- the split is by token
+    position. Building them at the point of use meant
+    ``torch.tensor(list, device=npu)`` twice per layer, which at 78 layers is
+    **156 host-to-device copies per forward**. Each one drains the queue before
+    the next kernel is enqueued, so the cost is a synchronisation rather than a
+    copy, and it lands squarely inside the win this feature exists to produce.
+
+    Cached on the batch beside the plan, and built as a pair because a forward
+    that needs one needs the other.
+
+    ``int32`` on the query's device, which is what both call sites ask for, so
+    their ``.to()`` is a no-op rather than another copy.
+    """
+    cached = getattr(forward_batch, "npu_dsa_cp_cu_lens", None)
+    if cached is None:
+        cached = (
+            torch.tensor(cumulative(plan.query_lens), dtype=torch.int32, device=device),
+            torch.tensor(cumulative(plan.key_lens), dtype=torch.int32, device=device),
+        )
+        forward_batch.npu_dsa_cp_cu_lens = cached
+    return cached
 
 
 def dsa_cp_slice(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:

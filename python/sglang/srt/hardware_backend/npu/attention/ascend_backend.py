@@ -24,8 +24,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import cumulative
+from sglang.srt.layers.attention.dsa.dsa_cp import (
+    dsa_cp_cumulative_lens,
+    get_dsa_cp_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_local_kv_block_table,
@@ -1253,17 +1255,20 @@ class AscendAttnBackend(AttentionBackend):
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         # DSA-CP replaces both length vectors, because this rank now holds a
-        # slice of the batch's tokens rather than all of them. Resolved once
-        # per forward and cached on the batch by the model side.
+        # slice of the batch's tokens rather than all of them. The plan and both
+        # vectors are resolved once per forward and cached on the batch: they do
+        # not vary by layer, and building them here would put two blocking
+        # host-to-device copies in every one of the 78.
         dsa_cp_plan = get_dsa_cp_plan(forward_batch)
+        dsa_cp_qlen = dsa_cp_kvlen = None
+        if dsa_cp_plan is not None:
+            dsa_cp_qlen, dsa_cp_kvlen = dsa_cp_cumulative_lens(
+                forward_batch, dsa_cp_plan, q.device
+            )
 
         if is_prefill:
-            if dsa_cp_plan is not None:
-                actual_seq_qlen = torch.tensor(
-                    cumulative(dsa_cp_plan.query_lens),
-                    dtype=torch.int32,
-                    device=q.device,
-                )
+            if dsa_cp_qlen is not None:
+                actual_seq_qlen = dsa_cp_qlen
             elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
@@ -1410,11 +1415,7 @@ class AscendAttnBackend(AttentionBackend):
                     # request's entry would move where the next one starts.
                     # With a single request the shortened length is a true
                     # prefix of the buffer and the read is exact.
-                    seq_lengths_kv = torch.tensor(
-                        cumulative(dsa_cp_plan.key_lens),
-                        dtype=torch.int32,
-                        device=q.device,
-                    )
+                    seq_lengths_kv = dsa_cp_kvlen
                 layout_kv = "TND"
                 # layout_kv must equal layout_query unless it is PA_BSND
                 # (sparse_flash_attention_tiling.cpp:1761), which is why this is
