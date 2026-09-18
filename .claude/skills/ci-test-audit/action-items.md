@@ -13,7 +13,7 @@ sections are about the pipeline around the tests.
 ## A. Should this test exist in this form?
 
 **A1. Every case answers "what future diff would turn this red?"; if the only answer is editing the test, delete it.**
-The admission criteria in `../../rules/unit-test-admission.md` apply to existing cases as
+The admission criteria in `.claude/rules/unit-test-admission.md` apply to existing cases as
 much as new ones. Spot: a test for a code path or kernel that no longer exists;
 assertions that only check a mock was called; a stress loop that cannot reproduce the
 failure it claims to guard; a case whose every assertion is also made by another case in
