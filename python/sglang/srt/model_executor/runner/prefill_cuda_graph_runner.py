@@ -551,14 +551,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 get_parallel().cp_strategy,
                 get_parallel().attn_cp_size,
             )
-            
+
         if self.max_context_size is not None and not (
             model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
         ):
             raise ValueError(
                 "--cuda-graph-prefill-max-context is only supported by attention "
                 "backends that implement fixed-context prefill graph metadata; "
-                f"got {type(model_runner.attn_backend).__name__}")
+                f"got {type(model_runner.attn_backend).__name__}"
+            )
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
