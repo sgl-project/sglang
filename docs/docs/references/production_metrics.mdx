@@ -70,6 +70,14 @@ sglang:e2e_request_latency_seconds_bucket{le="50.0",model_name="meta-llama/Llama
 sglang:e2e_request_latency_seconds_bucket{le="60.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1513.0
 sglang:e2e_request_latency_seconds_bucket{le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
 sglang:e2e_request_latency_seconds_count{model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
+# HELP sglang:request_decode_throughput_tokens_per_second Histogram of per-request decode throughput in tokens/s, computed as (completion_tokens - 1) / (e2e_latency - time_to_first_token). Only observed for requests that produced more than one output token across at least two output batches.
+# TYPE sglang:request_decode_throughput_tokens_per_second histogram
+sglang:request_decode_throughput_tokens_per_second_sum{is_streaming="true",model_name="meta-llama/Llama-3.1-8B-Instruct"} 472113.6
+sglang:request_decode_throughput_tokens_per_second_bucket{is_streaming="true",le="20.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.0
+sglang:request_decode_throughput_tokens_per_second_bucket{is_streaming="true",le="40.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 5512.0
+sglang:request_decode_throughput_tokens_per_second_bucket{is_streaming="true",le="60.0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11201.0
+sglang:request_decode_throughput_tokens_per_second_bucket{is_streaming="true",le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
+sglang:request_decode_throughput_tokens_per_second_count{is_streaming="true",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11228.0
 # HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.
 # TYPE sglang:time_per_output_token_seconds histogram
 sglang:time_per_output_token_seconds_sum{model_name="meta-llama/Llama-3.1-8B-Instruct"} 866964.5791549598

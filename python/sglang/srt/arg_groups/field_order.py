@@ -187,6 +187,7 @@ POSITIONAL_FIELD_ORDER = (
     "bucket_time_to_first_token",
     "bucket_inter_token_latency",
     "bucket_e2e_request_latency",
+    "bucket_request_decode_throughput",
     "prompt_tokens_buckets",
     "generation_tokens_buckets",
     "gc_warning_threshold_secs",

@@ -1533,6 +1533,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
+        bucket_request_decode_throughput: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -1743,6 +1744,31 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 8.000,
             ]
 
+        if bucket_request_decode_throughput is None:
+            bucket_request_decode_throughput = [
+                1,
+                2,
+                5,
+                10,
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                60,
+                80,
+                100,
+                150,
+                200,
+                300,
+                400,
+                600,
+                800,
+                1000,
+                2000,
+            ]
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -1765,6 +1791,18 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=list(labels.keys()) + ["is_streaming"],
             buckets=bucket_e2e_request_latency,
+        )
+
+        self.histogram_request_decode_throughput = Histogram(
+            name="sglang:request_decode_throughput_tokens_per_second",
+            documentation=(
+                "Histogram of per-request decode throughput in tokens/s, computed "
+                "as (completion_tokens - 1) / (e2e_latency - time_to_first_token). "
+                "Only observed for requests that produced more than one output "
+                "token across at least two output batches."
+            ),
+            labelnames=list(labels.keys()) + ["is_streaming"],
+            buckets=bucket_request_decode_throughput,
         )
 
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
@@ -1796,6 +1834,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
+        decode_throughput: Optional[float] = None,
     ):
         stream_labels = {
             **labels,
@@ -1834,6 +1873,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(
             float(e2e_latency)
         )
+        if decode_throughput is not None:
+            self.histogram_request_decode_throughput.labels(**stream_labels).observe(
+                float(decode_throughput)
+            )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)

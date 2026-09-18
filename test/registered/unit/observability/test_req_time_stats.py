@@ -65,6 +65,39 @@ class TestOutputMetaInfo(CustomTestCase):
                 else:
                     self.assertAlmostEqual(meta_info["first_token_latency"], expected)
 
+    def test_decode_throughput_is_tokens_after_first_over_decode_interval(self):
+        stats = rts.APIServerReqTimeStats()
+        stats.created_time = 1.0
+        stats.first_token_time = 1.5
+        stats.finished_time = 3.5
+        # 101 completion tokens, 100 of them in the 2.0s decode interval.
+        self.assertAlmostEqual(stats.get_decode_throughput(101), 50.0)
+        meta_info = stats.convert_to_output_meta_info(completion_tokens=101)
+        self.assertAlmostEqual(meta_info["decode_throughput"], 50.0)
+
+    def test_decode_throughput_undefined_cases(self):
+        for first, finished, completion_tokens in (
+            # Single-batch finish: first token stamped in the same batch.
+            (3.5, 3.5, 40),
+            # Not stamped at all.
+            (0.0, 3.5, 40),
+            # One or zero output tokens: no decode interval to measure.
+            (1.5, 3.5, 1),
+            (1.5, 3.5, 0),
+        ):
+            with self.subTest(
+                first=first, finished=finished, completion_tokens=completion_tokens
+            ):
+                stats = rts.APIServerReqTimeStats()
+                stats.created_time = 1.0
+                stats.first_token_time = first
+                stats.finished_time = finished
+                self.assertIsNone(stats.get_decode_throughput(completion_tokens))
+                meta_info = stats.convert_to_output_meta_info(
+                    completion_tokens=completion_tokens
+                )
+                self.assertNotIn("decode_throughput", meta_info)
+
 
 class TestConvertToGenAiSpanAttrs(CustomTestCase):
     def _stats_after_first_token(self) -> rts.APIServerReqTimeStats:

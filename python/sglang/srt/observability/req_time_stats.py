@@ -488,6 +488,22 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_decode_latency(self):
         return self.finished_time - self.first_token_time
 
+    def get_decode_throughput(self, completion_tokens: int) -> Optional[float]:
+        """Per-request decode throughput in tokens/s:
+        (completion_tokens - 1) / (finished_time - first_token_time).
+
+        Returns None when it is undefined: fewer than two output tokens, the
+        first token was never stamped, or the request finished in the same
+        output batch that carried its first token (so no decode interval was
+        observed at this layer).
+        """
+        if self.first_token_time <= 0.0 or completion_tokens <= 1:
+            return None
+        decode_latency = self.get_decode_latency()
+        if decode_latency <= 0.0:
+            return None
+        return (completion_tokens - 1) / decode_latency
+
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
@@ -514,9 +530,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
-        decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 1:
-            meta_info["decode_throughput"] = (completion_tokens - 1) / decode_latency
+        decode_throughput = self.get_decode_throughput(completion_tokens)
+        if decode_throughput is not None:
+            meta_info["decode_throughput"] = decode_throughput
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
