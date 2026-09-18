@@ -122,8 +122,8 @@ def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
     for _ in range(30):
         out = top_p_renorm_prob(probs, top_p, deterministic=True)
         assert torch.equal(out, ref), "top_p_renorm_prob output changed between calls"
-    # the default path is the deterministic one unless the env opts out
-    if envs.SGLANG_RENORM_DETERMINISTIC.get():
+    # the env is the knob deployments are given; it must reach the same kernel
+    with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
         assert torch.equal(top_p_renorm_prob(probs, top_p), ref)
 
 
@@ -138,10 +138,10 @@ def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
     for _ in range(30):
         out = top_k_renorm_prob(probs, top_k, deterministic=True)
         assert torch.equal(out, ref), "top_k_renorm_prob output changed between calls"
-    if envs.SGLANG_RENORM_DETERMINISTIC.get():
+    with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
         assert torch.equal(top_k_renorm_prob(probs, top_k), ref)
-    # and the deterministic kernel must agree with the fast one up to rounding
-    fast = top_k_renorm_prob(probs, top_k, deterministic=False)
+    # the default path, and it must agree with the deterministic one up to rounding
+    fast = top_k_renorm_prob(probs, top_k)
     torch.testing.assert_close(fast, ref, rtol=1e-5, atol=1e-6)
 
 

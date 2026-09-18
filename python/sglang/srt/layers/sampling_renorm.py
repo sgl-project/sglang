@@ -8,8 +8,10 @@ distribution; for top-k even on peaky rows). Each TP rank renormalizes
 independently, and the output decides committed tokens and speculative accept
 lengths, so a last-bit gap desynchronizes the ranks (#33549, #33289).
 
-``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC``; the top-k
-fallback goes away once the flashinfer pin includes flashinfer-ai/flashinfer#5034.
+``deterministic`` defaults to ``SGLANG_RENORM_DETERMINISTIC``, which is off: the
+fast kernels cost 4-12x less on top-k, and the consumers that commit per-rank
+state already broadcast their decisions from rank 0. The top-k fallback goes
+away once the flashinfer pin includes flashinfer-ai/flashinfer#5034.
 """
 
 from __future__ import annotations
