@@ -118,6 +118,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.rank_consensus_checker import assert_same
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
 
@@ -2641,7 +2642,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _l2_sync_admission_inputs(self) -> None:
+        """MIN-align the rank-local L2-Only admission inputs across ranks."""
+        if not self._l2_only:
+            return
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+        req_pool_avail = int(prealloc_queue.req_to_token_pool.available_size())
+        meta_avail = int(
+            prealloc_queue.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        sync_t = torch.tensor(
+            [
+                -int(prealloc_queue._hicache_pending_restore_tokens()),
+                int(
+                    prealloc_queue._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                    )
+                ),
+                req_pool_avail,
+                meta_avail,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self.tree_cache._all_reduce_attn_groups(sync_t, dist.ReduceOp.MIN)
+        self._l2_aligned_pending_restore = -int(sync_t[0].item())
+        self._l2_aligned_hbm_budget = int(sync_t[1].item())
+        self._l2_aligned_req_pool_avail = int(sync_t[2].item())
+        self._l2_aligned_meta_avail = int(sync_t[3].item())
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        if self._l2_only:
+            self._drain_l2_only_pending_frees()
+            assert_same("decode transfer queue len=%d", len(self.queue))
+            self._l2_sync_admission_inputs()
+
         if not self.queue:
             return []
 
@@ -2664,15 +2704,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Queue-removed but held for deferred release; excluded from the metadata
         # teardown below.
         deferred_indices = set()
+
+        l2_only_mode = self._l2_only
+        uniform_hicache_failure = (
+            l2_only_mode or envs.SGLANG_DISAGGREGATION_UNIFORM_HICACHE_FAILURE.get()
+        )
+        hicache_failed_rids = set()
+        if uniform_hicache_failure and self.scheduler.enable_decode_hicache:
+            failed_bits = torch.tensor(
+                [
+                    int(
+                        decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED
+                    )
+                    for decode_req in self.queue
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            self.tree_cache._all_reduce_attn_groups(failed_bits, dist.ReduceOp.MAX)
+            hicache_failed_rids = {
+                decode_req.req.rid
+                for decode_req, failed in zip(self.queue, failed_bits.tolist())
+                if failed
+            }
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
-            ):
+            if uniform_hicache_failure:
+                hicache_failed = decode_req.req.rid in hicache_failed_rids
+            else:
+                hicache_failed = hicache_restore_status == HiCacheRestoreResult.FAILED
+            if poll == KVPoll.Failed or hicache_failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2714,8 +2779,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
-                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if self._shrink_l2_only_kv_lens_for_release(decode_req):
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
@@ -2836,6 +2903,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if self._l2_only:
+            for decode_req in self.queue:
+                self._clean_hicache_prefetch_resources(decode_req)
+            self.l2_only_pending_frees.clear()
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
@@ -3119,6 +3190,8 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
+            if self.server_args.disaggregation_decode_l2_only_radix_cache:
+                self.disagg_decode_transfer_queue._drain_l2_only_pending_frees()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
