@@ -26,7 +26,6 @@ class TestPureSWARadixCache(CustomTestCase):
     def test_no_insert_frees_window_after_evict_floor_before_swa_eviction(self):
         allocator = _FakeAllocator()
         cache = PureSWARadixCache.__new__(PureSWARadixCache)
-        cache.disable_finished_insert = False
         cache.disable = False
         cache.is_eagle = False
         cache.page_size = 1

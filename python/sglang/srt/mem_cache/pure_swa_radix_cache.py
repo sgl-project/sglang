@@ -72,9 +72,6 @@ class PureSWARadixCache(RadixCache):
         to the allocator. The range [evict_floor, swa_evicted_seqlen) was already
         freed by _evict_swa during decode — we skip it to avoid double-free.
         """
-        if self.disable_finished_insert:
-            is_insert = False
-
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, :owned_kv_len

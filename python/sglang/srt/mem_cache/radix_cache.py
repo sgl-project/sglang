@@ -325,7 +325,6 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle
-        self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
         self.kv_events = KVCacheEventRecorder(
@@ -480,10 +479,6 @@ class RadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         """Cache request when it finishes."""
-        # In deterministic mode, disable finished request insertion to radix cache
-        if self.disable_finished_insert:
-            is_insert = False
-
         if self.disable:
             # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
