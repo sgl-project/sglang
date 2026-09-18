@@ -29,11 +29,14 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
 
     args = make_cpp_args(is_arch_support_pdl())
-    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
-    # defaults, and a 0 would size the persistent pool to an empty grid.
+    # Keep the existing C8 fallback: zero would make the persistent pool empty.
+    # C16 is optional and must only be enabled by a successful positive probe.
     extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         try:
@@ -45,11 +48,9 @@ def _jit_topk_v2_module():
                 extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}")
         try:
             occ_16_1 = get_max_active_clusters(16, occupancy=1)
-        except Exception:
-            pass
-        else:
-            if occ_16_1 > 0:
-                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
+        except NoSchedulableClustersError:
+            occ_16_1 = 0
+        extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
     kernel = f"TopKKernel<{args}>"
     return load_jit(
         make_name("topk_v2"),

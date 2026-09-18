@@ -411,6 +411,52 @@ def _assert_topk_values(window, indices, k):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("batch,seq", [(4, 65536), (1, 131072)])
+@pytest.mark.parametrize("use_graph", [False, True])
+@torch.inference_mode()
+def test_topk_v2_small_batch_cluster_fallback(batch, seq, use_graph):
+    """These shapes used to launch unsupported 16-block clusters on H20.
+
+    Devices with a positive C16 probe should keep their original fast path.
+    Check raw selection and page mapping in eager and captured execution.
+    """
+    k = 512
+    torch.manual_seed(batch * 100003 + seq)
+    scores = torch.randn(batch, seq, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    page_table, _ = _make_page_table(
+        batch, seq // PAGE_SIZE, "perm", "cuda", per_row=True
+    )
+    metadata = _plan(lengths)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device="cuda")
+    raw = torch.full_like(out, -1)
+
+    def run():
+        topk_transform_paged_v2(
+            scores, lengths, page_table, out, PAGE_SIZE, metadata, raw
+        )
+
+    # Compile and warm up before capture; the plan is ready outside the graph.
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    out.fill_(-1)
+    raw.fill_(-1)
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+    else:
+        run()
+    torch.cuda.synchronize()
+
+    for row in range(batch):
+        _assert_topk_values(scores[row], raw[row], k)
+    expected_pages = page_table.gather(1, raw.long() // PAGE_SIZE)
+    assert torch.equal(out, expected_pages * PAGE_SIZE + raw % PAGE_SIZE)
+
+
 @pytest.mark.parametrize("num_ties", [48, 96])
 @torch.inference_mode()
 def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
