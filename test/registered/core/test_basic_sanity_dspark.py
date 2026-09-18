@@ -121,9 +121,10 @@ class TestBasicSanityDSpark(_DSparkSanityMixin, CustomTestCase):
 class TestBasicSanityDSparkXpuTriton(_DSparkSanityMixin, CustomTestCase):
     attention_backend = "triton"
     draft_attention_backend = "triton"
-    # gsm8k drives 128 concurrent clients; the B60 tp2 DSpark path faults under
-    # the resulting large decode batches, so cap the scheduler (see intel_xpu).
-    max_running_requests = "16"
+    # The tp2 prefill allreduce aborts the XPU driver under gsm8k's 128-prompt
+    # cold-start burst at higher caps; cap=2 keeps the prefill batch small (see
+    # intel_xpu class). Backend-independent -- it is the allreduce, not attention.
+    max_running_requests = "2"
     # Two B60 cards in bfloat16 (fp16 produces garbage on XPU).
     extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
@@ -138,11 +139,11 @@ class TestBasicSanityDSparkXpuIntelXpu(_DSparkSanityMixin, CustomTestCase):
     # B60 (0.7 OOMs during draft build).
     page_size = "128"
     mem_fraction_static = "0.85"
-    # The intel_xpu DSpark spec kernels DEVICE_LOST when the decode batch grows
-    # into the mid-20s (a batch-size limit, not KV pressure -- the pool is ~22%
-    # full at that point). running-req 20 is stable; 16 leaves margin under the
-    # ~24 crash onset while gsm8k's 128 client threads would otherwise blow past.
-    max_running_requests = "16"
+    # gsm8k fires 128 prompts at once; --max-running-requests also bounds the
+    # prefill batch, and a large cold-start prefill's tp2 allreduce aborts the
+    # XPU driver (NEO drm_neo.cpp:289). cap=2 survives (gsm8k 0.975); higher
+    # caps abort at the first prefill batch, before any decode batch forms.
+    max_running_requests = "2"
     # Two B60 cards in bfloat16 (fp16 produces garbage on XPU).
     extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
