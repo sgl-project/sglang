@@ -1753,6 +1753,10 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Drop MultimodalProcessorOutput.input_ids in the tokenizer once it has been
+    # consumed, so the scheduler request broadcast does not carry a second copy
+    # of the prompt token ids.
+    SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

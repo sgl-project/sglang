@@ -9,6 +9,7 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
@@ -339,6 +340,9 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
+        if isinstance(input_ids, array) and input_ids.typecode == "q":
+            return pad_input_ids_array(input_ids, mm_inputs)
+
         input_ids_tensor = torch.as_tensor(input_ids)
 
         # Replace multimodal tokens using per-item offsets
@@ -364,6 +368,39 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
+
+
+def pad_input_ids_array(input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    """array('q') equivalent of
+    MultiModalityDataPaddingPatternMultimodalTokens.pad_input_tokens.
+
+    Same semantics (per-item pad_value written over each inclusive
+    [start, end] offset, items whose modality has no token id skipped),
+    always returns a new array.
+
+    Items are grouped by modality exactly like pad_input_tokens so the
+    write order — and therefore the result even for overlapping offsets —
+    is identical to the loop path for every input.
+    """
+    if not input_ids or not mm_inputs.mm_items:
+        return array("q", input_ids)
+
+    buf = np.frombuffer(input_ids, dtype=np.int64).copy()
+    items_by_modality = defaultdict(list)
+    for item in mm_inputs.mm_items:
+        items_by_modality[item.modality].append(item)
+    token_id_map = {
+        Modality.IMAGE: mm_inputs.im_token_id,
+        Modality.AUDIO: mm_inputs.audio_token_id,
+        Modality.VIDEO: mm_inputs.video_token_id,
+    }
+    for modality, items in items_by_modality.items():
+        if token_id_map.get(modality) is None:
+            continue
+        for item in items:
+            for start, end in item.offsets:
+                buf[start : end + 1] = item.pad_value
+    return array("q", buf.tobytes())
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus

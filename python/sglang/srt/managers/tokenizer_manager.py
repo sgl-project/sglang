@@ -1170,6 +1170,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
+                # Bailing multi-gate models build mm_token_modalities from the
+                # processor's input_ids in the scheduler; stripping them here
+                # would silently disable modality-specific MoE routing.
+                if (
+                    envs.SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS.get()
+                    and not self.model_config.requires_mm_token_modalities
+                ):
+                    mm_inputs.input_ids = None
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
