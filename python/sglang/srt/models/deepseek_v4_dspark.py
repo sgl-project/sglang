@@ -644,6 +644,9 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    # The draft model uses the same dynamically scaled DSV4 cache contract.
+    kv_cache_scale_mode = "dynamic"
+
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
