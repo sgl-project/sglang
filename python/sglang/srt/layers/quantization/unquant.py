@@ -857,10 +857,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # once per post-processing cycle.
         self._cache_permute_indices.clear()
 
-        for param_name in _FUSED_EXPERT_WEIGHT_NAMES:
-            self._apply_trtllm_bf16_block_layout(
-                layer, getattr(layer, param_name), param_name
-            )
+        # Bucketed updates may already have packed each weight before the final
+        # post-load hook; only canonical weights still need the block layout.
+        self.repack_weights_after_hot_update(layer)
 
     def _trtllm_bf16_row_permutation(
         self, layer: torch.nn.Module, param_name: str, expert_tile: torch.Tensor

@@ -135,7 +135,7 @@ def _canonical_shapes():
     }
 
 
-class TestFlashInferTrtllmBf16MoEReload(unittest.TestCase):
+class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
     def _cold_load(self, seed: int):
         """A layer loaded from disk and post-processed, i.e. in kernel layout."""
         method = _make_method()
@@ -169,6 +169,41 @@ class TestFlashInferTrtllmBf16MoEReload(unittest.TestCase):
         _, layer = self._cold_load(seed=0)
         for name, canonical in _canonical_shapes().items():
             self.assertNotEqual(tuple(getattr(layer, name).data.shape), canonical)
+
+    def test_post_load_preserves_already_packed_weights(self):
+        """Repeated post-load processing must preserve the cold-load layout."""
+        _, reference = self._cold_load(seed=0)
+        method = _make_method()
+        layer = _FakeMoELayer(method, seed=0)
+
+        with _mock_flashinfer():
+            for _ in range(3):
+                method.process_weights_after_loading(layer)
+                for name in _canonical_shapes():
+                    got = getattr(layer, name).data
+                    want = getattr(reference, name).data
+                    self.assertEqual(tuple(got.shape), tuple(want.shape))
+                    self.assertTrue(torch.equal(got, want), name)
+
+    def test_post_load_repacks_only_canonical_weights(self):
+        """Final post-load must pack a changed weight without repacking its peer."""
+        _, reference = self._cold_load(seed=1)
+        method, layer = self._cold_load(seed=0)
+        untouched_w2 = layer.w2_weight.data.clone()
+        self._restore_for_load(method, layer, param_names=("w13",))
+        layer.w13_weight.data.copy_(_FakeMoELayer(method, seed=1).w13_weight.data)
+        expected = {
+            "w13_weight": reference.w13_weight.data,
+            "w2_weight": untouched_w2,
+        }
+
+        with _mock_flashinfer():
+            for _ in range(2):
+                method.process_weights_after_loading(layer)
+                for name, want in expected.items():
+                    got = getattr(layer, name).data
+                    self.assertEqual(tuple(got.shape), tuple(want.shape))
+                    self.assertTrue(torch.equal(got, want), name)
 
     def test_restore_runs_for_non_routed_backend(self):
         """Regression for #27787: the undo must fire for plain flashinfer_trtllm.
@@ -279,6 +314,16 @@ class TestFlashInferTrtllmBf16MoEReload(unittest.TestCase):
             got, want = getattr(layer, name).data, getattr(reference, name).data
             self.assertEqual(tuple(got.shape), tuple(want.shape))
             self.assertTrue(torch.equal(got, want), f"{name} differs from cold load")
+
+        # A session can request final post-load after every bucket was repacked.
+        with _mock_flashinfer():
+            for _ in range(2):
+                method.process_weights_after_loading(layer)
+                for name in _canonical_shapes():
+                    got = getattr(layer, name).data
+                    want = getattr(reference, name).data
+                    self.assertEqual(tuple(got.shape), tuple(want.shape))
+                    self.assertTrue(torch.equal(got, want), name)
 
     def test_restore_rejects_non_bijective_permutation(self):
         """The inverse is an argsort, which is only valid for a bijection.
