@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     is_non_idle_and_non_empty,
+    is_npu,
     make_layers,
 )
 
@@ -350,23 +351,25 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        # bf16 gate keeps the router matmul on Cube units and lets
-        # npu_moe_gating_top_k consume logits without an fp32 cast.
+        # On NPU a bf16 gate keeps the router matmul on Cube units and lets
+        # npu_moe_gating_top_k consume logits without an fp32 cast. GPU keeps
+        # the historical fp32 gate.
+        self.dtype = torch.bfloat16 if is_npu() else torch.float32
         self.weight = nn.Parameter(
             torch.empty(
                 (config.n_routed_experts, config.hidden_size),
-                dtype=torch.bfloat16,
+                dtype=self.dtype,
             )
         )
         if config.topk_method == "noaux_tc":
             # flashinfer_trtllm topk on GPU requires an fp32 correction bias;
-            # everything else (incl. NPU) keeps it in bf16 alongside the gate.
+            # everything else keeps it alongside the gate dtype.
             correction_bias_dtype = (
                 torch.float32
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else torch.bfloat16
+                else self.dtype
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -375,7 +378,7 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
+        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
 
         return logits
 
