@@ -46,37 +46,39 @@ use crate::{
     },
 };
 
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
-    token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
+/// Owns an acquired admission token across handler and response-body lifetimes.
+struct AdmissionPermit {
+    bucket: Arc<TokenBucket>,
     tokens: f64,
 }
 
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
-        Self {
-            inner,
-            token_bucket: Some(token_bucket),
-            tokens,
-        }
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.bucket.return_tokens_sync(self.tokens);
     }
 }
 
-impl Drop for TokenGuardBody {
-    fn drop(&mut self) {
-        if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
+/// Holds admission until the response finishes, errors, or is dropped.
+pub struct TokenGuardBody {
+    inner: Body,
+    permit: Option<AdmissionPermit>,
+}
+
+impl TokenGuardBody {
+    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self::with_permit(
+            inner,
+            AdmissionPermit {
+                bucket: token_bucket,
+                tokens,
+            },
+        )
+    }
+
+    fn with_permit(inner: Body, permit: AdmissionPermit) -> Self {
+        Self {
+            inner,
+            permit: Some(permit),
         }
     }
 }
@@ -92,7 +94,11 @@ impl http_body::Body for TokenGuardBody {
         // SAFETY: We never move the inner body, and Body is Unpin
         // (it's a type alias for UnsyncBoxBody which is Unpin)
         let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_frame(cx)
+        let frame = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(&frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.permit.take();
+        }
+        frame
     }
 
     fn is_end_stream(&self) -> bool {
@@ -383,7 +389,7 @@ pub struct QueuedRequest {
     /// Time when the request was queued
     queued_at: Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
+    permit_tx: oneshot::Sender<Result<AdmissionPermit, StatusCode>>,
 }
 
 /// Queue metrics for monitoring
@@ -434,7 +440,10 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                let _ = queued.permit_tx.send(Ok(AdmissionPermit {
+                    bucket: self.token_bucket.clone(),
+                    tokens: 1.0,
+                }));
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +456,10 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        let _ = queued.permit_tx.send(Ok(AdmissionPermit {
+                            bucket: token_bucket,
+                            tokens: 1.0,
+                        }));
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -487,6 +499,23 @@ impl ConcurrencyLimiter {
             (Some(_), _) => (Self { queue_tx: None }, None),
         }
     }
+}
+
+/// Admission overload is temporary unavailability, matching the engine gate.
+fn admission_overload_response(concurrency_only: bool) -> Response {
+    if !concurrency_only {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(json!({"error": {
+            "message": "The server is at its configured concurrent request limit. Please retry shortly.",
+            "type": "server_error",
+            "param": null,
+            "code": "service_unavailable"
+        }})),
+    ).into_response()
 }
 
 /// Middleware function for concurrency limiting with optional queuing
@@ -534,13 +563,17 @@ pub async fn concurrency_limit_middleware(
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        let permit = AdmissionPermit {
+            bucket: token_bucket.clone(),
+            tokens: 1.0,
+        };
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::with_permit(body, permit);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -565,7 +598,7 @@ pub async fn concurrency_limit_middleware(
 
                     // Wait for token from queue processor
                     match permit_rx.await {
-                        Ok(Ok(())) => {
+                        Ok(Ok(permit)) => {
                             debug!("Acquired token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
@@ -577,7 +610,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::with_permit(body, permit);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
@@ -601,15 +634,15 @@ pub async fn concurrency_limit_middleware(
                     }
                 }
                 Err(_) => {
-                    warn!("Request queue is full, returning 429");
+                    warn!("Request queue is full");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    admission_overload_response(token_bucket.is_concurrency_only())
                 }
             }
         } else {
-            warn!("No tokens available and queuing is disabled, returning 429");
+            warn!("No tokens available and queuing is disabled");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            admission_overload_response(token_bucket.is_concurrency_only())
         }
     }
 }
@@ -1045,5 +1078,90 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+}
+
+#[cfg(test)]
+mod strict_admission_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn admission_overload_returns_503_and_retry_after() {
+        let response = admission_overload_response(true);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "service_unavailable");
+    }
+
+    #[test]
+    fn rate_limit_keeps_existing_429_status() {
+        let response = admission_overload_response(false);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    async fn acquire(bucket: &Arc<TokenBucket>) -> AdmissionPermit {
+        bucket.try_acquire(1.0).await.unwrap();
+        AdmissionPermit {
+            bucket: bucket.clone(),
+            tokens: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_headers_returns_slot() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let permit = acquire(&bucket).await;
+        let handler = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        handler.abort();
+        let _ = handler.await;
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_holds_slot_until_end_and_returns_once() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let permit = acquire(&bucket).await;
+        let mut body = TokenGuardBody::with_permit(Body::from("data"), permit);
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        assert!(body.frame().await.is_none());
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        drop(body);
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_closed_queue_receiver_return_slots() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let body = TokenGuardBody::with_permit(Body::from("data"), acquire(&bucket).await);
+        drop(body);
+        let permit = acquire(&bucket).await;
+        let (tx, rx) = oneshot::channel::<Result<AdmissionPermit, StatusCode>>();
+        drop(rx);
+        drop(tx.send(Ok(permit)));
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn body_error_returns_slot() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let stream =
+            futures::stream::once(async { Err::<Bytes, _>(std::io::Error::other("test failure")) });
+        let mut body =
+            TokenGuardBody::with_permit(Body::from_stream(stream), acquire(&bucket).await);
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        drop(body);
+        assert!(bucket.try_acquire(1.0).await.is_err());
     }
 }
