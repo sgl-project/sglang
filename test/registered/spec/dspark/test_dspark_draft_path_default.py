@@ -120,15 +120,6 @@ class TestDsparkPipelineParallelGate(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "CUDA PD prefill"):
                             _handle_dspark(server_args)
 
-    def test_target_without_pp_capture_is_rejected(self):
-        server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
-        )
-        server_args.pp_size = 2
-        server_args.disaggregation_mode = "prefill"
-        with self.assertRaisesRegex(ValueError, "Kimi-K3"):
-            _handle_dspark(server_args)
-
 
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""

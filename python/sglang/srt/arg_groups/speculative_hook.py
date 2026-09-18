@@ -599,14 +599,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark pipeline parallelism requires CUDA PD prefill; "
                 "decode and non-disaggregated serving require pp_size == 1."
             )
-        if model_config_of(server_args).hf_config.architectures[0] not in (
-            "KimiK3ForConditionalGeneration",
-            "KimiK3LinearForCausalLM",
-            "KimiLinearForCausalLM",
-        ):
-            raise ValueError(
-                "DSpark pipeline parallel prefill currently supports Kimi-K3 and Kimi Linear."
-            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
