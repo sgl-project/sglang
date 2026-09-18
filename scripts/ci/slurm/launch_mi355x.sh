@@ -1599,9 +1599,22 @@ EOF
                     # when even that is missing (seen on glm52-fp4-1k1k-2p1d-ep16,
                     # which had all seven results at 0.945), a passed accuracy
                     # gate with results on disk is the stronger evidence.
+                    #
+                    # "Some results plus a passed gate" is not enough. A leg
+                    # whose decode ran at ~9 tok/s got through conc=1, 8 and 16
+                    # of seven points before the job ended, and this branch
+                    # called it green: the gate had passed and raw files
+                    # existed. Require every expected concurrency point, so a
+                    # sweep that stopped early is red rather than a green row
+                    # standing on someone else's numbers.
+                    WANT=0; HAVE=0
+                    for _c in ${CONCS//,/ }; do
+                        WANT=$((WANT + 1))
+                        [[ -f "$WORKDIR/raw_conc${_c}.json" ]] && HAVE=$((HAVE + 1))
+                    done
                     if [[ "$(cat "$WORKDIR/bench_exit" 2>/dev/null)" == "0" ]]; then
                         echo 0 > "$WORKDIR/drive_exit"
-                    elif compgen -G "$WORKDIR/raw_conc*.json" >/dev/null 2>&1 \
+                    elif [[ "$HAVE" -eq "$WANT" ]] \
                          && awk '/\[gsm8k\] accuracy=/{
                                    match($0,/accuracy=([0-9.]+)/,a)
                                    match($0,/threshold=([0-9.]+)/,t)
@@ -1610,6 +1623,7 @@ EOF
                                 "$WORKDIR/bench.log" 2>/dev/null; then
                         echo 0 > "$WORKDIR/drive_exit"
                     else
+                        echo "[launch] incomplete sweep: $HAVE/$WANT concurrency points" >&2
                         echo 1 > "$WORKDIR/drive_exit"
                     fi
                 fi
