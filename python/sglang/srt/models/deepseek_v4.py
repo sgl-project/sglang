@@ -3162,7 +3162,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x.is_cuda
                 and get_platform().is_blackwell
                 and (
-                    0 < x.shape[0] <= 8
+                    0 < x.shape[0] <= 96
                     or (
                         self.config.model_type == "deepseek_v41"
                         and 4096 <= x.shape[0] <= 65536
