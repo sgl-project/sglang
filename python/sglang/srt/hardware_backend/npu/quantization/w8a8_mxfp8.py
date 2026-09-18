@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch.nn import Module
@@ -7,15 +7,19 @@ _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
 
 
 def process_npu_arch35_mxfp8_linear_weights(
-    layer: Module, weight_block_size: List[int], scale_fmt: str
+    layer: Module, weight_block_size: List[int], scale_fmt: Optional[str]
 ) -> None:
-    """Convert UE8M0 block-FP8 weights to the NPU arch35 MXFP8 layout."""
-    if scale_fmt != "ue8m0":
-        raise ValueError(
-            "NPU arch35 MXFP8 weight loading requires scale_fmt='ue8m0', "
-            f"got {scale_fmt!r}."
-        )
-    _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+    """Convert a linear layer's weights to the NPU arch35 MXFP8 layout.
+
+    UE8M0 checkpoints (scales already powers of two) only need re-layout:
+    the 128-group scale can be duplicated to its 1x32 sub-groups exactly.
+    Plain block-FP8 checkpoints carry arbitrary fp32 scales, so the payload
+    must be dequantized and requantized via npu_dynamic_mx_quant instead.
+    """
+    if scale_fmt == "ue8m0":
+        _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+    else:
+        _layout_npu_arch35_e4m3_weights(layer, weight_block_size)
 
 
 def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
@@ -39,10 +43,10 @@ def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
     return sign * mag
 
 
-def requant_npu_arch35_block_fp8_to_mxfp8(
+def _layout_npu_arch35_e4m3_weights(
     layer: Module, weight_block_size: List[int]
 ) -> None:
-    """Requantize a plain block-FP8 weight (fp32 block scales) to MXFP8 layout.
+    """Requantize an e4m3 block-FP8 weight (fp32 block scales) to MXFP8 layout.
 
     Dequantizes the fp8 payload with the expanded block scales to BF16, then
     requantizes to MXFP8 (fp8 payload + 1x32 UE8M0 scale via
