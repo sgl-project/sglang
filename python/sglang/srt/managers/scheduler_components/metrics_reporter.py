@@ -402,6 +402,57 @@ class SchedulerMetricsReporter:
             var_decode_kv_tokens=decode_kv.variance(),
         )
 
+    def _update_queue_depths(self) -> None:
+        """Split waiting requests into prefill-waiting vs decode-waiting.
+
+        Non-PD: the single waiting_queue holds both never-prefilled requests and
+        requests retracted from decode under KV pressure (is_retracted=True);
+        the latter are waiting to resume decoding, not for a first prefill.
+        PD: the same contract applied to the engine's own queues. On a prefill
+        engine, bootstrap and waiting requests have not been prefilled yet,
+        while the inflight queue holds requests whose prefill already
+        completed and that are only polling their KV transfer, so it is
+        excluded. On a decode engine, only retracted requests count: the
+        retracted queue, requests held for rebootstrap, and rebootstraps
+        still working through prealloc/transfer (DecodeRequest.is_rebootstrap).
+        resume_retracted_reqs clears is_retracted when it restores a request
+        into the waiting queue, so restored requests are matched there by
+        their persistent retracted_stain / pd_rebootstrap_in_progress markers.
+        Ordinary first-decode handoffs in those queues are not pressure and
+        are excluded.
+        """
+        scheduler = self.scheduler
+        mode = scheduler.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            prefill_depth = (
+                len(scheduler.disagg_prefill_bootstrap_queue.queue)
+                + len(scheduler.waiting_queue)
+            )
+            decode_depth = 0
+        elif mode == DisaggregationMode.DECODE:
+            prefill_depth = 0
+            prealloc_queue = scheduler.disagg_decode_prealloc_queue
+            transfer_queue = scheduler.disagg_decode_transfer_queue
+            decode_depth = (
+                len(prealloc_queue.retracted_queue)
+                + len(prealloc_queue.held_rebootstrap_reqs)
+                + sum(1 for req in prealloc_queue.queue if req.is_rebootstrap)
+                + sum(1 for req in transfer_queue.queue if req.is_rebootstrap)
+                + sum(
+                    1
+                    for req in scheduler.waiting_queue
+                    if req.retracted_stain
+                    or getattr(req, "pd_rebootstrap_in_progress", False)
+                )
+            )
+        else:
+            queue = self.stats.num_queue_reqs
+            decode_depth = queue.num_retracted
+            prefill_depth = queue.total - decode_depth
+        self.stats.prefill_queue_depth = prefill_depth
+        self.stats.decode_queue_depth = decode_depth
+        self.stats.num_prefill_inflight_reqs = int(scheduler.chunked_req is not None)
+
     def _build_queued_request_metrics(self):
         from sglang.srt.observability.forward_pass_metrics import (
             QueuedRequestMetrics,
@@ -786,8 +837,9 @@ class SchedulerMetricsReporter:
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
+                self.scheduler.waiting_queue, priority_enabled, count_retracted=True
             )
+            self._update_queue_depths()
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
@@ -1004,8 +1056,9 @@ class SchedulerMetricsReporter:
                 batch.reqs, priority_enabled
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
+                self.scheduler.waiting_queue, priority_enabled, count_retracted=True
             )
+            self._update_queue_depths()
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
@@ -1349,8 +1402,9 @@ class SchedulerMetricsReporter:
         )
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(
-            self.scheduler.waiting_queue, priority_enabled
+            self.scheduler.waiting_queue, priority_enabled, count_retracted=True
         )
+        self._update_queue_depths()
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
