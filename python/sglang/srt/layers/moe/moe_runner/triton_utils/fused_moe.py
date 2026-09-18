@@ -813,8 +813,11 @@ def _fused_moe_kernel_sequence(
     )
 
     # LoRA hooks force the second kernel to write to intermediate_cache3 so
-    # hooks.after_down can inspect/modify it before reduction.
-    _use_intermediate = not no_combine and (topk != 1 or hooks)
+    # hooks.after_down can inspect/modify it before reduction. Non-unit routed
+    # scaling also needs the intermediate because the reduction applies it.
+    _use_intermediate = not no_combine and (
+        topk != 1 or hooks or routed_scaling_factor not in (None, 1.0)
+    )
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:

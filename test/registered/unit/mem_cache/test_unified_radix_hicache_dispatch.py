@@ -48,6 +48,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         )
 
         kvcache = _mock_kvcache(DeepSeekV4TokenToKVPool)
+        kvcache.swa_kv_pool = MagicMock()
         strategy = _select_strategy(kvcache, {FULL, SWA})
         self.assertIsInstance(strategy, _DeepSeekV4Strategy)
 
@@ -141,6 +142,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         for cls in (SWAKVPool, DeepSeekV4TokenToKVPool):
             kvcache = _mock_kvcache(cls)
+            kvcache.swa_kv_pool = MagicMock()
             with self.assertRaises(AssertionError) as cm:
                 _select_strategy(kvcache, {FULL})
             self.assertIn("No matching HiCache strategy", str(cm.exception))

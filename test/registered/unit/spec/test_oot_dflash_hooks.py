@@ -23,8 +23,9 @@ def _platform(
     platform.is_out_of_tree.return_value = True
     platform.supports_speculative_algorithm.return_value = True
     platform.supports_speculative_draft_attention_backend.side_effect = (
-        lambda algorithm, backend: algorithm == "DFLASH"
-        and backend in supported_backends
+        lambda algorithm, backend: (
+            algorithm == "DFLASH" and backend in supported_backends
+        )
     )
     platform.get_default_speculative_draft_attention_backend.return_value = (
         default_backend
