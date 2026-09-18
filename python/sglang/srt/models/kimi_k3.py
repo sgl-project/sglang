@@ -3253,6 +3253,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         # Keyed by the `experts.<id>.<proj>.` fragment (see _EXPERT_WEIGHT_NAME).
         expert_params_lookup = {entry[1]: entry for entry in expert_params_mapping}
+        assert all(
+            _EXPERT_WEIGHT_NAME.fullmatch(key) for key in expert_params_lookup
+        ), "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
