@@ -270,6 +270,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "read_failed": 0,
             "l3_read_failed_tokens": 0,
             "l3_actual_read_tokens": 0,
+            "timeout": 0,
         }
 
         # Cumulative transfer-outcome counters for the non-prefetch tiers
@@ -1859,6 +1860,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     reason="timeout",
                     rid=operation.request_id,
                 )
+                stats = self._prefetch_outcome_stats
+                stats["timeout"] += 1
             return is_timeout
         else:
             return True

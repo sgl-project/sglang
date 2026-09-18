@@ -2034,6 +2034,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "read_failed",
             "l3_read_failed_tokens",
             "l3_actual_read_tokens",
+            "timeout",
         ):
             current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
             previous = self._last_prefetch_outcome.get(outcome, 0.0)
