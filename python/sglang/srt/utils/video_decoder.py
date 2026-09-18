@@ -46,16 +46,22 @@ class VideoDecoderWrapper:
     All frames are returned in NHWC uint8 numpy format for consistency.
     """
 
-    def __init__(self, source, device: str = "cpu", num_decode_threads: int = 0):
+    def __init__(
+        self, source, device: str = "cpu", num_decode_threads: int = 0, pin: bool = True
+    ):
         """source: file path (str) or video bytes.
         device: "cpu" or "cuda". GPU decoding only supported with torchcodec.
         num_decode_threads: number of parallel decoder instances for frame
             extraction (torchcodec only). 0 = auto (capped at 16),
             1 = single decoder. Set > 1 to split frame indices across
             multiple decoders in parallel threads.
+        pin: pin decoded CPU frames in get_frames_as_tensor. Set False when the
+            calling process should not initialize a CUDA context (pin_memory
+            creates one even for CPU tensors).
         """
         self._source = source
         self._num_decode_threads = num_decode_threads
+        self._pin = pin
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
@@ -129,8 +135,19 @@ class VideoDecoderWrapper:
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
+    def _maybe_pin(self, tensor):
+        """Return tensor pinned, unless pinning would create a CUDA context.
+
+        pin_memory() on a CPU tensor initializes a CUDA context in this
+        process. Callers that must stay off the GPU (CPU feature transport)
+        construct the wrapper with pin=False.
+        """
+        if not self._pin or _is_cpu_engine() or tensor.is_cuda:
+            return tensor
+        return tensor.pin_memory()
+
     def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+        """Return frames at given indices as a torch tensor (NHWC, uint8, optionally pinned)."""
         import torch
 
         if (
@@ -147,13 +164,10 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            if _is_cpu_engine():
-                return batch.data
-            return batch.data if batch.data.is_cuda else batch.data.pin_memory()
+            return self._maybe_pin(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            output = torch.from_numpy(arr)
-            return output if _is_cpu_engine() else output.pin_memory()
+            return self._maybe_pin(torch.from_numpy(arr))
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -186,10 +200,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        output = torch.cat(results, dim=0)
-        if _is_cpu_engine():
-            return output
-        return output if output.is_cuda else output.pin_memory()
+        return self._maybe_pin(torch.cat(results, dim=0))
 
     @property
     def source_bytes(self) -> bytes | None:

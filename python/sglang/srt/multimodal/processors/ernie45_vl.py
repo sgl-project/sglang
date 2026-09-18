@@ -18,6 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    feature_transport_uses_gpu,
 )
 from sglang.srt.utils import is_npu, logger
 
@@ -180,8 +181,13 @@ async def preprocess_video(
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
+    # pin_memory() initializes a CUDA context in this worker; with CPU
+    # feature transport the worker must stay off the base GPU.
+    gpu_transport = feature_transport_uses_gpu()
     video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
+    video = torch.from_numpy(video_np)
+    if gpu_transport:
+        video = video.pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = VIDEO_MIN_PIXELS
@@ -205,7 +211,8 @@ async def preprocess_video(
     )
 
     video = video.permute(0, 2, 3, 1)
-    video = video.pin_memory()
+    if gpu_transport:
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,

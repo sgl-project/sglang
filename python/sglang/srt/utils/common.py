@@ -1978,7 +1978,18 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
     raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 
-def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+def load_video(
+    video_file: Union[str, bytes, VideoData],
+    use_gpu: bool = True,
+    pin: bool = True,
+):
+    """Load a video source into a VideoDecoderWrapper.
+
+    use_gpu: decode on CUDA (torchcodec NVDEC) when True.
+    pin: pin decoded CPU frames. Set False when the calling process must not
+        initialize a CUDA context (pin_memory creates one even for CPU
+        tensors, e.g. tokenizer workers under CPU feature transport).
+    """
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
@@ -1992,7 +2003,7 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
 
     device = "cuda" if use_gpu else "cpu"
     try:
-        return VideoDecoderWrapper(source, device=device)
+        return VideoDecoderWrapper(source, device=device, pin=pin)
     except (ImportError, MemoryError):
         raise  # missing backend / OOM is not a bad payload
     except Exception as e:
