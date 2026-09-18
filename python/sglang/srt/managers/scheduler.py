@@ -3333,6 +3333,28 @@ class Scheduler(
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
+    def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
+        """Clear session/mm state of a request dropped before it was scheduled.
+
+        A streaming session's inflight marker only clears for the owning turn.
+        Session requests share historical multimodal inputs with their prior
+        request; the session owns and releases those features when it closes.
+        """
+        if getattr(req, "session", None) is not None:
+            if (
+                not getattr(req.session, "req_nodes", True)
+                and getattr(req, "multimodal_inputs", None) is not None
+            ):
+                # A first turn that never committed owns its multimodal inputs;
+                # session close only scans req_nodes, so nothing else would
+                # ever release these features.
+                req.multimodal_inputs.release_features()
+                req.multimodal_inputs = None
+            req.session.abort_req(req.rid)
+        elif req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs = None
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -5416,6 +5438,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            prepare_abort(req, "Aborted")
+            self._release_dropped_waiting_req_mm_inputs(req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
