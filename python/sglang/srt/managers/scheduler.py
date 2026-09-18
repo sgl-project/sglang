@@ -5544,6 +5544,8 @@ class Scheduler(
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                        prepare_abort(decode_req, "Aborted")
+                        self._release_dropped_waiting_req_mm_inputs(decode_req)
                         retraction_discard(
                             decode_req,
                             self.tree_cache,
