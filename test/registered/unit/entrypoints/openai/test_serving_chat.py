@@ -2933,6 +2933,99 @@ class ServingChatTestCase(unittest.TestCase):
             chunks.append(chunk)
         return chunks
 
+    def test_logprobs_preserve_duplicate_decoded_candidates(self):
+        """Distinct tokens that decode to the same text must all survive."""
+        selected = [(-0.1, 10, " �"), (-0.3, 12, "!")]
+        candidates = [
+            [(-0.1, 10, " �"), (-0.2, 11, " �")],
+            [(-0.3, 12, "!"), (-0.4, 13, "?")],
+        ]
+        expected_tokens = [(-0.1, " �"), (-0.3, "!")]
+        expected_tops = [
+            [(-0.1, " �"), (-0.2, " �")],
+            [(-0.3, "!"), (-0.4, "?")],
+        ]
+
+        json_result = self.chat._process_response_logprobs(
+            {
+                "meta_info": {
+                    "output_token_logprobs": selected,
+                    "output_top_logprobs": candidates,
+                }
+            }
+        )
+        self.assertEqual(
+            [(item.logprob, item.token) for item in json_result.content],
+            expected_tokens,
+        )
+        self.assertEqual(
+            [
+                [(item.logprob, item.token) for item in record.top_logprobs]
+                for record in json_result.content
+            ],
+            expected_tops,
+        )
+
+        for missing in (None, [], [None, []]):
+            empty_tops = self.chat._process_response_logprobs(
+                {
+                    "meta_info": {
+                        "output_token_logprobs": selected,
+                        "output_top_logprobs": missing,
+                    }
+                }
+            )
+            self.assertEqual(
+                [record.top_logprobs for record in empty_tops.content],
+                [[], []],
+            )
+
+        with get_context().override_server_args(incremental_streaming_output=True):
+            incremental = self.chat._process_streaming_logprobs(
+                {
+                    "meta_info": {
+                        "output_token_logprobs": selected,
+                        "output_top_logprobs": candidates,
+                    }
+                },
+                0,
+                2,
+            )
+        self.assertEqual(
+            [(item.logprob, item.token) for item in incremental.content],
+            expected_tokens,
+        )
+        self.assertEqual(
+            [
+                [(item.logprob, item.token) for item in record.top_logprobs]
+                for record in incremental.content
+            ],
+            expected_tops,
+        )
+
+        with get_context().override_server_args(incremental_streaming_output=False):
+            cumulative = self.chat._process_streaming_logprobs(
+                {
+                    "meta_info": {
+                        "output_token_logprobs": [(-1.0, 1, "prefix")] + selected,
+                        "output_top_logprobs": [[(-1.0, 1, "prefix")]] + candidates,
+                    }
+                },
+                1,
+                3,
+            )
+        self.assertEqual(
+            [(item.logprob, item.token) for item in cumulative.content],
+            expected_tokens,
+        )
+        self.assertEqual(
+            [
+                [(item.logprob, item.token) for item in record.top_logprobs]
+                for record in cumulative.content
+            ],
+            expected_tops,
+        )
+
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
         self.chat.reasoning_parser = "qwen3"
@@ -3034,63 +3127,108 @@ class ServingChatTestCase(unittest.TestCase):
             "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
         )
 
-    def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
-        """With no parser active, an empty-delta step must not emit a standalone
-        empty-delta logprobs chunk — clients expect each chunk to carry real
-        content/reasoning/tool_calls or a finish_reason."""
+    def test_streaming_logprobs_emitted_on_empty_text_delta(self):
+        """UTF-8 fragments and EOS must emit logprob records even with no text."""
         self.chat.reasoning_parser = None
         self.chat.tool_call_parser = None
-
-        async def _mock_generate():
-            yield {
-                "text": "",
-                "meta_info": {
-                    "id": "chatcmpl-empty",
-                    "prompt_tokens": 5,
-                    "completion_tokens": 1,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [(0.5, 7, "")],
-                    "output_top_logprobs": [],
-                    "output_token_logprobs_length": 1,
-                },
-                "index": 0,
-            }
-
-        self.tm.generate_request.return_value = _mock_generate()
-
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            stream=True,
-            logprobs=True,
-        )
-
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock:
-            conv_ins = Mock()
-            conv_ins.get_prompt.return_value = "Test prompt"
-            conv_mock.return_value = conv_ins
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
-            )
-            chunks = self._run_chat_stream(adapted_request, req)
-
-        parsed = self._parse_chunks(chunks)
-        empty_logprob_chunks = [
-            c
-            for c in parsed
-            if c["choices"][0].get("logprobs") is not None
-            and not c["choices"][0]["delta"].get("content")
-            and not c["choices"][0]["delta"].get("reasoning_content")
-            and not c["choices"][0]["delta"].get("tool_calls")
-            and not c["choices"][0].get("finish_reason")
+        selected = [
+            (-0.1, 1, "Hello"),
+            (-0.2, 2, " �"),
+            (-0.3, 3, "�"),
+            (-0.4, 4, "�"),
+            (-0.5, 5, "!"),
+            (-0.6, 6, ""),
         ]
-        self.assertFalse(
-            empty_logprob_chunks,
-            "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
-        )
+        steps = [("Hello", 1), ("Hello", 2), ("Hello 🌍!", 5), ("Hello 🌍!", 6)]
+
+        for incremental in (False, True):
+            for logprobs in (False, True):
+                with self.subTest(incremental=incremental, logprobs=logprobs):
+
+                    async def _mock_generate():
+                        previous_text, previous_end = "", 0
+                        for text, end in steps:
+                            start = previous_end if incremental else 0
+                            yield {
+                                "text": (
+                                    text[len(previous_text) :] if incremental else text
+                                ),
+                                "meta_info": {
+                                    "id": "chatcmpl-empty",
+                                    "prompt_tokens": 5,
+                                    "completion_tokens": end,
+                                    "cached_tokens": 0,
+                                    "finish_reason": (
+                                        {"type": "stop", "matched": None}
+                                        if end == len(selected)
+                                        else None
+                                    ),
+                                    "output_token_logprobs": selected[start:end],
+                                    "output_top_logprobs": [
+                                        [token] for token in selected[start:end]
+                                    ],
+                                    "output_token_logprobs_length": end,
+                                },
+                                "index": 0,
+                            }
+                            previous_text, previous_end = text, end
+
+                    self.tm.generate_request.return_value = _mock_generate()
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stream=True,
+                        logprobs=logprobs,
+                    )
+                    with (
+                        get_context().override_server_args(
+                            incremental_streaming_output=incremental
+                        ),
+                        patch(
+                            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                        ) as conv_mock,
+                    ):
+                        conv_mock.return_value.get_prompt.return_value = "Test prompt"
+                        adapted_request, _ = self.chat._convert_to_internal_request(
+                            req, self.fastapi_request
+                        )
+                        chunks = self._run_chat_stream(adapted_request, req)
+
+                    choices = [c["choices"][0] for c in self._parse_chunks(chunks)]
+                    self.assertEqual(
+                        "".join(c["delta"].get("content") or "" for c in choices),
+                        "Hello 🌍!",
+                    )
+                    records = [
+                        record
+                        for choice in choices
+                        for record in (choice.get("logprobs") or {}).get("content", [])
+                    ]
+                    expected = (
+                        [(lp, token) for lp, _, token in selected] if logprobs else []
+                    )
+                    self.assertEqual(
+                        [(r["logprob"], r["token"]) for r in records], expected
+                    )
+                    self.assertEqual(
+                        [
+                            [(t["logprob"], t["token"]) for t in r["top_logprobs"]]
+                            for r in records
+                        ],
+                        [[item] for item in expected],
+                    )
+                    empty_chunks = [
+                        c
+                        for c in choices
+                        if c.get("logprobs") is not None
+                        and not c["delta"].get("content")
+                    ]
+                    self.assertEqual(len(empty_chunks), 2 if logprobs else 0)
+                    self.assertEqual(
+                        [c["finish_reason"] for c in choices if c.get("finish_reason")],
+                        ["stop"],
+                    )
+                    self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):
         req = ChatCompletionRequest(

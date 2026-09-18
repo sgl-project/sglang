@@ -80,7 +80,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import iter_token_logprob_records
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -103,35 +103,29 @@ class _MediaInputValidationError(ValueError):
 
 
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
-    """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
-    covering every generated token."""
-    decoded = to_openai_style_logprobs(
-        output_token_logprobs=meta_info.get("output_token_logprobs"),
-        output_top_logprobs=meta_info.get("output_top_logprobs"),
-    )
-    top_lists = decoded.top_logprobs or []
-    logprobs: list[Logprob] = []
-    for index, (token, logprob) in enumerate(
-        zip(decoded.tokens, decoded.token_logprobs)
-    ):
-        top_entry = top_lists[index] if index < len(top_lists) else None
-        top_logprobs = [
-            LogprobTopLogprob(
-                token=top_token,
-                logprob=top_logprob,
-                bytes=list(top_token.encode("utf-8")),
-            )
-            for top_token, top_logprob in (top_entry or {}).items()
-        ]
-        logprobs.append(
-            Logprob(
-                token=token,
-                logprob=logprob,
-                bytes=list(token.encode("utf-8")),
-                top_logprobs=top_logprobs,
-            )
+    """Reshape engine logprobs into the Responses logprob type.
+
+    Candidates stay in engine order, including identical decoded texts.
+    """
+    return [
+        Logprob(
+            token=token,
+            logprob=logprob,
+            bytes=list(token.encode("utf-8")),
+            top_logprobs=[
+                LogprobTopLogprob(
+                    token=top_token,
+                    logprob=top_logprob,
+                    bytes=list(top_token.encode("utf-8")),
+                )
+                for top_token, top_logprob in candidates
+            ],
         )
-    return logprobs
+        for token, logprob, candidates in iter_token_logprob_records(
+            meta_info.get("output_token_logprobs"),
+            meta_info.get("output_top_logprobs"),
+        )
+    ]
 
 
 def _should_emit_normal_text_as_message(
