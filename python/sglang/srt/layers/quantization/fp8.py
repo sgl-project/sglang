@@ -421,10 +421,10 @@ class Fp8Config(QuantizationConfig):
                 and self.is_dsv4_fp4_experts
             ):
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
-                    NPUW4A4Fp4MoEMethod,
+                    NPUW4A8MXFP4FusedMoEMethod,
                 )
 
-                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
+                return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -1407,7 +1407,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
-                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+                fp4_scale_dtype = (
+                    torch.float8_e8m0fnu if _use_aiter or is_xpu() else torch.float32
+                )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -1566,9 +1568,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    def _dequantize_aiter_fp4_experts(self, layer: Module) -> None:
+        """Convert packed FP4 expert weights to block-FP8 in place."""
+        for weight_param, scale_param in [
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        ]:
+            num_experts = weight_param.shape[0]
+            new_weights = []
+            new_scales = []
+            for e in range(num_experts):
+                w, s = cast_e2m1fn_to_e4m3fn(weight_param.data[e], scale_param.data[e])
+                new_weights.append(w)
+                new_scales.append(s)
+            weight_param.data = torch.stack(new_weights)
+            scale_param.data = torch.stack(new_scales).float()
+            scale_param.format_ue8m0 = False
+        self.is_fp4_expert = False
+        logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        # AMD FP4 experts: use aiter's native MXFP4 MoE path
-        if _use_aiter and self.is_fp4_expert:
+        # AMD FP4 experts: use aiter's native MXFP4 MoE path.
+        # Skipped when dequant_fp4_to_fp8 is requested: this branch returns
+        # unconditionally, so without the extra check SGLANG_DSV4_FP4_DEQUANT=1
+        # is silently a no-op for routed experts on every AITER deployment.
+        if _use_aiter and self.is_fp4_expert and not self.dequant_fp4_to_fp8:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
@@ -1699,6 +1723,50 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
+            return
+
+        # ROCm AITER: bypass the native FP4 early return when DSV4 dequant is
+        # requested, then use the standard block-FP8 MoE path.
+        if self.is_fp4_expert and self.dequant_fp4_to_fp8 and _use_aiter:
+            self._dequantize_aiter_fp4_experts(layer)
+            self.weight_block_size = [128, 128]
+
+            # gfx942/gfx950 native FP8 is e4m3fnuz, not e4m3fn.
+            if _is_fp8_fnuz:
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_input_scale = None
+
+            # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+            # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+            runner_is_aiter = (
+                getattr(self, "runner", None) is not None
+                and self.runner.runner_backend.is_aiter()
+            )
+            if _use_aiter and runner_is_aiter:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
             return
 
         if self.convert_mxfp8_to_block:
@@ -2356,10 +2424,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
         num_experts = int(layer.num_local_experts)
         device = layer.w13_weight.device
+        clamp_limit = (
+            self.moe_runner_config.gemm1_clamp_limit
+            if self.moe_runner_config.gemm1_clamp_limit is not None
+            else self.moe_runner_config.swiglu_limit
+        )
         for name, value in (
             ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
             ("gemm1_beta", self.moe_runner_config.gemm1_beta),
-            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+            ("gemm1_clamp_limit", clamp_limit),
         ):
             tensor = (
                 None
