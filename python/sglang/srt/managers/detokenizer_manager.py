@@ -26,6 +26,10 @@ import setproctitle
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    decode_beam_search_output,
+    is_beam_search_batch,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -39,6 +43,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.runtime_context import (
+    get_device,
+    get_model,
+    get_observability,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -116,22 +127,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
-        if server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
     def init_tokenizer(self, server_args: ServerArgs):
-        if server_args.skip_tokenizer_init:
+        if get_serving().skip_tokenizer_init:
             self.tokenizer = None
             self.vocab_size = None
         else:
             self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                tokenizer_backend=server_args.tokenizer_backend,
+                get_serving().tokenizer_path,
+                tokenizer_mode=get_serving().tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend=get_serving().tokenizer_backend,
             )
             try:
                 self.vocab_size = len(self.tokenizer)
@@ -140,17 +151,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.disable_tokenizer_batch_decode = (
+            get_serving().disable_tokenizer_batch_decode
+        )
+        self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
 
     def init_request_dispatcher(self):
@@ -428,6 +441,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # Beam decoding is additive: a batch may mix beam leaders with normal
+        # requests, so every item still goes through the standard decode.
+        if is_beam_search_batch(recv_obj):
+            decode_beam_search_output(
+                recv_obj,
+                tokenizer=self.tokenizer,
+                disable_batch_decode=self.disable_tokenizer_batch_decode,
+                trim_matched_stop=self.trim_matched_stop,
+            )
         # If handling idle batch, set output_strs to [].
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
@@ -481,7 +503,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
+            weight_versions=recv_obj.weight_versions,
             token_steps=recv_obj.token_steps,
+            beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
@@ -520,12 +544,13 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+    publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
 
     manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
-        if server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             manager.event_loop()
         else:
             manager.multi_http_worker_event_loop()

@@ -122,6 +122,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
+    def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
+        device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
+        if device is None:
+            device = torch.device("cpu")
+        return torch.arange(
+            self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
+        )
+
     def shard_local_tokens(self, input_: Any) -> Any:
         return self._interleave_shard(input_)
 
@@ -132,7 +140,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import (
-            dsa_cp_round_robin_split_q_seqs_kernel,
+            dsa_cp_interleave_q_seqs_kernel,
         )
 
         cp_size = self.cp_size
@@ -154,7 +162,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         bs_idx = torch.empty(
             (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
         )
-        dsa_cp_round_robin_split_q_seqs_kernel[(1,)](
+        dsa_cp_interleave_q_seqs_kernel[(1,)](
             extend_seqs, q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
         )
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
@@ -204,6 +212,18 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         ):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
         attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
+
+        # Equal per-rank lengths: one interleave copy restores the original
+        # token order; cheaper than the index_select fallback below.
+        actual = metadata.per_rank_actual_token
+        if total_tokens == self.cp_size * physical_rank_len and all(
+            int(n) == physical_rank_len for n in actual
+        ):
+            return (
+                gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
+                .transpose(0, 1)
+                .reshape(total_tokens, *x.shape[1:])
+            )
 
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (

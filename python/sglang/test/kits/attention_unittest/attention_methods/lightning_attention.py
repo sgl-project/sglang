@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
 )
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -326,6 +326,7 @@ class MockLightningModelRunner(ModelRunner):
             enable_alt_stream=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -581,7 +582,9 @@ def build_lightning_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     backend = LightningAttentionBackend(runner)
     actual_module = ProjectedLightningAttention(
         num_heads=case.num_heads,
@@ -1052,7 +1055,7 @@ def make_lightning_token_padded_inputs(
 def lightning_attention_layers(fixture: LightningAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this list to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 

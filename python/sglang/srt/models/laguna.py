@@ -172,7 +172,8 @@ class LagunaMoE(nn.Module):
             layer_id=layer_id,
             renormalize=True,
             use_grouped_topk=False,
-            scoring_func="sigmoid",
+            # "sigmoid" (default) or "sqrtsoftplus"; the branch lives in topk.py.
+            scoring_func=config.moe_router_score_func,
             correction_bias=self.gate.e_score_correction_bias,
         )
 

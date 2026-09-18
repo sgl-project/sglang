@@ -7,10 +7,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use std::sync::Arc;
 
 use super::{AppState, openai_error, unix_seconds_u32};
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/models", get(available_models))
         .route("/v1/models/{model}", get(retrieve_model))
@@ -18,12 +19,12 @@ pub(super) fn routes() -> Router<AppState> {
 
 /// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
 /// no scheduler round-trip.
-async fn available_models(State(state): State<AppState>) -> Response {
+async fn available_models(State(state): State<Arc<AppState>>) -> Response {
     let base = model_card(&state);
     Json(serde_json::json!({ "object": "list", "data": [base] })).into_response()
 }
 
-async fn retrieve_model(State(state): State<AppState>, Path(model): Path<String>) -> Response {
+async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     if model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::NOT_FOUND,
