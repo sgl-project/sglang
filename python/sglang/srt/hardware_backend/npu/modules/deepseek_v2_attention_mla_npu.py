@@ -894,6 +894,7 @@ def _dcp_gather_extend_kv_npu(
     forward_batch: "ForwardBatch",
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
+    index_topk: Optional[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Materialise each request's FULL prefix+extend KV, for one layer.
 
@@ -964,7 +965,7 @@ def _dcp_gather_extend_kv_npu(
     """
     parallel = get_parallel()
     md = forward_batch.attn_dcp_metadata
-    packed_plan = dcp_packed_read_plan(forward_batch, m.indexer.index_topk)
+    packed_plan = dcp_packed_read_plan(forward_batch, index_topk)
     if packed_plan is not None:
         return _dcp_gather_extend_kv_packed_npu(
             m, forward_batch, k_nope, k_pe, packed_plan
@@ -1091,8 +1092,17 @@ def forward_dsa_core_npu(
         # backend attends over its own shard with a full-span page table -- in
         # bounds and wrong, which is why generation came out fluent and
         # unrelated to the prompt rather than crashing.
+        # From the TENSOR, never from m.indexer: the indexer is built only on
+        # the layers that compute a top-k (deepseek_v2.py:1828), so it is None
+        # on the 57 of 78 that reuse the previous layer's. topk_indices is a
+        # real tensor on every layer -- fresh or inherited -- and its width is
+        # the same index_topk either way.
         forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
-            m, forward_batch, k_nope, k_pe
+            m,
+            forward_batch,
+            k_nope,
+            k_pe,
+            topk_indices.shape[-1] if topk_indices is not None else None,
         )
 
     if is_dcp_mla_decode_phase(forward_batch):

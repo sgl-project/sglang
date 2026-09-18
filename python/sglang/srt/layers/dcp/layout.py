@@ -595,7 +595,9 @@ def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
     return prefix_len + 1 >= index_topk
 
 
-def dcp_packed_read_plan(forward_batch, index_topk: int) -> Optional[DcpPackedReadPlan]:
+def dcp_packed_read_plan(
+    forward_batch, index_topk: Optional[int]
+) -> Optional[DcpPackedReadPlan]:
     """This forward's packed-buffer plan, or None to keep the permuting path.
 
     Resolved once per forward and cached on the batch. It lives here, beside the
@@ -618,7 +620,16 @@ def dcp_packed_read_plan(forward_batch, index_topk: int) -> Optional[DcpPackedRe
     plan = None
     extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
     prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-    if not extend_lens or prefix_lens is None:
+    if index_topk is None:
+        # No top-k to measure, so the causal bound below cannot be checked.
+        # Refuse, and CACHE the refusal: a forward has to take one path the
+        # whole way down. Resolving later would leave earlier layers' top-k
+        # unremapped while later layers read a packed buffer.
+        print_info_once(
+            "DCP packed read is off: this forward reached the extend gather "
+            "with no top-k, so the causal bound cannot be checked"
+        )
+    elif not extend_lens or prefix_lens is None:
         print_info_once("DCP packed read is off: no CPU length metadata on this extend")
     elif len(extend_lens) != 1:
         # ONE REQUEST, for the layout reason in DcpPackedReadPlan: the

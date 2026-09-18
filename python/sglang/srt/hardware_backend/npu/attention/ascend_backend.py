@@ -1409,8 +1409,12 @@ class AscendAttnBackend(AttentionBackend):
                 key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
+                # topk_indices defaults to None on this signature, so guard it
+                # rather than deref it: an unresolved plan refuses, which is
+                # correct and slower, where an AttributeError is a dead server.
                 packed_plan = dcp_packed_read_plan(
-                    forward_batch, topk_indices.shape[-1]
+                    forward_batch,
+                    topk_indices.shape[-1] if topk_indices is not None else None,
                 )
                 if packed_plan is not None:
                     # C1. The buffer is the all-gather's own rank-major output,
