@@ -1,9 +1,10 @@
+import dataclasses
 import unittest
 
 import torch
 
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,10 +31,12 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
             vocab_size=4,
             has_custom_logit_processor=True,
             custom_params=[{"token_id": 1}, None, {"token_id": 2}],
-            custom_logit_processor={0: processor},
-            custom_logit_processor_rows={0: [0, 2]},
-            custom_logit_processor_batch_indices={
-                0: torch.tensor([0, 2], device="cuda")
+            custom_logit_processor={
+                0: ProcessorEntry(
+                    processor=processor,
+                    rows=[0, 2],
+                    indices=torch.tensor([0, 2], device="cuda"),
+                )
             },
             device="cuda",
         )
@@ -66,7 +69,9 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
             return logits.float() + 0.1
 
         info = self._make_info()
-        info.custom_logit_processor = {0: processor}
+        info.custom_logit_processor = {
+            0: dataclasses.replace(info.custom_logit_processor[0], processor=processor)
+        }
         for width in (1, 3):
             with self.subTest(width=width):
                 logits = torch.zeros(3 * width, 4, dtype=torch.bfloat16, device="cuda")
@@ -94,14 +99,12 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
                 self.assertNotIn("aten::nonzero", names)
                 self.assertNotIn("aten::_local_scalar_dense", names)
                 if keep == [2, 1]:
-                    rows = info.custom_logit_processor_rows[0]
-                    indices = info.custom_logit_processor_batch_indices[0]
-                    self.assertEqual(rows, [0])
-                    self.assertEqual(indices.tolist(), [0])
+                    entry = info.custom_logit_processor[0]
+                    self.assertEqual(entry.rows, [0])
+                    self.assertEqual(entry.indices.tolist(), [0])
                     self.assertEqual(info.custom_params, [{"token_id": 2}, None])
                     self.assertEqual(set(info.custom_logit_processor), {0})
                 else:
-                    self.assertEqual(info.custom_logit_processor_rows, {})
                     self.assertIsNone(info.custom_logit_processor)
                     self.assertFalse(info.has_custom_logit_processor)
 

@@ -949,18 +949,27 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
+    batch_size = len(sampling_batch_info)
+    assert len(sampling_batch_info.custom_params) == batch_size, (
+        f"The number of custom params ({len(sampling_batch_info.custom_params)}) does "
+        f"not match the number of sampling_batch_info ({batch_size})"
+    )
+
     token_offsets = (
         None
         if num_tokens_in_batch == 1
-        else torch.arange(num_tokens_in_batch, device=logits.device)
+        else torch.arange(num_tokens_in_batch, device=sampling_batch_info.device)
     )
-    batch_size = len(sampling_batch_info)
-    for key, processor in sampling_batch_info.custom_logit_processor.items():
-        rows = sampling_batch_info.custom_logit_processor_rows[key]
-        indices = sampling_batch_info.custom_logit_processor_batch_indices[key]
+    for entry in sampling_batch_info.custom_logit_processor.values():
+        rows, indices = entry.rows, entry.indices
+        assert len(rows) == indices.numel(), (
+            f"The number of cached processor rows ({len(rows)}) does not match the "
+            f"number of cached device indices ({indices.numel()})"
+        )
         assert not rows or rows[-1] < batch_size, (
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
+
         if token_offsets is not None:
             indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
         selected = logits.index_select(0, indices)
@@ -969,9 +978,9 @@ def apply_custom_logit_processor(
             for i in rows
             for _ in range(num_tokens_in_batch)
         ]
-        result = processor(selected, custom_params)
+        result = entry.processor(selected, custom_params)
         logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
-            f"Custom logit processor {processor.__class__.__name__} is applied."
+            f"Custom logit processor {entry.processor.__class__.__name__} is applied."
         )
