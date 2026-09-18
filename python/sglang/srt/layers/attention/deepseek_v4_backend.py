@@ -2997,7 +2997,9 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress_torch(layer, x, req, pos)
             return
 
-        from sglang.kernels.ops.attention.dsv4.pair_pool_decode import pair_pool_decode
+        from sglang.kernels.ops.attention.dsv4.c2_pair_pool_decode import (
+            pair_pool_decode,
+        )
 
         core = self.forward_metadata.core_metadata
         state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
