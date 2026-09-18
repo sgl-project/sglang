@@ -66,11 +66,13 @@ from sglang.srt.managers.scheduler_components.request_list import (
     assert_empty,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    release_local_serialized_tensors,
     unwrap_local_serialized_tensors,
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.utils.xpu_tensor_shm import release_unread
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -125,6 +127,14 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
     loaded_weights: bool = False
+
+
+def _release_unread_own_rank(serialized_named_tensors) -> None:
+    """Count this rank out of a payload it turns down before deserializing,
+    nested per-rank payloads included; see utils/xpu_tensor_shm."""
+    released = release_unread(serialized_named_tensors[get_parallel().tp_rank])
+    if isinstance(released, list):
+        release_local_serialized_tensors(released)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -287,6 +297,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
         if self._session is None:
+            _release_unread_own_rank(recv_req.serialized_named_tensors)
             return UpdateWeightsFromTensorReqOutput(
                 success=False,
                 message="update_weights_from_tensor must run between "
@@ -298,11 +309,15 @@ class SchedulerWeightUpdaterManager:
                 recv_req.serialized_named_tensors
             )
             runners = self._select_runners(recv_req.selector)
-            # A PP stage hosting none of the selected runners must not open the handles.
-            if runners and recv_req.load_format != "flattened_bucket":
-                named_tensors = unwrap_local_serialized_tensors(
-                    named_tensors, device=self.tp_worker.model_runner.device
-                )
+            if recv_req.load_format != "flattened_bucket":
+                if runners:
+                    named_tensors = unwrap_local_serialized_tensors(
+                        named_tensors, device=self.tp_worker.model_runner.device
+                    )
+                else:
+                    # A PP stage hosting none of the selected runners must not open
+                    # the handles, but still counts as done with them.
+                    release_local_serialized_tensors(named_tensors)
             success, message = True, "Success"
             for _, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_tensor(
