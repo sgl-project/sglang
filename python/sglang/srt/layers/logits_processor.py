@@ -26,7 +26,7 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -208,6 +208,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+
+    # Original flattened token indices when only a subset of hidden rows is captured.
+    hidden_states_token_indices: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -455,7 +458,16 @@ class LogitsProcessor(nn.Module):
             skip_entry_sync=True,
         )
 
-        self.input_logprob_processor = InputLogprobProcessor()
+        chunking_group = None
+        if (
+            self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            group = get_attn_tp_group() if self.use_attn_tp_group else get_tp_group()
+            chunking_group = group.cpu_group
+        self.input_logprob_processor = InputLogprobProcessor(
+            self.vocab_size, chunking_group=chunking_group
+        )
 
     def forward(
         self,

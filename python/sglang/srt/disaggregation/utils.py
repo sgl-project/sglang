@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_spec,
 )
 from sglang.srt.utils import is_npu
 
@@ -1672,6 +1673,29 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+    """Describe the positional transfer layout without pool capacities or pointers."""
+    ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return None
+
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if kv_args.state_types.count(StateType.SWA) != 2:
+        raise RuntimeError(
+            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+        )
+
+    return {
+        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+        "compression_ratios": list(ratios),
+        "kv_layer_ids": list(kv_args.kv_layer_ids),
+        "kv_item_lens": list(kv_args.kv_item_lens),
+        "state_types": [state_type.value for state_type in kv_args.state_types],
+        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
+    }
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
