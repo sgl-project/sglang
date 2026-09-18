@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from urllib.parse import quote
 
 import torch
 
@@ -24,23 +26,133 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
+_SCALE_OPERATION_KEY_PREFIX = "elastic_ep/scale_operation"
 
 
-def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+@dataclass(frozen=True)
+class ScaleOperation:
+    runtime_instance_id: str
+    operation_id: str
+    rank_offset: int
+    target_ep_size: int
+    expected_joining_member_ids: List[str]
+
+
+@dataclass(frozen=True)
+class ScaleCohort:
+    runtime_instance_id: str
+    operation_id: str
+    rank_offset: int
+    target_ep_size: int
+    ready_rank_count: int
+    member_id: Optional[str]
+
+
+def _store_json(key: str, value: dict) -> None:
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
-    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+    store.set(key, json.dumps(value, sort_keys=True).encode())
 
 
-def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+def _load_store_json(key: str) -> Optional[dict]:
     store = get_global_tcp_store()
-    if store is None:
+    if store is None or not store.check([key]):
         return None
-    key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
-    if not store.check([key]):
-        return None
-    return int(store.get(key).decode())
+    return json.loads(store.get(key).decode())
+
+
+def _scale_cohort_key(
+    rank_offset: int, runtime_instance_id: str, operation_id: str
+) -> str:
+    """Return an operation-scoped key for one joining cohort.
+
+    Operation IDs are supplied by callers, so quote both identity components
+    before embedding them in the TCPStore key namespace.
+    """
+    runtime_key = quote(runtime_instance_id, safe="")
+    operation_key = quote(operation_id, safe="")
+    return f"{_SCALE_COHORT_KEY_PREFIX}/{runtime_key}/{operation_key}/{rank_offset}"
+
+
+def register_scale_operation(
+    rank_offset: int,
+    target_ep_size: int,
+    runtime_instance_id: str,
+    operation_id: str,
+    expected_joining_member_ids: Optional[List[str]] = None,
+) -> None:
+    _store_json(
+        f"{_SCALE_OPERATION_KEY_PREFIX}/{rank_offset}",
+        {
+            "runtime_instance_id": runtime_instance_id,
+            "operation_id": operation_id,
+            "rank_offset": rank_offset,
+            "target_ep_size": target_ep_size,
+            "expected_joining_member_ids": expected_joining_member_ids or [],
+        },
+    )
+
+
+def get_scale_operation(rank_offset: int) -> Optional[ScaleOperation]:
+    value = _load_store_json(f"{_SCALE_OPERATION_KEY_PREFIX}/{rank_offset}")
+    return ScaleOperation(**value) if value is not None else None
+
+
+def register_scale_cohort(
+    rank_offset: int,
+    target_ep_size: int,
+    timeout: float,
+    member_id: Optional[str] = None,
+) -> ScaleCohort:
+    deadline = time.monotonic() + timeout
+    operation = get_scale_operation(rank_offset)
+    while operation is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+        operation = get_scale_operation(rank_offset)
+    if operation is None:
+        raise TimeoutError(
+            "Timed out waiting for an Elastic EP scale operation assigning "
+            f"rank offset {rank_offset}."
+        )
+    if operation.target_ep_size != target_ep_size:
+        raise RuntimeError(
+            f"Joining cohort target {target_ep_size} does not match operation "
+            f"target {operation.target_ep_size}."
+        )
+    if operation.expected_joining_member_ids and (
+        member_id not in operation.expected_joining_member_ids
+    ):
+        raise RuntimeError(
+            f"Joining member {member_id!r} is not authorized for operation "
+            f"{operation.operation_id}."
+        )
+    cohort = ScaleCohort(
+        runtime_instance_id=operation.runtime_instance_id,
+        operation_id=operation.operation_id,
+        rank_offset=rank_offset,
+        target_ep_size=target_ep_size,
+        ready_rank_count=target_ep_size - rank_offset,
+        member_id=member_id,
+    )
+    _store_json(
+        _scale_cohort_key(
+            rank_offset,
+            operation.runtime_instance_id,
+            operation.operation_id,
+        ),
+        cohort.__dict__,
+    )
+    return cohort
+
+
+def get_scale_cohort(
+    rank_offset: int, runtime_instance_id: str, operation_id: str
+) -> Optional[ScaleCohort]:
+    value = _load_store_json(
+        _scale_cohort_key(rank_offset, runtime_instance_id, operation_id)
+    )
+    return ScaleCohort(**value) if value is not None else None
 
 
 @dataclass
@@ -50,12 +162,22 @@ class ElasticEPState:
     active_ranks_cpu: Optional[torch.Tensor]
     effective_ep_size: int = 0
     pending_ep_size: Optional[int] = None
+    # These fields describe the latest scale operation and stop changing once
+    # operation_succeeded becomes non-None.
     scale_phase: str = "idle"
+    operation_succeeded: Optional[bool] = None
     last_error: Optional[str] = None
+    # Runtime health is independent from the latest scale operation result.
+    runtime_health: str = "healthy"
+    runtime_error: Optional[str] = None
     pending_since: Optional[float] = None
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    runtime_instance_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    operation_target_ep_size: Optional[int] = None
+    operation_expected_joining_member_ids: Optional[List[str]] = None
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -169,20 +291,50 @@ class ElasticEPStateManager:
         return torch.ones(size, dtype=torch.int32, device=dev)
 
     @classmethod
-    def request_scale(cls, n: int) -> bool:
+    def request_scale(
+        cls,
+        n: int,
+        runtime_instance_id: str,
+        operation_id: str,
+        expected_joining_member_ids: Optional[List[str]] = None,
+    ) -> bool:
         inst = cls._instance
         if inst is None:
             return False
         if (
             inst.pending_ep_size is not None
-            or inst.scale_phase == "recovery_unsupported"
+            or inst.runtime_health == "recovery_unsupported"
         ):
             return False
+        register_scale_operation(
+            inst.effective_ep_size,
+            n,
+            runtime_instance_id,
+            operation_id,
+            expected_joining_member_ids,
+        )
         inst.pending_ep_size = n
+        inst.runtime_instance_id = runtime_instance_id
+        inst.operation_id = operation_id
+        inst.operation_target_ep_size = n
+        inst.operation_expected_joining_member_ids = list(
+            expected_joining_member_ids or []
+        )
         inst.scale_phase = "waiting_for_cohort"
+        inst.operation_succeeded = None
         inst.last_error = None
         inst.pending_since = time.monotonic()
         return True
+
+    @classmethod
+    def get_operation_id(cls) -> Optional[str]:
+        inst = cls._instance
+        return inst.operation_id if inst is not None else None
+
+    @classmethod
+    def get_runtime_instance_id(cls) -> Optional[str]:
+        inst = cls._instance
+        return inst.runtime_instance_id if inst is not None else None
 
     @classmethod
     def begin_scale(cls) -> bool:
@@ -223,6 +375,7 @@ class ElasticEPStateManager:
         inst.pending_ep_size = None
         inst.has_scaled = True
         inst.scale_phase = "serving_expanded"
+        inst.operation_succeeded = True
         inst.last_error = None
         inst.pending_since = None
         inst.reset()
@@ -230,10 +383,11 @@ class ElasticEPStateManager:
     @classmethod
     def fail_scale(cls, error: str) -> None:
         inst = cls._instance
-        if inst is None:
+        if inst is None or inst.pending_ep_size is None:
             return
         inst.pending_ep_size = None
         inst.scale_phase = "failed"
+        inst.operation_succeeded = False
         inst.last_error = error
         inst.pending_since = None
         inst.reset()
@@ -243,8 +397,8 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return
-        inst.scale_phase = "recovery_unsupported"
-        inst.last_error = error
+        inst.runtime_health = "recovery_unsupported"
+        inst.runtime_error = error
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -274,6 +428,20 @@ class ElasticEPStateManager:
         return inst.last_error
 
     @classmethod
+    def get_runtime_health(cls) -> str:
+        inst = cls._instance
+        if inst is None:
+            return "disabled"
+        return inst.runtime_health
+
+    @classmethod
+    def get_runtime_error(cls) -> Optional[str]:
+        inst = cls._instance
+        if inst is None:
+            return None
+        return inst.runtime_error
+
+    @classmethod
     def get_ep_join_rank_offset(cls) -> int:
         inst = cls._instance
         if inst is None:
@@ -300,7 +468,7 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
             return False
-        if inst.scale_phase == "recovery_unsupported":
+        if inst.runtime_health == "recovery_unsupported":
             return False
         if inst.pending_ep_size is not None:
             return True

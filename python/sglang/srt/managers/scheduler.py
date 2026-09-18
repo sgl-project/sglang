@@ -5215,6 +5215,10 @@ class Scheduler(
             ret["pending_ep_size"] = ElasticEPStateManager.get_pending_ep_size()
             ret["scale_phase"] = ElasticEPStateManager.get_scale_phase()
             ret["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
+            ret["elastic_ep_runtime_health"] = (
+                ElasticEPStateManager.get_runtime_health()
+            )
+            ret["elastic_ep_runtime_error"] = ElasticEPStateManager.get_runtime_error()
 
         if (
             not self.spec_algorithm.is_none()
@@ -5663,6 +5667,75 @@ class Scheduler(
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
         max_ep_size = get_parallel().max_ep_size or old_ep_size
+        operation_id = recv_req.operation_id
+        runtime_instance_id = recv_req.runtime_instance_id
+        make_output = partial(
+            ScaleElasticEPReqOutput,
+            submission_id=recv_req.submission_id,
+        )
+
+        if operation_id is None or runtime_instance_id is None:
+            return make_output(
+                success=False,
+                message="Elastic EP scale requests require runtime and operation IDs.",
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
+            )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None and state.operation_id == operation_id:
+            expected_members = list(recv_req.expected_joining_member_ids or [])
+            existing_members = list(state.operation_expected_joining_member_ids or [])
+            conflict = None
+            if state.runtime_instance_id != runtime_instance_id:
+                conflict = (
+                    f"Operation {operation_id} belongs to runtime instance "
+                    f"{state.runtime_instance_id}, not {runtime_instance_id}."
+                )
+            elif state.operation_target_ep_size != new_ep_size:
+                conflict = (
+                    f"Operation {operation_id} already targets EP size "
+                    f"{state.operation_target_ep_size}, not {new_ep_size}."
+                )
+            elif existing_members != expected_members:
+                conflict = (
+                    f"Operation {operation_id} already has joining members "
+                    f"{existing_members}, not {expected_members}."
+                )
+            if conflict is not None:
+                return make_output(
+                    success=False,
+                    conflict=True,
+                    message=conflict,
+                    operation_id=operation_id,
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                    pending_ep_size=state.pending_ep_size,
+                    scale_phase=state.scale_phase,
+                    terminal=state.operation_succeeded is not None,
+                    effective_ep_size=state.effective_ep_size,
+                )
+
+            terminal = state.operation_succeeded is not None
+            success = state.operation_succeeded is not False
+            return make_output(
+                success=success,
+                message=(
+                    state.last_error
+                    if not success
+                    else f"Returning existing Elastic EP operation {operation_id}."
+                ),
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                pending_ep_size=state.pending_ep_size,
+                scale_phase=state.scale_phase,
+                terminal=terminal,
+                effective_ep_size=state.effective_ep_size,
+            )
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5673,49 +5746,67 @@ class Scheduler(
         )
 
         if new_ep_size <= old_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) must be greater than current "
                     f"effective_ep_size ({old_ep_size})."
                 ),
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         if new_ep_size > max_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
                     f"({max_ep_size}). Restart with a larger --max-ep-size."
                 ),
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         if ElasticEPStateManager.is_scaling():
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
+                conflict=True,
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
+                effective_ep_size=old_ep_size,
             )
 
-        if not ElasticEPStateManager.request_scale(new_ep_size):
-            return ScaleElasticEPReqOutput(
+        if not ElasticEPStateManager.request_scale(
+            new_ep_size,
+            runtime_instance_id,
+            operation_id,
+            recv_req.expected_joining_member_ids,
+        ):
+            return make_output(
                 success=False,
                 message=(
                     "Failed to queue elastic EP scale: no elastic state or "
                     "scale already pending."
                 ),
+                conflict=True,
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         if (eplb_manager := self.tp_worker.model_runner.eplb_manager) is not None:
             eplb_manager.disable_rebalance("elastic EP scale-up is pending")
@@ -5725,13 +5816,15 @@ class Scheduler(
             new_ep_size,
         )
 
-        return ScaleElasticEPReqOutput(
+        return make_output(
             success=True,
             message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+            operation_id=operation_id,
             old_ep_size=old_ep_size,
             new_ep_size=new_ep_size,
             pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
             scale_phase=ElasticEPStateManager.get_scale_phase(),
+            effective_ep_size=old_ep_size,
         )
 
     def load_lora_adapter(

@@ -397,6 +397,36 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
+    if cfg.ep_join_mode == "auto":
+        replica_index = cfg.elastic_ep_replica_index
+        assert replica_index is not None and replica_index >= 0, (
+            "--elastic-ep-join-mode auto requires a non-negative "
+            "--elastic-ep-replica-index."
+        )
+        if replica_index == 0:
+            declare_resolution(
+                server_args,
+                "_handle_elastic_ep_auto_bootstrap",
+                ep_join_mode=None,
+                ep_join_rank_offset=0,
+                node_rank=0,
+                nnodes=1,
+            )
+        else:
+            declare_resolution(
+                server_args,
+                "_handle_elastic_ep_auto_bootstrap",
+                ep_join_mode="scale",
+                ep_join_rank_offset=replica_index * cfg.tp_size,
+                node_rank=1,
+                nnodes=2,
+            )
+        cfg = resolving_view(server_args)
+    elif cfg.elastic_ep_replica_index is not None:
+        raise AssertionError(
+            "--elastic-ep-replica-index is only valid with --elastic-ep-join-mode auto."
+        )
+
     if cfg.elastic_ep_rejoin:
         if cfg.ep_join_mode is None:
             logger.warning(
