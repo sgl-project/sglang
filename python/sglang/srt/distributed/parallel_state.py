@@ -1092,7 +1092,17 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            assert input.numel() == output.numel() * self.world_size
+            # Reduction order must be independent of the receiving rank.
+            # Preserve input even when all_reduce mutates its argument.
+            reduced = self.all_reduce(input.clone())
+            output.copy_(
+                reduced.reshape(-1)
+                .narrow(0, self.rank_in_group * output.numel(), output.numel())
+                .view_as(output)
+            )
+        elif _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1173,6 +1183,33 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def _deterministic_reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        output: Optional[torch.Tensor],
+        sizes: Optional[List[int]],
+    ) -> torch.Tensor:
+        # Reduction order must be independent of the receiving rank.
+        # Offsets are a prefix sum, so unequal `sizes` work unchanged.
+        if sizes is not None:
+            assert len(sizes) == self.world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+            offset = sum(sizes[: self.rank_in_group])
+        else:
+            assert input_.shape[0] % self.world_size == 0
+            chunk_size = input_.shape[0] // self.world_size
+            offset = chunk_size * self.rank_in_group
+        output_shape = (chunk_size,) + input_.shape[1:]
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
+        # Preserve input even when all_reduce mutates its argument.
+        reduced = self.all_reduce(input_.clone())
+        output.copy_(reduced.narrow(0, offset, chunk_size))
+        return output
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1181,6 +1218,9 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
+
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            return self._deterministic_reduce_scatterv(input_, output, sizes)
 
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (
@@ -2866,6 +2906,13 @@ def create_custom_parallel_group(
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
+
+    NOTE: `group_ranks` must be the full rank list of the group, identical on
+    every rank of the world (e.g. obtained via get_process_group_ranks()).
+    Both paths below are world-collective: the general path performs a
+    world-size all_gather_object, and on NPU the fast path derives groups
+    locally from a rank-local check — a rank-local subset passed by only
+    some ranks would make ranks take different paths and deadlock.
     """
     assert torch.distributed.is_initialized()
 
@@ -2873,9 +2920,26 @@ def create_custom_parallel_group(
     rank = torch.distributed.get_rank()
 
     local_config = sorted(list(set(group_ranks)))
-    gathered_configs = [None for _ in range(world_size)]
+    group_size = len(local_config)
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Standard TP/DP partitioning: contiguous, group-aligned ranks.
+    is_standard_partition = (
+        world_size % group_size == 0
+        and local_config == list(range(local_config[0], local_config[0] + group_size))
+        and local_config[0] % group_size == 0
+    )
+
+    if not (_is_npu and is_standard_partition):
+        # General path: collect every rank's group via all_gather_object.
+        gathered_configs = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_configs, local_config)
+    else:
+        # NPU fast path: all_gather_object on the default HCCL PG allocates
+        # an HCCL buffer; instead derive the standard TP/DP groups locally.
+        num_groups = world_size // group_size
+        gathered_configs = [
+            list(range(i * group_size, (i + 1) * group_size)) for i in range(num_groups)
+        ]
 
     unique_groups = []
     seen_signatures = set()
@@ -3121,6 +3185,26 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def abort_distributed_environment() -> None:
+    """Drop this rank's communicators locally.
+
+    ``destroy_process_group`` is collective and blocks when a peer is gone,
+    which on a shutdown path is the common case.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+    if abort is None:
+        # Older torch exposes no non-collective teardown,
+        # and the collective one is what this function exists to avoid.
+        return
+    try:
+        # No argument aborts every group, the default one included.
+        abort()
+    except Exception as e:
+        logger.warning(f"NCCL abort on shutdown failed, {type(e).__name__}: {e}")
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
