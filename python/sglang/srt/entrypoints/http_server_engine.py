@@ -11,6 +11,8 @@ from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.xpu_tensor_shm import discard_staged_segments
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -98,17 +100,25 @@ class HttpServerEngineAdapter(EngineBase):
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
 
-        return self._make_request(
-            "update_weights_from_tensor",
-            {
-                "serialized_named_tensors": [
-                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(resolving_view(self.server_args).tp_size)
-                ],
-                "load_format": load_format,
-                "flush_cache": flush_cache,
-            },
-        )
+        monkey_patch_torch_reductions()
+        try:
+            return self._make_request(
+                "update_weights_from_tensor",
+                {
+                    "serialized_named_tensors": [
+                        MultiprocessingSerializer.serialize(
+                            named_tensors, output_str=True
+                        )
+                        for _ in range(resolving_view(self.server_args).tp_size)
+                    ],
+                    "load_format": load_format,
+                    "flush_cache": flush_cache,
+                },
+            )
+        finally:
+            # On XPU a payload holds a host shared-memory segment (see
+            # utils/xpu_tensor_shm); the server is done with it by now.
+            discard_staged_segments()
 
     def shutdown(self):
         kill_process_tree(self.process.pid, wait_timeout=60)
