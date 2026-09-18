@@ -241,11 +241,10 @@ class TestHostMemoryBudget(CustomTestCase):
     def _budget_with_ranks(self, ranks):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
-        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
         with (
             unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
             unittest.mock.patch.object(
-                base.psutil, "virtual_memory", return_value=fake_mem
+                base, "available_host_memory_bytes", return_value=self._AVAILABLE
             ),
         ):
             return base.host_memory_budget_bytes()
