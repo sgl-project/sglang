@@ -3336,6 +3336,50 @@ class Scheduler(
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
+    def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
+        """Clear session/mm state of a request dropped before it was scheduled.
+
+        A streaming session's inflight marker only clears for the owning turn.
+        Session requests inherit historical multimodal inputs from their prior
+        turn; the session owns and releases those features when it closes.
+        A dropped turn that appended its own media on top of the inherited
+        history owns just those additions: release them, or the items leak
+        with the dropped request.
+        """
+        if getattr(req, "session", None) is not None:
+            mm = getattr(req, "multimodal_inputs", None)
+            if mm is not None:
+                own_start = 0
+                retained = False
+                for node in req.session.req_nodes.values():
+                    other = getattr(node.req, "multimodal_inputs", None)
+                    if other is None:
+                        continue
+                    if other is mm:
+                        # The session retains this exact object (a committed
+                        # turn's shared history or this req's own node):
+                        # every item is session-owned.
+                        retained = True
+                        break
+                    inherited = other.mm_items
+                    if len(inherited) <= len(mm.mm_items) and all(
+                        mm.mm_items[i] is inherited[i] for i in range(len(inherited))
+                    ):
+                        own_start = max(own_start, len(inherited))
+                if not retained:
+                    if own_start == 0:
+                        # A first turn that never committed owns all of its
+                        # multimodal inputs; session close only scans
+                        # req_nodes, so nothing else would release them.
+                        mm.release_features()
+                        req.multimodal_inputs = None
+                    else:
+                        mm.release_features(mm.mm_items[own_start:])
+            req.session.abort_req(req.rid)
+        elif req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs = None
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -5450,6 +5494,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            prepare_abort(req, "Aborted")
+            self._release_dropped_waiting_req_mm_inputs(req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
