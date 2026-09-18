@@ -1385,6 +1385,22 @@ class KimiK3MoE(nn.Module):
         return out.view(num_tokens, hidden_size)
 
 
+def _should_fuse_kda_projections(
+    *,
+    use_full_rank_gate: bool,
+    quant_config: Optional[QuantizationConfig],
+    tp_size: int,
+    attn_tp_size: int,
+) -> bool:
+    """Whether the checkpoint projections can use a supported fused layout."""
+    if use_full_rank_gate:
+        # K3's merged QKVG linear takes explicit attention-TP rank/size, so it
+        # also supports DP attention where attention weights are replicated.
+        return True
+    # The low-rank repeated/batched layout still follows the global TP group.
+    return quant_config is None and attn_tp_size == tp_size
+
+
 class KimiK3DeltaAttention(nn.Module):
     """KDA attention; optional full-rank gate."""
 
@@ -1441,10 +1457,15 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config, f"{prefix}.b_proj"
         )
 
-        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        # Full-rank K3 also fuses mixed block-FP8 attention projections.
-        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
+        # The full-rank K3 layout passes the attention-TP rank/size explicitly
+        # to every head-sharded projection, including under DP attention, and
+        # supports the mixed block-FP8 attention projections. The low-rank
+        # repeated/batched layout still requires matching attention/global TP.
+        self.do_fuse_qkvbfg = _should_fuse_kda_projections(
+            use_full_rank_gate=self.use_full_rank_gate,
+            quant_config=quant_config,
+            tp_size=self.tp_size,
+            attn_tp_size=self.attn_tp_size,
         )
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
@@ -1469,8 +1490,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
