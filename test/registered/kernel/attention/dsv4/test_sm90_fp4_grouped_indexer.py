@@ -17,13 +17,11 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
     )
     def test_matches_triton(self):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            fp4_index_logits_decode,
             store_fp4_index_k_cache,
         )
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer import (
             fp4_index_logits_grouped_sm90,
-        )
-        from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
-            fp4_index_logits_decode,
         )
         from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 

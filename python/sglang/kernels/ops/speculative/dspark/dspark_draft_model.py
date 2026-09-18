@@ -528,8 +528,7 @@ def _build_stacked_wkv_weight(
                 for linear in wkv_linears
             )
         ):
-            # Each projection ends on a 128-row scale tile, so concatenating
-            # the prepared tiles preserves FlashInfer's swizzled scale layout.
+            # 128-row-aligned scale tiles concatenate without breaking the swizzle.
             scale = torch.cat(
                 [linear.weight_scale_inv_swizzled.reshape(-1) for linear in wkv_linears]
             )

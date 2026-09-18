@@ -1384,8 +1384,6 @@ class KVCacheConfigurator:
             kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            # 584-byte V4 pages, or the V4.1 fp8 / fp4 pages of the SM100 FlashMLA
-            # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout

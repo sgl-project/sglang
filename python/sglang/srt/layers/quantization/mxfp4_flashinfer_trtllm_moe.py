@@ -104,13 +104,8 @@ def routed_hidden_size(layer: Module) -> int:
 
 
 class Mxfp8RoutedInputPreQuant(NamedTuple):
-    """MXFP8 linear-layout quant of the routed MoE input, produced ahead of
-    :meth:`Mxfp4FlashinferTrtllmMoEMethod.apply` by
-    :meth:`Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input`. ``ready`` is
-    recorded on the producing stream after the quant; ``apply`` waits on it
-    before the routed MoE op, whose first kernel (routing) precedes the GEMM
-    that reads ``x_q``/``x_sf``. Carried in
-    ``StandardDispatchOutput.hidden_states_pre_quant``."""
+    """MXFP8 linear-layout quant of the routed MoE input. ``ready`` is recorded on
+    the producing stream; the consumer must wait on it before the routed MoE op."""
 
     x_q: torch.Tensor
     x_sf: torch.Tensor
@@ -334,11 +329,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def quantize_routed_input(
         self, hidden_states: torch.Tensor, hidden_size: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """MXFP8 quant of the routed input in the linear scale layout the
-        routed MoE op requires (``hidden_states_scale`` [tokens, hidden // 32]),
-        on the current stream. It depends on ``hidden_states`` alone, so a
-        caller may run it on a side stream and hand the result to :meth:`apply`
-        as :class:`Mxfp8RoutedInputPreQuant`."""
+        """MXFP8 quant of the routed input, with the scale in the linear
+        [tokens, hidden // 32] layout the routed MoE op requires."""
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
         x_quant, x_scale = flashinfer_mxfp8_quantize(
@@ -420,9 +412,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         num_tokens = x_quant.shape[0]
-        # Deferred finalize: hand back the permuted GEMM2 output plus the
-        # routing triple instead of the finalized [T, hidden] tensor, for a
-        # caller that fuses the finalize into its shared add / all-reduce.
+        # Deferred finalize returns the permuted GEMM2 output plus the routing
+        # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
         symm_output = None
         if not defer_finalize:
@@ -442,8 +433,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 )
 
         if input_ready is not None:
-            # The routing kernel is launched inside the op below, so the
-            # cross-stream join for x_quant/x_scale must precede the op call.
+            # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
 
         result = trtllm_fp4_block_scale_routed_moe(
@@ -532,8 +522,6 @@ _fused_finalize_all_reduce_probed = False
 
 
 def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
-    """Register the TP group's CustomAllReduceV2 push plane with the fused
-    kernel once; None when the TP group has no usable v2 communicator."""
     global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
     if not _fused_finalize_all_reduce_probed:
         _fused_finalize_all_reduce_probed = True
@@ -558,13 +546,8 @@ def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
 def should_use_fuse_finalize_all_reduce(
     experts, num_tokens: int, hidden_dim: int
 ) -> bool:
-    """Whether ``moe_finalize_all_reduce`` can replace finalize + shared add +
-    TP all-reduce for this layer and batch.
-
-    Capability only, no routing policy: the batch-size cap lives at the call
-    site. The expert weights must already carry the routed scaling factor,
-    since the kernel never rescales.
-    """
+    """Capability only; the batch-size policy cap lives at the call site. The
+    kernel never rescales, so the expert weights must carry the routed scaling."""
     if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
         return False
     if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":

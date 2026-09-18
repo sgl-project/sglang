@@ -2835,8 +2835,7 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        # The prebuilt batch never reaches the forward loop's prepare call, and
-        # its requests skip EXTEND here, so seed their engram history now.
+        # The prebuilt batch never reaches the forward loop's prepare call.
         self.ngram_embedding_manager.prepare_for_forward(
             new_batch, chunked_req=self.chunked_req
         )

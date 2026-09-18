@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import triton
@@ -96,7 +96,7 @@ def _router_triton_kernel(
     num_token_non_padded_ptr,
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
-    out_packed_ptr,  # [M, K] int32, (id << 16) | bf16 bits of weight (HAS_PACKED)
+    out_packed_ptr,  # [M, K] int32 (HAS_PACKED)
     M,
     routed_scaling_factor,
     moe_softcapping,
@@ -111,6 +111,7 @@ def _router_triton_kernel(
     EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
     BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
     SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
+    SQRTSOFTPLUS_LOG1P: tl.constexpr,  # sqrtsoftplus via log1p (V4.1 numerics)
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
@@ -184,9 +185,18 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + row_bias
     elif SCORING_FUNC == 1:
-        # log1p preserves small positive scores for negative logits.
-        sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
-        activated = libdevice.sqrt(sp)
+        if SQRTSOFTPLUS_LOG1P:
+            # log1p preserves small positive scores for negative logits.
+            sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
+            activated = libdevice.sqrt(sp)
+        else:
+            # Open-coded log1p; reproduces the DeepSeek-V4 sqrtsoftplus numerics.
+            z = tl.exp(-tl.abs(scores))
+            u = 1.0 + z
+            exact = u == 1.0
+            log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
+            sp = tl.maximum(scores, 0.0) + log1p_z
+            activated = tl.sqrt(sp)
         biased = activated + row_bias
     else:
         # softmax over the row: weight is the softmax probability (bias kept), with
@@ -206,7 +216,7 @@ def _router_triton_kernel(
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
-    if SCORING_FUNC == 1:
+    if SCORING_FUNC == 1 and SQRTSOFTPLUS_LOG1P:
         # Rank NaNs above finite scores, matching torch.topk.
         biased = tl.where(biased == biased, biased, float("inf"))
     else:
@@ -298,15 +308,24 @@ def _router_triton_kernel(
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
     if HAS_PACKED:
-        # FlashInfer routed-MoE packed entry, bitwise identical to
-        # _pack_topk_ids_triton_kernel: same fp32 -> bf16 rounding, same -1
-        # sentinel on padded rows.
+        # Must stay bitwise identical to fused_pack_topk.
         w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
         packed = (selected_idx << 16) | (w_bits & 0xFFFF)
         out_p_ptr = (
             out_packed_ptr + offs_m[:, None] * stride_pm + offs_k[None, :] * stride_pk
         )
         tl.store(out_p_ptr, packed, mask=store_mask)
+
+
+_DUMMY_I32: Dict[torch.device, torch.Tensor] = {}
+
+
+def _dummy_i32(device: torch.device) -> torch.Tensor:
+    # Placeholder pointer for kernel args whose constexpr flag is off.
+    t = _DUMMY_I32.get(device)
+    if t is None:
+        t = _DUMMY_I32[device] = torch.empty(1, dtype=torch.int32, device=device)
+    return t
 
 
 @debug_kernel_api
@@ -329,20 +348,22 @@ def moe_fused_gate(
     num_token_non_padded: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    Mirrors :func:`moe_fused_gate_jit` (the CUDA JIT kernel) for the shared
+    parameters; the keyword-only extras are Triton-only.
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). ``scores`` contains raw GEMM logits.
 
-    Rows with ``input_ids == bias_alt_token_id`` use ``bias_alt`` instead of ``bias``.
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
-    ``packed_out`` ([M, topk] int32, optional) additionally receives the FlashInfer
-    routed-MoE form ``(id << 16) | bf16_bits(weight)`` of the returned pair, computed
-    in-register and bitwise identical to the separate ``PackTopkIds`` kernel.
+    ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
+    (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
+    ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
+    ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (
@@ -441,10 +462,9 @@ def moe_fused_gate(
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
-    # Never alias an output as the fallback for an unused pointer arg: when
-    # Dynamo cannot analyze the kernel (PDL inline asm) it treats every pointer
-    # as mutated and writes both aliases back, clobbering `indices`.
-    _unused_i32 = torch.empty(1, dtype=torch.int32, device=scores.device)
+    # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
+    # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
+    _unused_i32 = _dummy_i32(scores.device)
     _router_triton_kernel[grid](
         scores,
         bias if bias is not None else scores,
@@ -468,6 +488,7 @@ def moe_fused_gate(
         EXPERTS_PER_GROUP=experts_per_group,
         BLOCK_G=BLOCK_G,
         SCORING_FUNC=scoring_func_int,
+        SQRTSOFTPLUS_LOG1P=bool(sqrtsoftplus_log1p),
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),

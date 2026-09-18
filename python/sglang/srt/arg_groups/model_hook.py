@@ -419,8 +419,7 @@ def handle_model_specific_adjustments(server_args: Any):
             validate_deepseek_v41_features,
         )
 
-        # Ahead of the CP validation: DeepSeek-V4.1 rejects CP outright, and
-        # that message is the actionable one.
+        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
         validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)

@@ -1121,10 +1121,8 @@ def prepare_dsv4_runner_inputs(
 def _seed_c4_if_needed(
     fixture: DSV4AttentionFixture, *, num_entries: int | None = None
 ) -> None:
-    """For compress_ratio in (1, 2, 4), seed the C4 metadata the exercised path
-    consumes (the indexer would normally populate it; the compact fixture skips
-    it): `c4_sparse_page_indices` for the dense extend path,
-    `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
+    """Seed `c4_sparse_page_indices` (dense extend) or `c4_sparse_raw_indices`
+    (sparse prefill); the compact fixture skips the indexer that fills them.
     """
     if fixture.case.compress_ratio not in (1, 2, 4):
         return
@@ -1624,21 +1622,10 @@ def run_dsv4_compress_attention_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> None:
-    """Math-faithful test for the SWA + compressed-cache path (compress ratios
-    1, 2, 4, 128) through `DeepseekV4AttnBackend.forward`.
-
-    Pre-writes random packed K into both the SWA cache and the extra
-    (C4/C128) cache via the production pack+set paths, lets
-    `init_forward_metadata` populate the compression metadata, manually seeds
-    the C4 metadata the exercised path consumes (see `_seed_c4_if_needed`; the
-    un-run indexer would otherwise leave it at `-1` / uninitialized), then
-    dispatches `forward(compress_ratio=case.compress_ratio)` and compares
-    against an independent pure-PyTorch SWA + extra reference that reads the
-    SAME cache bytes and metadata indices.
-
-    `sparse_prefill` pins `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`, selecting the
-    dense `flash_mla_with_kvcache` extend path or `_forward_prefill_sparse`;
-    the C4 seeding dispatches on the same flag.
+    """SWA + compressed-cache path (compress ratios 1, 2, 4, 128) through
+    `DeepseekV4AttnBackend.forward` against a pure-PyTorch reference that reads the
+    same cache bytes and metadata indices. `sparse_prefill` pins
+    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`; the C4 seeding dispatches on the same flag.
     """
     assert case.compress_ratio in (1, 2, 4, 128), (
         f"DSV4 compact runner requires compress_ratio in (1, 2, 4, 128); "

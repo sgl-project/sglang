@@ -184,8 +184,7 @@ class CompressStatePool:
         )
         if not online:
             if ratio == 2 or (_is_hip and ratio == 128):
-                # Initialize all request-scoped rows to the empty-state sentinel before reuse;
-                # C4 initializes only its last-row sentinel.
+                # Request-scoped rings reset all rows; C4 only its -1 sentinel row.
                 self.kv_score_buffer.clear()
             else:
                 self.kv_score_buffer[-1].clear()
@@ -194,8 +193,7 @@ class CompressStatePool:
         """PD transfer indices of this pool's state for one request."""
         assert self.request_scoped, "page-scoped state travels with the SWA pages"
         if self.ratio == 2:
-            # The pair ring is one row per request; only an odd prefix leaves a
-            # pending half-pair for decode to read.
+            # Only an odd prefix leaves a pending half-pair for decode to read.
             if seq_len % 2 == 0:
                 return np.empty((0,), dtype=np.int32)
             return np.array([int(req_pool_idx)], dtype=np.int32)
@@ -264,9 +262,8 @@ class CompressStatePool:
     ) -> torch.Tensor:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
-        # masked_fill_, not where(cond, -1, ...): a Scalar branch is passed by
-        # value, while the scalar overload of where may stage a host tensor and
-        # so cannot run inside a CUDA graph capture.
+        # Not where(cond, -1, x): its scalar overload may stage a host tensor,
+        # which a CUDA graph capture cannot run.
         return state_loc.masked_fill_(swa_loc < 0, -1)
 
     def translate_from_req_position_to_state_loc(

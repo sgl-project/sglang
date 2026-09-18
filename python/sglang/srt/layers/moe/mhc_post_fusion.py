@@ -25,8 +25,8 @@ class MhcPostFusion:
     ] = None
 
     def materialize_stats(self):
-        # The stream was forked before the sublayer. Record its work here, after
-        # the main parent, so graph replay keeps the join on the main stream.
+        # Record after the main parent; graph replay must keep the join on the
+        # main stream.
         if self.record_stats is not None:
             self.pre, self.post, self.comb = self.record_stats()
             self.record_stats = None

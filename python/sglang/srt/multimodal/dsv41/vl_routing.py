@@ -13,9 +13,8 @@ from sglang.srt.utils import is_cuda
 
 
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
-    # Standard EP replicates the fused shared expert on every rank and
-    # all-reduces the outputs, so the shared columns carry a 1/ep_size factor
-    # (applied by _post_process_topk_ids on the paths that go through it).
+    # Standard EP replicates the fused shared expert on every rank and all-reduces,
+    # so the shared columns carry a 1/ep_size factor.
     if num_fused_shared_experts and scaling_factor is not None:
         weights[:, -num_fused_shared_experts:] *= scaling_factor
     return weights
@@ -25,8 +24,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
     config = moe.topk.topk_config
     num_fused_shared_experts = config.num_fused_shared_experts
     if num_fused_shared_experts:
-        # The per-rank shared-slot layout is appended by _post_process_topk_ids,
-        # which this routing path bypasses.
+        # This path bypasses _post_process_topk_ids, which appends the per-rank slots.
         assert not has_per_rank_fused_shared_slots(num_fused_shared_experts), (
             "VL routing does not support per-rank fused shared slots"
         )
@@ -34,8 +32,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        # Same admission as _fused_gate_emits_packed_ids on the text path: only
-        # flashinfer_mxfp4 consumes the packed form, and the shared-expert slots
+        # Same admission as _fused_gate_emits_packed_ids: the shared-expert slots
         # rescaled below would rewrite weights after the router.
         packed_topk = None
         if (
@@ -61,6 +58,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             apply_routed_scaling_factor_on_output=config.apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
             packed_out=packed_topk,
+            sqrtsoftplus_log1p=True,
         )
         weights = _scale_fused_shared_weights(
             weights,
@@ -79,8 +77,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             moe.gate.e_score_correction_bias_vl,
             moe.gate.e_score_correction_bias,
         )
-    # topk for routed experts only; the shared expert slots are appended below
-    # with the same layout as biased_grouped_topk_gpu.
+    # The shared slots appended below use the same layout as biased_grouped_topk_gpu.
     topk_routed = config.top_k - num_fused_shared_experts
     indices = (scores + bias).topk(topk_routed, dim=-1).indices
     weights = scores.gather(-1, indices)

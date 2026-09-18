@@ -1,3 +1,6 @@
+"""Weight-update entry points refuse a model carrying compensated-mHC derived
+weight caches before any weight is written."""
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch

@@ -1,3 +1,6 @@
+"""A TP-sharded MXFP4 trtllm-gen MoE whose per-rank intermediate size needs
+padding must sum to the unsharded experts' output."""
+
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -11,7 +14,7 @@ from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe as mxfp4
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def make_layer(weights):
@@ -32,31 +35,19 @@ def make_layer(weights):
 
 def make_weights(intermediate, hidden=256, device="cpu"):
     experts = 8
-    w13 = torch.randint(
-        -128,
-        128,
-        (experts, 2 * intermediate, hidden // 2),
-        dtype=torch.int8,
-        device=device,
+
+    def fp4_packed(*shape):
+        return torch.randint(-128, 128, shape, dtype=torch.int8, device=device)
+
+    def e8m0_scales(*shape):
+        return torch.randint(-6, -3, shape, device=device).float().exp2()
+
+    return (
+        fp4_packed(experts, 2 * intermediate, hidden // 2),
+        fp4_packed(experts, hidden, intermediate // 2),
+        e8m0_scales(experts, 2 * intermediate, hidden // 32),
+        e8m0_scales(experts, hidden, intermediate // 32),
     )
-    w2 = torch.randint(
-        -128,
-        128,
-        (experts, hidden, intermediate // 2),
-        dtype=torch.int8,
-        device=device,
-    )
-    s13 = (
-        torch.randint(-6, -3, (experts, 2 * intermediate, hidden // 32), device=device)
-        .float()
-        .exp2()
-    )
-    s2 = (
-        torch.randint(-6, -3, (experts, hidden, intermediate // 32), device=device)
-        .float()
-        .exp2()
-    )
-    return w13, w2, s13, s2
 
 
 class TestMxfp4TrtllmPadding(CustomTestCase):
@@ -113,16 +104,10 @@ class TestMxfp4TrtllmPadding(CustomTestCase):
                         method.apply(layer, dispatch).hidden_states.float()
                         for method, layer in shards
                     )
-                    relative_rmse = (
-                        (
-                            (actual - reference).square().mean()
-                            / reference.square().mean()
-                        )
-                        .sqrt()
-                        .item()
+                    rmse = torch.linalg.norm(actual - reference) / torch.linalg.norm(
+                        reference
                     )
-                    self.assertTrue(torch.isfinite(actual).all())
-                    self.assertLess(relative_rmse, 0.01)
+                    self.assertLess(rmse.item(), 0.01)
 
 
 if __name__ == "__main__":

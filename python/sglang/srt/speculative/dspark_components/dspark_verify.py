@@ -82,13 +82,9 @@ def candidate_request_length_bound(
     reqs, pending_verify_tokens: int = 0
 ) -> Optional[int]:
     """Bound committed positions without reading asynchronous acceptance results.
-
-    The overlap loop can have one unprocessed result, which may overshoot the
-    output budget. Reserve its full width here; the runner adds the current
-    verify width as well. Aborted/embedding/multimodal requests keep the
-    general graph because their visible token IDs may not represent the
-    actual cache position space.
-    """
+    The overlap loop can hold one unprocessed result, so reserve its full width;
+    the runner adds the current verify width. Aborted/embedding/multimodal requests
+    return None: their visible token IDs may not track cache positions."""
     if not reqs:
         return None
     longest = 0
@@ -120,6 +116,15 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
+        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
+        self._target_is_dsv41 = (
+            getattr(
+                target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -163,6 +168,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            fused_argmax=self._target_is_dsv41,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -324,7 +330,7 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
-        if verify_input.live_seq_lens_cpu is None:
+        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
@@ -532,9 +538,11 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fused_argmax: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -621,8 +629,7 @@ class DsparkVerifyEpilogue:
         )
         if not self.folds_commit:
             return
-        # Consume the same staged locations as target verify, not a second
-        # lookup through req_to_token. Padded and fallback rows never write KV.
+        # Same staged locations as target verify; padded and fallback rows skip KV.
         gated_commit_lens = (
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
@@ -742,6 +749,7 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=self._fused_argmax,
         )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
@@ -813,6 +821,7 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -823,6 +832,7 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
@@ -847,6 +857,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,

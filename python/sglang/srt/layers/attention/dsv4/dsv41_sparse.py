@@ -1,8 +1,7 @@
 """DeepSeek V4.1 ratio-1/2 compressors and indexers.
 
-Only kv_source layers own compressed latents; later layers with the same ratio
-share that storage. Index sources score the latents and publish top-k slots
-for subsequent attention layers.
+Only kv_source layers own compressed latents; later layers of the same ratio
+share that storage.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from sglang.srt.utils import add_prefix
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    """RoPE plus fake FP4 quantization, fused for CUDA BF16 inputs."""
     if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
@@ -61,7 +59,6 @@ class RMSNorm(nn.Module):
 
 
 def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
-    """req_pool_indices repeated once per token of the batch."""
     req = forward_batch.req_pool_indices.to(torch.int64)
     if forward_batch.forward_mode.is_decode():
         return req
@@ -80,7 +77,7 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
 def rope_tail(
     x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
 ) -> torch.Tensor:
-    """Rotate the last rope_dim features of x [T, ..., D] with complex freqs [T, rope_dim // 2]."""
+    """Rotate the last rope_dim features of x with complex freqs [T, rope_dim // 2]."""
     head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
     tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
     f = freqs.conj() if inverse else freqs
@@ -90,22 +87,17 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """Whether the fused c1 / c2 / index-K decode kernels can serve this process.
-
-    They pack fp4 with `cvt.rn.satfinite.e2m1x2`, a Blackwell (sm100+) CUDA
-    instruction. Decided once at load time: the answer also fixes the weight
-    layout of the ratio-2 projection (one `wkv_gate` or `wkv` plus `wgate`)."""
+    """The fused c1 / c2 / index-K decode kernels pack fp4 with
+    `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
+    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available() or torch.version.hip is not None:
         return False
     return torch.cuda.get_device_capability()[0] >= 10
 
 
 class DeepseekV41Compressor(nn.Module):
-    """Pool consecutive tokens into one pre-RoPE KV latent.
-
-    Ratio 2 keeps checkpoint weights in bf16 but accumulates projections and
-    softmax pooling in fp32; finish rounds to bf16 before RMSNorm.
-    """
+    """Pool consecutive tokens into one pre-RoPE KV latent; bf16 weights, fp32
+    projection and softmax pooling, rounded back to bf16 in `finish`."""
 
     def __init__(
         self,
@@ -144,20 +136,17 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             return self.wkv(x), None
         if self.use_fused_gate:
-            # Extend accepts strided column views; pair_pool_decode requires contiguous
-            # halves and is reachable only when the fused projection is disabled.
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
             return fused[..., :head_dim], fused[..., head_dim:]
-        # Two GEMMs rather than one fused [2D, K] projection: pair_pool_decode
-        # reads kv and score as contiguous [n, D] fp32 rows, which column slices
-        # of a fused output are not.
+        # Two GEMMs, not one fused [2D, K] projection: c2_decode_pool reads kv and
+        # score as contiguous [n, D] rows; column slices of a fused output are not.
         kv = linear_bf16_fp32(x, self.wkv.weight)
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
 
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """`[n, 2D]` fp32, `| kv | score |`, for the fused decode kernel."""
+        """`[n, 2D]` fp32, `| kv | score |`."""
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
@@ -170,9 +159,7 @@ class DeepseekV41Compressor(nn.Module):
 
 
 def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
-    """Maximum decode rows for the small head-weight GEMM;
-    -1 means the device or checkpoint shape requires the linear fallback.
-    """
+    # -1 means the device or checkpoint shape requires the linear fallback.
     if not torch.cuda.is_available() or torch.version.hip is not None:
         return -1
     from sglang.kernels.ops.gemm.small_gemm_bf16 import MAX_M, can_use_n32k5120_gemm
@@ -181,11 +168,9 @@ def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
 
 
 class DeepseekV41Indexer(nn.Module):
-    """Scores compressed positions with a small fp4 side attention. Only a
-    kv_source layer owns index keys; the other index sources read the source's.
-
-    The projections are replicated across TP, as in the c4 indexer: every rank
-    scores with all heads, so the top-k needs no cross-rank reduction."""
+    """Scores compressed positions with a small fp4 side attention; only a
+    kv_source layer owns index keys. Projections are replicated across TP: every
+    rank scores with all heads, so the top-k needs no cross-rank reduction."""
 
     def __init__(
         self,
@@ -223,8 +208,7 @@ class DeepseekV41Indexer(nn.Module):
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
-        # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's;
-        # wider batches use the linear path.
+        # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
         )
@@ -240,8 +224,7 @@ class DeepseekV41Indexer(nn.Module):
             n128k512_gemm_bf16,
         )
 
-        # Use the shared admission check: the JIT kernel requires supported shapes and
-        # hardware, and raises instead of falling back when either condition is violated.
+        # The JIT kernel raises rather than falling back on an unsupported shape.
         if can_use_n128k512_gemm(
             self.index_head_dim, latent.shape[-1], latent.shape[0]
         ):
@@ -277,8 +260,7 @@ class DeepseekV41Indexer(nn.Module):
     def scores(
         self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
-        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
-        bf16 up to the reduction, as the reference does."""
+        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
         return s.float()

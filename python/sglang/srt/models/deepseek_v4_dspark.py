@@ -359,6 +359,7 @@ class DSparkAttention(MqaAttentionBase):
                 wo_a,
                 is_decode=forward_batch.forward_mode.is_decode(),
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
@@ -386,10 +387,13 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 class DSparkV4MarkovHead(nn.Module):
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
+        self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"DSparkV4MarkovHead requires markov_rank > 0, got {self.markov_rank}."
@@ -444,7 +448,8 @@ class DSparkV4MarkovHead(nn.Module):
         self._vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
-            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+            prefer_nvlink=self._is_dsv41
+            and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
         )
         if shard_group.rank == 0:
             cls_name = type(self._vocab_gather).__name__
@@ -505,7 +510,9 @@ class DSparkV4MarkovHead(nn.Module):
 
     @property
     def supports_sharded_greedy(self) -> bool:
-        return self._tp_shard is not None and self._opt_markov_w2_bf16
+        return (
+            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
+        )
 
     def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
         if not self.supports_sharded_greedy or not base_logits.is_cuda:
@@ -584,7 +591,6 @@ def build_dspark_v4_confidence_head(
 
 
 def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
-    """Apply draft expert counts and disable image routing for text-only stages."""
     n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
     n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
     has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
@@ -845,7 +851,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.moe_routed_quant_stream = (
             torch.cuda.Stream()
-            if use_multi_stream and torch.version.cuda is not None
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
             else None
         )
         self.hc_stats_stream = (
@@ -876,6 +884,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
+            is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
@@ -938,8 +947,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
-            # The FlashMLA writer reads an explicit KV row stride. Keep the
-            # stacked projection's views and avoid a copy for every draft stage.
+            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
             allow_strided_output=(
                 get_platform().is_blackwell
                 and not is_unified_kv_triton()

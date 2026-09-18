@@ -920,8 +920,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         )
 
 
-# Applied when the operator left --swa-full-tokens-ratio at the CLI default and
-# the request cap is not usable; cap mode governs whenever it is.
+# Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
@@ -970,14 +969,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
-        # Row width across both unified pools: 1024 B bf16, 640 B fp8. Read from
-        # the pool module so sizing can't drift from the allocation.
+        # Row width across both unified pools: 1024 B bf16, 640 B fp8.
         self._unified_row_bytes = dsv4_unified_row_bytes(
             self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
         )
         if self._unified:
-            # Unified_kv stores the whole latent: one bf16 pool, or an fp8 nope
-            # pool plus a bf16 rope pool.
+            # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
         else:
             # One FlashMLA-layout latent slot, in bytes.
@@ -1036,10 +1033,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
-        # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one packed
-        # index key per compressed position. The low-ratio indexer pools are built
-        # with force_fp4=True (deepseek_v4_memory_pool._init_low_ratio_pools), so
-        # they are fp4 whatever dtype the c4 indexer runs at.
+        # The low-ratio indexer pools are built with force_fp4=True
+        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
@@ -1187,9 +1182,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _resolve_swa_prefix_tails(self) -> int:
-        """Cached prefix tails cap mode keeps addressable in the SWA pool: a
-        radix-cached prefix is reusable only while its last sliding_window
-        tokens still hold SWA slots."""
+        """Cached prefix tails cap mode keeps addressable: a prefix is reusable only
+        while its last sliding_window tokens still hold SWA slots."""
         prefix_tails = get_schedule().swa_prefix_tails
         if prefix_tails is not None:
             return prefix_tails
@@ -1200,15 +1194,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return 4 * max_running_requests if max_running_requests is not None else 0
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
-        """SWA slots to reserve in cap mode, or None to keep ratio sizing. Cap
-        mode replaces "swa_tokens = full_tokens * ratio" with a request-cap
-        budget plus radix headroom, so the SWA pool stops growing with the KV
-        budget."""
+        """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
+        budgets from the request cap plus radix headroom, not full_tokens."""
         if self.operator_swa_ratio is not None:
             return None
         if self._unified:
-            # Ring mode: SWA is a fixed per-request ring (_fixed_swa_bytes), so
-            # there is no paged pool for the request cap to size.
+            # Ring mode: SWA is a fixed per-request ring, with no paged pool to size.
             return None
         max_running_requests = self.requested_max_running_requests_per_worker
         if max_running_requests is None or self.sliding_window_size is None:
@@ -1228,12 +1219,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_bytes_per_swa_token(self) -> float:
-        """Bytes one SWA slot costs across the whole stage. The c4 compress
-        state follows swa_tokens (c4_state_pool_size = swa_tokens /
-        swa_page_size * ring), so it is priced per SWA slot too."""
+        """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
+        / swa_page_size * ring, so c4 compress state is priced per SWA slot too."""
         if self.encoder_replay:
-            # Target SWA lives in the fixed request window; only the draft owns
-            # paged SWA bytes. DSpark's draft layers have no compressed state.
+            # Target SWA lives in the request window; only the draft owns paged SWA
+            # bytes, and its layers carry no compressed state.
             return self.kv_bytes * self.paged_draft_layers
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
@@ -1261,10 +1251,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # max_running_requests is known, so it should not scale with
         # full-token capacity here.
         c128_state_ratio = 0
-        # Cap mode holds swa_tokens fixed, so the SWA pool and the c4 state that
-        # follows it become bias bytes (_get_swa_fixed_bytes) instead of coeff.
-        # Ring mode: both are fixed per-request pools (_fixed_swa_bytes,
-        # _fixed_c4_state_bytes), so they leave the coefficient as well.
+        # Cap mode and ring mode both move the SWA pool and the c4 state that
+        # follows it out of the coefficient and into fixed bytes.
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
@@ -1289,8 +1277,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self.request_window_bytes + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
-        # swa_cap_tokens was page-aligned at resolve time; page_size here is the
-        # same get_schedule().page_size that self.page_size holds.
+        # swa_cap_tokens was already page-aligned at resolve time.
         if self.swa_cap_tokens is None:
             return int(full_token * self.swa_ratio) // page_size * page_size
         return self.swa_cap_tokens
@@ -1299,10 +1286,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         full_token = full_token // page_size * page_size
         swa_tokens = self._get_swa_tokens(full_token, page_size)
         if self.swa_cap_tokens is None:
-            # Cap mode sizes the pool from the request floor itself, encoder
-            # bounded replay deliberately runs with swa_tokens == 0, and ring
-            # mode's paged SWA pool is vestigial; only ratio sizing of a paged
-            # pool can produce one too small for a request.
+            # Only ratio sizing can under-size a request: cap mode sizes from the
+            # request floor, and encoder replay deliberately runs swa_tokens == 0.
             if not self._unified:
                 self.validate_swa_pool_size(
                     swa_tokens, self.sliding_window_size, page_size

@@ -68,12 +68,9 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
-    # Optional pre-quantized activation for ``hidden_states``, which itself
-    # stays bf16, so the runner skips its own activation quant. Either the
-    # SGLANG_OPT_MOE_QUANT_ONCE (q, scale) pair (per-token-group-128 fp8, q rows
-    # possibly padded to a multiple of 4) for the standard->triton fused runner,
-    # or ``Mxfp8RoutedInputPreQuant`` (MXFP8 linear scale layout) for
-    # ``Mxfp4FlashinferTrtllmMoEMethod.apply``.
+    # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
+    # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
+    # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
     hidden_states_pre_quant: Optional[Tuple] = None
 
     @property

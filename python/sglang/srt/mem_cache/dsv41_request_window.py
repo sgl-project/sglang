@@ -21,9 +21,8 @@ class WindowLayout(msgspec.Struct, frozen=True):
     size: int
 
     def copy_(self, other: "WindowLayout") -> None:
-        # Graph replay refreshes a captured layout in place: the captured copy
-        # kernels read these tensors by address, so their contents move, not
-        # the object.
+        # Captured copy kernels read these tensors by address, so a graph replay
+        # must refresh their contents in place, not rebind the object.
         assert self.size == other.size, (self.size, other.size)
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
@@ -124,8 +123,7 @@ def window_layout(
 
 
 def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout.V4):
-    """Move tokens between two paged buffers of ``layout``: a token is a data row
-    and a scale row (576 + 8 bytes for V4, 512 + 16 for V41, 256 + 32 for V41_FP4)."""
+    """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
         return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
@@ -202,8 +200,7 @@ class RequestWindow:
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
-            # Captured graphs hold the workspace address; growing it here would
-            # leave them writing into a freed buffer. Size it at construction.
+            # Captured graphs hold the workspace address; growing it strands them.
             raise RuntimeError(
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
@@ -226,9 +223,8 @@ class RequestWindow:
         )
 
     def buffer(self, layer):
-        # The runner's capture scope includes eager warmups, before CUDA capture
-        # starts. Include the phase in the key so leaving that scope revalidates
-        # ownership even when the layout and layer have not changed.
+        # The runner's capture scope includes eager warmups before CUDA capture
+        # starts, so the phase is part of the key: leaving the scope revalidates.
         in_capture = get_is_capture_mode() or _capturing()
         prepared_key = (layer, in_capture)
         if self.prepared != prepared_key:

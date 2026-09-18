@@ -301,7 +301,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 def interleave_rows_per_request(
     extend_lens: List[int], cp_rank: int, cp_size: int
 ) -> List[int]:
-    """Rows of each request an interleave CP rank holds (batch index congruent to the rank)."""
+    """Rows of each request a CP rank holds: global token index congruent to cp_rank."""
     counts, start = [], 0
     for n in extend_lens:
         end = start + n

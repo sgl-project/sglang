@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Attention, page and MoE defaults; KV-cache dtype, NPU split-backend setup,
-    request limits and validation remain in deepseek_v4_hook.
-    """
+    """Attention, page and MoE defaults; the rest lives in deepseek_v4_hook."""
     cfg = resolving_view(server_args)
 
     model_arch = hf_config.architectures[0]
@@ -44,6 +42,14 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
         logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+
+    # Left unset, the pool configurator sizes the SWA pool from the request cap.
+    if (
+        cfg.swa_full_tokens_ratio is None
+        and getattr(hf_config, "model_type", None) != "deepseek_v41"
+    ):
+        overrides["swa_full_tokens_ratio"] = 0.1
+        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
     page_size = 256
     if cfg.device == "npu":

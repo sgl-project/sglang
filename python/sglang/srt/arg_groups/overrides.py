@@ -1017,7 +1017,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
-    # Keep the existing default for other models and parallel configurations.
     prefer_custom_dsv41 = (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
         and getattr(hf_config, "hidden_size", None) == 5120

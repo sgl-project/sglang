@@ -1595,11 +1595,8 @@ class FusedMoE(torch.nn.Module):
             and dispatch_output.format.is_standard()
             and dispatch_output.hidden_states_scale is None
         ):
-            # The standard dispatch was a pure passthrough, so the caller's
-            # pre-quantized activation still matches dispatch_output.hidden_states;
-            # attach it so the runner skips its own activation quant. Dropping an
-            # Mxfp8RoutedInputPreQuant here would leave its side stream unjoined
-            # under CUDA-graph capture.
+            # Dropping an Mxfp8RoutedInputPreQuant here would leave its side
+            # stream unjoined under CUDA-graph capture.
             dispatch_output = dispatch_output._replace(
                 hidden_states_pre_quant=pre_quant_input
             )
