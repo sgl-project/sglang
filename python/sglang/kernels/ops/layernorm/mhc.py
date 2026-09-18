@@ -1,10 +1,11 @@
-import fcntl
 import functools
 import importlib
 import logging
 import math
 import threading
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator, Tuple
 
 import torch
@@ -759,28 +760,61 @@ def get_mhc_pre_token_count_representatives(
     return tuple(sorted(reps.values()))
 
 
-@contextmanager
-def _claim_prewarm_bucket(tag: str, *, wait: bool) -> Iterator[bool]:
-    # Ranks sharing a JIT cache dir walk the same buckets in the same order, so
-    # an unclaimed sweep compiles every kernel once per rank. wait=False yields
-    # False when a peer owns the bucket; wait=True blocks until its compile is
-    # on disk. The kernel drops the lock on process death, so a rank that dies
-    # mid-compile hands the bucket back.
-    from sglang.kernels.jit.utils.compile.cache import cache_root
+@functools.lru_cache(maxsize=1)
+def _warn_prewarm_lock_fallback():
+    logger.warning(
+        "MHC prewarm locking unavailable or timed out; continuing without sharding"
+    )
 
-    lock_dir = cache_root() / "prewarm_locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_dir / f"{tag}.lock", "w") as lock_file:
-        flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+
+@contextmanager
+def _claim_prewarm_bucket(
+    tag: str, *, wait: bool, timeout: float = 300.0
+) -> Iterator[bool]:
+    # False means a peer owns the bucket. Infrastructure failures yield True
+    # so this rank replays normally, without relying on another rank's cache.
+    lock_file = None
+    locked = False
+    own = True
+    try:
         try:
-            fcntl.flock(lock_file, flags)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            import fcntl
+
+            from tilelang.env import env as tilelang_env
+
+            lock_dir = Path(tilelang_env.TILELANG_CACHE_DIR) / "prewarm_locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_file = open(lock_dir / f"{tag}.lock", "a")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if not wait:
+                        own = False
+                        break
+                    # A live but stuck owner must not indefinitely delay startup.
+                    if time.monotonic() >= deadline:
+                        _warn_prewarm_lock_fallback()
+                        break
+                    time.sleep(0.1)
+        except (ImportError, OSError):
+            _warn_prewarm_lock_fallback()
+        # Keep replay exceptions outside the lock error handler.
+        yield own
+    finally:
+        if locked:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                _warn_prewarm_lock_fallback()
+        if lock_file is not None:
+            try:
+                lock_file.close()
+            except OSError:
+                _warn_prewarm_lock_fallback()
 
 
 def prewarm_mhc_pre(
@@ -832,7 +866,13 @@ def prewarm_mhc_pre(
             norm_eps=norm_eps,
         )
 
-    shard_key = f"mhc_pre_h{hc_mult}x{hidden_size}_s{n_splits}_{n_splits_pre}"
+    props = torch.cuda.get_device_properties(residual.device)
+    arch = (
+        props.gcnArchName.split(":")[0]
+        if torch.version.hip
+        else f"sm{props.major}{props.minor}"
+    )
+    shard_key = f"mhc_pre_{arch}_h{hc_mult}x{hidden_size}_s{n_splits}_{n_splits_pre}"
     taken_by_peers: list[int] = []
     with torch.inference_mode():
         for num_tokens in buckets:
@@ -842,9 +882,9 @@ def prewarm_mhc_pre(
                 else:
                     taken_by_peers.append(num_tokens)
         for num_tokens in taken_by_peers:
-            # Wait for the owner's compile to land, then replay outside the lock:
-            # every rank defers the same buckets in the same order, so holding it
-            # across the replay would queue them all behind one another.
+            # Replay outside the lock to avoid serializing cache-hit loads.
+            # After owner death or a timeout, peers may compile concurrently;
+            # TileLang's cache remains responsible for artifact correctness.
             with _claim_prewarm_bucket(f"{shard_key}_m{num_tokens}", wait=True):
                 pass
             replay(num_tokens)
