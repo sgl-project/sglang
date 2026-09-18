@@ -266,7 +266,7 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
-    validate_intel_xpu_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
@@ -386,7 +386,7 @@ def check_load_publish_args(server_args: Any):
         raise ValueError(reason)
 
 
-def validate_intel_xpu_sampling_backend(
+def validate_device_sampling_backend(
     sampling_backend: Optional[str], device: str
 ) -> None:
     # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
