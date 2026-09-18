@@ -154,6 +154,7 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
@@ -200,6 +201,11 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dst_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+                if len(msg) > 19 and msg[19]
+                else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -989,11 +995,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
         pack_buffer=None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: int = 0,
+        dst_attn_tp_size: Optional[int] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
 
+        if dst_kv_item_lens and len(dst_kv_item_lens) != len(dst_kv_ptrs):
+            raise ValueError("PD DCP destination KV lengths must match its buffers")
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             dst_indices = resolve_dcp_dst_entry_indices(
@@ -1004,11 +1015,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             src_kv_ptrs = self.kv_args.kv_data_ptrs
             dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+            if dst_kv_item_lens:
+                dst_kv_item_lens = [dst_kv_item_lens[j] for j in dst_indices]
         else:
             src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
+            if dst_kv_item_lens:
+                _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_item_lens, dst_kv_item_lens
+                )
         num_draft = self.kv_args.num_draft_entries
         num_target = len(src_kv_ptrs) - num_draft
 
@@ -1054,20 +1071,67 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for entry in range(num_target)
             ]
+        sliced_draft_blocks = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
+            if not dst_kv_item_lens and dst_attn_tp_size not in (
+                None,
+                self.attn_tp_size,
+            ):
+                raise ValueError(
+                    "PD DCP with different draft TP sizes requires destination KV lengths"
+                )
             draft_groups = group_concurrent_contiguous(
                 plan.draft_src_token_indices,
                 plan.draft_dst_token_indices,
             )
-            layers_params += [
-                (
-                    src_kv_ptrs[num_target + entry],
-                    dst_kv_ptrs[num_target + entry],
-                    dcp_token_item_lens[num_target + entry],
-                    draft_groups,
+            for entry in range(num_target, num_target + num_draft):
+                src_width = dcp_token_item_lens[entry]
+                dst_width = src_width
+                if dst_kv_item_lens:
+                    dst_width, remainder = divmod(
+                        dst_kv_item_lens[entry], physical_page_size * dst_dcp_size
+                    )
+                    if remainder or dst_width <= 0:
+                        raise ValueError("Invalid PD DCP draft destination token width")
+                if src_width == dst_width:
+                    layers_params.append(
+                        (
+                            src_kv_ptrs[entry],
+                            dst_kv_ptrs[entry],
+                            src_width,
+                            draft_groups,
+                        )
+                    )
+                    continue
+                copy_width = min(src_width, dst_width)
+                if max(src_width, dst_width) % copy_width:
+                    raise ValueError("PD DCP draft KV head shards must divide evenly")
+                if dst_attn_tp_size is None:
+                    raise ValueError(
+                        "PD DCP draft head slicing requires destination TP size"
+                    )
+                src_span = src_width * self.attn_tp_size
+                dst_span = dst_width * dst_attn_tp_size
+                src_rank = self.kv_args.engine_rank // max(1, src_span // dst_span)
+                dst_rank = dst_tp_rank // max(1, dst_span // src_span)
+                src_offset = (dst_rank * dst_width) % src_width
+                dst_offset = (src_rank * src_width) % dst_width
+                src_addrs = (
+                    src_kv_ptrs[entry]
+                    + plan.draft_src_token_indices * src_width
+                    + src_offset
                 )
-                for entry in range(num_draft)
-            ]
+                dst_addrs = (
+                    dst_kv_ptrs[entry]
+                    + plan.draft_dst_token_indices * dst_width
+                    + dst_offset
+                )
+                sliced_draft_blocks.append(
+                    [
+                        (int(src), int(dst), copy_width)
+                        for src, dst in zip(src_addrs, dst_addrs)
+                    ]
+                )
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
@@ -1095,11 +1159,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.submit(process_layer, *layer_params)
                 for layer_params in layers_params
             ]
+            futures.extend(
+                executor.submit(self._transfer_data, mooncake_session_id, blocks)
+                for blocks in sliced_draft_blocks
+            )
             return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for layer_params in layers_params:
             transfer_blocks.extend(set_transfer_blocks(*layer_params))
+        for blocks in sliced_draft_blocks:
+            transfer_blocks.extend(blocks)
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def send_kvcache_slice(
@@ -2008,6 +2078,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                                 pack_buffer=pack_buffer,
+                                dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
                         elif (
                             self.is_mla_backend
@@ -2691,6 +2764,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+                                *self.kv_mgr.kv_args.kv_item_lens,
+                            ),
                         ]
                     )
             except zmq.ZMQError:
