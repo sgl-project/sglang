@@ -7,23 +7,23 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for MiniMax-M2.5 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [MiniMax-M2.5 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
+| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
+| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
+| MiniMax-M2.5 | Ascend A3 Series Products | 4 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
+| MiniMax-M2.5 | Ascend A3 Series Products | 4 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
+| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -33,7 +33,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 4
 
@@ -145,7 +145,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 4
 
@@ -254,7 +254,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -366,7 +366,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -473,7 +473,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 

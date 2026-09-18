@@ -1067,21 +1067,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         elif _is_xpu:
             # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
-            # layout: packed e2m1 [E, N, K/2] plus N-outer ue8m0 scales
-            # [E, N, K/32] uint8, with GPT-OSS's interleaved
+            # layout as-is: packed e2m1 [E, N, K/2] uint8 plus N-outer ue8m0
+            # scales [E, N, K/32] uint8, with GPT-OSS's interleaved
             # [gate_0, up_0, gate_1, up_1, ...] w13 row order (which is exactly
-            # what the swiglu epilogue expects). Scales and biases are already in
-            # the expected dtypes (uint8 / bf16 -- the launcher promotes bias to
-            # fp32 since the kernel accumulates it in fp32), so the only step is
-            # reinterpreting the packed nibbles as int8, matching the dtype the
-            # kernel keys the 4-bit path on. That is a free view, and crucially
-            # there is no bf16 upcast -- the whole point of MXFP4 on XPU.
-            layer.w13_weight = Parameter(
-                layer.w13_weight.data.view(torch.int8), requires_grad=False
-            )
-            layer.w2_weight = Parameter(
-                layer.w2_weight.data.view(torch.int8), requires_grad=False
-            )
+            # what the swiglu epilogue expects). A packed byte holds two e2m1
+            # nibbles rather than an integer, so the torch dtype is only a
+            # container label: the op accepts int8 or uint8, always casts to
+            # uint8_t*, and decodes each nibble (sign bit included) as
+            # float_e2m1_t -- a path selected by the explicit
+            # use_mxfp4_w4a16=True that apply() passes, not by the weight dtype.
+            # Biases stay bf16 (the launcher promotes them to fp32, which is how
+            # the kernel accumulates them). Crucially there is no bf16 upcast of
+            # the weights -- the whole point of MXFP4 on XPU.
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp

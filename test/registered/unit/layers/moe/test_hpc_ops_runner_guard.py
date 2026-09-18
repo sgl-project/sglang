@@ -106,17 +106,30 @@ def test_deepep_v2_quant_contract_rejects_incompatible_fp8(
         _validate_deepep_v2_quant_method(_fp8_method(**overrides))
 
 
+def test_deepep_v2_quant_contract_accepts_unquantized_bf16(_moe_flags):
+    """BF16 experts take the BF16 wire format instead of the FP8 one."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        _deepep_v2_experts_are_fp8,
+        _validate_deepep_v2_quant_method,
+    )
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    _validate_deepep_v2_quant_method(method)
+    assert _deepep_v2_experts_are_fp8(method) is False
+    assert _deepep_v2_experts_are_fp8(_fp8_method()) is True
+
+
 def test_deepep_v2_quant_contract_rejects_incompatible_methods(_moe_flags):
     from sglang.srt.layers.moe.fused_moe_triton.layer import (
         _validate_deepep_v2_quant_method,
     )
-    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8MoEMethod
 
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
-    for method_type in (UnquantizedFusedMoEMethod, W4AFp8MoEMethod):
-        with pytest.raises(ValueError, match=method_type.__name__):
-            _validate_deepep_v2_quant_method(object.__new__(method_type))
+    with pytest.raises(ValueError, match=W4AFp8MoEMethod.__name__):
+        _validate_deepep_v2_quant_method(object.__new__(W4AFp8MoEMethod))
 
 
 def test_deepep_v2_quant_contract_does_not_affect_other_backends(_moe_flags):
