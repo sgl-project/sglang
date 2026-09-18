@@ -38,10 +38,10 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
-    # SM120 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
+    # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
     # probe every API used by the SM120 DSV4 paths since installed builds may
     # expose fp8_einsum but still predate the SM120 kernels.
-    if sm_version == 120 and not _sm120_deep_gemm_apis_available():
+    if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
         return False
 
     try:
@@ -56,7 +56,7 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
-    get_platform().is_sm100 or get_device_sm() == 120
+    get_platform().is_sm100 or get_device_sm() in (120, 121)
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
