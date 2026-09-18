@@ -1,11 +1,11 @@
 import importlib
 import logging
-from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import replace as dataclass_replace
 from itertools import product
 from typing import Any, Callable, ClassVar, Optional, Union
 
+import msgspec
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -25,11 +25,10 @@ _SUPPORTED_COLLECTIVES = {"allreduce", "allgather", "reducescatter"}
 _DEFAULT_SUPPORTED_DTYPES = (torch.float, torch.float16, torch.bfloat16)
 _DEFAULT_GPU_BUFFER_SIZE = 1 << 27
 _TUNING_MESSAGE_SIZES = tuple(1 << exponent for exponent in range(9, 24))
-_ParameterAdapter = Callable[..., None]
+_ParameterAdapter = Callable[..., "_AlgorithmConfig"]
 
 
-@dataclass(frozen=True)
-class _MessageSizeRange:
+class _MessageSizeRange(msgspec.Struct, frozen=True):
     minimum: int
     maximum: int
 
@@ -41,8 +40,7 @@ class _MessageSizeRange:
         return self.minimum <= size <= self.maximum
 
 
-@dataclass(kw_only=True)
-class _AlgorithmConfig(ABC):
+class _AlgorithmConfig(msgspec.Struct, frozen=True, kw_only=True):
     implementation: ClassVar[str]
     name: str
     collective: str
@@ -98,10 +96,12 @@ class _AlgorithmConfig(ABC):
     def resolve_reduce_op(self, reduce_ops):
         return getattr(reduce_ops, self.reduce_op)
 
-    def adapt_to_topology(self, world_size: int, nranks_per_ipc_domain: int):
+    def adapt_to_topology(
+        self, world_size: int, nranks_per_ipc_domain: int
+    ) -> "_AlgorithmConfig":
         if self.parameter_adapter is None:
-            return
-        self.parameter_adapter(
+            return self
+        return self.parameter_adapter(
             self,
             world_size=world_size,
             nranks_per_ipc_domain=nranks_per_ipc_domain,
@@ -127,12 +127,11 @@ class _AlgorithmConfig(ABC):
             return message_size // world_size
         return message_size
 
-    @abstractmethod
     def tuning_launches(self) -> tuple[tuple[int, int], ...]:
         raise NotImplementedError
 
     def bind(self, algorithm) -> "_AlgorithmConfig":
-        return replace(self, algorithm=algorithm)
+        return msgspec.structs.replace(self, algorithm=algorithm)
 
     def select(self, nblocks: int, threads_per_block: int) -> "_AlgorithmConfig":
         if self.algorithm is None:
@@ -206,11 +205,10 @@ class _AlgorithmConfig(ABC):
         )
 
 
-@dataclass(kw_only=True)
 class _DslAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "dsl"
     algo_spec: Any
-    algorithm_kwargs: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    algorithm_kwargs: dict[str, tuple[Any, ...]] = msgspec.field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -240,10 +238,10 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
         world_size: int,
         nranks_per_ipc_domain: int,
         algorithm_kwargs: Optional[dict[str, Any]] = None,
-    ):
+    ) -> "_AlgorithmConfig":
         if self.parameter_adapter is None:
-            return
-        self.parameter_adapter(
+            return self
+        return self.parameter_adapter(
             self,
             world_size=world_size,
             nranks_per_ipc_domain=nranks_per_ipc_domain,
@@ -252,7 +250,7 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
         )
 
     def bind(self, algorithm, algo_spec) -> "_AlgorithmConfig":
-        return replace(self, algorithm=algorithm, algo_spec=algo_spec)
+        return msgspec.structs.replace(self, algorithm=algorithm, algo_spec=algo_spec)
 
     def dsl_name(
         self,
@@ -267,7 +265,6 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
         return f"{self.name}_{ipc_domain_count}node_{variant}{threads_per_block}TPB"
 
 
-@dataclass(kw_only=True)
 class _NativeAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "native"
     nblocks: tuple[int, ...]
@@ -296,7 +293,7 @@ class _NativeAlgorithmConfig(_AlgorithmConfig):
         launch = (nblocks, threads_per_block)
         if launch not in self.tuning_launches():
             raise ValueError(f"Invalid launch selection for algorithm {self.name}")
-        return replace(self, selected_launch_parameters=launch)
+        return msgspec.structs.replace(self, selected_launch_parameters=launch)
 
     def selected_launch(self) -> tuple[int, int]:
         if self.selected_launch_parameters is None:
@@ -304,7 +301,6 @@ class _NativeAlgorithmConfig(_AlgorithmConfig):
         return self.selected_launch_parameters
 
 
-@dataclass(kw_only=True)
 class _CompositeAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "composite"
 
@@ -320,6 +316,7 @@ class _CompositeAlgorithmConfig(_AlgorithmConfig):
 _DEFAULT_THREADS_PER_BLOCK = (256, 512, 768, 1024)
 _DEFAULT_THREAD_BLOCK_GROUP_SIZES = (1, 2, 4, 8)
 _SUPPORTED_WORLD_SIZES = (4, 8, 16, 32, 64)
+_NATIVE_SUPPORTED_WORLD_SIZES = (4, 8, 16, 32)
 _NATIVE_IPC_DOMAIN_COUNTS = (1,)
 _MULTI_NODE_IPC_DOMAIN_COUNTS = (2, 4, 8)
 
@@ -329,17 +326,16 @@ def _adapt_allreduce_packet(
     *,
     world_size: int,
     nranks_per_ipc_domain: int,
-) -> bool:
+) -> _AlgorithmConfig:
     if not isinstance(config, _NativeAlgorithmConfig):
         raise TypeError("AllReduce packet adaptation requires a native config")
     if world_size != nranks_per_ipc_domain:
-        return False
+        return config
     min_blocks = nranks_per_ipc_domain - 1
     nblocks = tuple(nblocks for nblocks in config.nblocks if nblocks >= min_blocks)
     if not nblocks:
-        return False
-    config.nblocks = nblocks
-    return True
+        return config
+    return msgspec.structs.replace(config, nblocks=nblocks)
 
 
 def _adapt_dsl_message_size_range(
@@ -349,16 +345,18 @@ def _adapt_dsl_message_size_range(
     nranks_per_ipc_domain: int,
     algorithm_kwargs: dict[str, Any],
     **_: Any,
-) -> bool:
+) -> _AlgorithmConfig:
     if not isinstance(config, _DslAlgorithmConfig):
         raise TypeError("DSL message size adaptation requires a DSL config")
     ipc_domain_count = world_size // nranks_per_ipc_domain
     thread_block_group_size = algorithm_kwargs.get("thread_block_group_size", 1)
-    config.message_size_range = _MessageSizeRange(
-        minimum=config.message_size_range.minimum * thread_block_group_size,
-        maximum=config.message_size_range.maximum * ipc_domain_count,
+    return msgspec.structs.replace(
+        config,
+        message_size_range=_MessageSizeRange(
+            minimum=config.message_size_range.minimum * thread_block_group_size,
+            maximum=config.message_size_range.maximum * ipc_domain_count,
+        ),
     )
-    return True
 
 
 def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
@@ -366,7 +364,7 @@ def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
         _NativeAlgorithmConfig(
             name="default_allreduce_nvls_packet",
             collective="allreduce",
-            world_sizes=_SUPPORTED_WORLD_SIZES,
+            world_sizes=_NATIVE_SUPPORTED_WORLD_SIZES,
             ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
             message_size_range=_MessageSizeRange(0, 512 << 10),
             nblocks=(4, 8, 12, 16),
@@ -377,7 +375,7 @@ def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
         _NativeAlgorithmConfig(
             name="default_allreduce_packet",
             collective="allreduce",
-            world_sizes=_SUPPORTED_WORLD_SIZES,
+            world_sizes=_NATIVE_SUPPORTED_WORLD_SIZES,
             ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
             message_size_range=_MessageSizeRange(0, 2 << 20),
             nblocks=(14, 21, 28, 42, 56),
@@ -388,7 +386,7 @@ def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
         _NativeAlgorithmConfig(
             name="default_allreduce_rsag_zero_copy",
             collective="allreduce",
-            world_sizes=(4, 8, 16, 32),
+            world_sizes=_NATIVE_SUPPORTED_WORLD_SIZES,
             ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
             message_size_range=_MessageSizeRange(512 << 10, 4 << 30),
             nblocks=(32, 48, 64, 128),
@@ -398,7 +396,7 @@ def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
         _NativeAlgorithmConfig(
             name="default_allreduce_nvls_zero_copy",
             collective="allreduce",
-            world_sizes=_SUPPORTED_WORLD_SIZES,
+            world_sizes=_NATIVE_SUPPORTED_WORLD_SIZES,
             ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
             message_size_range=_MessageSizeRange(1 << 10, 4 << 30),
             nblocks=(4, 8, 12, 16, 32),
@@ -425,13 +423,13 @@ def _create_algorithm_configs(language) -> tuple[_AlgorithmConfig, ...]:
         use_double_scratch_buffer=True,
         buffer_alignment=16,
     )
-    allgather_spec = replace(
+    allgather_spec = dataclass_replace(
         default_spec,
         name="allgather_multi_nodes",
         collective=language.collectives.AllGather(0, 1, False),
         in_place=False,
     )
-    reduce_scatter_spec = replace(
+    reduce_scatter_spec = dataclass_replace(
         default_spec,
         name="reducescatter_multi_nodes",
         collective=language.collectives.ReduceScatter(0, 1, True),
@@ -482,8 +480,7 @@ def _create_algorithm_configs(language) -> tuple[_AlgorithmConfig, ...]:
     return (*dsl_configs, *_create_native_algorithm_configs())
 
 
-@dataclass(frozen=True)
-class _TwoKernelAllReduce:
+class _TwoKernelAllReduce(msgspec.Struct, frozen=True):
     name: str
     reduce_scatter: Any
     allgather: Any
@@ -507,13 +504,6 @@ class _TwoKernelAllReduce:
         nthreads_per_block,
         symmetric_memory,
     ):
-        if input_buffer != output_buffer:
-            raise ValueError("RSAG AllReduce requires in-place buffers")
-        if input_size % (16 * self.world_size) != 0:
-            raise ValueError(
-                f"RSAG AllReduce input size {input_size} must be divisible "
-                f"by {16 * self.world_size}"
-            )
         shard_size = input_size // self.world_size
 
         result = self.reduce_scatter.execute(
@@ -624,7 +614,7 @@ class PyMscclppCommunicator:
         for values in product(*config.algorithm_kwargs.values()):
             algorithm_kwargs = dict(zip(algorithm_kwarg_names, values))
             for threads_per_block in config.threads_per_block:
-                spec = replace(
+                spec = dataclass_replace(
                     config.algo_spec,
                     name=config.dsl_name(
                         ipc_domain_count,
@@ -636,8 +626,7 @@ class PyMscclppCommunicator:
                     world_size=self.world_size,
                     num_threads_per_block=threads_per_block,
                 )
-                candidate = replace(config)
-                candidate.adapt_to_topology(
+                candidate = config.adapt_to_topology(
                     self.world_size,
                     self.nranks_per_ipc_domain,
                     algorithm_kwargs,
@@ -682,7 +671,9 @@ class PyMscclppCommunicator:
                 continue
             message_range = config.message_size_range
             algo.set_message_size_range(message_range.minimum, message_range.maximum)
-            config.adapt_to_topology(self.world_size, self.nranks_per_ipc_domain)
+            config = config.adapt_to_topology(
+                self.world_size, self.nranks_per_ipc_domain
+            )
             algorithms.append(config.bind(algo))
 
         return algorithms
@@ -811,11 +802,23 @@ class PyMscclppCommunicator:
             )
 
         result = run()
-        if result != 0:
-            raise RuntimeError(
-                f"MSCCL++ {algorithm_config.collective} tuning failed "
-                f"with error code {result}"
-            )
+        failed = torch.tensor([int(result != 0)], dtype=torch.int32)
+        dist.all_reduce(failed, op=ReduceOp.MAX, group=self.group)
+        if failed.item():
+            if result != 0:
+                logger.warning(
+                    "MSCCL++ %s tuning candidate failed on rank %d with error "
+                    "code %s; skipping algorithm=%s message_bytes=%d "
+                    "nblocks=%d nthreads=%d",
+                    algorithm_config.collective,
+                    self.rank,
+                    result,
+                    algorithm_config.name,
+                    message_size,
+                    nblocks,
+                    nthreads,
+                )
+            return float("inf")
 
         for _ in range(n_warmup):
             run()
@@ -1094,12 +1097,7 @@ class PyMscclppCommunicator:
         self.comm = self.mscclpp.CommGroup(
             torch_group=self.group, rank=self.rank, size=self.world_size
         )
-        nranks_per_ipc_domain = getattr(self.comm, "nranks_per_ipc_domain", None)
-        self.nranks_per_ipc_domain = (
-            self.comm.nranks_per_node
-            if nranks_per_ipc_domain is None
-            else nranks_per_ipc_domain
-        )
+        self.nranks_per_ipc_domain = self.comm.nranks_per_ipc_domain
         self.executor = self.mscclpp.Executor(self.comm.communicator)
         self.symm_mem_enabled = self._is_symm_mem_enabled()
         try:
