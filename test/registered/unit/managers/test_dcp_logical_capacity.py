@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -107,7 +108,7 @@ def make_scheduler(worker):
     return scheduler
 
 
-class TestDcpLogicalCapacity(unittest.TestCase):
+class TestDcpLogicalCapacity(CustomTestCase):
     def setUp(self):
         for config in (
             patch(
