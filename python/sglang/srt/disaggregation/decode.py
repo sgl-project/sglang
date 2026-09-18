@@ -397,6 +397,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
+        from sglang.srt.disaggregation.decode_hrrn import DecodeHrrn
+
+        policy = envs.SGLANG_DECODE_PREALLOC_POLICY.get()
+        if policy not in ("fcfs", "hrrn"):
+            raise ValueError("Decode preallocation policy must be fcfs or hrrn")
+        self._hrrn = DecodeHrrn() if policy == "hrrn" else None
+        if self._hrrn is not None and scheduler.enable_priority_scheduling:
+            raise ValueError("Decode HRRN cannot be combined with explicit priority")
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
@@ -1186,6 +1194,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        if self._hrrn is not None:
+            self._hrrn.order(self.queue)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1417,6 +1428,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if self._hrrn is not None:
+                self._hrrn.admitted(decode_req.req.rid)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
