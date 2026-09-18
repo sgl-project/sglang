@@ -6,6 +6,13 @@
 
 use crate::message::response::{ChunkEvent, ChunkExtras};
 
+/// Request options that determine logprob metadata presence, including empty data.
+#[derive(Clone, Copy, Default)]
+pub(super) struct LogprobOptions {
+    pub return_logprob: bool,
+    pub top_logprobs_num: i64,
+}
+
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.
 fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
@@ -162,7 +169,12 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
-pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+pub(super) fn frame_value(
+    out: &ChunkEvent,
+    cumulative: &ChunkEvent,
+    rid: &str,
+    options: LogprobOptions,
+) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -175,6 +187,26 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     });
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
+    }
+    // Python slices only output-side arrays for incremental streaming. Input
+    // candidates and the output logprob count retain their cumulative values.
+    if options.return_logprob {
+        let extras = cumulative.extras.as_deref();
+        v["meta_info"]["output_token_logprobs_length"] =
+            serde_json::json!(extras.map_or(0, |ex| ex.out_lp_val.len()));
+        if options.top_logprobs_num > 0 {
+            v["meta_info"]["input_top_logprobs"] = extras.map_or_else(
+                || serde_json::json!([]),
+                |ex| {
+                    ragged_logprob_tuples(
+                        &ex.in_top_val,
+                        &ex.in_top_idx,
+                        &ex.in_top_lens,
+                        opt_texts(&ex.in_top_txt),
+                    )
+                },
+            );
+        }
     }
     // Logprobs + hidden states ride behind the boxed extras (absent for a plain
     // token/text frame). `[logprob, token_id, text|null]` tuples; text
@@ -199,14 +231,6 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
             &ex.out_top_idx,
             &ex.out_top_lens,
             opt_texts(&ex.out_top_txt),
-        );
-    }
-    if !ex.in_top_lens.is_empty() {
-        v["meta_info"]["input_top_logprobs"] = ragged_logprob_tuples(
-            &ex.in_top_val,
-            &ex.in_top_idx,
-            &ex.in_top_lens,
-            opt_texts(&ex.in_top_txt),
         );
     }
     if !ex.out_tid_lens.is_empty() {
@@ -242,6 +266,7 @@ pub(super) fn cumulative_frame_json(
     acc: &OutputAccumulator,
     rid: &str,
     index: Option<usize>,
+    options: LogprobOptions,
 ) -> Option<String> {
     use std::fmt::Write;
 
@@ -274,7 +299,8 @@ pub(super) fn cumulative_frame_json(
         let v = acc.in_lp_json.as_deref().unwrap_or("[]");
         let _ = write!(m, ",\"input_token_logprobs\":{v}");
     }
-    if let Some(v) = &acc.in_top_json {
+    if options.return_logprob && options.top_logprobs_num > 0 {
+        let v = acc.in_top_json.as_deref().unwrap_or("[]");
         let _ = write!(m, ",\"input_top_logprobs\":{v}");
     }
     // The `Value` path keys these off the source columns being non-empty; an empty
@@ -284,6 +310,10 @@ pub(super) fn cumulative_frame_json(
     }
     if lp_pair {
         let _ = write!(m, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
+    }
+    if options.return_logprob {
+        let length = o.extras.as_deref().map_or(0, |ex| ex.out_lp_val.len());
+        let _ = write!(m, ",\"output_token_logprobs_length\":{length}");
     }
     if !acc.out_top_json.is_empty() {
         let _ = write!(m, ",\"output_top_logprobs\":[{}]", acc.out_top_json);
@@ -323,11 +353,15 @@ pub(super) fn stream_frame_string(
     incremental: bool,
     rid_str: &str,
     index: Option<usize>,
+    options: LogprobOptions,
 ) -> String {
     if !incremental {
-        return cumulative_frame_string(acc, rid_str, index);
+        return cumulative_frame_string(acc, rid_str, index, options);
     }
-    tag_value(stream_frame_value(delta, acc, true, rid_str), index)
+    tag_value(
+        stream_frame_value(delta, acc, true, rid_str, options),
+        index,
+    )
 }
 
 /// A cumulative frame's JSON, built purely from the accumulator (which is why a
@@ -336,9 +370,14 @@ pub(super) fn cumulative_frame_string(
     acc: &OutputAccumulator,
     rid_str: &str,
     index: Option<usize>,
+    options: LogprobOptions,
 ) -> String {
-    cumulative_frame_json(acc, rid_str, index)
-        .unwrap_or_else(|| tag_value(frame_value(acc.snapshot(), rid_str), index))
+    cumulative_frame_json(acc, rid_str, index, options).unwrap_or_else(|| {
+        tag_value(
+            frame_value(acc.snapshot(), acc.snapshot(), rid_str, options),
+            index,
+        )
+    })
 }
 
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
@@ -348,13 +387,14 @@ pub(super) fn stream_frame_value(
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
+    options: LogprobOptions,
 ) -> serde_json::Value {
     if incremental {
         let mut d = delta;
         d.completion_tokens = acc.snapshot().completion_tokens;
-        frame_value(&d, rid_str)
+        frame_value(&d, acc.snapshot(), rid_str, options)
     } else {
-        frame_value(acc.snapshot(), rid_str)
+        frame_value(acc.snapshot(), acc.snapshot(), rid_str, options)
     }
 }
 
@@ -620,7 +660,15 @@ mod tests {
             })),
             ..Default::default()
         };
-        let frame = frame_value(&out, "1");
+        let frame = frame_value(
+            &out,
+            &out,
+            "1",
+            LogprobOptions {
+                return_logprob: true,
+                top_logprobs_num: 0,
+            },
+        );
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -673,6 +721,64 @@ mod tests {
         serde_json::from_str(frame).expect("a frame must be valid JSON")
     }
 
+    #[test]
+    fn logprob_metadata_presence_follows_request_options() {
+        for extras in [
+            None,
+            Some(ChunkExtras::default()),
+            Some(ChunkExtras {
+                hidden_val: vec![1.0],
+                hidden_lens: vec![1],
+                ..Default::default()
+            }),
+            Some(ChunkExtras {
+                in_top_val: vec![-0.5],
+                in_top_idx: vec![7],
+                in_top_lens: vec![0, 1],
+                out_lp_val: vec![-0.25, -0.5],
+                out_lp_idx: vec![8, 9],
+                ..Default::default()
+            }),
+        ] {
+            let count = extras.as_ref().map_or(0, |ex| ex.out_lp_val.len());
+            let expected_input = if count == 0 {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([null, [[-0.5, 7, null]]])
+            };
+            let out = ChunkEvent {
+                // Metadata counts probability records, not visible token IDs.
+                token_ids: vec![8],
+                completion_tokens: 3,
+                extras: extras.map(Box::new),
+                ..Default::default()
+            };
+            let mut acc = OutputAccumulator::default();
+            acc.fold(&out);
+            for (return_logprob, top_logprobs_num) in [(false, 0), (false, 2), (true, 0), (true, 2)]
+            {
+                let options = LogprobOptions {
+                    return_logprob,
+                    top_logprobs_num,
+                };
+                let value = frame_value(&out, &out, "request", options);
+                let meta = &value["meta_info"];
+                assert_eq!(
+                    meta.get("output_token_logprobs_length"),
+                    return_logprob.then(|| serde_json::json!(count)).as_ref()
+                );
+                assert_eq!(
+                    meta.get("input_top_logprobs"),
+                    (return_logprob && top_logprobs_num > 0).then_some(&expected_input)
+                );
+                assert_eq!(
+                    as_json(&cumulative_frame_json(&acc, "request", None, options).unwrap()),
+                    value
+                );
+            }
+        }
+    }
+
     /// The memoized cumulative fast path must emit the **same JSON document** as the
     /// `serde_json::Value` builder it replaces — same keys, same values, same
     /// escaping. Covers unicode and control chars, an empty-ids first frame, a
@@ -723,8 +829,17 @@ mod tests {
             let mut acc = OutputAccumulator::default();
             for d in &deltas {
                 acc.fold(d);
-                let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
-                let slow = tag_value(frame_value(acc.snapshot(), "7"), index);
+                let fast = cumulative_frame_json(&acc, "7", index, LogprobOptions::default())
+                    .expect("no extras → fast path");
+                let slow = tag_value(
+                    frame_value(
+                        acc.snapshot(),
+                        acc.snapshot(),
+                        "7",
+                        LogprobOptions::default(),
+                    ),
+                    index,
+                );
                 println!("fast={fast:?}");
                 println!("slow={slow:?}");
                 assert_eq!(
@@ -742,6 +857,10 @@ mod tests {
     /// `return_text_in_logprobs` texts and with a null ragged position.
     #[test]
     fn cumulative_frame_json_matches_serde_with_logprobs() {
+        let options = LogprobOptions {
+            return_logprob: true,
+            top_logprobs_num: 2,
+        };
         for with_texts in [false, true] {
             let txt = |v: &[&str]| -> Vec<String> {
                 if with_texts {
@@ -827,9 +946,12 @@ mod tests {
                 let mut acc = OutputAccumulator::default();
                 for d in &deltas {
                     acc.fold(d);
-                    let fast = cumulative_frame_json(&acc, "9", index)
+                    let fast = cumulative_frame_json(&acc, "9", index, options)
                         .expect("the extras memo must stay valid for a well-formed request");
-                    let slow = tag_value(frame_value(acc.snapshot(), "9"), index);
+                    let slow = tag_value(
+                        frame_value(acc.snapshot(), acc.snapshot(), "9", options),
+                        index,
+                    );
                     assert_eq!(
                         as_json(&fast),
                         as_json(&slow),
@@ -846,6 +968,10 @@ mod tests {
     /// the `Value` builder rather than emit a frame that disagrees with it.
     #[test]
     fn mismatched_logprob_texts_fall_back_to_the_value_path() {
+        let options = LogprobOptions {
+            return_logprob: true,
+            top_logprobs_num: 1,
+        };
         let mut acc = OutputAccumulator::default();
         acc.fold(&ChunkEvent {
             rid: "1".into(),
@@ -856,7 +982,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        assert!(cumulative_frame_json(&acc, "1", None).is_some());
+        assert!(cumulative_frame_json(&acc, "1", None, options).is_some());
         acc.fold(&ChunkEvent {
             rid: "1".into(),
             extras: Some(Box::new(ChunkExtras {
@@ -868,8 +994,12 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            cumulative_frame_json(&acc, "1", None).is_none(),
+            cumulative_frame_json(&acc, "1", None, options).is_none(),
             "a text column out of lockstep must invalidate the memo"
+        );
+        assert_eq!(
+            as_json(&cumulative_frame_string(&acc, "1", None, options)),
+            frame_value(acc.snapshot(), acc.snapshot(), "1", options)
         );
     }
 }

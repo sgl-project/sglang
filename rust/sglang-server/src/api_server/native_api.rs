@@ -26,7 +26,8 @@ use tokio::sync::mpsc;
 
 use super::app::AppState;
 use super::frame::{
-    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
+    LogprobOptions, OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string,
+    tag_value,
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
@@ -276,6 +277,10 @@ async fn generate_single(
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
+    let options = LogprobOptions {
+        return_logprob: req.return_logprob,
+        top_logprobs_num: req.top_logprobs_num,
+    };
     let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
     {
         Ok(v) => v,
@@ -292,13 +297,19 @@ async fn generate_single(
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx, timing)], guard, incremental, false)
-            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+        let s = generation_event_stream(
+            vec![(rid_str, rx, timing, options)],
+            guard,
+            incremental,
+            false,
+        )
+        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing(), timing).await;
+        let (status, value, terminal) =
+            drain_unary(&mut rx, rid_str.client_facing(), timing, options).await;
         if terminal {
             guard.disarm(&rid_str);
         }
@@ -312,6 +323,7 @@ async fn drain_unary(
     rx: &mut mpsc::Receiver<ResponseItem>,
     rid_str: &str,
     mut timing: RequestTiming,
+    options: LogprobOptions,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
@@ -335,7 +347,7 @@ async fn drain_unary(
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     return (status, error_value(code, message), true);
                 }
-                let mut value = frame_value(&final_out, rid_str);
+                let mut value = frame_value(&final_out, &final_out, rid_str, options);
                 add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value, true);
             }
@@ -376,10 +388,14 @@ async fn generate_batch(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
+        let options = LogprobOptions {
+            return_logprob: req.return_logprob,
+            top_logprobs_num: req.top_logprobs_num,
+        };
         match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((rid, rx)) => {
                 guard.arm(rid.clone());
-                receivers.push((rid, rx, timing.clone()));
+                receivers.push((rid, rx, timing.clone(), options));
             }
             Err(resp) => return resp,
         }
@@ -398,10 +414,10 @@ async fn generate_batch(
         // preserves input order for the final JSON array, while each drain observes
         // its own terminal output promptly (important for per-item e2e_latency).
         let drained = futures::future::join_all(receivers.into_iter().map(
-            |(rid_str, mut rx, request_timing)| async move {
+            |(rid_str, mut rx, request_timing, options)| async move {
                 let client_rid = rid_str.client_facing().to_owned();
                 let (_status, value, terminal) =
-                    drain_unary(&mut rx, &client_rid, request_timing).await;
+                    drain_unary(&mut rx, &client_rid, request_timing, options).await;
                 (rid_str, value, terminal)
             },
         ))
@@ -439,7 +455,12 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
+    receivers: Vec<(
+        Rid,
+        mpsc::Receiver<ResponseItem>,
+        RequestTiming,
+        LogprobOptions,
+    )>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -450,11 +471,15 @@ fn generation_event_stream(
         let n = receivers.len();
         let rid_strs: Vec<Rid> = receivers
             .iter()
-            .map(|(rid, _, _)| rid.clone())
+            .map(|(rid, _, _, _)| rid.clone())
             .collect();
         let mut timings: Vec<RequestTiming> = receivers
             .iter()
-            .map(|(_, _, timing)| timing.clone())
+            .map(|(_, _, timing, _)| timing.clone())
+            .collect();
+        let options: Vec<LogprobOptions> = receivers
+            .iter()
+            .map(|(_, _, _, options)| *options)
             .collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
@@ -465,7 +490,7 @@ fn generation_event_stream(
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
         let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, (_, rx, _)) in receivers.into_iter().enumerate() {
+        for (i, (_, rx, _, _)) in receivers.into_iter().enumerate() {
             futs.push(recv_indexed(i, rx));
         }
 
@@ -489,7 +514,7 @@ fn generation_event_stream(
                         timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
-                            yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
+                            yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i), options[i]);
                         } else {
                             coalesced = true;
                         }
@@ -523,12 +548,13 @@ fn generation_event_stream(
                         rid_strs[i].client_facing(),
                         idx(i),
                         &timings[i],
+                        options[i],
                     ),
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
-                    yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
+                    yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i), options[i]);
                 }
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
@@ -559,8 +585,9 @@ fn terminal_stream_frame_string(
     rid_str: &str,
     index: Option<usize>,
     timing: &RequestTiming,
+    options: LogprobOptions,
 ) -> String {
-    let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str);
+    let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str, options);
     add_e2e_latency(&mut value, timing);
     tag_value(value, index)
 }
@@ -610,7 +637,12 @@ mod tests {
     fn timed_receiver(
         rid: u64,
         rx: mpsc::Receiver<ResponseItem>,
-    ) -> (Rid, mpsc::Receiver<ResponseItem>, RequestTiming) {
+    ) -> (
+        Rid,
+        mpsc::Receiver<ResponseItem>,
+        RequestTiming,
+        LogprobOptions,
+    ) {
         (
             Rid::from(rid.to_string()),
             rx,
@@ -619,7 +651,119 @@ mod tests {
                 time_to_first_token: None,
                 e2e_latency: None,
             },
+            LogprobOptions::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn logprob_metadata_survives_unary_and_mixed_batch_streams() {
+        use crate::message::response::ChunkExtras;
+
+        let options = [
+            LogprobOptions::default(),
+            LogprobOptions {
+                return_logprob: true,
+                top_logprobs_num: 0,
+            },
+            LogprobOptions {
+                return_logprob: true,
+                top_logprobs_num: 2,
+            },
+        ];
+        let item = |index: usize, step| {
+            let extras = match step {
+                0 => ChunkExtras {
+                    in_top_val: vec![-0.5],
+                    in_top_idx: vec![7],
+                    in_top_lens: vec![0, 1],
+                    out_lp_val: vec![-0.25, -0.5],
+                    out_lp_idx: vec![8, 9],
+                    ..Default::default()
+                },
+                1 => ChunkExtras {
+                    out_lp_val: vec![-0.75],
+                    out_lp_idx: vec![10],
+                    ..Default::default()
+                },
+                // No new extras at termination: cumulative metadata must survive.
+                _ => return done(index as u64, ""),
+            };
+            ResponseItem::Frame(ChunkEvent {
+                extras: Some(Box::new(extras)),
+                ..Default::default()
+            })
+        };
+        let receiver = |index: usize| {
+            let (tx, rx) = mpsc::channel(3);
+            let mut entry = timed_receiver(index as u64, rx);
+            entry.3 = options[index];
+            (tx, entry)
+        };
+        let check = |value: &serde_json::Value, index: usize, count: usize| {
+            let meta = &value["meta_info"];
+            assert_eq!(
+                meta.get("output_token_logprobs_length"),
+                options[index]
+                    .return_logprob
+                    .then(|| serde_json::json!(count))
+                    .as_ref()
+            );
+            assert_eq!(
+                meta.get("input_top_logprobs"),
+                (index == 2)
+                    .then(|| serde_json::json!([null, [[-0.5, 7, null]]]))
+                    .as_ref()
+            );
+        };
+
+        for index in 0..options.len() {
+            let (tx, (rid, mut rx, timing, config)) = receiver(index);
+            for step in 0..3 {
+                tx.try_send(item(index, step)).unwrap();
+            }
+            let (status, value, terminal) =
+                drain_unary(&mut rx, rid.client_facing(), timing, config).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(terminal);
+            assert_eq!(
+                value["meta_info"]["output_token_logprobs"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                3
+            );
+            check(&value, index, 3);
+        }
+        for incremental in [false, true] {
+            let (txs, receivers): (Vec<_>, Vec<_>) = (0..options.len()).map(&receiver).unzip();
+            let stream = generation_event_stream(
+                receivers,
+                AbortGuard::new_empty(senders()),
+                incremental,
+                true,
+            );
+            futures::pin_mut!(stream);
+            // Poll between sends so cumulative mode exercises intermediate frames,
+            // and each result retains its options across other results' events.
+            for step in 0..3 {
+                for index in [2, 0, 1] {
+                    txs[index].try_send(item(index, step)).unwrap();
+                    let value = parse(&stream.next().await.unwrap());
+                    assert_eq!(value["index"], index);
+                    check(&value, index, [2, 3, 3][step]);
+                    let records = value["meta_info"]
+                        .get("output_token_logprobs")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len);
+                    assert_eq!(
+                        records,
+                        if incremental { [2, 1, 0] } else { [2, 3, 3] }[step]
+                    );
+                }
+            }
+            assert_eq!(stream.next().await.unwrap(), "[DONE]");
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]
@@ -696,7 +840,8 @@ mod tests {
             time_to_first_token: None,
             e2e_latency: None,
         };
-        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", timing).await;
+        let (status, value, terminal) =
+            drain_unary(&mut rx, "client-rid", timing, LogprobOptions::default()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(terminal);
         assert_eq!(value["meta_info"]["id"], "client-rid");
