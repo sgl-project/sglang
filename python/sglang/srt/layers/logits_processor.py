@@ -639,6 +639,32 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
+        # Guard against empty hidden_states. Under DP attention, some DP
+        # ranks may receive zero tokens for a given batch (e.g., when the
+        # batch has fewer requests than dp_size). The model forward already
+        # skips the final norm for empty states (see MiniMaxM2Model.forward),
+        # so hidden_states arrives here as a size-0 tensor. Indexing it
+        # would raise IndexError; return empty results instead.
+        if hidden_states.shape[0] == 0:
+            # When aux_hidden_states is not None (e.g., EAGLE3 capture),
+            # set aux_pruned_states to match so that downstream assertions
+            # in _get_hidden_states_to_store (assert aux_pruned_states is
+            # not None) are satisfied.
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden for hidden in aux_hidden_states]
+                )
+            return (
+                hidden_states,
+                pruned_states_before_norm,
+                aux_pruned_states,
+                None,  # sample_indices
+                None,  # input_logprob_indices
+                token_to_seq_idx,
+            )
+
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
