@@ -139,8 +139,8 @@ chooses its implementation:
 Callers set this field before building the router. A missing model in the reorg
 map returns 404, without falling back to legacy routing. This PR adds the
 programmatic configuration switch; CLI/configuration factory construction and
-concrete production policies remain follow-ups. No default attaches the
-power-of-two placeholder to serving.
+the remaining production policies remain follow-ups. Power-of-two is implemented
+for explicit attachments; the default serving path remains legacy.
 
 Both implementations reuse request preparation (including sampling validation
 and tokenization), forwarding, streaming, middleware, and the 32 MiB body limit.
@@ -244,8 +244,18 @@ behavior. Other required state handles belong to the checker.
 Power-of-two first selects an engine, then calls admission exactly once on that
 engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
 resample, choose the other sampled engine, or run a policy fallback. No candidates
-returns `NoCandidates` without invoking admission. The empty and single-candidate
-paths are implemented; two-candidate sampling and load comparison remain in #40271.
+returns `NoCandidates` without invoking admission. A single candidate is selected
+directly; otherwise two distinct candidates are sampled uniformly, and the one
+with lower stage pressure wins. A complete tie keeps the first sampled engine.
+
+Power-of-two reuses the existing pure pressure-comparison functions. Plain and
+prefill stages compare estimated prefill queue time when both reports provide it,
+then waiting uncached tokens, waiting requests, and running requests. Decode
+compares waiting requests, running requests, KV usage fraction, then used KV tokens.
+Reported-pressure ties use router-local active requests. If either sampled engine
+lacks a fresh, complete native report with valid capacity, both are compared by
+router-local active requests instead. Basic reports from older publishers are
+still passed to admission when fresh, but do not supply native pressure metrics.
 
 Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
@@ -355,10 +365,11 @@ reports change after selection; it neither recaptures nor reserves capacity.
 Fallback policies read their own state and do not share snapshots with callers.
 
 Snapshot capture still scans the full table; an engine-scoped reader can be added
-if profiling justifies it. Multi-candidate sampling/comparison and concrete
-load-aware admission remain in #40271. Shared load interpretation, router-local
-fallback, and correction for dispatches since the report remain follow-ups; these
-must preserve source, freshness, and available measurements without adding another
+if profiling justifies it. Power-of-two reuses the legacy prefill/decode pressure
+comparisons, including router-local fallback. Concrete load-aware admission remains
+in #40271. Further shared load interpretation and correction for dispatches since
+the report remain follow-ups; these must preserve source, freshness, and available
+measurements without adding another
 independent in-flight counter. Load and cache observations are not an atomic global
 snapshot. Preserve request-guard cleanup.
 
@@ -535,7 +546,8 @@ Implemented here:
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
-  and `AllowAll`. Power-of-two checks its selected engine with no replacement on rejection.
+  and `AllowAll`. Power-of-two samples two distinct engines, compares stage pressure,
+  and checks its selected engine with no replacement on rejection.
 - Policy-owned load dependency and local observations. Power-of-two passes the
   selected engine's load record directly to admission, without another snapshot.
   `PickRequest`, `Pick`, and bucket APIs carry no load observations.
@@ -545,13 +557,12 @@ Implemented here:
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
 
-Follow-up order: power-of-two and admission (#40271), then bucket SLO ordering
+Follow-up order: concrete admission (#40271), then bucket SLO ordering
 in a separate PR, followed by remaining policies and production configuration.
 
 Not yet implemented in the reorg path:
 
-- Power-of-two sampling/load comparison for multiple candidates, other
-  policies, and capacity/in-flight admission checks.
+- Other concrete policies and capacity/in-flight admission checks.
 - SLO estimates, targets, and bucket preference ordering.
 - CLI/configuration parsing, validation, and model-specific construction.
   The YAML above is illustrative; reorg resolvers are installed in code.

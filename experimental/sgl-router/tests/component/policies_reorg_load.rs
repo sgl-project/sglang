@@ -76,10 +76,20 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
     policy.admission = admission.clone();
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
-    let engines = [engine()];
+    let alternative = Arc::new(Worker::new(WorkerSpec {
+        id: WorkerId("b".into()),
+        url: "http://other".into(),
+        mode: Stage::Plain,
+        model_ids: vec![ModelId("m".into())],
+        bootstrap_port: None,
+    }));
+    // These old-format reports lack native pressure metrics, so selection uses
+    // local active counts for both candidates and chooses the second engine.
+    let _busy = alternative.load_guard();
+    let engines = [alternative, engine()];
     for _ in 0..2 {
         let pick = policy.pick(&engines, &request).await.unwrap();
-        assert!(Arc::ptr_eq(&pick.engine, &engines[0]));
+        assert!(Arc::ptr_eq(&pick.engine, &engines[1]));
     }
     let observations = admission.observations.lock().unwrap();
     assert_eq!(observations.len(), 2);
