@@ -2345,6 +2345,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+    # A full prefill has one result but can span several run_batch calls.
+    split_prefill_start: Optional[Tuple[int, float]] = None
 
     # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
     # not read by ForwardBatch), stale in spec draft window
@@ -3790,6 +3792,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
+            split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
         )
 
