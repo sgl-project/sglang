@@ -15,7 +15,10 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -23,6 +26,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -322,6 +326,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+
+        # LiteTopk fused indexer top-k (SM100, prefill only, opt-in): scoring +
+        # top-k in one pass, never materializing the [num_q, seq_len] logits.
+        # GLM DSA shape only (H=32, D=128), and incompatible with forced
+        # init/local token inclusion (no logits buffer to mask). Its output is
+        # gathered-KV positions, so _get_topk_ragged also requires the RAGGED
+        # top-k transform of the batch.
+        if _is_cuda and envs.SGLANG_ENABLE_DSA_LITETOPK.get():
+            from sglang.kernels.ops.attention.dsa import dsa_litetopk_is_supported
+
+            self.use_dsa_litetopk = (
+                self.n_heads == 32
+                and self.head_dim == 128
+                and self.num_init_tokens == 0
+                and self.num_local_tokens == 0
+                and dsa_litetopk_is_supported()
+            )
+        else:
+            self.use_dsa_litetopk = False
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -1050,6 +1073,43 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
 
+    def _get_topk_ragged_litetopk(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        indexer_seq_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """LiteTopk fused prefill top-k: scoring + gate + exact select in one
+        KV pass; no [num_q, seq_len] logits buffer and no chunk loop. Output
+        indices are gathered-KV absolute positions, -1 padded -- identical to
+        the dense RAGGED transform contract."""
+        from sglang.kernels.ops.attention.dsa import dsa_litetopk_indexer
+
+        assert forward_batch.extend_seq_lens_cpu is not None
+        kv_lens = indexer_seq_lens_cpu.tolist()
+        req_bounds = []
+        row0 = kv0 = 0
+        for rows, kv_len in zip(forward_batch.extend_seq_lens_cpu, kv_lens):
+            req_bounds.append((row0, row0 + rows, kv0, kv0 + int(kv_len)))
+            row0 += rows
+            kv0 += int(kv_len)
+        return dsa_litetopk_indexer(
+            q_fp8.contiguous(),
+            k_fp8,
+            k_scale,
+            weights.contiguous(),
+            ks,
+            ke,
+            self.index_topk,
+            req_bounds=req_bounds,
+        )
+
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1139,6 +1199,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        # PAGED expects KV-pool locations, translated through the page table
+        # inside the fused top-k; LiteTopk emits gathered-KV positions.
+        if (
+            self.use_dsa_litetopk
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_transform_method == TopkTransformMethod.RAGGED
+        ):
+            raw_topk_result = self._get_topk_ragged_litetopk(
+                forward_batch=forward_batch,
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            )
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )

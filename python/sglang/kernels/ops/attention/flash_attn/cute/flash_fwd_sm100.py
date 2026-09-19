@@ -2764,8 +2764,14 @@ class FlashAttentionForwardSm100:
                     staggered_bias_loads = (
                         dummy_first_bias_load or (bias_max_idx0 > bias_max_idx1)
                     ) and const_expr(self.q_stage == 2)
+                # Hoisted above the branch: with is_split_kv the `if` below is
+                # dynamic, so a name first bound inside it is undefined on the
+                # fall-through path. The DSL then joins `None` against `Int32`
+                # and rejects the region (TYPE_UNSTABLE_JOIN). This is pure
+                # arithmetic on a value already computed above, so evaluating it
+                # unconditionally costs nothing and keeps the type stable.
+                n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
-                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
