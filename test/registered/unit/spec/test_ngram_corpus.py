@@ -527,6 +527,41 @@ class TestNgramCorpusIncremental(CustomTestCase):
     def test_incremental_matches_stateless_prob(self):
         self._assert_incremental_matches_stateless("PROB")
 
+    def test_cached_miss_becomes_match_after_insert(self):
+        for mode in ("BFS", "PROB"):
+            for partial in (False, True):
+                for appended in range(3):
+                    with self.subTest(mode=mode, partial=partial, appended=appended):
+                        corpus = _make_corpus(
+                            mode,
+                            max_trie_depth=18,
+                            max_bfs_breadth=1,
+                            draft_token_num=4,
+                            capacity=10000,
+                        )
+                        if partial:
+                            corpus.batch_put([[20, 99]])
+                            corpus.synchronize()
+                        _batch_get_with_state(corpus, "cached", [10, 20], 2)
+                        learned = [10, 20, 30, 40, 50, 60, 61]
+                        query = learned[: 2 + appended]
+                        distractor = query[1:] + [70, 80, 90]
+                        corpus.batch_put([learned, distractor, distractor])
+                        corpus.synchronize()
+                        ids, masks = corpus.batch_get(
+                            req_ids=["cached", "fresh"],
+                            batch_tokens=[query, query],
+                            total_lens=[len(query), len(query)],
+                        )
+                        expected = learned[1 + appended : 5 + appended]
+                        np.testing.assert_array_equal(
+                            ids.reshape(2, 4), [expected, expected]
+                        )
+                        expected_mask = np.tril(np.ones((4, 4), dtype=bool))
+                        np.testing.assert_array_equal(
+                            masks.reshape(2, 4, 4), [expected_mask, expected_mask]
+                        )
+
     def test_leaf_anchor_becomes_expandable(self):
         corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
         corpus.batch_put([[1, 2, 3]])
