@@ -24,6 +24,9 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -209,6 +212,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64
         ).reshape(8, 16)
@@ -218,11 +225,14 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.req_to_metadata_buffer_idx_allocator.alloc.side_effect = iter(range(100))
 
         queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
-        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[]),
+        )
         queue.tree_cache = MagicMock()
 
         scheduler = MagicMock()
@@ -586,6 +596,8 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.policy = MagicMock()
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
+        scheduler.ngram_embedding_manager = MagicMock()
+        scheduler.chunked_req = None
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
