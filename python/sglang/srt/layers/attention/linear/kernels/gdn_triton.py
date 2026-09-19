@@ -26,12 +26,13 @@ if is_npu():
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
 elif is_cpu():
-    from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
+    from sgl_kernel.mamba import (
+        chunk_gated_delta_rule_cpu,
+        fused_sigmoid_gating_delta_rule_update_cpu,
+    )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
-    fused_sigmoid_gating_delta_rule_update = (
-        torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
-    )
+    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_cpu
 elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
