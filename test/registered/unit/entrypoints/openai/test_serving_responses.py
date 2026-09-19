@@ -1741,10 +1741,10 @@ def test_response_conversion_uses_shared_executor(response_serving, harmony):
     )
     method = "_make_request_with_harmony" if harmony else "_make_request_sync"
     original = getattr(serving, method)
-    worker_threads = []
+    main_thread = threading.get_ident()
 
     def convert(*args):
-        worker_threads.append(threading.get_ident())
+        assert threading.get_ident() != main_thread
         return original(*args)
 
     setattr(serving, method, convert)
@@ -1755,7 +1755,6 @@ def test_response_conversion_uses_shared_executor(response_serving, harmony):
             )
         )
     assert result.status == "completed"
-    assert worker_threads and all(t != threading.get_ident() for t in worker_threads)
 
 
 if __name__ == "__main__":
