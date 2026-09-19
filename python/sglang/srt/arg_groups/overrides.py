@@ -697,6 +697,35 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
+    if view.dcp_size > 1:
+        # Only the paged FlashMLA path returns rank-local LSEs. Ordinary
+        # prefill on a DCP worker and speculative index-cache layouts need
+        # separate implementations; do not silently run them as dense MLA.
+        if (
+            view.disaggregation_mode != "decode"
+            or get_platform().is_hip
+            or major not in (9, 10)
+            or kv_cache_dtype != "fp8_e4m3"
+            or view.enable_hisparse
+            or view.speculative_algorithm is not None
+            or getattr(hf_config, "index_kpool", 1) != 1
+            or getattr(hf_config, "learnable_sink", False)
+        ):
+            raise ValueError(
+                "DSA DCP currently requires PD decode on SM90/SM100, "
+                "--kv-cache-dtype fp8_e4m3, unpooled index-K, and no "
+                "HiSparse, learnable sinks, or speculative decoding."
+            )
+        if user_set_decode and view.dsa_decode_backend != "flashmla_kv":
+            raise ValueError(
+                "DSA DCP requires --dsa-decode-backend flashmla_kv "
+                "to return LSEs for the cross-rank attention merge."
+            )
+        declared["dsa_decode_backend"] = "flashmla_kv"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_kv"
+        return declared
+
     is_glm_sm12_fp8 = (
         model_arch == "GlmMoeDsaForCausalLM"
         and major == 12

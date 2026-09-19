@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
+from sglang.srt.disaggregation.common.dsa_dcp import build_dsa_dcp_transfer_blocks
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     StagingManagerMixin,
@@ -1438,6 +1439,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                                dst_dcp_size=dst_info.dst_dcp_size,
+                                dst_dcp_rank=dst_info.dst_dcp_rank,
+                                requires_dcp_relayout=dst_info.requires_dcp_relayout,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -2536,6 +2540,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
+        dst_dcp_size: int = 1,
+        dst_dcp_rank: int = 0,
+        requires_dcp_relayout: bool = False,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2640,6 +2647,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id,
                     comp_notif,
                 )
+            elif st == StateType.DSA and requires_dcp_relayout:
+                entry_indices = resolve_dcp_dst_entry_indices(
+                    src_lids, dst_lids, len(src_ptrs), len(dst_ptrs)
+                )
+                blocks = build_dsa_dcp_transfer_blocks(
+                    src_ptrs,
+                    [dst_ptrs[j] for j in entry_indices],
+                    src_lens,
+                    [dst_lens[j] for j in entry_indices],
+                    src_indices,
+                    dst_indices,
+                    page_size=self.kv_args.page_size,
+                    dcp_size=dst_dcp_size,
+                    dcp_rank=dst_dcp_rank,
+                )
+                if not blocks:
+                    continue
+                src_descs = self.agent.get_xfer_descs(
+                    [(src, size, self.kv_args.gpu_id) for src, _, size in blocks],
+                    "VRAM",
+                )
+                dst_descs = self.agent.get_xfer_descs(
+                    [(dst, size, dst_gpu_id) for _, dst, size in blocks], "VRAM"
+                )
+                h = self.agent.initialize_xfer(
+                    "WRITE", src_descs, dst_descs, peer_name, comp_notif.encode("ascii")
+                )
+                if not h:
+                    raise RuntimeError("Failed to create DSA DCP index-cache transfer")
+                if self.agent.transfer(h) == "ERR":
+                    raise RuntimeError("Failed to post DSA DCP index-cache transfer")
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(

@@ -114,6 +114,12 @@ def init_dcp_pack_buffers(
         buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
         register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if buffers and StateType.DSA in getattr(kv_args, "state_types", []):
+        from sglang.srt.disaggregation.common.dsa_pack import warmup_dsa_pack_buffer
+
+        warmup_dsa_pack_buffer(buffers[0], dcp_size)
     logger.info(
         "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
         count,

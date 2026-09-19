@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -50,7 +50,15 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        # The v2 planner currently faults when every row on a DCP rank has
+        # local length zero (for example rank >= 1 during decode graph capture's
+        # length-1 warmup). The legacy fused transform supports those rows and
+        # consumes the same rank-local page table.
+        return (
+            self.is_sgl_kernel()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and get_parallel().attn_dcp_size == 1
+        )
 
     def topk_func(
         self,
@@ -160,11 +168,18 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
-                    if batch_idx_list is not None
-                    else attn_metadata.page_table_1
-                )
+                page_table_size_1 = attn_metadata.page_table_1
+                if batch_idx_list is not None:
+                    if page_table_size_1.shape[0] == 1:
+                        # Chunked single-request prefill repeats batch index 0
+                        # for every query. Share the row instead of allocating
+                        # another query-by-context buffer alongside the logits.
+                        # The legacy CUDA/HIP kernels accept a zero row stride.
+                        page_table_size_1 = page_table_size_1.expand(
+                            len(batch_idx_list), -1
+                        )
+                    else:
+                        page_table_size_1 = page_table_size_1[batch_idx_list]
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
