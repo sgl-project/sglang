@@ -75,11 +75,26 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
     }
     true
 }
+/// A worker as one EndpointSlice currently describes it.
+///
+/// Readiness is kept BESIDE the spec rather than on it: `WorkerSpec` is the
+/// immutable description a backend emits once, while readiness is mutable
+/// state that flips over a pod's lifetime and travels as
+/// [`DiscoveryEvent::ReadyChanged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SliceWorker {
+    spec: WorkerSpec,
+    ready: bool,
+}
 
-/// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
+/// Convert an `EndpointSlice` into a list of [`SliceWorker`]s with the
 /// supplied [`WorkerMode`].
 ///
-/// Skips endpoints whose `conditions.ready` is explicitly `Some(false)`.
+/// Skips only endpoints whose `conditions.terminating` is `Some(true)` — a
+/// pod being deleted will never serve again. An endpoint that is merely
+/// not ready is RETURNED, carrying `ready: false`, so `emit_diff` can report
+/// it as [`DiscoveryEvent::ReadyChanged`] rather than `Removed`; `Removed`
+/// clears the worker's KV-event tree, which a readiness flap must not do.
 /// Per the EndpointSlice API spec, `conditions.ready = None` (absent) means
 /// the endpoint should be considered ready.
 ///
@@ -99,7 +114,7 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 /// `model_ids` is intentionally left empty — model membership is resolved
 /// by the worker manager via `/server_info` introspection after the
 /// `Added` event is emitted.
-fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
+fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<SliceWorker> {
     let port = es
         .ports
         .as_ref()
@@ -112,8 +127,20 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
+        // Per the EndpointSlice API spec, absent `ready` means ready.
         let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
-        if !is_ready {
+        // `terminating` is the only condition that means GONE. A pod being
+        // deleted will never serve again, so its KV-tree state is worth
+        // nothing and holding it would strand an entry no event can clear.
+        // Everything else — including `ready: false` — keeps the worker in
+        // the union and travels as a readiness change, because a flap must
+        // not cost the engine's radix view.
+        let is_terminating = ep
+            .conditions
+            .as_ref()
+            .and_then(|c| c.terminating)
+            .unwrap_or(false);
+        if is_terminating {
             continue;
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
@@ -132,12 +159,15 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
             // carries neither, but doesn't need to — see
             // `src/workers/introspect.rs` for the extraction and
             // `register_one` in `src/workers/manager.rs` for the override.
-            out.push(WorkerSpec {
-                id,
-                url,
-                mode,
-                model_ids: Vec::new(),
-                bootstrap_port: None,
+            out.push(SliceWorker {
+                spec: WorkerSpec {
+                    id,
+                    url,
+                    mode,
+                    model_ids: Vec::new(),
+                    bootstrap_port: None,
+                },
+                ready: is_ready,
             });
         }
     }
@@ -171,39 +201,75 @@ fn slice_key(es: &EndpointSlice) -> String {
     format!("{ns}/{name}")
 }
 
-/// Send all `Added` / `Removed` / `ModeChanged` events that bring the
-/// consumer from `prev_union` to the recomputed union of `per_slice`.
+/// Send all `Added` / `Removed` / `ModeChanged` / `ReadyChanged` events that
+/// bring the consumer from `prev_union` to the recomputed union of
+/// `per_slice`.
 ///
 /// Returns `Err` on the first send failure (consumer dropped); the caller is
 /// expected to exit the watcher loop.  Updates `prev_union` in place to the
 /// new union on success.
+///
+/// A worker that is present but not ready stays in the union and is reported
+/// with `ReadyChanged`. Besides the url/`model_ids` teardown-and-rebuild below,
+/// `Removed` — the only event that destroys a worker's KV-tree state — is
+/// emitted solely when the endpoint disappears from every slice or is marked
+/// `terminating`.
 async fn emit_diff(
     tx: &mpsc::Sender<DiscoveryEvent>,
-    per_slice: &HashMap<String, HashMap<WorkerId, WorkerSpec>>,
-    prev_union: &mut HashMap<WorkerId, WorkerSpec>,
+    per_slice: &HashMap<String, HashMap<WorkerId, SliceWorker>>,
+    prev_union: &mut HashMap<WorkerId, SliceWorker>,
 ) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
-    let union: HashMap<WorkerId, WorkerSpec> = per_slice
+    let union: HashMap<WorkerId, SliceWorker> = per_slice
         .values()
         .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
         .collect();
 
-    for (id, spec) in &union {
+    // `Added` for an id the registry does not already hold builds a fresh
+    // `Worker`, whose `serving` flag starts true (for one it does hold, the
+    // upsert carries the old flag forward — see `WorkerRegistry::add_with_cb`). So
+    // any `Added` for a worker discovered not-ready must be followed by an
+    // explicit `ReadyChanged`, or the worker would be selectable until its
+    // next readiness transition — which may never come.
+    async fn send_added(
+        tx: &mpsc::Sender<DiscoveryEvent>,
+        w: &SliceWorker,
+    ) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
+        tx.send(DiscoveryEvent::Added(w.spec.clone())).await?;
+        if !w.ready {
+            tx.send(DiscoveryEvent::ReadyChanged {
+                id: w.spec.id.clone(),
+                ready: false,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    for (id, cur) in &union {
         match prev_union.get(id) {
             Some(prev) => {
-                if prev.mode != spec.mode {
+                if prev.spec.mode != cur.spec.mode {
                     tx.send(DiscoveryEvent::ModeChanged {
                         id: id.clone(),
-                        mode: spec.mode,
+                        mode: cur.spec.mode,
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.spec.url != cur.spec.url || prev.spec.model_ids != cur.spec.model_ids {
+                    // Still a teardown/rebuild: `send_added` re-asserts
+                    // readiness because the rebuild resets it.
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
-                    tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                    send_added(tx, cur).await?;
+                } else if prev.ready != cur.ready {
+                    tx.send(DiscoveryEvent::ReadyChanged {
+                        id: id.clone(),
+                        ready: cur.ready,
+                    })
+                    .await?;
                 }
             }
             None => {
-                tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                send_added(tx, cur).await?;
             }
         }
     }
@@ -243,18 +309,18 @@ async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode
 where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
-    let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
-    let mut prev_union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
-    let mut init_buffer: Option<HashMap<String, HashMap<WorkerId, WorkerSpec>>> = None;
+    let mut per_slice: HashMap<String, HashMap<WorkerId, SliceWorker>> = HashMap::new();
+    let mut prev_union: HashMap<WorkerId, SliceWorker> = HashMap::new();
+    let mut init_buffer: Option<HashMap<String, HashMap<WorkerId, SliceWorker>>> = None;
 
     fn workers_for_slice(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
-    ) -> HashMap<WorkerId, WorkerSpec> {
+    ) -> HashMap<WorkerId, SliceWorker> {
         match classify_mode(es, mode) {
             Some(wm) => extract_workers(es, wm)
                 .into_iter()
-                .map(|w| (w.id.clone(), w))
+                .map(|w| (w.spec.id.clone(), w))
                 .collect(),
             None => HashMap::new(),
         }
@@ -526,24 +592,53 @@ mod tests {
         let s = make_slice(&["10.0.0.1"], 30000, true);
         let ws = extract_workers(&s, WorkerMode::Plain);
         assert_eq!(ws.len(), 1);
-        assert_eq!(ws[0].mode, WorkerMode::Plain);
-        assert_eq!(ws[0].url, "http://10.0.0.1:30000");
-        assert_eq!(ws[0].id.0, "testns/test-slice/10.0.0.1:30000");
+        assert_eq!(ws[0].spec.mode, WorkerMode::Plain);
+        assert_eq!(ws[0].spec.url, "http://10.0.0.1:30000");
+        assert_eq!(ws[0].spec.id.0, "testns/test-slice/10.0.0.1:30000");
         assert!(
-            ws[0].model_ids.is_empty(),
+            ws[0].spec.model_ids.is_empty(),
             "model_ids are resolved via /server_info, not at extract time"
         );
 
         // The mode argument flows through unchanged.
         let ws = extract_workers(&s, WorkerMode::Prefill);
-        assert_eq!(ws[0].mode, WorkerMode::Prefill);
+        assert_eq!(ws[0].spec.mode, WorkerMode::Prefill);
         let ws = extract_workers(&s, WorkerMode::Decode);
-        assert_eq!(ws[0].mode, WorkerMode::Decode);
+        assert_eq!(ws[0].spec.mode, WorkerMode::Decode);
     }
 
+    /// A not-ready endpoint is KEPT, carrying `ready: false`.
+    ///
+    /// This inverts the pre-readiness behaviour on purpose. Dropping the
+    /// endpoint made `emit_diff` produce `Removed`, which clears the worker's
+    /// KV-event tree — so a readiness blip measured in seconds cost an
+    /// engine's whole radix view, which takes minutes to rebuild.
     #[test]
-    fn skips_not_ready_endpoints() {
+    fn keeps_not_ready_endpoints_and_marks_them_unready() {
         let s = make_slice(&["10.0.0.1"], 30000, false);
+        let ws = extract_workers(&s, WorkerMode::Plain);
+        assert_eq!(ws.len(), 1, "a not-ready endpoint stays in the union");
+        assert!(!ws[0].ready);
+        assert_eq!(ws[0].spec.url, "http://10.0.0.1:30000");
+    }
+
+    /// `terminating` is the one condition that means gone: the pod will never
+    /// serve again, so retaining its tree state would strand entries that no
+    /// later event can clear.
+    #[test]
+    fn drops_terminating_endpoints() {
+        let mut s = make_slice(&["10.0.0.1"], 30000, true);
+        s.endpoints[0].conditions.as_mut().unwrap().terminating = Some(true);
+        assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
+    }
+
+    /// A terminating endpoint is dropped even while it still reports ready —
+    /// the two conditions are independent and `terminating` wins.
+    #[test]
+    fn terminating_wins_over_ready() {
+        let mut s = make_slice(&["10.0.0.1"], 30000, true);
+        s.endpoints[0].conditions.as_mut().unwrap().ready = Some(true);
+        s.endpoints[0].conditions.as_mut().unwrap().terminating = Some(true);
         assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
     }
 
@@ -569,7 +664,7 @@ mod tests {
         s.metadata.namespace = Some("prod".to_string());
         s.metadata.name = Some("svc-abc-xyz".to_string());
         let ws = extract_workers(&s, WorkerMode::Plain);
-        assert_eq!(ws[0].id.0, "prod/svc-abc-xyz/10.0.0.1:30000");
+        assert_eq!(ws[0].spec.id.0, "prod/svc-abc-xyz/10.0.0.1:30000");
     }
 
     /// A cluster-scoped slice (no namespace metadata) must still produce a
@@ -580,13 +675,13 @@ mod tests {
         let s = make_slice_ns(&["10.0.0.1"], 30000, true, "", "my-slice");
         let ws = extract_workers(&s, WorkerMode::Plain);
         assert!(
-            ws[0].id.0.contains("10.0.0.1:30000"),
+            ws[0].spec.id.0.contains("10.0.0.1:30000"),
             "id must contain addr:port"
         );
         assert!(
-            ws[0].id.0.starts_with('/'),
+            ws[0].spec.id.0.starts_with('/'),
             "empty ns => id starts with '/', got: {}",
-            ws[0].id.0
+            ws[0].spec.id.0
         );
     }
 
@@ -1025,6 +1120,106 @@ mod tests {
     /// a Removed+Added cycle so the new pod gets fresh CB/active_load
     /// state. Without UID-keyed WorkerIds, two consecutive
     /// `process_events` snapshots would dedup by `addr:port` and the
+    /// The thesis of readiness-as-state, pinned at the layer that implements it.
+    ///
+    /// A pod that goes not-ready and comes back must produce `ReadyChanged`
+    /// either way and NEVER `Removed` — `Removed` is what clears the worker's
+    /// KV radix tree, which is the cost this whole mechanism exists to avoid.
+    #[tokio::test]
+    async fn readiness_flap_emits_ready_changed_and_never_removed() {
+        let ready = with_uid(
+            make_slice_with_uids(&["10.0.0.1"], 30000, &["uid-a"]),
+            "u-1",
+        );
+        let mut not_ready = ready.clone();
+        not_ready.endpoints[0].conditions.as_mut().unwrap().ready = Some(false);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(vec![
+                Ok(watcher::Event::Apply(ready.clone())),
+                Ok(watcher::Event::Apply(not_ready)),
+                Ok(watcher::Event::Apply(ready)),
+            ]),
+            tx,
+            plain_mode(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DiscoveryEvent::Removed { .. })),
+            "a readiness flap must never tear the worker down: {events:?}",
+        );
+        assert_eq!(events.len(), 3, "got {events:?}");
+        assert!(
+            matches!(&events[0], DiscoveryEvent::Added(spec) if spec.id.0 == "ns/uid-a"),
+            "got {events:?}",
+        );
+        assert!(
+            matches!(
+                &events[1],
+                DiscoveryEvent::ReadyChanged { id, ready: false } if id.0 == "ns/uid-a"
+            ),
+            "going not-ready must be reported as ReadyChanged(false): {events:?}",
+        );
+        assert!(
+            matches!(
+                &events[2],
+                DiscoveryEvent::ReadyChanged { id, ready: true } if id.0 == "ns/uid-a"
+            ),
+            "recovery must be ReadyChanged(true), with no second Added: {events:?}",
+        );
+    }
+
+    /// An endpoint discovered ALREADY not-ready must be followed by an explicit
+    /// `ReadyChanged(false)`, in that order.
+    ///
+    /// `Added` builds a `Worker` whose `serving` flag starts true, and the diff
+    /// only emits on a TRANSITION — so without the follow-up a router that
+    /// starts while the whole fleet is restarting registers every pod as
+    /// serving, reports Ready, and 503s every request with nothing left to
+    /// correct it.
+    #[tokio::test]
+    async fn added_for_a_not_ready_endpoint_is_followed_by_ready_changed_false() {
+        let mut s = with_uid(
+            make_slice_with_uids(&["10.0.0.1"], 30000, &["uid-a"]),
+            "u-1",
+        );
+        s.endpoints[0].conditions.as_mut().unwrap().ready = Some(false);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(vec![Ok(watcher::Event::Apply(s))]),
+            tx,
+            plain_mode(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert!(
+            matches!(&events[0], DiscoveryEvent::Added(spec) if spec.id.0 == "ns/uid-a"),
+            "the Added must come first, or the manager drops the ReadyChanged \
+             for an id it has never seen: {events:?}",
+        );
+        assert!(
+            matches!(
+                &events[1],
+                DiscoveryEvent::ReadyChanged { id, ready: false } if id.0 == "ns/uid-a"
+            ),
+            "got {events:?}",
+        );
+    }
+
     /// new pod would inherit the dead pod's state.
     #[tokio::test]
     async fn pod_replace_with_same_ip_emits_remove_then_add() {

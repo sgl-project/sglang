@@ -17,7 +17,8 @@ on `/metrics` (text/plain, version 0.0.4) on the router's serving port
 ## Metrics covered
 
 Families the router emits. The dashboard graphs all of them except the
-`sgl_router_kv_*` series, whose panels ship separately:
+`sgl_router_kv_*` series, whose panels ship separately, and
+`sgl_router_worker_serving`, which is scrape-and-alert only for now:
 
 | Metric | Type | What it shows |
 |---|---|---|
@@ -30,6 +31,7 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |
+| `sgl_router_worker_serving` | Gauge | Per-worker serving state from discovery (1=reported able to serve, 0=present but not ready). Orthogonal to `_worker_health`; selection requires both |
 | `sgl_router_worker_cb_state` | Gauge | Per-worker circuit breaker state (0=closed, 1=open, 2=half_open) |
 | `sgl_router_worker_inflight_requests` | Gauge | In-flight requests per worker |
 | `sgl_router_stale_requests_total` | Counter | Stale-request cancellations |

@@ -47,6 +47,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                 // underflow would wrap usize and render as a nonsensical
                 // negative gauge; clamp to a large positive ceiling instead.
                 inflight: i64::try_from(w.active_load()).unwrap_or(i64::MAX),
+                serving: w.serving(),
             }
         })
         .collect();

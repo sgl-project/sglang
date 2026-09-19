@@ -4,7 +4,7 @@
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -179,6 +179,15 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// Whether discovery currently reports this worker able to serve.
+    ///
+    /// Interior-mutable so `ReadyChanged` can flip it in place. Replacing the
+    /// `Arc<Worker>` instead would reset `active_requests` and the breaker, and
+    /// the `Removed` path that does replace it also clears the worker's
+    /// KV-event tree separately. This flag is orthogonal to the breaker: the breaker is
+    /// the router's own passive observation of failures, `serving` is what
+    /// the deployment says. Selection requires both.
+    serving: AtomicBool,
 }
 
 impl Worker {
@@ -212,6 +221,10 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            // Default true: discovery reports readiness through
+            // `ReadyChanged`, never on the immutable `WorkerSpec`. A
+            // backend that cannot observe readiness leaves this at true.
+            serving: AtomicBool::new(true),
         }
     }
 
@@ -244,6 +257,26 @@ impl Worker {
     /// The wire protocol the proxy uses when forwarding to this worker.
     pub fn protocol(&self) -> WireProtocol {
         self.protocol
+    }
+
+    /// Whether discovery currently reports this worker able to serve.
+    ///
+    /// Uses `Relaxed` ordering for the same reason as `mode`: readiness
+    /// changes are rare discovery events that synchronise with nothing else.
+    /// A stale read costs at most one request dispatched to a worker that has
+    /// just stopped being (or just become) ready; it surfaces as an ordinary
+    /// upstream error. There is no request-level retry or failover in this
+    /// router — see `WorkerRegistry::healthy_workers_for`.
+    pub fn serving(&self) -> bool {
+        self.serving.load(Ordering::Relaxed)
+    }
+
+    /// Update the worker's serving state in place.
+    ///
+    /// Preserves `active_requests`, breaker state and — because this call does
+    /// not drop the registry entry, as `Removed` would — its KV-event tree.
+    pub fn set_serving(&self, serving: bool) {
+        self.serving.store(serving, Ordering::Relaxed);
     }
 
     pub fn active_load(&self) -> usize {
