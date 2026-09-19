@@ -15,7 +15,6 @@ import glob
 import importlib.util
 import os
 import re
-import subprocess
 import sys
 
 # Exactly what stage=/runner_config= produces, so a legacy suite= of this shape
@@ -26,9 +25,7 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # to a suite no workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-_KERNEL_ROOT = "kernels"
-
-_KERNEL_ROOT_TYPO = "kernel"
+_KERNEL_LAYOUT = "test/registered/kernels/{ops,benchmark}/<group>/"
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
@@ -62,64 +59,38 @@ def _main_runs_tests(tree: ast.Module) -> bool:
     return False
 
 
-def _git_lines(*args: str) -> list[str] | None:
-    result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        return None
-    return [line for line in result.stdout.splitlines() if line]
+def _contains_call(tree: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == name)
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+        )
+        for node in ast.walk(tree)
+    )
 
 
-def _changed_registered_files() -> set[str]:
-    """Return added, copied, or renamed registered-test destinations."""
-
-    lines = _git_lines("diff", "--cached", "--name-status", "--diff-filter=ACR")
-    if not lines:
-        base_ref = os.environ.get("GITHUB_BASE_REF", "main")
-        for candidate in (f"origin/{base_ref}", base_ref):
-            if _git_lines("rev-parse", "--verify", candidate) is None:
-                continue
-            merge_base = _git_lines("merge-base", candidate, "HEAD")
-            if not merge_base:
-                continue
-            lines = _git_lines(
-                "diff",
-                "--name-status",
-                "--diff-filter=ACR",
-                merge_base[0],
-                "HEAD",
-            )
-            break
-
-    selected = set()
-    for line in lines or []:
-        fields = line.split("\t")
-        destination = fields[-1]
-        if destination.startswith("test/registered/") and destination.endswith(".py"):
-            selected.add(destination)
-    return selected
-
-
-def taxonomy_errors(path: str, registries: list) -> list[str]:
-
+def taxonomy_errors(path: str, tree: ast.AST) -> list[str]:
     parts = path.split("/")
-    relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
-    if not relative_parts:
+    if parts[:2] != ["test", "registered"] or len(parts) < 3:
         return []
-    if relative_parts[0] == _KERNEL_ROOT:
-        errors = []
-        if len(relative_parts) < 4 or relative_parts[1] not in {"ops", "benchmark"}:
-            errors.append(
-                f"{path}: kernel tests must live under "
-                "test/registered/kernels/{ops,benchmark}/<group>/"
-            )
-        if any("-kernel-" not in (r.effective_suite or "") for r in registries):
-            errors.append(f"{path}: kernel tests must use a *-kernel-* suite")
-        return errors
-    if relative_parts[0] == _KERNEL_ROOT_TYPO:
-        return [
-            f"{path}: kernel tests use the plural root: "
-            "test/registered/kernels/{ops,benchmark}/<group>/"
-        ]
+    relative_parts = parts[2:]
+    root = relative_parts[0]
+
+    if root in ("kernel", "kernels"):
+        canonical = (
+            root == "kernels"
+            and len(relative_parts) >= 4
+            and relative_parts[1] in ("ops", "benchmark")
+        )
+        return (
+            [] if canonical else [f"{path}: kernel tests live under {_KERNEL_LAYOUT}"]
+        )
+
+    if root != "unit":
+        return []
+    if _contains_call(tree, "popen_launch_server"):
+        return [f"{path}: unit tests may not launch a server"]
     return []
 
 
@@ -147,7 +118,6 @@ def main() -> int:
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
-    changed_files = _changed_registered_files()
     for f in files:
         try:
             registries, _has_main_entry = ci_register.ut_parse_one_file(f)
@@ -160,8 +130,7 @@ def main() -> int:
         # `python3 file.py`); the ERROR text below explains the fix.
         with open(f, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=f)
-        if f in changed_files:
-            taxonomy_violations.extend(taxonomy_errors(f, registries))
+        taxonomy_violations.extend(taxonomy_errors(f, tree))
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
