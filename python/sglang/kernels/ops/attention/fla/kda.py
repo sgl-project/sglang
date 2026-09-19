@@ -1094,6 +1094,7 @@ def chunk_kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    fused_intra: Optional[bool] = None,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
 ):
@@ -1146,6 +1147,9 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    # Layers whose per-channel decays exceed the +-126 (log2) clamp of the fused diagonal
+    # factorization opt out (RadixLinearAttention.kda_fused_intra = False).
+    _fused_intra = _small_grid if fused_intra is None else bool(fused_intra)
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1157,8 +1161,8 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         safe_gate=lower_bound is not None,
-        fuse_diagonal=_small_grid,
-        fuse_recompute=_small_grid,
+        fuse_diagonal=_fused_intra,
+        fuse_recompute=_fused_intra,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -1214,6 +1218,7 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    fused_intra: Optional[bool] = None,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
@@ -1244,6 +1249,7 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+        fused_intra=fused_intra,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
     )

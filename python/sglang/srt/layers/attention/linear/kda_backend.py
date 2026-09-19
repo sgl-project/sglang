@@ -861,6 +861,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if gate_was_flat:
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
+        if layer.num_v_heads != layer.num_q_heads:
+            # Grouped value heads (BerryLM: 16 q/k heads over 32 value heads). The
+            # chunk KDA kernels take H == HV, so repeat q/k per value head; the
+            # decode / verify kernels index the groups themselves.
+            group = layer.num_v_heads // layer.num_q_heads
+            q = q.repeat_interleave(group, dim=2)
+            k = k.repeat_interleave(group, dim=2)
         track_ssm = self.forward_metadata.has_mamba_track_mask
         track_chunk_idx = self.forward_metadata.track_chunk_idx
         h_track_buf = None
@@ -904,6 +911,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            fused_intra=getattr(layer, "kda_fused_intra", None),
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
