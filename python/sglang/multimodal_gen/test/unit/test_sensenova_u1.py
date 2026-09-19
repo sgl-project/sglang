@@ -927,7 +927,6 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
     ("override", "expected"),
     [
         ({"enable_torch_compile": True}, "torch.compile"),
-        ({"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"}, "LoRA adapters"),
         (
             {"component_residency": {"transformer": "component-offload"}},
             "component residency offload",
@@ -1399,3 +1398,80 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+        LoRAPipeline,
+    )
+
+    assert issubclass(SenseNovaU1Pipeline, LoRAPipeline)
+
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    model, tokenizer = object(), object()
+    loaded = {"model": model, "tokenizer": tokenizer}
+    modules = pipeline.load_modules(server_args=None, loaded_modules=loaded)
+
+    assert modules["transformer"] is model
+    assert modules["model"] is model
+    assert "transformer" not in loaded
+
+
+def _validate_server_args(**overrides):
+    config = SenseNovaU1PipelineConfig()
+    args = {
+        "num_gpus": 1,
+        "enable_torch_compile": False,
+        "lora_path": None,
+        "lora_target_modules": None,
+        "component_residency": None,
+        "cpu_offload_components": None,
+        "dit_cpu_offload": None,
+        "text_encoder_cpu_offload": None,
+        "image_encoder_cpu_offload": None,
+        "vae_cpu_offload": False,
+        "dit_layerwise_offload": None,
+        "layerwise_offload_components": None,
+        "quantization": None,
+        "quantization_ignored_layers": None,
+        "transformer_weights_path": None,
+        "component_paths": {},
+        "component_weights_paths": {},
+        "component_quantizations": {},
+        "component_quantization_ignored_layers": {},
+        "component_precisions": {},
+        "attention_backend": None,
+        "component_attention_backends": {},
+        "attention_backend_config": {},
+    }
+    args.update(overrides)
+    server_args = SimpleNamespace(**args)
+    config.validate_server_args(server_args)
+    return server_args
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param(
+            {"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"},
+            ["_mot_gen"],
+            id="startup-adapter",
+        ),
+        pytest.param(
+            {
+                "lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs",
+                "lora_target_modules": ["q_proj"],
+            },
+            ["q_proj"],
+            id="explicit-targets",
+        ),
+        pytest.param({}, ["_mot_gen"], id="without-adapter"),
+    ],
+)
+def test_sensenova_u1_lora_target_modules(overrides, expected):
+    server_args = _validate_server_args(**overrides)
+    assert server_args.lora_target_modules == expected
