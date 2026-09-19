@@ -3661,6 +3661,95 @@ class AiterAttnBackend(AttentionBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def save_kv_cache(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """Write this decode step's K/V into the paged cache.
+
+        This is the KV-write half of :meth:`forward_decode`, factored out so a
+        caller that computes the attention itself -- e.g. a fused
+        attention+epilogue kernel that bypasses ``RadixAttention.forward`` --
+        can still populate the cache through the one code path that knows about
+        every pool layout, instead of duplicating the dispatch chain.
+        """
+        k_descale = None
+        v_descale = None
+        if self.kv_cache_dtype == fp8_dtype:
+            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+
+        # SHUFFLE 5D pool path — see forward_extend for rationale.
+        if self.kv_cache_is_vectorized_5d:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
+                k_descale,
+                v_descale,
+            )
+        # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+        # both unified attention and sliding window kv pool are active.
+        # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+        # use standard set_kv_buffer, as they lack SWA-specific attributes
+        # like full_to_swa_index_mapping.
+        elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+            token_to_kv_pool = self.token_to_kv_pool
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
+
+            launch_reshape_and_cache_flash(
+                k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                forward_batch.out_cache_loc,
+                slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+        elif self.use_mla:
+            # MLA pool has its own set_kv_buffer (no scale args).
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+        elif self._use_fused_fp8_kv_write(layer):
+            # FP8: fuse bf16->fp8 cast + paged write in one kernel.
+            token_to_kv_pool = self.token_to_kv_pool
+            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            launch_reshape_and_cache_flash(
+                k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                forward_batch.out_cache_loc,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+        else:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
+                k_descale,
+                v_descale,
+            )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -3680,77 +3769,7 @@ class AiterAttnBackend(AttentionBackend):
             v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
         if save_kv_cache:
-            # SHUFFLE 5D pool path — see forward_extend for rationale.
-            if self.kv_cache_is_vectorized_5d:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                    ),
-                    k,
-                    v,
-                    k_descale,
-                    v_descale,
-                )
-            # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
-            # both unified attention and sliding window kv pool are active.
-            # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
-            # use standard set_kv_buffer, as they lack SWA-specific attributes
-            # like full_to_swa_index_mapping.
-            elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
-                token_to_kv_pool = self.token_to_kv_pool
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
-
-                launch_reshape_and_cache_flash(
-                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                    ),
-                    v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                    ),
-                    forward_batch.out_cache_loc,
-                    slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
-                    k_scale=k_descale,
-                    v_scale=v_descale,
-                )
-            elif self.use_mla:
-                # MLA pool has its own set_kv_buffer (no scale args).
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
-            elif self._use_fused_fp8_kv_write(layer):
-                # FP8: fuse bf16->fp8 cast + paged write in one kernel.
-                token_to_kv_pool = self.token_to_kv_pool
-                k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                launch_reshape_and_cache_flash(
-                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                    ),
-                    v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                    ),
-                    forward_batch.out_cache_loc,
-                    k_scale=k_descale,
-                    v_scale=v_descale,
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                    ),
-                    k,
-                    v,
-                    k_descale,
-                    v_descale,
-                )
+            self.save_kv_cache(layer, forward_batch, k, v)
 
         if self.use_mla:
             if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
