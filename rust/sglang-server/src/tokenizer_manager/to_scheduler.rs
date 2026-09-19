@@ -86,9 +86,17 @@ impl Runnable for Intake {
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
                 // A fresh request and one returning from the tokenizer pool.
-                Some(Lane::Event(TmEvent::Intake(req) | TmEvent::Tokenized(req))) => {
-                    self.drive(req)
+                Some(Lane::Event(TmEvent::Intake { request, admission })) => {
+                    if admission.try_accept() {
+                        self.drive(request);
+                    } else {
+                        tracing::debug!(
+                            rid = %request.rid,
+                            "intake discarded request cancelled before admission"
+                        );
+                    }
                 }
+                Some(Lane::Event(TmEvent::Tokenized(req))) => self.drive(req),
                 Some(Lane::Event(TmEvent::MmEncoded { rid, input_ids })) => {
                     self.on_mm_encoded(rid, input_ids)
                 }

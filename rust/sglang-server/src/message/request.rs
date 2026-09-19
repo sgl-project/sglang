@@ -694,7 +694,7 @@ pub struct GenerateRequest {
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
 /// modality already fanned out to this request's own item list.
 ///
-/// Constructed directly only by tests: `api_server::prefetch` fills its
+/// Constructed directly only by tests: `frontend::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
@@ -703,7 +703,7 @@ pub struct MmData {
     pub audio_data: Vec<MmItem>,
     pub processor_extensions: ProcessorExtensions,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `api_server::prefetch` in `payload::io_sources` order so MM workers
+    /// `frontend::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,

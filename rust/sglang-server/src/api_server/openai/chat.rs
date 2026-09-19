@@ -25,9 +25,7 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 
-use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
@@ -38,6 +36,7 @@ use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
+use crate::frontend::FrontendCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
@@ -187,7 +186,6 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
     // V4 prefills <think>, so the generated stream has no opening marker.
@@ -220,17 +218,16 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let rx = match submit_generation(&state, native, stream, &mut guard).await {
-            Ok(rx) => rx,
+        let call = match submit_generation(&state, native, stream).await {
+            Ok(call) => call,
             Err(response) => return response,
         };
-        submitted.push((index, rid, rx));
+        submitted.push((index, call));
     }
 
     if stream {
         let event_stream = chat_event_stream(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -250,7 +247,6 @@ async fn chat_completions(
     } else {
         unary_chat(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -442,8 +438,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
+    submitted: Vec<(usize, FrontendCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -458,8 +453,8 @@ pub(super) async fn unary_chat(
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
 
-    for (index, rid, rx) in submitted {
-        let output = match collect_output(rx, &mut guard, &rid).await {
+    for (index, call) in submitted {
+        let output = match collect_output(call).await {
             Ok(output) => output,
             Err((status, message)) => {
                 return openai_error(status, message, false);
@@ -526,8 +521,7 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
+    submitted: Vec<(usize, FrontendCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -545,7 +539,6 @@ pub(super) fn chat_event_stream(
     let count = submitted.len();
     let raw = async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
@@ -561,9 +554,8 @@ pub(super) fn chat_event_stream(
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
 
-        for (index, rid, rx) in submitted {
-            rids.push(rid);
-            streams.push(indexed_decode_stream(index, rx));
+        for (index, call) in submitted {
+            streams.push(indexed_decode_stream(index, call));
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id.clone(),
@@ -601,12 +593,8 @@ pub(super) fn chat_event_stream(
             };
             let output = match item {
                 ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
+                ResponseItem::Done(output) => output,
                 ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
                     yield Annotated {
                         data: None,
                         id: None,
@@ -870,12 +858,11 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
+    use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
         merge_template_stops, unary_chat,
     };
-    use crate::api_server::guard::AbortGuard;
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
@@ -1057,7 +1044,6 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1094,7 +1080,6 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1132,7 +1117,6 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1179,7 +1163,6 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
