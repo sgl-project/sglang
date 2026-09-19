@@ -4,7 +4,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime import launch_server as launcher
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.scripts import gen_perf_baselines
 from sglang.multimodal_gen.test.server import test_server_utils as utils
@@ -148,23 +150,24 @@ def test_server_load_clock_excludes_warmup(
         clock[0] += 1_000_000_000
         return {"status": "ready"}
 
-    monkeypatch.setattr(
-        launcher.mp, "Pipe", lambda **kwargs: (Mock(recv=ready), Mock())
-    )
-    monkeypatch.setattr(launcher.mp, "Process", Mock())
+    worker_context = Mock()
+    worker_context.Pipe.side_effect = lambda **kwargs: (Mock(recv=ready), Mock())
+    monkeypatch.setattr(launcher.mp, "get_context", Mock(return_value=worker_context))
     monkeypatch.setattr(launcher, "shutdown_scheduler_processes", Mock())
 
     def warmup(args):
         clock[0] += warmup_seconds * 1_000_000_000
 
     monkeypatch.setattr(launcher, "launch_http_server_only", warmup)
-    args = SimpleNamespace(
+    monkeypatch.setattr(ServerArgs, "__post_init__", lambda self: None)
+    args = ServerArgs(
+        model_path="test",
         num_gpus=workers,
         nnodes=1,
         node_rank=0,
         master_port=1234,
         webui=False,
-        pipeline_config=SimpleNamespace(supports_action_endpoint=lambda: False),
+        pipeline_config=PipelineConfig(),
     )
 
     def spawn(*unused_args, **unused_kwargs):
@@ -175,6 +178,12 @@ def test_server_load_clock_excludes_warmup(
     manager = utils.ServerManager("test", 1234)
     monkeypatch.setattr(manager, "_wait_for_ready", Mock())
     context = manager.start()
+    launcher.mp.get_context.assert_called_once_with("spawn")
+    assert worker_context.Process.call_count == workers
+    for call in worker_context.Process.call_args_list:
+        restored_args = call.kwargs["args"][0].server_args.materialize()
+        assert isinstance(restored_args, ServerArgs)
+        assert restored_args.num_gpus == workers
     context._log_thread.join(timeout=5)
     assert not context._log_thread.is_alive()
     assert context.load_time_ms == workers * 1000
