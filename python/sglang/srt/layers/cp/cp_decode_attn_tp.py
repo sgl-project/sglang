@@ -84,6 +84,28 @@ class CpDecodeAttnTpContext:
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
         return sliced if dim == 0 else sliced.contiguous()
 
+    def _slice_aiter_bpreshuffled_weight(
+        self, tensor: torch.Tensor, dim: int
+    ) -> torch.Tensor:
+        """Slice an AITER B-preshuffled weight in its logical layout.
+
+        A physical dim-1 narrow is not a logical K shard: the (16, 16) layout
+        interleaves K tiles within each N tile. Physical dim-0 slicing is safe
+        because complete N tiles stay contiguous, so callers only use this
+        relayout for dim 1. The block scales are not preshuffled and continue
+        through the normal slicing path.
+        """
+        assert dim == 1
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            unshuffle_aiter_fp8_weight,
+        )
+
+        logical = unshuffle_aiter_fp8_weight(tensor)
+        logical_slice = self._slice(logical, dim)
+        return shuffle_weight(logical_slice, layout=(16, 16))
+
     # ==================== Unified activate/restore ====================
 
     def _activate(self, obj, attr_name: str, dim: int):
@@ -105,7 +127,17 @@ class CpDecodeAttnTpContext:
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            cache = (raw, self._slice(raw, dim), is_param)
+            if (
+                attr_name == "weight"
+                and dim == 1
+                and getattr(obj, "aiter_bpreshuffled", False)
+            ):
+                sliced = self._slice_aiter_bpreshuffled_weight(raw, dim)
+            else:
+                sliced = self._slice(raw, dim)
+            # Hold the shard for the context lifetime. Besides avoiding repeated
+            # permutations, this gives every CUDA graph capture the same pointer.
+            cache = (raw, sliced, is_param)
             self._slice_cache[cache_key] = cache
 
         if cache[2]:
