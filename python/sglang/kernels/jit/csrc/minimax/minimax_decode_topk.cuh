@@ -67,20 +67,6 @@ struct TopKTrait {
     constexpr auto is_greater = [](float x, float y, int32_t delta) {
       return (x > y) || ((x == y) && delta < 0);  // lower block id wins
     };
-    constexpr auto warp_inclusive_sum = [](uint32_t lane_id, uint32_t val) {
-#pragma unroll
-      for (uint32_t offset = 1; offset < device::kWarpThreads; offset *= 2) {
-        // Width-32 up-shuffle. On wave64 HIP the un-suffixed __shfl_up takes the
-        // logical-warp width directly; CUDA needs the active mask.
-#ifdef USE_ROCM
-        uint32_t n = __shfl_up(val, offset, device::kWarpThreads);
-#else
-        uint32_t n = __shfl_up_sync(kWarpSyncMask, val, offset, device::kWarpThreads);
-#endif
-        if (lane_id >= offset) val += n;
-      }
-      return val;
-    };
     constexpr auto clip_nan = [](float x) { return x != x ? kNegInf : x; };
     constexpr auto score_to_key = [](float x) {
       uint32_t b = __float_as_uint(x);
@@ -95,7 +81,7 @@ struct TopKTrait {
       uint32_t warp_inc = 0;
       if (tx < kRadixSize) {
         hist_val = histogram[tx];
-        warp_inc = warp_inclusive_sum(lane_id, hist_val);
+        warp_inc = warp::inclusive_sum(hist_val, lane_id);
         if (lane_id == kWarpThreads - 1) smem->warp_sum[warp_id] = warp_inc;
       }
       __syncthreads();

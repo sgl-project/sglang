@@ -264,6 +264,7 @@ class TinyDSV4ModelConfig:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False

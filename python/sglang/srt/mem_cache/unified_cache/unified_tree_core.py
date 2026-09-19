@@ -2863,16 +2863,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Aux host-only states must match the host LRU. A host lock
+                # delists its node, so locked nodes are exempt on both sides.
                 host_lru = self.host_lru_lists[ct]
+                host_locked_ids = {
+                    n.id for n in all_nodes if n.component_data[ct].host_lock_ref > 0
+                }
                 s3_ids = {
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
-                }
-                host_lru_ids = set(host_lru.cache.keys())
+                } - host_locked_ids
+                host_lru_ids = set(host_lru.cache.keys()) - host_locked_ids
                 if s3_ids != host_lru_ids:
                     E(
                         f"{ct} host LRU: "
