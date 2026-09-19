@@ -4,8 +4,9 @@ import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -357,6 +358,177 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
         self.assertNotIn(DSML, normal)
         self.assertIn("Before.", normal)
         self.assertIn("5 > 3 After.", normal)
+
+
+class TestDeepSeekV4StreamFinish(CustomTestCase):
+    """End-of-stream flush for the DSML detector.
+
+    The streaming guard holds back any buffer containing the marker while it
+    waits for a closer. Without a `finish()` override that text is discarded,
+    so a turn whose prose follows the tool calls comes back empty.
+    """
+
+    D = DSML
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="ping",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+    def _invoke(self, closed=True):
+        body = (
+            f'<{self.D}invoke name="get_weather">\n'
+            f'<{self.D}parameter name="city" string="true">SF</{self.D}parameter>\n'
+        )
+        return body + (f"</{self.D}invoke>" if closed else "")
+
+    def _feed(self, text, size):
+        """Stream `text`, then flush. Returns (normal_text, names, arguments)."""
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        normal, names, arguments = "", [], ""
+        for start in range(0, len(text), size):
+            chunk_text, calls = parser.parse_stream_chunk(text[start : start + size])
+            normal += chunk_text
+            for call in calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    arguments += call.parameters
+        tail, calls = parser.parse_stream_end()
+        normal += tail
+        for call in calls:
+            if call.name:
+                names.append(call.name)
+            if call.parameters:
+                arguments += call.parameters
+        return normal, names, arguments
+
+    def test_arguments_are_chunk_invariant_when_cut_mid_arguments(self):
+        """A body cut mid-arguments must never complete as a zero-arg call.
+
+        Re-parsing a truncated body yields "{}", so completing the call from
+        it would dispatch `get_weather({})` the model never asked for — and
+        only at the chunk sizes where nothing had been streamed yet.
+        """
+        text = f'Let me check.\n<{self.D}invoke name="get_weather">\n' '{"city": "S'
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                _, _, arguments = self._feed(text, size)
+
+                # The exact prefix depends on how much streamed before the
+                # cut, but no chunking may turn a truncated body into a
+                # dispatchable zero-argument call.
+                self.assertNotEqual(arguments, "{}")
+                if arguments:
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(arguments)
+
+    def test_zero_argument_invoke_without_closer_still_completes(self):
+        """An empty body legitimately means no arguments, so it must finish."""
+        text = f'<{self.D}tool_calls>\n<{self.D}invoke name="ping">\n'
+        for size in (8, len(text)):
+            with self.subTest(chunk=size):
+                _, names, arguments = self._feed(text, size)
+
+                self.assertEqual(names, ["ping"])
+                self.assertEqual(json.loads(arguments), {})
+
+    def test_partial_marker_tail_is_not_released(self):
+        """A generation cut inside the marker leaves residue, not prose."""
+        _, _, _ = self._feed("Answer done.", 4)
+        normal, _, _ = self._feed(f"Answer done <{self.D[:3]}", 4)
+
+        self.assertNotIn(self.D[:3], normal)
+        self.assertIn("Answer done", normal)
+
+    def test_prose_after_the_call_is_released(self):
+        """Text following a completed call must not die in the buffer."""
+        text = (
+            f"<{self.D}tool_calls>\n{self._invoke()}\n</{self.D}tool_calls>\n"
+            "Here you go!"
+        )
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                normal, names, arguments = self._feed(text, size)
+
+                self.assertIn("Here you go!", normal)
+                self.assertNotIn(self.D, normal)
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
+
+    def test_invoke_without_closer_still_completes_arguments(self):
+        """A missing `</invoke>` must not strand truncated arguments."""
+        text = (
+            f"<{self.D}tool_calls>\n{self._invoke(closed=False)}"
+            f"</{self.D}tool_calls>"
+        )
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                normal, names, arguments = self._feed(text, size)
+
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
+                self.assertNotIn(self.D, normal)
+
+    def test_refusal_after_a_mangled_opener_is_released(self):
+        """Markup with no parseable call must still yield the model's prose."""
+        text = f"<{self.D}tool_calls|\nI cannot do that."
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                normal, names, _ = self._feed(text, size)
+
+                self.assertIn("I cannot do that.", normal)
+                self.assertNotIn(self.D, normal)
+                self.assertEqual(names, [])
+
+    def test_preamble_is_not_resent_at_finish(self):
+        """A chunk boundary inside the preamble must not duplicate it.
+
+        The buffer can still hold a partial copy of prose already streamed,
+        so releasing the buffer wholesale would emit it twice.
+        """
+        text = f'Let me check.\n<{self.D}invoke name="get_weather">\n' '{"city": "S'
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                normal, _, _ = self._feed(text, size)
+
+                self.assertEqual(normal.count("Let me check."), 1)
+                self.assertNotIn(self.D, normal)
+
+    def test_finish_is_idempotent(self):
+        """A repeated terminal flush must be a no-op."""
+        text = f"<{self.D}tool_calls>\n{self._invoke()}\n</{self.D}tool_calls>\nTail"
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        for start in range(0, len(text), 8):
+            parser.parse_stream_chunk(text[start : start + 8])
+
+        first = parser.parse_stream_end()
+        second = parser.parse_stream_end()
+
+        self.assertIn("Tail", first[0])
+        self.assertEqual(second, ("", []))
+
+    def test_plain_text_needs_no_flush(self):
+        normal, names, _ = self._feed("Just a plain answer.", 8)
+
+        self.assertEqual(normal, "Just a plain answer.")
+        self.assertEqual(names, [])
 
 
 class TestDeepSeekV32SharesTheFix(CustomTestCase):

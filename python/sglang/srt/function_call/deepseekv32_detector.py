@@ -114,6 +114,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self.invoke_tag_name[-3:],
         ]
         self.current_tool_id = -1
+        # Set once the pre-call prose has been streamed; see finish().
+        self._preamble_emitted = False
         # Any DSML tag, so leftovers never reach user-visible content.
         # Escaped because subclasses may override the marker. The marker is a
         # single special token, so any occurrence is model markup rather than
@@ -131,8 +133,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
         )
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text or self.invoke_start_token in text
+        """Check if the text contains a deepseek v32 format tool call.
+
+        A bare marker counts: it is a single special token, so its presence
+        means the model emitted protocol markup even when the surrounding tag
+        is mangled. Serving skips this detector entirely when this returns
+        False, so the marker has to be recognised here for the markup to be
+        removed from ``message.content``.
+        """
+        return self.dsml_token in text
 
     def _strip_residual_markup(self, text: str) -> str:
         """Remove leftover DSML tags so they never reach ``message.content``.
@@ -249,14 +258,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # emit a bare `<｜DSML｜invoke …>` block, or open the section and never
         # close it. Anchor on whichever marker comes first so those calls are
         # still recovered instead of returned as text.
-        idx = min(
+        anchors = [
             pos
             for pos in (
                 text.find(self.bot_token),
                 text.find(self.invoke_start_token),
             )
             if pos != -1
-        )
+        ]
+        if not anchors:
+            # A marker with no well-formed opener: nothing is parseable, but
+            # the markup still must not reach the client as content.
+            return StreamingParseResult(
+                normal_text=self._strip_residual_markup(text), calls=[]
+            )
+
+        idx = min(anchors)
         normal_text = text[:idx].removesuffix("\n\n")
 
         calls = []
@@ -363,6 +380,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
                     preamble = current_text[:call_start].removesuffix("\n\n")
+                    # The buffer can still hold a partial copy of this text
+                    # (a chunk boundary inside the preamble), so remember that
+                    # it has already gone out and finish() must not resend it.
+                    self._preamble_emitted = True
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -424,6 +445,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if is_tool_end:
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
+                    # Past a completed call the buffer no longer holds any of
+                    # the emitted preamble, so whatever remains at end of
+                    # stream is new text that finish() may release.
+                    self._preamble_emitted = False
                     current_text = self._buffer  # Update for next iteration
 
                     # Move to next tool call
@@ -449,9 +474,112 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Calls are dropped on purpose: the failure can land between a tool's
             # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
+            # The buffer is gone, so nothing of the emitted preamble can still
+            # be in it; a later finish() must be free to release new prose.
+            self._preamble_emitted = False
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
             return StreamingParseResult(normal_text=current_text)
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Flush buffered state once the stream has ended.
+
+        The DSML guard in ``parse_streaming_increment`` holds back any buffer
+        containing the marker, waiting for a closer that can no longer arrive.
+        Without this override that text is silently discarded, so a turn whose
+        prose follows the tool calls comes back empty.
+
+        Two rules keep this from making things worse:
+
+        * Text is released only from *before* the first well-formed opener.
+          Anything from the opener onwards was either already emitted as a
+          call or is a half-written protocol block whose payload must not be
+          shown as prose.
+        * A completing call emits only the remainder of its arguments, with no
+          name, so the serving layer extends the in-flight tool call instead of
+          opening a second one at the same index.
+        """
+        buffered = self._buffer
+        self._buffer = ""
+        if not buffered:
+            return StreamingParseResult()
+
+        calls: list[ToolCallItem] = []
+        try:
+            # Complete an in-flight call whose closing tag never arrived, but
+            # only when the re-parse actually extends what was streamed; a
+            # generation cut mid-arguments re-parses to "{}", which would
+            # leave the client holding unclosed JSON.
+            invoke_match = re.search(self.invoke_regex, buffered, re.DOTALL)
+            if invoke_match is not None and 0 <= self.current_tool_id < len(
+                self.streamed_args_for_tool
+            ):
+                _, invoke_content, _ = self._unpack_invoke_match(invoke_match)
+                final_args = self._parse_parameters_from_xml(invoke_content)
+                sent = self.streamed_args_for_tool[self.current_tool_id]
+                # A body that was cut mid-arguments re-parses to "{}" (no
+                # complete parameter tag, and direct JSON is only accepted
+                # once it closes). Completing the call with that would
+                # dispatch a zero-argument call the model never asked for, so
+                # discriminate on the body rather than on what was streamed:
+                # an empty body legitimately means no arguments.
+                body = invoke_content.strip()
+                lost_arguments = final_args == "{}" and body not in ("", "{}")
+                if lost_arguments:
+                    logger.warning(
+                        "DSML stream ended mid-arguments for tool_index %d; "
+                        "leaving the streamed prefix %r unterminated rather "
+                        "than completing it as an empty call",
+                        self.current_tool_id,
+                        sent,
+                    )
+                elif final_args.startswith(sent) and len(final_args) > len(sent):
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=final_args[len(sent) :],
+                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = final_args
+                elif not final_args.startswith(sent):
+                    logger.warning(
+                        "DSML re-parse %r does not extend the streamed prefix "
+                        "%r; leaving it unterminated",
+                        final_args,
+                        sent,
+                    )
+
+            # Release only what precedes the first well-formed opener.
+            cut = len(buffered)
+            for token in (self.bot_token, self.invoke_start_token):
+                pos = buffered.find(token)
+                if pos != -1:
+                    cut = min(cut, pos)
+            leading = buffered[:cut]
+            if self._preamble_emitted:
+                # A chunk boundary can leave a partial copy of the already
+                # streamed preamble in the buffer; resending it would duplicate
+                # text in the client's content.
+                leading = ""
+            normal_text = self._strip_residual_markup(leading)
+            # A generation cut inside the marker leaves a partial prefix that
+            # can never complete now the stream is over; it is protocol
+            # residue, not prose.
+            for length in range(len(self.dsml_token) - 1, 0, -1):
+                partial = self.dsml_token[:length]
+                for opener in (f"<{partial}", f"</{partial}", partial):
+                    if normal_text.endswith(opener):
+                        normal_text = normal_text[: -len(opener)]
+                        break
+                else:
+                    continue
+                break
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in finish: {e}")
+            # Emitting the raw buffer here would leak markup; drop it instead.
+            return StreamingParseResult()
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
