@@ -15,8 +15,8 @@
 
 use crate::config::DEFAULT_MIN_LOAD_CHOICES;
 use crate::policies::admission::{compare_prefill_pressure, queue_gate_admits};
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::state::load_monitor::engine_load::EngineLoadSnapshot;
 use crate::workers::Worker;
 use rand::seq::index::sample;
 use rand::Rng;
@@ -186,8 +186,7 @@ fn best_two_of_sample(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::engine_load::NativeCacheWorkerLoad;
-    use std::time::Instant;
+        use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {

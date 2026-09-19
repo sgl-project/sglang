@@ -41,7 +41,7 @@ use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::KvCacheEvent;
-use crate::policies::engine_load::EngineLoadTable;
+use crate::state::load_monitor::engine_load::EngineLoadTable;
 
 /// Channel buffer between the subscriber registry and the pump task.
 ///
@@ -585,8 +585,8 @@ async fn pump_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policies::engine_load::LoadStat;
-    use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
+    use crate::state::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
+    use crate::state::load_monitor::engine_load::LoadStat;
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
         KvWorkerId {
