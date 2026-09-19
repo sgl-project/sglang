@@ -31,6 +31,7 @@ class HybridAttnBackend(AttentionBackend):
         decode_backend: AttentionBackend,
     ):
         self.model_runner = model_runner
+        self._init_dcp(model_runner.is_draft_worker)
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
         self.data_type = model_runner.kv_cache_dtype

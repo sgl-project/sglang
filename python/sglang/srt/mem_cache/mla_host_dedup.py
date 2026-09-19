@@ -136,7 +136,7 @@ class MLAHostDedupBroadcaster:
 
         page_idx = None
         if self.idx_bufs is not None:
-            page_size = self.device_pool.page_size
+            page_size = self.device_pool.index_page_size
             if page_size > 1:
                 if indices.numel() % page_size != 0:
                     raise ValueError(

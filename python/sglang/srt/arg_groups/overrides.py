@@ -57,6 +57,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _invoke_provider,
     _register_for,
     attention_backends_of,
+    dcp_comm_backend_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -79,7 +80,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
-    is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -1437,25 +1437,13 @@ def _data_parallelism_defaults(view: Any) -> dict:
 def _dcp_comm_backend_default(view: Any) -> dict:
     if view.dcp_comm_backend is not None:
         return {}
-    if view.dcp_size <= 1:
-        return {"dcp_comm_backend": "ag_rs"}
-    platform = get_platform()
-    if is_fi_a2a_supported(
-        dcp_size=view.dcp_size,
-        tp_size=view.tp_size,
-        pp_size=view.pp_size,
-        nnodes=view.nnodes,
-    ):
-        backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
-        backend = "a2a"
-    else:
-        backend = "ag_rs"
-    logger.info(
-        "DCP (dcp_size=%d) selects communication backend %r.",
-        view.dcp_size,
-        backend,
-    )
+    backend = dcp_comm_backend_of(view)
+    if view.dcp_size > 1:
+        logger.info(
+            "DCP (dcp_size=%d) selects communication backend %r.",
+            view.dcp_size,
+            backend,
+        )
     return {"dcp_comm_backend": backend}
 
 

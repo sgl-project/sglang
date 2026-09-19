@@ -32,6 +32,8 @@ DCP_RANK = 2
 
 def _make_backend(backend_cls, bs: int):
     backend = object.__new__(backend_cls)
+    backend.dcp_size = DCP_SIZE
+    backend.dcp_rank = DCP_RANK
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.full((bs, 4), -1, dtype=torch.int32, device="cuda"),
@@ -145,6 +147,8 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
             dcp_size=DCP_SIZE if dcp_enabled else 1,
             dcp_rank=DCP_RANK if dcp_enabled else 0,
         )
+        backend.dcp_size = parallel.dcp_size
+        backend.dcp_rank = parallel.dcp_rank
         flashinfer_stub = SimpleNamespace(
             decode=SimpleNamespace(
                 trtllm_batch_decode_with_kv_cache_mla=kernel or (lambda **kw: None)

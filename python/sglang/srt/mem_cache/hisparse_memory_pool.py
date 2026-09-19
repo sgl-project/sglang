@@ -46,6 +46,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
+        dcp_replicated: bool = False,
     ):
         super().__init__(
             size=size,
@@ -66,6 +67,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             tail_extra_slots=tail_extra_slots,
             max_running_requests=max_running_requests,
             skip_topk_layers=skip_topk_layers,
+            dcp_replicated=dcp_replicated,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

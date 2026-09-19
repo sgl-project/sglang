@@ -64,7 +64,7 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
-        self.page_size = anchor_host.page_size
+        self.page_size = anchor_host.logical_page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -83,7 +83,7 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
-        self.size = anchor_host.size
+        self.size = anchor_host.logical_size
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (
