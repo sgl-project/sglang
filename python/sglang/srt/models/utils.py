@@ -285,6 +285,10 @@ class AutoWeightsLoader:
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
 
+    RL on-policy targets force native RoPE for numerical alignment. Native RoPE
+    does not consume the fused KV-store payload, so let the attention layer use
+    its regular KV-cache write path instead.
+
     SHUFFLE 5D pools on HIP also work — the underlying triton kernel
     (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
     SHUFFLE layout (key_cache.ndim==5, value_cache.ndim==5). We just need
@@ -292,6 +296,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    if get_exec().deterministic.rl_on_policy_target is not None:
+        return False
+
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
