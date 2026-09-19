@@ -6,7 +6,7 @@ This test suite verifies the weight_version feature implementation including:
 2. /get_weight_version endpoint
 3. /update_weight_version endpoint
 4. /generate request meta_info contains weight_version
-5. OpenAI API response metadata contains weight_version
+5. OpenAI API response sglext contains weight_version
 """
 
 import unittest
@@ -85,9 +85,9 @@ class TestWeightVersion(CustomTestCase):
         )
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("metadata", data)
-        self.assertIn("weight_version", data["metadata"])
-        self.assertEqual(data["metadata"]["weight_version"], "test_version_1.0")
+        self.assertIn("sglext", data)
+        self.assertIn("weight_version", data["sglext"])
+        self.assertEqual(data["sglext"]["weight_version"], "test_version_1.0")
 
         request_data = {
             "model": self.model,
@@ -98,9 +98,9 @@ class TestWeightVersion(CustomTestCase):
         response = requests.post(f"{self.base_url}/v1/completions", json=request_data)
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("metadata", data)
-        self.assertIn("weight_version", data["metadata"])
-        self.assertEqual(data["metadata"]["weight_version"], "test_version_1.0")
+        self.assertIn("sglext", data)
+        self.assertIn("weight_version", data["sglext"])
+        self.assertEqual(data["sglext"]["weight_version"], "test_version_1.0")
 
         update_data = {
             "new_version": "updated_version_2.0",
