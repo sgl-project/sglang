@@ -65,7 +65,8 @@ class AscendTransferEngine(MooncakeTransferEngine):
             # through all_gather to avoid conflicts with rdma initialization.
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
-                torch.empty_like(tmp_tensor) for _ in range(get_parallel().world_size)
+                torch.empty_like(tmp_tensor)
+                for _ in range(get_parallel().launch_world_size)
             ]
             torch.distributed.all_gather(
                 output_tensor_list,
