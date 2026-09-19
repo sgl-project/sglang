@@ -679,7 +679,7 @@ fn recompute_worker_subtrees(
     roots: impl IntoIterator<Item = i64>,
 ) {
     let kind = state.workers.get(worker_id).and_then(fast_path_kind);
-    let mut queue: VecDeque<i64> = roots.into_iter().collect();
+    let mut queue: VecDeque<i64> = topmost_dirty(state, roots);
     let mut visited = HashSet::new();
     while let Some(hash) = queue.pop_front() {
         if !visited.insert(hash) {
@@ -707,6 +707,54 @@ fn recompute_worker_subtrees(
         }
         queue.extend(children);
     }
+}
+
+/// Drops every dirty block that has a dirty ancestor. A child seeded on its own
+/// can be recomputed before its parent, inherit the parent's stale completeness,
+/// and then be skipped as visited when the parent's pass reaches it. Seeding only
+/// the topmost dirty blocks makes each pass strictly top-down.
+fn topmost_dirty(state: &State, roots: impl IntoIterator<Item = i64>) -> VecDeque<i64> {
+    let roots: Vec<i64> = roots.into_iter().collect();
+    let dirty: HashSet<i64> = roots.iter().copied().collect();
+    let mut shadowed: HashSet<i64> = HashSet::new();
+    let mut clear: HashSet<i64> = HashSet::new();
+    let mut seeds = VecDeque::new();
+    for root in roots {
+        if shadowed.contains(&root) || clear.contains(&root) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = root;
+        let has_dirty_ancestor = loop {
+            match state.blocks.get(&current).map(|block| block.parent) {
+                Some(ParentLink::Hash(parent)) => {
+                    if dirty.contains(&parent) || shadowed.contains(&parent) {
+                        break true;
+                    }
+                    if clear.contains(&parent) {
+                        break false;
+                    }
+                    path.push(parent);
+                    current = parent;
+                }
+                _ => break false,
+            }
+        };
+        // Every ancestor walked shares the verdict, so later roots stop early.
+        let memo = if has_dirty_ancestor {
+            &mut shadowed
+        } else {
+            &mut clear
+        };
+        memo.extend(path);
+        if has_dirty_ancestor {
+            shadowed.insert(root);
+        } else {
+            clear.insert(root);
+            seeds.push_back(root);
+        }
+    }
+    seeds
 }
 
 /// Returns direct children held by this worker but outside the current REPORT chain.
