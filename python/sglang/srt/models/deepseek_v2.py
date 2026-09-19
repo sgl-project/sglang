@@ -60,6 +60,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.dsa.dsa_cp import dsa_cp_enabled
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -2081,6 +2082,26 @@ class DeepseekV2AttentionMLA(
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
                 self.num_local_heads * get_parallel().attn_dcp_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
+        # DSA-CP: every head, for this rank's slice of the batch's tokens.
+        #
+        # Only the attention module needs the full head count. The weights are
+        # untouched -- q_nope_out and q_pe are redistributed across attn-TP by
+        # an all-to-all after the rope, and the output is put back by another
+        # before w_vc and o_proj -- so q_b_proj, kv_b_proj, w_kc, w_vc and
+        # o_proj all stay head-sharded exactly as they are without DSA-CP.
+        self.attn_mqa_for_dsa_cp = None
+        if dsa_cp_enabled():
+            self.attn_mqa_for_dsa_cp = RadixAttention(
+                self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,

@@ -976,6 +976,39 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
+    # ON: measured 1M TTFT 2011 -> 491 s and a 960k warm-up 456 s against ~33
+    # minutes. Set 0 to restore the unsharded indexer for an A/B.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: shard the whole attention block's TOKENS across the
+    # attention-TP group -- every rank computes every head for its own slice,
+    # instead of its own heads for every token. Consumes no ranks, so it
+    # composes with DCP, and with the indexer-only sharding above rather than
+    # replacing it. No weight is resharded: the query is redistributed across
+    # attention TP by all-to-all and put back after attention. Read at startup
+    # because it decides whether the full-head RadixAttention gets built.
+    # ON: measured a 16k tail on a 958k cached prefix 7.699 -> 4.757 s (-38.2%)
+    # against a same-session control, with prefill logprobs bitwise identical at
+    # all 44,062 paired positions. Set 0 to restore the unsharded attention.
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
+    # DSA-CP: also shard batches that carry more than one request. Shards each
+    # request's tokens separately and drops the operator's causal crop, which
+    # the top-k already enforces -- see dsa_cp_layout.plan_dsa_cp_shard_per_req.
+    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(False)
+    # DCP extend on NPU: let the sparse operator read the gathered prefix in the
+    # rank-major order the all-gather already produced, remapping the top-k
+    # instead of permuting ~1 GiB of KV back into position order.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(False)
+    # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
+    # l computes, into the other of two slots. Requires the packed read above.
+    SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
+    # the scratch a layer holds beside the gathered context. The default is
+    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

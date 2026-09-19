@@ -1447,7 +1447,12 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         nnodes=view.nnodes,
     ):
         backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
+    # Ascend NPU joins the a2a branch: ``ag_rs`` (all-gather LSE,
+    # reduce-scatter output) costs three collectives per layer, while ``a2a``
+    # packs output and LSE into one HCCL all-to-all, which is also what
+    # vLLM-Ascend does. ``is_fi_a2a_supported`` gates on ``is_sm100``, so the
+    # FlashInfer path above cannot catch NPU by accident.
+    elif platform.is_cuda or platform.is_hip or platform.is_npu:
         backend = "a2a"
     else:
         backend = "ag_rs"
