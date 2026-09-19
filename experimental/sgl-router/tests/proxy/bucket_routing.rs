@@ -76,7 +76,7 @@ fn build_app_context(
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        inflight_load: InflightLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

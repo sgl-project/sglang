@@ -146,7 +146,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             urls: vec![url.clone()],
         }),
         proxy: ProxyConfig::default(),
-        inflight_load: InflightLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
 
     let registry = Arc::new(WorkerRegistry::default());

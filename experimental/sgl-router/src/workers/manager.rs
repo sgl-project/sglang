@@ -609,7 +609,7 @@ mod tests {
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
-            inflight_load: InflightLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 

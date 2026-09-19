@@ -76,7 +76,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        inflight_load: InflightLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
