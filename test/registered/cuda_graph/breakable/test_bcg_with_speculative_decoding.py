@@ -12,7 +12,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
-register_cuda_ci(est_time=531, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=106, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestBCGWithEAGLE3(PCGSpecBase, unittest.TestCase):

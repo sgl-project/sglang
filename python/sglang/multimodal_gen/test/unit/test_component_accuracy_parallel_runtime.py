@@ -132,7 +132,10 @@ def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
 
 
 def test_srt_attention_tp_group_tracks_diffusion_tp_group():
-    tp_group = object()
+    # `world_size`, because lending the group also states the parallel widths it
+    # implies -- the shared `srt` vision layers ask for `attn_tp_size`, and this
+    # package publishes no `srt` config for that read to resolve against.
+    tp_group = SimpleNamespace(world_size=2)
 
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -143,6 +146,7 @@ def test_srt_attention_tp_group_tracks_diffusion_tp_group():
 
         assert srt_parallel_state._TP is tp_group
         assert srt_parallel_state._ATTN_TP is tp_group
+        assert get_parallel().attn_tp_size == 2
 
         parallel_state._clear_srt_tp_group()
 

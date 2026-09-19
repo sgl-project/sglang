@@ -12,6 +12,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -32,7 +33,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_derived_weight_cache_error() -> Optional[str]:
+def _unsupported_derived_weight_cache_error(
+    model: Optional[torch.nn.Module] = None,
+) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
     The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
@@ -40,6 +43,18 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
+    if model is not None and any(
+        getattr(module, "_hc_attn_tf32_parts", None) is not None
+        or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        for module in model.modules()
+    ):
+        return (
+            "Online weight updates are not supported while compensated mHC "
+            "weight splits are active: captured CUDA graphs retain these derived "
+            "weights. Restart with SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 to use "
+            "online weight updates."
+        )
+
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
@@ -83,9 +98,9 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -128,7 +143,7 @@ class WeightUpdater:
         param.data is the daemon's master copy shared with every co-attached
         engine, so an in-place update would silently corrupt them all.
         """
-        mode = self.get_model_runner().server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} is not supported while the weight cache is "
@@ -147,7 +162,7 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -237,7 +252,7 @@ class WeightUpdater:
             shape: the shape of the parameter to be updated.
         """
         self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -306,7 +321,7 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -321,7 +336,7 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -387,7 +402,7 @@ class WeightUpdater:
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
