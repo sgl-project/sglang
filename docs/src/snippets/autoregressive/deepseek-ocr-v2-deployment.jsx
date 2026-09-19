@@ -25,7 +25,7 @@ export const DeepSeekOCR2Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
         { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
       ]
     },

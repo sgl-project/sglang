@@ -47,7 +47,7 @@ export const DeepSeekR1BasicDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
         { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
         { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs do not support Multi-token Prediction' },
       ],
@@ -116,7 +116,8 @@ export const DeepSeekR1BasicDeployment = () => {
       command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
     }
     if (strategyValues.includes('dp')) {
-      command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+      command += isXeon ? ' \\\n  --dp 6' : ' \\\n  --dp 8';
+      command += ' \\\n  --enable-dp-attention';
     }
     if (strategyValues.includes('ep')) {
       command += ' \\\n  --ep 8';

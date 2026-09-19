@@ -15,7 +15,7 @@ ERNIE-4.5 delivers advanced features as below:
 - **Vision Encoder**: Dedicated adaptive-resolution ViT with 2D RoPE and image packing; for video, adaptive frame sampling and timestamp rendering, supporting both shared and modality-specific visual processing.
 - **Adapter**: Shared modality-bridging module with spatial and temporal compression to align vision to text embedding space, enabling cross-modal understanding without compromising text representations.
 - **Multimodal Position Embedding**: Unified 3D RoPE (temporal, height, width) for vision and 1D RoPE for text in a single embedding space, supporting parameter sharing while encoding modality-specific positions.
-- **Hardware Optimization**: Specifically tuned for AMD MI300X, MI325X, and MI355X GPUs.
+- **Hardware Optimization**: Specifically tuned for AMD MI300X, MI325X, MI355X GPUs and Intel Xeon CPUs.
 
 ## 2. SGLang Installation
 

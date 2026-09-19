@@ -38,6 +38,8 @@ Install SGLang with the diffusion dependencies:
 pip install -e "python[diffusion]"
 ```
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 Cosmos3 guardrails are enabled by default when the package is available:
 
 ```bash Command
@@ -53,6 +55,12 @@ COSMOS_GUARDRAIL_DIR="$(dirname "$(python -c 'import cosmos_guardrail; print(cos
 sed -i 's/weights_only=True/weights_only=False/g' "$COSMOS_GUARDRAIL_DIR/cosmos_utils.py"
 ```
 ## 3. Serve Cosmos3
+
+For CPU deployment, use `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` with the selected Cosmos3 checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path nvidia/Cosmos3-Nano
+```
 
 Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
 
