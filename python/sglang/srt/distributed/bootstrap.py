@@ -70,6 +70,7 @@ def init_torch_distributed(
 ):
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
+    parallel = get_parallel()
 
     backend = _resolve_backend(device=device)
 
@@ -83,8 +84,8 @@ def init_torch_distributed(
     if not is_draft_worker:
         if device == "cpu":
             _init_cpu_threads_env(
-                tp_size=ps.tp_size,
-                tp_rank=ps.tp_rank,
+                tp_size=parallel.tp_size,
+                tp_rank=parallel.tp_rank,
                 local_omp_cpuid=local_omp_cpuid,
                 dist_init_method=dist_init_method,
             )
@@ -102,10 +103,12 @@ def init_torch_distributed(
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
         if get_exec().comm.pre_warm_nccl and (
-            ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
+            parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.moe_ep_size > 1
         ):
             _prewarm_nccl(
-                tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
+                tp_size=parallel.tp_size,
+                pp_size=parallel.pp_size,
+                moe_ep_size=parallel.moe_ep_size,
             )
 
         # CUDA graph capture enables the PyNCCL communicator for TP LM-head
@@ -115,7 +118,7 @@ def init_torch_distributed(
         if (
             device == "cuda"
             and get_parallel().enable_tp_lm_head_all_to_all
-            and ps.tp_size > 1
+            and parallel.tp_size > 1
         ):
             _prewarm_tp_lm_head_all_to_all()
 
@@ -133,7 +136,7 @@ def init_torch_distributed(
     )
     # Check memory for tensor parallelism
     local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
-    if ps.tp_size > 1 and not is_draft_worker:
+    if parallel.tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
             local_gpu_memory=local_gpu_memory,

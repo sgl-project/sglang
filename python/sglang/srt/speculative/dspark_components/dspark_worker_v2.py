@@ -158,7 +158,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             get_parallel().enable_dp_attention
             and self._draft_is_moe
-            and ps.attn_tp_size > 1
+            and get_parallel().attn_tp_size > 1
         ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
@@ -223,7 +223,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else parallel.tp_group
         )
 
-        if self.ps.tp_rank == 0:
+        if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
@@ -246,7 +246,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if self.ps.tp_rank == 0:
+            if self.model_runner.tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
                 )
@@ -270,7 +270,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             model_runner=self.model_runner,
             device=self.device,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
@@ -318,7 +318,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
             and not get_parallel().enable_dp_attention
-            and self.ps.pp_size == 1
+            and self.model_runner.pp_size == 1
         )
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
@@ -382,7 +382,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             planner=self._verify_planner,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -436,7 +436,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             is_deepseek_v4_draft=self._draft_is_moe,
         )
-        if self._target_hidden_projection_enabled and self.ps.tp_rank == 0:
+        if self._target_hidden_projection_enabled and self.model_runner.tp_rank == 0:
             logger.info(
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
@@ -491,7 +491,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(
