@@ -101,6 +101,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
@@ -516,6 +517,15 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+
+        # Phase two: make the topology this process published exist, before
+        # anything that reads a group does.
+        bootstrap.init_parallel_runtime(
+            server_args=server_args,
+            model_config=self.model_config,
+            device=get_device().device,
+            dist_port=self.nccl_port,
+        )
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)

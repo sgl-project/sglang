@@ -2641,6 +2641,78 @@ class TestTheTopologyIdentities(CustomTestCase):
                 self.assertEqual(get_parallel().attn_tp_size, 2)
 
 
+class TestTheParallelPhase(CustomTestCase):
+    """Publish says what the topology is; one phase builds it, once.
+
+    Before this, whichever runner was constructed first brought the groups up
+    on its way past, so whether they existed depended on construction order --
+    and a draft runner, which must not build them, went down the same path.
+    """
+
+    def test_building_twice_is_refused(self):
+        from sglang.srt.distributed import bootstrap
+
+        bootstrap.reset_parallel_initialised()
+        self.addCleanup(bootstrap.reset_parallel_initialised)
+        with (
+            patch.object(bootstrap, "_resolve_backend", return_value="gloo"),
+            patch.object(bootstrap, "_resolve_dist_init_method", return_value="env://"),
+            patch.object(bootstrap, "_set_all_reduce_flags"),
+            patch.object(bootstrap, "_init_parallel_groups"),
+            patch.object(bootstrap, "monkey_patch_p2p_access_check"),
+            patch.object(bootstrap, "_init_cpu_threads_env"),
+            patch.object(bootstrap, "_bind_threads_if_cpu", return_value=None),
+            patch.object(bootstrap, "maybe_init_shared_mooncake_transfer_engine"),
+        ):
+            reset_context()
+            self.addCleanup(reset_context)
+            publish(
+                ServerArgs(model_path="dummy"),
+                role="test",
+                ranks=SpawnRanks(world_rank=0),
+            )
+            kwargs = dict(
+                server_args=ServerArgs(model_path="dummy"),
+                model_config=None,
+                device="cpu",
+                dist_port=12345,
+            )
+            bootstrap.init_parallel_runtime(**kwargs)
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.init_parallel_runtime(**kwargs)
+        self.assertIn("ran twice", str(caught.exception))
+
+    def test_every_publisher_that_builds_a_runner_runs_the_phase(self):
+        """The companion to the bundle census: an entry that publishes and then
+        builds a runner has to bring the parallel runtime up
+        itself, because the runner no longer does it on the way past."""
+        import ast as _ast
+
+        root = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
+        offenders = []
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8-sig")
+            if "ModelRunner(" not in text or "publish(" not in text:
+                continue
+            tree = _ast.parse(text)
+            builds = any(
+                isinstance(n, _ast.Call)
+                and getattr(n.func, "id", getattr(n.func, "attr", None))
+                == "ModelRunner"
+                for n in _ast.walk(tree)
+            )
+            if not builds:
+                continue
+            if "init_parallel_runtime(" not in text:
+                offenders.append(str(path.relative_to(root)))
+        self.assertEqual(
+            offenders,
+            [],
+            "these publish and then build a ModelRunner without bringing the "
+            "parallel runtime up first:\n  " + "\n  ".join(offenders),
+        )
+
+
 class TestWhoAnswersDuringADraftScope(CustomTestCase):
     """A draft worker runs in one process with the target, under a scope.
 
