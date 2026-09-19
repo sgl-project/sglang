@@ -4,7 +4,7 @@
 mod forward;
 mod preparation;
 
-use crate::buckets_reorg::BucketResolver;
+use crate::buckets_reorg::{BucketResolver, SloPreference};
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdPools, PdResolveError};
@@ -141,6 +141,17 @@ async fn pick_with_new_policy(
         request.input_token_count as u64,
         &load,
     );
+    match stage {
+        Stage::Plain | Stage::Prefill if resolver.prefill_slo != SloPreference::Disabled => {
+            pick.ttft_ms =
+                parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?;
+        }
+        Stage::Decode if resolver.decode_slo != SloPreference::Disabled => {
+            pick.tokens_per_second =
+                parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?;
+        }
+        _ => {}
+    }
     pick.expected_peak_tokens = request
         .max_output_tokens
         .map(|output| {

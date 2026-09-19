@@ -665,8 +665,11 @@ the legacy policy registry or fall back to a legacy selection on failure.
 
 `tests/proxy/new_policy_routing.rs` exercises power-of-two against live HTTP mock
 workers, including length matching, role separation, admission rejection,
-streaming cleanup, and invalid requests. New policies can use the same builder
-as they are implemented.
+streaming cleanup, and invalid requests. With SLO preference enabled, the new
+handler parses the existing `x-sgl-ttft-slo-ms` and `x-sgl-tps-slo` headers for
+the applicable stage. An HTTP test verifies independent P/D choices and invalid
+header rejection before dispatch. New policies can use the same builder as
+they are implemented.
 
 ### Selection implementation
 

@@ -311,3 +311,73 @@ async fn new_policy_invalid_requests_fail_before_dispatch() {
     assert_eq!(ctx.active_load.inflight_count(), 0);
     assert_eq!(ctx.inflight_http.count(), 0);
 }
+
+#[tokio::test]
+async fn new_policy_slo_headers_select_pd_groups_independently() {
+    use sgl_router::buckets_reorg::SloPreference;
+
+    let fast_p = MockWorker::start(vec![]).await;
+    let slow_p = MockWorker::start(vec![]).await;
+    let fast_d = MockWorker::start(vec![]).await;
+    let slow_d = MockWorker::start(vec![]).await;
+    let ctx = context(&[
+        ("fast-p", &fast_p, WorkerMode::Prefill),
+        ("slow-p", &slow_p, WorkerMode::Prefill),
+        ("fast-d", &fast_d, WorkerMode::Decode),
+        ("slow-d", &slow_d, WorkerMode::Decode),
+    ]);
+    let mut resolver = BucketResolver::new(
+        ctx.registry.clone(),
+        vec![
+            Bucket {
+                id: "fast-prefill".into(),
+                ttft_ms: Some(50),
+                tokens_per_second: Some(10.0),
+                prefill: Some(group(&["fast-p"])),
+                decode: Some(group(&["slow-d"])),
+                ..Default::default()
+            },
+            Bucket {
+                id: "fast-decode".into(),
+                ttft_ms: Some(100),
+                tokens_per_second: Some(100.0),
+                prefill: Some(group(&["slow-p"])),
+                decode: Some(group(&["fast-d"])),
+                ..Default::default()
+            },
+        ],
+    );
+    resolver.prefill_slo = SloPreference::SloFirst;
+    resolver.decode_slo = SloPreference::SloFirst;
+    let app = build_router_with_new_policy(ctx, resolver);
+    for (ttft, tps) in [("0", "100"), ("50", "NaN"), ("50", "0")] {
+        let mut req = request(chat(false));
+        req.headers_mut()
+            .insert("x-sgl-ttft-slo-ms", ttft.parse().unwrap());
+        req.headers_mut()
+            .insert("x-sgl-tps-slo", tps.parse().unwrap());
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for worker in [&fast_p, &slow_p, &fast_d, &slow_d] {
+        assert!(worker.captured.lock().unwrap().last_body.is_none());
+    }
+    let mut req = request(chat(false));
+    req.headers_mut()
+        .insert("x-sgl-ttft-slo-ms", "50".parse().unwrap());
+    req.headers_mut()
+        .insert("x-sgl-tps-slo", "100".parse().unwrap());
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-sgl-decode-url"], fast_d.url);
+    response.into_body().collect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fast_p.captured.lock().unwrap().last_body.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(slow_p.captured.lock().unwrap().last_body.is_none());
+    assert!(slow_d.captured.lock().unwrap().last_body.is_none());
+}
