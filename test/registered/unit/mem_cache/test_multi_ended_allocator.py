@@ -3574,6 +3574,58 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
                     device="cpu",
                 )
 
+    def test_matches_reference_on_a_strided_view(self):
+        """A column slice of a wider page table is what the SWA read path hands
+        down under cuda graphs, so its ids must equal the flat reference's."""
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        rows, cols, page_size = 3, 5, 4
+        v2p = torch.arange(32, dtype=torch.int64, device=_DEV)
+        backing = torch.full((rows, cols + 3), -1, dtype=torch.int64, device=_DEV)
+        view = backing[:, :cols]
+        view.copy_(torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols))
+        self.assertFalse(view.is_contiguous())
+
+        want = self._reference(
+            view.reshape(-1).cpu(), v2p.cpu(), page_size, page_size, 1, 0
+        )
+        got = write_loc_to_kernel_ids(
+            loc=view, v2p=v2p, page_size=page_size, stride=page_size
+        )
+        self.assertEqual(got.shape, view.shape)
+        self.assertEqual(got.reshape(-1).tolist(), want)
+
+        # `out=` into a slice of a DIFFERENTLY strided backing: the ids land in
+        # the sliced columns and the rest of that buffer is left alone.
+        dst = torch.full((rows, cols + 7), -9, dtype=torch.int64, device=_DEV)
+        ret = write_loc_to_kernel_ids(
+            loc=view,
+            v2p=v2p,
+            page_size=page_size,
+            stride=page_size,
+            out=dst[:, :cols],
+        )
+        self.assertEqual(ret.data_ptr(), dst.data_ptr())
+        self.assertEqual(dst[:, :cols].reshape(-1).tolist(), want)
+        self.assertTrue(bool((dst[:, cols:] == -9).all()))
+
+    def test_out_width_needs_a_packed_loc(self):
+        """`out_width` addresses a packed lane range, so a strided loc would
+        write its tail zeros over live ids."""
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        v2p = torch.arange(16, dtype=torch.int64, device=_DEV)
+        loc = torch.arange(12, dtype=torch.int64, device=_DEV)[::2]
+        with self.assertRaises(AssertionError):
+            write_loc_to_kernel_ids(
+                loc=loc,
+                v2p=v2p,
+                page_size=1,
+                stride=1,
+                out=torch.zeros(10, dtype=torch.int64, device=_DEV),
+                out_width=10,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
