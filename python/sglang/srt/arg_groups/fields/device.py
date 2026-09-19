@@ -17,7 +17,7 @@ from typing import (
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import A
+from sglang.srt.arg_groups.arg_utils import A, Arg
 
 
 class Device(msgspec.Struct):
@@ -40,6 +40,19 @@ class Device(msgspec.Struct):
         int,
         "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
     ] = 1
+    gpu_id: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Which device this process runs on. Not a topology: the parent "
+                "decides it -- reindexing narrows the visible devices before the "
+                "spawn, and Ray allocates from its own pool -- so the process "
+                "cannot compute it and the entry that was told it supplies it "
+                "before publishing."
+            ),
+            no_cli=True,
+        ),
+    ] = None
     random_seed: A[Optional[int], "The random seed."] = None
     mlx_enable_sampling: A[
         bool,

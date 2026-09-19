@@ -78,7 +78,7 @@ class ProfileManager:
         )
         self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
+        self.first_rank_in_node = get_device().gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
         self.detailed_annotations = False
