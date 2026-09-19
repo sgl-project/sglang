@@ -3120,7 +3120,7 @@ class TestTheRecordIsNeverWrittenTo(CustomTestCase):
         fields = set(namespace_of(ServerArgs))
         offenders = []
         for path in _sources():
-            rel = path.relative_to(_PACKAGE.parent).as_posix()
+            rel = path.as_posix()
             if "sglang/srt/" not in rel and "sglang/benchmark/" not in rel:
                 continue
             if any(part in rel for part in self.EXEMPT):

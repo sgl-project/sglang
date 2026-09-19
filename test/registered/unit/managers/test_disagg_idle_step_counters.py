@@ -20,7 +20,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    published_topology,
+)
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -58,6 +62,12 @@ def load_mlx_scheduler_module():
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The loop asks the context where this process sits; nothing here
+        # builds a process group, so the placement arrives by publishing one.
+        enter_scope(self, published_topology(role="scheduler"))
+
     @parameterized.expand(
         [
             (
