@@ -14,6 +14,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,16 +60,6 @@ def make_worker(dcp_size, *, allocator_size=None):
 def make_scheduler(worker):
     info = TpModelWorker.get_worker_info(worker)
     runner = worker.model_runner
-    stats = NS(
-        kv_transfer_speed_gb_s=0,
-        kv_transfer_latency_ms=0,
-        num_grammar_queue_reqs=0,
-        num_paused_reqs=0,
-        num_retracted_reqs=0,
-        gen_throughput=0,
-        cache_hit_rate=0,
-        utilization=0,
-    )
     scheduler = NS(
         tp_worker=worker,
         token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
@@ -99,7 +90,7 @@ def make_scheduler(worker):
         disagg_decode_transfer_queue=NS(queue=[]),
         ps=NS(dp_rank=0),
         spec_algorithm=NS(is_none=lambda: True),
-        metrics_reporter=NS(stats=stats),
+        metrics_reporter=NS(stats=SchedulerStats()),
     )
     Scheduler.init_pool_stats_observer(scheduler)
     Scheduler.init_load_inquirer(scheduler)
@@ -204,7 +195,7 @@ class TestDcpLogicalCapacity(CustomTestCase):
             max_total_num_tokens=scheduler.max_total_num_tokens,
             _rebootstrap_prefill_len=DecodePreallocQueue._rebootstrap_prefill_len,
             _uses_swa_tail_prealloc=lambda: False,
-            scheduler=NS(enable_hisparse=False),
+            scheduler=NS(enable_hisparse=False, output_streamer=Mock()),
         )
         self.assertFalse(
             DecodePreallocQueue._check_if_req_exceed_kv_capacity(queue, req)
@@ -214,29 +205,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
         Scheduler.init_req_max_new_tokens(scheduler, req)
         self.assertEqual(req.sampling_params.max_new_tokens, 30)
 
-    def test_decode_rejects_request_larger_than_actual_logical_pool(self):
-        scheduler = make_scheduler(make_worker(8))
-        req = NS(
-            rid="too-large",
-            origin_input_ids=range(scheduler.max_total_num_tokens + 1),
-            output_ids=[],
-            return_logprob=False,
-        )
-        output = Mock()
-        queue = NS(
-            max_total_num_tokens=scheduler.max_total_num_tokens,
-            _rebootstrap_prefill_len=DecodePreallocQueue._rebootstrap_prefill_len,
-            _uses_swa_tail_prealloc=lambda: False,
-            scheduler=NS(
-                enable_hisparse=False, output_streamer=NS(stream_output=output)
-            ),
-        )
+        req.origin_input_ids = range(scheduler.max_total_num_tokens + 1)
+        req.return_logprob = False
         with patch("sglang.srt.disaggregation.decode.prepare_abort") as abort:
             self.assertTrue(
                 DecodePreallocQueue._check_if_req_exceed_kv_capacity(queue, req)
             )
         abort.assert_called_once()
-        output.assert_called_once()
+        queue.scheduler.output_streamer.stream_output.assert_called_once()
 
     def test_load_usage_uses_logical_capacity_exactly_once(self):
         for dcp_size in (1, 8):
