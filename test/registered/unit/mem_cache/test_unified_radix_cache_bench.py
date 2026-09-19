@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
@@ -662,7 +662,7 @@ def bench_cache_finished(
         "cache_finished",
         lambda: req_items,
         lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv.kv_committed_len
+            req, is_insert=True, owned_kv_len=req.kv.kv_committed_len
         ),
         len(req_items) - warmup,
         env.avg_tokens,

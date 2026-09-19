@@ -52,6 +52,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -106,6 +107,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -114,6 +116,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+if _is_xpu:
+    from sgl_kernel import store_cache_xpu
 
 
 def conv_window_dedup_enabled(
@@ -166,6 +171,15 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
             v_row_bytes=v_row_bytes,
             size_limit=size_limit,
+        )
+
+    if _is_xpu and v_row_dim == row_dim:
+        return store_cache_xpu(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
         )
 
     # store_cache_cpu takes a single row_dim for both K and V, so it only serves
@@ -259,6 +273,10 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
+    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
+    # positive value. Declared here so callers can read it without getattr.
+    pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
@@ -736,15 +754,8 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -1113,8 +1124,8 @@ class MambaPool:
         }
     )
 
-    def _iter_transfer_state_tensors(self):
-        """Yield transferable state tensors with their per-slot slice axis."""
+    def _iter_transfer_state_entries(self):
+        """Yield ``[slot, ...]`` state entries and their transfer metadata."""
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1125,20 +1136,20 @@ class MambaPool:
                 # empty. Advertising it fails the whole batch registration.
                 if state_tensor.numel() == 0:
                     continue
-                yield field, state_tensor, slice_axis
+                for layer_index, layer_id in enumerate(self.mamba_layer_ids):
+                    yield field, state_tensor[layer_index], slice_axis, layer_id
+
+        for sibling in self._slot_siblings:
+            yield from sibling.iter_transfer_state_entries()
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor, _ in self._iter_transfer_state_tensors():
-            data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
-            ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
-            item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
-            ]
+        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            data_ptrs.append(state_tensor.data_ptr())
+            data_lens.append(state_tensor.nbytes)
+            item_lens.append(state_tensor[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1148,13 +1159,17 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
-            axis = 2 + slice_axis
-            sliceable_dim = state_tensor.shape[axis]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            # Zero is a protocol marker for request state replicated across the
+            # attention-TP group. Heterogeneous PD copies the whole item from one
+            # elected source rank instead of slicing it as a TP-sharded tensor.
+            if slice_axis is None:
+                dim_per_tensor.append(0)
+                continue
+            # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
+            # transposes the two per-slot axes to [K-1, dim].
+            axis = 1 + slice_axis
+            dim_per_tensor.append(state_tensor.shape[axis])
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1164,15 +1179,18 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
-        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
-        return list(self.mamba_layer_ids) * state_tensor_count
+        return [layer_id for _, _, _, layer_id in self._iter_transfer_state_entries()]
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
-            outer_counts += [outer_count] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            outer_count = (
+                1
+                if slice_axis is None
+                else math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            )
+            outer_counts.append(outer_count)
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1187,14 +1205,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field, _, _ in self._iter_transfer_state_tensors():
+        for field, _, _, _ in self._iter_transfer_state_entries():
             # Only conv_state carries a q/k/v decomposition.
             subdims = (
                 list(self.conv_shard_groups)
                 if field == "conv" and self.conv_shard_groups is not None
                 else None
             )
-            subdims_per_tensor += [subdims] * self.num_mamba_layers
+            subdims_per_tensor.append(subdims)
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
@@ -2127,6 +2145,8 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_scale_buffer = None
             self.v_scale_buffer = None
+            self.native_k_scale_buffer = None
+            self.native_v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
@@ -2155,6 +2175,8 @@ class MHATokenToKVPool(KVCache):
         self.v_buffer = buf["v_buffer"]
         self.k_scale_buffer = buf.get("k_scale_buffer")
         self.v_scale_buffer = buf.get("v_scale_buffer")
+        self.native_k_scale_buffer = buf.get("native_k_scale_buffer")
+        self.native_v_scale_buffer = buf.get("native_v_scale_buffer")
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
@@ -2164,6 +2186,24 @@ class MHATokenToKVPool(KVCache):
         expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
         has_k_workspace = self.dq_k_buffer is not None
         has_v_workspace = self.dq_v_buffer is not None
+        has_k_native_scales = self.native_k_scale_buffer is not None
+        has_v_native_scales = self.native_v_scale_buffer is not None
+        requires_native_scales = (
+            self.quant_method.needs_native_fp4_scales()
+            if hasattr(self.quant_method, "needs_native_fp4_scales")
+            else False
+        )
+        if has_k_native_scales != has_v_native_scales:
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} created only one "
+                "native FP4 scale buffer."
+            )
+        if requires_native_scales != has_k_native_scales:
+            expectation = "requires" if requires_native_scales else "does not require"
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} {expectation} native "
+                f"FP4 scales, but buffer presence is {has_k_native_scales}."
+            )
         if has_k_workspace != has_v_workspace:
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} created only one "
@@ -2372,6 +2412,16 @@ class MHATokenToKVPool(KVCache):
             del self.k_scale_buffer
         if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
             del self.v_scale_buffer
+        if (
+            hasattr(self, "native_k_scale_buffer")
+            and self.native_k_scale_buffer is not None
+        ):
+            del self.native_k_scale_buffer
+        if (
+            hasattr(self, "native_v_scale_buffer")
+            and self.native_v_scale_buffer is not None
+        ):
+            del self.native_v_scale_buffer
         if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
             del self.dq_k_buffer
         if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
@@ -2388,6 +2438,9 @@ class MHATokenToKVPool(KVCache):
         if getattr(self, "k_scale_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
             v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "native_k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.native_k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.native_v_scale_buffer)
         if getattr(self, "dq_k_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
             v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
@@ -2668,6 +2721,12 @@ class MHATokenToKVPool(KVCache):
         loc, _, _ = unwrap_write_loc(loc_info)
         local_layer_id = layer_id - self.start_layer
         k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
+        native_scale_kwargs = {}
+        if self.native_k_scale_buffer is not None:
+            native_scale_kwargs = {
+                "native_k_scale_buffer": self.native_k_scale_buffer[local_layer_id],
+                "native_v_scale_buffer": self.native_v_scale_buffer[local_layer_id],
+            }
         self.quant_method.quantize_and_store(
             self.k_buffer[local_layer_id],
             self.v_buffer[local_layer_id],
@@ -2686,6 +2745,7 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
+            **native_scale_kwargs,
         )
 
     def get_raw_kv_buffer(
@@ -3004,6 +3064,7 @@ class MHATokenToKVPool(KVCache):
             for kb, vb in zip(self.k_buffer, self.v_buffer):
                 kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
@@ -3017,6 +3078,7 @@ class MHATokenToKVPool(KVCache):
                 move_kv_cache_native(
                     self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
                 )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         N = tgt_loc.numel()
@@ -3040,6 +3102,7 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(N),
                 cfg,
             )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
@@ -3055,6 +3118,21 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(chunk_len),
                 cfg,
             )
+        self._move_native_fp4_scales(tgt_loc, src_loc)
+
+    def _move_native_fp4_scales(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        if self.native_k_scale_buffer is None:
+            return
+        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+            move_nvfp4_native_scales,
+        )
+
+        for k_scale, v_scale in zip(
+            self.native_k_scale_buffer, self.native_v_scale_buffer
+        ):
+            move_nvfp4_native_scales(k_scale, v_scale, tgt_loc, src_loc)
 
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
@@ -3973,6 +4051,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_mla and _is_npu and layer_ids:
+            data_ptrs, _, _ = self.get_contiguous_buf_infos()
+            return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4603,6 +4684,9 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4622,6 +4706,9 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
