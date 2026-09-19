@@ -609,7 +609,9 @@ class HiCacheNixl(HiCacheStorage):
     def clear(self) -> None:
         if self.file_manager is None:
             return
-        self.file_manager.clear()
+        # Scope the clear to this instance's keys; the base directories may
+        # be a shared mount holding other models'/deployments' cache files.
+        self.file_manager.clear(suffix=self.config_suffix)
 
     def close(self):
         if self._l3_cleaner is not None:

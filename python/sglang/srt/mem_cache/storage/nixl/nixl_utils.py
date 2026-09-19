@@ -11,6 +11,24 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 
 logger = logging.getLogger(__name__)
 
+
+def _name_matches_suffix(name: str, suffix: str) -> bool:
+    """True if ``name`` contains ``suffix`` at a key-component boundary.
+
+    Physical file names are ``{hash}{config_suffix}`` optionally followed by
+    ``_{component}`` parts, so a match is an occurrence of ``suffix`` followed
+    by either the end of the name or an underscore. Plain substring matching
+    would cross model boundaries (``_llama`` is a substring of ``_llama-2``).
+    """
+    start = 0
+    while (idx := name.find(suffix, start)) != -1:
+        rest = name[idx + len(suffix) :]
+        if not rest or rest.startswith("_"):
+            return True
+        start = idx + 1
+    return False
+
+
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
     "l3_cleaner_enabled",
@@ -233,16 +251,32 @@ class NixlFileManager:
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
 
-    def clear(self) -> None:
-        """Clear all files below every configured base directory."""
+    def clear(self, suffix: Optional[str] = None) -> None:
+        """Delete cache files below every configured base directory.
+
+        Only files whose name carries ``suffix`` at a key-component boundary
+        are removed. ``suffix`` is the clearing instance's config suffix; on
+        a shared mount this keeps one instance's clear from deleting other
+        models'/deployments' files. A missing or degenerate suffix falls back
+        to clearing everything, with a warning.
+        """
         if not self.base_dirs:
             logger.warning("Base directories are empty, skipping clear operation")
             return
 
+        scoped = bool(suffix) and suffix != "_"
+        if not scoped:
+            logger.warning(
+                f"clear called without a usable key suffix (suffix={suffix!r}); "
+                f"deleting ALL files under {self.base_dirs}. Other instances "
+                "sharing these directories will lose their cached data."
+            )
         for base in self.base_dirs:
             try:
                 for root, _dirs, files in os.walk(base):
                     for file in files:
+                        if scoped and not _name_matches_suffix(file, suffix):
+                            continue
                         file_path = os.path.join(root, file)
                         try:
                             os.remove(file_path)
@@ -250,7 +284,10 @@ class NixlFileManager:
                             logger.warning(f"Failed to remove file {file_path}: {e}")
             except Exception as e:
                 logger.error(f"Failed to clear base directory {base}: {e}")
-        logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
+        logger.debug(
+            f"Cleared files with suffix {suffix!r} in base directories: "
+            f"{self.base_dirs}"
+        )
 
     def ensure_all_bucket_dirs(self) -> None:
         """Pre-create every possible bucket directory under each base dir.
