@@ -99,6 +99,7 @@ def init_torch_distributed(
             )
 
         # Only initialize the distributed environment on the target model worker.
+        # This builds the groups behind the context's live group-handle reads.
         _init_parallel_groups(
             backend=backend,
             dist_init_method=dist_init_method,
@@ -291,11 +292,14 @@ def _init_parallel_groups(
         attention_context_model_parallel_size=attn_cp_size,
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
+        shared_experts_tensor_parallel_size=get_parallel().shared_experts_tp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
+        # Only WORLD is extended during scale-up. The joiner's model-parallel
+        # groups are fixed groups local to its launch cohort.
+        recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
-        max_world_size=get_parallel().max_ep_size,
+        max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(

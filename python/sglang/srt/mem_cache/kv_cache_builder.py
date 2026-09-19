@@ -39,6 +39,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -153,13 +154,15 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Host-pool retraction transfers full and sliding-window components
-        # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        # Host-pool retraction does not address unified page envelopes or
+        # recurrent state, so those configurations stay on cpu_tensor.
+        supports_host_pool = (
+            not memory.enable_unified_memory
+            and not uses_ssm_state(tp_worker.model_runner.model_config)
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -223,7 +226,11 @@ def build_kv_cache(
     )
 
     # Hybrid memory pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa
+    token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
+    is_hybrid_swa = tp_worker.is_hybrid_swa and (
+        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        or token_to_kv_pool.needs_paged_swa_allocator
+    )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
@@ -250,8 +257,8 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
+    # component (match + lock + CoW), the same path as colocated serving.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -280,11 +287,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:

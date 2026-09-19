@@ -11,7 +11,6 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -108,6 +107,17 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],
@@ -150,34 +160,13 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
-        return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
-        available_size = allocator.available_size()
-        if available_size < num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
-            )
-            _evict_until_allocatable(tree_cache, allocator, num_tokens)
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
+    if tree_cache is not None and not tree_cache.is_chunk_cache():
+        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+            tree_cache, num_tokens
+        )
 
 
 def _evict_until_allocatable(
@@ -205,6 +194,19 @@ def _evict_until_allocatable(
             return
 
 
+def dsv41_dspark_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return False
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+
+
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -214,6 +216,11 @@ def retraction_backup(
 ) -> bool:
     """Returns False when the host pool cannot hold the backup; the caller
     aborts the request since its KV cannot be preserved."""
+    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
+        # Drain the in-flight verify before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -277,11 +284,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.kv.mamba_pool_idx = None
         return
 
-    effective_kv_committed_len = req.effective_kv_committed_len()
+    owned_kv_len = req.owned_kv_len()
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
+        owned_kv_len=owned_kv_len,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
@@ -290,7 +297,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if not req.kv.holds_kv:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.

@@ -115,6 +115,11 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         )
 
     def test_truncated_and_aborted_streams_have_matching_terminal_events(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"
+        )
         serving = make_serving()
         for finish_reason, status in (
             ({"type": "length"}, "incomplete"),
@@ -418,6 +423,11 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
         self.assertEqual(added["call_id"], done["call_id"])
 
     def test_split_and_coalesced_messages_preserve_stream_items(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"
+        )
         from openai_harmony import Message, Role, StreamState
 
         from sglang.srt.entrypoints.context import StreamingHarmonyContext
