@@ -1002,27 +1002,42 @@ async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
                     manager.request_lifecycle.seal(attempt_id)
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-@app.api_route(
-    "/generate",
-    methods=["POST", "PUT"],
-    response_class=SGLangORJSONResponse,
-)
+class NativeGenerateRoute(APIRoute):
+    def get_route_handler(self):
+        native_handler = super().get_route_handler()
+
+        async def handle(request: Request):
+            attempt_id = request.headers.get("x-sglang-attempt-id")
+            if attempt_id is None:
+                return await native_handler(request)
+            manager = _global_state.tokenizer_manager
+            registry = _get_request_lifecycle(request)
+            try:
+                registry.claim(attempt_id, manager.disaggregation_mode.value)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            manager.auto_create_handle_loop()
+            request.state.lifecycle_attempt_id = attempt_id
+            request.state.lifecycle_handed_off = False
+            try:
+                return await native_handler(request)
+            finally:
+                # Body/JSON validation runs inside native_handler, before the
+                # endpoint is called. Such rejection executes no engine work.
+                if not request.state.lifecycle_handed_off and attempt_id in registry:
+                    registry.seal(attempt_id)
+
+        return handle
+
+
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
-    attempt_id = request.headers.get("x-sglang-attempt-id")
+    attempt_id = getattr(request.state, "lifecycle_attempt_id", None)
     if attempt_id is not None:
-        registry = _get_request_lifecycle(request)
-        try:
-            registry.claim(
-                attempt_id, _global_state.tokenizer_manager.disaggregation_mode.value
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
         obj._lifecycle_attempt_id = attempt_id
-        _global_state.tokenizer_manager.auto_create_handle_loop()
+        request.state.lifecycle_handed_off = True
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1069,6 +1084,15 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+app.router.add_api_route(
+    "/generate",
+    generate_request,
+    methods=["POST", "PUT"],
+    response_class=SGLangORJSONResponse,
+    route_class_override=NativeGenerateRoute,
+)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
