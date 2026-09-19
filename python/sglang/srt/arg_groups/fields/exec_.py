@@ -63,6 +63,12 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
     ] = False
+    enable_sleep_comm_cleanup: A[
+        bool,
+        "Release device communicator memory (HCCL/NCCL buffers) during "
+        "release_memory_occupation and restore on resume. Currently NPU-only; "
+        "requires enable_memory_saver.",
+    ] = False
     enable_weights_cpu_backup: A[
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",

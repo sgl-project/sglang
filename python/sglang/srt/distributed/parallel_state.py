@@ -331,93 +331,17 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
-        for ranks in group_ranks:
-            subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in torch_distributed_backend:
-                from mooncake.pg import MooncakeBackendOptions
+        # Stash the group-construction config so the device-side process
+        # groups can be rebuilt later (NPU sleep-mode comm cleanup) without
+        # touching the gloo cpu group.
+        self._pg_group_ranks = group_ranks
+        self._pg_backend = torch_distributed_backend
+        self._pg_name = group_name
+        self._pg_gloo_timeout = gloo_timeout
+        self.recovered_rank = recovered_rank
+        self._pg_max_world_size = max_world_size
+        self._pg_use_local_synchronization = use_local_synchronization
 
-                pg_active_size = len(ranks)
-                if max_world_size is not None:
-                    assert max_world_size >= len(ranks), (
-                        f"max_world_size ({max_world_size}) must be >= "
-                        f"group size ({len(ranks)})"
-                    )
-                    pg_active_size = max_world_size
-
-                pg_active_ranks = torch.zeros(
-                    pg_active_size, dtype=torch.int32, device=self.device
-                )
-                pg_active_ranks[: len(ranks)] = 1
-                pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
-                pg_active_ranks_cpu[: len(ranks)] = 1
-
-                if max_world_size is not None:
-                    dev_opts = MooncakeBackendOptions(
-                        pg_active_ranks, recovered_rank, max_world_size
-                    )
-                    cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank, max_world_size
-                    )
-                else:
-                    dev_opts = MooncakeBackendOptions(pg_active_ranks, recovered_rank)
-                    cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank
-                    )
-
-                active_ranks = pg_active_ranks[: len(ranks)]
-                active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake",
-                    pg_options=dev_opts,
-                    timeout=subgroup_timeout,
-                    group_desc=f"{group_name}:device",
-                    use_local_synchronization=use_local_synchronization,
-                )
-                cpu_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake-cpu",
-                    pg_options=cpu_opts,
-                    timeout=subgroup_timeout,
-                    group_desc=f"{group_name}:cpu",
-                    use_local_synchronization=use_local_synchronization,
-                )
-            else:
-                active_ranks = torch.ones(
-                    len(ranks), dtype=torch.int32, device=self.device
-                )
-                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
-                pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend=torch_distributed_backend,
-                    pg_options=pg_options,
-                    timeout=subgroup_timeout,
-                    group_desc=f"{group_name}:device",
-                    use_local_synchronization=use_local_synchronization,
-                )
-                # a group with `gloo` backend, to allow direct coordination
-                # between processes through the CPU.
-                cpu_group = torch.distributed.new_group(
-                    ranks,
-                    backend="gloo",
-                    timeout=gloo_timeout,
-                    group_desc=f"{group_name}:cpu",
-                    use_local_synchronization=use_local_synchronization,
-                )
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
-                self.active_ranks = active_ranks
-                self.active_ranks_cpu = active_ranks_cpu
-
-        assert self.cpu_group is not None
-        assert self.device_group is not None
-
-        # Import communicators
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
@@ -427,6 +351,119 @@ class GroupCoordinator:
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
+        self._init_process_groups(create_cpu_group=True)
+        self._init_communicators()
+
+    def _init_process_groups(self, create_cpu_group: bool = True) -> None:
+        """Create the device process group and, optionally, the cpu group.
+
+        With ``create_cpu_group=False`` only the device-side group (HCCL on
+        NPU) is rebuilt and the existing gloo cpu group is kept, as done when
+        restoring communicators after NPU sleep-mode cleanup.
+        """
+        for ranks in self._pg_group_ranks:
+            subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
+            use_local_synchronization = self._pg_use_local_synchronization
+            if "mooncake" in self._pg_backend:
+                from mooncake.pg import MooncakeBackendOptions
+
+                pg_active_size = len(ranks)
+                if self._pg_max_world_size is not None:
+                    assert self._pg_max_world_size >= len(ranks), (
+                        f"max_world_size ({self._pg_max_world_size}) must be >= "
+                        f"group size ({len(ranks)})"
+                    )
+                    pg_active_size = self._pg_max_world_size
+
+                pg_active_ranks = torch.zeros(
+                    pg_active_size, dtype=torch.int32, device=self.device
+                )
+                pg_active_ranks[: len(ranks)] = 1
+                pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
+                pg_active_ranks_cpu[: len(ranks)] = 1
+
+                if self._pg_max_world_size is not None:
+                    dev_opts = MooncakeBackendOptions(
+                        pg_active_ranks, self.recovered_rank, self._pg_max_world_size
+                    )
+                else:
+                    dev_opts = MooncakeBackendOptions(
+                        pg_active_ranks, self.recovered_rank
+                    )
+                cpu_opts = None
+                if create_cpu_group:
+                    if self._pg_max_world_size is not None:
+                        cpu_opts = MooncakeBackendOptions(
+                            pg_active_ranks_cpu,
+                            self.recovered_rank,
+                            self._pg_max_world_size,
+                        )
+                    else:
+                        cpu_opts = MooncakeBackendOptions(
+                            pg_active_ranks_cpu, self.recovered_rank
+                        )
+
+                active_ranks = pg_active_ranks[: len(ranks)]
+                active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake",
+                    pg_options=dev_opts,
+                    timeout=subgroup_timeout,
+                    group_desc=f"{self._pg_name}:device",
+                    use_local_synchronization=use_local_synchronization,
+                )
+                cpu_group = None
+                if create_cpu_group:
+                    cpu_group = torch.distributed.new_group(
+                        ranks,
+                        backend="mooncake-cpu",
+                        pg_options=cpu_opts,
+                        timeout=subgroup_timeout,
+                        group_desc=f"{self._pg_name}:cpu",
+                        use_local_synchronization=use_local_synchronization,
+                    )
+            else:
+                active_ranks = torch.ones(
+                    len(ranks), dtype=torch.int32, device=self.device
+                )
+                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
+                pg_options = get_torch_distributed_pg_options(self._pg_name)
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=self._pg_backend,
+                    pg_options=pg_options,
+                    timeout=subgroup_timeout,
+                    group_desc=f"{self._pg_name}:device",
+                    use_local_synchronization=use_local_synchronization,
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                cpu_group = None
+                if create_cpu_group:
+                    cpu_group = torch.distributed.new_group(
+                        ranks,
+                        backend="gloo",
+                        timeout=self._pg_gloo_timeout,
+                        group_desc=f"{self._pg_name}:cpu",
+                        use_local_synchronization=use_local_synchronization,
+                    )
+            if self.rank in ranks:
+                self.ranks = ranks
+                self.world_size = len(ranks)
+                self.rank_in_group = ranks.index(self.rank)
+                self.device_group = device_group
+                if cpu_group is not None:
+                    self.cpu_group = cpu_group
+                self.active_ranks = active_ranks
+                self.active_ranks_cpu = active_ranks_cpu
+
+        assert self.device_group is not None
+        if create_cpu_group:
+            assert self.cpu_group is not None
+
+    def _init_communicators(self) -> None:
+        """Create the communicator objects on top of the process groups."""
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
@@ -458,7 +495,7 @@ class GroupCoordinator:
             )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
+        if self.use_pynccl and self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -466,7 +503,7 @@ class GroupCoordinator:
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
-        if use_pymscclpp and self.world_size > 1:
+        if self.use_pymscclpp and self.world_size > 1:
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -474,7 +511,7 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
-        if use_custom_allreduce and self.world_size > 1:
+        if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
                 CAClass = dispatch_custom_allreduce(
@@ -525,15 +562,15 @@ class GroupCoordinator:
         )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
-        if use_hpu_communicator and self.world_size > 1:
+        if self.use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
         self.xpu_communicator: Optional[XpuCommunicator] = None
-        if use_xpu_communicator and self.world_size > 1:
+        if self.use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
         self.npu_communicator: Optional[NpuCommunicator] = None
-        if use_npu_communicator and self.world_size > 1:
+        if self.use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         # Create message queue
@@ -542,7 +579,11 @@ class GroupCoordinator:
         )
 
         self.mq_broadcaster: Optional[MessageQueue] = None
-        if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
+        if (
+            self.use_message_queue_broadcaster
+            and self.world_size > 1
+            and not self.recovered_rank
+        ):
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
@@ -2047,6 +2088,49 @@ class GroupCoordinator:
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
+
+    def _release_device_resources(self) -> bool:
+        """Destroy device-side comm resources. The communicators are destroyed
+        before the process group because they hold references to it (the
+        reverse order makes PyTorch report the group as busy). The gloo
+        cpu_group is intentionally kept: it is the control plane and holds no
+        device memory."""
+        released = False
+        for attr in (
+            "npu_communicator",
+            "hpu_communicator",
+            "xpu_communicator",
+            "pynccl_comm",
+            "pymscclpp_comm",
+            "ca_comm",
+            "qr_comm",
+            "torch_symm_mem_comm",
+        ):
+            comm = getattr(self, attr, None)
+            if comm is not None:
+                destroy_fn = getattr(comm, "destroy", None)
+                if callable(destroy_fn):
+                    destroy_fn()
+                setattr(self, attr, None)
+                released = True
+        if self.device_group is not None:
+            torch.distributed.destroy_process_group(self.device_group)
+            self.device_group = None
+            released = True
+        return released
+
+    def release_device_comm(self) -> bool:
+        """Release device-side comm resources for sleep mode. CPU group is kept."""
+        return self._release_device_resources()
+
+    def restore_device_comm(self) -> bool:
+        """Rebuild the device process group (HCCL handshake) and communicators
+        after ``release_device_comm``. The gloo cpu group is reused as-is."""
+        if self.device_group is not None:
+            return False
+        self._init_process_groups(create_cpu_group=False)
+        self._init_communicators()
+        return True
 
     def destroy(self):
         if self.device_group is not None:
