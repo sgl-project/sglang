@@ -576,6 +576,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
+    # CUDA-graph runners may capture only the transformer body and execute the
+    # logits processor eagerly after replay.
+    defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -698,6 +701,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+    encoder_swa_replay: bool = False
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
