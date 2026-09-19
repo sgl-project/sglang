@@ -265,7 +265,11 @@ def install_move_gate(
 
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for one sub-pool over a `UnifiedKVPool`."""
+    """Allocator for one sub-pool over a `UnifiedKVPool`.
+
+    ``need_sort`` applies to transfer-facing physical ids, not virtual ids.
+    Physical free pages are sorted during compaction.
+    """
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
     # the chain's capacity memos (see `_CapacityField`).
@@ -1207,11 +1211,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
-            if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-                self.free_virtual_ids
-            ):
-                self.merge_and_sort_free()
-
             # Snapshot the virtual pages the kernel will consume, to bind them
             # to physical pages afterward.
             if num_new_pages > 0:
@@ -1274,9 +1273,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if need_tokens > self.available_size():
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
-            if self.need_sort and bs > len(self.free_virtual_ids):
-                self.merge_and_sort_free()
-
             # Most decode steps reuse the prefix's tail page -> num_new_pages == 0.
             if num_new_pages > 0:
                 new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
