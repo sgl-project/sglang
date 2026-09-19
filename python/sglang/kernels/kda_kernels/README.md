@@ -25,3 +25,10 @@ load Triton, CUTLASS, or compile a JIT extension.
 For JIT kernels, the Python entry module and the corresponding source under
 `csrc/` move together. The shared `sglang.kernels.jit` loader remains build
 infrastructure rather than an ownership directory.
+
+The Qwen PLE implementation in `qwen4_ple_fusion.py` and
+`csrc/qwen4_ple_producer.cuh` was developed with a native-container adaptation
+of the KDA Codex workflow and integrated with SGLang JIT bindings. It supports
+width-1 decode and width-4 target verify on B200; the HC norm remains a separate
+launch. Experiment and validation records are in the
+[PLE KDA journal](https://github.com/Qiaolin-Yu/journals/blob/main/qwen-ple-full-fusion-kda-journal.md).

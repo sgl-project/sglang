@@ -1204,6 +1204,7 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
+        residual_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states[: batch.processed_tokens]
         if self._prefetch_state is not None:
@@ -1220,29 +1221,120 @@ class Qwen4ExpPLELayer(nn.Module):
                 "PLE hidden size does not match its hyper-connection layout: "
                 f"expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}"
             )
+        if (
+            residual_input is not None
+            and self.ple_embedding.enable_ple_fusion
+            and (
+                (batch.use_decode_fast_path and batch.row_width == 1)
+                or (batch.mode.is_target_verify() and batch.row_width == 4)
+            )
+            and batch.physical_tokens == batch.processed_tokens
+            and self.short_conv_dilation == 3
+            and all(
+                norm.eps == 1e-6
+                for norm in (self.norm_key, self.norm_query, self.norm_conv)
+            )
+        ):
+            from sglang.kernels.ops.qwen4_ple import (
+                can_fuse_qwen4_ple,
+                fused_qwen4_ple,
+            )
+
+            pool = get_req_to_token_pool()
+            intermediate = (
+                pool.short_conv_layer_intermediate_cache(self.layer_id)
+                if batch.mode.is_target_verify()
+                else None
+            )
+            inputs = (
+                key,
+                hidden_states,
+                value,
+                residual_input,
+                self.norm_key.weight,
+                self.norm_query.weight,
+                self.norm_conv.weight,
+                self.conv1d.weight,
+                pool.short_conv_layer_cache(self.layer_id),
+                batch.state_indices,
+                batch.valid_tokens,
+            )
+            if can_fuse_qwen4_ple(*inputs, batch.row_width, intermediate):
+                track_indices = track_mask = None
+                if (
+                    batch.use_decode_fast_path
+                    and forward_batch.mamba_track_indices is not None
+                    and forward_batch.mamba_track_mask is not None
+                ):
+                    rows = batch.state_indices.numel()
+                    track_indices = forward_batch.mamba_track_indices[:rows]
+                    track_mask = forward_batch.mamba_track_mask[:rows]
+                return fused_qwen4_ple(
+                    *inputs,
+                    batch.row_width,
+                    intermediate,
+                    track_indices=track_indices,
+                    track_mask=track_mask,
+                )
+
         key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
-        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
-        gate = gate / math.sqrt(hidden_size)
-        fused_gate_value = False
-        if batch.use_decode_fast_path:
-            from sglang.kernels.ops.qwen4_ple import (
-                can_fuse_qwen4_gate_value,
-                fused_qwen4_gate_value,
-            )
+        from sglang.kernels.ops.qwen4_ple import (
+            can_fuse_qwen4_gate_reduce,
+            fused_qwen4_gate_reduce,
+        )
 
-            fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
-        if fused_gate_value:
-            gated_value = fused_qwen4_gate_value(gate, value)
+        fused_gate_reduce = (
+            self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+            and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
+        )
+        if fused_gate_reduce:
+            gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = torch.sigmoid(gate)
-            gated_value = gate * value.unsqueeze(-2)
+            gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            gate = gate / math.sqrt(hidden_size)
+            fused_gate_value = False
+            if batch.use_decode_fast_path:
+                from sglang.kernels.ops.qwen4_ple import (
+                    can_fuse_qwen4_gate_value,
+                    fused_qwen4_gate_value,
+                )
+
+                fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
+            if fused_gate_value:
+                gated_value = fused_qwen4_gate_value(gate, value)
+            else:
+                gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+                gate = torch.sigmoid(gate)
+                gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
+        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+            from sglang.kernels.ops.qwen4_ple import (
+                can_fuse_qwen4_verify_conv,
+                fused_qwen4_verify_conv,
+            )
+
+            pool = get_req_to_token_pool()
+            conv_args = (
+                gated_value_normed,
+                gated_value,
+                self.conv1d.weight,
+                pool.short_conv_layer_cache(self.layer_id),
+                batch.state_indices,
+                batch.valid_tokens,
+                batch.row_width,
+                self.short_conv_dilation,
+                pool.short_conv_layer_intermediate_cache(self.layer_id),
+            )
+            if can_fuse_qwen4_verify_conv(*conv_args):
+                output = fused_qwen4_verify_conv(*conv_args)
+                output = _pad_token_rows(output, batch.physical_tokens)
+                return output if residual_input is None else residual_input + output
         conv_output = self._short_conv(
             gated_value_normed,
             forward_batch,
@@ -1255,7 +1347,8 @@ class Qwen4ExpPLELayer(nn.Module):
                 output,
                 torch.zeros_like(output),
             )
-        return _pad_token_rows(output, batch.physical_tokens)
+        output = _pad_token_rows(output, batch.physical_tokens)
+        return output if residual_input is None else residual_input + output
 
 
 class Qwen4ExpLayerExtensionMixin:
@@ -1339,8 +1432,8 @@ class Qwen4ExpLayerExtensionMixin:
                 ple_query = (
                     hidden_states if residual is None else hidden_states + residual
                 )
-                hidden_states = hidden_states + self.ple(
-                    ple_query, forward_batch, ple_batch
+                hidden_states = self.ple(
+                    ple_query, forward_batch, ple_batch, residual_input=hidden_states
                 )
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
