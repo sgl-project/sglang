@@ -615,6 +615,7 @@ def build_warmup_reqs(
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
+            task_type=task_type,
             data_type=task_type.data_type(),
             width=width,
             height=height,
