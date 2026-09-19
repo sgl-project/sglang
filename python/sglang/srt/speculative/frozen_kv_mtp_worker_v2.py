@@ -73,6 +73,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
     draft_tp_context,
     fast_topk,
     get_plan_stream,
@@ -134,7 +135,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context(),
+            draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             draft_model_build_scope(),
@@ -204,6 +205,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_attention_backends(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -214,6 +216,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_cuda_graphs(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
