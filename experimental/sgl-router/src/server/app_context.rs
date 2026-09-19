@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::buckets_reorg::BucketResolver;
 use crate::config::Config;
+use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
@@ -14,6 +16,7 @@ use crate::state::load_monitor::active_load::ActiveLoadRegistry;
 use crate::state::load_monitor::engine_load::EngineLoadTable;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -26,6 +29,15 @@ const READINESS_NOT_READY: u8 = 0;
 const READINESS_READY: u8 = 1;
 const READINESS_DRAINING: u8 = 2;
 
+/// Routing implementation used by the standard chat-completions endpoint.
+/// Reorg configuration is installed explicitly until its CLI factory is available.
+#[derive(Debug, Default)]
+pub enum ChatRouting {
+    #[default]
+    Legacy,
+    Reorg(HashMap<ModelId, BucketResolver>),
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -34,6 +46,8 @@ pub struct AppContext {
     pub policies: Arc<PolicyRegistry>,
     /// Converts static Bucket configuration into request candidate domains.
     pub bucket_selector: Arc<BucketSelector>,
+    /// Select legacy policies or model-specific bucket-first routing.
+    pub chat_routing: ChatRouting,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
@@ -105,6 +119,7 @@ impl AppContext {
             registry,
             policies,
             bucket_selector,
+            chat_routing: ChatRouting::Legacy,
             active_load,
             metrics,
             prefix_index: None,
@@ -193,6 +208,7 @@ impl AppContext {
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             bucket_selector: Arc::new(BucketSelector::new(None)),
+            chat_routing: ChatRouting::Legacy,
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             prefix_index: None,

@@ -3,6 +3,7 @@
 
 mod forward;
 mod preparation;
+mod reorg;
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
@@ -11,7 +12,7 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
-use crate::server::app_context::AppContext;
+use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
@@ -39,6 +40,19 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    match &ctx.chat_routing {
+        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
+        ChatRouting::Reorg(resolvers) => {
+            reorg::chat_completions(&ctx, resolvers, headers, body).await
+        }
+    }
+}
+
+async fn chat_completions_legacy(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -59,11 +73,11 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     let request =
-        PreparedChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
+        PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(
-        &ctx,
+        ctx,
         &request,
         &headers,
         policy.as_ref(),
@@ -73,7 +87,7 @@ pub async fn chat_completions(
     .await?;
 
     // PD sends to both workers and returns the decode response.
-    forward_chat_request(&ctx, request, workers, headers, start).await
+    forward_chat_request(ctx, request, workers, headers, start).await
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Side-by-side implementation of POLICY_DESIGN.md. Not wired into serving;
-//! `policies` stays live until the switch PR replaces it.
+//! Side-by-side implementation of POLICY_DESIGN.md. Chat routing can opt into
+//! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
 pub mod power_of_two;
@@ -67,6 +67,8 @@ pub struct Rejection {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PickError {
+    #[error("no bucket matches the request length")]
+    NoMatchingBucket,
     #[error("no candidates")]
     NoCandidates,
     #[error("no admissible engine: {0:?}")]

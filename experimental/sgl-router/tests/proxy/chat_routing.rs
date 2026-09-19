@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+mod reorg;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn config_for(_worker_url: &str) -> Config {
