@@ -58,12 +58,6 @@ class Serving(msgspec.Struct):
         int,
         "The worker num of the tokenizer manager.",
     ] = 1
-    request_conversion_concurrency: A[
-        int,
-        "Maximum concurrent CPU request validation/conversion jobs per frontend "
-        "process, shared by OpenAI and Messages handlers. Zero keeps synchronous "
-        "processing. Running jobs keep their slot after client cancellation.",
-    ] = 0
     detokenizer_worker_num: A[
         int,
         "The worker num of the detokenizer manager.",

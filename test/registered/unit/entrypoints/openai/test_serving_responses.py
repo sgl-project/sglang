@@ -1729,18 +1729,16 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
     assert serving.tokenizer_manager.generate_request.call_count == 1
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
-
-
 @pytest.mark.parametrize("harmony", [False, True])
 def test_response_conversion_uses_shared_executor(response_serving, harmony):
-    from sglang.srt.entrypoints.openai.request_conversion import (
-        RequestConversionExecutor,
-    )
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
     serving = response_serving(harmony=harmony)
-    serving.request_conversion_executor = RequestConversionExecutor(1)
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.init_request_preprocessor()
+    serving.tokenizer_manager.run_in_request_preprocessor = (
+        manager.run_in_request_preprocessor
+    )
     method = "_make_request_with_harmony" if harmony else "_make_request_sync"
     original = getattr(serving, method)
     worker_threads = []
@@ -1750,10 +1748,15 @@ def test_response_conversion_uses_shared_executor(response_serving, harmony):
         return original(*args)
 
     setattr(serving, method, convert)
-    result = asyncio.run(
-        create_response_result(
-            serving, ResponsesRequest(model="x", input="Hello", store=False)
+    with manager._request_preprocessor_executor:
+        result = asyncio.run(
+            create_response_result(
+                serving, ResponsesRequest(model="x", input="Hello", store=False)
+            )
         )
-    )
     assert result.status == "completed"
     assert worker_threads and all(t != threading.get_ident() for t in worker_threads)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

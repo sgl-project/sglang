@@ -204,13 +204,9 @@ class AnthropicServing:
         return getattr(tokenizer, "chat_template", None)
 
     async def _run_conversion(self, function, *args):
-        # All native endpoint handlers share the same frontend concurrency limit.
-        executor = getattr(
-            self.openai_serving_chat, "request_conversion_executor", None
+        return await self.openai_serving_chat.tokenizer_manager.run_in_request_preprocessor(
+            function, *args
         )
-        if executor is None:
-            return function(*args)
-        return await executor.run(function, *args)
 
     async def handle_messages(
         self,

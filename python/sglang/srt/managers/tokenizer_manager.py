@@ -29,10 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -460,6 +462,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
+        self.init_request_preprocessor()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -489,6 +492,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
+        )
+
+    def init_request_preprocessor(self):
+        # Serialize preprocessing without blocking response delivery on the event loop.
+        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._request_preprocessor_executor, call
         )
 
     def init_model_config(self):
@@ -956,15 +969,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize_sync():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.run_in_request_preprocessor(
+                tokenize_sync
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS

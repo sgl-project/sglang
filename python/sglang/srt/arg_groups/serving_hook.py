@@ -452,8 +452,6 @@ def handle_environment_variables(server_args: Any):
 
 def handle_other_validations(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.request_conversion_concurrency < 0:
-        raise ValueError("request_conversion_concurrency must be nonnegative")
     if cfg.default_chat_template_kwargs is not None and not isinstance(
         cfg.default_chat_template_kwargs, dict
     ):

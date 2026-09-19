@@ -56,7 +56,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -104,7 +103,6 @@ class _MockTemplateManager:
 class ServingEmbeddingTestCase(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
-        self.enterContext(get_context().override_server_args())
         self.tokenizer_manager = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.serving_embedding = OpenAIServingEmbedding(
