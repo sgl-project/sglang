@@ -32,8 +32,12 @@ def dcp_pack_buffer_bytes(
             f"got {list(kv_item_lens)} with page_size={page_size}"
         )
     token_item_lens = [item_len // page_size for item_len in kv_item_lens]
-    rank_tokens = (max_tokens + dcp_size - 1) // dcp_size
-    return dcp_size * rank_tokens * sum(token_item_lens)
+    # Every DCP rank packs the FULL token range -- DCP shards a different axis,
+    # not the token count -- so each rank's region must hold `max_tokens` worth
+    # of per-token bytes. Dividing by `dcp_size` here undersizes the buffer by
+    # exactly that factor, which makes try_pack_dcp_src's fits() check fail and
+    # silently fall back to per-token RDMA.
+    return dcp_size * max_tokens * sum(token_item_lens)
 
 
 def try_pack_dcp_src(
