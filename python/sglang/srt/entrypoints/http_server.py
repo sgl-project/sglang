@@ -931,6 +931,7 @@ def _get_request_lifecycle(request: Request):
 
 
 @app.get("/request_lifecycle/{attempt_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def request_lifecycle_snapshot(
     attempt_id: str, request: Request, after: int = -1
 ):
@@ -948,6 +949,7 @@ class LifecycleControl:
 
 
 @app.post("/request_lifecycle/{attempt_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def request_lifecycle_control(
     attempt_id: str, obj: LifecycleControl, request: Request
 ):
