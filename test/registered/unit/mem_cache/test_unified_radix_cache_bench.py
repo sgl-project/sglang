@@ -662,7 +662,7 @@ def bench_cache_finished(
         "cache_finished",
         lambda: req_items,
         lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv.kv_committed_len
+            req, is_insert=True, owned_kv_len=req.kv.kv_committed_len
         ),
         len(req_items) - warmup,
         env.avg_tokens,

@@ -71,7 +71,7 @@ class LLaDAImageTextEncoderRunner:
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
-        from sglang.srt.runtime_context import create_context, use_context
+        from sglang.srt.runtime_context import SpawnRanks, create_context, use_context
         from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
         self.queryformer = queryformer
@@ -106,7 +106,9 @@ class LLaDAImageTextEncoderRunner:
                 server_args.pipeline_config.text_encoder_mem_fraction_static
             ),
         )
-        self.runtime_context = create_context(srt_args, role="scheduler")
+        self.runtime_context = create_context(
+            srt_args, role="scheduler", ranks=SpawnRanks(world_rank=0)
+        )
         with use_context(self.runtime_context):
             # The diffusion runtime mirrors its TP group into the srt globals.
             # Clear it so the worker can install the encoder's real srt groups,

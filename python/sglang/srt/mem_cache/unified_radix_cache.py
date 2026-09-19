@@ -391,7 +391,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
-        self._storage_prefetch_hit_remaining_by_reqid: dict[str, int] = {}
+        self._storage_prefetch_hit_remaining_by_reqid: dict[
+            CacheRequestHandle, int
+        ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
@@ -955,22 +957,22 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
+    @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         if self.disable:
-            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(0, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         result = None
@@ -995,6 +997,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+            for comp in self._components_tuple:
+                effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -1068,10 +1072,15 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
-                ranges.append((tail_free_start, len(kv_indices_full)))
+                if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
+                    # The two halves touch at the truncation boundary and share
+                    # that page; free the union as one range.
+                    ranges[0] = (free_from, len(kv_indices_full))
+                else:
+                    ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
 
         # Synthetic profiling requests may own KV without locking a tree node.
         if req.last_node is not None:
@@ -1130,6 +1139,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
+
+        for comp in self._components_tuple:
+            effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1584,8 +1596,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
 
     def _track_write_through_node(
@@ -1970,9 +1983,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
-            # A too-short/fully-matched suffix can become a full recompute if
-            # the device match evicts while queued; arm the retry.
-            self.storage_prefetch_retries.poll_miss(req_id)
+            # No lookup was issued, so no retry is armed: polling here would
+            # spend the re-issue budget the admission-time device-hit-loss
+            # re-query needs once the device match evicts while queued.
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
@@ -2446,8 +2459,8 @@ class UnifiedRadixCache(BasePrefixCache):
         rid = request.rid
         if self.linker is not None:
             self.linker.release_request(rid)
-        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
+        self.prefetch_loaded_tokens_by_reqid.pop(request, None)
+        self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None
@@ -3126,7 +3139,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if write_back:
-            # Blocking: wait for all pending write-backs
+            # Blocking: submit what is still queued, then wait for every ack.
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -3302,6 +3316,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        # Backups queued outside process_batch_result: the chunked-prefill stash
+        # in get_next_batch_to_run, abort_request, and the PD prefill release.
+        self.flush_pending_backups()
 
         (
             write_finish_count,
@@ -3335,6 +3352,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def flush_pending_backups(self) -> None:
+        """Submit pending D2H backups as a merged operation."""
+        if self.linker is not None or self.cache_controller is None:
+            return
+        self.cache_controller.start_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
@@ -3527,7 +3550,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # can resolve + validate them without reaching into Controller state.
         if self.buffer_pipeline is not None:
             ongoing_write_through = [
-                (nid, entry.intent.node_id)
+                (nid, entry.intent.snapshot.node_id)
                 for nid, entry in self.buffer_pipeline.ongoing_write_through.items()
             ]
         else:
