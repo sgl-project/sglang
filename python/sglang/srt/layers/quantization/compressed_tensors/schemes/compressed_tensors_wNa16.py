@@ -39,9 +39,10 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -69,6 +70,18 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                  group_size: Optional[int] = None,
                  symmetric: Optional[bool] = True,
                  actorder: Optional[ActivationOrdering] = None):
+
+        if _is_hip and (
+            num_bits != 4
+            or not symmetric
+            or actorder is not None
+            or strategy not in ("group", "channel")
+            or group_size not in (None, -1, 32, 64, 128)
+        ):
+            raise NotImplementedError(
+                "ROCm WNA16 requires symmetric 4-bit group/channel quantization "
+                "without activation ordering (group_size: -1, 32, 64, 128)."
+            )
 
         self.pack_factor = 32 // num_bits
         self.strategy = strategy
@@ -115,6 +128,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             zero_points=not self.symmetric,
             has_g_idx=self.has_g_idx
         )
+
+        if _is_hip:
+            if params_dtype not in (torch.float16, torch.bfloat16):
+                raise NotImplementedError("ROCm WNA16 requires float16 or bfloat16.")
+            if input_size_per_partition % 128 or output_size_per_partition % 128:
+                raise NotImplementedError(
+                    "ROCm WNA16 requires partition dimensions divisible by 128."
+                )
 
         # If group_size is -1, we are in channelwise case.
         group_size = self.group_size if self.group_size != -1 else input_size
@@ -205,9 +226,60 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
+    def _process_weights_rocm(self, layer: torch.nn.Module) -> None:
+        # These optional ops are supplied by ROCm vLLM builds. Do not import
+        # vLLM at module scope: CUDA and other quantization schemes do not need it.
+        try:
+            from vllm._custom_ops import gptq_gemm, gptq_shuffle
+        except ImportError as exc:
+            raise ImportError(
+                "ROCm compressed-tensors W4A16 requires a ROCm vLLM build "
+                "providing gptq_gemm and gptq_shuffle."
+            ) from exc
+
+        self._rocm_gptq_gemm = gptq_gemm
+        k, n = self.kernel_config.partition_weight_shape
+        group_size = k if self.group_size == -1 else self.group_size
+        if k % group_size:
+            raise ValueError("ROCm WNA16 input partition must contain whole groups.")
+
+        # The checkpoint packs unsigned (signed + 8) nibbles along K, in
+        # [N, K/8] order. GPTQ wants [K/8, N]; scales follow the same transpose.
+        # Use the checkpoint layout, not a shape heuristic (square shapes
+        # cannot distinguish the two orientations).
+        if tuple(layer.weight_packed.shape) != (n, k // 8):
+            raise ValueError("Unexpected compressed-tensors packed weight shape.")
+        if tuple(layer.weight_scale.shape) != (n, k // group_size):
+            raise ValueError("Unexpected compressed-tensors scale shape.")
+        qweight = layer.weight_packed.t().contiguous()
+        scales = layer.weight_scale.t().contiguous().to(torch.float16)
+        if not torch.isfinite(scales).all():
+            raise ValueError("ROCm WNA16 scales must be finite in float16.")
+
+        # GPTQ v1 stores zero - 1: symmetric CT's zero=8 becomes eight 7s
+        # per int32. No unpack/repack or full dequantization is necessary.
+        qzeros = torch.full(
+            (k // group_size, n // 8),
+            0x77777777,
+            dtype=torch.int32,
+            device=qweight.device,
+        )
+        g_idx = torch.empty(0, dtype=torch.int32, device=qweight.device)
+        gptq_shuffle(qweight, g_idx, 4)
+
+        # Replace the checkpoint parameters rather than retaining duplicate
+        # packed weights/scales alongside the serving representation.
+        replace_parameter(layer, "weight_packed", qweight)
+        replace_parameter(layer, "weight_scale", scales)
+        layer.register_buffer("rocm_qzeros", qzeros)
+        layer.register_buffer("rocm_g_idx", g_idx)
+
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_hip:
+            self._process_weights_rocm(layer)
+            return
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -303,6 +375,31 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
+        if _is_hip:
+            if x.dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("ROCm WNA16 requires float16 or bfloat16 input.")
+            if x.shape[-1] != self.kernel_config.partition_weight_shape[0]:
+                raise ValueError("ROCm WNA16 input does not match the weight partition.")
+            output_shape = (
+                *x.shape[:-1], self.kernel_config.partition_weight_shape[1]
+            )
+            if x.numel() == 0:
+                return x.new_empty(output_shape)
+            # ExLlama's ROCm GPTQ kernel requires FP16 activations/scales.
+            # BF16 inputs therefore use FP16 arithmetic and must fit its range.
+            out = self._rocm_gptq_gemm(
+                x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous(),
+                layer.weight_packed,
+                layer.rocm_qzeros,
+                layer.weight_scale,
+                layer.rocm_g_idx,
+                True,  # use_exllama
+                False,  # use_v2_format (GPTQ v1 zero points)
+                4,
+            )
+            out = out.to(x.dtype).reshape(output_shape)
+            return out if bias is None else out + bias
+
         c = self.kernel_config
 
         def _get_weight_params(
