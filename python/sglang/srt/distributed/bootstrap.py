@@ -3,14 +3,12 @@ import os
 import time
 from typing import List, Optional
 
-import msgspec
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
-    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -58,13 +56,6 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 # Therefore, the chunk size that each peer sends is 120*129280/8=1.849MB.
 # The total warmup bytes per peer should be 1.849*2 = 4MB
 _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
-
-
-class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
-    tp_group: object
-    pp_group: object
-    attention_tp_group: object
-    pre_model_load_memory: float
 
 
 def init_torch_distributed(
@@ -140,10 +131,6 @@ def init_torch_distributed(
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
-    tp_group = get_tp_group()
-    pp_group = get_pp_group()
-    attention_tp_group = get_parallel().attn_tp_group
-
     # Check memory for tensor parallelism
     local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
     if ps.tp_size > 1 and not is_draft_worker:
@@ -156,12 +143,7 @@ def init_torch_distributed(
         f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
         f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
     )
-    return TorchDistributedResult(
-        tp_group=tp_group,
-        pp_group=pp_group,
-        attention_tp_group=attention_tp_group,
-        pre_model_load_memory=pre_model_load_memory,
-    )
+    return pre_model_load_memory
 
 
 def _resolve_backend(*, device: str) -> str:
