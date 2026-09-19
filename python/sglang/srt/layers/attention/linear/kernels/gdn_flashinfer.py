@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -615,6 +614,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        stable_rows: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
@@ -640,9 +640,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         intermediate_states_buffer_mtp = intermediate_states_buffer
         copy_verify_intermediate_back = False
-        use_stable_pp_rows = envs.SGLANG_ENABLE_PP_SPEC.get()
         if intermediate_states_buffer is not None and (
-            self.use_state_pool or use_stable_pp_rows
+            self.use_state_pool or stable_rows
         ):
             # The SM100 bf16 MTP kernel indexes this scratch buffer by the
             # per-call batch id, while SGLang's speculative state cache is
@@ -654,7 +653,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ) = self._prepare_verify_intermediate_buffer(
                 intermediate_states_buffer,
                 batch_size,
-                force_scratch=use_stable_pp_rows,
+                force_scratch=stable_rows,
             )
         if not self._mutable_inputs_are_aligned(
             ("ssm_states", ssm_states),
@@ -719,7 +718,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm=True,
         )
 
-        if use_stable_pp_rows:
+        if stable_rows and intermediate_states_buffer is not None:
             # FlashInfer's SM100 kernel always writes scratch rows 0..B-1.
             # PP acceptance returns after other micro-batches have run, so move
             # those snapshots to the stable request rows consumed by the delayed
