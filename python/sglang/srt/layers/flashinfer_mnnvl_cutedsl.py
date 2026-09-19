@@ -498,7 +498,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     if not torch.cuda.is_available():
         raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
 
-    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
@@ -512,7 +512,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         max_m=max_m,
         rms_epsilon=rms_epsilon,
         weight_bias=weight_bias,
-        process_group=get_tp_group().device_group,
+        process_group=get_parallel().tp_group.device_group,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
     return _WORKSPACE
