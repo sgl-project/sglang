@@ -1,3 +1,4 @@
+from array import array
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
@@ -5,7 +6,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import run_doctests
+from sglang.test.test_utils import CustomTestCase, run_doctests
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -75,6 +76,36 @@ def test_evs_items_store_wire_data_in_model_specific_data():
     assert items[0].thw_grids == [(1, 2, 3)]
     assert items[1].thw_grids == [(2, 2, 3)]
     assert items[1].pre_chunked_input_ids == [1, 2, 3]
+
+
+class TestPackedVideoTokens(CustomTestCase):
+    def test_array_metadata_preserves_list_output(self):
+        from sglang.srt.multimodal.evs.evs_core import (
+            replace_offsets_with_tokens_per_frame,
+        )
+
+        for values, offsets, counts in (
+            ([300, 0, 0, 301], [(1, 2)], [1, 2]),
+            ([300, 0, 0, 301, 0, 302], [(1, 2), (4, 4)], [1, 3]),
+            ([0, 0], [(0, 1)], [0]),
+        ):
+            with self.subTest(offsets=offsets, counts=counts):
+                source = array("q", values)
+                expected = replace_offsets_with_tokens_per_frame(
+                    pre_chunked_input_ids=values,
+                    num_tokens_per_frame=counts,
+                    frame_offsets_inclusive=offsets,
+                    filler_token_id=2**40,
+                )
+                actual = replace_offsets_with_tokens_per_frame(
+                    pre_chunked_input_ids=source,
+                    num_tokens_per_frame=counts,
+                    frame_offsets_inclusive=offsets,
+                    filler_token_id=2**40,
+                )
+                self.assertIsInstance(actual, list)
+                self.assertEqual(actual, expected)
+                self.assertEqual(source, array("q", values))
 
 
 if __name__ == "__main__":

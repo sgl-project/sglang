@@ -4,6 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
+from array import array
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import (
@@ -4981,7 +4982,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def pad_input_ids(self, input_ids, mm_inputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )
