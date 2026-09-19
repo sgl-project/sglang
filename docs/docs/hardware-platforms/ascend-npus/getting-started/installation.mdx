@@ -427,6 +427,10 @@ cat /proc/sys/vm/swappiness # shows 10
 
 ### Running Service For Large Language Models
 
+<Note>
+NPU graph capture is enabled by default. If graph capture fails for your model or environment, retry the server with `--disable-cuda-graph`.
+</Note>
+
 #### PD Mixed Scene
 
 ```bash Command
