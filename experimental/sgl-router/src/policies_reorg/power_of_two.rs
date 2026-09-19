@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::future::BoxFuture;
 
-use crate::state::load_monitor::engine_load::EngineLoadTable;
+use crate::state::load_monitor::engine_load::{EngineLoadTable, EngineWorkerLoad};
 use crate::workers::Worker;
 
 use super::admission::{AllowAll, Decision, EngineAdmission};
-use super::{Pick, PickContext, PickError, PickRequest, Policy, Rejection};
+use super::{Pick, PickError, PickRequest, Policy, Rejection};
 
 /// Selects an engine, then checks its admission; rejection never resamples.
 /// Multi-candidate sampling and load comparison remain a follow-up.
@@ -34,13 +35,19 @@ impl PowerOfTwoPolicy {
         &self,
         engines: &[Arc<Worker>],
         _request: &PickRequest<'_>,
-        context: &PickContext,
-    ) -> Result<Arc<Worker>, PickError> {
+    ) -> Result<(Arc<Worker>, Option<EngineWorkerLoad>), PickError> {
+        if engines.is_empty() {
+            return Err(PickError::NoCandidates);
+        }
+        // Keep load local to selection. Admission receives the chosen engine's
+        // record from this same snapshot, including capacity and report time.
+        let load = self.engine_load.capture_snapshot(Instant::now());
         match engines {
-            [] => Err(PickError::NoCandidates),
-            [engine] => Ok(Arc::clone(engine)),
+            [engine] => Ok((
+                Arc::clone(engine),
+                load.fresh_load_for_url(&engine.url).cloned(),
+            )),
             _ => {
-                let _load = context.load(&self.engine_load);
                 todo!("sample two engines and compare load for request.stage")
             }
         }
@@ -48,15 +55,16 @@ impl PowerOfTwoPolicy {
 }
 
 impl Policy for PowerOfTwoPolicy {
-    fn pick_with_context<'a>(
+    fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
-        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         Box::pin(async move {
-            let engine = self.select_engine(engines, request, context)?;
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, context)? {
+            let (engine, load) = self.select_engine(engines, request)?;
+            if let Decision::Reject(reason) =
+                self.admission.check(&engine, request, load.as_ref())?
+            {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,

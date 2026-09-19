@@ -3,9 +3,10 @@
 
 use std::fmt::Debug;
 
+use crate::state::load_monitor::engine_load::EngineWorkerLoad;
 use crate::workers::Worker;
 
-use super::{PickContext, PickError, PickRequest};
+use super::{PickError, PickRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -13,14 +14,16 @@ pub enum Decision {
     Reject(String),
 }
 
-/// Checks use their injected state handles with the policy's observation context.
+/// Checks one engine using the load observation retained by selection.
+/// `None` means no usable load observation, never zero load. Each check defines
+/// its missing-data behavior and owns any other state handles it needs.
 /// Each policy decides when to check an engine and how to handle rejection.
 pub trait EngineAdmission: Send + Sync + Debug {
     fn check(
         &self,
         engine: &Worker,
         request: &PickRequest<'_>,
-        context: &PickContext,
+        load: Option<&EngineWorkerLoad>,
     ) -> Result<Decision, PickError>;
 }
 
@@ -32,7 +35,7 @@ impl EngineAdmission for AllowAll {
         &self,
         _: &Worker,
         _: &PickRequest<'_>,
-        _: &PickContext,
+        _: Option<&EngineWorkerLoad>,
     ) -> Result<Decision, PickError> {
         Ok(Decision::Allow)
     }
