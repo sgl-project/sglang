@@ -46,17 +46,16 @@ class FakeKVSender(BaseKVSender):
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
-        self.has_sent = False
+        self.num_kv_indices: Optional[int] = None
+        self.curr_idx = 0
         self.conclude_state: Optional[KVPoll] = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
-        if not self.has_sent:
-            # Assume handshake completed instantly
+        if self.num_kv_indices is None or self.curr_idx < self.num_kv_indices:
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
         logger.debug("FakeKVSender poll success")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
@@ -66,13 +65,13 @@ class FakeKVSender(BaseKVSender):
 
     def init(
         self,
-        kv_indices: list[int],
+        num_kv_indices: int,
         aux_index: Optional[int] = None,
     ):
+        self.num_kv_indices = num_kv_indices
         logger.debug(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVSender init with num_kv_indices: {num_kv_indices}, aux_index: {aux_index}"
         )
-        pass
 
     def send(
         self,
@@ -80,7 +79,7 @@ class FakeKVSender(BaseKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
-        self.has_sent = True
+        self.curr_idx += len(kv_indices)
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
