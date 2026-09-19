@@ -2373,7 +2373,17 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_tp_rank, 1)
                 self.assertEqual(parallel.attn_dp_size, 1)
                 self.assertEqual(parallel.attn_dp_rank, 0)
+                self.assertEqual(parallel.attn_cp_size, 1)
+                self.assertEqual(parallel.attn_cp_rank, 0)
                 self.assertEqual(parallel.dp_size, 1)
+                # The whole point of stating all of them: the identity the
+                # override path and the group build both check holds in here.
+                self.assertEqual(
+                    parallel.tp_size,
+                    parallel.attn_tp_size
+                    * parallel.attn_dp_size
+                    * parallel.attn_cp_size,
+                )
         self.assertEqual(get_parallel().attn_dp_size, 2)
         self.assertEqual(get_parallel().dp_size, 2)
 
