@@ -309,7 +309,7 @@ class SchedulerMetricsReporter:
         if (
             get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
-            and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
+            and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
