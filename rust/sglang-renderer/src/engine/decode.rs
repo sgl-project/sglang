@@ -41,7 +41,7 @@ impl TokenDecoder {
         &self,
         request: &mut GenerateRequest,
     ) -> Result<DecodeState, ResponseError> {
-        let stops = take_text_stops(request);
+        let stops = text_stop_matcher(request);
         let prompt_ids = request
             .input_ids
             .iter()
@@ -87,9 +87,14 @@ impl TokenDecoder {
     }
 }
 
-pub(super) fn take_text_stops(request: &mut GenerateRequest) -> Option<StopStringMatcher> {
-    let params = &mut request.sampling_params;
-    StopStringMatcher::new(std::mem::take(&mut params.stop), params.no_stop_trim)
+/// Match text stops locally without removing them from the engine request.
+///
+/// The engine uses the same stops to end decoding promptly. The renderer still
+/// needs its own matcher because it owns text decoding, stop trimming, and the
+/// OpenAI-facing finish reason.
+pub(super) fn text_stop_matcher(request: &GenerateRequest) -> Option<StopStringMatcher> {
+    let params = &request.sampling_params;
+    StopStringMatcher::new(params.stop.clone(), params.no_stop_trim)
 }
 
 pub(super) struct StopStringMatcher {
@@ -284,14 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn text_stops_stay_in_the_frontend_and_token_stops_reach_the_engine() {
+    fn text_stops_reach_the_frontend_and_engine() {
         let mut request = request(vec!["<eos>"]);
         request.sampling_params.stop_token_ids = Some(vec![9]);
-        let matcher = take_text_stops(&mut request);
+        let matcher = text_stop_matcher(&request);
 
         assert!(matcher.is_some());
         assert_eq!(request.sampling_params.stop_token_ids, Some(vec![9]));
-        assert!(request.sampling_params.stop.is_empty());
+        assert_eq!(request.sampling_params.stop, ["<eos>"]);
     }
 
     #[test]
@@ -300,8 +305,9 @@ mod tests {
         request.sampling_params.stop_regex = vec!["[0-9]{3}".into()];
         request.sampling_params.min_new_tokens = 4;
 
-        take_text_stops(&mut request);
+        text_stop_matcher(&request);
 
+        assert_eq!(request.sampling_params.stop, ["END"]);
         assert_eq!(request.sampling_params.stop_regex, ["[0-9]{3}"]);
         assert_eq!(request.sampling_params.min_new_tokens, 4);
     }

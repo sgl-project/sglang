@@ -942,7 +942,6 @@ mod suite {
 
         rendered["stream"] = serde_json::Value::Bool(true);
         rendered["return_text_in_logprobs"] = serde_json::Value::Bool(false);
-        rendered["sampling_params"]["stop"] = serde_json::json!([]);
         assert_eq!(engine_request, rendered);
 
         for (prompt, batched) in [
@@ -988,7 +987,6 @@ mod suite {
             for request in &mut rendered {
                 request["stream"] = serde_json::Value::Bool(true);
                 request["return_text_in_logprobs"] = serde_json::Value::Bool(false);
-                request["sampling_params"]["stop"] = serde_json::json!([]);
             }
             assert_eq!(engine_requests, rendered);
         }

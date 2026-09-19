@@ -112,7 +112,7 @@ async fn shared_decoder_stops_across_chunks_and_releases_transport() {
         assert!(events.next().await.is_none());
 
         let sent = transport.requests.lock().unwrap();
-        assert!(sent[0].sampling_params.stop.is_empty());
+        assert_eq!(sent[0].sampling_params.stop, ["he"]);
         assert_eq!(sent[0].sampling_params.stop_token_ids, Some(vec![9]));
         assert_eq!(sent[0].return_text_in_logprobs, Some(false));
     }
