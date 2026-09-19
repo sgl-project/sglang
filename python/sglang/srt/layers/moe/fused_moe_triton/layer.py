@@ -14,8 +14,6 @@ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
-    get_moe_ep_group,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -150,13 +148,13 @@ def _maybe_copy_weight_view_before_h2d(
 
 
 def _get_deepep_comm_group(a2a_backend):
-    group = get_tp_group().device_group
+    group = get_parallel().tp_group.device_group
 
     if a2a_backend.is_mori():
-        group = get_tp_group()
+        group = get_parallel().tp_group
 
     elif _is_npu:
-        group = get_moe_ep_group().device_group
+        group = get_parallel().moe_ep_group.device_group
 
     return group
 
@@ -204,7 +202,7 @@ def create_moe_dispatcher(
             _deepep_v2_experts_are_fp8(quant_method)
         )
         return DeepEPv2Dispatcher(
-            group=get_tp_group().device_group,
+            group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
@@ -219,7 +217,7 @@ def create_moe_dispatcher(
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
-            group=get_tp_group().device_group,
+            group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
@@ -1583,7 +1581,7 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 

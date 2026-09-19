@@ -15,16 +15,11 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_cp_group,
-    get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
-    get_attn_tp_group,
 )
 from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -380,7 +375,7 @@ def initialize_dp_attention(
 
     dp.enabled = enable_dp_attention
 
-    tp_rank = get_tensor_model_parallel_rank()
+    tp_rank = get_parallel().tp_rank
     tp_size = get_tensor_model_parallel_world_size()
 
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
@@ -503,9 +498,7 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (
-        is_partial or get_attn_tensor_model_parallel_rank() == 0
-    ):
+    if local_tokens.shape[0] > 0 and (is_partial or get_parallel().attn_tp_rank == 0):
         assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
             "aliasing between global_tokens and local_tokens not allowed"
         )
@@ -527,7 +520,9 @@ def _dp_gather_via_all_reduce(
         ):
             from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
-            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+            inplace_all_reduce(
+                global_tokens, group_name=get_parallel().tp_group.unique_name
+            )
 
         else:
             global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
@@ -549,16 +544,18 @@ def _dp_gather_via_all_gather(
                 group=torch.distributed.group.WORLD,
             )
         else:
-            get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+            get_parallel().tp_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
-        if get_attn_tensor_model_parallel_rank() != 0:
+        if get_parallel().attn_tp_rank != 0:
             local_tokens.fill_(0)
     scattered_local_tokens = local_tokens.tensor_split(
         get_attn_tensor_model_parallel_world_size()
-    )[get_attn_tensor_model_parallel_rank()]
-    get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    )[get_parallel().attn_tp_rank]
+    get_parallel().attn_tp_group.reduce_scatter_tensor(
+        scattered_local_tokens, local_tokens
+    )
     if use_world:
         torch.distributed.all_gather_into_tensor(
             global_tokens,
@@ -566,7 +563,9 @@ def _dp_gather_via_all_gather(
             group=torch.distributed.group.WORLD,
         )
     else:
-        get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+        get_parallel().tp_group.all_gather_into_tensor(
+            global_tokens, scattered_local_tokens
+        )
 
 
 # Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
@@ -696,7 +695,7 @@ def _dp_gather_via_all_gatherv_fp8(
         local_real.contiguous(), _DP_GATHER_FP8_GROUP
     )
     gq, gs = _get_dp_gather_fp8_bufs(rows, hidden, global_tokens.device)
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     tp_group.all_gatherv(q.view(torch.uint8), sizes=sizes, output=gq)
     tp_group.all_gatherv(s, sizes=sizes, output=gs)
     _dequant_per_token_group_fp8_kernel[(rows,)](
@@ -785,7 +784,7 @@ def _dp_gather_via_all_gatherv(
     ):
         _dp_gather_via_all_gatherv_fp8(global_tokens, local_real, sizes)
         return
-    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
+    get_parallel().tp_group.all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
 def _note_dp_gather_in_prefill_graph() -> None:
@@ -882,16 +881,18 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         # the default reduce-scatter path if per-rank sizes are unavailable.
         sizes = get_dp_global_num_tokens()
         if sizes is not None:
-            get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+            get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size:
-        get_tp_group().reduce_scatter_tensor(output, input)
+        get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(
             get_tensor_model_parallel_world_size()
-        )[get_tensor_model_parallel_rank()]
-        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
-        get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+        )[get_parallel().tp_rank]
+        get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
+        get_parallel().attn_tp_group.all_gather_into_tensor(
+            output, scattered_local_tokens
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -989,29 +990,31 @@ def dp_reduce_scatterv_async(
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
-        get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)
+        get_parallel().tp_group.reduce_scatterv(
+            global_tokens, output=output_local, sizes=sizes
+        )
         ev.record(comm)
     return ev
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_tp_group().reduce_scatter_tensor(output, input)
+    return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
 
 
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_group().reduce_scatter_tensor(output, input)
+    return get_parallel().attn_cp_group.reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
-    return get_attn_tp_group().all_reduce(input)
+    return get_parallel().attn_tp_group.all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_tp_group().all_gather_into_tensor(output, input)
+    return get_parallel().attn_tp_group.all_gather_into_tensor(output, input)
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_group().all_gather_into_tensor(output, input)
+    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:
@@ -1041,4 +1044,6 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
+    return get_parallel().attn_tp_group.all_gather(
+        input, output_tensor_list=output_list
+    )

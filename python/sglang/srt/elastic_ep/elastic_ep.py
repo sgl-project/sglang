@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
 
-from sglang.srt.distributed import get_world_group, parallel_state
+from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.runtime_context import (
@@ -446,7 +446,7 @@ def join_process_groups() -> None:
 def get_healthy_expert_location_src_rank(
     *, invoked_in_elastic_ep_rejoin_path: bool
 ) -> int:
-    world_group = get_world_group()
+    world_group = get_parallel().world_group
     # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
     # A rank that was started as a rejoin rank may later act as a healthy
     # rank in a subsequent recovery cycle.
