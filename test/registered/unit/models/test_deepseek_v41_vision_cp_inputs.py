@@ -77,6 +77,7 @@ class _VisionStub(DeepseekV4ForCausalLM):
         self.config = SimpleNamespace(image_token_id=IMAGE_TOKEN_ID)
         self.vision = object()
         self.tp_size = 1
+        self.mm_owner_group = None
         self.model = _RecordingBody(embed)
         self.pp_group = SimpleNamespace(is_last_rank=True)
         self.lm_head = object()

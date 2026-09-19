@@ -10,6 +10,7 @@ import pickle
 import sys
 from abc import abstractmethod
 from collections import defaultdict
+from contextlib import nullcontext
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.mm_owner_embedding import MmOwnerSession
 
 # Preserve the existing initialization import for downstream callers.
 from sglang.srt.managers.mm_schedule import (
@@ -397,6 +399,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    mm_owner: Optional[MmOwnerSession] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -469,6 +472,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                mm_owner=mm_owner,
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
@@ -489,7 +493,12 @@ def embed_mm_inputs(
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
-    input_embeds = input_embedding(input_ids)
+    if mm_owner is not None:
+        # The text embedding may all-reduce across TP; a rank-local failure in
+        # feature preparation has to be agreed on before any rank enters it.
+        mm_owner.features_ready()
+    with mm_owner.uncaptured() if mm_owner is not None else nullcontext():
+        input_embeds = input_embedding(input_ids)
 
     # deepstack embedding
     if use_deepstack:
@@ -516,7 +525,9 @@ def embed_mm_inputs(
         _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
         if use_deepstack.get(modality, None):
             _scatter_mm_embedding(
-                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+                dest=input_deepstack_embeds,
+                mask=mask,
+                src=deepstack_embeddings[i],
             )
 
     return input_embeds, other_info
