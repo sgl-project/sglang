@@ -797,6 +797,12 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        if self.ps.pp_size == 1 or self.ps.pp_rank == 0:
+            return 0
+        getter = getattr(self.model, "get_pp_proxy_dspark_hidden_size", None)
+        return getter() if getter is not None else 0
+
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,

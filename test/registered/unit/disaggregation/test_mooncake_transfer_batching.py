@@ -134,12 +134,21 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
     def test_transfers_draft_heads_to_logical_destination_rows(self):
         for src_tp, dst_tp in ((4, 8), (8, 4), (8, 8), (4, 32), (32, 4)):
             for custom_pool in (False, True):
-                with self.subTest(
-                    src_tp=src_tp, dst_tp=dst_tp, custom_pool=custom_pool
-                ):
-                    self._check_transfer(src_tp, dst_tp, custom_pool)
+                for batch_size in (0, 37):
+                    with self.subTest(
+                        src_tp=src_tp,
+                        dst_tp=dst_tp,
+                        custom_pool=custom_pool,
+                        batch_size=batch_size,
+                    ):
+                        self._check_transfer(src_tp, dst_tp, custom_pool, batch_size)
 
-    def _check_transfer(self, src_tp, dst_tp, custom_pool):
+    def test_sliced_draft_stops_after_failed_batch(self):
+        self._check_transfer(4, 8, False, 37, fail_draft=True)
+
+    def _check_transfer(
+        self, src_tp, dst_tp, custom_pool, batch_size, fail_draft=False
+    ):
         page_size, tokens, heads, head_bytes = 64, 249, 16, 4
         src_width, dst_width = (
             max(1, heads // src_tp) * head_bytes,
@@ -177,9 +186,19 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                 )
                 src_buffers = {10000: target, 100000: source, 200000: source}
 
+                failed_batches = []
+
                 def transfer(
                     session, blocks, src_buffers=src_buffers, dst_buffers=dst_buffers
                 ):
+                    draft_blocks = [block for block in blocks if block[1] >= 3000000]
+                    if fail_draft and draft_blocks:
+                        failed_batches.append(draft_blocks)
+                        return 17
+                    if batch_size and src_width != dst_width:
+                        self.assertLessEqual(
+                            len(draft_blocks), batch_size * (1 if custom_pool else 2)
+                        )
                     for src, dst, size in blocks:
                         src_base = max(base for base in src_buffers if base <= src)
                         dst_base = max(base for base in dst_buffers if base <= dst)
@@ -196,9 +215,10 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         kv_layer_ids=[47, 93, 93],
                         kv_data_ptrs=[10000, 100000, 200000],
                         num_draft_entries=2,
-                        engine_rank=src_rank,
+                        engine_rank=src_rank + 2 * src_tp,
                     ),
                     attn_tp_size=src_tp,
+                    max_transfer_batch_indices=batch_size,
                     enable_custom_mem_pool=custom_pool,
                     _transfer_data=transfer,
                     _await_transfer_futures=lambda futures: max(
@@ -229,6 +249,10 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         dst_tp_rank=dst_rank,
                         dst_attn_tp_size=dst_tp,
                     )
+                if fail_draft:
+                    self.assertEqual(result, 17)
+                    self.assertEqual(len(failed_batches), 1)
+                    return
                 self.assertEqual(result, 0)
             dst_head_start = (dst_rank // max(1, dst_tp // heads)) * max(
                 1, heads // dst_tp

@@ -3068,6 +3068,12 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer - 1 for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
             raise ValueError(
@@ -3517,6 +3523,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             raise AttributeError("lm_head is not available in encoder-only mode")
         return self.language_model.lm_head
+
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_pp_proxy_dspark_hidden_size()
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:

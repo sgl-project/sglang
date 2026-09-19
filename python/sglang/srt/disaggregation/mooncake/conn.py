@@ -1071,7 +1071,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for entry in range(num_target)
             ]
-        sliced_draft_blocks = []
+        sliced_draft_params = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
             if not dst_kv_item_lens and dst_attn_tp_size not in (
                 None,
@@ -1112,26 +1112,41 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 src_span = src_width * self.attn_tp_size
                 dst_span = dst_width * dst_attn_tp_size
-                src_rank = self.kv_args.engine_rank // max(1, src_span // dst_span)
+                src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
+                    1, src_span // dst_span
+                )
                 dst_rank = dst_tp_rank // max(1, dst_span // src_span)
                 src_offset = (dst_rank * dst_width) % src_width
                 dst_offset = (src_rank * src_width) % dst_width
-                src_addrs = (
-                    src_kv_ptrs[entry]
-                    + plan.draft_src_token_indices * src_width
-                    + src_offset
+                sliced_draft_params.append(
+                    (
+                        src_kv_ptrs[entry] + src_offset,
+                        dst_kv_ptrs[entry] + dst_offset,
+                        src_width,
+                        dst_width,
+                        copy_width,
+                    )
                 )
-                dst_addrs = (
-                    dst_kv_ptrs[entry]
-                    + plan.draft_dst_token_indices * dst_width
-                    + dst_offset
-                )
-                sliced_draft_blocks.append(
-                    [
+
+        def process_sliced_draft(params) -> int:
+            batch_size = self.max_transfer_batch_indices
+            if batch_size <= 0:
+                batch_size = 4096
+            for start in range(0, plan.draft_src_token_indices.size, batch_size):
+                src_indices = plan.draft_src_token_indices[start : start + batch_size]
+                dst_indices = plan.draft_dst_token_indices[start : start + batch_size]
+                blocks = []
+                for src_ptr, dst_ptr, src_width, dst_width, copy_width in params:
+                    src_addrs = src_ptr + src_indices * src_width
+                    dst_addrs = dst_ptr + dst_indices * dst_width
+                    blocks.extend(
                         (int(src), int(dst), copy_width)
                         for src, dst in zip(src_addrs, dst_addrs)
-                    ]
-                )
+                    )
+                ret = self._transfer_data(mooncake_session_id, blocks)
+                if ret != 0:
+                    return ret
+            return 0
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
@@ -1160,17 +1175,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_params in layers_params
             ]
             futures.extend(
-                executor.submit(self._transfer_data, mooncake_session_id, blocks)
-                for blocks in sliced_draft_blocks
+                executor.submit(process_sliced_draft, [params])
+                for params in sliced_draft_params
             )
             return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for layer_params in layers_params:
             transfer_blocks.extend(set_transfer_blocks(*layer_params))
-        for blocks in sliced_draft_blocks:
-            transfer_blocks.extend(blocks)
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+        if ret != 0 or not sliced_draft_params:
+            return ret
+        return process_sliced_draft(sliced_draft_params)
 
     def send_kvcache_slice(
         self,

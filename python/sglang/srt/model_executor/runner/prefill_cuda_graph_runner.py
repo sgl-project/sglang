@@ -383,6 +383,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            pp_proxy_dspark_hidden_size=(
+                self.model_runner.get_pp_proxy_dspark_hidden_size()
+            ),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -593,8 +596,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"unsupported for this model architecture."
                 ) from exc
             params = list(inspect.signature(self.layer_model.forward).parameters)
-            self._input_embeds_arg_idx = (
-                params.index("input_embeds") if "input_embeds" in params else None
+            self._input_embeds_arg_idx = next(
+                (
+                    params.index(name)
+                    for name in ("input_embeds", "inputs_embeds")
+                    if name in params
+                ),
+                None,
             )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
@@ -1924,8 +1932,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # text-only batches they are get_input_embeddings()(input_ids).
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
-            if self.buffer_registry.has_slot("input_embeds"):
+            if (
+                self.model_runner.pp_group.is_first_rank
+                and self.buffer_registry.has_slot("input_embeds")
+            ):
                 ie = layer_kwargs.get("input_embeds")
+                if ie is None:
+                    ie = layer_kwargs.get("inputs_embeds")
                 if ie is None and ie_idx is not None and len(args) > ie_idx:
                     ie = args[ie_idx]
                 if ie is None:
