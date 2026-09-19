@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -22,6 +23,18 @@ namespace sglang::minicpm_sala {
 
 constexpr int kTopkPerBlock = 16;
 
+// Vector width used by the blockwise kernel to write one out_block_table row.
+// Rows are int32 and start at a multiple of kSparseBlockSize elements, so a
+// vectorized store is naturally aligned whenever the row length is a multiple
+// of 4. AlignedVector rejects widths above the architecture limit, so this
+// stays portable (16 B on pre-Blackwell, 32 B on Blackwell and later).
+template <int kSparseBlockSize>
+constexpr int kBlockwiseVecWidth = (kSparseBlockSize % 4 == 0) ? 4 : 1;
+
+// Threads cooperating on one out_block_table row in the blockwise kernel.
+template <int kSparseBlockSize>
+constexpr int kBlockwiseThreadsPerRow = kSparseBlockSize / kBlockwiseVecWidth<kSparseBlockSize>;
+
 // topk_idx:        [head_group, token_num, kSparseTopK]  int32
 // block_table:     [batch_size, seqlen_q_max]           int32
 // token_to_bs:     [token_num]                           int32
@@ -29,9 +42,13 @@ constexpr int kTopkPerBlock = 16;
 // seqlen_q:        [batch_size]                          int32
 // out_block_table: [token_num, head_group, kSparseTopK * kSparseBlockSize] int32
 
-// 1 thread calc 64 element of out_block_table.
-// This allows topk_idx to be read once and all corresponding
-// out_block_table elements calculated, reducing memory access.
+// kBlockwiseThreadsPerRow threads cooperate on one out_block_table row: each
+// thread computes kBlockwiseVecWidth consecutive elements and writes them with a
+// single vectorized store. Threads of a row are adjacent, so a warp covers whole
+// rows and its stores stay contiguous. The former one-thread-per-row layout
+// strided the stores by kSparseBlockSize and needed ~8x the memory transactions.
+// topk_idx is still read once per row: every thread of a row reads the same
+// address, which the hardware broadcasts.
 template <int kSparseTopK, int kHeadGroup, int kSparseBlockSize>
 __global__ void get_block_table_cuda_blockwise(
     const int* topk_idx,
@@ -42,26 +59,40 @@ __global__ void get_block_table_cuda_blockwise(
     int* out_block_table,
     const int seqlen_q_max,
     const int token_num) {
-  int token_idx = (blockIdx.x * blockDim.x + threadIdx.x) / (kSparseTopK * kHeadGroup);
-  if (token_idx >= token_num) return;
-  int head_group_idx = ((blockIdx.x * blockDim.x + threadIdx.x) / kSparseTopK) % kHeadGroup;
-  int topk_idx_in_head = (blockIdx.x * blockDim.x + threadIdx.x) % kSparseTopK;
-  int bs = token_to_bs[token_idx];
-  int pos_in_bs = token_pos_in_bs[token_idx];
-  int seqlen_q_bs = seqlen_q[bs];
-  int sparse_block_idx =
+  constexpr int kVec = kBlockwiseVecWidth<kSparseBlockSize>;
+  constexpr int kThreadsPerRow = kBlockwiseThreadsPerRow<kSparseBlockSize>;
+
+  // The grid is kThreadsPerRow times larger than one-thread-per-row, so the flat
+  // thread id no longer fits an int for long sequences.
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t row = gid / kThreadsPerRow;
+  if (row >= static_cast<int64_t>(token_num) * kSparseTopK * kHeadGroup) return;
+  const int lane = static_cast<int>(gid % kThreadsPerRow);
+
+  const int token_idx = static_cast<int>(row / (kSparseTopK * kHeadGroup));
+  const int head_group_idx = static_cast<int>((row / kSparseTopK) % kHeadGroup);
+  const int topk_idx_in_head = static_cast<int>(row % kSparseTopK);
+  const int bs = token_to_bs[token_idx];
+  const int pos_in_bs = token_pos_in_bs[token_idx];
+  const int seqlen_q_bs = seqlen_q[bs];
+  const int sparse_block_idx =
       topk_idx[head_group_idx * token_num * kSparseTopK + token_idx * kSparseTopK + topk_idx_in_head];
 
   auto out_view = reinterpret_cast<int (*)[kHeadGroup][kSparseTopK][kSparseBlockSize]>(out_block_table);
-  for (int i = 0; i < kSparseBlockSize; i++) {
-    int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i;
+  int* out_row = &out_view[token_idx][head_group_idx][topk_idx_in_head][0];
+
+  device::AlignedVector<int, kVec> out_vec;
+#pragma unroll
+  for (int j = 0; j < kVec; j++) {
+    const int i = lane * kVec + j;
+    const int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i;
     if (sparse_block_idx >= 0 && token_idx_in_batch < seqlen_q_bs && token_idx_in_batch < pos_in_bs) {
-      out_view[token_idx][head_group_idx][topk_idx_in_head][i] =
-          kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] + head_group_idx;
+      out_vec[j] = kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] + head_group_idx;
     } else {
-      out_view[token_idx][head_group_idx][topk_idx_in_head][i] = 0;
+      out_vec[j] = 0;
     }
   }
+  out_vec.store(out_row + lane * kVec);
 }
 
 // 1 thread calculates 1 element of out_block_table. A 1024-thread block
@@ -180,8 +211,11 @@ void get_block_table(
   const DLDevice dev = device.unwrap();
 
   constexpr int kThreadsPerBlock = 1024;
-  constexpr int kElementsPerEntry = kElementwise ? kSparseBlockSize : 1;
-  const int64_t total = static_cast<int64_t>(n_token) * kHeadGroup * kSparseTopK * kElementsPerEntry;
+  // The blockwise kernel spreads one (token, head_group, topk) entry over
+  // kBlockwiseThreadsPerRow cooperating threads; the elementwise kernel uses one
+  // thread per output element.
+  constexpr int kThreadsPerEntry = kElementwise ? kSparseBlockSize : kBlockwiseThreadsPerRow<kSparseBlockSize>;
+  const int64_t total = static_cast<int64_t>(n_token) * kHeadGroup * kSparseTopK * kThreadsPerEntry;
   const int64_t num_blocks = (total + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
   if constexpr (!kElementwise) {
