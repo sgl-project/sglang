@@ -114,6 +114,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             backend = SimpleNamespace(
                 has_c4=True,
                 has_c128=True,
+                low_ratio_prefill_graph=False,
                 expand_prefill_casually=Mock(
                     return_value=(torch.ones(16), torch.zeros(16))
                 ),
