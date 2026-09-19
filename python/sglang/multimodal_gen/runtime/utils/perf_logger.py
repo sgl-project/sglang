@@ -17,6 +17,7 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     CYAN,
@@ -294,6 +295,7 @@ class StageProfiler:
         record_as_step: bool = False,
     ):
         self.stage_name = stage_name
+        self.prometheus = get_metrics()
         self.metrics = metrics
         self.logger = logger
         self.start_time = 0.0
@@ -335,14 +337,22 @@ class StageProfiler:
                 msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
-        if (self.log_timing and self.metrics) or self.log_stage_start_end:
+        if (
+            (self.log_timing and self.metrics)
+            or self.log_stage_start_end
+            or self.prometheus is not None
+        ):
             self._maybe_sync_device()
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
+        if not (
+            (self.log_timing and self.metrics)
+            or self.log_stage_start_end
+            or self.prometheus is not None
+        ):
             return False
 
         self._maybe_sync_device()
@@ -362,6 +372,9 @@ class StageProfiler:
             self.logger.info(
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
+
+        if self.prometheus is not None:
+            self.prometheus.observe_stage(self.stage_name, execution_time_s)
 
         if self.log_timing and self.metrics:
             if self._should_record_as_step():
