@@ -853,7 +853,7 @@ def test_async_load_pins_node_until_completion():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
 
-    wrapper._queue_load("rid", node_id, [object()])
+    wrapper._queue_load(SimpleNamespace(rid="rid"), node_id, [object()])
 
     assert locks == [node_id]
     assert not unlocks
@@ -965,7 +965,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()])
+    wrapper._queue_load(SimpleNamespace(rid="rid"), node.id, [object()])
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
