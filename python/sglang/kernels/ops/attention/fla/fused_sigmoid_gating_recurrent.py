@@ -494,7 +494,7 @@ def fused_sigmoid_gating_delta_rule_update(
 
     sail_fla_supported = lower_bound is None and not cache_ring
     if envs.SGLANG_SAIL_FLA_CUDA.get() and sail_fla_supported:
-        from fla import fused_sigmoid_gating_delta_rule_forward_k_last
+        from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last
 
         logger.info_once(
             f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
