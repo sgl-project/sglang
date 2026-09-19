@@ -4524,15 +4524,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
