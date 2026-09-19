@@ -1726,8 +1726,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def cancel_lifecycle(self, attempt_id: str):
+        sealed = self.request_lifecycle.is_sealed(attempt_id)
         producer = self._lifecycle_tasks.get(attempt_id)
-        if producer is not None and producer is not asyncio.current_task():
+        # Once all children are dispatched, let their native abort responses
+        # finish the HTTP request. Only interrupt a producer that could still
+        # be tokenizing, paused, or creating new sampling children.
+        if (
+            not sealed
+            and producer is not None
+            and producer is not asyncio.current_task()
+        ):
             producer.cancel()
         for child_id in self.request_lifecycle.cancel(attempt_id):
             self._dispatch_to_scheduler(AbortReq(lifecycle_id=child_id))
@@ -2345,8 +2353,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def abort_request():
             attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
             if attempt_id is not None:
-                self.cancel_lifecycle(attempt_id)
-                self.request_lifecycle.seal(attempt_id)
+                if attempt_id in self.request_lifecycle:
+                    self.cancel_lifecycle(attempt_id)
+                    self.request_lifecycle.seal(attempt_id)
                 return
             await asyncio.sleep(2)
             rids = [obj.rid] if obj.is_single else obj.rid

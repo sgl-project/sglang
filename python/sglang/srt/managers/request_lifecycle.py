@@ -74,6 +74,16 @@ class RequestLifecycle:
         self._retention_seconds = retention_seconds
         self._clock = clock
 
+    def __contains__(self, attempt_id: str) -> bool:
+        return attempt_id in self._attempts
+
+    def is_sealed(self, attempt_id: str) -> bool:
+        return self._attempts[attempt_id].sealed
+
+    def is_cancelled(self, attempt_id: str) -> bool:
+        attempt = self._attempts.get(attempt_id)
+        return attempt is not None and attempt.cancel_requested
+
     def claim(self, attempt_id: str, stage: str, lease_seconds: float = 30) -> None:
         # The proxy owns this UUID. Never derive it from the native rid, which may
         # be reused, overlap another rid's prefix, or expand during sampling.
@@ -218,7 +228,11 @@ class RequestLifecycle:
         if attempt.version <= after and attempt.finished_at is None:
             # No await between testing the version and capturing the event.
             changed = attempt.changed
-            remaining = max(0, attempt.expires_at - self._clock())
+            remaining = (
+                timeout
+                if attempt.cancel_requested
+                else max(0, attempt.expires_at - self._clock())
+            )
             try:
                 await asyncio.wait_for(changed.wait(), min(timeout, remaining))
             except asyncio.TimeoutError:

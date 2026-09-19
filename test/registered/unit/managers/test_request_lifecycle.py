@@ -139,6 +139,20 @@ class TestRequestLifecycle(unittest.IsolatedAsyncioTestCase):
         registry.claim(other, "decode")
         registry.add_child(other, "rid")
 
+    async def test_cancelled_long_poll_waits_for_scheduler_acknowledgement(self):
+        child = self.child()
+        self.registry.seal(self.attempt)
+        self.now = 10
+        cancelled = self.registry.snapshot(self.attempt)
+        self.assertTrue(cancelled["cancel_requested"])
+        waiter = asyncio.create_task(
+            self.registry.wait(self.attempt, cancelled["version"])
+        )
+        await asyncio.sleep(0.01)
+        self.assertFalse(waiter.done())
+        self.registry.scheduler_event(child, 0, "terminal")
+        self.assertTrue((await waiter)["terminal"])
+
 
 class TestSchedulerLifecycle(unittest.TestCase):
     def test_unary_prefill_and_deferred_cleanup_without_any_response_output(self):

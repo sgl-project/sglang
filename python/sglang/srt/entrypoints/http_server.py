@@ -982,15 +982,24 @@ async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
                 complete = True
             yield result
         complete = True
+    except asyncio.CancelledError:
+        if attempt_id is not None and manager.request_lifecycle.is_cancelled(
+            attempt_id
+        ):
+            raise ValueError("Generation attempt cancelled before dispatch") from None
+        raise
     finally:
         try:
             await generator.aclose()
         finally:
             if attempt_id is not None:
                 manager._lifecycle_tasks.pop(attempt_id, None)
-                if not complete:
-                    manager.cancel_lifecycle(attempt_id)
-                manager.request_lifecycle.seal(attempt_id)
+                # Accounting can finish and be acknowledged before a slow
+                # reader consumes the last native response bytes.
+                if attempt_id in manager.request_lifecycle:
+                    if not complete:
+                        manager.cancel_lifecycle(attempt_id)
+                    manager.request_lifecycle.seal(attempt_id)
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
