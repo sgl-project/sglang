@@ -116,8 +116,6 @@ def assert_metadata_equal(test, actual, expected):
             lengths = expected.cache_seqlens_int32
             lengths = lengths.repeat_interleave(value.shape[0] // lengths.numel())
             step = 1 if name == "page_table_1" else 64
-            if name == "pooled_real_page_table":
-                step *= POOL
             live = (
                 torch.arange(value.shape[1], device=value.device)[None, :] * step
                 < lengths[:, None]
