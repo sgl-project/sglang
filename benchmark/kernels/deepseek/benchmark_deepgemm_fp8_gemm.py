@@ -7,9 +7,6 @@ import torch
 import triton
 from deep_gemm import ceil_div
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
-)
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -150,25 +147,6 @@ def fp8_gemm_sglang(
 
     # Run SGLang kernel
     out = w8a8_block_fp8_matmul(
-        x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
-    )
-    return out
-
-
-def fp8_gemm_vllm(
-    x_fp8: torch.Tensor,
-    x_scale: torch.Tensor,
-    y_fp8: torch.Tensor,
-    y_scale: torch.Tensor,
-    m: int,
-    n: int,
-    k: int,
-):
-    """vLLM implementation of FP8 GEMM"""
-    block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
-
-    # Run vLLM kernel
-    out = vllm_w8a8_block_fp8_matmul(
         x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
     )
     return out
