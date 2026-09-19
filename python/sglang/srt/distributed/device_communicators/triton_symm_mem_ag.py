@@ -471,6 +471,7 @@ class MultimemAllGatherer:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.environ import envs
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
@@ -479,8 +480,14 @@ class MultimemAllGatherer:
             # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
             # EP/mooncake setups, and keep multimem enabled.
+            # SGLANG_MULTIMEM_AG_CROSS_NODE keeps multimem enabled on
+            # multi-node deployments whose TP group is one NVLink clique
+            # (MNNVL fabric): torch symmetric memory rendezvous and multicast
+            # work across such nodes, and create_state below still falls back
+            # to NCCL when the multicast pointer is unavailable.
             if (
                 tp_group.world_size > 1
+                and not envs.SGLANG_MULTIMEM_AG_CROSS_NODE.get()
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
