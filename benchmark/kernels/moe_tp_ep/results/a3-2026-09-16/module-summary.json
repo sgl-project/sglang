@@ -1,0 +1,392 @@
+[
+  {
+    "phase": "decode",
+    "global_tokens": 1,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.08120995759964,
+        "run_medians_ms": [
+          1.0896700024604797,
+          1.08120995759964,
+          1.0537499785423279
+        ],
+        "relative_range": 0.033222061696413493
+      },
+      "none": {
+        "median_ms": 0.9337599873542786,
+        "run_medians_ms": [
+          0.9337599873542786,
+          0.956389993429184,
+          0.880079984664917
+        ],
+        "relative_range": 0.08172336553045524
+      }
+    },
+    "ep_over_tp": 1.1579099257220766
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 8,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.0941799879074097,
+        "run_medians_ms": [
+          1.0973399877548218,
+          1.0941799879074097,
+          1.090939998626709
+        ],
+        "relative_range": 0.005849119156668733
+      },
+      "none": {
+        "median_ms": 0.9262199997901917,
+        "run_medians_ms": [
+          0.9262199997901917,
+          0.9774300158023834,
+          0.8483000099658966
+        ],
+        "relative_range": 0.13941612777281584
+      }
+    },
+    "ep_over_tp": 1.1813391938797095
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 32,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.1777200102806091,
+        "run_medians_ms": [
+          1.1399099826812744,
+          1.1777200102806091,
+          1.1829800009727478
+        ],
+        "relative_range": 0.036570677169025366
+      },
+      "none": {
+        "median_ms": 0.9252599775791168,
+        "run_medians_ms": [
+          0.9252599775791168,
+          0.9788500070571899,
+          0.8418900072574615
+        ],
+        "relative_range": 0.148023261697837
+      }
+    },
+    "ep_over_tp": 1.2728530778582228
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 64,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.165470004081726,
+        "run_medians_ms": [
+          1.1388999819755554,
+          1.165470004081726,
+          1.1748000383377075
+        ],
+        "relative_range": 0.03080307192499369
+      },
+      "none": {
+        "median_ms": 0.8896600008010864,
+        "run_medians_ms": [
+          0.9612399935722351,
+          0.8896600008010864,
+          0.8522000014781952
+        ],
+        "relative_range": 0.12256366701420299
+      }
+    },
+    "ep_over_tp": 1.3100173133919575
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 128,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.1550000309944153,
+        "run_medians_ms": [
+          1.1550000309944153,
+          1.1402199864387512,
+          1.1783600449562073
+        ],
+        "relative_range": 0.03302169479997224
+      },
+      "none": {
+        "median_ms": 0.8713000118732452,
+        "run_medians_ms": [
+          0.929749995470047,
+          0.8713000118732452,
+          0.855789989233017
+        ],
+        "relative_range": 0.084884661114626
+      }
+    },
+    "ep_over_tp": 1.3256054347012245
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 256,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.1385799646377563,
+        "run_medians_ms": [
+          1.1385799646377563,
+          1.1227499842643738,
+          1.1900999546051025
+        ],
+        "relative_range": 0.05915260450077954
+      },
+      "none": {
+        "median_ms": 0.8783200085163116,
+        "run_medians_ms": [
+          0.9135000109672546,
+          0.8783200085163116,
+          0.8571799993515015
+        ],
+        "relative_range": 0.0641224281237665
+      }
+    },
+    "ep_over_tp": 1.2963156407663816
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 512,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.2194899916648865,
+        "run_medians_ms": [
+          1.2112200260162354,
+          1.2194899916648865,
+          1.2283000349998474
+        ],
+        "relative_range": 0.014005862368984176
+      },
+      "none": {
+        "median_ms": 0.9032000005245209,
+        "run_medians_ms": [
+          0.9455600082874298,
+          0.9032000005245209,
+          0.8877499997615814
+        ],
+        "relative_range": 0.06400576670978303
+      }
+    },
+    "ep_over_tp": 1.3501882096508908
+  },
+  {
+    "phase": "decode",
+    "global_tokens": 1001,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.4190599918365479,
+        "run_medians_ms": [
+          1.3946099877357483,
+          1.4190599918365479,
+          1.4229000210762024
+        ],
+        "relative_range": 0.01993575571378144
+      },
+      "none": {
+        "median_ms": 0.9358400106430054,
+        "run_medians_ms": [
+          0.9841900169849396,
+          0.9358400106430054,
+          0.9294399917125702
+        ],
+        "relative_range": 0.05850361669699423
+      }
+    },
+    "ep_over_tp": 1.516348922570138
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 128,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.737999975681305,
+        "run_medians_ms": [
+          1.737999975681305,
+          1.712909996509552,
+          1.7744399905204773
+        ],
+        "relative_range": 0.03540275884457664
+      },
+      "none": {
+        "median_ms": 0.9459399878978729,
+        "run_medians_ms": [
+          0.947299987077713,
+          0.9165199995040894,
+          0.9459399878978729
+        ],
+        "relative_range": 0.032539048953861095
+      }
+    },
+    "ep_over_tp": 1.837325832417337
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 512,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 1.7819600105285645,
+        "run_medians_ms": [
+          1.7819600105285645,
+          1.7789599895477295,
+          1.8081199526786804
+        ],
+        "relative_range": 0.01636398289448791
+      },
+      "none": {
+        "median_ms": 0.9443199932575226,
+        "run_medians_ms": [
+          0.9443199932575226,
+          0.9258600175380707,
+          0.958299994468689
+        ],
+        "relative_range": 0.034352737591325865
+      }
+    },
+    "ep_over_tp": 1.8870298450226837
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 2048,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 2.360069990158081,
+        "run_medians_ms": [
+          2.3658400774002075,
+          2.3441799879074097,
+          2.360069990158081
+        ],
+        "relative_range": 0.009177731839786254
+      },
+      "none": {
+        "median_ms": 1.3031499981880188,
+        "run_medians_ms": [
+          1.2977599501609802,
+          1.3031499981880188,
+          1.321120023727417
+        ],
+        "relative_range": 0.017925851666284062
+      }
+    },
+    "ep_over_tp": 1.8110501426847792
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 4096,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 3.1427799463272095,
+        "run_medians_ms": [
+          3.1427799463272095,
+          3.1120399236679077,
+          3.156790018081665
+        ],
+        "relative_range": 0.01423901615067076
+      },
+      "none": {
+        "median_ms": 1.834500014781952,
+        "run_medians_ms": [
+          1.8308199644088745,
+          1.834500014781952,
+          1.8478899598121643
+        ],
+        "relative_range": 0.009304985154398447
+      }
+    },
+    "ep_over_tp": 1.7131534047443218
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 8192,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 4.633029937744141,
+        "run_medians_ms": [
+          4.648980140686035,
+          4.614609956741333,
+          4.633029937744141
+        ],
+        "relative_range": 0.007418511083793529
+      },
+      "none": {
+        "median_ms": 3.005429983139038,
+        "run_medians_ms": [
+          2.9979300498962402,
+          3.005429983139038,
+          3.006010055541992
+        ],
+        "relative_range": 0.0026884691012873793
+      }
+    },
+    "ep_over_tp": 1.5415531101160929
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 16384,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 7.569200038909912,
+        "run_medians_ms": [
+          7.567410230636597,
+          7.584650039672852,
+          7.569200038909912
+        ],
+        "relative_range": 0.0022776262944079486
+      },
+      "none": {
+        "median_ms": 5.178149938583374,
+        "run_medians_ms": [
+          5.169960021972656,
+          5.18245005607605,
+          5.178149938583374
+        ],
+        "relative_range": 0.0024120649752391197
+      }
+    },
+    "ep_over_tp": 1.4617576023649628
+  },
+  {
+    "phase": "prefill",
+    "global_tokens": 32768,
+    "independent_runs": 3,
+    "configurations": {
+      "deepep": {
+        "median_ms": 13.608980178833008,
+        "run_medians_ms": [
+          13.581000328063965,
+          13.646180152893066,
+          13.608980178833008
+        ],
+        "relative_range": 0.004789471655670442
+      },
+      "none": {
+        "median_ms": 9.345570087432861,
+        "run_medians_ms": [
+          9.345570087432861,
+          9.361909866333008,
+          9.344749927520752
+        ],
+        "relative_range": 0.0018361575218756431
+      }
+    },
+    "ep_over_tp": 1.4561958287738084
+  }
+]
