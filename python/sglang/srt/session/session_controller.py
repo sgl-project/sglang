@@ -87,8 +87,10 @@ class Session:
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        incarnation: Optional[str] = None,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
+        self.incarnation = incarnation or uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
@@ -176,30 +178,84 @@ class Session:
         return input_ids, input_ids_unpadded, carry_fill
 
     @staticmethod
+    def _concat_history(origin, output, new_input, session_params):
+        history = origin[:] if session_params.drop_previous_output else origin + output
+        if session_params.offset:
+            return history[: session_params.offset] + new_input
+        history += new_input
+        return history
+
+    @staticmethod
     def _concat_token_arrays(
         last_req: Req, req: TokenizedGenerateReqInput, session_params
     ):
         """Copy-based assembly for replace/offset/drop_previous_output turns."""
         out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
 
-        input_ids = last_req.origin_input_ids + out_tail
-        if session_params.drop_previous_output:
-            input_ids = last_req.origin_input_ids[:]
-        if session_params.offset and session_params.offset != 0:
-            input_ids = input_ids[: session_params.offset] + req.input_ids
-        else:
-            input_ids += req.input_ids
-
-        input_ids_unpadded = last_req.origin_input_ids_unpadded + out_tail
-        if session_params.drop_previous_output:
-            input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-        if session_params.offset and session_params.offset != 0:
-            input_ids_unpadded = (
-                input_ids_unpadded[: session_params.offset] + req.input_ids
-            )
-        else:
-            input_ids_unpadded += req.input_ids
+        input_ids = Session._concat_history(
+            last_req.origin_input_ids, out_tail, req.input_ids, session_params
+        )
+        input_ids_unpadded = Session._concat_history(
+            last_req.origin_input_ids_unpadded, out_tail, req.input_ids, session_params
+        )
         return input_ids, input_ids_unpadded
+
+    def _resolve_parent(self, session_params):
+        """Read-only parent selection shared by routing inspection and execution."""
+        if self.streaming:
+            if self._inflight:
+                return None, "Streaming session already has an active request."
+            elif session_params.replace:
+                return None, "Streaming sessions do not support replace."
+            elif session_params.drop_previous_output:
+                return None, "Streaming sessions do not support drop_previous_output."
+            elif session_params.offset and session_params.offset != 0:
+                return None, "Streaming sessions do not support offset."
+            elif self.req_nodes:
+                assert len(self.req_nodes) == 1
+                return next(iter(self.req_nodes.values())), ""
+        elif session_params.rid is not None:
+            node = self.req_nodes.get(session_params.rid)
+            if node is None:
+                return None, "Invalid request session id"
+            if not session_params.replace and not node.req.finished():
+                return (
+                    node,
+                    "Session request is appending to a request that hasn't finished.",
+                )
+            return node, ""
+        return None, ""
+
+    def routing_input_ids(self, session_params, input_ids, tokenizer):
+        """Snapshot the effective prompt without changing history or claiming a turn.
+
+        This is advisory admission metadata, not a lock: later session operations
+        may change the history before generation reaches the scheduler.
+        """
+        node, error = self._resolve_parent(session_params)
+        if error:
+            raise ValueError(error)
+        tokens = array("q", input_ids)
+        if node is not None:
+            if tokenizer is not None and tokens and tokens[0] == tokenizer.bos_token_id:
+                tokens = tokens[1:]
+            parent = node.req
+            origin = parent.origin_input_ids
+            if self.streaming and self.committed_origin_len is not None:
+                # A cancelled append may have extended the shared array. Only
+                # the last successful turn's prefix belongs to this snapshot.
+                origin = origin[: self.committed_origin_len]
+            tokens = self._concat_history(
+                origin,
+                parent.output_ids[: parent.sampling_params.max_new_tokens],
+                tokens,
+                session_params,
+            )
+        if not tokens:
+            raise ValueError(
+                "A session request must contain input tokens after restoring history."
+            )
+        return list(tokens), node is not None and node.req.multimodal_inputs is not None
 
     def create_req(
         self,
@@ -211,58 +267,17 @@ class Session:
     ):
         assert req.session_params is not None
         session_params = req.session_params
-
-        last_req_node = None
-        last_req = None
-        abort = False
-        abort_message = ""
-        if self.streaming:
-            # Streaming sessions: only simple appends allowed; reject otherwise.
-            if self._inflight:
-                abort = True
-                abort_message = "Streaming session already has an active request."
-            elif session_params.replace:
-                abort = True
-                abort_message = "Streaming sessions do not support replace."
-            elif session_params.drop_previous_output:
-                abort = True
-                abort_message = (
-                    "Streaming sessions do not support drop_previous_output."
-                )
-            elif session_params.offset and session_params.offset != 0:
-                abort = True
-                abort_message = "Streaming sessions do not support offset."
-            elif self.req_nodes:
-                assert len(self.req_nodes) == 1
-                # Peek (don't pop) the single req_node. req_nodes is updated
-                # only in finish_req after the request completes successfully.
-                [last_req_node] = self.req_nodes.values()
-                last_req = last_req_node.req
-        elif session_params.replace:
-            if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
+        last_req_node, abort_message = self._resolve_parent(session_params)
+        last_req = last_req_node.req if last_req_node is not None else None
+        abort = bool(abort_message)
+        if not abort and session_params.replace:
+            if last_req_node is None:
+                # clear() recursively removes descendants from this dictionary.
+                while self.req_nodes:
+                    next(iter(self.req_nodes.values())).clear(self.req_nodes)
             else:
-                if session_params.rid not in self.req_nodes:
-                    abort = True
-                    abort_message = "Invalid request session id"
-                else:
-                    last_req_node = self.req_nodes[session_params.rid]
-                    last_req_node.abort()
-                    last_req = last_req_node.req
-                    last_req_node.clear_children(self.req_nodes)
-        else:
-            if session_params.rid is not None:
-                if session_params.rid not in self.req_nodes:
-                    abort = True
-                    abort_message = "Invalid request session id"
-                else:
-                    last_req_node = self.req_nodes[session_params.rid]
-                    last_req = last_req_node.req
-                    if not last_req.finished():
-                        abort = True
-                        abort_message = "Session request is appending to a request that hasn't finished."
-                        logging.warning(abort_message)
+                last_req_node.abort()
+                last_req_node.clear_children(self.req_nodes)
 
         carry_fill = None
         if last_req is not None:
@@ -393,6 +408,7 @@ class SessionController:
                 session_id,
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
+                incarnation=recv_req.session_incarnation,
             )
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"

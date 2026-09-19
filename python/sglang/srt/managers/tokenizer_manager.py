@@ -92,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
+    SessionRoutingReqOutput,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -678,6 +679,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.session_routing_futures = {}  # query_id -> scheduler snapshot
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -841,6 +843,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (AbortReq, self._handle_abort_req),
                 (RequestLifecycleOutput, self._handle_lifecycle_event),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (SessionRoutingReqOutput, self._handle_session_routing_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,

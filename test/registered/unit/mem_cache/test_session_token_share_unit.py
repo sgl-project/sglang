@@ -16,6 +16,8 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.io_struct import SessionParams
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -26,6 +28,7 @@ VOCAB = 1 << 20
 def _recv(rid, input_ids, max_new_tokens=8):
     return SimpleNamespace(
         rid=rid,
+        lifecycle_id=None,
         input_ids=array("q", input_ids),
         mm_inputs=None,
         session_params=SimpleNamespace(
@@ -163,6 +166,58 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
         r2._refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
+
+    def test_routing_snapshot_restores_committed_history_without_mutation(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4, 5])
+        self._create("aborted", [99])
+        self.session.abort_req()
+        before = list(first.origin_input_ids)
+        params = SessionParams(id="s")
+        snapshot, multimodal = self.session.routing_input_ids(params, [], None)
+        self.assertEqual(snapshot, [1, 2, 3, 4, 5])
+        self.assertFalse(multimodal)
+        self.assertEqual(list(first.origin_input_ids), before)
+        self.assertFalse(self.session._inflight)
+        resumed = self._create("r3", [])
+        self.assertEqual(list(resumed.origin_input_ids), snapshot)
+        with self.assertRaisesRegex(ValueError, "active request"):
+            self.session.routing_input_ids(params, [], None)
+
+    def test_tree_routing_matches_execution_for_native_history_options(self):
+        for options, expected in [
+            ({}, [10, 11, 20, 21, 30]),
+            ({"offset": 1}, [10, 30]),
+            ({"offset": -1}, [10, 11, 20, 30]),
+            ({"drop_previous_output": True}, [10, 11, 30]),
+            ({"replace": True}, [10, 11, 20, 21, 30]),
+            ({"replace": True, "rid": None}, [1, 30]),
+        ]:
+            with self.subTest(options=options):
+                session = Session(0, "s")
+                first = session.create_req(_recv("r1", [10, 11], 2), None, VOCAB)
+                first.output_ids.extend([20, 21, 22])
+                first.finished_reason = FINISH_LENGTH(2)
+                child = _recv("r2", [1, 30])
+                child.session_params = SessionParams(
+                    id="s", **({"rid": "r1"} | options)
+                )
+                tokenizer = SimpleNamespace(bos_token_id=1)
+                snapshot, _ = session.routing_input_ids(
+                    child.session_params, child.input_ids, tokenizer
+                )
+                self.assertEqual(snapshot, expected)
+                self.assertEqual(list(first.origin_input_ids), [10, 11])
+                self.assertEqual(list(session.req_nodes), ["r1"])
+                actual = session.create_req(child, tokenizer, VOCAB)
+                self.assertEqual(list(actual.origin_input_ids), snapshot)
+
+    def test_empty_session_and_missing_parent_do_not_produce_routing_tokens(self):
+        with self.assertRaisesRegex(ValueError, "restoring history"):
+            self.session.routing_input_ids(SessionParams(id="s"), [], None)
+        tree = Session(0, "s")
+        with self.assertRaisesRegex(ValueError, "Invalid request session id"):
+            tree.routing_input_ids(SessionParams(id="s", rid="missing"), [1], None)
 
 
 if __name__ == "__main__":

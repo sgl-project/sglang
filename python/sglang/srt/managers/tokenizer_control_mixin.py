@@ -8,7 +8,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -63,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionRoutingReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -954,6 +954,7 @@ class TokenizerControlMixin:
             return None
 
         future = asyncio.Future()
+        obj.session_incarnation = uuid.uuid4().hex
         self.session_futures[obj.session_id] = future
         self._dispatch_to_scheduler(obj)
 
@@ -968,6 +969,31 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def session_routing(self: TokenizerManager, obj: SessionRoutingReqInput):
+        """Query one scheduler rank; late replies cannot satisfy another query."""
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            raise ValueError("session routing metadata requires aggregated serving")
+        if not 0 <= obj.dp_rank < self.elastic_worker_count:
+            raise ValueError("session DP rank is out of range")
+        if get_parallel().enable_dp_attention:
+            raise ValueError("session routing metadata does not support DP attention")
+        if len(self.session_routing_futures) >= 1024:
+            raise ValueError("too many pending session routing queries")
+        self.auto_create_handle_loop()
+        obj.query_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.session_routing_futures[obj.query_id] = future
+        try:
+            self._dispatch_to_scheduler(obj)
+            return await asyncio.wait_for(future, timeout=10)
+        finally:
+            self.session_routing_futures.pop(obj.query_id, None)
+
+    def _handle_session_routing_output(self, obj):
+        future = self.session_routing_futures.get(obj.query_id)
+        if future is not None and not future.done():
+            future.set_result(obj)
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput
