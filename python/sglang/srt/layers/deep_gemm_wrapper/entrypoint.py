@@ -819,6 +819,138 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
         )
 
 
+# fused variants (gather-read GEMM, no physical scatter)
+# config is required (provided by moe_align_block_size return value)
+
+
+def grouped_gemm_nt_bf16bf16bf16_fused(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = lhs.shape
+    num_groups, n, _ = rhs.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_i8i8bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_f8f8bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED
+    if lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL
+        )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def moe_align_block_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    topk_ids: torch.Tensor,
+    perchannel_quant: bool = False,
+    configs=None,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = A.shape
+    num_groups, n, _ = B.shape
+
+    # Infer dtype for config selection
+    if A.dtype == torch.float8_e4m3fn:
+        gemm_dtype = "fp8"
+    elif A.dtype == torch.int8:
+        gemm_dtype = "int8"
+    elif A.dtype == torch.bfloat16:
+        gemm_dtype = "bf16"
+    else:
+        raise ValueError(
+            f"Unsupported dtype {A.dtype}, expected one of: torch.float8_e4m3fn, torch.int8, torch.bfloat16"
+        )
+
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype=gemm_dtype
+        )
+    )
+
+    return deep_gemm.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=perchannel_quant, config=best_config
+    )
+
+
 def update_deep_gemm_config(gpu_id: int):
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.

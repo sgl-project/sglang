@@ -179,6 +179,170 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(A, (B, Bs), C, m_indices, m_rows)
 
 
+# ---- fused variants: register_custom_op for CUDA graph / torch.compile ----
+
+
+def grouped_gemm_nt_f8f8bf16_fused_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    is_perchannel: bool,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    numel = A.shape[0] * topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(B.shape[0], dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+    )
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_f8f8bf16_fused_fake)
+def grouped_gemm_nt_f8f8bf16_fused(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    is_perchannel: bool,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        configs_list,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        inv_perm,
+        expert_ids,
+    ) = deep_gemm_wrapper.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=is_perchannel, configs=configs
+    )
+
+    deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_fused(
+        (A, As),
+        (B, Bs),
+        C,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        configs_list,
+    )
+
+    return m_rows, inv_perm, expert_ids
+
+
+def grouped_gemm_nt_i8i8bf16_fused_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    numel = A.shape[0] * topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(B.shape[0], dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+    )
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_i8i8bf16_fused_fake)
+def grouped_gemm_nt_i8i8bf16_fused(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        configs_list,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        inv_perm,
+        expert_ids,
+    ) = deep_gemm_wrapper.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=True, configs=configs
+    )
+
+    deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_fused(
+        (A, As),
+        (B, Bs),
+        C,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        configs_list,
+    )
+
+    return m_rows, inv_perm, expert_ids
+
+
+def grouped_gemm_nt_bf16bf16bf16_fused_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_groups = B.shape[0]
+    numel = A.shape[0] * topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(num_groups, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+    )
+
+
+@register_custom_op(
+    mutates_args=["C"], fake_impl=grouped_gemm_nt_bf16bf16bf16_fused_fake
+)
+def grouped_gemm_nt_bf16bf16bf16_fused(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[list[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        configs_list,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        inv_perm,
+        expert_ids,
+    ) = deep_gemm_wrapper.moe_align_block_size(A, B, topk_ids, configs=configs)
+
+    deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_fused(
+        A,
+        B,
+        C,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        configs_list,
+    )
+
+    return m_rows, inv_perm, expert_ids
+
+
 def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
@@ -436,16 +600,50 @@ def deep_moe_impl_fused(
         (num_tokens_padded, N), device=hidden_states.device, dtype=torch.bfloat16
     )
 
-    a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = deepgemm_moe_permute(
-        aq=hidden_states,
-        aq_scale=hidden_states_scale,
-        topk_ids=topk_ids,
-        local_num_experts=E,
-        block_align=block_align,
-        block_k=block_k,
-        is_block_wise=(block_shape is not None),
-    )
-    assert a.size(0) == num_tokens_padded
+    # Hybrid fused path: requires DeepGemm commit 53ea8ff (refactor fused MoE API)
+    use_tp_fused = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
+    use_fused_path = use_tp_fused and not use_mxfp4 and not use_int4_w4a16
+
+    if use_fused_path:
+        # ── fused path: moe_align + GEMM1 fused (gather read) ──
+        is_perchannel = use_int8 or (use_fp8 and per_channel_quant)
+
+        if use_int8:
+            m_rows, inv_perm, expert_ids = grouped_gemm_nt_i8i8bf16_fused(
+                hidden_states, hidden_states_scale, w1, w1_scale, out1, topk_ids
+            )
+        elif use_fp8:
+            m_rows, inv_perm, expert_ids = grouped_gemm_nt_f8f8bf16_fused(
+                hidden_states,
+                hidden_states_scale,
+                w1,
+                w1_scale,
+                out1,
+                topk_ids,
+                per_channel_quant,
+            )
+        else:
+            m_rows, inv_perm, expert_ids = grouped_gemm_nt_bf16bf16bf16_fused(
+                hidden_states, w1, out1, topk_ids
+            )
+
+        num_recv_tokens_per_expert = m_rows
+        inv_perm = inv_perm.view(num_tokens, top_k)
+
+    else:
+        # ── nopad path: deepgemm_moe_permute + GEMM1 nopad ──
+        a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = (
+            deepgemm_moe_permute(
+                aq=hidden_states,
+                aq_scale=hidden_states_scale,
+                topk_ids=topk_ids,
+                local_num_experts=E,
+                block_align=block_align,
+                block_k=block_k,
+                is_block_wise=(block_shape is not None),
+            )
+        )
+        assert a.size(0) == num_tokens_padded
 
     _nvtx_moe_pushed = False
     if SGLANG_PROFILE_NVTX:
@@ -483,26 +681,34 @@ def deep_moe_impl_fused(
             nvtx_pushed = True
             th_nvtx_range_push(nvtx_tag)
 
-    if use_int8:
-        grouped_gemm_nt_i8i8bf16_nopad(
-            a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
-        )
-    elif use_fp8:
-        grouped_gemm_nt_f8f8bf16_nopad(
-            a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
-        )
-    elif use_mxfp4:
-        grouped_gemm_nt_f4f4bf16_nopad(
-            a, a_scale, w1, w1_scale, b1, out1, expert_ids, num_recv_tokens_per_expert
-        )
-    elif use_w4a16:
-        grouped_gemm_nt_bf16i4bf16_nopad(
-            a, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
-        )
-    else:
-        grouped_gemm_nt_bf16bf16bf16_nopad(
-            a, w1, out1, expert_ids, num_recv_tokens_per_expert
-        )
+    if not use_fused_path:
+        if use_int8:
+            grouped_gemm_nt_i8i8bf16_nopad(
+                a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
+            )
+        elif use_fp8:
+            grouped_gemm_nt_f8f8bf16_nopad(
+                a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
+            )
+        elif use_mxfp4:
+            grouped_gemm_nt_f4f4bf16_nopad(
+                a,
+                a_scale,
+                w1,
+                w1_scale,
+                b1,
+                out1,
+                expert_ids,
+                num_recv_tokens_per_expert,
+            )
+        elif use_w4a16:
+            grouped_gemm_nt_bf16i4bf16_nopad(
+                a, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
+            )
+        else:
+            grouped_gemm_nt_bf16bf16bf16_nopad(
+                a, w1, out1, expert_ids, num_recv_tokens_per_expert
+            )
 
     if use_w4a16:
         del a

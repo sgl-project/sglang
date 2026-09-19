@@ -146,6 +146,12 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16I4BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_NOPAD = auto()
 
+    # fused variants (gather-read GEMM, no physical scatter)
+    GROUPED_GEMM_NT_F8F8BF16_FUSED = auto()
+    GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL = auto()
+    GROUPED_GEMM_NT_I8I8BF16_FUSED = auto()
+    GROUPED_GEMM_NT_BF16_FUSED = auto()
+
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
@@ -356,6 +362,11 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
+            # fused variants
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED: _GroupedFusedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -444,6 +455,71 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
+        elif kernel_type in [
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED,
+        ]:
+            # moe_align output memory (all int32)
+            _BLOCK_M_MIN = 16  # min block_m config, used for conservative upper bound of max_num_m_blocks
+            _BLOCK_M_MAX = (
+                256  # max block_m config, used for conservative upper bound of s_total
+            )
+            _numel = max_m  # warmup topk=1
+            _n_align = _numel + 1 - num_groups
+            _max_blocks_ub = num_groups - 1 + ceil_div(_n_align, _BLOCK_M_MIN)
+            _s_total_ub = (
+                num_groups - 1 + ceil_div(_n_align, _BLOCK_M_MAX)
+            ) * _BLOCK_M_MAX
+            _bs = (
+                1 << max(0, num_groups - 1).bit_length() if num_groups > 0 else 1
+            )  # next_pow2 with boundary check
+            _num_blocks_pad = ceil_div(_s_total_ub, _bs)
+            _moe_align_mem = (
+                40  # config (10 ints)
+                + num_groups * 4  # m_rows
+                + _max_blocks_ub * 16  # expert_ids_and_cumsum (max_num_m_blocks, 4)
+                + _s_total_ub * 4  # sorted_token_ids (max_num_m_blocks, block_m)
+                + 4  # aligned_num_m_blocks
+                + _numel * 4  # inv_perm
+                + _numel * 4  # m_indices
+                + (2 * _num_blocks_pad + 2) * num_groups * 4  # intermediate_buffer
+            )
+            if kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED]:
+                # lhs(fp8) + lhs_scale(f32 blockwise) + rhs(fp8) + rhs_scale(f32 blockwise) + out(bf16)
+                return (
+                    max_m * k
+                    + max_m * ceil_div(k, _BLOCK_SIZE) * 4
+                    + num_groups * n * k
+                    + num_groups
+                    * ceil_div(n, _BLOCK_SIZE)
+                    * ceil_div(k, _BLOCK_SIZE)
+                    * 4
+                    + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
+            elif kernel_type in [
+                DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL,
+                DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED,
+            ]:
+                # lhs(i8/fp8) + lhs_scale(f32 per-channel) + rhs(i8/fp8) + rhs_scale(f32 per-channel) + out(bf16)
+                return (
+                    max_m * k
+                    + max_m * 4
+                    + num_groups * n * k
+                    + num_groups * n * 4
+                    + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
+            else:  # BF16_FUSED
+                # lhs(bf16) + rhs(bf16) + out(bf16)
+                return (
+                    max_m * k * 2
+                    + num_groups * n * k * 2
+                    + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -1122,4 +1198,156 @@ class _GroupedNopadWarmupExecutor_int4(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedFusedWarmupExecutor(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_F8F8BF16_FUSED."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
+        )
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_int8(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_I8I8BF16_FUSED."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int8((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=True
+        )
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_bf16(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_BF16_FUSED."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q = _empty_token_bf16((max_m, k))
+        self.rhs_q = _empty_block_bf16((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
+        )
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(
+            self.lhs_q[:m],
+            self.rhs_q,
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_fp8_channel(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8_channel((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=True
+        )
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
         )

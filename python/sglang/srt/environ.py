@@ -1963,6 +1963,7 @@ class Envs:
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
