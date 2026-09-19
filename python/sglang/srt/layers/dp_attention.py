@@ -15,11 +15,9 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -374,7 +372,7 @@ def initialize_dp_attention(
     dp.enabled = enable_dp_attention
 
     tp_rank = get_parallel().tp_rank
-    tp_size = get_tensor_model_parallel_world_size()
+    tp_size = get_parallel().tp_size
 
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
@@ -514,7 +512,7 @@ def _dp_gather_via_all_reduce(
         NUM_GPUS_PER_NODE = 8
         if (
             not local_tokens.dtype.is_floating_point
-            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+            and get_parallel().tp_size <= NUM_GPUS_PER_NODE
         ):
             from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
@@ -534,7 +532,7 @@ def _dp_gather_via_all_gather(
 ):
     use_world = world_dp_gather_enabled()
 
-    if get_attn_tensor_model_parallel_world_size() == 1:
+    if get_parallel().attn_tp_size == 1:
         if use_world:
             torch.distributed.all_gather_into_tensor(
                 global_tokens,
@@ -548,9 +546,9 @@ def _dp_gather_via_all_gather(
     if not is_partial:
         if get_parallel().attn_tp_rank != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(
-        get_attn_tensor_model_parallel_world_size()
-    )[get_parallel().attn_tp_rank]
+    scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
+        get_parallel().attn_tp_rank
+    ]
     get_parallel().attn_tp_group.reduce_scatter_tensor(
         scattered_local_tokens, local_tokens
     )
@@ -721,8 +719,8 @@ def is_dp_gatherv_active() -> bool:
     return (
         _USE_DP_GATHERV
         and not world_dp_gather_enabled()
-        and get_attn_tensor_model_parallel_world_size() == 1
-        and get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size
+        and get_parallel().attn_tp_size == 1
+        and get_parallel().tp_size == get_parallel().attn_dp_size
         and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
@@ -881,12 +879,12 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         if sizes is not None:
             get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
             return
-    if get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size:
+    if get_parallel().tp_size == get_parallel().attn_dp_size:
         get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
-        scattered_local_tokens = input.tensor_split(
-            get_tensor_model_parallel_world_size()
-        )[get_parallel().tp_rank]
+        scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
+            get_parallel().tp_rank
+        ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
         get_parallel().attn_tp_group.all_gather_into_tensor(
             output, scattered_local_tokens
