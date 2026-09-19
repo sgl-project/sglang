@@ -33,7 +33,6 @@ from sglang.kernels.ops.elementwise.elementwise import (
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -60,6 +59,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
@@ -1055,7 +1055,7 @@ class Qwen2MoeModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.moe_dp_size = get_parallel().moe_dp_size
 
@@ -1161,10 +1161,20 @@ class Qwen2MoeModel(nn.Module):
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if get_parallel().moe_ep_size > 1:
-                    hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                if get_parallel().moe_tp_size > 1:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                # The deferred reduction the next layer would have fused; no
+                # layer follows on this rank, so run it here. Unconditional --
+                # the skip flags that deferred it are what got us into this
+                # branch -- so it bypasses post_experts_all_reduce()'s guards
+                # while reusing its merge rule.
+                if can_merge_post_experts_all_reduce():
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                else:
+                    if get_parallel().moe_ep_size > 1:
+                        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+                    if get_parallel().moe_tp_size > 1:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                 hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
@@ -1195,7 +1205,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None
