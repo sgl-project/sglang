@@ -453,10 +453,10 @@ required settings even when the model's default uses a different policy.
 `state/load_monitor/` owns engine reports and existing router-local request
 accounting. `state/load_view.rs` provides a lazy wrapper over `EngineLoadTable`:
 the first `snapshot()` call captures reports, and subsequent calls reuse them.
-The skeleton does not yet implement shared load interpretation, local fallback,
-or correction for dispatches since the report. Those follow-ups must preserve
-source, freshness, and available measurements without adding another independent
-in-flight counter.
+Power-of-two uses `LoadView::lower_pressure` to call the existing stage-specific
+comparisons, including their local fallback and dispatch correction. A future
+shared interpretation layer must preserve source, freshness, and available
+measurements without adding another independent in-flight counter.
 
 The request handler creates a fresh `LoadView` for each stage's selection pass
 and lends it through `PickRequest`. Reuse it across admission, selection, and
@@ -623,7 +623,7 @@ Selection metrics must not imply that dispatch or execution succeeded.
 
 ## Implementation status
 
-This PR adds the side-by-side skeleton in `src/buckets_reorg.rs` and
+The series adds the side-by-side selection implementation in `src/buckets_reorg.rs` and
 `src/policies_reorg/`. The live `src/policies/` path still serves traffic.
 
 Implemented here:
@@ -635,19 +635,21 @@ Implemented here:
   exact candidate validation.
 - `Policy::pick`, fallback interface, admission placement, and `AllowAll`.
 - Lazy report capture through `LoadView`.
+- Power-of-two selection, stage-aware load comparison, and capacity, in-flight,
+  queue, and combined admission checks (#40271).
 
-Follow-up order: power-of-two and admission (#40271), then bucket SLO ordering
-in a separate PR, followed by the remaining policy and wiring work.
+Next: bucket SLO ordering in a separate PR after power-of-two (#40271),
+followed by the remaining policy and wiring work.
 
-Not yet implemented or wired in this skeleton:
+Not yet implemented or wired in this path:
 
 - SLO estimates, request targets, and per-stage preference ordering.
-- Concrete power-of-two selection (its body is still a placeholder), other
-  policies, and capacity/in-flight admission checks.
+- Other concrete policies and pending-prefill admission.
 - Configuration parsing, validation, model-specific construction, and default
   group synthesis for the new bucket format. The YAML above is illustrative.
 - Affinity probes, session modes, prefix memoization, and cache-aware selection.
-- Shared load interpretation and dispatch correction.
+- A unified load interpretation layer; power-of-two currently reuses the
+  existing stage-specific load comparisons.
 - Request-handler wiring, PD compatibility filtering, retry integration, and
   removal of the legacy path.
 
