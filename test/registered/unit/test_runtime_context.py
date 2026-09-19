@@ -10,6 +10,7 @@ import os
 import pathlib as _pathlib
 import shutil
 import tempfile
+import types
 import unittest
 import warnings
 from unittest.mock import patch
@@ -2405,13 +2406,32 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
     has its own parallel state.
     """
 
-    #: Not topology. `get_self_pp_group` builds the single-rank group a draft
-    #: pipeline scope installs, so there is nothing for the context to answer
-    #: with until the scope has installed it.
+    #: May have callers. `get_self_pp_group` builds the single-rank group a
+    #: draft pipeline scope installs, so there is nothing for the context to
+    #: answer with until the scope has installed it; the other two are not
+    #: topology at all.
     ALLOWED = {
         "get_self_pp_group",
         "get_default_distributed_backend",
         "get_mooncake_transfer_engine",
+    }
+
+    #: Zero callers required, but not deprecated either: the context has no
+    #: name that answers the same question.
+    #:
+    #: The three widths read a group the build does not check against the
+    #: configuration, so "the group's width" and "the configured width" are two
+    #: facts -- the MoE-DP group is the attention-CP group when the latter is
+    #: wider, and the other two are simply not pinned yet. Pinning them in
+    #: `_WIDTH_AND_GROUP` is what would let them move.
+    NOT_ANSWERED_BY_THE_CONTEXT = {
+        "get_moe_data_parallel_world_size",
+        "get_moe_tensor_parallel_world_size",
+        "get_dcp_world_size",
+        # Answers `None` where the context asserts, which is the whole point of
+        # the caller that wants it.
+        "get_dcp_group_no_assert",
+        "get_torch_distributed_pg_options",
     }
 
     def _accessors(self):
@@ -2457,6 +2477,100 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             "read these through get_parallel() instead, or say here why the "
             "context cannot answer them",
         )
+
+    #: How many callers each exempt accessor has outside the defining package.
+    #: A ratchet, not a description: these may go down and never up, and a name
+    #: that reaches zero comes off the list. Anything not here must have none.
+    ALLOWED_CALLERS = {
+        "get_self_pp_group": 1,
+        "get_default_distributed_backend": 1,
+        "get_mooncake_transfer_engine": 6,
+    }
+
+    def test_the_exempt_accessors_do_not_grow_new_callers(self):
+        """The zero-caller rule above cannot cover the three that are not
+        topology, so they get a count instead. Ratchets only turn one way: a
+        number that has to go up means a new business-code reader of a name the
+        context should be answering."""
+        for name, allowed in sorted(self.ALLOWED_CALLERS.items()):
+            callers = self._callers(name)
+            self.assertLessEqual(
+                len(callers),
+                allowed,
+                f"{name} grew a caller: {callers}. Read it through "
+                f"get_parallel() if the context can answer it; if it truly "
+                f"cannot, lower this number only when one goes away.",
+            )
+
+    def test_every_getter_the_context_answers_is_deprecated(self):
+        """The other half of the ratchet: the deprecation set is derived from
+        the table that maps a context name to the getter behind it, so dropping
+        a getter out of that table would quietly take it off the list. This
+        fails if one of them stops being marked."""
+        from sglang.srt.distributed import parallel_state
+
+        marked = set(parallel_state._CONTEXT_NAME_OF)
+        unclassified = (
+            self._accessors() - self.ALLOWED - self.NOT_ANSWERED_BY_THE_CONTEXT
+        )
+        for name in sorted(unclassified):
+            if name in marked:
+                continue
+            # Not answered by the context and not exempt: a getter that is
+            # neither is a name with no home, which is what this module exists
+            # to prevent.
+            self.assertIn(
+                name,
+                marked,
+                f"{name} is neither deprecated nor listed as exempt -- give it "
+                "a context name or say here why it has none",
+            )
+
+    def test_calling_one_from_outside_the_package_is_deprecated(self):
+        """The getters stay -- they are the definition -- but a call that comes
+        from outside the package that defines them cannot be redirected by a
+        scope, so it says what to read instead."""
+        import warnings
+
+        from sglang.srt.distributed import parallel_state
+
+        parallel_state._ALREADY_WARNED.discard("get_tp_group")
+        self.addCleanup(parallel_state._ALREADY_WARNED.discard, "get_tp_group")
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            try:
+                parallel_state.get_tp_group()
+            except Exception:
+                pass
+        messages = [str(w.message) for w in seen]
+        self.assertTrue(
+            any("get_parallel().tp_group" in m for m in messages),
+            f"expected the replacement to be named, got {messages}",
+        )
+
+    def test_the_package_that_defines_them_is_not_warned_at(self):
+        """`srt/distributed/` keeps calling them: a read there would go through
+        the context back into itself."""
+        import warnings
+
+        from sglang.srt.distributed import parallel_state
+
+        parallel_state._ALREADY_WARNED.discard("get_tp_group")
+        self.addCleanup(parallel_state._ALREADY_WARNED.discard, "get_tp_group")
+        caller = types.ModuleType("sglang.srt.distributed.pretend_internal")
+        caller.__dict__["call"] = lambda: parallel_state.get_tp_group()
+        exec(
+            "def call():\n    from sglang.srt.distributed import parallel_state\n"
+            "    return parallel_state.get_tp_group()",
+            caller.__dict__,
+        )
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            try:
+                caller.call()
+            except Exception:
+                pass
+        self.assertEqual([str(w.message) for w in seen], [])
 
     def test_the_guard_would_notice_a_caller(self):
         """The subject set is derived, so this checks the search finds a real

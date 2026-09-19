@@ -24,10 +24,13 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import functools
 import gc
 import logging
 import os
 import pickle
+import sys
+import warnings
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -50,6 +53,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    _LIVE_READS,
+    Live,
     _validate_parallel,
     derive_parallel_widths,
     get_global_dwdp_manager,
@@ -3437,3 +3442,72 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
+
+
+# --- deprecation ---------------------------------------------------------
+#
+# These getters are the definition of a name, not a second spelling of it.
+# Business code asks `get_parallel()`, which answers by calling them and which
+# a scope can redirect; a call that arrives here directly cannot be redirected,
+# so a draft worker's scope does not reach it. The package that defines them
+# keeps calling them -- a read there would go through the context back into
+# itself -- so the warning fires only for callers outside it, and once per
+# name, because the point is to name the replacement rather than to fill a log.
+
+# The context's own read path calls these -- that is how it answers -- so it is
+# exempt for the same reason the defining package is.
+_EXEMPT_CALLERS = ("sglang.srt.distributed.", "sglang.srt.runtime_context")
+
+# Derived from the table that says which context name each getter answers, so a
+# getter added there is covered without being listed again here.
+_CONTEXT_NAME_OF = {
+    source: name
+    for name, source in (
+        (name, live.source if isinstance(live, Live) else live)
+        for name, live in _LIVE_READS.items()
+    )
+    if isinstance(source, str)
+}
+# The width getters read a built group; the context answers the same names from
+# the configuration. Those are one answer rather than two only for the groups
+# the build checks against the configuration -- `_WIDTH_AND_GROUP` in
+# `runtime_context` -- so only those are listed here. `moe_dp`, `moe_tp` and
+# `dcp` are not on that list and are deliberately absent: the MoE-DP group is
+# the attention-CP group when the latter is wider, and the other two are simply
+# not pinned yet.
+_CONTEXT_NAME_OF["get_tensor_model_parallel_world_size"] = "tp_size"
+_CONTEXT_NAME_OF["get_attn_tensor_model_parallel_world_size"] = "attn_tp_size"
+_CONTEXT_NAME_OF["get_attn_context_model_parallel_world_size"] = "attn_cp_size"
+_CONTEXT_NAME_OF["get_pipeline_model_parallel_world_size"] = "pp_size"
+_CONTEXT_NAME_OF["get_moe_expert_parallel_world_size"] = "moe_ep_size"
+
+_ALREADY_WARNED: set = set()
+
+
+def _warn_if_called_from_outside(name: str, replacement: str):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if name not in _ALREADY_WARNED:
+                caller = sys._getframe(1).f_globals.get("__name__", "")
+                if not caller.startswith(_EXEMPT_CALLERS):
+                    _ALREADY_WARNED.add(name)
+                    warnings.warn(
+                        f"{name}() is deprecated; read "
+                        f"get_parallel().{replacement} instead, which answers the "
+                        "same thing and can be redirected by a scope",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+for _name, _replacement in _CONTEXT_NAME_OF.items():
+    _fn = globals().get(_name)
+    if _fn is not None:
+        globals()[_name] = _warn_if_called_from_outside(_name, _replacement)(_fn)
+del _name, _replacement, _fn
