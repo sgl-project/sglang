@@ -11,9 +11,25 @@ from sglang.srt.layers.quantization import mxfp4
 from sglang.srt.layers.quantization.ppu_mxfp4_utils import (
     preprocess_mxfp4_w4a16_mma_scales,
 )
+from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestMiniMaxM3PackedModulesMapping(CustomTestCase):
+    def test_index_qkv_mapping_omits_disabled_value_projection(self):
+        for model_class in (
+            MiniMaxM3SparseForCausalLM,
+            MiniMaxM3SparseForConditionalGeneration,
+        ):
+            with self.subTest(model_class=model_class.__name__):
+                self.assertEqual(
+                    model_class.packed_modules_mapping["index_qkv_proj"],
+                    ["index_q_proj", "index_k_proj"],
+                )
 
 
 class TestPpuMxfp4W4A16(unittest.TestCase):
