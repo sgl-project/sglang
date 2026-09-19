@@ -736,12 +736,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         # publishing a record rather than by standing one in.
         reset_context()
         publish(
-            ServerArgs(model_path="dummy", startup_weight_load_mode=mode),
+            ServerArgs(
+                model_path="dummy",
+                startup_weight_load_mode=mode,
+                pp_size=pp_size,
+            ),
             role="scheduler",
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
-        scheduler.ps = SimpleNamespace(pp_size=pp_size)
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
