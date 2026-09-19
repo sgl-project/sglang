@@ -63,9 +63,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
-        # Decode radix / HiCache L1+L2 are allowed with DCP. Prefix skip is
-        # virtual-page aligned (page_size * dcp_size) in the transfer plan.
-        # HiCache L3 is still rejected in resolve_hicache_dcp_compatibility.
 
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:

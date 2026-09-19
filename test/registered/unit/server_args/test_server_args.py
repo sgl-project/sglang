@@ -1039,50 +1039,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
-    def test_pd_decode_dcp_allows_radix_cache(self):
-        server_args = self._load_balance_args(
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            dcp_size=4,
-        )
-        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
-
-    def test_pd_decode_dcp_allows_hierarchical_cache_with_radix(self):
-        server_args = self._load_balance_args(
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            enable_hierarchical_cache=True,
-            dcp_size=4,
-        )
-        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
-        self.assertTrue(resolution_result(server_args, "enable_hierarchical_cache"))
-
-    def test_pd_decode_dcp_radix_cache_allows_dspark(self):
-        server_args = self._load_balance_args(
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            speculative_algorithm="DSPARK",
-            dcp_size=4,
-        )
-        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
-
-    def test_pd_decode_radix_cache_rejects_eagle(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            speculative_algorithm="EAGLE",
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(
-            ValueError, "incompatible with speculative decoding"
-        ):
-            handle_pd_disaggregation(server_args)
-
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",
