@@ -194,6 +194,7 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
     "cutedsl",
+    "cudnn",
     "flashinfer",
     "flashkda",
     "nvidia_kda",
