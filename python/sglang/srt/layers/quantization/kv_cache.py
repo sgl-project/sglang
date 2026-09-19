@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
 
 import logging
+import math
 
 import torch
 
@@ -49,6 +50,21 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
     def process_weights_after_loading(self, layer) -> None:
+        if layer.k_scale.numel() != 1 or layer.v_scale.numel() != 1:
+            raise ValueError(
+                "Only support per-tensor scaling factor for fp8 KV cache, got "
+                f"k_scale shape={tuple(layer.k_scale.shape)} "
+                f"v_scale shape={tuple(layer.v_scale.shape)}"
+            )
+        k_scale_cpu = layer.k_scale.to("cpu")
+        v_scale_cpu = layer.v_scale.to("cpu")
+        if not (
+            torch.isfinite(k_scale_cpu).all() and torch.isfinite(v_scale_cpu).all()
+        ):
+            raise ValueError(
+                "fp8 KV cache scales must be finite, got "
+                f"k_scale={k_scale_cpu.item()} v_scale={v_scale_cpu.item()}"
+            )
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
@@ -75,6 +91,21 @@ class BaseKVCacheMethod(QuantizeMethodBase):
 
         if not isinstance(k_scale, float) or not isinstance(v_scale, float):
             raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        # The FNUZ conversion above doubles loaded scales, so a finite
+        # checkpoint value can still overflow the destination dtype; validate
+        # the final scales before mutating the layer.
+        max_scale = torch.finfo(layer.k_scale.dtype).max
+        if not (
+            math.isfinite(k_scale)
+            and math.isfinite(v_scale)
+            and k_scale <= max_scale
+            and v_scale <= max_scale
+        ):
+            raise ValueError(
+                "fp8 KV cache scales must be finite and fit in "
+                f"{layer.k_scale.dtype}, got k_scale={k_scale} v_scale={v_scale}"
+            )
 
         # These are used in the final Attention.forward()
         layer.k_scale.copy_(k_scale)
