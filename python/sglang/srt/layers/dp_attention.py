@@ -15,9 +15,6 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-)
-from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
-from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1015,15 +1012,15 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def get_moe_cp_group() -> GroupCoordinator:
     """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
-    return _get_moe_dp_group()
+    return get_parallel().moe_dp_group
 
 
 def get_moe_cp_rank() -> int:
-    return _get_moe_dp_group().rank_in_group
+    return get_parallel().moe_dp_group.rank_in_group
 
 
 def get_moe_cp_size() -> int:
-    return _get_moe_dp_group().world_size
+    return get_parallel().moe_dp_group.world_size
 
 
 def is_enable_moe_cp_allgather() -> bool:
@@ -1036,7 +1033,7 @@ def is_enable_moe_cp_allgather() -> bool:
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return _get_moe_dp_group().all_gather_into_tensor(output, input)
+    return get_parallel().moe_dp_group.all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
