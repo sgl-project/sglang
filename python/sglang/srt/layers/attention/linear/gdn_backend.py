@@ -849,7 +849,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = self.verify_intermediate_state_indices
+            intermediate_state_indices = self._select_verify_intermediate_state_indices(
+                forward_batch, cache_indices, query_start_loc
+            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

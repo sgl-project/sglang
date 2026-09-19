@@ -346,6 +346,31 @@ class MambaAttnBackendBase(AttentionBackend):
             spec_info.retrieve_next_sibling
         )
 
+    def _select_verify_intermediate_state_indices(
+        self,
+        forward_batch: ForwardBatch,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose scratch rows that survive a delayed PP accept relay.
+
+        Outside PP speculative decoding the verify kernels may use compact
+        positional rows. Under PP, several micro-batches can run before the
+        matching accept result returns, so every recurrent backend must write
+        its snapshots to the stable request-pool rows that the delayed commit
+        reads. Padded rows share the scratch pool's dedicated discard row.
+        """
+        intermediate_state_indices = self.verify_intermediate_state_indices
+        if not envs.SGLANG_ENABLE_PP_SPEC.get():
+            return intermediate_state_indices
+
+        req_rows = forward_batch.req_pool_indices[: query_start_loc.shape[0] - 1]
+        return torch.where(
+            cache_indices[: req_rows.shape[0]] >= 0,
+            req_rows.to(torch.int32),
+            torch.full_like(req_rows, self.req_to_token_pool.size).to(torch.int32),
+        )
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1347,12 +1372,19 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
-        ``req_pool_indices`` serves implementations that must re-derive the state
-        slot ids instead of reusing this step's ``forward_metadata``; the scatter
-        below reads the metadata it just planned.
+        Under PP-spec, ``req_pool_indices`` identifies the delayed micro-batch's
+        stable scratch rows and lets the commit re-derive its destination slots
+        after the original forward context has exited. Non-PP commits keep the
+        historical hot path: they read the active ``forward_metadata`` directly
+        and launch no request-to-mamba lookup or virtual-to-physical translation.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
+        source_indices_tensor = None
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and req_pool_indices is not None:
+            # PP target-verify writes scratch by stable request-pool row so it
+            # survives other in-flight micro-batches until acceptance relays
+            # back.  Commit must read those same rows, not positional 0..bs-1.
+            source_indices_tensor = req_pool_indices[:request_number]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
         if mamba_track_indices is not None:
@@ -1360,11 +1392,25 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if source_indices_tensor is not None:
+            # A relayed PP accept result is committed after its verify forward
+            # context has exited.  At that point forward_metadata belongs to the
+            # most recently launched micro-batch, not necessarily the batch whose
+            # accept result just arrived.  Rebuild the destination slots from the
+            # matched forward snapshot supplied by the commit caller.
+            state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
+                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
+                    req_pool_indices[:request_number]
+                )
+            )
+        else:
+            # Direct worker commits happen in the active verify context and some
+            # legacy callers do not carry request-pool indices.
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
@@ -1389,6 +1435,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
+                source_indices_raw=source_indices_tensor,
                 null_block_id=-1,
             )
             return
@@ -1412,6 +1459,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                     intermediate_conv_window,
                     state_indices_tensor,
                     last_correct_step_indices,
+                    source_indices_tensor,
                 )
             accept_lens_pool[state_indices_tensor.to(torch.int64)] = (
                 last_correct_step_indices.to(torch.int32) + 1
@@ -1424,6 +1472,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            source_indices_tensor=source_indices_tensor,
         )
 
         self._update_ple_state_after_mtp_verify(
@@ -1431,6 +1480,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            source_indices_tensor,
         )
 
     @staticmethod
@@ -1439,19 +1489,28 @@ class HybridLinearAttnBackend(AttentionBackend):
         src: torch.Tensor,
         dst_indices_raw: torch.Tensor,
         step_indices_raw: torch.Tensor,
+        source_indices_raw: Optional[torch.Tensor] = None,
     ):
         if dst is None or src is None or step_indices_raw.numel() == 0:
             return
         if dst.is_cuda and src.is_cuda:
             fused_mamba_state_scatter_with_mask(
-                dst, src, dst_indices_raw, step_indices_raw
+                dst,
+                src,
+                dst_indices_raw,
+                step_indices_raw,
+                source_indices_raw,
             )
             return
 
         device = dst.device
         dst_indices = dst_indices_raw.to(device=device, dtype=torch.long)
         steps = step_indices_raw.to(device=device, dtype=torch.long)
-        src_indices = torch.arange(steps.shape[0], device=device, dtype=torch.long)
+        src_indices = (
+            torch.arange(steps.shape[0], device=device, dtype=torch.long)
+            if source_indices_raw is None
+            else source_indices_raw.to(device=device, dtype=torch.long)
+        )
         valid = (
             (steps >= 0)
             & (steps < src.shape[2])
@@ -1472,6 +1531,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
+        source_indices_tensor: Optional[torch.Tensor] = None,
     ):
         """Roll the accepted per-step PLE side states into their main slots."""
         req_to_token_pool = self.linear_attn_backend.req_to_token_pool
@@ -1509,6 +1569,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_state,
                 state_indices_tensor,
                 last_correct_step_indices,
+                source_indices_tensor,
             )
             if mamba_track_indices is not None:
                 self._scatter_speculative_state_with_mask(
@@ -1516,6 +1577,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                     intermediate_state,
                     mamba_track_indices,
                     mamba_steps_to_track,
+                    source_indices_tensor,
                 )
 
 

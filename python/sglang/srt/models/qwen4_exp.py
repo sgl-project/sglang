@@ -310,12 +310,14 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
+        scratch_indices = _ple_verify_scratch_indices(batch, forward_batch)
         pool.set_ngram_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
-            )
+            ),
+            scratch_indices,
         )
         return
 
@@ -343,6 +345,21 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
             track_indices,
             context.gather(1, track_offsets.unsqueeze(1) + context_cols.unsqueeze(0)),
         )
+
+
+def _ple_verify_scratch_indices(
+    batch: _PLEBatch, forward_batch: ForwardBatch
+) -> Optional[torch.Tensor]:
+    """Stable PP rows for PLE snapshots consumed after a delayed accept relay."""
+    if not envs.SGLANG_ENABLE_PP_SPEC.get():
+        return None
+    pool = get_req_to_token_pool()
+    req_rows = forward_batch.req_pool_indices[: batch.lengths.shape[0]]
+    return torch.where(
+        batch.lengths.ne(0),
+        req_rows,
+        torch.full_like(req_rows, pool.size),
+    )
 
 
 def _ple_track_targets(
@@ -1084,9 +1101,18 @@ class Qwen4ExpPLELayer(nn.Module):
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
-                intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(
-                    intermediate_state.to(dtype=intermediate_cache.dtype)
+                intermediate_state = intermediate_state.to(
+                    dtype=intermediate_cache.dtype
                 )
+                scratch_indices = _ple_verify_scratch_indices(batch, forward_batch)
+                if scratch_indices is None:
+                    intermediate_cache[
+                        : batch.lengths.shape[0], : batch.row_width
+                    ].copy_(intermediate_state)
+                else:
+                    intermediate_cache[
+                        scratch_indices.to(dtype=torch.long), : batch.row_width
+                    ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
