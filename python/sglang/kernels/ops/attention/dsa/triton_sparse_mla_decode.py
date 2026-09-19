@@ -21,11 +21,14 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
     _is_gfx950_sparse_mla_fp8,
+    _kv_splits_heuristic,
+    _next_pow2,
     _no_async_copy,
     _page_offsets_fit_i32,
     _reduce_d_chunk,
     _row_strides,
     _sparse_mla_block_k,
+    _sparse_mla_reduce_kernel,
     _validate_input_dtypes,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
@@ -84,37 +87,6 @@ def _get_splitk_bufs(
 # ---------------------------------------------------------------------------
 
 LOG2E = 1.4426950408889634
-
-
-def _prev_pow2(n: int) -> int:
-    if n < 1:
-        return 1
-    return 1 << (n.bit_length() - 1)
-
-
-def _next_pow2(n: int) -> int:
-    if n < 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
-def _kv_splits_heuristic(
-    T: int,
-    H: int,
-    block_h: int,
-    num_cu: int | None = None,
-    target_wg_per_cu: float = 2.0,
-    max_kv_splits: int = 64,
-) -> int:
-    if num_cu is None:
-        num_cu = _cu_count()
-    target_wg = max(1, int(target_wg_per_cu * num_cu))
-    head_blocks = max(1, (H + block_h - 1) // block_h)
-    base_ctas = max(1, T * head_blocks)
-    if base_ctas >= target_wg:
-        return 1
-    splits_to_fill = max(1, target_wg // base_ctas)
-    return _prev_pow2(min(splits_to_fill, max_kv_splits))
 
 
 @triton.jit
@@ -524,64 +496,6 @@ def _sparse_mla_decode_split_kernel(
         )
 
 
-@triton.jit
-def _sparse_mla_decode_reduce_kernel(
-    lse_partial_ptr,  # [N, KV_SPLITS, H_padded]  fp32
-    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D_V]  bf16
-    out_ptr,  # [N, H, D_V]
-    H: tl.constexpr,
-    D_V: tl.constexpr,
-    KV_SPLITS: tl.constexpr,
-    ACTIVE_SPLITS: tl.constexpr,
-    ACTIVE_SPLITS_POW2: tl.constexpr,
-    D_CHUNK: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    t = tl.program_id(0)
-    h = tl.program_id(1)
-    dc = tl.program_id(2)
-
-    d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    # tl.arange needs a power-of-two extent, but ACTIVE_SPLITS is only a power
-    # of two when topk // BLOCK_K is. Iterate over the padded range and mask the
-    # tail: -3.4e38 drives exp2() to 0 without the NaN an -inf would produce.
-    k_offs = tl.arange(0, ACTIVE_SPLITS_POW2)
-    k_mask = k_offs < ACTIVE_SPLITS
-    d_mask = d_offs < D_V
-
-    H_padded = tl.cdiv(H, 16) * 16
-
-    lse_base = t * KV_SPLITS * H_padded
-    lse_p = tl.load(
-        lse_partial_ptr + lse_base + k_offs * H_padded + h,
-        mask=k_mask,
-        other=-3.4e38,
-    )
-
-    ap_base = t * KV_SPLITS * H_padded * D_V
-    a_p = tl.load(
-        acc_partial_ptr
-        + ap_base
-        + k_offs[:, None] * H_padded * D_V
-        + h * D_V
-        + d_offs[None, :],
-        mask=k_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-
-    lse_max = tl.max(lse_p, axis=0)
-    weights = tl.exp2(lse_p - lse_max)
-    w_sum = tl.sum(weights, axis=0)
-    scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
-    out = tl.sum(a_p * scale[:, None], axis=0)
-
-    tl.store(
-        out_ptr + t * H * D_V + h * D_V + d_offs,
-        out.to(tl.bfloat16),
-        mask=d_mask,
-    )
-
-
 def triton_sparse_mla_decode_splitk(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -754,7 +668,7 @@ def triton_sparse_mla_decode_splitk(
 
     D_CHUNK = _reduce_d_chunk(active_splits, bs * H) if optimize_gfx950_fp8 else 64
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
-    _sparse_mla_decode_reduce_kernel[grid_reduce](
+    _sparse_mla_reduce_kernel[grid_reduce](
         lse_partial,
         acc_partial,
         out,

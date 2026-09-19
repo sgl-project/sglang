@@ -37,7 +37,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
@@ -285,9 +285,15 @@ def handle_model_specific_adjustments(server_args: Any):
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     if cfg.dp_size < cfg.tp_size:
+                        _, attn_tp_size = derive_attention_widths(
+                            tp_size=cfg.tp_size,
+                            attn_cp_size=cfg.attn_cp_size,
+                            dp_size=cfg.dp_size,
+                            enable_dp_attention=cfg.enable_dp_attention,
+                        )
                         logger.warning(
                             f"DSA with TP mode is active, dp_size={cfg.dp_size}, tp_size={cfg.tp_size}, "
-                            f"attn_tp_size={cfg.tp_size}, attention weights will be sharded across {cfg.tp_size} ranks."
+                            f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
 
                 # The DSA page-size selection moved to the override registry
@@ -416,8 +422,11 @@ def handle_model_specific_adjustments(server_args: Any):
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
             validate_deepseek_v4_mega_moe_token_budget,
+            validate_deepseek_v41_features,
         )
 
+        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
