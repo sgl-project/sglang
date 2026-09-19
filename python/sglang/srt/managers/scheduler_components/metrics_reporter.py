@@ -172,9 +172,6 @@ class _SchedulerTimeAccountingSnapshot:
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
-    tp_rank: int
-    pp_rank: int
-    dp_rank: Optional[int]
     metrics_collector_context: SchedulerMetricsCollectorContext
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
@@ -191,7 +188,7 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
-        self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
+        self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
         # not synchronize the model stream once per generated token.
@@ -213,12 +210,7 @@ class SchedulerMetricsReporter:
             self.last_gen_throughput = 0.0
         return self.last_gen_throughput
 
-    def _init_metrics(
-        self,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
-    ):
+    def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
