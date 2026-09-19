@@ -407,6 +407,16 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_routing_key_carried_through_batch_slices(self):
+        """Per-index slices of a batched request must keep routing_key."""
+        req = copy.deepcopy(self.base_req)
+        req.routing_key = "rollout-7"
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].routing_key, "rollout-7")
+        self.assertEqual(req[1].routing_key, "rollout-7")
+
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
         req = copy.deepcopy(self.base_req)
