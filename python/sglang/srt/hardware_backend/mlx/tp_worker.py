@@ -174,6 +174,35 @@ class MlxTpModelWorker(TpModelWorker):
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
 
+    def prepare_for_retraction(self, req) -> None:
+        """Dispose of MLX runner state when the scheduler retracts a request.
+
+        Retraction (or the OOM-abort inside ``retract_decode``) frees the
+        request's req_to_token row and KV slots immediately — without the
+        finish path's pre-release hook — and requeues the request to restart
+        from scratch. The runner's private decode cache must be dropped at
+        that moment, for two reasons:
+
+        * ``flush_all_decode_kv`` on a later *extend* forward would otherwise
+          read the freed row for this rid. ``_cleanup_stale_rids`` only
+          disposes on *decode* forwards, so an extend forward in between is
+          unprotected; once the row is reused by a new prefill, the read
+          yields the new owner's slot ids and the retracted request's dirty
+          decode KV is scattered over the new owner's pool slots,
+          silently corrupting its output (issue #33547).
+        * A requeued request must re-route as a fresh ``"prefill"``
+          (``has_request`` is False), rebuilding from its cached prefix,
+          instead of extending the now-orphaned private cache against a
+          freed row.
+
+        This is a pure discard — no pool sync: the retracted request's KV
+        slots are already freed, so a sync would be exactly the poisoning
+        write described above. The finish path is unaffected and keeps its
+        own flush semantics via the stale-rid cleanup.
+        """
+        self._mlx_runner.discard_request(req.rid)
+        self._mlx_active_rids.discard(req.rid)
+
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
 
