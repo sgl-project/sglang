@@ -234,7 +234,7 @@ fn start_engine_state_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
 fn start_local_inflight_tracker(
     config: &Config,
 ) -> (Arc<RouterInflightLoadRegistry>, JanitorHandle) {
-    let timeout_secs = config.inflight_load.stale_request_timeout_secs;
+    let timeout_secs = config.router_inflight_load.stale_request_timeout_secs;
     let local_inflight_requests = RouterInflightLoadRegistry::new(
         Arc::new(SystemTimeClock),
         Duration::from_secs(timeout_secs),

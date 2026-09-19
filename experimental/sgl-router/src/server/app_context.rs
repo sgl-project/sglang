@@ -188,7 +188,7 @@ impl AppContext {
                     },
                 ),
                 proxy: crate::config::ProxyConfig::default(),
-                inflight_load: crate::config::InflightLoadConfig::default(),
+                router_inflight_load: crate::config::InflightLoadConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),

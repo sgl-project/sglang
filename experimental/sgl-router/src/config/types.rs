@@ -11,7 +11,7 @@ pub struct Config {
     /// Discovery mode resolved from CLI options; static URLs are checked by [`Config::validate`].
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
-    pub inflight_load: InflightLoadConfig,
+    pub router_inflight_load: InflightLoadConfig,
 }
 
 /// Outbound request timeout settings.

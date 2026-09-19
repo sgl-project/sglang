@@ -390,7 +390,7 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
             },
-            inflight_load: InflightLoadConfig {
+            router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
-        assert_eq!(c.inflight_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 30);
     }
 
@@ -1473,7 +1473,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
-        assert_eq!(c.inflight_load.stale_request_timeout_secs, 240);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 240);
     }
 
     #[test]
