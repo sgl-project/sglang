@@ -421,7 +421,9 @@ mod tests {
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
-    use crate::state::load_monitor::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
+    use crate::state::load_monitor::engine_reported_load::{
+        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -439,15 +441,15 @@ mod tests {
         vec![worker("a"), worker("b"), worker("c")]
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, running, waiting, used, capacity)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: *running,
                             num_waiting_reqs: *waiting,
                             num_waiting_uncached_tokens: *waiting,
@@ -783,7 +785,7 @@ mod tests {
         );
         assert_eq!(proposal.primary.id, ws[2].id);
 
-        let snapshot = EngineLoadSnapshot::default();
+        let snapshot = EngineReportedLoadSnapshot::default();
         let decision =
             resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot, None)
                 .expect("an eligible escape worker exists");

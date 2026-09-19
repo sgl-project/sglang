@@ -21,8 +21,8 @@ use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    RouterInflightLoadConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -61,7 +61,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: RouterInflightLoadConfig::default(),
     }
 }
 
@@ -224,7 +224,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
     let request = tokio::spawn(build_router(Arc::clone(&ctx)).oneshot(chat_request()));
 
     await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    assert_eq!(prefill_worker.active_load(), 1);
+    assert_eq!(prefill_worker.router_inflight_load(), 1);
     assert_eq!(prefill_worker.slots_acquired_since(cutoff), 0);
 
     assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);

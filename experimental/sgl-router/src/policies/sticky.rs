@@ -17,11 +17,11 @@
 //! - **New key, or pinned worker unhealthy** → pick a worker via `fallback`
 //!   and record the assignment.
 //!
-//! Worker identity is the worker URL (stable across discovery events).
+//! Worker identity is the worker ID supplied by discovery.
 //!
 //! # Eviction
 //! A background sweeper (shared engine with the active-load janitor, see
-//! [`crate::state::load_monitor::active_load::spawn_sweeper`]) removes assignments idle longer
+//! [`crate::state::load_monitor::router_inflight_load::spawn_sweeper`]) removes assignments idle longer
 //! than `idle`, bounding the map against unbounded routing-key cardinality.
 //! The sweeper is spawned only when constructed inside a Tokio runtime;
 //! unit tests use [`StickyPolicy::with_clock`] and drive eviction
@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use crate::policies::{Policy, SelectionContext};
 use crate::server::metrics::{MetricsRegistry, StickyOutcome};
-use crate::state::load_monitor::active_load::JanitorHandle;
+use crate::state::load_monitor::router_inflight_load::JanitorHandle;
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 
@@ -70,7 +70,7 @@ impl StickyPolicy {
     fn with_clock(
         idle: Duration,
         fallback: Arc<dyn Policy>,
-        clock: Arc<dyn crate::state::load_monitor::active_load::Clock>,
+        clock: Arc<dyn crate::state::load_monitor::router_inflight_load::Clock>,
     ) -> Self {
         Self {
             store: AffinityStore::with_clock(idle, clock),
@@ -181,9 +181,9 @@ mod tests {
     }
 
     fn policy(idle_secs: u64) -> StickyPolicy {
-        let clock = Arc::new(crate::state::load_monitor::active_load::MockClock::new(
-            Instant::now(),
-        ));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         StickyPolicy::with_clock(Duration::from_secs(idle_secs), fallback(), clock)
     }
 
@@ -286,9 +286,9 @@ mod tests {
     #[test]
     fn sweep_evicts_idle_entries_keeps_fresh() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::state::load_monitor::active_load::MockClock::new(
-            Instant::now(),
-        ));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0"), worker("w1")];
 
@@ -315,9 +315,9 @@ mod tests {
     #[test]
     fn hit_refreshes_last_seen_so_active_key_is_not_evicted() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::state::load_monitor::active_load::MockClock::new(
-            Instant::now(),
-        ));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));

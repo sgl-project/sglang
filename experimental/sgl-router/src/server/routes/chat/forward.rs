@@ -11,7 +11,7 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
-use crate::state::load_monitor::active_load::ActiveLoadGuard;
+use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -22,7 +22,7 @@ use std::time::Instant;
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-type LoadGuards = (LoadGuard, ActiveLoadGuard);
+type LoadGuards = (LoadGuard, RouterInflightLoadGuard);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -56,7 +56,7 @@ pub(super) async fn forward_chat_request(
     } else {
         prefill.load_guard()
     };
-    let active_request_guard = ctx.active_load.register(
+    let active_request_guard = ctx.router_inflight_load.register(
         prefill.id.clone(),
         prefill.url.clone(),
         request.input_token_count,
@@ -89,7 +89,7 @@ pub(super) async fn forward_chat_request(
         );
         let decode_load_guards = (
             decode.load_guard(),
-            ctx.active_load
+            ctx.router_inflight_load
                 .register(decode.id.clone(), decode.url.clone(), 0, 1),
         );
         (decode, decode_load_guards)

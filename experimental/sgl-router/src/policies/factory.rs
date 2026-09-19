@@ -237,7 +237,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
+        Config, DiscoveryBackend, ModelConfig, ProxyConfig, RouterInflightLoadConfig, ServerConfig,
         StaticUrlsDiscoveryConfig,
     };
 
@@ -352,7 +352,7 @@ mod tests {
                 urls: vec!["http://placeholder:0".into()],
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: RouterInflightLoadConfig::default(),
         }
     }
 
