@@ -596,7 +596,7 @@ class ModelRunner:
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
-            tp_rank=self.tp_rank,
+            tp_rank=get_parallel().tp_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -1599,10 +1599,11 @@ class ModelRunner:
         # rather than spawning additional processes, so dp_size must not be
         # multiplied into the process count here (unlike regular DP, where
         # dp_size * tp_size * pp_size is the true worker count).
-        dp_size = 1 if get_parallel().enable_dp_attention else self.dp_size
+        parallel = get_parallel()
+        dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             numa_index=self.gpu_id,
-            world_size=dp_size * self.tp_size * get_parallel().pp_size,
+            world_size=dp_size * parallel.tp_size * parallel.pp_size,
         )
 
     def apply_torch_tp(self):

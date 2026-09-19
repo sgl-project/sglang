@@ -2800,5 +2800,135 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
+class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
+    """`ModelRunner.__init__` freezes its placement partway through.
+
+    A method called before that point reads an attribute that does not exist
+    yet, and only on the configuration that reaches it -- a remote weight
+    transporter, a NUMA binding -- so the suites say nothing and a GPU job is
+    where it surfaces. The order is what makes it wrong, so the order is what
+    is checked.
+    """
+
+    def _model_runner(self):
+        import ast as _ast
+
+        source = (_SRT / "model_executor" / "model_runner.py").read_text()
+        for node in _ast.parse(source).body:
+            if isinstance(node, _ast.ClassDef) and node.name == "ModelRunner":
+                return {m.name: m for m in node.body if isinstance(m, _ast.FunctionDef)}
+        raise AssertionError("ModelRunner not found")
+
+    def _frozen_names(self, methods):
+        import ast as _ast
+
+        return {
+            target.attr
+            for node in _ast.walk(methods["init_torch_distributed"])
+            if isinstance(node, _ast.Assign)
+            for target in node.targets
+            if isinstance(target, _ast.Attribute)
+            and isinstance(target.value, _ast.Name)
+            and target.value.id == "self"
+        }
+
+    def _reads(self, methods, fn, frozen, depth=0):
+        import ast as _ast
+
+        found = set()
+        for node in _ast.walk(fn):
+            if (
+                isinstance(node, _ast.Attribute)
+                and isinstance(node.value, _ast.Name)
+                and node.value.id == "self"
+                and isinstance(node.ctx, _ast.Load)
+                and node.attr in frozen
+            ):
+                found.add(node.attr)
+            if (
+                depth < 2
+                and isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and isinstance(node.func.value, _ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr in methods
+                and node.func.attr != "init_torch_distributed"
+            ):
+                found |= self._reads(
+                    methods, methods[node.func.attr], frozen, depth + 1
+                )
+        return found
+
+    def _calls_before_the_freeze(self, methods):
+        import ast as _ast
+
+        calls = []
+        for statement in methods["__init__"].body:
+            for node in _ast.walk(statement):
+                if (
+                    isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and isinstance(node.func.value, _ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    calls.append((node.lineno, node.func.attr))
+        calls.sort()
+        names = [name for _, name in calls]
+        self.assertIn(
+            "init_torch_distributed",
+            names,
+            "the freeze moved; this census is keyed on where it happens",
+        )
+        return calls[: names.index("init_torch_distributed")]
+
+    def test_no_method_called_before_the_freeze_reads_what_it_freezes(self):
+        methods = self._model_runner()
+        frozen = self._frozen_names(methods)
+        self.assertGreater(len(frozen), 5, "found no frozen names; census is broken")
+        offenders = []
+        for lineno, name in self._calls_before_the_freeze(methods):
+            fn = methods.get(name)
+            if fn is None:
+                continue
+            read = self._reads(methods, fn, frozen)
+            if read:
+                offenders.append(
+                    f"__init__:{lineno} self.{name}() reads {sorted(read)}"
+                )
+        self.assertEqual(
+            offenders,
+            [],
+            "these run before init_torch_distributed and read what it sets; "
+            "ask get_parallel() there, or move the call after the freeze:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_the_census_would_notice_one(self):
+        """The positive control: the walk has to find a read that is there."""
+        import ast as _ast
+        import textwrap
+
+        methods = {
+            m.name: m
+            for m in _ast.parse(
+                textwrap.dedent(
+                    """
+                    class R:
+                        def init_torch_distributed(self):
+                            self.tp_rank = 0
+
+                        def early(self):
+                            return self.tp_rank
+                    """
+                )
+            )
+            .body[0]
+            .body
+        }
+        frozen = self._frozen_names(methods)
+        self.assertEqual(frozen, {"tp_rank"})
+        self.assertEqual(self._reads(methods, methods["early"], frozen), {"tp_rank"})
+
+
 if __name__ == "__main__":
     unittest.main()
