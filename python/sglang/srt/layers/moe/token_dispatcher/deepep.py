@@ -812,10 +812,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # round_scale is FP8-DeepGEMM specific.
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
+        # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
             if self.use_fp8
