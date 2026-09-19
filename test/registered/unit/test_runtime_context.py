@@ -3162,6 +3162,72 @@ class TestTheRecordIsNeverWrittenTo(CustomTestCase):
         )
 
 
+class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
+    """The package stopped re-exporting the getters and the build stopped
+    taking widths. Both are import-time or call-time failures in whatever tree
+    they survive in, and the trees beside the package have no suite to notice.
+    """
+
+    def _retired(self):
+        from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
+
+        return set(_CONTEXT_NAME_OF)
+
+    def test_nothing_imports_a_retired_name_from_the_package(self):
+        import ast as _ast
+
+        retired = self._retired()
+        offenders = []
+        for path in _sources():
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.ImportFrom)
+                    and node.module == "sglang.srt.distributed"
+                ):
+                    for alias in node.names:
+                        if alias.name in retired:
+                            offenders.append(f"{path}:{node.lineno} {alias.name}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these import a name the package no longer re-exports; import it "
+            "from parallel_state, or read get_parallel():\n  " + "\n  ".join(offenders),
+        )
+
+    def test_nothing_passes_a_width_to_the_build(self):
+        """`multimodal_gen` is out: it has a function of this name that builds
+        its own parallelism from its own degrees."""
+        import ast as _ast
+        import inspect
+
+        from sglang.srt.distributed.parallel_state import initialize_model_parallel
+
+        takes = set(inspect.signature(initialize_model_parallel).parameters)
+        offenders = []
+        for path in _sources():
+            if "multimodal_gen" in path.parts:
+                continue
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.Call)
+                    and getattr(node.func, "id", getattr(node.func, "attr", None))
+                    == "initialize_model_parallel"
+                ):
+                    stale = [
+                        kw.arg for kw in node.keywords if kw.arg and kw.arg not in takes
+                    ]
+                    if stale or node.args:
+                        offenders.append(
+                            f"{path}:{node.lineno} {stale or 'positional'}"
+                        )
+        self.assertEqual(
+            offenders,
+            [],
+            "the build reads every width from the context; publish the "
+            "topology instead of passing it:\n  " + "\n  ".join(offenders),
+        )
+
+
 class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
     """`ModelRunner.__init__` freezes its placement partway through.
 
