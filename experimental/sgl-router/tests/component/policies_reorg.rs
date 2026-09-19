@@ -4,7 +4,9 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup, TokenLimits};
+use sgl_router::buckets_reorg::{
+    Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits,
+};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
@@ -219,23 +221,20 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         },
     )]);
     let bucket = resolver.resolve(10, Some(20)).unwrap()[0];
-    let BucketGroups::Pd { prefill, decode } = &bucket.groups else {
-        panic!("expected PD")
+    let request = BucketRequest {
+        model: &model,
+        input_tokens: 10,
+        expected_peak_tokens: Some(20),
+        token_ids: None,
+        session_key: None,
+        routing_key: None,
     };
-    for (stage, group, expected) in [
-        (Stage::Prefill, prefill, "p2"),
-        (Stage::Decode, decode, "d2"),
-    ] {
-        let load = LoadView::new(&table);
-        let request = PickRequest {
-            bucket: &bucket.id,
-            ..PickRequest::new(&model, stage, 10, &load)
-        };
-        assert_eq!(
-            group.pick(&workers, &request).await.unwrap().engine.id.0,
-            expected
-        );
-    }
+    let picks = bucket
+        .pick_engines(&workers, &request, &table)
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "p2");
+    assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
     assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
 }
@@ -379,4 +378,56 @@ async fn admission_placement_changes_whether_an_alternative_can_win() {
         policy.pick(&[], &request).await,
         Err(PickError::NoCandidates)
     ));
+}
+
+#[tokio::test]
+async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
+    #[derive(Debug)]
+    struct InspectRequest;
+
+    impl Policy for InspectRequest {
+        fn pick<'a>(
+            &'a self,
+            engines: &'a [Arc<Worker>],
+            request: &'a PickRequest<'a>,
+        ) -> BoxFuture<'a, Result<Pick, PickError>> {
+            Box::pin(async move {
+                assert_eq!(request.model.0, "m");
+                assert_eq!(request.bucket, "plain-bucket");
+                assert_eq!(request.stage, Stage::Plain);
+                assert_eq!(request.input_tokens, 2);
+                assert_eq!(request.expected_peak_tokens, Some(12));
+                assert_eq!(request.token_ids, Some([7, 9].as_slice()));
+                assert_eq!(request.session_key, Some("session"));
+                assert_eq!(request.routing_key, Some("routing"));
+                Ok(Pick {
+                    engine: engines[0].clone(),
+                    reason: "inspected",
+                })
+            })
+        }
+    }
+
+    let workers = registry();
+    let model = ModelId("m".into());
+    let table = EngineLoadTable::new();
+    let bucket = Bucket::new(
+        "plain-bucket",
+        BucketGroups::Plain(group(&["b"], Arc::new(InspectRequest))),
+    );
+    let request = BucketRequest {
+        model: &model,
+        input_tokens: 2,
+        expected_peak_tokens: Some(12),
+        token_ids: Some(&[7, 9]),
+        session_key: Some("session"),
+        routing_key: Some("routing"),
+    };
+    let picks = bucket
+        .pick_engines(&workers, &request, &table)
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "b");
+    assert_eq!(picks.prefill.reason, "inspected");
+    assert!(picks.decode.is_none());
 }

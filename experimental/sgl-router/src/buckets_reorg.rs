@@ -6,8 +6,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::discovery::WorkerId;
-use crate::policies_reorg::{Pick, PickError, PickRequest, Policy};
+use crate::discovery::{ModelId, WorkerId};
+use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::state::load_monitor::engine_load::EngineLoadTable;
+use crate::state::LoadView;
 use crate::workers::WorkerRegistry;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +81,26 @@ pub enum BucketGroups {
     },
 }
 
+/// Prepared request facts shared by all bucket attempts. The bucket supplies
+/// its ID, each group's stage, and a fresh load view when calling policies.
+#[derive(Debug)]
+pub struct BucketRequest<'a> {
+    pub model: &'a ModelId,
+    pub input_tokens: u64,
+    pub expected_peak_tokens: Option<u64>,
+    pub token_ids: Option<&'a [u32]>,
+    pub session_key: Option<&'a str>,
+    pub routing_key: Option<&'a str>,
+}
+
+/// A complete selection from one bucket. For plain serving, `prefill` is the
+/// plain engine and `decode` is absent; PD supplies both picks.
+#[derive(Debug)]
+pub struct BucketPick {
+    pub prefill: Pick,
+    pub decode: Option<Pick>,
+}
+
 #[derive(Debug)]
 pub struct Bucket {
     pub id: String,
@@ -100,6 +122,60 @@ impl Bucket {
             max_context_tokens: None,
             groups,
         }
+    }
+
+    /// Select this bucket's plain engine or complete P/D pair, without dispatching.
+    /// A failed group reports its stage; the caller may then try another bucket.
+    pub async fn pick_engines(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        engine_load: &EngineLoadTable,
+    ) -> Result<BucketPick, (Stage, PickError)> {
+        let (prefill, decode) = match &self.groups {
+            BucketGroups::Plain(group) => (
+                self.pick_group(group, Stage::Plain, workers, request, engine_load)
+                    .await?,
+                None,
+            ),
+            BucketGroups::Pd { prefill, decode } => {
+                let prefill = self
+                    .pick_group(prefill, Stage::Prefill, workers, request, engine_load)
+                    .await?;
+                let decode = self
+                    .pick_group(decode, Stage::Decode, workers, request, engine_load)
+                    .await?;
+                (prefill, Some(decode))
+            }
+        };
+        Ok(BucketPick { prefill, decode })
+    }
+
+    async fn pick_group(
+        &self,
+        group: &EngineGroup,
+        stage: Stage,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        engine_load: &EngineLoadTable,
+    ) -> Result<Pick, (Stage, PickError)> {
+        // One lazy snapshot for this group attempt, including policy fallback/admission.
+        let load = LoadView::new(engine_load);
+        let request = PickRequest {
+            model: request.model,
+            stage,
+            bucket: &self.id,
+            input_tokens: request.input_tokens,
+            expected_peak_tokens: request.expected_peak_tokens,
+            token_ids: request.token_ids,
+            session_key: request.session_key,
+            routing_key: request.routing_key,
+            load: &load,
+        };
+        group
+            .pick(workers, &request)
+            .await
+            .map_err(|error| (stage, error))
     }
 
     fn fits(&self, input_tokens: u64, expected_peak_tokens: Option<u64>) -> bool {
