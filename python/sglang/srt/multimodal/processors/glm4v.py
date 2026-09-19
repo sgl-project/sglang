@@ -1,7 +1,6 @@
 import asyncio
 import json
 import math
-from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -272,7 +271,7 @@ def _resize_frames_to_max_tokens(frames, max_tokens_per_frame):
     return nchw.permute(0, 2, 3, 1).contiguous()
 
 
-def preprocess_video_frames_sync(frame_list: List[dict]):
+def preprocess_video_frames_sync(frame_list: list[dict]):
     total_num_frames = len(frame_list)
     if total_num_frames == 0:
         raise ValueError("GLM video frame list must not be empty")
@@ -487,7 +486,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         input_ids: torch.Tensor,
         mm_tokens: MultimodalSpecialTokens,
         modality: Modality,
-    ) -> List[Tuple[int, int]]:
+    ) -> list[tuple[int, int]]:
         """Disambiguate image and video spans sharing ``IM_TOKEN_ID``."""
         if (
             modality not in (Modality.IMAGE, Modality.VIDEO)
@@ -502,7 +501,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             self.VIDEO_END_TOKEN_ID,
         )
 
-        def is_video_offset(offset: Tuple[int, int]) -> bool:
+        def is_video_offset(offset: tuple[int, int]) -> bool:
             start, end = offset
             return any(
                 video_start <= start and end <= video_end
@@ -537,12 +536,20 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        image_data: list[str | bytes],
         input_text,
         request_obj,
         *args,
         **kwargs,
     ):
+        if image_data and self.IMAGE_TOKEN not in input_text:
+            reminder = "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>"
+            for _ in range(len(image_data)):
+                if reminder in input_text:
+                    input_text = input_text.replace(reminder, self.IMAGE_TOKEN, 1)
+                else:
+                    input_text += self.IMAGE_TOKEN
+
         # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
         video_urls, video_configs = split_glm_video_items(request_obj.video_data)
         video_processor = getattr(self._processor, "video_processor", None)
