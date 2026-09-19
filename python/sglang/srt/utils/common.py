@@ -1759,6 +1759,7 @@ GLM_MEDIA_CONFIG_KEYS = (
 class VideoData:
     url: str
     preprocess_kwargs: Optional[Dict] = None
+    cache_id: Optional[str] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")

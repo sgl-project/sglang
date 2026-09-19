@@ -246,7 +246,8 @@ def process_content_for_template_format(
                     }
                     if mdp is not None:
                         preprocess_kwargs["max_dynamic_patch"] = mdp
-                    if not preprocess_kwargs:
+                    cache_id = video_obj.get("cache_id")
+                    if not preprocess_kwargs and cache_id is None:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # VideoData survives load_video on every processor; a
@@ -255,6 +256,7 @@ def process_content_for_template_format(
                             VideoData(
                                 url=video_obj["url"],
                                 preprocess_kwargs=preprocess_kwargs,
+                                cache_id=cache_id,
                             )
                         )
                     if chunk.get("modalities"):
@@ -291,6 +293,12 @@ def process_content_for_template_format(
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
+            if (
+                isinstance(chunk, dict)
+                and chunk.get("type") == "video_url"
+                and (chunk.get("video_url") or {}).get("cache_id") is not None
+            ):
+                raise ValueError("video cache_id requires a multimodal chat template")
             if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
                 text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
