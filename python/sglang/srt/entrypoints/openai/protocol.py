@@ -434,6 +434,18 @@ class SpecTokensDetails(BaseModel):
     spec_cap_lens_histogram: List[int] = Field(default_factory=list)
 
 
+class WeightVersionSpan(BaseModel):
+    """Output-token span attributed to a single weight version.
+
+    Ranges are half-open ``[start, end)`` over output-token indices, prompt
+    excluded.
+    """
+
+    version: str
+    start: int
+    end: int
+
+
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
 
@@ -448,6 +460,8 @@ class SglExt(BaseModel):
     )
     input_ids: Optional[List[int]] = None
     output_ids: Optional[List[List[int]]] = None
+    weight_version: Optional[str] = None
+    weight_versions: Optional[List[WeightVersionSpan]] = None
 
     def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
         """Split set fields into (non_ids, ids); a side with no set fields is None."""
@@ -505,6 +519,8 @@ class CompletionResponse(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.metadata is None:
+            data.pop("metadata", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
@@ -1254,6 +1270,8 @@ class ChatCompletionResponse(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.metadata is None:
+            data.pop("metadata", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
