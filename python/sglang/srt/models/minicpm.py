@@ -14,7 +14,7 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -487,6 +487,7 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture: List[int] = []
 
     def forward(
         self,
@@ -494,23 +495,29 @@ class MiniCPMModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
             hidden_states = input_embeds
         residual = None
 
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
+        aux_hidden_states = []
+        for i, layer in enumerate(self.layers):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+        if len(self.layers) in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states)
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        if not aux_hidden_states:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
@@ -540,6 +547,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -552,12 +560,37 @@ class MiniCPMSALAForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         hidden_states = hidden_states / self.scale_width
-        if self.config.tie_word_embeddings:
-            lm_head = self.model.embed_tokens
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self._lm_head_module(),
+            forward_batch,
+            aux_hidden_states,
+        )
+
+    def _lm_head_module(self):
+        return (
+            self.model.embed_tokens if self.config.tie_word_embeddings else self.lm_head
+        )
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self._lm_head_module().weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+            # The draft checkpoint indexes target layers by their output hidden state;
+            # capturing before layer i+1 reads layer i's output.
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
