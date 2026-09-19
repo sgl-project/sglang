@@ -542,6 +542,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/optimization/ring_sp_performance"
     },
     {
+      "source": "/docs/hardware-platforms/ascend-npus/ascend_npu_deployment_knowledge_base",
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/knowledge_base"
+    },
+    {
       "source": "/docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
       "destination": "/docs/hardware-platforms/ascend-npus/optimization/profiling"
     },
@@ -1105,11 +1109,12 @@
                       "docs/hardware-platforms/ascend-npus/reference/glossary"
                     ]
                   },
-                  {
-                    "group": "Model Deployment",
-                    "pages": [
                       {
-                        "group": "Model Tutorials",
+                        "group": "Model Deployment",
+                        "pages": [
+                          "docs/hardware-platforms/ascend-npus/model-deployment/knowledge_base",
+                          {
+                            "group": "Model Tutorials",
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2",
