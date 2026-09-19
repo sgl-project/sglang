@@ -1,6 +1,7 @@
 """Inkling checkpoint writes use live physical slots, including graph replay."""
 
 import unittest
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -661,6 +662,94 @@ class TestInklingCheckpointIndices(CustomTestCase):
                             multilayer, static, tracking
                         )
 
+    def _allocate_production_draft_buffers(self, multilayer, tracking):
+        from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
+        from sglang.srt.speculative import (
+            multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
+        )
+
+        model_runner = SimpleNamespace(
+            device="cuda",
+            ps=SimpleNamespace(tp_size=1, attn_dp_size=1),
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16, vocab_size=8, hf_config=SimpleNamespace()
+            ),
+            graph_shared_output=SimpleNamespace(
+                get_logits_buffer=lambda vocab, rows: torch.zeros(
+                    rows, vocab, device="cuda"
+                )
+            ),
+        )
+        worker = SimpleNamespace(
+            draft_runner=model_runner,
+            speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
+            seed_dsa_topk_from_draft_extend=False,
+            mtp_model_runner=lambda step: model_runner,
+        )
+        runtime = SimpleNamespace(
+            mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
+            graph=SimpleNamespace(
+                disable_cuda_graph_padding=False, enable_profile_cuda_graph=False
+            ),
+        )
+        if multilayer:
+            composite = (
+                multi.MultiLayerEagleMultiStepDraftExtendCudaGraphRunner.__new__(
+                    multi.MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
+                )
+            )
+            composite.runners = [SimpleNamespace(model_runner=model_runner)]
+            composite.eagle_worker = worker
+            composite.max_bs = 4
+            composite.captured_req_width = 4
+            composite.seq_len_fill_value = 4
+            composite.device = "cuda"
+            composite.prune_draft_extend_logits = False
+            composite.rotates_in_graph = False
+            composite.require_gathered_buffer = False
+            with (
+                patch.object(multi, "get_exec", return_value=runtime),
+                patch.object(
+                    multi, "get_draft_input_from_target_hidden_dim", return_value=64
+                ),
+            ):
+                return composite._allocate_buffers()
+
+        worker.draft_extend_attn_backend = SimpleNamespace(
+            init_cuda_graph_state=lambda *args: None,
+            get_cuda_graph_seq_len_fill_value=lambda: 4,
+        )
+        # Only model/distributed capture scaffolding is replaced. __init__ and
+        # its real input-buffer allocation run before the kernel replay test.
+        with ExitStack() as stack:
+            replacements = {
+                "get_exec": runtime,
+                "get_parallel": SimpleNamespace(pp_size=1),
+                "get_flags": SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=False)
+                ),
+                "get_spec": SimpleNamespace(speculative_num_steps=1),
+                "get_batch_sizes_to_capture": ([4], []),
+                "resolve_num_tokens_per_req": 4,
+                "get_draft_input_from_target_hidden_dim": 64,
+                "require_gathered_buffer": False,
+                "require_mlp_tp_gather": False,
+                "require_mlp_sync": False,
+                "require_attn_tp_gather": False,
+                "resolve_decode_backend": Mock(),
+            }
+            for name, result in replacements.items():
+                stack.enter_context(patch.object(eagle, name, return_value=result))
+            stack.enter_context(patch.object(eagle, "model_capture_mode", nullcontext))
+            stack.enter_context(patch.object(eagle, "DeepEPCudaGraphRunnerAdapter"))
+            stack.enter_context(
+                patch.object(eagle.EagleDraftExtendInputBuffers, "share_buffers")
+            )
+            stack.enter_context(
+                patch.object(eagle.EAGLEDraftExtendCudaGraphRunner, "capture")
+            )
+            return eagle.EAGLEDraftExtendCudaGraphRunner(worker).buffers
+
     def _make_draft_checkpoint_runner(self, multilayer, static, tracking):
         from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
         from sglang.srt.speculative import (
@@ -675,28 +764,23 @@ class TestInklingCheckpointIndices(CustomTestCase):
         req_pool.req_index_to_mamba_index_mapping = torch.cat(
             [slots.new_zeros(1), slots[1:5]]
         ).to(torch.int32)
-        buffers = SimpleNamespace(
-            input_ids=torch.zeros(16, dtype=torch.int64, device="cuda"),
-            req_pool_indices=torch.arange(1, 5, device="cuda"),
-            mamba_track_indices=slots[-4:].clone() if tracking else None,
-            out_cache_loc=torch.zeros(16, dtype=torch.int64, device="cuda"),
-            positions=torch.zeros(16, dtype=torch.int64, device="cuda"),
-            mrope_positions=torch.zeros(3, 16, dtype=torch.int64, device="cuda"),
-            hidden_states=torch.zeros(16, 64, dtype=torch.bfloat16, device="cuda"),
-            seq_lens=torch.full((4,), 6, dtype=torch.int64, device="cuda"),
-            seq_lens_cpu=torch.full((4,), 6, dtype=torch.int64),
-            extend_seq_lens=torch.full((4,), 4, dtype=torch.int32, device="cuda"),
-            extend_start_loc=torch.arange(0, 16, 4, device="cuda"),
-            num_correct_drafts=torch.ones(4, dtype=torch.int32, device="cuda"),
-            num_accept_tokens=torch.full((4,), 3, dtype=torch.int32, device="cuda"),
-            select_index=torch.arange(0, 16, 4, device="cuda"),
-            next_token_logits_buffer=torch.zeros(16, 8, device="cuda"),
-            global_num_tokens_gpu=None,
-            global_num_tokens_for_logprob_gpu=None,
-            dsa_seed_topk_capture=None,
-            temperatures=None,
-            draft_probs=None,
-        )
+        buffers = self._allocate_production_draft_buffers(multilayer, tracking)
+        buffers.req_pool_indices.copy_(torch.arange(1, 5, device="cuda"))
+        buffers.seq_lens.fill_(6)
+        buffers.seq_lens_cpu.fill_(6)
+        buffers.num_accept_tokens.fill_(3)
+        if tracking:
+            self.assertIsNotNone(buffers.mamba_track_indices)
+            self.assertEqual(buffers.mamba_track_indices.shape, (4,))
+            self.assertEqual(buffers.mamba_track_indices.dtype, torch.int64)
+            self.assertEqual(buffers.mamba_track_indices.device.type, "cuda")
+            torch.testing.assert_close(
+                buffers.mamba_track_indices,
+                torch.zeros(4, dtype=torch.int64, device="cuda"),
+            )
+            buffers.mamba_track_indices.copy_(slots[-4:])
+        else:
+            self.assertIsNone(buffers.mamba_track_indices)
         cls = (
             multi.MultiLayerEagleDraftExtendCudaGraphRunner
             if multilayer
@@ -724,13 +808,21 @@ class TestInklingCheckpointIndices(CustomTestCase):
         runner.draft_extend_attn_backend = backend
         runner.eagle_worker = SimpleNamespace(draft_extend_attn_backend_list=[backend])
         runner.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(model_is_mrope=False),
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
         )
         return runner, backend, allocator, pool, slots, buffers
 
-    def _check_draft_checkpoint_replay(self, multilayer, static, tracking):
+    def test_static_staged_runner_checkpoint_replay(self):
+        for tracking in (False, True):
+            with self.subTest(tracking=tracking):
+                self._check_draft_checkpoint_replay(True, True, tracking, staging=True)
+
+    def _check_draft_checkpoint_replay(
+        self, multilayer, static, tracking, staging=False
+    ):
         from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
@@ -740,6 +832,20 @@ class TestInklingCheckpointIndices(CustomTestCase):
         runner, backend, allocator, pool, slots, buffers = (
             self._make_draft_checkpoint_runner(multilayer, static, tracking)
         )
+        hook_backend = backend
+        if staging:
+            wrapper = InklingShortConvHybridAttnBackend.__new__(
+                InklingShortConvHybridAttnBackend
+            )
+            wrapper.short_conv_backend = backend
+            wrapper.full_attn_backend = Mock(
+                supports_draft_extend_metadata_staging=True
+            )
+            wrapper.full_attn_backend.draft_extend_metadata_captured_in_graph.return_value = False
+            hook_backend = wrapper
+            runner.attn_backend = wrapper
+            runner.draft_extend_attn_backend = wrapper
+            runner.eagle_worker.draft_extend_attn_backend_list = [wrapper]
         cache = pool.mamba_cache.conv[0][0]
         captured = []
         graph = torch.cuda.CUDAGraph()
@@ -784,10 +890,10 @@ class TestInklingCheckpointIndices(CustomTestCase):
         ):
             if multilayer:
                 batch = runner.get_forward_batch(4)
-                backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                hook_backend.init_forward_metadata_out_graph(batch, in_capture=True)
 
                 def run_once():
-                    backend.init_forward_metadata_in_graph(batch)
+                    hook_backend.init_forward_metadata_in_graph(batch)
                     return model_forward(batch.input_ids, batch.positions, batch)
 
                 capture_graph(None, run_once)
@@ -860,7 +966,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     composite.num_front_tokens = 0
                     composite.seq_len_fill_value = 4
                     composite.runners = [runner]
-                    composite._stage_metadata = Mock()
+                    composite.draft_extend_attn_backend_list = [hook_backend]
+                    if not staging:
+                        composite._stage_metadata = Mock()
                     composite.prepare(fresh)
                     runner.replay(
                         4, composite.seq_lens_sum, composite._replay_spec_info, None
