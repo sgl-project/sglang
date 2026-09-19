@@ -38,6 +38,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -4133,7 +4134,7 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
-class TestLfm2Detector(unittest.TestCase):
+class TestLfm2Detector(CustomTestCase):
     """Tests for LFM2 (Liquid Foundation Model 2) function call detector."""
 
     def setUp(self):
@@ -4456,6 +4457,86 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
+
+    def test_streaming_complete_blocks_are_independent_of_chunk_boundaries(self):
+        """Coalesced blocks must not lose calls/text or reuse a call index."""
+        expected_calls = [
+            ("get_weather", {"city": "Paris"}),
+            ("search", {"query": "hotels"}),
+            ("get_weather", {"city": "London"}),
+        ]
+        for format_name in ("pythonic", "json"):
+            blocks = []
+            for name, arguments in expected_calls:
+                if format_name == "json":
+                    body = json.dumps([{"name": name, "arguments": arguments}])
+                else:
+                    key, value = next(iter(arguments.items()))
+                    body = f"[{name}({key}={value!r})]"
+                blocks.append(f"<|tool_call_start|>{body}<|tool_call_end|>")
+            parts = [
+                "Checking. " + blocks[0],
+                " Next. " + blocks[1],
+                blocks[2] + " Done.",
+            ]
+            text = "".join(parts)
+            partitions = [[text], parts, list(text)] + [
+                [text[:i], text[i:]] for i in range(1, len(text))
+            ]
+            for split, chunks in enumerate(partitions):
+                with self.subTest(format=format_name, split=split):
+                    parser = FunctionCallParser(
+                        tools=self.tools, tool_call_parser="lfm2"
+                    )
+                    normal_text, calls = "", []
+                    for chunk in chunks:
+                        delta_text, delta_calls = parser.parse_stream_chunk(chunk)
+                        normal_text += delta_text
+                        calls.extend(delta_calls)
+                    self.assertEqual(
+                        [(call.name, json.loads(call.parameters)) for call in calls],
+                        expected_calls,
+                    )
+                    self.assertEqual([call.tool_index for call in calls], [0, 1, 2])
+                    self.assertEqual(normal_text, "Checking.  Next.  Done.")
+                    self.assertEqual(parser.parse_stream_end(), ("", []))
+
+    def test_streaming_skipped_blocks_do_not_hide_later_calls(self):
+        """An empty or invalid block must not strand a subsequent valid call."""
+        for skipped in ("", "[", '[unknown_function(arg="value")]'):
+            with self.subTest(skipped=skipped):
+                parser = FunctionCallParser(tools=self.tools, tool_call_parser="lfm2")
+                text, calls = parser.parse_stream_chunk(
+                    '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>'
+                    f"<|tool_call_start|>{skipped}<|tool_call_end|>"
+                    '<|tool_call_start|>[search(query="hotels")]<|tool_call_end|>'
+                )
+                self.assertEqual(text, "")
+                self.assertEqual(
+                    [call.name for call in calls], ["get_weather", "search"]
+                )
+                self.assertEqual([call.tool_index for call in calls], [0, 1])
+                self.assertEqual(parser.parse_stream_end(), ("", []))
+
+    def test_stream_end_preserves_text_but_does_not_complete_truncated_calls(self):
+        """EOF releases held text once, without inventing a truncated call."""
+        for suffix, expected_text in (
+            (" <", " <"),
+            (" <|tool_call_", " <|tool_call_"),
+            (' <|tool_call_start|>[search(query="unfinished', " "),
+            (' <|tool_call_start|>[search(query="done")]<|tool_call_end', " "),
+        ):
+            with self.subTest(suffix=suffix):
+                parser = FunctionCallParser(tools=self.tools, tool_call_parser="lfm2")
+                text, calls = parser.parse_stream_chunk(
+                    '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>'
+                    + suffix
+                )
+                final_text, final_calls = parser.parse_stream_end()
+                self.assertEqual(text + final_text, expected_text)
+                self.assertEqual([call.name for call in calls], ["get_weather"])
+                self.assertEqual(final_calls, [])
+                self.assertEqual(parser.parse_stream_end(), ("", []))
 
     # ==================== recovery tests (dropped-call regressions) ====================
 

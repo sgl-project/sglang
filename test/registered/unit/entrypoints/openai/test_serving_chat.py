@@ -270,7 +270,7 @@ class TestChatTemplateCache(CustomTestCase):
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
@@ -2295,6 +2295,76 @@ class ServingChatTestCase(unittest.TestCase):
             payload = json.loads(line[len("data: ") :])
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_lfm2_streaming_blocks_reconstruct_distinct_tool_calls(self):
+        """Clients must recover both calls by index, even in a terminal chunk."""
+        self.chat.tool_call_parser = "lfm2"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Check the weather."}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+            stream=True,
+        )
+        blocks = [
+            f'<|tool_call_start|>[get_weather(city="{city}")]<|tool_call_end|>'
+            for city in ("Paris", "London")
+        ]
+        for chunks in (
+            [blocks[0], blocks[1] + " Done <"],
+            ["".join(blocks) + " Done <"],
+        ):
+            with self.subTest(chunks=len(chunks)):
+
+                async def mock_generate():
+                    text = ""
+                    for i, chunk in enumerate(chunks):
+                        text += chunk
+                        yield {
+                            "text": text,
+                            "index": 0,
+                            "meta_info": {
+                                "id": "chatcmpl-lfm2",
+                                "prompt_tokens": 1,
+                                "completion_tokens": i + 1,
+                                "finish_reason": (
+                                    {"type": "stop"} if i == len(chunks) - 1 else None
+                                ),
+                            },
+                        }
+
+                self.tm.generate_request.return_value = mock_generate()
+                raw_chunks = self._run_chat_stream(
+                    GenerateReqInput(text="test", stream=True), req
+                )
+                self.assertEqual(raw_chunks[-1], "data: [DONE]\n\n")
+                calls, text, finish_reasons = {}, "", []
+                for chunk in self._parse_chunks(raw_chunks):
+                    self.assertNotIn("error", chunk)
+                    for choice in chunk["choices"]:
+                        delta = choice["delta"]
+                        text += delta.get("content") or ""
+                        for call in delta.get("tool_calls") or []:
+                            item = calls.setdefault(
+                                call["index"], {"name": "", "arguments": "", "id": ""}
+                            )
+                            item["name"] += call["function"].get("name") or ""
+                            item["arguments"] += call["function"].get("arguments") or ""
+                            item["id"] += call.get("id") or ""
+                        if choice.get("finish_reason"):
+                            finish_reasons.append(choice["finish_reason"])
+                self.assertEqual(sorted(calls), [0, 1])
+                self.assertEqual(
+                    [calls[i]["name"] for i in range(2)], ["get_weather"] * 2
+                )
+                self.assertEqual(
+                    [json.loads(calls[i]["arguments"]) for i in range(2)],
+                    [{"city": "Paris"}, {"city": "London"}],
+                )
+                self.assertTrue(all(item["id"] for item in calls.values()))
+                self.assertEqual(len({item["id"] for item in calls.values()}), 2)
+                self.assertEqual(text, " Done <")
+                self.assertEqual(finish_reasons, ["tool_calls"])
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
