@@ -561,6 +561,7 @@ class TestTraceServerAsync(TestTraceServer):
 
     @classmethod
     def setUpClass(cls):
+        cls.process = None
         cls.collector = LightweightOtlpCollector()
         cls.collector.start()
         time.sleep(0.2)
@@ -574,7 +575,12 @@ class TestTraceServerAsync(TestTraceServer):
                 "--otlp-traces-endpoint",
                 "127.0.0.1:4317",
             ],
-            env={"SGLANG_TRACE_ASYNC": "1"},
+            env={
+                "SGLANG_TRACE_ASYNC": "1",
+                # Keep per-context threshold flushes from hiding a broken
+                # scheduler multi_batch transport/replay path.
+                "SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD": "10000",
+            },
         )
 
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
@@ -582,11 +588,63 @@ class TestTraceServerAsync(TestTraceServer):
 
         cls.collector.clear()
 
-    # Only run trace_level_3 — the most comprehensive check.
+    def test_batch_request(self):
+        """Every request in a large async batch must reach the real OTLP collector."""
+        batch_size = 32
+        response = requests.get(
+            f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=3", timeout=30
+        )
+        self.assertEqual(response.status_code, 200)
+        self.collector.clear()
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/generate",
+            json={
+                "text": ["The capital of France is"] * batch_size,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 32,
+                    "ignore_eos": True,
+                },
+                "stream": False,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json()
+        self.assertEqual(len(results), batch_size)
+        for result in results:
+            self.assertEqual(result["meta_info"]["completion_tokens"], 32)
+
+        prefill_name = RequestStage.PREFILL_FORWARD.stage_name
+        decode_name = RequestStage.DECODE_FORWARD.stage_name
+        # Inference completing does not imply the exporter queue is drained.
+        # Wait for both stages from every request, not just the first span.
+        deadline = time.monotonic() + 30
+        while True:
+            spans = self.collector.get_spans()
+            prefill = [span for span in spans if span.name == prefill_name]
+            decode = [span for span in spans if span.name == decode_name]
+            prefill_ids = {span.trace_id for span in prefill}
+            decode_ids = {span.trace_id for span in decode}
+            if len(prefill_ids) == batch_size and decode_ids == prefill_ids:
+                break
+            if time.monotonic() >= deadline:
+                self.fail(
+                    f"Missing async batch traces: expected {batch_size} requests, "
+                    f"got {len(prefill_ids)} prefill and {len(decode_ids)} decode traces"
+                )
+            time.sleep(0.1)
+
+        self.assertEqual(len(prefill), batch_size)
+        for span in prefill + decode:
+            self.assertTrue(span.parent_span_id, f"Missing parent for {span.name}")
+            self.assertGreater(span.start_time_ns, 0)
+            self.assertGreaterEqual(span.end_time_ns, span.start_time_ns)
+
+    # Run the comprehensive trace-level check plus the large async batch.
     test_trace_level_0 = None
     test_trace_level_1 = None
     test_trace_level_2 = None
-    test_batch_request = None
     test_parallel_sample = None
 
 
