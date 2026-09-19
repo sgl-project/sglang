@@ -137,6 +137,42 @@ class DPBudget:
         return target_rank
 
 
+def resolve_local_rank_ranges(
+    *,
+    pp_size: int,
+    tp_size: int,
+    nnodes: int,
+    node_rank: int,
+    is_scale_joiner: bool,
+) -> tuple[range, range, int, int]:
+    """Which (pp_rank, tp_rank) coordinates this process owns locally.
+
+    Returns ``(pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node)``.
+
+    An elastic-EP scale joiner is not a node of the deployment it joins: it owns
+    a whole TP group on one machine and always starts at pipeline stage 0. Its
+    ``--node-rank 1`` is only a marker that it is not the primary's node 0, so
+    reading it as a pipeline coordinate would offset every rank the cohort
+    claims by ``tp_size`` and place them outside the world it declares.
+    """
+    pp_size_per_node = max(pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    nnodes_per_tp_group = nnodes_per_pp_rank
+
+    if is_scale_joiner:
+        return range(1), range(tp_size), 1, tp_size
+
+    tp_size_per_node = tp_size // nnodes_per_tp_group
+    pp_stage = node_rank // nnodes_per_pp_rank
+    tp_slot = node_rank % nnodes_per_tp_group
+    return (
+        range(pp_size_per_node * pp_stage, pp_size_per_node * (pp_stage + 1)),
+        range(tp_size_per_node * tp_slot, tp_size_per_node * (tp_slot + 1)),
+        pp_size_per_node,
+        tp_size_per_node,
+    )
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
@@ -617,24 +653,15 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(get_parallel().pp_size // get_parallel().nnodes, 1)
-        nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
-        if get_exec().moe.is_ep_scale_joiner:
-            # Scale joiners enumerate their full local TP span.
-            tp_rank_range = range(get_parallel().tp_size)
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            tp_rank_range = range(
-                tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group),
-                tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group + 1),
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            resolve_local_rank_ranges(
+                pp_size=get_parallel().pp_size,
+                tp_size=get_parallel().tp_size,
+                nnodes=get_parallel().nnodes,
+                node_rank=get_parallel().node_rank,
+                is_scale_joiner=get_exec().moe.is_ep_scale_joiner,
             )
+        )
 
         attn_cp_rank = 0
         moe_dp_rank = 0
