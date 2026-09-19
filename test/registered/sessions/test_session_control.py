@@ -74,14 +74,14 @@ class TestSessionControl(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
+            json={},
         ).json()
         rid = None
 
         # open an existing session, should get session_id as None
         ret = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000, "session_id": session_id},
+            json={"session_id": session_id},
         )
         self.assertNotEqual(ret.status_code, 200)
 
@@ -339,7 +339,7 @@ class TestSessionControl(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
+            json={},
         ).json()
         rid = None
 
@@ -449,7 +449,7 @@ class TestSessionControl(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
+            json={},
         ).json()
 
         outputs_from_session = []
@@ -625,14 +625,14 @@ class TestSessionControlVision(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
+            json={},
         ).json()
         rid = None
 
         # open an existing session, should get session_id as None
         ret = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000, "session_id": session_id},
+            json={"session_id": session_id},
         )
         self.assertNotEqual(ret.status_code, 200)
 
@@ -840,9 +840,7 @@ class TestSessionControlMrope(CustomTestCase):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
                 salt = uuid.uuid4().hex
-                sid = self.post(
-                    "/open_session", capacity_of_str_len=4096, streaming=streaming
-                )
+                sid = self.post("/open_session", streaming=streaming)
                 try:
                     first = self.post(
                         "/generate",

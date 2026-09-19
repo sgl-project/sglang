@@ -1314,7 +1314,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def open_session(
         self,
-        capacity_of_str_len: int,
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
@@ -1322,7 +1321,6 @@ class Engine(EngineScoreMixin, EngineBase):
         """Open a session for multi-turn conversation with shared context.
 
         Args:
-            capacity_of_str_len: Maximum string length capacity for the session.
             session_id: Optional session ID. If not provided, a UUID will be generated.
             streaming: Use low-overhead path for realtime streaming (append-only mode).
             timeout: If set, the session is automatically closed after being inactive
@@ -1333,7 +1331,6 @@ class Engine(EngineScoreMixin, EngineBase):
             The session ID (either the provided one or a newly generated UUID).
         """
         obj = OpenSessionReqInput(
-            capacity_of_str_len=capacity_of_str_len,
             session_id=session_id,
             streaming=streaming,
             timeout=timeout,

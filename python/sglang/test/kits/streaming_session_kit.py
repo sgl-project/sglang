@@ -46,7 +46,7 @@ class StreamingSessionKitMixin:
         requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000, "streaming": True},
+            json={"streaming": True},
         ).json()
         rid = None
 
@@ -147,7 +147,7 @@ class StreamingSessionKitMixin:
 
         resp = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 50000, "streaming": True},
+            json={"streaming": True},
         )
         self.assertEqual(resp.status_code, 200)
         session_id = resp.json()
@@ -253,7 +253,7 @@ class StreamingSessionKitMixin:
 
         resp = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 50000, "streaming": True},
+            json={"streaming": True},
         )
         self.assertEqual(resp.status_code, 200)
         session_id = resp.json()
@@ -337,7 +337,7 @@ class StreamingSessionKitMixin:
 
         resp = requests.post(
             self.base_url + "/open_session",
-            json={"capacity_of_str_len": 50000, "streaming": True},
+            json={"streaming": True},
         )
         self.assertEqual(resp.status_code, 200)
         session_id = resp.json()
