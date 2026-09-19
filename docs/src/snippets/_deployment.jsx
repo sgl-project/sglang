@@ -985,11 +985,12 @@ export const Deployment = ({ config, benchmarks }) => {
           {sharedText && (
             <div style={s.benchWorkload}>{sharedText}</div>
           )}
+          <div style={{ overflowX: "auto" }}>
           <div
             style={{
               ...s.benchTable,
               gridTemplateColumns:
-                `max-content repeat(${colCount}, minmax(0, 1fr))`,
+                `max-content repeat(${colCount}, minmax(max-content, 1fr))`,
             }}
           >
             {showColHeaders && (
@@ -1013,6 +1014,7 @@ export const Deployment = ({ config, benchmarks }) => {
                 </div>
               )),
             ])}
+          </div>
           </div>
           {legend && (
             <div style={s.benchLegend}>
