@@ -202,6 +202,9 @@ class Session:
 
     def _resolve_parent(self, session_params):
         """Read-only parent selection shared by routing inspection and execution."""
+        incarnation = getattr(session_params, "incarnation", None)
+        if incarnation is not None and incarnation != self.incarnation:
+            return None, "Session incarnation changed."
         if self.streaming:
             if self._inflight:
                 return None, "Streaming session already has an active request."
@@ -319,7 +322,12 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
-            session=self,
+            session=(
+                self
+                if getattr(session_params, "incarnation", None)
+                in (None, self.incarnation)
+                else None
+            ),
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,

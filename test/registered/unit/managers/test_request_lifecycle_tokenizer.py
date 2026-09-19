@@ -2,7 +2,7 @@ import asyncio
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import httpx
 from fastapi import FastAPI, Request
@@ -17,12 +17,16 @@ from sglang.srt.entrypoints import http_server
 from sglang.srt.managers import tokenizer_control_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    CloseSessionReqInput,
     GenerateReqInput,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
     SessionParams,
     SessionRoutingReqInput,
     SessionRoutingReqOutput,
 )
 from sglang.srt.managers.request_lifecycle import RequestLifecycle
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -38,6 +42,48 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
         self.manager._lifecycle_tasks = {}
         self.attempt = uuid.uuid4().hex
         self.manager.request_lifecycle.claim(self.attempt, "null")
+
+    async def test_open_uses_proxy_fence_but_ignores_untrusted_body_incarnation(self):
+        manager = self.manager
+        manager.session_futures = {}
+        manager.auto_create_handle_loop = Mock()
+        manager._dispatch_to_scheduler = lambda obj: (
+            manager._handle_open_session_req_output(
+                OpenSessionReqOutput(session_id=obj.session_id, success=True)
+            )
+        )
+        chosen = uuid.uuid4().hex
+        for request in [
+            SimpleNamespace(state=SimpleNamespace(native_session_incarnation=chosen)),
+            None,
+        ]:
+            obj = OpenSessionReqInput(
+                capacity_of_str_len=0, session_id="s", session_incarnation="body-value"
+            )
+            self.assertEqual(await manager.open_session(obj, request), "s")
+            self.assertEqual(len(obj.session_incarnation), 32)
+            if request is not None:
+                self.assertEqual(obj.session_incarnation, chosen)
+            else:
+                self.assertNotIn(obj.session_incarnation, (chosen, "body-value"))
+
+    def test_stale_session_close_is_rejected_before_releasing_radix_state(self):
+        controller, cache = MagicMock(), Mock()
+        controller.get.return_value = SimpleNamespace(incarnation="current")
+        controller.__contains__.return_value = True
+        scheduler = SimpleNamespace(
+            session_controller=controller,
+            tree_cache=cache,
+            enable_session_radix_cache=True,
+        )
+        request = CloseSessionReqInput(session_id="s", session_incarnation="stale")
+        Scheduler.close_session(scheduler, request)
+        cache.release_radix_session.assert_not_called()
+        controller.close.assert_not_called()
+        request.session_incarnation = "current"
+        Scheduler.close_session(scheduler, request)
+        cache.release_radix_session.assert_called_once_with("s")
+        controller.close.assert_called_once_with(request)
 
     async def test_session_routing_cancelled_query_cannot_capture_a_later_reply(self):
         manager = self.manager

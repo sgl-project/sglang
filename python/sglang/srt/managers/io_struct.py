@@ -155,6 +155,8 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
+    # Optional exact-open fence; the native HTTP proxy supplies this in a header.
+    incarnation: Optional[str] = None
 
 
 # Type definitions for multimodal input data
@@ -2235,6 +2237,7 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+    session_incarnation: Optional[str] = None
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):

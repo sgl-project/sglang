@@ -15,9 +15,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import SessionParams
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -218,6 +219,21 @@ class TestSessionTokenShare(CustomTestCase):
         tree = Session(0, "s")
         with self.assertRaisesRegex(ValueError, "Invalid request session id"):
             tree.routing_input_ids(SessionParams(id="s", rid="missing"), [1], None)
+
+    def test_stale_incarnation_does_not_attach_or_mutate_a_reopened_session(self):
+        self._create("active", [1, 2, 3])
+        stale = _recv("stale", [])
+        stale.session_params = SessionParams(id="s", incarnation="previous-open")
+        with self.assertRaisesRegex(ValueError, "incarnation changed"):
+            self.session.routing_input_ids(stale.session_params, [], None)
+        with patch(
+            "sglang.srt.managers.schedule_batch.get_parallel",
+            return_value=SimpleNamespace(tp_rank=0),
+        ):
+            rejected = self.session.create_req(stale, None, VOCAB)
+        self.assertIsNone(rejected.session)
+        self.assertIsInstance(rejected.to_finish, FINISH_ABORT)
+        self.assertTrue(self.session._inflight)
 
 
 if __name__ == "__main__":
