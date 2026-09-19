@@ -17,7 +17,7 @@ import logging
 import os
 import pathlib
 import shutil
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -63,13 +63,24 @@ def device_compiler_path() -> str:
 
 
 @cache_once
+def explicit_host_compiler() -> Optional[str]:
+    """The host compiler the user named via ``CXX``, if any.
+
+    nvcc does not read ``CXX`` — it takes ``-ccbin`` or falls back to ``gcc``
+    off PATH — so ``base_cuda_flags`` also consults this to decide whether to
+    point nvcc at the compiler the rest of the build already uses.
+    """
+    return os.environ.get("CXX")
+
+
+@cache_once
 def host_compiler_path() -> str:
     """The C++ compiler host code is handed to.
 
     nvcc dispatches all host code to it, so its version decides both which
     system headers are pulled in and how that half is codegen'd.
     """
-    return os.environ.get("CXX", "c++")
+    return explicit_host_compiler() or "c++"
 
 
 @cache_once
@@ -137,7 +148,15 @@ def base_cxx_flags() -> List[str]:
 def base_cuda_flags() -> List[str]:
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
-    return ["-Xcompiler", "-fPIC"]
+    flags = ["-Xcompiler", "-fPIC"]
+    # nvcc picks its host compiler off PATH (gcc), ignoring CXX, so .cu host
+    # code can be built by a different compiler than the .cpp units and the
+    # link step. Only an explicit CXX is forwarded — the fallback ("c++")
+    # would change the default host compiler nvcc would otherwise choose.
+    cxx = explicit_host_compiler()
+    if cxx is not None:
+        flags += ["-ccbin", cxx]
+    return flags
 
 
 def base_include_paths() -> List[str]:
