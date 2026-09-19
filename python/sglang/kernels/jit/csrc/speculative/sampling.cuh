@@ -52,7 +52,7 @@ void tree_speculative_sampling_target_only(
   SymbolicDevice device;
   TensorMatcher({batch_size, draft_tokens})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(candidates)
       .verify(retrive_index)
       .verify(retrive_next_token)
