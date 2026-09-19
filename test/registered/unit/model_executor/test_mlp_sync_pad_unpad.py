@@ -86,6 +86,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
             can_run_decode_cuda_graph=True,
+            dp_prefill_spec_phase=None,
         )
 
         fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
