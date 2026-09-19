@@ -819,7 +819,7 @@ class SWAComponent(TreeComponent):
             covered += len(cur.key)
             if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
+                    comp.metadata[uuid_key] = next_component_uuid(ct)
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 

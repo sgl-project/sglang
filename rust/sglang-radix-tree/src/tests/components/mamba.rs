@@ -159,6 +159,14 @@ fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
 }
 
 #[test]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+fn get_or_fill_uuid_rejects_mamba() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [node] = chain::<1>(&mut tc);
+    mamba_component().get_or_fill_uuid(&mut tc, node, /* host = */ false);
+}
+
+#[test]
 fn node_has_component_data_reads_each_layer() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
