@@ -877,6 +877,17 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Serve a dense bf16 MoE layer as MXFP4 on the AITER path, quantising its
+    # experts once at weight load. A model served as MXFP4 that keeps one layer
+    # dense bf16 -- a draft/MTP layer, typically -- moves four times the weight
+    # bytes per step on that layer. Opt-in because the quantisation is lossy:
+    # it trades weight precision for bandwidth and changes numerics.
+    SGLANG_AITER_BF16_MOE_MXFP4 = EnvBool(False)
+    # Route the bf16 linears a decode step issues through the gfx950 Gluon
+    # skinny GEMM instead of AITER's tuned dispatch. Opt-in: the kernel carries
+    # a tuned table for the shapes it was measured on and a conservative
+    # fallback elsewhere, so a shape outside that table is slower, not wrong.
+    SGLANG_USE_SKINNY_GEMM = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
@@ -217,6 +218,19 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.skinny_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.skinny_gemm_gluon:skinny_gemm_gluon",
+        capabilities=_HIP,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="skinny [m, k] @ [n, k].T with deep k; serves the GEMMs a decode step issues",
+        ),
+        description="Skinny bf16 GEMM for gfx950, in Gluon (split-K, XCD banding, B cache policy).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.n128k512",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
@@ -324,6 +338,30 @@ def tiny_gemm_bf16(
     return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
 
 
+def skinny_gemm_bf16(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    **config,
+) -> torch.Tensor:
+    """Skinny bf16 GEMM ``x[m, k] @ w[n, k].T (+ bias)`` for decode batches.
+
+    `gemm.tiny_gemm` covers the same operand shape by splitting N only, which
+    assumes N carries enough parallelism to fill the device. The GEMMs a decode
+    step issues run k in the thousands against an n that yields a handful of
+    blocks, so this one splits k as well. The tile, split and cache-policy
+    choices come from the kernel's tuned table for the shape; anything passed
+    in `config` overrides them.
+    """
+    from sglang.kernels.ops.gemm.skinny_gemm_gluon import default_config
+
+    impl = get_kernel("gemm.skinny_gemm", KernelBackend.TRITON)
+    tuned = default_config(x.shape[0], w.shape[0], x.shape[1])
+    tuned.update(config)
+    return impl(x, w, bias, out, **tuned)
+
+
 def n128k512_gemm_bf16(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -383,6 +421,7 @@ __all__ = [
     "fp8_scaled_mm",
     "n128k512_gemm_bf16",
     "n32k5120_gemm_bf16",
+    "skinny_gemm_bf16",
     "tiny_gemm_bf16",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
