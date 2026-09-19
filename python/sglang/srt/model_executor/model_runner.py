@@ -1375,12 +1375,7 @@ class ModelRunner:
 
     @property
     def logical_max_total_num_tokens(self):
-        """Schedulable capacity in request-token IDs, not per-rank KV rows.
-
-        Physical pool capacities remain unchanged. DCP's allocator already
-        widens its token domain; applying another parallelism multiplier would
-        overstate the number of allocatable tokens.
-        """
+        """Request-token capacity; the DCP allocator already accounts for sharding."""
         capacity = self.max_total_num_tokens
         if self.ps.attn_dcp_size > 1 and not self.is_hybrid_swa:
             capacity = self.token_to_kv_pool_allocator.size

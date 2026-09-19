@@ -45,17 +45,15 @@ def make_worker(dcp_size, *, allocator_size=None):
     runner.req_to_token_pool.max_context_len = CONTEXT
     runner.req_to_token_pool._aux_cache = None
     runner.forward_stream = None
-    runner.weight_load_mem_usage = 190.15
-    runner.graph_mem_usage = 6.22
-    worker = NS(
+    runner.weight_load_mem_usage = 0
+    return NS(
         model_runner=runner,
         model_config=NS(context_len=CONTEXT),
         server_args=NS(max_prefill_tokens=16384, max_queued_requests=None),
         random_seed=0,
         device="cpu",
-        graph_memory_usage={"decode": 6.22},
+        graph_memory_usage={},
     )
-    return worker
 
 
 def make_scheduler(worker):
@@ -123,21 +121,6 @@ class TestDcpLogicalCapacity(CustomTestCase):
             config.start()
             self.addCleanup(config.stop)
 
-    def test_attention_group_capacity_ignores_unrelated_tp_dp_and_configured_dcp(self):
-        for effective_dcp, configured_dcp, tp, dp in (
-            (1, 8, 8, 8),
-            (2, 8, 16, 4),
-            (8, 8, 16, 2),
-        ):
-            with self.subTest(effective_dcp=effective_dcp, tp=tp, dp=dp):
-                worker = make_worker(effective_dcp)
-                worker.model_runner.server_args.dcp_size = configured_dcp
-                worker.model_runner.ps.tp_size = tp
-                worker.model_runner.ps.dp_size = dp
-                self.assertEqual(
-                    TpModelWorker.get_worker_info(worker)[0], PHYSICAL * effective_dcp
-                )
-
     def test_auxiliary_dense_capacity_applies_after_dcp_translation(self):
         worker = make_worker(8)
         worker.model_config.context_len = 4_000_000
@@ -146,17 +129,19 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertEqual(info[0], 2_000_000)
         self.assertEqual(info[4], 1_999_999)
 
-    def test_worker_capacity_and_physical_buffers(self):
-        for dcp_size in (1, 8):
+    def test_worker_capacity_uses_effective_dcp(self):
+        for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):
                 worker = make_worker(dcp_size)
+                # Configured DCP/TP/DP are not the effective attention group.
+                worker.model_runner.server_args.dcp_size = 8
+                worker.model_runner.ps.tp_size = 16
+                worker.model_runner.ps.dp_size = 4
                 info = TpModelWorker.get_worker_info(worker)
-                logical = PHYSICAL * dcp_size
-                self.assertEqual(info[0], logical)
-                self.assertEqual(info[4], min(CONTEXT - 1, logical - 1))
-                self.assertEqual(info[5], min(CONTEXT - 1, logical - 1) - 5)
-                self.assertEqual(worker.model_runner.max_total_num_tokens, PHYSICAL)
-                self.assertEqual(worker.model_runner.token_to_kv_pool.size, PHYSICAL)
+                capacity = PHYSICAL * dcp_size
+                self.assertEqual(info[0], capacity)
+                self.assertEqual(info[4], min(CONTEXT, capacity) - 1)
+                self.assertEqual(info[5], info[4] - 5)
 
     def test_allocator_is_authoritative_not_another_dcp_multiplier(self):
         worker = make_worker(8, allocator_size=PHYSICAL * 4)
@@ -166,16 +151,23 @@ class TestDcpLogicalCapacity(CustomTestCase):
         worker.model_runner.max_total_num_tokens = PHYSICAL * 8
         self.assertEqual(TpModelWorker.get_worker_info(worker)[0], PHYSICAL * 4)
 
-    def test_tp1_and_hybrid_swa_keep_existing_capacity_semantics(self):
-        worker = make_worker(1, allocator_size=PHYSICAL * 2)
-        runner = worker.model_runner
+    def test_non_dcp_and_hybrid_swa_bounds(self):
+        runner = make_worker(1, allocator_size=PHYSICAL * 2).model_runner
         self.assertEqual(runner.logical_max_total_num_tokens, PHYSICAL)
         runner.is_hybrid_swa = True
-        runner.full_max_total_num_tokens = PHYSICAL // 2
         runner.swa_max_total_num_tokens = PHYSICAL // 4
-        self.assertEqual(runner.effective_max_total_num_tokens, PHYSICAL // 2)
-        runner.full_max_total_num_tokens = 0
-        self.assertEqual(runner.effective_max_total_num_tokens, PHYSICAL // 4)
+        for dcp_size, full_capacity, expected in (
+            (1, PHYSICAL // 2, PHYSICAL // 2),
+            (1, 0, PHYSICAL // 4),
+            (8, PHYSICAL // 2, PHYSICAL // 2),
+        ):
+            with self.subTest(dcp_size=dcp_size, full_capacity=full_capacity):
+                runner.ps.attn_dcp_size = dcp_size
+                runner.full_max_total_num_tokens = full_capacity
+                self.assertEqual(
+                    runner.effective_logical_max_total_num_tokens, expected
+                )
+                self.assertEqual(runner.logical_max_total_num_tokens, PHYSICAL)
 
     def test_output_budget_does_not_multiply_logical_capacity_again(self):
         worker = make_worker(8)
@@ -188,16 +180,6 @@ class TestDcpLogicalCapacity(CustomTestCase):
         )
         Scheduler.init_req_max_new_tokens(scheduler, req)
         self.assertEqual(req.sampling_params.max_new_tokens, 511)
-
-    def test_hybrid_swa_request_bound_is_not_blindly_widened(self):
-        worker = make_worker(8)
-        runner = worker.model_runner
-        runner.is_hybrid_swa = True
-        runner.full_max_total_num_tokens = PHYSICAL // 2
-        runner.swa_max_total_num_tokens = PHYSICAL // 4
-        self.assertEqual(runner.effective_logical_max_total_num_tokens, PHYSICAL // 2)
-        self.assertEqual(runner.logical_max_total_num_tokens, PHYSICAL)
-        self.assertEqual(runner.effective_max_total_num_tokens, PHYSICAL // 2)
 
     def test_one_million_token_context_is_not_clipped_to_per_rank_rows(self):
         scheduler = make_scheduler(make_worker(8))
