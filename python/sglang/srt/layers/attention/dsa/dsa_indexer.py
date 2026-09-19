@@ -112,10 +112,6 @@ if _is_xpu:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
-from sglang.srt.distributed import (
-    get_attn_tp_group,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -157,7 +153,7 @@ if _is_cuda:
 
 
 def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
-    group = get_attn_tp_group()
+    group = get_parallel().attn_tp_group
     if group.world_size == 1:
         return
 
@@ -260,7 +256,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
-            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+            self.logits_with_pp_recv = (
+                pp_size > 1 and not get_parallel().pp_group.is_last_rank
+            )
         else:
             self.logits_with_pp_recv = False
 
