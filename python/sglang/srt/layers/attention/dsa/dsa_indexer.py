@@ -213,10 +213,63 @@ else:
 
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa.indexer_k import (
+        can_use_k_indexer_norm_rope_store_mxfp4,
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
+        fused_k_indexer_norm_rope_store_mxfp4,
     )
-    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.kernels.ops.attention.dsv4 import (
+        fused_q_indexer_rope_first_fp4_quant,
+        fused_q_indexer_rope_first_int8_quant,
+        fused_q_indexer_rope_first_quant,
+    )
+
+    def _scale_head_gate_no_q_scale_graph_fake_impl(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (weights_raw.shape[0], weights_raw.shape[1], 1),
+            dtype=torch.float32,
+            device=weights_raw.device,
+        )
+
+    @register_custom_op(fake_impl=_scale_head_gate_no_q_scale_graph_fake_impl)
+    def scale_head_gate_no_q_scale_graph(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        weights = weights_raw * n_heads_inv_sqrt
+        return weights.unsqueeze(-1) * softmax_scale
+
+    def _logits_head_gate_graph_fake_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+
+    # In-graph (PCG/BCG) head gate for the NON-prefill path
+    @register_custom_op(fake_impl=_logits_head_gate_graph_fake_impl)
+    def logits_head_gate_graph(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        weights = out * n_heads_inv_sqrt
+        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+        return weights
 
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
@@ -601,6 +654,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
         weights = weights_raw * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    @torch.compile(dynamic=True)
+    def _scale_head_gates_no_q_scale(self, weights_raw: torch.Tensor):
+        weights = weights_raw * self.n_heads**-0.5
+        return (weights.unsqueeze(-1) * self.softmax_scale).to(torch.float32)
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
@@ -1011,7 +1069,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
         if (
-            not _is_fp8_fnuz
+            self.use_fp4
+            and not _is_fp8_fnuz
+            and out_cache_loc is not None
+            and can_use_k_indexer_norm_rope_store_mxfp4(
+                torch.bfloat16, out_cache_loc.dtype, page_size
+            )
+        ):
+            fused_k_indexer_norm_rope_store_mxfp4(
+                key_raw,
+                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                out_cache_loc,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_cos_sin_cache,
+                positions,
+                page_size,
+            )
+            return
+
+        if (
+            not self.use_fp4
+            and not self.use_int8
+            and not _is_fp8_fnuz
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -1028,7 +1109,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return
 
-        # Fallback: separate K kernel + store kernel.
+        # Fallback: compute normalized/rotated K as bf16, then use the
+        # format-specific cache store below. For MXFP4, _store_index_k_cache
+        # performs the FP4 block quantization and writes the 68-byte/token layout.
         key = fused_k_indexer_norm_rope(
             key_raw,
             self.k_norm.weight,
@@ -1056,9 +1139,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         *,
         num_tokens: Optional[int] = None,
         enable_dual_stream: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         # num_tokens (graph split-op contract) slices q/k/positions/out_cache_loc
-        # to the unpadded count; the returned q_fp8/weights are sliced to match.
+        # to the unpadded count; the returned q/weights are sliced to match.
         q_scale_gate = self.softmax_scale * self.n_heads**-0.5
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
@@ -1082,7 +1165,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
-            return fused_q_indexer_rope_first_quant(
+            q_quant_func = (
+                fused_q_indexer_rope_first_fp4_quant
+                if self.use_fp4
+                else (
+                    fused_q_indexer_rope_first_int8_quant
+                    if self.use_int8
+                    else fused_q_indexer_rope_first_quant
+                )
+            )
+            return q_quant_func(
                 q.contiguous(),
                 weights_raw,
                 q_scale_gate,
@@ -1109,7 +1201,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
+        q_quant_func = (
+            fused_q_indexer_rope_first_fp4_quant
+            if self.use_fp4
+            else (
+                fused_q_indexer_rope_first_int8_quant
+                if self.use_int8
+                else fused_q_indexer_rope_first_quant
+            )
+        )
+        q_quant, weights = q_quant_func(
             q.contiguous(),
             weights_raw,
             q_scale_gate,
@@ -1127,7 +1228,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         current_stream.wait_stream(self.alt_stream)
-        return q_fp8, weights
+        return q_quant, weights
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -2123,13 +2224,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         out_cache_loc will default to forward_batch.out_cache_loc if not provided.
         """
 
-        # FP4 path: must use the fused MXFP4 store kernel — the unfused
-        # quant+store fallback is FP8-only (no scalar fp32 scale exists).
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
+
+        # FP4 path: the norm+rope fallback produces bf16 key here; this store
+        # kernel performs MXFP4 block quantization and writes the FP4 cache layout.
         if self.use_fp4:
             assert _is_cuda and not _is_fp8_fnuz
             assert can_use_nsa_fused_store_mxfp4(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
+                out_cache_loc.dtype,
                 get_token_to_kv_pool().page_size,
             ), "MXFP4 fused store JIT failed to load"
             buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
@@ -2138,18 +2242,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             fused_store_index_k_mxfp4_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
+                out_cache_loc,
                 get_token_to_kv_pool().page_size,
             )
             return
-
-        if out_cache_loc is None:
-            out_cache_loc = forward_batch.out_cache_loc
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
+        # int8 path: per-token int8 quantization + store (no fused FP8 store kernel).
+        if self.use_int8:
+            key_2d = key.view(-1, key.shape[-1]) if key.dim() != 2 else key
+            k_int8, k_scale = per_token_quant_int8(key_2d.contiguous())
+            if not out_cache_loc.is_contiguous():
+                out_cache_loc = out_cache_loc.contiguous()
+            pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=out_cache_loc,
+                index_k=k_int8,
+                index_k_scale=k_scale,
+            )
             return
 
         if (
@@ -2506,12 +2621,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 if self.use_fp4:
                     # FP4 path: per-block Q scales travel with Q values, so the
                     # head-gate weights skip the q_scale factor entirely.
-                    weights = logits_head_gate_no_q_scale_pcg(
-                        x_for_gate,
-                        self.weights_proj.weight,
-                        self.n_heads**-0.5,
-                        self.softmax_scale,
-                    )
+                    if self.use_dsa_indexer_fusion:
+                        weights = scale_head_gate_no_q_scale_graph(
+                            weights_raw,
+                            self.n_heads**-0.5,
+                            self.softmax_scale,
+                        )
+                    else:
+                        weights = logits_head_gate_no_q_scale_pcg(
+                            x_for_gate,
+                            self.weights_proj.weight,
+                            self.n_heads**-0.5,
+                            self.softmax_scale,
+                        )
                 elif self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
@@ -2532,7 +2654,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             elif self.use_fp4:
                 # FP4 path: per-block Q scales travel with Q values, so the
                 # head-gate weights skip the q_scale factor entirely.
-                weights = self._get_logits_head_gate_no_q_scale(x_for_gate)
+                if self.use_dsa_indexer_fusion:
+                    weights = self._scale_head_gates_no_q_scale(weights_raw)
+                else:
+                    weights = self._get_logits_head_gate_no_q_scale(x_for_gate)
             elif self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:

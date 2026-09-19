@@ -1,5 +1,7 @@
 """DSA only. Indexer K kernels (JIT)."""
 
+import logging
+
 import torch
 
 from sglang.kernels.jit.utils import (
@@ -36,6 +38,34 @@ def _jit_k_indexer_norm_rope_store_module(dtype: torch.dtype, page_size: int):
             ("forward", f"FusedKIndexerNormRopeStoreKernel<{args}>::forward"),
         ],
     )
+
+
+@cache_once
+def _jit_k_indexer_norm_rope_store_mxfp4_module(
+    dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
+):
+    args = make_cpp_args(dtype, indices_dtype, is_arch_support_pdl(), page_size)
+    return load_jit(
+        f"dpsk_v32_k_indexer_norm_rope_store_mxfp4_p{page_size}",
+        *args,
+        cuda_files=[_CUDA_FILE],
+        cuda_wrappers=[
+            ("forward", f"FusedKIndexerNormRopeStoreMXFP4Kernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def can_use_k_indexer_norm_rope_store_mxfp4(
+    dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
+) -> bool:
+    logger = logging.getLogger(__name__)
+    try:
+        _jit_k_indexer_norm_rope_store_mxfp4_module(dtype, indices_dtype, page_size)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load dsa fused K MXFP4 store JIT kernel: {e}")
+        return False
 
 
 def fused_k_indexer_norm_rope(
@@ -78,6 +108,36 @@ def fused_k_indexer_norm_rope_store(
     if not out_cache_loc.is_contiguous():
         out_cache_loc = out_cache_loc.contiguous()
     module = _jit_k_indexer_norm_rope_store_module(k_input.dtype, page_size)
+    module.forward(
+        k_input,
+        cache,
+        out_cache_loc,
+        weight,
+        bias,
+        cos_sin_cache,
+        positions,
+        float(eps),
+    )
+
+
+def fused_k_indexer_norm_rope_store_mxfp4(
+    k_input: torch.Tensor,
+    cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    page_size: int,
+) -> None:
+    """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims + MXFP4
+    block quant + paged index-k cache write, in one launch. CUDA only."""
+    if not out_cache_loc.is_contiguous():
+        out_cache_loc = out_cache_loc.contiguous()
+    module = _jit_k_indexer_norm_rope_store_mxfp4_module(
+        k_input.dtype, out_cache_loc.dtype, page_size
+    )
     module.forward(
         k_input,
         cache,
