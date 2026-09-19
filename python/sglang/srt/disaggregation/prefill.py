@@ -659,6 +659,7 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                self._sched_idled = True
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
@@ -700,6 +701,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self._sched_idled = True
 
             # Process the last batch
             if self.last_batch:

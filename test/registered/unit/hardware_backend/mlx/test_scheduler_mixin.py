@@ -32,6 +32,7 @@ class TestMlxLaunchBookkeeping(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         result = MagicMock()
         result.next_token_ids = None
         scheduler.tp_worker.finalize_mlx_result.return_value = result
@@ -111,6 +112,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (
             SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
         )
@@ -260,7 +262,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
     never get their user-space release.
     """
 
-    def _make_scheduler(self):
+    def _make_scheduler(self, *, recv_side_effect):
         from collections import deque
 
         scheduler = MagicMock()
@@ -269,14 +271,16 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
+        recv_requests = MagicMock(side_effect=recv_side_effect)
 
-        # ingest_requests now receives and processes ShutdownReq in one call.
-        def ingest_shutdown():
-            if scheduler.gracefully_exit:
-                raise _StopLoop()
-            scheduler.gracefully_exit = True
+        def ingest_requests():
+            reqs = recv_requests()
+            # Ingestion dispatches the shutdown request before the loop resumes.
+            if reqs:
+                scheduler.gracefully_exit = True
+            return reqs
 
-        scheduler.ingest_requests.side_effect = ingest_shutdown
+        scheduler.ingest_requests.side_effect = ingest_requests
         plan = MagicMock()
         plan.batch_to_run = None
         scheduler.get_next_batch_to_run.return_value = plan
@@ -289,7 +293,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
 
         # Ingest shutdown once. A second poll raises instead of hanging if
         # the loop fails to exit.
-        scheduler = self._make_scheduler()
+        scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
 
         with patch(
             "sglang.srt.hardware_backend.mlx.scheduler_mixin.mx.synchronize"
@@ -309,7 +313,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         # the body.  The flag check must sit above the paused-continue, like in
         # event_loop_normal/event_loop_overlap, or shutdown during a pause
         # spins forever.
-        scheduler = self._make_scheduler()
+        scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
         scheduler._engine_paused = True
 
         with patch(

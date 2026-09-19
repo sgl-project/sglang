@@ -425,10 +425,10 @@ def handle_environment_variables(server_args: Any):
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
         )
-    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-    # it, mirroring the forward scale split: the ue8m0 path
-    # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-    # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
+    # run it, mirroring the forward scale split: the default sm100 UE8M0
+    # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
+    # SM120 API compatibility is centralized in deep_gemm_wrapper.configurer.
     if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
@@ -442,7 +442,7 @@ def handle_environment_variables(server_args: Any):
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and a compatible sm100/sm120 build, or explicit opt-in on sm90; "
                 "detected sm%d.",
                 sm,
             )
