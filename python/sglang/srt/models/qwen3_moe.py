@@ -72,11 +72,13 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
@@ -88,6 +90,12 @@ if _is_cuda:
 @lru_cache(maxsize=1)
 def _has_cpu_fused_qk_norm_rope() -> bool:
     return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_rope_cpu")
+
+
+@lru_cache(maxsize=1)
+def _has_xpu_fused_qk_norm_rope() -> bool:
+    # AOT in sgl-kernel-xpu (sgl-kernel-xpu#97); absent from older wheels.
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_rope")
 
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
@@ -527,6 +535,12 @@ class Qwen3MoeAttention(nn.Module):
             and self.rotary_emb.rotary_dim % 2 == 0
             and _has_cpu_fused_qk_norm_rope()
         )
+        self.use_fused_qk_norm_rope_xpu = (
+            get_exec().kernel.enable_fused_qk_norm_rope
+            and _is_xpu
+            and self.compatible_with_fused_qk_norm_rope
+            and _has_xpu_fused_qk_norm_rope()
+        )
         self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
@@ -594,9 +608,16 @@ class Qwen3MoeAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        use_fused = (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16) or (
-            self.use_fused_qk_norm_rope_cpu
-            and qkv.dtype in (torch.bfloat16, torch.float16)
+        use_fused = (
+            (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16)
+            or (
+                self.use_fused_qk_norm_rope_cpu
+                and qkv.dtype in (torch.bfloat16, torch.float16)
+            )
+            or (
+                self.use_fused_qk_norm_rope_xpu
+                and qkv.dtype in (torch.bfloat16, torch.float16)
+            )
         )
         if use_fused:
             if _is_cuda:
@@ -625,6 +646,34 @@ class Qwen3MoeAttention(nn.Module):
                     low,
                     high,
                     attention_factor,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            elif _is_xpu:
+                positions = (
+                    positions.view(-1)
+                    .to(dtype=torch.int32, device=qkv.device)
+                    .contiguous()
+                )
+                factor, low, high, attention_factor = compute_yarn_parameters(
+                    self.config
+                )
+                torch.ops.sgl_kernel.fused_qk_norm_rope(
+                    qkv,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rope_theta,
+                    self.rotary_emb.is_neox_style,
+                    positions,
+                    factor,
+                    low,
+                    high,
+                    attention_factor,
+                    self.rotary_emb.rotary_dim,
                 )
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             elif _is_cpu:
