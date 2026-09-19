@@ -129,7 +129,11 @@ class MultimodalSpecialTokens:
             return token
         if isinstance(token, str):
             return token
-        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+        # PATCH(AMD): AutoProcessor returns a bare tokenizer when the repo ships no
+        # image-preprocessor config (DeepSeek-V4.1-Flash has vision weights but no
+        # preprocessor_config.json), and that object has no `.tokenizer`.
+        tokenizer = getattr(processor, "tokenizer", processor)
+        return tokenizer.convert_ids_to_tokens([token])[0]
 
     def convert_to_strs(self, processor):
         if not self.image_token:

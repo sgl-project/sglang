@@ -45,7 +45,18 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
 
 namespace moe {
 
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+// PATCH(AMD): HIP wavefronts are 64 wide, so __shfl_up_sync's mask must be a
+// 64-bit integer; the CUDA-shaped `unsigned` mask trips a static_assert in
+// amd_warp_sync_functions.h and the whole JIT module fails to build on gfx942.
+#ifdef USE_ROCM
+using sgl_warp_mask_t = unsigned long long;
+#define SGL_FULL_WARP_MASK (~0ull)
+#else
+using sgl_warp_mask_t = unsigned;
+#define SGL_FULL_WARP_MASK (0xffffffffu)
+#endif
+
+__device__ __forceinline__ int warp_exclusive_scan(int v, sgl_warp_mask_t mask = SGL_FULL_WARP_MASK) {
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
