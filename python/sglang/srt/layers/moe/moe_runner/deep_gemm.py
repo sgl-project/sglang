@@ -311,6 +311,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_int8: bool = False
     use_mxfp4: bool = False
     use_int4_w4a16: bool = False
+    # MXFP4 weights repacked for Marlin, paired with BF16 activations and
+    # BF16 numerical scales required by the PPU W4A16 kernel.
+    use_mxfp4_w4a16: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None

@@ -372,6 +372,7 @@ def deep_moe_impl_fused(
     use_int8: bool = False,
     use_mxfp4: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     gemm1_alpha: Optional[float] = None,
@@ -389,7 +390,8 @@ def deep_moe_impl_fused(
     E, N, _ = w1.shape
     _, top_k = topk_ids.shape
 
-    if use_int4_w4a16:
+    use_w4a16 = use_int4_w4a16 or use_mxfp4_w4a16
+    if use_w4a16:
         N = w2.shape[1] * 32
 
     if out_hidden_states is None:
@@ -432,9 +434,6 @@ def deep_moe_impl_fused(
 
     out1 = torch.empty(
         (num_tokens_padded, N), device=hidden_states.device, dtype=torch.bfloat16
-    )
-    out3 = torch.empty(
-        (num_tokens_padded, K), device=hidden_states.device, dtype=torch.bfloat16
     )
 
     a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = deepgemm_moe_permute(
@@ -496,7 +495,7 @@ def deep_moe_impl_fused(
         grouped_gemm_nt_f4f4bf16_nopad(
             a, a_scale, w1, w1_scale, b1, out1, expert_ids, num_recv_tokens_per_expert
         )
-    elif use_int4_w4a16:
+    elif use_w4a16:
         grouped_gemm_nt_bf16i4bf16_nopad(
             a, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
         )
@@ -504,6 +503,9 @@ def deep_moe_impl_fused(
         grouped_gemm_nt_bf16bf16bf16_nopad(
             a, w1, out1, expert_ids, num_recv_tokens_per_expert
         )
+
+    if use_w4a16:
+        del a
 
     if (
         activation != "situ"
@@ -553,6 +555,13 @@ def deep_moe_impl_fused(
             a = out2
             a_scale = None
 
+    if use_w4a16:
+        del out1
+
+    out3 = torch.empty(
+        (num_tokens_padded, K), device=hidden_states.device, dtype=torch.bfloat16
+    )
+
     if use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(
             a, a_scale, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
@@ -565,7 +574,7 @@ def deep_moe_impl_fused(
         grouped_gemm_nt_f4f4bf16_nopad(
             a, a_scale, w2, w2_scale, b2, out3, expert_ids, num_recv_tokens_per_expert
         )
-    elif use_int4_w4a16:
+    elif use_w4a16:
         grouped_gemm_nt_bf16i4bf16_nopad(
             a, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
         )
@@ -607,6 +616,7 @@ def fused_experts_none_to_deep_gemm(
     use_int8 = quant_info.use_int8
     use_mxfp4 = quant_info.use_mxfp4
     use_int4_w4a16 = quant_info.use_int4_w4a16
+    use_mxfp4_w4a16 = quant_info.use_mxfp4_w4a16
     per_channel_quant = quant_info.per_channel_quant
     w1_scale = quant_info.w13_scale
     w2_scale = quant_info.w2_scale
@@ -631,6 +641,7 @@ def fused_experts_none_to_deep_gemm(
         use_int8=use_int8,
         use_mxfp4=use_mxfp4,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         b1=b1,
         b2=b2,
         gemm1_alpha=moe_runner_config.gemm1_alpha,

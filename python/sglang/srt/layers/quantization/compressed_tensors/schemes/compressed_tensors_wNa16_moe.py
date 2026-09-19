@@ -593,9 +593,10 @@ class CompressedTensorsWNA16DeepGemmMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "situ",
+        ), "Only SiLU and SiTU activations are supported."
 
         quant_info = self.get_deep_gemm_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
