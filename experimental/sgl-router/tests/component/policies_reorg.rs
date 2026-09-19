@@ -452,34 +452,38 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
     let engine = Arc::new(Worker::new(spec("a", Stage::Plain, "m")));
-    for (reject, invalid) in [(false, false), (true, false), (false, true)] {
-        let check = Arc::new(Check {
-            calls: Mutex::new(Vec::new()),
-            reject,
-            invalid,
-        });
-        let fallback = Arc::new(TestPolicy::default());
-        let mut policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
-        policy.admission = check.clone();
-        policy.fallback = Some(fallback.clone());
-        assert!(matches!(
-            policy.pick(&[], &request).await,
-            Err(PickError::NoCandidates)
-        ));
-        assert!(check.calls.lock().unwrap().is_empty());
-        let result = policy.pick(std::slice::from_ref(&engine), &request).await;
-        if invalid {
-            assert!(matches!(result, Err(PickError::InvalidSignal(_))));
-        } else if reject {
-            assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
+    let other = Arc::new(Worker::new(spec("b", Stage::Plain, "m")));
+    let _busy = other.load_guard();
+    for engines in [vec![engine.clone()], vec![other.clone(), engine.clone()]] {
+        for (reject, invalid) in [(false, false), (true, false), (false, true)] {
+            let check = Arc::new(Check {
+                calls: Mutex::new(Vec::new()),
+                reject,
+                invalid,
+            });
+            let fallback = Arc::new(TestPolicy::default());
+            let mut policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
+            policy.admission = check.clone();
+            policy.fallback = Some(fallback.clone());
+            assert!(matches!(
+                policy.pick(&[], &request).await,
+                Err(PickError::NoCandidates)
+            ));
+            assert!(check.calls.lock().unwrap().is_empty());
+            let result = policy.pick(&engines, &request).await;
+            if invalid {
+                assert!(matches!(result, Err(PickError::InvalidSignal(_))));
+            } else if reject {
+                assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
                 if reason.engine == engine.id && reason.reason == "full"));
-        } else {
-            assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
+            } else {
+                assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
+            }
+            assert_eq!(
+                check.calls.lock().unwrap().as_slice(),
+                std::slice::from_ref(&engine.id)
+            );
+            assert!(fallback.calls.lock().unwrap().is_empty());
         }
-        assert_eq!(
-            check.calls.lock().unwrap().as_slice(),
-            std::slice::from_ref(&engine.id)
-        );
-        assert!(fallback.calls.lock().unwrap().is_empty());
     }
 }
