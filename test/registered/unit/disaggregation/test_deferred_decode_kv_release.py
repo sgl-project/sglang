@@ -10,7 +10,7 @@ fires. See DecodeTransferQueue.resolve_deferred_releases.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -130,6 +130,8 @@ def _make_queue(timeout=30.0):
     q.tree_cache = object()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
+    # _do_release clears session/mm state through the scheduler helper.
+    q.scheduler = MagicMock()
     return q
 
 

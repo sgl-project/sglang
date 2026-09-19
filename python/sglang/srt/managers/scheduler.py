@@ -170,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionReapPlan,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -2103,8 +2104,11 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
-        now = time.monotonic()
-        self.session_controller.maybe_reap(now)
+        reap_plans = [r for r in recv_reqs if isinstance(r, SessionReapPlan)]
+        if reap_plans:
+            recv_reqs = [r for r in recv_reqs if not isinstance(r, SessionReapPlan)]
+            for plan in reap_plans:
+                self.session_controller.apply_reap(plan)
 
         for recv_req in recv_reqs:
             vmm_errors = None
@@ -2340,6 +2344,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            plan_session_reap=self.session_controller.plan_reap,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -3243,7 +3248,7 @@ class Scheduler(
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
         if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+            req.session.abort_req(req.rid)
             req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
         # checks that reject; no-op when the request has no group.
@@ -3309,12 +3314,24 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
+            message = (
+                "Using priority is disabled for this server. Please send a "
+                "new request without a priority."
+            )
+            # This rejection never reaches a queue, so run the same
+            # dropped-request cleanup as a queue-full reject or the session
+            # stays busy and the early mamba alloc leaks; then stamp the req
+            # terminal so a non-streaming session node unblocks appends/close.
+            self._release_dropped_waiting_req_mm_inputs(req)
+            self._release_dropped_waiting_req_mamba_slot(req)
+            self.beam_coordinator.retire_group(req)
+            prepare_abort(req, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
             abort_req = _make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                    "message": message,
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
@@ -3325,6 +3342,40 @@ class Scheduler(
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+
+    def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
+        """Clear session/mm state of a request dropped before it was scheduled.
+
+        A streaming session's inflight marker only clears for the owning turn.
+        Session requests share historical multimodal inputs with their prior
+        request; the session owns and releases those features when it closes.
+        """
+        if getattr(req, "session", None) is not None:
+            if (
+                not getattr(req.session, "req_nodes", True)
+                and getattr(req, "multimodal_inputs", None) is not None
+            ):
+                # A first turn that never committed owns its multimodal inputs;
+                # session close only scans req_nodes, so nothing else would
+                # ever release these features.
+                req.multimodal_inputs.release_features()
+                req.multimodal_inputs = None
+            req.session.abort_req(req.rid)
+        elif getattr(req, "multimodal_inputs", None) is not None:
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs = None
+
+    def _release_dropped_waiting_req_mamba_slot(self, req: Req) -> None:
+        """Return a req-owned early Mamba alloc (init_next_round_input on a
+        req that was then refused admission) when the req leaves the waiting
+        queue for good. Slot-owned state (req_pool_idx set) stays with the
+        session."""
+        kv = getattr(req, "kv", None)
+        if kv is None or kv.mamba_pool_idx is None or kv.req_pool_idx is not None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3354,9 +3405,32 @@ class Scheduler(
             if abort_existing_req:
                 self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
+                self._release_dropped_waiting_req_mm_inputs(candidate_req)
+                self._release_dropped_waiting_req_mamba_slot(candidate_req)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+
+        if req_to_abort is recv_req:
+            # The incoming request is the one dropped: it never entered the
+            # queue, but its session turn and any early mamba alloc are still
+            # live, so run the same dropped-request cleanup or the session
+            # stays busy and the alloc leaks.
+            self._release_dropped_waiting_req_mm_inputs(recv_req)
+            self._release_dropped_waiting_req_mamba_slot(recv_req)
+
+        if req_to_abort.finished_reason is None:
+            # A queue drop never reaches prepare_abort, but a non-streaming
+            # session node only goes terminal when its req is finished --
+            # abort_req() alone clears just the streaming inflight marker, so
+            # an unstamped drop leaves the node unfinished forever (later
+            # appends rejected, close deferred). Stamp after the cleanup
+            # helpers so their pre-stamp ownership checks are unchanged. A
+            # req already stamped (e.g. by a racing AbortReq) keeps its
+            # original reason.
+            prepare_abort(
+                req_to_abort, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+            )
 
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
@@ -4026,16 +4100,18 @@ class Scheduler(
                     else:
                         running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
+                # A slot restored from a session (req_pool_idx set) is slot-owned
+                # and freed with the session; a fresh early alloc from
+                # init_next_round_input (req_pool_idx is None) is req-owned and
+                # must be returned here. Non-session reqs always have
+                # req_pool_idx None when rejected here.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
+                    if req.kv.holds_mamba and req.kv.req_pool_idx is None:
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
@@ -5412,6 +5488,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            prepare_abort(req, "Aborted")
+            self._release_dropped_waiting_req_mm_inputs(req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5445,15 +5523,51 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
+            # Reqs whose forward result is still queued (overlap) must be
+            # finished by process_batch_result_dllm, which releases KV once.
+            pending_result_reqs = (
+                {r for b, _ in self.result_queue for r in b.reqs}
+                if self.enable_overlap
+                else set()
+            )
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # A req that finished in the last forward stays queued until
+                # filter_finished_reqs(); its result is already committed.
+                if req.finished():
+                    continue
+                if req in pending_result_reqs:
+                    if recv_req.abort_message:
+                        # Keep the running-timeout message + 503 on the
+                        # deferred finish; a bare abort would lose both.
+                        req.to_finish = FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
+                    else:
+                        req.to_finish = FINISH_ABORT()
+                    self.dllm_manager.add_staging_reqs(req)
+                    continue
+                if recv_req.abort_message:
+                    # Keep the running-timeout message + 503; a generic stamp
+                    # would stream a statusless abort to the client.
+                    prepare_abort(
+                        req,
+                        recv_req.abort_message,
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                else:
+                    prepare_abort(req, "Aborted")
                 self._release_aborted_request(req)
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                # After KV release so a session slot is never reusable while
+                # the turn's KV is still held; before the IPC send so a send
+                # failure cannot strand already-popped requests.
+                self._release_dropped_waiting_req_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -5469,16 +5583,19 @@ class Scheduler(
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req)
+                    req.user_aborted = True
+                    prepare_abort(req, "Aborted")
+                    self._release_dropped_waiting_req_mm_inputs(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    req.user_aborted = True
+                    prepare_abort(req, "Aborted")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -5488,8 +5605,8 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    decode_req.req.user_aborted = True
+                    prepare_abort(decode_req.req, "Aborted")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -5497,6 +5614,8 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
+                    decode_req.req.user_aborted = True
+                    prepare_abort(decode_req.req, "Aborted")
                     # Arm drain-ack accounting once the ABORT is sent, so acks
                     # arriving before this req is deferred (e.g. during the next
                     # forward step) are captured. A fresh set also drops stale acks
@@ -5511,22 +5630,44 @@ class Scheduler(
                             decode_req.req.bootstrap_room
                         )
 
+            # Abort requests held for rebootstrap (KV already freed by retract)
+            held_rebootstrap = self.disagg_decode_prealloc_queue.held_rebootstrap_reqs
+            idx = 0
+            while idx < len(held_rebootstrap):
+                req = held_rebootstrap[idx]
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                prepare_abort(req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req), req
+                )
+                held_rebootstrap.pop(idx)
+
             # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        retraction_discard(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+            idx = 0
+            while idx < len(retracted_queue):
+                decode_req = retracted_queue[idx]
+                if not (recv_req.abort_all or decode_req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                prepare_abort(decode_req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(decode_req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(decode_req), decode_req
+                )
+                # Discard the backup only after send_output succeeds so a
+                # failed send leaves the entry queued and retryable; commit
+                # the removal in place so a retry never re-trips cleanup on
+                # an already-discarded entry.
+                retraction_discard(
+                    decode_req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                retracted_queue.pop(idx)
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
