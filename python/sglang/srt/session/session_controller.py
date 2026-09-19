@@ -298,6 +298,7 @@ class Session:
 
         new_req = Req(
             rid=req.rid,
+            lifecycle_id=req.lifecycle_id,
             origin_input_text=None,
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,

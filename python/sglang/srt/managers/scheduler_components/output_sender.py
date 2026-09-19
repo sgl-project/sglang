@@ -2,12 +2,13 @@ from typing import Optional, Union
 
 import zmq
 
-from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
+from sglang.srt.managers.io_struct import AbortReq, BaseBatchReq, BaseReq, sock_send
 
 
 class SenderWrapper:
     def __init__(self, socket: zmq.Socket):
         self.socket = socket
+        self.on_abort = None
 
     def send_output(
         self,
@@ -16,6 +17,9 @@ class SenderWrapper:
     ):
         if self.socket is None:
             return
+
+        if isinstance(output, AbortReq) and self.on_abort is not None:
+            self.on_abort(recv_obj)
 
         http_worker_ipc = getattr(recv_obj, "http_worker_ipc", None)
         if (

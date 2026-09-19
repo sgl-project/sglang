@@ -1023,9 +1023,11 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        lifecycle_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
+        self.lifecycle_id = lifecycle_id
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (

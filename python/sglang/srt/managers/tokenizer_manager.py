@@ -54,7 +54,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
@@ -89,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RequestLifecycleEvent,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -106,6 +106,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.request_lifecycle import RequestLifecycle
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -247,6 +248,7 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    lifecycle_id: Optional[str] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -654,6 +656,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.request_lifecycle = (
+            RequestLifecycle() if envs.SGLANG_ENABLE_REQUEST_LIFECYCLE.get() else None
+        )
+        if (
+            self.request_lifecycle is not None
+            and get_serving().tokenizer_worker_num != 1
+        ):
+            raise ValueError(
+                "request lifecycle currently requires one tokenizer worker"
+            )
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -826,6 +838,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (RequestLifecycleEvent, self._handle_lifecycle_event),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -898,6 +911,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    self._seal_lifecycle(obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1678,6 +1692,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
+            self._prepare_lifecycle_dispatch(tokenized_obj)
             self._dispatch_to_scheduler(tokenized_obj)
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
@@ -1689,6 +1704,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+
+    def _prepare_lifecycle_dispatch(self, obj):
+        state = self.rid_to_state.get(obj.rid)
+        if state is not None and state.lifecycle_id is not None:
+            self.request_lifecycle.dispatched(state.lifecycle_id)
+            obj.lifecycle_id = state.lifecycle_id
+            # A failed send is ambiguous; keep it accounted until acknowledged.
+            state.dispatched = True
+
+    def _seal_lifecycle(self, obj):
+        attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
+        if attempt_id is not None:
+            self.request_lifecycle.seal(attempt_id)
+
+    def _handle_lifecycle_event(self, event):
+        if self.request_lifecycle is not None:
+            self.request_lifecycle.scheduler_event(
+                event.child_id, event.dp_rank, event.phase
+            )
+
+    def cancel_lifecycle(self, attempt_id: str):
+        for child_id in self.request_lifecycle.cancel(attempt_id):
+            self._dispatch_to_scheduler(AbortReq(lifecycle_id=child_id))
+
+    async def _lifecycle_lease_loop(self):
+        while True:
+            await asyncio.sleep(1)
+            for attempt_id in self.request_lifecycle.expired():
+                self.cancel_lifecycle(attempt_id)
+            self.request_lifecycle.prune()
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -1726,6 +1771,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+            for tokenized_obj in tokenized_objs:
+                self._prepare_lifecycle_dispatch(tokenized_obj)
             self._dispatch_to_scheduler(batch_req)
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
@@ -2011,7 +2058,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
+                self._init_req_state(
+                    tmp_obj,
+                    lifecycle_attempt_id=getattr(obj, "_lifecycle_attempt_id", None),
+                    lifecycle_kind="warmup",
+                )
                 request_rids.add(tmp_obj.rid)
                 await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
@@ -2028,7 +2079,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
+                    self._init_req_state(
+                        tmp_obj,
+                        lifecycle_attempt_id=getattr(
+                            obj, "_lifecycle_attempt_id", None
+                        ),
+                    )
                     request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
@@ -2039,7 +2095,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     rids.append(tmp_obj.rid)
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                state = self.rid_to_state.pop(objs[i].rid)
+                if state.lifecycle_id is not None:
+                    self.request_lifecycle.discard(state.lifecycle_id)
+
+        self._seal_lifecycle(obj)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2107,7 +2167,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            lifecycle_id=state.lifecycle_id if state is not None else None,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2295,6 +2359,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
+        if self.request_lifecycle is not None:
+            self.asyncio_tasks.add(loop.create_task(self._lifecycle_lease_loop()))
 
         # We only add signal handler when the tokenizer manager is in the main thread
         # due to the CPython limitation.
@@ -3571,8 +3637,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        lifecycle_attempt_id: Optional[str] = None,
+        lifecycle_kind: str = "sample",
     ):
         created_time = obj.received_time
+        lifecycle_attempt_id = lifecycle_attempt_id or getattr(
+            obj, "_lifecycle_attempt_id", None
+        )
 
         external_trace_header = None
         if self.enable_trace:
@@ -3602,11 +3674,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
+        # Check the entire batch before mutating state. Otherwise a duplicate
+        # later in the batch could leave earlier children orphaned.
+        rids = [rid for rid, _, _ in items]
+        if len(set(rids)) != len(rids) or any(rid in self.rid_to_state for rid in rids):
+            raise ValueError("Duplicate request ID detected")
+        child_ids = (
+            self.request_lifecycle.add_children(
+                lifecycle_attempt_id, rids, lifecycle_kind
+            )
+            if lifecycle_attempt_id is not None
+            else [None] * len(items)
+        )
+        for (rid, sub_obj, bootstrap_room), child_id in zip(items, child_ids):
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            state.lifecycle_id = child_id
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
@@ -3629,6 +3714,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Failed to abort request %s during cleanup", rid
                         )
                 else:
+                    if state.lifecycle_id is not None:
+                        self.request_lifecycle.discard(state.lifecycle_id)
                     del self.rid_to_state[rid]
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:

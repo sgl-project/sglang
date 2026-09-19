@@ -62,7 +62,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -850,6 +849,15 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            "request_lifecycle": (
+                {
+                    "version": 1,
+                    "incarnation": _global_state.tokenizer_manager.request_lifecycle.incarnation,
+                    "header_overrides": envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+                }
+                if _global_state.tokenizer_manager.request_lifecycle is not None
+                else None
+            ),
         }
     )
 
@@ -913,6 +921,72 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
         return [x for result in results for x in result.response]
 
 
+def _get_request_lifecycle(request: Request):
+    registry = _global_state.tokenizer_manager.request_lifecycle
+    if registry is None:
+        raise HTTPException(404, "request lifecycle is disabled")
+    if request.headers.get("x-sglang-worker-incarnation") != registry.incarnation:
+        raise HTTPException(409, "worker incarnation changed")
+    return registry
+
+
+@app.get("/request_lifecycle/{attempt_id}")
+async def request_lifecycle_snapshot(
+    attempt_id: str, request: Request, after: int = -1
+):
+    registry = _get_request_lifecycle(request)
+    try:
+        return await registry.wait(attempt_id, after)
+    except KeyError:
+        raise HTTPException(404, "unknown attempt") from None
+
+
+@dataclasses.dataclass
+class LifecycleControl:
+    action: str
+    lease_seconds: float = 30
+
+
+@app.post("/request_lifecycle/{attempt_id}")
+async def request_lifecycle_control(
+    attempt_id: str, obj: LifecycleControl, request: Request
+):
+    registry = _get_request_lifecycle(request)
+    try:
+        if obj.action == "renew":
+            registry.renew(attempt_id, obj.lease_seconds)
+        elif obj.action == "cancel":
+            _global_state.tokenizer_manager.cancel_lifecycle(attempt_id)
+        else:
+            raise ValueError("action must be renew or cancel")
+        return registry.snapshot(attempt_id)
+    except KeyError:
+        raise HTTPException(404, "unknown attempt") from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
+    manager = _global_state.tokenizer_manager
+    attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
+    generator = manager.generate_request(obj, request)
+    complete = False
+    try:
+        async for result in generator:
+            if not obj.stream:
+                complete = True
+            yield result
+        complete = True
+    finally:
+        try:
+            await generator.aclose()
+        finally:
+            if attempt_id is not None:
+                if not complete:
+                    manager.cancel_lifecycle(attempt_id)
+                manager.request_lifecycle.seal(attempt_id)
+
+
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route(
     "/generate",
@@ -923,13 +997,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    attempt_id = request.headers.get("x-sglang-attempt-id")
+    if attempt_id is not None:
+        registry = _get_request_lifecycle(request)
+        try:
+            registry.claim(
+                attempt_id, _global_state.tokenizer_manager.disaggregation_mode.value
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        obj._lifecycle_attempt_id = attempt_id
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in _generate_with_lifecycle(obj, request):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -958,10 +1040,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
-            return orjson_response(ret)
+            generator = _generate_with_lifecycle(obj, request)
+            try:
+                ret = await generator.__anext__()
+                return orjson_response(ret)
+            finally:
+                await generator.aclose()
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
