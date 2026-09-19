@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
+from sglang.srt.disaggregation.common.dsa_dcp import iter_dsa_dcp_transfer_batches
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
@@ -33,6 +34,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_rsp,
     handle_watermark_msg,
 )
+from sglang.srt.disaggregation.common.transfer_profile import DCPTransferProfile
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
@@ -1090,10 +1092,55 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
         pack_buffer=None,
+        transfer_profile=None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
+
+        if pack_buffer is not None:
+            num_target_entries = (
+                len(self.kv_args.kv_data_ptrs) - self.kv_args.num_draft_entries
+            )
+            packed_token_bytes = sum(dcp_token_item_lens[:num_target_entries])
+            if packed_token_bytes > 0:
+                rank_capacity = pack_buffer.get_size() // packed_token_bytes
+                max_src_pages = rank_capacity * dst_dcp_size // physical_page_size
+                if max_src_pages > 0 and num_kv_tokens > (
+                    max_src_pages * physical_page_size
+                ):
+                    # A cached prefix can span the whole context, unlike a
+                    # normal prefill chunk. Keep each gather within this worker's
+                    # registered buffer instead of falling back to an unbounded
+                    # per-token RDMA batch. Each successful recursive call drains
+                    # its writes before the same pack buffer is reused.
+                    num_src_pages = (
+                        num_kv_tokens + physical_page_size - 1
+                    ) // physical_page_size
+                    for start in range(0, num_src_pages, max_src_pages):
+                        count = min(
+                            max_src_pages * physical_page_size,
+                            num_kv_tokens - start * physical_page_size,
+                        )
+                        ret = self.send_kvcache_dcp(
+                            mooncake_session_id,
+                            prefill_kv_indices[start : start + max_src_pages],
+                            dst_kv_ptrs,
+                            dst_kv_indices,
+                            dcp_token_item_lens=dcp_token_item_lens,
+                            dst_dcp_size=dst_dcp_size,
+                            dst_dcp_rank=dst_dcp_rank,
+                            src_page_offset=src_page_offset + start,
+                            decode_prefix_len=decode_prefix_len,
+                            num_kv_tokens=count,
+                            executor=executor,
+                            dst_layer_ids=dst_layer_ids,
+                            pack_buffer=pack_buffer,
+                            transfer_profile=transfer_profile,
+                        )
+                        if ret != 0:
+                            return ret
+                    return 0
 
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
@@ -1131,7 +1178,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if pack_buffer is not None and src_token_indices.size:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
-            packed = try_pack_dcp_src(
+            pack = try_pack_dcp_src
+            if transfer_profile is not None:
+
+                def pack(**kwargs):
+                    return transfer_profile.call("mla_pack", try_pack_dcp_src, **kwargs)
+
+            packed = pack(
                 pack_buffer=pack_buffer,
                 kv_data_ptrs=target_src_kv_ptrs,
                 src_token_indices=src_token_indices,
@@ -1183,10 +1236,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for src_group, dst_group in zip(src_groups, dst_groups)
             ]
 
+        def transfer(session, blocks):
+            if transfer_profile is None:
+                return self._transfer_data(session, blocks)
+            return transfer_profile.transfer(
+                "mla", self._transfer_data, session, blocks
+            )
+
         def process_layer(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> int:
-            return self._transfer_data(
+            return transfer(
                 mooncake_session_id,
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
             )
@@ -1201,7 +1261,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         transfer_blocks = []
         for layer_params in layers_params:
             transfer_blocks.extend(set_transfer_blocks(*layer_params))
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        return transfer(mooncake_session_id, transfer_blocks)
 
     def send_kvcache_slice(
         self,
@@ -1496,6 +1556,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        transfer_profile=None,
+        pack_buffer=None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1606,6 +1668,52 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         or rc
                     )
+            elif (
+                st == StateType.DSA
+                and target_rank_registration_info is not None
+                and target_rank_registration_info.requires_dcp_relayout
+            ):
+                entry_indices = resolve_dcp_dst_entry_indices(
+                    src_state_layer_ids,
+                    dst_state_layer_ids,
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                )
+                batch_iterator = iter_dsa_dcp_transfer_batches
+                pack_kwargs = {}
+                use_pack = pack_buffer is not None and pack_buffer.get_size() >= 8448
+                if use_pack:
+                    from sglang.srt.disaggregation.common.dsa_pack import (
+                        iter_packed_dsa_transfer_batches,
+                    )
+
+                    batch_iterator = iter_packed_dsa_transfer_batches
+                    pack_kwargs = dict(
+                        pack_buffer=pack_buffer, transfer_profile=transfer_profile
+                    )
+                batches = batch_iterator(
+                    src_data_ptrs,
+                    [dst_data_ptrs[j] for j in entry_indices],
+                    src_item_lens,
+                    [dst_item_lens[j] for j in entry_indices],
+                    indices,
+                    dst_indices,
+                    page_size=self.kv_args.page_size,
+                    dcp_size=target_rank_registration_info.dst_dcp_size,
+                    dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                    **pack_kwargs,
+                )
+                if transfer_profile is not None and not use_pack:
+                    batches = transfer_profile.batches(batches)
+                for blocks in batches:
+                    if transfer_profile is None:
+                        batch_rc = self._transfer_data(req.mooncake_session_id, blocks)
+                    else:
+                        batch_rc = transfer_profile.transfer(
+                            "dsa", self._transfer_data, req.mooncake_session_id, blocks
+                        )
+                    if batch_rc != 0:
+                        return batch_rc
             elif st == StateType.DSA_TAIL:
                 rc = (
                     self._send_slot_state(
@@ -1961,6 +2069,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            transfer_profile = None
+            profile_error = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -1968,6 +2078,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                if envs.SGLANG_MOONCAKE_DCP_TRANSFER_PROFILE.get():
+                    transfer_profile = DCPTransferProfile(
+                        room=kv_chunk.room,
+                        worker=worker_index,
+                        source_rank=self.kv_args.engine_rank,
+                        chunk=kv_chunk,
+                        enqueued_at=kv_chunk.profile_enqueued_at,
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2098,6 +2216,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 if self._dcp_pack_buffers
                                 else None
                             )
+                            mla_start = time.perf_counter() if transfer_profile else 0
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -2114,7 +2233,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                                 pack_buffer=pack_buffer,
+                                transfer_profile=transfer_profile,
                             )
+                            if transfer_profile is not None:
+                                transfer_profile.add(
+                                    "mla_wall_s", time.perf_counter() - mla_start
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -2191,6 +2315,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    transfer_profile=transfer_profile,
+                                    pack_buffer=(
+                                        self._dcp_pack_buffers[worker_index]
+                                        if self._dcp_pack_buffers
+                                        else None
+                                    ),
                                 )
                                 if state_rc != 0:
                                     with self.session_lock:
@@ -2286,10 +2416,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                profile_error = True
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if transfer_profile is not None:
+                    transfer_profile.log(logger, error=profile_error)
 
     def start_prefill_thread(self):
         recv = self._make_worker_recv(self.server_socket)
@@ -2550,6 +2684,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                profile_enqueued_at=(
+                    time.perf_counter()
+                    if envs.SGLANG_MOONCAKE_DCP_TRANSFER_PROFILE.get()
+                    else 0.0
+                ),
             )
         )
 

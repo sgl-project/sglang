@@ -944,10 +944,14 @@ class CommonKVManager(BaseKVManager):
                 raise RuntimeError(
                     "PD decode DCP requires an MLA or hybrid-MLA KV pool."
                 )
-            if info.attn_cp_size != 1:
+            # Layer-split DSA CP ranks each own complete token sequences for
+            # different layers, so each can independently relayout for DCP.
+            # Other CP layouts are not supported by the DCP transfer path.
+            if info.attn_cp_size != 1 and not info.enable_dsa_cache_layer_split:
                 raise RuntimeError(
-                    "PD decode DCP currently requires prefill attention CP=1, "
-                    f"got {info.attn_cp_size}."
+                    "PD decode DCP requires prefill attention CP=1 or "
+                    "--enable-dsa-cache-layer-split on prefill, "
+                    f"got CP={info.attn_cp_size} without DSA cache layer splitting."
                 )
 
         self._resolve_rank_mapping(info)

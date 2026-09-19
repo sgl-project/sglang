@@ -15,6 +15,11 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dcp_utils import (
+    dcp_topk_candidates,
+    localize_dcp_indexer_write_loc,
+    merge_dcp_topk_candidates,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -176,7 +181,11 @@ def _broadcast_indexer_topk_from_rank0(
 ) -> Optional[torch.Tensor]:
     # Sync only the finalized indexer output. Internal topk_transform calls can
     # be chunked differently across ranks, which would make collectives diverge.
-    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+    if (
+        topk_indices is None
+        or get_parallel().attn_dcp_size > 1
+        or not envs.SGLANG_DSA_TOPK_BROADCAST.get()
+    ):
         return topk_indices
 
     if is_in_tc_piecewise_cuda_graph():
@@ -565,10 +574,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
+            parallel = get_parallel()
+            indexer_out_cache_loc = localize_dcp_indexer_write_loc(
+                out_cache_loc,
+                dcp_size=parallel.attn_dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+            )
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
+                indexer_out_cache_loc,
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
@@ -973,8 +988,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1:
+            scores, positions = dcp_topk_candidates(
+                logits,
+                forward_batch.seq_lens,
+                topk=self.index_topk,
+                dcp_size=parallel.attn_dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+                num_init_tokens=self.num_init_tokens,
+                num_local_tokens=self.num_local_tokens,
+            )
+            topk_result = merge_dcp_topk_candidates(
+                parallel.dcp_group.all_gather(scores, dim=1),
+                parallel.dcp_group.all_gather(positions, dim=1),
+                topk=self.index_topk,
+                dcp_size=parallel.attn_dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+            )
+            if not metadata.force_unfused_topk:
+                valid = topk_result >= 0
+                topk_result = (
+                    metadata.get_page_table_1()
+                    .gather(1, topk_result.clamp_min(0).long())
+                    .masked_fill(~valid, -1)
+                )
+        else:
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1275,6 +1316,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
+            # Drop this chunk before the next kernel allocates its output.
+            # Assignment evaluates the RHS first, otherwise two full logits
+            # chunks stay live and defeat the single-chunk memory budget.
+            del logits_chunk, raw_topk_chunk
             start = end
 
         return topk_result
@@ -1384,6 +1429,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        parallel = get_parallel()
+        out_cache_loc = localize_dcp_indexer_write_loc(
+            out_cache_loc,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):

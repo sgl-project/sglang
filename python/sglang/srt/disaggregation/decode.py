@@ -1535,6 +1535,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_pages_payload():
+                if get_parallel().attn_dcp_size == 1:
+                    return _full_kv_pages_payload()
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.kv.req_pool_idx, :seq_len
+                ]
+                return kv_to_page_indices(
+                    kv_indices_full,
+                    self.token_to_kv_pool.page_size * get_parallel().attn_dcp_size,
+                )
+
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool,
@@ -1575,7 +1586,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,

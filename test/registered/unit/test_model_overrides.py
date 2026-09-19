@@ -2008,6 +2008,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                dcp_size=1,
+                disaggregation_mode="decode",
+                speculative_algorithm=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2021,6 +2024,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
+            # DSA DCP must select an LSE-producing backend even on Blackwell.
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                self.assertEqual(
+                    _dsa_split_backend_resolution(
+                        _view(arch="GlmMoeDsaForCausalLM", dcp_size=4)
+                    ),
+                    {
+                        "dsa_prefill_backend": "flashmla_kv",
+                        "dsa_decode_backend": "flashmla_kv",
+                    },
+                )
+                for unsupported in (
+                    {"dsa_decode_backend": "trtllm"},
+                    {"disaggregation_mode": "prefill"},
+                    {"kv_cache_dtype": "bfloat16"},
+                    {"enable_hisparse": True},
+                    {"speculative_algorithm": "EAGLE"},
+                    {"learnable_sink": True},
+                ):
+                    with (
+                        self.subTest(unsupported=unsupported),
+                        self.assertRaises(ValueError),
+                    ):
+                        _dsa_split_backend_resolution(_view(dcp_size=4, **unsupported))
+
             # Hopper FP8 -> flashmla_kv both
             self.assertEqual(
                 _dsa_split_backend_resolution(_view()),
