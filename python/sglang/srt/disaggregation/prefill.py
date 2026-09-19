@@ -704,6 +704,10 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
+                if batch is None:
+                    # No forward ran to release the GIL, and on_idle -- which
+                    # would yield -- is skipped while last_batch is pending.
+                    self._yield_to_storage_threads()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()

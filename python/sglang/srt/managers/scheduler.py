@@ -2021,6 +2021,11 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
+                if batch is None:
+                    # This iteration launched no batch, so no forward released
+                    # the GIL, and on_idle -- which would yield -- is skipped
+                    # while last_batch is still pending.
+                    self._yield_to_storage_threads()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -4881,10 +4886,7 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
-                # Storage workers need the GIL between I/O calls. Yield while
-                # there is no GPU batch so polling cannot starve their acks.
-                time.sleep(0)
+            self._yield_to_storage_threads()
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5825,8 +5827,26 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+        if self.idle_sleeper is None:
+            self._yield_to_storage_threads()
+            return
+        self.idle_sleeper.maybe_sleep()
+
+    def _yield_to_storage_threads(self) -> None:
+        """Release the GIL so a storage backend's transfer threads can run.
+
+        A loop iteration that runs no batch holds the GIL end to end, and the
+        transfer its stalled requests wait on is driven by daemon threads in
+        this same process -- the HiCache prefetch daemon, or a backend's own
+        progress thread. CPython will not preempt a pure-Python loop for them.
+        An iteration that ran a batch needs nothing: the forward releases the
+        GIL for the length of the launch.
+
+        Independent of --sleep-on-idle, which is off by default and which
+        init_idle_sleeper nulls on every rank that is not pp0/attn-tp0/attn-cp0.
+        """
+        if self.enable_hicache_storage:
+            time.sleep(0)
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
