@@ -664,11 +664,13 @@ def _fwd_kernel(
 
             e_max = n_e_max
 
-    # stage 2: compute the triangle part
+    # stage 2: compute attention over the current extend chunk. A custom
+    # mask replaces causality, including the key-loop bound: it may expose
+    # keys in later tiles (for example, bidirectional dLLM blocks).
 
     cur_block_m_end = (
         cur_seq_len_extend
-        if not IS_CAUSAL
+        if USE_CUSTOM_MASK or not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
