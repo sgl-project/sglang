@@ -236,7 +236,7 @@ change buckets, or mutate affinity.
 checker directly as `Arc<dyn EngineAdmission>`. There is no placement setting,
 filtering wrapper, or before/after API; each policy decides where checking
 belongs in its selection algorithm. The `load` argument is an
-`Option<&EngineWorkerLoad>` retained by the policy for this engine, including
+`Option<&EngineReportedWorkerLoad>` retained by the policy for this engine, including
 request counts, token usage, capacity, and the report timestamp. `None` means
 no usable observation, never zero load; each check defines its missing-data
 behavior. Other required state handles belong to the checker.
@@ -337,7 +337,7 @@ applies to the current group.
 
 Application wiring starts shared services once. Policy construction validates
 configuration and passes the required handles to each policy and admission
-implementation. For example, `PowerOfTwoPolicy::new(Arc<EngineLoadTable>)`
+implementation. For example, `PowerOfTwoPolicy::new(Arc<EngineReportedLoadTable>)`
 retains the application's shared load table. KV-aware and affinity-aware policies
 receive their corresponding shared handles when implemented. Policies with no
 state dependency require none. Policy instances do not create duplicate
@@ -351,7 +351,7 @@ required settings even when the model's default uses a different policy.
 ### Load state
 
 `state/load_monitor/` owns engine reports and existing router-local request
-accounting. Power-of-two owns an `Arc<EngineLoadTable>` and captures a snapshot
+accounting. Power-of-two owns an `Arc<EngineReportedLoadTable>` and captures a snapshot
 locally for each nonempty selection attempt. Its `pick` method selects the engine,
 then passes that engine's borrowed load record directly to admission.
 No snapshot or observation is added to `Pick`, `PickRequest`,

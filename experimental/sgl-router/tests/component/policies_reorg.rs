@@ -10,7 +10,7 @@ use sgl_router::buckets_reorg::{
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
-use sgl_router::state::load_monitor::engine_load::EngineWorkerLoad;
+use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl EngineAdmission for Reject {
         &self,
         engine: &Worker,
         _: &PickRequest<'_>,
-        _: Option<&EngineWorkerLoad>,
+        _: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         Ok(if engine.id.0 == self.0 {
             Decision::Reject("full".into())
@@ -422,7 +422,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
 #[tokio::test]
 async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
     use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
-    use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
     #[derive(Debug)]
     struct Check {
@@ -436,7 +436,7 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
             &self,
             engine: &Worker,
             _: &PickRequest<'_>,
-            _: Option<&EngineWorkerLoad>,
+            _: Option<&EngineReportedWorkerLoad>,
         ) -> Result<Decision, PickError> {
             self.calls.lock().unwrap().push(engine.id.clone());
             if self.invalid {
@@ -461,10 +461,8 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
                 reject,
                 invalid,
             });
-            let fallback = Arc::new(TestPolicy::default());
-            let mut policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
+            let mut policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
             policy.admission = check.clone();
-            policy.fallback = Some(fallback.clone());
             assert!(matches!(
                 policy.pick(&[], &request).await,
                 Err(PickError::NoCandidates)
@@ -483,7 +481,6 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
                 check.calls.lock().unwrap().as_slice(),
                 std::slice::from_ref(&engine.id)
             );
-            assert!(fallback.calls.lock().unwrap().is_empty());
         }
     }
 }

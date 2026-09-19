@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_load::{
-    EngineLoadTable, LoadStat, NativeCacheRankLoad,
+use sgl_router::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
 };
 use sgl_router::workers::Worker;
 
@@ -61,7 +61,7 @@ async fn assert_winner(
 async fn plain_and_prefill_use_pending_work_while_decode_uses_request_pressure() {
     for stage in [Stage::Plain, Stage::Prefill, Stage::Decode] {
         let engines = [engine("a", stage, 100), engine("b", stage, 0)];
-        let table = EngineLoadTable::new();
+        let table = EngineReportedLoadTable::new();
         table.set(&engines[0].url, 0, load(5, 8, 10, 100, 1), Instant::now());
         table.set(&engines[1].url, 0, load(1, 1, 10, 100, 100), Instant::now());
         let expected = if stage == Stage::Decode { 1 } else { 0 };
@@ -82,7 +82,7 @@ async fn prefill_uses_estimated_queue_time_only_when_both_engines_have_rates() {
             engine("a", Stage::Prefill, 0),
             engine("b", Stage::Prefill, 0),
         ];
-        let table = EngineLoadTable::new();
+        let table = EngineReportedLoadTable::new();
         for (i, worker) in engines.iter().enumerate() {
             let mut report = load(1, 1, 10, 100, if i == 0 { 10 } else { 20 });
             if i == 0 || both_have_rates {
@@ -119,7 +119,7 @@ async fn decode_orders_by_waiting_running_kv_fraction_then_tokens() {
             engine("a", Stage::Decode, 100),
             engine("b", Stage::Decode, 0),
         ];
-        let table = EngineLoadTable::new();
+        let table = EngineReportedLoadTable::new();
         table.set(&engines[0].url, 0, left, Instant::now());
         table.set(&engines[1].url, 0, right, Instant::now());
         assert_winner(
@@ -143,7 +143,7 @@ async fn unusable_telemetry_falls_back_to_local_load_for_both_candidates() {
             "unknown_capacity",
         ] {
             let engines = [engine("a", stage, 1), engine("b", stage, 5)];
-            let table = EngineLoadTable::new();
+            let table = EngineReportedLoadTable::new();
             // A's high reported pressure must not be compared to B's local
             // count or to a fabricated zero for its unavailable telemetry.
             table.set(
@@ -177,7 +177,7 @@ async fn unusable_telemetry_falls_back_to_local_load_for_both_candidates() {
 async fn equal_reported_pressure_uses_local_active_load_as_tiebreaker() {
     for stage in [Stage::Plain, Stage::Prefill, Stage::Decode] {
         let engines = [engine("a", stage, 5), engine("b", stage, 1)];
-        let table = EngineLoadTable::new();
+        let table = EngineReportedLoadTable::new();
         for worker in &engines {
             table.set(&worker.url, 0, load(1, 1, 10, 100, 10), Instant::now());
         }
@@ -190,7 +190,7 @@ async fn multiple_candidates_never_select_the_unique_busiest_engine() {
     let engines: Vec<_> = (0..8)
         .map(|i| engine(&i.to_string(), Stage::Plain, i))
         .collect();
-    let policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
+    let policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
     for _ in 0..64 {

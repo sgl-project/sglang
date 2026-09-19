@@ -9,7 +9,7 @@ use sgl_router::policies::PolicyRegistry;
 use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 use sgl_router::server::app_context::ChatRouting;
-use sgl_router::state::load_monitor::engine_load::EngineWorkerLoad;
+use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use std::sync::Mutex;
 
 type PickCall = (String, Stage, u64, Option<u64>);
@@ -78,7 +78,7 @@ impl EngineAdmission for RejectAll {
         &self,
         _: &Worker,
         _: &PickRequest<'_>,
-        _: Option<&EngineWorkerLoad>,
+        _: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         Ok(Decision::Reject("full".into()))
     }
@@ -274,12 +274,12 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
     assert_eq!(policy.calls.lock().unwrap().len(), 2);
-    assert_eq!(ctx.active_load.inflight_count(), 0);
+    assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
             .get(&WorkerId("p".into()))
             .unwrap()
-            .active_load(),
+            .router_inflight_load(),
         0
     );
 }
@@ -450,7 +450,7 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
             ctx.registry
                 .get(&WorkerId("p1".into()))
                 .unwrap()
-                .active_load(),
+                .router_inflight_load(),
             0
         );
         assert_eq!(first.calls.lock().unwrap().len(), 1);
@@ -491,7 +491,7 @@ async fn admission_exhaustion_is_preserved_when_later_buckets_are_empty() {
     assert_eq!(second.calls.lock().unwrap().len(), 1);
     assert!(empty.calls.lock().unwrap().is_empty());
     assert!(worker.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(ctx.active_load.inflight_count(), 0);
+    assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
 }
 
 #[tokio::test]

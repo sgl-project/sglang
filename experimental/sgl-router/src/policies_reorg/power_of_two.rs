@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use rand::Rng;
 
 use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
-use crate::state::load_monitor::engine_load::EngineLoadTable;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
 use super::admission::{AllowAll, Decision, EngineAdmission};
@@ -19,17 +19,15 @@ use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Shared application state; snapshots are local to each pick.
-    engine_load: Arc<EngineLoadTable>,
+    engine_load: Arc<EngineReportedLoadTable>,
     pub admission: Arc<dyn EngineAdmission>,
-    pub fallback: Option<Arc<dyn Policy>>,
 }
 
 impl PowerOfTwoPolicy {
-    pub fn new(engine_load: Arc<EngineLoadTable>) -> Self {
+    pub fn new(engine_load: Arc<EngineReportedLoadTable>) -> Self {
         Self {
             engine_load,
             admission: Arc::new(AllowAll),
-            fallback: None,
         }
     }
 }
@@ -77,9 +75,5 @@ impl Policy for PowerOfTwoPolicy {
                 reason: "power_of_two",
             })
         })
-    }
-
-    fn fallback(&self) -> Option<&dyn Policy> {
-        self.fallback.as_deref()
     }
 }

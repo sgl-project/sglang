@@ -3,7 +3,7 @@
 
 use std::fmt::Debug;
 
-use crate::state::load_monitor::engine_load::EngineWorkerLoad;
+use crate::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use crate::workers::Worker;
 
 use super::{PickError, PickRequest};
@@ -23,7 +23,7 @@ pub trait EngineAdmission: Send + Sync + Debug {
         &self,
         engine: &Worker,
         request: &PickRequest<'_>,
-        load: Option<&EngineWorkerLoad>,
+        load: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError>;
 }
 
@@ -35,7 +35,7 @@ impl EngineAdmission for AllowAll {
         &self,
         _: &Worker,
         _: &PickRequest<'_>,
-        _: Option<&EngineWorkerLoad>,
+        _: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         Ok(Decision::Allow)
     }

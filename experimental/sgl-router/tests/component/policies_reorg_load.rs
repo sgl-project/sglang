@@ -8,12 +8,14 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_load::{EngineLoadTable, EngineWorkerLoad, LoadStat};
+use sgl_router::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadTable, EngineReportedWorkerLoad, LoadStat,
+};
 use sgl_router::workers::Worker;
 
 const URL: &str = "http://engine";
 
-fn report(table: &EngineLoadTable, rank: u32, running: u64, at: Instant) {
+fn report(table: &EngineReportedLoadTable, rank: u32, running: u64, at: Instant) {
     table.set(
         URL,
         rank,
@@ -40,8 +42,8 @@ fn engine() -> Arc<Worker> {
 
 #[derive(Debug)]
 struct ObserveAdmission {
-    table: Arc<EngineLoadTable>,
-    observations: Mutex<Vec<Option<EngineWorkerLoad>>>,
+    table: Arc<EngineReportedLoadTable>,
+    observations: Mutex<Vec<Option<EngineReportedWorkerLoad>>>,
 }
 
 impl EngineAdmission for ObserveAdmission {
@@ -49,7 +51,7 @@ impl EngineAdmission for ObserveAdmission {
         &self,
         engine: &Worker,
         _: &PickRequest<'_>,
-        load: Option<&EngineWorkerLoad>,
+        load: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         assert_eq!(engine.url, URL);
         // A new report arriving after selection must not change the observation
@@ -62,7 +64,7 @@ impl EngineAdmission for ObserveAdmission {
 
 #[tokio::test]
 async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
-    let table = EngineLoadTable::new();
+    let table = EngineReportedLoadTable::new();
     let first_at = Instant::now();
     report(&table, 0, 1, first_at);
     report(&table, 1, 3, first_at);
@@ -95,7 +97,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
     assert_eq!(observations.len(), 2);
     assert_eq!(
         observations[0],
-        Some(EngineWorkerLoad {
+        Some(EngineReportedWorkerLoad {
             num_running_reqs: 4,
             num_waiting_reqs: 4,
             num_tokens: 60,
@@ -109,7 +111,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
 #[tokio::test]
 async fn missing_stale_and_incomplete_reports_reach_admission_as_unknown() {
     for case in ["missing", "stale", "incomplete"] {
-        let table = EngineLoadTable::new();
+        let table = EngineReportedLoadTable::new();
         match case {
             "missing" => {}
             "stale" => report(&table, 0, 1, Instant::now() - Duration::from_secs(3600)),
