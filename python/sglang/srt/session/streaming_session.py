@@ -486,7 +486,12 @@ class StreamingSession(BasePrefixCache):
             if slot.kv.holds_mamba:
                 total += slot.kv.mamba_pool_idx.numel()
             if slot.kv.mamba_ping_pong_track_buffer is not None:
-                total += slot.kv.mamba_ping_pong_track_buffer.numel()
+                buffer = slot.kv.mamba_ping_pong_track_buffer
+                # Lazy tracking leaves unallocated entries marked with -1.
+                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy:
+                    total += (buffer != -1).sum().item()
+                else:
+                    total += buffer.numel()
         return total
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
@@ -498,7 +503,10 @@ class StreamingSession(BasePrefixCache):
             mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
             slot.kv.mamba_pool_idx = None
         if slot.kv.mamba_ping_pong_track_buffer is not None:
-            mamba_allocator.free(slot.kv.mamba_ping_pong_track_buffer)
+            buffer = slot.kv.mamba_ping_pong_track_buffer
+            if self.req_to_token_pool.enable_mamba_extra_buffer_lazy:
+                buffer = buffer[buffer != -1]
+            mamba_allocator.free(buffer)
             slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
