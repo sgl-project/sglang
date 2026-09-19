@@ -2420,7 +2420,9 @@ class KVCacheConfigurator:
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
-                        self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                        self.model_config.num_hidden_layers,
+                        rank,
+                        self.ps.pp_size,
                     )
                     for rank in range(self.ps.pp_size)
                 )

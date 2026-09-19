@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -120,12 +121,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
                                 ]
-                        parallel = SimpleNamespace(
-                            pp_async_batch_depth=depth,
-                            enable_dsa_prefill_context_parallel=False,
-                        )
                         with (
-                            patch(f"{PP_MODULE}.get_parallel", return_value=parallel),
+                            get_parallel().override(
+                                pp_size=2,
+                                pp_async_batch_depth=depth,
+                            ),
                             patch(
                                 f"{PP_MODULE}.get_disagg",
                                 return_value=SimpleNamespace(
@@ -278,7 +278,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
-        with self.assertRaises(StopIteration):
+        with (
+            get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+            self.assertRaises(StopIteration),
+        ):
             event_loop(scheduler)
 
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])

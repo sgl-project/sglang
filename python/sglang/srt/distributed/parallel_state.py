@@ -3029,7 +3029,14 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     global _PP
     _PP = pp_group
     try:
-        yield
+        # `pp_size` is a configured leaf: unlike the rank and the handle it
+        # does not follow the group being swapped, so the scope has to name it.
+        with get_parallel().override(
+            pp_size=pp_group.world_size,
+            pp_rank=pp_group.rank_in_group,
+            pp_group=pp_group,
+        ):
+            yield
     finally:
         _PP_STATE_PATCHED = False
         _PP = old_pp_group
