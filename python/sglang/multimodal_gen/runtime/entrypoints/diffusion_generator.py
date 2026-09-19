@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    select_output_rollout_trajectory,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -558,7 +561,9 @@ class DiffGenerator:
             action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
-            rollout_trajectory_data=output_batch.rollout_trajectory_data,
+            rollout_trajectory_data=select_output_rollout_trajectory(
+                output_batch.rollout_trajectory_data, output_index
+            ),
             trajectory_decoded=output_batch.trajectory_decoded,
         )
 
