@@ -570,8 +570,8 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, ModelConfig, PolicyKind,
-        ProxyConfig, RouterInflightLoadConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, InflightLoadConfig, ModelConfig,
+        PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
@@ -609,7 +609,7 @@ mod tests {
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
-            router_inflight_load: RouterInflightLoadConfig::default(),
+            inflight_load: InflightLoadConfig::default(),
         }
     }
 

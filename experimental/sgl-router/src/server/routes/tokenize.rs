@@ -135,7 +135,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            router_inflight_load: crate::config::RouterInflightLoadConfig::default(),
+            inflight_load: crate::config::InflightLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(

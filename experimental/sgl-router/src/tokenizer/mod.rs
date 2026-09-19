@@ -253,7 +253,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            router_inflight_load: crate::config::RouterInflightLoadConfig::default(),
+            inflight_load: crate::config::InflightLoadConfig::default(),
         }
     }
 

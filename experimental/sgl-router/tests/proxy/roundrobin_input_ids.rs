@@ -11,8 +11,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
-    Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    RouterInflightLoadConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -57,7 +57,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        router_inflight_load: RouterInflightLoadConfig::default(),
+        inflight_load: InflightLoadConfig::default(),
     }
 }
 
