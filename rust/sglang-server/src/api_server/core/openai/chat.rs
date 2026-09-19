@@ -24,7 +24,7 @@ use crate::api_server::core::generate::{
     generation_event_stream_with, unary_output,
 };
 use crate::api_server::core::openai::completions::completion_usage;
-use crate::api_server::core::openai::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
+use crate::api_server::core::openai::reasoning::ReasoningStreamSplitter;
 use crate::api_server::core::openai::template::ChatFormatter;
 use crate::api_server::core::openai::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
@@ -239,11 +239,9 @@ pub(crate) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) = split_reasoning_unary(
-            options.reasoning_parser.as_deref(),
-            &output.text,
-            &output.token_ids,
-        );
+        let (reasoning_text, text) =
+            ReasoningStreamSplitter::new(options.reasoning_parser.as_deref())
+                .split_complete(&output.text, &output.token_ids);
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             options.parser.as_deref(),
@@ -956,6 +954,47 @@ mod tests {
         );
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert!(value["choices"][0]["message"]["reasoning_content"].is_string());
+    }
+
+    /// Whitespace-preserving reasoning split must not disturb tool parsing: the
+    /// normal text after `</think>` still yields the call and its arguments.
+    #[tokio::test]
+    async fn unary_chat_reasoning_whitespace_survives_tool_parsing() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk(
+            "r0",
+            "<think>\nOkay \n</think> <tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+            true,
+        ))
+        .await
+        .unwrap();
+
+        let response = unary_chat(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                reasoning_parser: Some("qwen3".into()),
+                parser: Some("qwen".into()),
+                ..chat_options()
+            },
+        )
+        .await
+        .expect("unary chat succeeds");
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "\nOkay \n"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert!(
+            value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("Paris")
+        );
     }
 
     #[tokio::test]

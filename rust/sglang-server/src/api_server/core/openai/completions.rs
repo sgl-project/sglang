@@ -35,6 +35,18 @@ pub(crate) enum PromptSpec {
     TokenIds(TokenIds),
 }
 
+/// Record one output's prompt count for `prompt_index`, keeping the first
+/// nonzero value: a scheduler's first frame may report 0 before the real count
+/// is known, and sibling choices sharing a prompt must neither double-count nor
+/// overwrite a known count with 0. Returns the recorded count.
+fn record_prompt_tokens(counts: &mut BTreeMap<usize, u32>, prompt_index: usize, count: u32) -> u32 {
+    let entry = counts.entry(prompt_index).or_insert(0);
+    if *entry == 0 {
+        *entry = count;
+    }
+    *entry
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
@@ -150,9 +162,7 @@ pub(crate) async fn unary_completion(
         let output = unary_output(outcome)?;
         let prompt_index = choice_index / options.n;
 
-        prompt_tokens
-            .entry(prompt_index)
-            .or_insert(output.prompt_tokens);
+        record_prompt_tokens(&mut prompt_tokens, prompt_index, output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let (response_choice, extension) =
             completion_choice(choice_index, output, options.echo, options.want_logprobs)?;
@@ -331,13 +341,15 @@ impl CompletionFrameShaper {
         first: bool,
     ) -> Result<CoreEvent<serde_json::Value>, ApiError> {
         let prompt_index = choice_index / self.n;
-        self.prompt_tokens_by_prompt
-            .entry(prompt_index)
-            .or_insert(out.prompt_tokens);
+        let prompt_tokens = record_prompt_tokens(
+            &mut self.prompt_tokens_by_prompt,
+            prompt_index,
+            out.prompt_tokens,
+        );
         self.completion_tokens_by_choice[choice_index] = completion_tokens;
         let chunk_usage = self.continuous_usage.then(|| {
             completion_usage(
-                out.prompt_tokens,
+                prompt_tokens,
                 u32::try_from(completion_tokens).unwrap_or(u32::MAX),
             )
         });
@@ -588,6 +600,17 @@ mod tests {
         }
     }
 
+    fn chunk_with_prompt(rid: &str, text: &str, done: bool, prompt_tokens: u32) -> ResponseItem {
+        let mut item = chunk(rid, text, done);
+        match &mut item {
+            ResponseItem::Frame(event) | ResponseItem::Done(event) => {
+                event.prompt_tokens = prompt_tokens;
+            }
+            _ => unreachable!("chunk builds a frame"),
+        }
+        item
+    }
+
     #[test]
     fn prompt_specs_consume_text_and_convert_token_ids() {
         assert_eq!(
@@ -679,6 +702,32 @@ mod tests {
         assert_eq!(value["choices"][0]["matched_stop"], "</s>");
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 4);
+    }
+
+    /// A zero prompt count on the first sibling must not latch: a later
+    /// sibling's real count recovers it, and the shared prompt is counted once.
+    #[tokio::test]
+    async fn unary_usage_recovers_a_zero_prompt_count_from_a_sibling_choice() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(chunk_with_prompt("r0", "a", true, 0))
+            .await
+            .unwrap();
+        tx1.send(chunk_with_prompt("r1", "b", true, 5))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["completion_tokens"], 2);
     }
 
     #[tokio::test]
@@ -887,6 +936,86 @@ mod tests {
         assert_eq!(frames[0]["usage"]["prompt_tokens"], 5);
         assert_eq!(frames[0]["usage"]["completion_tokens"], 1);
         assert_eq!(frames[1]["usage"]["completion_tokens"], 2);
+    }
+
+    /// The first nonzero prompt count wins per original prompt: an early zero
+    /// is recovered, siblings sharing a prompt count once, and the final
+    /// trailer sums distinct prompts. Continuous chunks report recovered counts.
+    #[tokio::test]
+    async fn stream_usage_recovers_zero_prompt_counts_and_deduplicates_prompts() {
+        let (receivers, txs): (Vec<_>, Vec<_>) =
+            (0..4).map(|index| planned(&format!("r{index}"))).unzip();
+        // Two prompts x two choices. Prompt 0 reports 0 from both choices
+        // before the real count arrives; prompt 1 is known from the start.
+        txs[0]
+            .send(chunk_with_prompt("r0", "a", false, 0))
+            .await
+            .unwrap();
+        txs[0]
+            .send(chunk_with_prompt("r0", "b", true, 5))
+            .await
+            .unwrap();
+        txs[1]
+            .send(chunk_with_prompt("r1", "c", false, 0))
+            .await
+            .unwrap();
+        txs[1]
+            .send(chunk_with_prompt("r1", "d", true, 5))
+            .await
+            .unwrap();
+        txs[2]
+            .send(chunk_with_prompt("r2", "e", false, 7))
+            .await
+            .unwrap();
+        txs[2]
+            .send(chunk_with_prompt("r2", "f", true, 7))
+            .await
+            .unwrap();
+        txs[3]
+            .send(chunk_with_prompt("r3", "g", true, 7))
+            .await
+            .unwrap();
+
+        let stream = completion_event_stream(
+            plan(receivers, senders()),
+            CompletionFrameShaper::new(
+                4,
+                CompletionRenderingOptions {
+                    n: 2,
+                    ..completion_options()
+                },
+                true, // final usage trailer
+                true, // continuous per-chunk usage
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::completion_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 8, "7 chunks + the final usage trailer");
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["prompt_tokens"], 12);
+        assert_eq!(trailer["usage"]["completion_tokens"], 7);
+        assert_eq!(trailer["usage"]["total_tokens"], 19);
+
+        let mut recovered_by_choice = std::collections::BTreeMap::new();
+        for frame in &frames {
+            let prompt = frame["usage"]["prompt_tokens"].as_u64().unwrap();
+            for choice in frame["choices"].as_array().unwrap() {
+                let index = choice["index"].as_u64().unwrap();
+                recovered_by_choice
+                    .entry(index)
+                    .and_modify(|value: &mut u64| *value = (*value).max(prompt))
+                    .or_insert(prompt);
+            }
+        }
+        assert_eq!(
+            recovered_by_choice,
+            std::collections::BTreeMap::from([(0, 5), (1, 5), (2, 7), (3, 7)])
+        );
     }
 
     #[tokio::test]
