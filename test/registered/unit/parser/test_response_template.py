@@ -532,6 +532,30 @@ class TestResponseTemplateAdapters(unittest.TestCase):
 
         self.assertEqual(detector.reasoning_default, "explicit_enable_thinking")
 
+    def test_reasoning_subclass_can_define_regex_delimiters_and_policy(self):
+        class PatternReasoningDetector(ResponseTemplateReasoningDetector):
+            response_template = {
+                "start_anchor": "<assistant>",
+                "fields": {
+                    "thinking": {
+                        "open_pattern": r"<analysis(?: mode=\"\w+\")?>",
+                        "close_pattern": r"</analysis\s*>",
+                    },
+                    "content": {"content": "text"},
+                },
+            }
+            _default_think_start = "<analysis>"
+            _default_think_end = "</analysis>"
+            thinks_internally = True
+            reasoning_default = "always"
+
+        detector = PatternReasoningDetector()
+
+        self.assertEqual(detector.think_start_token, "<analysis>")
+        self.assertEqual(detector.think_end_token, "</analysis>")
+        self.assertTrue(detector.thinks_internally)
+        self.assertEqual(detector.reasoning_default, "always")
+
     def test_transform_each_tool_region_emits_all_calls(self):
         template = {
             "start_anchor": "<assistant>",

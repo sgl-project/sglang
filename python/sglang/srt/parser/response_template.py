@@ -393,6 +393,11 @@ class _ResponseTemplateParserInputMixin:
 class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
     """Reasoning detector driven by a `response_template` grammar."""
 
+    _default_think_start = ""
+    _default_think_end = ""
+    thinks_internally = False
+    reasoning_default = "explicit_enable_thinking"
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -408,14 +413,16 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         self.stream_reasoning = stream_reasoning
         thinking = loaded.fields.get(_THINKING_FIELD)
         self.think_start_token = (
-            thinking.open_literals[0] if thinking and thinking.open_literals else ""
+            thinking.open_literals[0]
+            if thinking and thinking.open_literals
+            else self._default_think_start
         )
         self.think_end_token = (
-            thinking.close_literals[0] if thinking and thinking.close_literals else ""
+            thinking.close_literals[0]
+            if thinking and thinking.close_literals
+            else self._default_think_end
         )
         self.think_start_self_label = ""
-        self.thinks_internally = False
-        self.reasoning_default = "explicit_enable_thinking"
         self._adapter = ResponseTemplateStreamAdapter(
             _streaming_template(template),
             prefix=prefix,
