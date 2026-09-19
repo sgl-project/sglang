@@ -53,7 +53,7 @@ class PureSWARadixCache(RadixCache):
 
     def sanity_check(self):
         """No-op: PureSWARadixCache uses RadixCache's simple tree structure
-        which doesn't need the dual-LRU sanity checks of SWARadixCache."""
+        which doesn't need a dual-LRU sanity check."""
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:

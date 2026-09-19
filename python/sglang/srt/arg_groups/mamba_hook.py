@@ -73,7 +73,7 @@ def handle_mamba_backend(server_args: Any):
 
 def handle_int8_mamba_checkpoint(server_args: Any):
     # The int8 mamba checkpoint pool is only wired into the built-in
-    # MambaRadixCache. The host-offload path (enabled by
+    # mamba radix cache. The host-offload path (enabled by
     # --enable-hierarchical-cache) and custom radix-cache backends are NOT
     # int8-aware: they would read int8 checkpoint slots as bf16 active slots
     # (wrong pool / out-of-range). Reject the combination up front rather than

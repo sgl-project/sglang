@@ -471,7 +471,7 @@ def build_fixture(
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
     )
-    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # The mamba component reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
     server_args._mamba_cache_chunk_size = (
