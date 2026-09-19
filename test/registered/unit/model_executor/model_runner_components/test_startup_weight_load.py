@@ -812,6 +812,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                     stream=stream_context, Stream=lambda priority: schedule_stream
                 ),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
+                side_effect=lambda: trace.append("borrow_prewarm"),
+            ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
@@ -830,6 +834,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -857,6 +862,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -872,6 +878,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "draft_prewarm",
                 "stream_exit",
                 "resize",

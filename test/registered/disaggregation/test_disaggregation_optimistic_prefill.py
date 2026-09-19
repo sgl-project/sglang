@@ -1,3 +1,6 @@
+import os
+import shutil
+import tempfile
 import time
 import unittest
 import uuid
@@ -16,7 +19,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=193, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -37,17 +40,21 @@ def rid_that_forces_retry(prefix: str) -> str:
 
 
 class OptimisticPrefillRetryCounterMixin:
-    def _get_retry_counter(self) -> float:
+    def _get_counter_total(self, family_name: str) -> float:
+        """Sum of a prefill-side Prometheus counter across its label sets."""
         response = requests.get(f"{self.prefill_url}/metrics")
         response.raise_for_status()
         total = 0.0
         for family in text_string_to_metric_families(response.text):
-            if family.name != "sglang:num_prefill_retries":
+            if family.name != family_name:
                 continue
             for sample in family.samples:
-                if sample.name == "sglang:num_prefill_retries_total":
+                if sample.name == f"{family_name}_total":
                     total += sample.value
         return total
+
+    def _get_retry_counter(self) -> float:
+        return self._get_counter_total("sglang:num_prefill_retries")
 
     def assert_retry_counter_increases(self, fn):
         before_retries = self._get_retry_counter()
@@ -199,6 +206,88 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
                     _ = future.result()
                 except Exception:
                     pass
+        time.sleep(1)  # trigger memory check
+
+
+class TestOptimisticPrefillL3BufferWriteThrough(
+    OptimisticPrefillRetryCounterMixin, PDDisaggregationServerBase
+):
+    """Optimistic prefill with buffer-only L3 (write-through, file backend).
+
+    Small prefill and decode pools keep yielded prefixes evictable while their
+    retries wait for decode, so retries that recover the prefix from L3 run
+    under real load; the gsm8k score is the correctness check."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hicache_dir = tempfile.mkdtemp(prefix="sglang-hicache-")
+        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
+        super().setUpClass()
+        cls._force_retry_prob_was_set = (
+            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.is_set()
+        )
+        cls._force_retry_prob_value = (
+            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
+        )
+        envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(FORCE_RETRY_PROB)
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = [
+            "--optimistic-prefill-attempts",
+            "2",
+            "--chunked-prefill-size",
+            "128",
+            "--max-total-tokens",
+            "16384",
+            "--enable-metrics",
+            "--enable-hierarchical-cache",
+            "--hicache-size",
+            "4",
+            "--hicache-host-memory-mode",
+            "buffer_only",
+            "--hicache-write-policy",
+            "write_through",
+            "--hicache-storage-backend",
+            "file",
+            "--hicache-storage-prefetch-policy",
+            "wait_complete",
+        ]
+        # A small decode pool gates bootstrap, so a yielded request waits long
+        # enough for the prefill pool above to evict its cached prefix.
+        cls.extra_decode_args = ["--max-total-tokens", "16384"]
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            if getattr(cls, "_force_retry_prob_was_set", False):
+                envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(
+                    cls._force_retry_prob_value
+                )
+            else:
+                envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.clear()
+            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
+            shutil.rmtree(cls.hicache_dir, ignore_errors=True)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = self.assert_retry_counter_increases(lambda: run_eval(args))
+        print(f"Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.62)
+        # Write-through published prefixes to L3; report what retries fetched back.
+        self.assertGreater(self._get_counter_total("sglang:backuped_tokens"), 0)
+        print(
+            "L3 prefetch hit tokens: "
+            f"{self._get_counter_total('sglang:storage_prefetch_hit_tokens')}"
+        )
         time.sleep(1)  # trigger memory check
 
 

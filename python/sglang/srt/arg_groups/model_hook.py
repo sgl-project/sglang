@@ -37,7 +37,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
@@ -285,9 +285,15 @@ def handle_model_specific_adjustments(server_args: Any):
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     if cfg.dp_size < cfg.tp_size:
+                        _, attn_tp_size = derive_attention_widths(
+                            tp_size=cfg.tp_size,
+                            attn_cp_size=cfg.attn_cp_size,
+                            dp_size=cfg.dp_size,
+                            enable_dp_attention=cfg.enable_dp_attention,
+                        )
                         logger.warning(
                             f"DSA with TP mode is active, dp_size={cfg.dp_size}, tp_size={cfg.tp_size}, "
-                            f"attn_tp_size={cfg.tp_size}, attention weights will be sharded across {cfg.tp_size} ranks."
+                            f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
 
                 # The DSA page-size selection moved to the override registry
@@ -425,9 +431,11 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # SM120 lacks tcgen05/TMEM: disable features that depend on
-            # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
+            # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The default top-k v2 path still requires unsupported resources.
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)

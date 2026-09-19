@@ -52,7 +52,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_glm_moe_dsa,
 )
-from sglang.srt.distributed import divide, get_pp_group
+from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -2775,7 +2775,7 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
@@ -3097,7 +3097,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
