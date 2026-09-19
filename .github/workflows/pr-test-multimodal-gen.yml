@@ -296,6 +296,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
+      - name: Record retry deadline
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:

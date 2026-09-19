@@ -2,11 +2,13 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import (
+    _estimate_failed_test_time,
     _is_retryable_failure,
     run_pytest,
 )
@@ -78,8 +80,15 @@ def test_infrastructure_failure_policy_is_unchanged(output):
     assert _is_retryable_failure(output)
 
 
-def test_performance_retry_recovers_only_failed_items(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_deadline", [False, True])
+def test_performance_retry_recovers_only_failed_items(
+    tmp_path, monkeypatch, with_deadline
+):
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    if with_deadline:
+        monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() + 600))
+    else:
+        monkeypatch.delenv("SGLANG_DIFFUSION_RETRY_DEADLINE", raising=False)
     test_file = tmp_path / "test_retry.py"
     test_file.write_text(
         "from pathlib import Path\n"
@@ -97,6 +106,40 @@ def test_performance_retry_recovers_only_failed_items(tmp_path, monkeypatch):
     assert code == 0
     assert test_file.with_suffix(".attempt").exists()
     assert test_file.with_suffix(".passed").exists()
+
+
+def test_retry_budget_preserves_failure_and_report(tmp_path, monkeypatch, capfd):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() - 1))
+    test_file = tmp_path / "test_budget.py"
+    test_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('case_id', ['slow_case'])\n"
+        "def test_slow(case_id):\n"
+        "    assert False, '[performance] Validation failed for E2E Latency'\n"
+    )
+    report = tmp_path / "junit.xml"
+    code, executed, results = run_pytest([str(test_file)], junit_xml_path=str(report))
+    output = capfd.readouterr().out
+    assert code == 1
+    assert executed == ["slow_case"]
+    assert results == {"slow_case": "fail"}
+    assert output.count("Starting pytest attempt") == 1
+    assert "Retry budget exhausted" in output
+    assert "Pytest Tail Summary" in output
+
+
+def test_retry_estimate_excludes_successful_cases(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        "<testsuites><testsuite>"
+        '<testcase name="passed" time="100" />'
+        '<testcase name="failed" time="10"><failure /></testcase>'
+        '<testcase name="error" time="20"><error /></testcase>'
+        "</testsuite></testsuites>"
+    )
+    assert _estimate_failed_test_time(str(report), 130) == 30
+    assert _estimate_failed_test_time(None, 130) == 130
 
 
 @pytest.mark.parametrize(

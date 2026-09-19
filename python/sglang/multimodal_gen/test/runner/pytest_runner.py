@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Sequence
@@ -115,6 +117,18 @@ def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
 
     process.wait()
     return process.returncode, output_bytes.decode("utf-8", errors="replace")
+
+
+def _estimate_failed_test_time(xml_path: str | None, attempt_time: float) -> float:
+    if xml_path is None or not Path(xml_path).exists():
+        return attempt_time
+
+    failed_time = sum(
+        float(testcase.get("time", "0"))
+        for testcase in ET.parse(xml_path).getroot().iter("testcase")
+        if testcase.find("failure") is not None or testcase.find("error") is not None
+    )
+    return failed_time if failed_time > 0 else attempt_time
 
 
 def _extract_collection_line(full_output: str) -> str | None:
@@ -276,6 +290,8 @@ def run_pytest(
         base_cmd.extend(["-k", filter_expr])
 
     max_retries = 6
+    retry_deadline = os.environ.get("SGLANG_DIFFUSION_RETRY_DEADLINE")
+    retry_deadline = float(retry_deadline) if retry_deadline else None
     attempt_reports = []
     for i in range(max_retries + 1):
         is_retry = i > 0
@@ -290,7 +306,9 @@ def run_pytest(
             f"for {len(files)} assigned item(s)"
         )
 
+        attempt_start = time.monotonic()
         returncode, full_output = _run_pytest_attempt(cmd)
+        attempt_time = time.monotonic() - attempt_start
         retryable = returncode not in (0, 5) and _is_retryable_failure(full_output)
         attempt_reports.append(
             {
@@ -334,6 +352,21 @@ def run_pytest(
             print(f"Max retry exceeded ({max_retries})")
             _print_attempt_tail_summary(attempt_reports, len(files))
             return (returncode, list(all_executed_cases), all_case_results)
+
+        if retry_deadline is not None:
+            remaining = retry_deadline - time.time()
+            retry_estimate = _estimate_failed_test_time(junit_xml_path, attempt_time)
+            # leave headroom for pytest startup and variation in the failed cases
+            required = retry_estimate * 1.1 + 30
+            if remaining < required:
+                print(
+                    f"Retry budget exhausted: {remaining:.1f}s remaining, "
+                    f"next failed-item retry needs approximately {required:.1f}s. "
+                    "Preserving the failing result instead of starting another attempt.",
+                    flush=True,
+                )
+                _print_attempt_tail_summary(attempt_reports, len(files))
+                return (returncode, list(all_executed_cases), all_case_results)
 
         print(
             f"Retryable failure detected on attempt {i + 1}. "
