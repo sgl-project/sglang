@@ -36,9 +36,13 @@ def dense_prefill_topk(
     selected = torch.full(
         (q[0].shape[0], topk), -1, dtype=torch.int32, device=weights.device
     )
-    compact = publish_candidates and sum(n > 0 for _, n in request_lengths) == 1 and all(
-        n == 0 or n >= 16 * candidate_topk_blocks * candidate_block_size
-        for _, n in request_lengths
+    compact = (
+        publish_candidates
+        and sum(n > 0 for _, n in request_lengths) == 1
+        and all(
+            n == 0 or n >= 16 * candidate_topk_blocks * candidate_block_size
+            for _, n in request_lengths
+        )
     )
     published = (
         PrefillCandidateBlocks(request_blocks=[], compact=compact)

@@ -63,8 +63,9 @@ class TestPrefillCandidateBlocks(CustomTestCase):
 
     def test_replay_tail_keeps_request_boundaries_and_empty_tails(self):
         requests = [torch.arange(n * 2).reshape(n, 2) for n in (5, 0, 3)]
-        candidates = PrefillCandidateBlocks(request_blocks=requests)
+        candidates = PrefillCandidateBlocks(request_blocks=requests, compact=True)
         tail = candidates.tail([2, 0, 0])
+        self.assertTrue(tail.compact)
         self.assertEqual(
             [tuple(b.shape) for b in tail.request_blocks], [(2, 2), (0, 2), (0, 2)]
         )

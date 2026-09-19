@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_indexer import candidate_block_mask
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4 import dense_prefill_indexer
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -207,6 +208,55 @@ class TestDensePrefillIndexer(CustomTestCase):
                             candidates=candidates.tail(tail_lengths),
                         )
                         self.assert_topk(tail_inputs, selected, consumer_scores[rows])
+
+    def test_compact_dispatch_policy_and_mapping(self):
+        from sglang.kernels.ops.attention.dsv4 import candidate_fp4_indexer
+
+        cases = (
+            ([(257, 32771)], True),
+            ([(257, 16383)], False),
+            ([(257, 32771), (17, 32771)], False),
+            ([(257, 32771), (0, 1)], False),
+        )
+        for request_lengths, compact in cases:
+            with self.subTest(request_lengths=request_lengths):
+                source_inputs = make_inputs(request_lengths)
+                source_inputs["candidate_topk_blocks"] = 128
+                _, candidates = dense_prefill_indexer.dense_prefill_topk(
+                    **source_inputs, publish_candidates=True, candidates=None
+                )
+                self.assertEqual(candidates.compact, compact)
+
+                consumer_inputs = make_inputs(request_lengths, seed=29)
+                consumer_inputs["kv"] = source_inputs["kv"]
+                consumer_inputs["candidate_topk_blocks"] = 128
+                expected = dense_scores(consumer_inputs)
+                row = 0
+                for (queries, context), blocks in zip(
+                    request_lengths, candidates.request_blocks
+                ):
+                    if queries and context:
+                        expected[row : row + queries, :context].masked_fill_(
+                            ~candidate_block_mask(blocks, context, 8), -torch.inf
+                        )
+                    row += queries
+
+                with patch.object(
+                    candidate_fp4_indexer,
+                    "candidate_fp4_mqa_logits",
+                    wraps=candidate_fp4_indexer.candidate_fp4_mqa_logits,
+                ) as compact_call:
+                    selected, published = dense_prefill_indexer.dense_prefill_topk(
+                        **consumer_inputs,
+                        publish_candidates=False,
+                        candidates=candidates,
+                    )
+                self.assertIsNone(published)
+                self.assertEqual(compact_call.call_count, 1 if compact else 0)
+                self.assert_topk(consumer_inputs, selected, expected)
+
+                tail = candidates.tail([min(q, 3) for q, _ in request_lengths])
+                self.assertEqual(tail.compact, compact)
 
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
