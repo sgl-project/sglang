@@ -10,7 +10,7 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-from typing import Optional
+from typing import Literal, Optional
 
 import msgspec
 
@@ -97,6 +97,22 @@ class Parallel(msgspec.Struct):
             ],
         ),
     ] = "auto"
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the DP-only fault-tolerance control plane.",
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int,
+        "Timeout in seconds for each fault-tolerance control phase.",
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        float,
+        "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
+    ] = 300
     attn_cp_size: A[
         int,
         Arg(
