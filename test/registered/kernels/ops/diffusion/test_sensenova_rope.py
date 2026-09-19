@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """SenseNova RoPE must preserve the eager bf16 rounding and sliced-head layout."""
 
+import sys
+
 import pytest
 import torch
 
@@ -119,3 +121,7 @@ def test_sensenova_attention_with_fused_rope_matches_eager(monkeypatch):
     monkeypatch.setattr(modeling_qwen3, "apply_rotary_pos_emb", eager_rope)
     expected, _ = attention.forward_gen(hidden, indexes, None)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
