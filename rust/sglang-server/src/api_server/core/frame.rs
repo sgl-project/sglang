@@ -470,6 +470,18 @@ impl OutputAccumulator {
         if oe.prompt_text.is_none() {
             oe.prompt_text.clone_from(&de.prompt_text);
         }
+        // Metadata snapshots are cumulative (reasoning) or constant per request
+        // (cached); 0 means "not reported yet". Spans arrive on the final frame
+        // only, so the latest `Some` wins.
+        if de.reasoning_tokens != 0 {
+            oe.reasoning_tokens = de.reasoning_tokens;
+        }
+        if de.cached_tokens != 0 {
+            oe.cached_tokens = de.cached_tokens;
+        }
+        if de.weight_versions.is_some() {
+            oe.weight_versions.clone_from(&de.weight_versions);
+        }
         oe.out_lp_val.extend_from_slice(&de.out_lp_val);
         oe.out_lp_idx.extend_from_slice(&de.out_lp_idx);
         oe.out_top_val.extend_from_slice(&de.out_top_val);
@@ -575,6 +587,7 @@ impl OutputAccumulator {
 mod tests {
     use super::*;
     use crate::message::finish_reason::FinishReason;
+    use crate::message::response::WeightVersionSpan;
 
     fn fr(v: serde_json::Value) -> Option<FinishReason> {
         Some(serde_json::from_value(v).expect("finish reason must parse"))
@@ -1086,5 +1099,37 @@ mod tests {
             cumulative_frame_json(&acc, "1", None).is_none(),
             "a text column out of lockstep must invalidate the memo"
         );
+    }
+    /// Metadata rides the same box as logprobs: the accumulator keeps the
+    /// latest nonzero reasoning/cached snapshots and the latest span list, and
+    /// a later 0 does not erase a known count.
+    #[test]
+    fn accumulator_keeps_the_latest_metadata_snapshot() {
+        let mut acc = OutputAccumulator::default();
+        let meta =
+            |reasoning: u32, cached: u32, spans: Option<Vec<WeightVersionSpan>>| ChunkEvent {
+                extras: Some(Box::new(ChunkExtras {
+                    reasoning_tokens: reasoning,
+                    cached_tokens: cached,
+                    weight_versions: spans,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+        acc.fold(&meta(2, 3, None));
+        acc.fold(&meta(
+            7,
+            0,
+            Some(vec![WeightVersionSpan {
+                version: "v2".into(),
+                start: 0,
+                end: 7,
+            }]),
+        ));
+        let out = acc.snapshot();
+        let extras = out.extras.as_deref().expect("metadata box");
+        assert_eq!(extras.reasoning_tokens, 7);
+        assert_eq!(extras.cached_tokens, 3);
+        assert_eq!(extras.weight_versions.as_deref().unwrap()[0].version, "v2");
     }
 }

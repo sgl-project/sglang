@@ -113,8 +113,17 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     Bytes::from(buf)
 }
 
+/// One `(version, start, end)` output-token span from Python
+/// `utils/weight_versions.py`. msgspec encodes it as a 3-element array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightVersionSpan {
+    pub version: String,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// Columnar scalar header for a whole decode batch. All numeric fields are
-/// `#[serde(default)]`; the hot path (no extras) emits just the first four.
+/// `#[serde(default)]`; the hot path (no extras) emits the first seven.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
     /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
@@ -125,6 +134,18 @@ pub struct BatchHeader {
     pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
+    /// Per-request cumulative snapshots, one entry per request (`meta_info`
+    /// semantics), present on every frame.
+    #[serde(default)]
+    pub reasoning_tokens: Vec<u32>,
+    #[serde(default)]
+    pub cached_tokens: Vec<u32>,
+    /// Weight-version spans as Python computes them: present on each request's
+    /// final frame (a final span is emitted even without a version change),
+    /// `None` while that request streams; the batch column is all-`None` until
+    /// some request in it finishes.
+    #[serde(default)]
+    pub weight_versions: Vec<Option<Vec<WeightVersionSpan>>>,
     #[serde(default)]
     pub out_lp_lens: Vec<u32>,
     #[serde(default)]
@@ -250,6 +271,15 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
         reject!()
     }
+    // The metadata columns are one entry per request (never partial); a whole
+    // empty column means the producer did not send the metadata family.
+    let per_req_len = |c: usize| c == 0 || c == n;
+    if !per_req_len(h.reasoning_tokens.len())
+        || !per_req_len(h.cached_tokens.len())
+        || !per_req_len(h.weight_versions.len())
+    {
+        reject!()
+    }
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
     let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
@@ -343,11 +373,15 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // which is exactly what the streaming decode avoids.
     let mut decode_one = |i: usize| -> Option<ChunkEvent> {
         let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
+        // Header (msgpack) metadata, independent of the numeric data cursors.
+        let reasoning_tokens = h.reasoning_tokens.get(i).copied().unwrap_or(0);
+        let cached_tokens = h.cached_tokens.get(i).copied().unwrap_or(0);
+        let weight_versions = h.weight_versions.get(i).cloned().flatten();
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely.
         let extras = if !has_extras {
-            None
+            ChunkExtras::metadata_only(reasoning_tokens, cached_tokens, weight_versions)
         } else {
             let (out_lp_val, out_lp_idx) =
                 take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i))?;
@@ -415,6 +449,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 in_tid_lens,
                 hidden_val,
                 hidden_lens,
+                reasoning_tokens,
+                cached_tokens,
+                weight_versions,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -542,14 +579,18 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
-    /// Logprob + hidden-state columns — `None` unless the request asked for them.
-    /// Boxed to keep the common token/text/finish frame small at large decode
-    /// batches (the decoder allocates it only when a column is non-empty).
+    /// Logprob + hidden-state columns and the per-request metadata snapshots —
+    /// `None` unless the request asked for one or the scheduler reported
+    /// reasoning/cached counts. Boxed to keep the common token/text/finish
+    /// frame small at large decode batches (the decoder allocates it only when
+    /// a column is non-empty).
     pub extras: Option<Box<ChunkExtras>>,
 }
 
-/// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
-/// request enabled logprobs / hidden states. Columnar `val`/`idx` (+ ragged `lens`)
+/// Logprob + hidden-state columns and metadata snapshots for a [`ChunkEvent`],
+/// allocated only when the request enabled logprobs / hidden states or the
+/// frame carries nonzero reasoning/cached counts (or final weight spans).
+/// Columnar `val`/`idx` (+ ragged `lens`)
 /// buffers arrive pre-decode; the detok shard fills the parallel `*_txt` columns
 /// when `return_text_in_logprobs` is set. In-process only — no serde (see
 /// [`ChunkEvent`]).
@@ -583,6 +624,13 @@ pub struct ChunkExtras {
     /// across chunks (the final message has the full set).
     pub hidden_val: Vec<f32>,
     pub hidden_lens: Vec<u32>,
+    /// Reasoning token count snapshot (`meta_info.reasoning_tokens`); 0 until the
+    /// scheduler reports one.
+    pub reasoning_tokens: u32,
+    /// Cached prompt token count snapshot (`meta_info.cached_tokens`); 0 = none.
+    pub cached_tokens: u32,
+    /// Weight-version spans, present only on the request's final frame.
+    pub weight_versions: Option<Vec<WeightVersionSpan>>,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -594,8 +642,8 @@ pub struct ChunkExtras {
 }
 
 impl ChunkExtras {
-    /// True when no logprob / hidden column carries data — lets the decoder skip the
-    /// box allocation for the common (extras-free) frame.
+    /// True when no logprob / hidden / metadata column carries data — lets the
+    /// decoder skip the box allocation for the common (extras-free) frame.
     fn is_empty(&self) -> bool {
         self.prompt_text.is_none()
             && self.out_lp_val.is_empty()
@@ -605,6 +653,26 @@ impl ChunkExtras {
             && self.out_tid_lens.is_empty()
             && self.in_tid_lens.is_empty()
             && self.hidden_lens.is_empty()
+            && self.reasoning_tokens == 0
+            && self.cached_tokens == 0
+            && self.weight_versions.is_none()
+    }
+
+    /// Rare-column box carrying only the metadata snapshots, for frames with no
+    /// logprob/hidden families. `None` when there is no metadata to carry, so
+    /// plain decode frames still skip the box.
+    fn metadata_only(
+        reasoning_tokens: u32,
+        cached_tokens: u32,
+        weight_versions: Option<Vec<WeightVersionSpan>>,
+    ) -> Option<Box<Self>> {
+        let ex = Self {
+            reasoning_tokens,
+            cached_tokens,
+            weight_versions,
+            ..Default::default()
+        };
+        (!ex.is_empty()).then(|| Box::new(ex))
     }
 }
 
@@ -689,6 +757,90 @@ mod tests {
         assert!(events.iter().all(|e| e.extras.is_none()));
     }
 
+    /// The three metadata columns decode per request: reasoning/cached
+    /// snapshots and the final-frame weight spans (msgspec's 3-element arrays).
+    /// Zero/None entries are the "not reported" spelling and allocate no box.
+    #[test]
+    fn decodes_metadata_columns() {
+        use rmpv::Value;
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),             // finish
+            arr_u(&[3, 4]),                                         // prompt
+            arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[7, 0]),                                         // reasoning_tokens
+            arr_u(&[3, 0]),                                         // cached_tokens
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::Array(vec![
+                        Value::from("v1"),
+                        Value::from(0u32),
+                        Value::from(2u32),
+                    ]),
+                    Value::Array(vec![
+                        Value::from("v2"),
+                        Value::from(2u32),
+                        Value::from(3u32),
+                    ]),
+                ]),
+                Value::Nil,
+            ]), // weight_versions
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [10i32, 20].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let framed = frame_decode_batch_cols(&header, &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
+        assert_eq!(events.len(), 2);
+
+        let ex0 = events[0].extras.as_deref().expect("req0 carries metadata");
+        assert_eq!(ex0.reasoning_tokens, 7);
+        assert_eq!(ex0.cached_tokens, 3);
+        assert_eq!(
+            ex0.weight_versions.as_deref().unwrap(),
+            [
+                WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 2,
+                },
+                WeightVersionSpan {
+                    version: "v2".into(),
+                    start: 2,
+                    end: 3,
+                },
+            ]
+        );
+        assert!(
+            events[1].extras.is_none(),
+            "zero/None metadata allocates no box"
+        );
+    }
+
+    /// A partial metadata column (one entry for two requests) is a producer
+    /// bug: the frame is rejected rather than silently shifting requests.
+    #[test]
+    fn rejects_partial_metadata_columns() {
+        use rmpv::Value;
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1"), Value::from("2")]),
+            Value::Array(vec![Value::Nil, Value::Nil]),
+            arr_u(&[3, 4]),
+            arr_u(&[1, 1]),
+            arr_u(&[7]), // reasoning_tokens: short
+            arr_u(&[]),
+            arr_u(&[]),
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [10i32, 20].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let framed = frame_decode_batch_cols(&header, &[&data]);
+        assert!(!for_each_chunk(&framed[1..], |_| {}).ok);
+    }
+
     /// A header whose column lengths exceed the data buffer (a Python/Rust
     /// positional-ABI drift, or a truncated frame) is rejected: `for_each_chunk`
     /// returns false and routes nothing — it must NOT panic the sole from_scheduler thread
@@ -706,6 +858,9 @@ mod tests {
             Value::Array(vec![Value::Nil]),         // finish_reasons
             Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
             Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 40 bytes)
+            Value::Array(vec![]),                   // reasoning_tokens
+            Value::Array(vec![]),                   // cached_tokens
+            Value::Array(vec![]),                   // weight_versions
             Value::Array(vec![Value::from(1u32)]),  // out_lp_lens (base now past data)
         ]);
         let mut header = Vec::new();
@@ -743,6 +898,9 @@ mod tests {
             finish.clone(),
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[]),     // reasoning_tokens
+            arr_u(&[]),     // cached_tokens
+            arr_u(&[]),     // weight_versions
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
@@ -767,6 +925,9 @@ mod tests {
             finish,
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[]),     // reasoning_tokens
+            arr_u(&[]),     // cached_tokens
+            arr_u(&[]),     // weight_versions
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[0, 0]), // out_top_reqlens
@@ -903,6 +1064,9 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),             // finish
             arr_u(&[3, 4]),                                         // prompt
             arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[]),                                             // reasoning_tokens
+            arr_u(&[]),                                             // cached_tokens
+            arr_u(&[]),                                             // weight_versions
             arr_u(&[2, 0]),                                         // out_lp_lens
             arr_u(&[0, 0]),                                         // in_lp_lens
             arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
@@ -975,6 +1139,9 @@ mod tests {
                 Value::Array(vec![Value::Nil, Value::Nil]),             // finish
                 arr_u(&[3, 4]),                                         // prompt
                 arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[]),                                             // reasoning_tokens
+                arr_u(&[]),                                             // cached_tokens
+                arr_u(&[]),                                             // weight_versions
                 arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
                 reqlens.clone(),                                        // in_lp_lens
                 reqlens.clone(),                                        // out_top_reqlens
@@ -1055,6 +1222,9 @@ mod tests {
             Value::Array(vec![Value::Nil]),       // finish
             arr_u(&[9]),                          // prompt
             arr_u(&[1]),                          // tok_lens
+            arr_u(&[]),                           // reasoning_tokens
+            arr_u(&[]),                           // cached_tokens
+            arr_u(&[]),                           // weight_versions
             arr_u(&[2]),                          // out_lp_lens      (2 flat)
             arr_u(&[1]),                          // in_lp_lens       (1 flat)
             arr_u(&[1]),                          // out_top_reqlens  (1 position…

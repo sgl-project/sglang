@@ -457,7 +457,8 @@ class _GenerationStreamAccumulator:
             # replaces those stages and builds its own metadata from the
             # ChunkEvent, so `push_generation` never reads these — skip the whole
             # block. The parallel lists stay empty; the payload goes straight to
-            # `push_generation`, which only indexes the fields appended above.
+            # `push_generation`, which only indexes the fields appended above and
+            # the metadata appended below.
             self.http_worker_ipcs.append(req.http_worker_ipc)
             self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
@@ -469,12 +470,16 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(len(output_ids_))
-            self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+
+        # These two feed both the Python detokenizer's meta_info and the Rust
+        # bridge's per-request metadata columns, so they are appended in every
+        # mode (unlike the Python-only fields above).
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer

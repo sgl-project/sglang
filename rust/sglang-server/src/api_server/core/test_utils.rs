@@ -2,7 +2,7 @@
 
 use crate::api_server::core::generate::{GeneratePlan, RequestTiming};
 use crate::message::ids::Rid;
-use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
 use crate::tokenizer_manager::wiring::{AbortSource, Senders};
 
 /// The CLOSED-inbox fixture: every receiver is dropped at construction, so the
@@ -67,6 +67,28 @@ pub(crate) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     } else {
         ResponseItem::Frame(output)
     }
+}
+
+/// A frame carrying the per-request metadata snapshots the bridge decodes.
+pub(crate) fn chunk_with_metadata(
+    rid: &str,
+    text: &str,
+    done: bool,
+    reasoning_tokens: u32,
+    cached_tokens: u32,
+) -> ResponseItem {
+    let mut item = chunk(rid, text, done);
+    match &mut item {
+        ResponseItem::Frame(event) | ResponseItem::Done(event) => {
+            event.extras = Some(Box::new(ChunkExtras {
+                reasoning_tokens,
+                cached_tokens,
+                ..Default::default()
+            }));
+        }
+        _ => unreachable!("chunk builds a frame"),
+    }
+    item
 }
 
 pub(crate) type TestReceiver = (

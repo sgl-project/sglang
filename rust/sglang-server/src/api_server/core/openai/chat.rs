@@ -32,6 +32,7 @@ use crate::api_server::core::openai::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
     parse_chat_tool_calls,
 };
+use crate::api_server::core::openai::{UsageDetails, usage_value, weight_metadata_value};
 use crate::api_server::core::state::CoreState;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::response::{ChunkEvent, ChunkExtras};
@@ -232,6 +233,12 @@ pub(crate) struct ChatRenderingOptions {
     pub(crate) tools: Option<Vec<ToolDefinition>>,
     pub(crate) parallel_tool_calls: bool,
     pub(crate) service_tier: Option<ChatServiceTier>,
+    /// `--enable-cache-report`: OpenAI usage exposes
+    /// `prompt_tokens_details.cached_tokens` only when enabled.
+    pub(crate) enable_cache_report: bool,
+    /// Launch-time `--weight-version`, the scalar fallback when the request has
+    /// no weight-version spans.
+    pub(crate) weight_version: Option<String>,
 }
 
 /// The unary fan-in returns the serialized response so the native matched stop
@@ -245,6 +252,11 @@ pub(crate) async fn unary_chat(
     let mut matched_stops = Vec::with_capacity(drained.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u32;
+    // Python takes the cached count from the prompt representative (choice 0);
+    // every choice shares the one rendered prompt.
+    let mut cached_tokens = None;
+    let mut weight_spans = None;
 
     for (index, (_, outcome)) in drained.into_iter().enumerate() {
         let output = unary_output(outcome)?;
@@ -253,6 +265,16 @@ pub(crate) async fn unary_chat(
             prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        if let Some(extras) = output.extras.as_deref() {
+            reasoning_tokens = reasoning_tokens.saturating_add(extras.reasoning_tokens);
+            if index == 0 && extras.cached_tokens != 0 {
+                cached_tokens = Some(extras.cached_tokens);
+            }
+            // Python reads metadata from the first response only.
+            if index == 0 {
+                weight_spans = extras.weight_versions.clone();
+            }
+        }
         matched_stops.push(output.finish_reason.as_ref().and_then(matched_stop_value));
         let logprobs = options
             .want_logprobs
@@ -295,6 +317,10 @@ pub(crate) async fn unary_chat(
         });
     }
 
+    let usage = completion_usage(
+        prompt_tokens,
+        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+    );
     let response = CreateChatCompletionResponse {
         id: options.response_id,
         choices,
@@ -303,10 +329,7 @@ pub(crate) async fn unary_chat(
         service_tier: options.service_tier,
         system_fingerprint: None,
         object: "chat.completion".into(),
-        usage: Some(completion_usage(
-            prompt_tokens,
-            u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-        )),
+        usage: None,
     };
     // Add the native matched stop per choice; Dynamo's `ChatChoice` has no slot
     // for it. Python always emits the key, null when nothing matched.
@@ -316,6 +339,18 @@ pub(crate) async fn unary_chat(
             choice["matched_stop"] = matched_stop.clone().unwrap_or(serde_json::Value::Null);
         }
     }
+    value["usage"] = usage_value(
+        usage,
+        UsageDetails {
+            reasoning_tokens,
+            cached_tokens: options
+                .enable_cache_report
+                .then_some(cached_tokens)
+                .flatten(),
+        },
+    );
+    value["metadata"] =
+        weight_metadata_value(weight_spans.as_deref(), options.weight_version.as_deref());
     Ok(value)
 }
 
@@ -329,6 +364,11 @@ struct ChatStreamState {
     prompt_tokens: Option<u32>,
     completion_tokens: Vec<u64>,
     matched_stop: Vec<Option<serde_json::Value>>,
+    /// Latest reasoning-count snapshot per choice (Python sums them at the end).
+    reasoning_tokens: Vec<u32>,
+    /// Cached prompt count per choice; continuous chunks report the current
+    /// choice's count, the trailer the prompt representative (choice 0).
+    cached_tokens: Vec<u32>,
 }
 
 impl ChatStreamState {
@@ -336,6 +376,8 @@ impl ChatStreamState {
         Self {
             completion_tokens: vec![0; count],
             matched_stop: vec![None; count],
+            reasoning_tokens: vec![0; count],
+            cached_tokens: vec![0; count],
             ..Default::default()
         }
     }
@@ -349,6 +391,14 @@ impl ChatStreamState {
             self.prompt_tokens = Some(output.prompt_tokens);
         }
         self.completion_tokens[choice_index] = completion_tokens;
+        if let Some(extras) = output.extras.as_deref() {
+            if extras.reasoning_tokens != 0 {
+                self.reasoning_tokens[choice_index] = extras.reasoning_tokens;
+            }
+            if extras.cached_tokens != 0 {
+                self.cached_tokens[choice_index] = extras.cached_tokens;
+            }
+        }
         if output.finish_reason.is_some() {
             self.matched_stop[choice_index] =
                 output.finish_reason.as_ref().and_then(matched_stop_value);
@@ -379,6 +429,29 @@ impl ChatStreamState {
             )
             .unwrap_or(u32::MAX),
         )
+    }
+
+    fn choice_reasoning(&self, choice_index: usize) -> u32 {
+        self.reasoning_tokens
+            .get(choice_index)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn choice_cached(&self, choice_index: usize) -> u32 {
+        self.cached_tokens.get(choice_index).copied().unwrap_or(0)
+    }
+
+    /// The prompt representative's cached count (Python `idx % n == 0`).
+    fn representative_cached(&self) -> u32 {
+        self.choice_cached(0)
+    }
+
+    fn total_reasoning(&self) -> u32 {
+        self.reasoning_tokens
+            .iter()
+            .copied()
+            .fold(0u32, u32::saturating_add)
     }
 }
 
@@ -614,6 +687,8 @@ pub(crate) fn chat_event_stream(
         tools,
         parallel_tool_calls,
         service_tier,
+        enable_cache_report,
+        weight_version: _,
     } = options;
     let reasoning_splitters = reasoning_parser
         .as_deref()
@@ -685,12 +760,22 @@ pub(crate) fn chat_event_stream(
                 // choice and Python emits one choice per event: split only
                 // packed events, leaving ordinary single-choice chunks as-is.
                 if response.choices.len() <= 1 {
-                    yield CoreEvent::Item(chat_chunk_value(response, &state, continuous_usage));
+                    yield CoreEvent::Item(chat_chunk_value(
+                        response,
+                        &state,
+                        continuous_usage,
+                        enable_cache_report,
+                    ));
                 } else {
                     for choice in std::mem::take(&mut response.choices) {
                         let mut chunk = response.clone();
                         chunk.choices = vec![choice];
-                        yield CoreEvent::Item(chat_chunk_value(chunk, &state, continuous_usage));
+                        yield CoreEvent::Item(chat_chunk_value(
+                            chunk,
+                            &state,
+                            continuous_usage,
+                            enable_cache_report,
+                        ));
                     }
                 }
             } else if let Some(error) = item.error {
@@ -701,10 +786,19 @@ pub(crate) fn chat_event_stream(
         // The final usage trailer follows the parser's EOF flush, so buffered
         // content and terminal choices always precede it.
         if include_usage {
-            let usage = state
-                .lock()
-                .expect("chat stream state poisoned")
-                .total_usage();
+            let (usage, details) = {
+                let state = state.lock().expect("chat stream state poisoned");
+                (
+                    state.total_usage(),
+                    UsageDetails {
+                        reasoning_tokens: state.total_reasoning(),
+                        // Python aggregates cached over the prompt
+                        // representative, not every choice.
+                        cached_tokens: enable_cache_report
+                            .then(|| state.representative_cached()),
+                    },
+                )
+            };
             let trailer = CreateChatCompletionStreamResponse {
                 id: response_id,
                 choices: Vec::new(),
@@ -713,11 +807,12 @@ pub(crate) fn chat_event_stream(
                 service_tier,
                 system_fingerprint: None,
                 object: "chat.completion.chunk".into(),
-                usage: Some(usage),
+                usage: None,
             };
-            yield CoreEvent::Item(
-                serde_json::to_value(trailer).expect("OpenAI response must serialize"),
-            );
+            let mut value =
+                serde_json::to_value(trailer).expect("OpenAI response must serialize");
+            value["usage"] = usage_value(usage, details);
+            yield CoreEvent::Item(value);
         }
     }
 }
@@ -726,9 +821,10 @@ pub(crate) fn chat_event_stream(
 /// `reasoning_content` present-as-null in the delta, attach continuous usage
 /// when enabled, and always emit `matched_stop` (null when nothing matched).
 fn chat_chunk_value(
-    mut chunk: CreateChatCompletionStreamResponse,
+    chunk: CreateChatCompletionStreamResponse,
     state: &Mutex<ChatStreamState>,
     continuous_usage: bool,
+    enable_cache_report: bool,
 ) -> serde_json::Value {
     let index = chunk.choices.first().map(|choice| choice.index as usize);
     let carries_delta = chunk.choices.first().is_some_and(choice_carries_delta);
@@ -736,19 +832,27 @@ fn chat_chunk_value(
         .choices
         .first()
         .is_some_and(|choice| choice.finish_reason.is_some());
-    let (usage, matched_stop) = {
+    // One short lock scope: gather usage, per-choice details, and the matched
+    // stop before serializing the chunk.
+    let (usage, details, matched_stop) = {
         let state = state.lock().expect("chat stream state poisoned");
-        let usage =
-            (continuous_usage && carries_delta).then(|| state.choice_usage(index.unwrap_or(0)));
+        let choice_index = index.unwrap_or(0);
+        let usage = (continuous_usage && carries_delta).then(|| state.choice_usage(choice_index));
+        let details = UsageDetails {
+            reasoning_tokens: state.choice_reasoning(choice_index),
+            // Python's continuous chat chunks report the current choice's
+            // cached count.
+            cached_tokens: enable_cache_report.then(|| state.choice_cached(choice_index)),
+        };
         let matched_stop = terminal
             .then(|| index.and_then(|index| state.matched_stop.get(index).cloned().flatten()))
             .flatten();
-        (usage, matched_stop)
+        (usage, details, matched_stop)
     };
-    if let Some(usage) = usage {
-        chunk.usage = Some(usage);
-    }
     let mut value = serde_json::to_value(chunk).expect("OpenAI response must serialize");
+    if let Some(usage) = usage {
+        value["usage"] = usage_value(usage, details);
+    }
     if let Some(delta) = value
         .pointer_mut("/choices/0/delta")
         .and_then(serde_json::Value::as_object_mut)
@@ -855,10 +959,10 @@ mod tests {
     };
     use crate::api_server::core::openai::template::ChatFormatter;
     use crate::api_server::core::test_utils::{
-        abort_senders, aborted_guard_rids, chunk, plan, planned, senders,
+        abort_senders, aborted_guard_rids, chunk, chunk_with_metadata, plan, planned, senders,
     };
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::{ChunkExtras, ResponseItem};
+    use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan};
     use dynamo_protocols::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
@@ -875,6 +979,8 @@ mod tests {
             tools: None,
             parallel_tool_calls: true,
             service_tier: None,
+            enable_cache_report: false,
+            weight_version: Some("wv-test".into()),
         }
     }
 
@@ -1663,5 +1769,142 @@ mod tests {
             serde_json::Value::Null,
             "no match still emits the key, as null"
         );
+    }
+    /// Python's `UsageInfo` on a unary chat response: top-level
+    /// `reasoning_tokens`, cached prompt details with cache reporting, and the
+    /// request's weight metadata (spans' last version, launch scalar fallback).
+    #[tokio::test]
+    async fn unary_chat_usage_exposes_reasoning_cached_and_metadata() {
+        let (choice, tx) = planned("r0");
+        let mut item = chunk_with_metadata("r0", "answer", true, 5, 4);
+        if let ResponseItem::Done(event) = &mut item {
+            event.extras.as_mut().unwrap().weight_versions = Some(vec![
+                WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 1,
+                },
+                WeightVersionSpan {
+                    version: "v2".into(),
+                    start: 1,
+                    end: 2,
+                },
+            ]);
+        }
+        tx.send(item).await.unwrap();
+
+        let value = unary_chat(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                enable_cache_report: true,
+                ..chat_options()
+            },
+        )
+        .await
+        .expect("unary chat succeeds");
+        assert_eq!(value["usage"]["reasoning_tokens"], 5);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(value["metadata"]["weight_version"], "v2");
+        assert_eq!(value["metadata"]["weight_versions"][1]["end"], 2);
+    }
+
+    /// Continuous chat chunks carry the choice's reasoning snapshot and (with
+    /// cache reporting) the shared cached count; the trailer sums the choices.
+    #[tokio::test]
+    async fn stream_continuous_usage_exposes_reasoning_and_cached() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk_with_metadata("r0", "a", false, 2, 3))
+            .await
+            .unwrap();
+        tx.send(chunk_with_metadata("r0", "b", true, 7, 3))
+            .await
+            .unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                enable_cache_report: true,
+                ..chat_options()
+            },
+            true,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames[1]["usage"]["reasoning_tokens"], 2);
+        assert_eq!(
+            frames[1]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["reasoning_tokens"], 7);
+        assert_eq!(
+            trailer["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+    }
+    /// Cached counts are retained per choice: a continuous chunk reports its
+    /// own choice's count even when it renders first. The trailer check here
+    /// only shapes the usage object the way the production trailer does;
+    /// actual trailer emission and ordering are covered by the stream fixture
+    /// tests.
+    #[test]
+    fn stream_cached_counts_are_per_choice_with_a_choice_zero_trailer() {
+        let event = |cached: u32| ChunkEvent {
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens: cached,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut state = super::ChatStreamState::new(2);
+        // Choice 1 reports before choice 0 has recorded anything.
+        state.record(1, &event(4), 1);
+        let state = std::sync::Mutex::new(state);
+
+        let chunk = |index: u32| super::CreateChatCompletionStreamResponse {
+            id: "chatcmpl-test".into(),
+            choices: vec![super::ChatChoiceStream {
+                index,
+                delta: super::chat_delta(Some("x".into()), None, None, None),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            created: 1,
+            model: "model".into(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".into(),
+            usage: None,
+        };
+
+        // Early arrival: choice 1's chunk carries its own count.
+        let second = super::chat_chunk_value(chunk(1), &state, true, true);
+        assert_eq!(second["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+
+        state.lock().unwrap().record(0, &event(3), 2);
+        let first = super::chat_chunk_value(chunk(0), &state, true, true);
+        assert_eq!(first["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+
+        // The trailer's usage is shaped exactly like the production trailer:
+        // aggregated counts plus the representative's cached count.
+        let trailer_usage = {
+            let state = state.lock().unwrap();
+            super::usage_value(
+                state.total_usage(),
+                super::UsageDetails {
+                    reasoning_tokens: state.total_reasoning(),
+                    cached_tokens: Some(state.representative_cached()),
+                },
+            )
+        };
+        assert_eq!(trailer_usage["prompt_tokens_details"]["cached_tokens"], 3);
     }
 }

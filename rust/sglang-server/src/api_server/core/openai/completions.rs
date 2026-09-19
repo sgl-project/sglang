@@ -11,6 +11,7 @@ use crate::api_server::core::generate::{
     FrameShaper, GeneratePlan, RequestTiming, UnaryDrainPolicy, drain_plan_unary,
     generation_event_stream_with, unary_output,
 };
+use crate::api_server::core::openai::{UsageDetails, usage_value, weight_metadata_value};
 use crate::message::response::{ChunkEvent, ChunkExtras};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -144,6 +145,12 @@ pub(crate) struct CompletionRenderingOptions {
     pub(crate) echo: bool,
     pub(crate) want_logprobs: bool,
     pub(crate) n: usize,
+    /// `--enable-cache-report`: OpenAI usage exposes
+    /// `prompt_tokens_details.cached_tokens` only when enabled.
+    pub(crate) enable_cache_report: bool,
+    /// Launch-time `--weight-version`, the scalar fallback when the request has
+    /// no weight-version spans.
+    pub(crate) weight_version: Option<String>,
 }
 
 pub(crate) async fn unary_completion(
@@ -155,7 +162,10 @@ pub(crate) async fn unary_completion(
     let mut choices = Vec::with_capacity(drained.len());
     let mut extensions = Vec::with_capacity(drained.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
+    let mut cached_tokens = 0u32;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u32;
+    let mut weight_spans = None;
 
     for (choice_index, (_, outcome)) in drained.into_iter().enumerate() {
         let output = unary_output(outcome)?;
@@ -163,6 +173,22 @@ pub(crate) async fn unary_completion(
 
         record_prompt_tokens(&mut prompt_tokens, prompt_index, output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        if let Some(extras) = output.extras.as_deref() {
+            reasoning_tokens = reasoning_tokens.saturating_add(extras.reasoning_tokens);
+            // Python selects cached counts from the first choice of each prompt
+            // (`idx % n == 0`) only; a sibling's count never wins, even if the
+            // first choice reported 0. Each choice is visited once, so a scalar
+            // total is enough here.
+            if choice_index.is_multiple_of(options.n) {
+                cached_tokens = cached_tokens.saturating_add(extras.cached_tokens);
+            }
+        }
+        if choice_index == 0 {
+            weight_spans = output
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.weight_versions.clone());
+        }
         let (response_choice, extension) =
             completion_choice(choice_index, output, options.echo, options.want_logprobs)?;
         choices.push(response_choice);
@@ -177,8 +203,12 @@ pub(crate) async fn unary_completion(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
     );
+    let details = UsageDetails {
+        reasoning_tokens,
+        cached_tokens: options.enable_cache_report.then_some(cached_tokens),
+    };
 
-    Ok(completion_response_value(
+    let mut value = completion_response_value(
         CreateCompletionResponse {
             id: options.response_id,
             choices,
@@ -189,7 +219,11 @@ pub(crate) async fn unary_completion(
             usage: Some(usage),
         },
         &extensions,
-    ))
+        details,
+    );
+    value["metadata"] =
+        weight_metadata_value(weight_spans.as_deref(), options.weight_version.as_deref());
+    Ok(value)
 }
 
 fn completion_choice(
@@ -237,10 +271,15 @@ fn completion_choice(
 /// its schema cannot represent. `text_offset` is corrected here because Dynamo
 /// types it as `u32`, while Python deliberately emits `-1`.
 pub(crate) fn completion_response_value(
-    response: CreateCompletionResponse,
+    mut response: CreateCompletionResponse,
     extensions: &[ChoiceExtensions],
+    details: UsageDetails,
 ) -> serde_json::Value {
+    let usage = response.usage.take();
     let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
+    if let Some(usage) = usage {
+        value["usage"] = usage_value(usage, details);
+    }
     let Some(root) = value.as_object_mut() else {
         return value;
     };
@@ -288,9 +327,12 @@ pub(crate) struct CompletionFrameShaper {
     want_logprobs: bool,
     include_usage: bool,
     continuous_usage: bool,
+    enable_cache_report: bool,
     n: usize,
     first_chunks: Vec<bool>,
     prompt_tokens_by_prompt: BTreeMap<usize, u32>,
+    cached_tokens_by_prompt: BTreeMap<usize, u32>,
+    reasoning_tokens_by_choice: Vec<u32>,
     completion_tokens_by_choice: Vec<u64>,
 }
 
@@ -308,6 +350,8 @@ impl CompletionFrameShaper {
             echo,
             want_logprobs,
             n,
+            enable_cache_report,
+            weight_version: _,
         } = options;
         Self {
             response_id,
@@ -317,9 +361,12 @@ impl CompletionFrameShaper {
             want_logprobs,
             include_usage,
             continuous_usage,
+            enable_cache_report,
             n,
             first_chunks: vec![true; count],
             prompt_tokens_by_prompt: BTreeMap::new(),
+            cached_tokens_by_prompt: BTreeMap::new(),
+            reasoning_tokens_by_choice: vec![0; count],
             completion_tokens_by_choice: vec![0; count],
         }
     }
@@ -337,6 +384,16 @@ impl CompletionFrameShaper {
             prompt_index,
             out.prompt_tokens,
         );
+        if let Some(extras) = out.extras.as_deref() {
+            if extras.reasoning_tokens != 0 {
+                self.reasoning_tokens_by_choice[choice_index] = extras.reasoning_tokens;
+            }
+            // First choice of each prompt only (Python `idx % n == 0`).
+            if choice_index.is_multiple_of(self.n) && extras.cached_tokens != 0 {
+                self.cached_tokens_by_prompt
+                    .insert(prompt_index, extras.cached_tokens);
+            }
+        }
         self.completion_tokens_by_choice[choice_index] = completion_tokens;
         let chunk_usage = self.continuous_usage.then(|| {
             completion_usage(
@@ -344,6 +401,12 @@ impl CompletionFrameShaper {
                 u32::try_from(completion_tokens).unwrap_or(u32::MAX),
             )
         });
+        // Python's continuous chunks report the choice's own reasoning count and
+        // no cached details; the final trailer carries both.
+        let details = UsageDetails {
+            reasoning_tokens: self.reasoning_tokens_by_choice[choice_index],
+            cached_tokens: None,
+        };
         let (choice, extension) =
             completion_choice(choice_index, out, self.echo && first, self.want_logprobs)?;
         Ok(CoreEvent::Item(completion_response_value(
@@ -357,6 +420,7 @@ impl CompletionFrameShaper {
                 usage: chunk_usage,
             },
             &[extension],
+            details,
         )))
     }
 }
@@ -417,6 +481,19 @@ impl FrameShaper for CompletionFrameShaper {
             .iter()
             .copied()
             .fold(0u64, u64::saturating_add);
+        let details = UsageDetails {
+            reasoning_tokens: self
+                .reasoning_tokens_by_choice
+                .iter()
+                .copied()
+                .fold(0u32, u32::saturating_add),
+            cached_tokens: self.enable_cache_report.then(|| {
+                self.cached_tokens_by_prompt
+                    .values()
+                    .copied()
+                    .fold(0u32, u32::saturating_add)
+            }),
+        };
         Some(Ok(CoreEvent::Item(completion_response_value(
             CreateCompletionResponse {
                 id: self.response_id.clone(),
@@ -431,6 +508,7 @@ impl FrameShaper for CompletionFrameShaper {
                 )),
             },
             &[],
+            details,
         ))))
     }
 }
@@ -565,7 +643,7 @@ fn append_top_logprobs(
 #[cfg(test)]
 mod tests {
     use crate::api_server::core::test_utils::{
-        abort_senders, aborted_guard_rids, chunk, plan, planned, senders,
+        abort_senders, aborted_guard_rids, chunk, chunk_with_metadata, plan, planned, senders,
     };
 
     use super::{
@@ -574,7 +652,8 @@ mod tests {
         completion_response_value, unary_completion,
     };
     use crate::api_server::core::event::CoreEvent;
-    use crate::message::response::{ChunkExtras, ResponseItem};
+    use crate::api_server::core::openai::UsageDetails;
+    use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan};
     use dynamo_protocols::types::{Choice, CreateCompletionResponse, Prompt};
     use futures::{FutureExt, StreamExt};
 
@@ -588,6 +667,8 @@ mod tests {
             echo: false,
             want_logprobs: false,
             n: 1,
+            enable_cache_report: false,
+            weight_version: Some("wv-test".into()),
         }
     }
 
@@ -662,6 +743,7 @@ mod tests {
                 usage: None,
             },
             &[ChoiceExtensions::default()],
+            UsageDetails::default(),
         );
         assert_eq!(
             value["choices"][0]["logprobs"]["text_offset"],
@@ -1052,6 +1134,195 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&frames[1]).unwrap()["choices"][0]["text"],
             "b"
+        );
+    }
+    /// Python's `UsageInfo`: top-level `reasoning_tokens` and cached prompt
+    /// details (with cache reporting), plus unary weight metadata from the
+    /// request's spans, whose scalar falls back to the launch version.
+    #[tokio::test]
+    async fn unary_usage_exposes_reasoning_cached_and_weight_metadata() {
+        // Two choices of one prompt: reasoning sums over choices, cached is
+        // counted once per prompt representative.
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        let mut first = chunk_with_metadata("r0", "done", true, 7, 3);
+        if let ResponseItem::Done(event) = &mut first {
+            event.extras.as_mut().unwrap().weight_versions = Some(vec![
+                WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 2,
+                },
+                WeightVersionSpan {
+                    version: "v2".into(),
+                    start: 2,
+                    end: 4,
+                },
+            ]);
+        }
+        tx0.send(first).await.unwrap();
+        tx1.send(chunk_with_metadata("r1", "done", true, 5, 4))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                enable_cache_report: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["reasoning_tokens"], 12);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(value["metadata"]["weight_version"], "v2");
+        assert_eq!(value["metadata"]["weight_versions"][0]["version"], "v1");
+        assert_eq!(value["metadata"]["weight_versions"][1]["end"], 4);
+    }
+
+    /// With cache reporting off the details block is absent, and a request with
+    /// no spans reports the launch-time scalar only (metadata is still present,
+    /// matching Python's unconditional unary metadata).
+    #[tokio::test]
+    async fn unary_usage_omits_cached_details_and_falls_back_to_scalar_metadata() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk_with_metadata("r0", "done", true, 7, 3))
+            .await
+            .unwrap();
+
+        let value = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["reasoning_tokens"], 7);
+        assert!(value["usage"].get("prompt_tokens_details").is_none());
+        assert_eq!(value["metadata"]["weight_version"], "wv-test");
+        assert!(value["metadata"].get("weight_versions").is_none());
+    }
+
+    /// The prompt representative's cached count wins even when it is zero:
+    /// a sibling's nonzero count must not leak into the details.
+    #[tokio::test]
+    async fn unary_usage_keeps_the_first_choices_zero_cached_count() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(chunk_with_metadata("r0", "a", true, 0, 0))
+            .await
+            .unwrap();
+        tx1.send(chunk_with_metadata("r1", "b", true, 0, 4))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                enable_cache_report: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert!(
+            value["usage"].get("prompt_tokens_details").is_none(),
+            "the first choice's zero wins over a sibling's count"
+        );
+    }
+
+    /// Streaming also selects cached counts from the prompt representative,
+    /// regardless of the order sibling choices report.
+    #[test]
+    fn stream_usage_takes_cached_from_the_prompt_representative() {
+        let trailer_cached = |representative: u32, sibling: u32, representative_first: bool| {
+            let event = |cached: u32| ChunkEvent {
+                extras: Some(Box::new(ChunkExtras {
+                    cached_tokens: cached,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let mut shaper = CompletionFrameShaper::new(
+                2,
+                CompletionRenderingOptions {
+                    n: 2,
+                    enable_cache_report: true,
+                    ..completion_options()
+                },
+                true,
+                false,
+            );
+            let (first_choice, second_choice, first_count, second_count) = if representative_first {
+                (0, 1, representative, sibling)
+            } else {
+                (1, 0, sibling, representative)
+            };
+            shaper
+                .frame(first_choice, event(first_count), 1, false)
+                .unwrap();
+            shaper
+                .frame(second_choice, event(second_count), 1, true)
+                .unwrap();
+            let trailer = crate::api_server::core::generate::FrameShaper::finish(&mut shaper)
+                .expect("trailer enabled")
+                .expect("trailer frame");
+            let CoreEvent::Item(value) = trailer else {
+                panic!("trailer must be an item")
+            };
+            value["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64()
+        };
+
+        // The representative's 3 wins over a sibling's 4 in either arrival order
+        // (a last-writer implementation passes only the second case).
+        assert_eq!(trailer_cached(3, 4, true), Some(3));
+        assert_eq!(trailer_cached(3, 4, false), Some(3));
+        // A representative 0 stays 0; a sibling's count never leaks in.
+        assert_eq!(trailer_cached(0, 4, true), None);
+        assert_eq!(trailer_cached(0, 4, false), None);
+    }
+
+    /// Streaming: continuous chunks report the choice's own reasoning snapshot
+    /// (Python omits cached there); the final trailer carries the summed
+    /// reasoning and the prompt-representative cached count.
+    #[tokio::test]
+    async fn stream_usage_exposes_reasoning_and_cached_details() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk_with_metadata("r0", "a", false, 2, 3))
+            .await
+            .unwrap();
+        tx.send(chunk_with_metadata("r0", "b", true, 7, 3))
+            .await
+            .unwrap();
+
+        let stream = completion_event_stream(
+            plan(vec![choice], senders()),
+            CompletionFrameShaper::new(
+                1,
+                CompletionRenderingOptions {
+                    enable_cache_report: true,
+                    ..completion_options()
+                },
+                true,
+                true,
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::completion_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames[0]["usage"]["reasoning_tokens"], 2);
+        assert!(
+            frames[0]["usage"].get("prompt_tokens_details").is_none(),
+            "Python's completion chunks omit cached details"
+        );
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["reasoning_tokens"], 7);
+        assert_eq!(
+            trailer["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
         );
     }
 }

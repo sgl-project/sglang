@@ -236,6 +236,8 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
         tools,
         parallel_tool_calls,
         service_tier,
+        enable_cache_report: state.server_args.enable_cache_report,
+        weight_version: state.server_args.weight_version.clone(),
     };
     if stream {
         let event_stream = chat_event_stream(
@@ -401,6 +403,8 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
         echo,
         want_logprobs,
         n,
+        enable_cache_report: state.server_args.enable_cache_report,
+        weight_version: state.server_args.weight_version.clone(),
     };
     if stream {
         let include_usage = stream_options.map(|o| o.include_usage).unwrap_or(false)
