@@ -213,6 +213,10 @@ class GSM8KMixin:
     gsm8k_accept_length_thres: Optional[float] = None
     gsm8k_num_threads: int = 128
     gsm8k_num_shots: int = 5  # run_eval backend only
+    # One ordered OpenAI completion batch removes client-thread arrival-order
+    # noise for batch-sensitive greedy evals. None keeps the traditional
+    # one-request-per-example workload.
+    gsm8k_request_batch_size: Optional[int] = None
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
@@ -255,6 +259,7 @@ class GSM8KMixin:
                 api="completion",
                 max_tokens=512,
                 num_shots=self.gsm8k_num_shots,
+                request_batch_size=self.gsm8k_request_batch_size,
                 temperature=self.gsm8k_temperature,
                 top_p=self.gsm8k_top_p,
             )

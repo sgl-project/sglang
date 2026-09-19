@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 import jinja2
@@ -218,19 +218,24 @@ class CompletionSampler(SamplerBase):
     def _pack_message(self, role: str, content: Any):
         return {"role": str(role), "content": content}
 
-    def __call__(self, message_list: MessageList) -> str:
-        # Extract raw text from message list (eval objects pack prompt as a single user message)
-        prompt = "\n".join(
+    @staticmethod
+    def _messages_to_prompt(message_list: MessageList) -> str:
+        # Eval objects pack a raw completion prompt as a single user message.
+        return "\n".join(
             msg["content"]
             for msg in message_list
             if isinstance(msg.get("content"), str)
         )
+
+    def _sample_prompts(
+        self, prompts: Union[str, List[str]], expected_count: int
+    ) -> List[str]:
         trial = 0
         while trial < 6:
             try:
                 response = self.client.completions.create(
                     model=self.model,
-                    prompt=prompt,
+                    prompt=prompts,
                     temperature=self.temperature,
                     top_p=self.top_p,
                     max_tokens=self.max_tokens,
@@ -238,10 +243,19 @@ class CompletionSampler(SamplerBase):
                 )
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
-                return response.choices[0].text or ""
+
+                choices = sorted(response.choices, key=lambda choice: choice.index)
+                indices = [choice.index for choice in choices]
+                expected_indices = list(range(expected_count))
+                if indices != expected_indices:
+                    raise ValueError(
+                        "Completion batch returned unexpected choice indices: "
+                        f"expected {expected_indices}, got {indices}"
+                    )
+                return [choice.text or "" for choice in choices]
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
-                return ""
+                return [""] * expected_count
             except Exception as e:
                 exception_backoff = 2**trial
                 print(
@@ -251,7 +265,23 @@ class CompletionSampler(SamplerBase):
                 time.sleep(exception_backoff)
                 trial += 1
         print(f"All retry attempts exhausted for request. Returning empty response.")
-        return ""
+        return [""] * expected_count
+
+    def sample_batch(self, message_lists: List[MessageList]) -> List[str]:
+        """Submit an ordered prompt batch in one completion request.
+
+        A single request is useful for reproducible evals: the server receives
+        the whole workload in a defined order instead of inheriting the
+        nondeterministic arrival order of many client threads.
+        """
+        prompts = [self._messages_to_prompt(messages) for messages in message_lists]
+        if not prompts:
+            return []
+        return self._sample_prompts(prompts, expected_count=len(prompts))
+
+    def __call__(self, message_list: MessageList) -> str:
+        prompt = self._messages_to_prompt(message_list)
+        return self._sample_prompts(prompt, expected_count=1)[0]
 
 
 class GenerateSampler(SamplerBase):

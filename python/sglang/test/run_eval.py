@@ -316,6 +316,7 @@ def run_eval(args):
             num_threads=args.num_threads,
             num_shots=getattr(args, "num_shots", 5),
             data_path=getattr(args, "gsm8k_data_path", None),
+            request_batch_size=getattr(args, "request_batch_size", None),
         )
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
@@ -327,6 +328,7 @@ def run_eval(args):
             secondary_pool_size=args.mixed_prefix_gsm8k_secondary_pool_size,
             data_path=args.gsm8k_data_path,
             seed=args.mixed_prefix_gsm8k_seed,
+            request_batch_size=getattr(args, "request_batch_size", None),
         )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")

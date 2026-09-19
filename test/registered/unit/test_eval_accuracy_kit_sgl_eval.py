@@ -76,6 +76,14 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         self.assertEqual(args.eval_name, "gsm8k")
         self.assertEqual(args.api, "completion")
 
+    def test_gsm8k_ordered_batch_size_is_forwarded(self):
+        args = self._run_gsm8k_default(
+            0.95,
+            gsm8k_accuracy_thres=0.5,
+            gsm8k_request_batch_size=500,
+        )
+        self.assertEqual(args.request_batch_size, 500)
+
     def test_legacy_accuracy_thres_alias_gates_score(self):
         # Canonical gsm8k_score_threshold left unset (NaN) -> the legacy
         # gsm8k_accuracy_thres must still be the pass/fail gate.

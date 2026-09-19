@@ -7,6 +7,8 @@ import random
 import re
 from typing import Optional
 
+from tqdm import tqdm
+
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
     HTML_JINJA,
@@ -50,9 +52,13 @@ class GSM8KEval(Eval):
         num_threads: int = 64,
         num_shots: int = 5,
         data_path: Optional[str] = None,
+        request_batch_size: Optional[int] = None,
     ):
         self._num_threads = num_threads
         self._num_shots = num_shots
+        if request_batch_size is not None and request_batch_size < 1:
+            raise ValueError("request_batch_size must be positive")
+        self._request_batch_size = request_batch_size
 
         if data_path:
             filename = data_path
@@ -77,7 +83,7 @@ class GSM8KEval(Eval):
         return self._few_shot_prompt
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(idx: int) -> SingleEvalResult:
+        def build_input(idx: int):
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
@@ -85,12 +91,13 @@ class GSM8KEval(Eval):
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]
+            return prompt_messages, correct_answer
 
-            try:
-                response_text = sampler(prompt_messages)
-            except Exception:
+        def score_response(
+            prompt_messages, correct_answer, response_text
+        ) -> SingleEvalResult:
+            if not isinstance(response_text, str):
                 response_text = ""
-
             extracted_answer = get_answer_value(response_text)
             score = float(extracted_answer == correct_answer)
 
@@ -105,9 +112,52 @@ class GSM8KEval(Eval):
 
             return SingleEvalResult(html=html, score=score, convo=convo)
 
-        results = common.map_with_progress(
-            fn, list(range(len(self._lines))), num_threads=self._num_threads
-        )
+        def fn(idx: int) -> SingleEvalResult:
+            prompt_messages, correct_answer = build_input(idx)
+            try:
+                response_text = sampler(prompt_messages)
+            except Exception:
+                response_text = ""
+            return score_response(prompt_messages, correct_answer, response_text)
+
+        if self._request_batch_size is None:
+            results = common.map_with_progress(
+                fn, list(range(len(self._lines))), num_threads=self._num_threads
+            )
+        else:
+            if not hasattr(sampler, "sample_batch"):
+                raise TypeError(
+                    f"{type(sampler).__name__} does not support batched requests"
+                )
+            results = []
+            indices = list(range(len(self._lines)))
+            for start in tqdm(
+                range(0, len(indices), self._request_batch_size),
+                total=(len(indices) + self._request_batch_size - 1)
+                // self._request_batch_size,
+            ):
+                batch_inputs = [
+                    build_input(idx)
+                    for idx in indices[start : start + self._request_batch_size]
+                ]
+                prompt_batch = [item[0] for item in batch_inputs]
+                try:
+                    response_batch = sampler.sample_batch(prompt_batch)
+                    if len(response_batch) != len(batch_inputs):
+                        raise ValueError(
+                            "Sampler returned "
+                            f"{len(response_batch)} responses for "
+                            f"{len(batch_inputs)} prompts"
+                        )
+                except Exception as e:
+                    print(f"Batch request failed; scoring the batch as empty: {e}")
+                    response_batch = [""] * len(batch_inputs)
+                results.extend(
+                    score_response(prompt_messages, correct_answer, response_text)
+                    for (prompt_messages, correct_answer), response_text in zip(
+                        batch_inputs, response_batch, strict=True
+                    )
+                )
         return common.aggregate_results(results, default_stats=("mean", "std"))
 
 
@@ -120,6 +170,7 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         secondary_pool_size: int,
         data_path: Optional[str],
         seed: int,
+        request_batch_size: Optional[int] = None,
     ):
         self._secondary_pool_size = secondary_pool_size
         self._seed = seed
@@ -128,6 +179,7 @@ class MixedPrefixGSM8KEval(GSM8KEval):
             num_threads=num_threads,
             num_shots=num_shots,
             data_path=data_path,
+            request_batch_size=request_batch_size,
         )
 
     def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
