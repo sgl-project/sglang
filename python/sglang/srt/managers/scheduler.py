@@ -101,6 +101,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
@@ -513,15 +514,24 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
+        # Init ZBAL, switch allocator should before any torch alloc action
+        self.init_zbal_on_npu()
+
+        # The groups are the first thing that allocates, so this comes after the
+        # allocator switch above and before anything that reads a group.
+        bootstrap.init_parallel_runtime(
+            server_args=server_args,
+            model_config=self.model_config,
+            device=get_device().device,
+            dist_port=self.nccl_port,
+        )
+
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-
-        # Init ZBAL, switch allocator should before any torch alloc action
-        self.init_zbal_on_npu()
 
         # Init PD-multiplexing context
         if self.enable_pdmux:

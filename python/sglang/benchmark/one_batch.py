@@ -71,6 +71,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -93,6 +94,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     SpawnRanks,
+    get_device,
     get_model,
     get_parallel,
     get_schedule,
@@ -334,6 +336,14 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         gpu_id=gpu_id,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
+    )
+
+    # Phase two: this entry has no scheduler to run it.
+    bootstrap.init_parallel_runtime(
+        server_args=server_args,
+        model_config=model_config,
+        device=get_device().device,
+        dist_port=port_args.nccl_port,
     )
 
     _use_mlx = use_mlx()
