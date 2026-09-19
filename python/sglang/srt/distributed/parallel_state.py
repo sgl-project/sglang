@@ -3050,7 +3050,14 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     at the target's attention-TP width rather than its global TP width.
 
     The scope replaces both the module global that ``get_tp_group()`` reads and
-    the three members the runtime context answers with.
+    the members the runtime context answers with. The group it installs is the
+    target's attention-TP group, which is already the TP width divided by the
+    attention-DP and attention-CP factors -- so the draft running on it has
+    neither: its attention identity is the group itself, one replica, one
+    context shard. Stating all of it keeps
+    ``tp_size == attn_tp_size * attn_dp_size * attn_cp_size`` true inside the
+    scope; leaving the names on the target's answers is what lets a draft read
+    report a replica count the draft does not have.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
@@ -3068,6 +3075,13 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            attn_tp_size=tp_group.world_size,
+            attn_tp_rank=tp_group.rank_in_group,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            dp_size=1,
         ):
             yield
     finally:
