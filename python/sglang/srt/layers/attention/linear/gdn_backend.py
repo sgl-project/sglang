@@ -36,6 +36,7 @@ if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         can_use_fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkv_split_gdn_prefill,
+        fused_qkv_split_l2norm_gdn_prefill,
         fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkvzba_split_reshape_cat_contiguous,
     )
@@ -926,7 +927,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        use_fused_split = (
+            is_cuda() or is_hip() or is_xpu()
+        ) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+        # HIP folds the Q/K L2-norm into the split; CUDA uses
+        # gdn_prefill_qkv_prepare_fwd. Only TritonGDNKernel.extend reads the
+        # flag, so gate on the kernel rather than on the platform.
+        qk_l2norm_applied = (
+            use_fused_split
+            and is_hip()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and not is_target_verify
+            and layer.num_q_heads == layer.num_k_heads
+            and layer.head_q_dim == layer.head_k_dim
+        )
+        if qk_l2norm_applied:
+            query, key, value = fused_qkv_split_l2norm_gdn_prefill(
+                mixed_qkv,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        elif use_fused_split:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1035,6 +1058,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                use_qk_l2norm_in_kernel=not qk_l2norm_applied,
             )
 
             if is_npu() and last_recurrent_state is not None:
