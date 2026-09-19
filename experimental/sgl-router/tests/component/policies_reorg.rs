@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use sgl_router::buckets_reorg::{Bucket, BucketResolver, EngineGroup, TokenLimits};
+use sgl_router::buckets_reorg::{Bucket, BucketResolver, EngineGroup, SloPreference, TokenLimits};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
@@ -417,4 +417,120 @@ async fn admission_placement_changes_whether_an_alternative_can_win() {
         policy.pick(&[], &request).await,
         Err(PickError::NoCandidates)
     ));
+}
+
+#[test]
+fn slo_preferences_order_each_stage_without_relaxing_length_limits() {
+    let table = EngineLoadTable::new();
+    let load = LoadView::new(&table);
+    let model = ModelId("pd".into());
+    let policy = Arc::new(TestPolicy::default());
+    let mut resolver = BucketResolver::new(
+        registry(),
+        vec![
+            Bucket {
+                id: "fast-prefill".into(),
+                ttft_ms: Some(50),
+                tokens_per_second: Some(10.0),
+                prefill: Some(group(10, &["p"], policy.clone())),
+                decode: Some(group(10, &["d"], policy.clone())),
+                ..Default::default()
+            },
+            Bucket {
+                id: "fast-decode".into(),
+                ttft_ms: Some(100),
+                tokens_per_second: Some(100.0),
+                prefill: Some(group(0, &["p"], policy.clone())),
+                decode: Some(group(0, &["d"], policy.clone())),
+                ..Default::default()
+            },
+            Bucket {
+                id: "unknown".into(),
+                prefill: Some(group(5, &["p"], policy.clone())),
+                decode: Some(group(5, &["d"], policy)),
+                ..Default::default()
+            },
+        ],
+    );
+    let mut prefill = request(&model, Stage::Prefill, &load);
+    prefill.ttft_ms = Some(50);
+    let mut decode = request(&model, Stage::Decode, &load);
+    decode.tokens_per_second = Some(100.0);
+    decode.expected_peak_tokens = Some(20);
+    let rank_order = ["fast-decode", "unknown", "fast-prefill"];
+    for (slo, expected_prefill, expected_decode) in [
+        (SloPreference::Disabled, rank_order, rank_order),
+        (
+            SloPreference::SloFirst,
+            ["fast-prefill", "fast-decode", "unknown"],
+            rank_order,
+        ),
+        (
+            SloPreference::BestEffort,
+            rank_order,
+            ["unknown", "fast-prefill", "fast-decode"],
+        ),
+    ] {
+        resolver.prefill_slo = slo;
+        resolver.decode_slo = slo;
+        for (request, expected) in [(&prefill, expected_prefill), (&decode, expected_decode)] {
+            let buckets = resolver.matching_buckets(request).unwrap();
+            assert_eq!(
+                buckets.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+        // A missing target treats every bucket alike, including unknown estimates.
+        let buckets = resolver
+            .matching_buckets(&request(&model, Stage::Prefill, &load))
+            .unwrap();
+        assert_eq!(
+            buckets.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            rank_order
+        );
+    }
+    resolver.prefill_slo = SloPreference::SloFirst;
+    resolver.decode_slo = SloPreference::BestEffort;
+    assert_eq!(
+        resolver.matching_buckets(&prefill).unwrap()[0].id,
+        "fast-prefill"
+    );
+    assert_eq!(resolver.matching_buckets(&decode).unwrap()[0].id, "unknown");
+
+    // SLO matches cannot override context or role-specific token limits.
+    resolver.buckets[0].max_context_tokens = Some(9);
+    resolver.buckets[1].decode.as_mut().unwrap().limits.max = Some(19);
+    assert_eq!(
+        resolver.matching_buckets(&prefill).unwrap()[0].id,
+        "fast-decode"
+    );
+    let buckets = resolver.matching_buckets(&decode).unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].id, "unknown");
+}
+
+#[tokio::test]
+async fn slo_ordering_applies_to_plain_selection_and_rejects_invalid_targets() {
+    let table = EngineLoadTable::new();
+    let load = LoadView::new(&table);
+    let model = ModelId("m".into());
+    let policy = Arc::new(TestPolicy::default());
+    let mut fast = bucket("fast", 10, &["b"], policy.clone());
+    fast.ttft_ms = Some(50);
+    let mut resolver =
+        BucketResolver::new(registry(), vec![bucket("unknown", 0, &["a"], policy), fast]);
+    resolver.prefill_slo = SloPreference::SloFirst;
+    let mut request = request(&model, Stage::Plain, &load);
+    request.ttft_ms = Some(50);
+    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "b");
+    // A nonmatching group remains a fallback when the preferred group is empty.
+    resolver.workers.remove(&WorkerId("b".into()));
+    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "a");
+    for target in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        request.tokens_per_second = Some(target);
+        assert!(matches!(
+            resolver.pick(&request).await,
+            Err(PickError::InvalidSignal(_))
+        ));
+    }
 }
