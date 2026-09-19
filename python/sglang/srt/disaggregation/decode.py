@@ -2746,6 +2746,9 @@ class SchedulerDisaggregationDecodeMixin:
                 new_prebuilt_batch
             )
             new_prebuilt_batch.filter_batch()
+            if running_batch.is_empty() and self._pp_microbatches_drained():
+                # idle worker admitting transferred reqs: close the gap here
+                self.metrics_reporter.mark_idle()
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch

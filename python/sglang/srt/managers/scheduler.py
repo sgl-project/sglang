@@ -4869,7 +4869,8 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
-        """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        """Idle housekeeping: mark idle, guard, check, metrics, reset, sleep."""
+        self.metrics_reporter.mark_idle()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -4954,6 +4955,9 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        # Engine-paused wall time is not decode forward time: close the
+        # interval as gap time or the whole pause lands in the next step-ms.
+        self.metrics_reporter.mark_idle()
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
