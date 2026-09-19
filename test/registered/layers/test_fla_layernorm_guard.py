@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import (
     rms_norm_ref,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(
     est_time=60,
@@ -88,7 +89,8 @@ def _setup_sglang_distributed(
     init_distributed_environment(
         world_size=world_size, rank=local_rank, local_rank=local_rank
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(tp_size=world_size, world_rank=local_rank)
+    initialize_model_parallel()
 
     return device
 

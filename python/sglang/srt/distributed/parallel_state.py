@@ -50,6 +50,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    _validate_parallel,
     derive_parallel_widths,
     get_global_dwdp_manager,
     get_parallel,
@@ -2513,44 +2514,41 @@ def init_distributed_environment(
 
 
 def initialize_model_parallel(
-    tensor_model_parallel_size: int = 1,
-    expert_model_parallel_size: int = 1,
-    pipeline_model_parallel_size: int = 1,
-    attention_data_parallel_size: int = 1,
-    attention_context_model_parallel_size: int = 1,
-    moe_data_model_parallel_size: int = 1,
-    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
-    shared_experts_tensor_parallel_size: Optional[int] = None,
 ) -> None:
     """
-    Initialize model parallel groups.
+    Initialize model parallel groups at the published widths.
 
-    Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model
-            parallelism.
-        expert_model_parallel_size: number of GPUs used for expert model
-            parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model
-            parallelism.
-        attention_data_parallel_size: number of GPUs used for attention data
-            parallelism.
-        attention_context_model_parallel_size: number of GPUs used for attention context
-            parallelism.
-        moe_data_model_parallel_size: number of GPUs used for moe data
-            parallelism.
-        decode_context_parallel_size: number of GPUs used for decode context
-            parallelism, which splits the KV cache across GPUs within each
-            tensor-parallel group during decoding. Must be a divisor of
-            tensor_model_parallel_size and is currently only supported on the
-            AMD HIP platform.
-        shared_experts_tensor_parallel_size: optional shared-expert TP width.
-            Must divide attention TP; subgroups never cross attention replicas.
+    Every width comes from the runtime context rather than from an argument:
+    the configuration already says how wide each dimension is, and a caller
+    that translates it again is a second place for the two to disagree. A
+    process that needs a narrower layout than the one it published -- the
+    media encoder is the case in the tree -- states that layout on the context
+    first, so what it builds and what it answers stay the same thing.
+
+    The remaining arguments are not topology. `backend` is decided by the
+    device, `duplicate_tp_group` and `enable_symm_mem` by other namespaces, and
+    `recovered_rank` / `rank_offset` / `max_world_size` describe this
+    particular join rather than the layout being joined.
+
+    The widths this reads:
+        tp_size: GPUs used for tensor model parallelism.
+        moe_ep_size: GPUs used for expert model parallelism.
+        pp_size: GPUs used for pipeline model parallelism.
+        attn_dp_size: GPUs used for attention data parallelism.
+        attn_cp_size: GPUs used for attention context parallelism.
+        moe_dp_size: GPUs used for MoE data parallelism.
+        attn_dcp_size: GPUs used for decode context parallelism, which splits
+            the KV cache across GPUs within each tensor-parallel group during
+            decoding. Must be a divisor of `tp_size` and is currently only
+            supported on the AMD HIP platform.
+        shared_experts_tp_size: optional shared-expert TP width. Must divide
+            attention TP; subgroups never cross attention replicas.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2586,6 +2584,16 @@ def initialize_model_parallel(
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    parallel = get_parallel()
+    tensor_model_parallel_size = parallel.tp_size
+    expert_model_parallel_size = parallel.moe_ep_size
+    pipeline_model_parallel_size = parallel.pp_size
+    attention_data_parallel_size = parallel.attn_dp_size
+    attention_context_model_parallel_size = parallel.attn_cp_size
+    moe_data_model_parallel_size = parallel.moe_dp_size
+    decode_context_parallel_size = parallel.attn_dcp_size
+    shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
 
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
@@ -2930,6 +2938,12 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+
+    # The groups just built and the configuration they were built from are two
+    # accounts of one layout. Check them against each other here, where the
+    # disagreement is still attributable, rather than letting a collective run
+    # on the wrong peers.
+    _validate_parallel(get_parallel(), "group build")
 
 
 def create_custom_parallel_group(
