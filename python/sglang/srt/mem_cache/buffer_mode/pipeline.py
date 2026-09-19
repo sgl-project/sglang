@@ -884,7 +884,7 @@ class BufferModePipeline:
         f = self.staged_prefetches.get(req.cache_request_handle)
         if f is None:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                self._clear_storage_hit(req)
+                self._clip_storage_hit(req)
             return True
         if len(req.prefix_indices) >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
@@ -928,8 +928,7 @@ class BufferModePipeline:
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
-        req.storage_hit_length = full_tokens
-        req.storage_hit_start = matched_len if full_tokens else None
+        # Preserve the completed L3 span, including peer-covered KV.
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
             f.operation_id, key, matched_len, full_tokens, swa_tokens
@@ -939,16 +938,15 @@ class BufferModePipeline:
     def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
-        self._clear_storage_hit(req)
+        self._clip_storage_hit(req)
         self._cache._resolve_storage_prefetch_tokens(
             req.cache_request_handle, f.num_tokens, reason="device_covered"
         )
         self.release_staged_hold(req.cache_request_handle, reason=None)
 
     @staticmethod
-    def _clear_storage_hit(req: Req) -> None:
-        req.storage_hit_length = 0
-        req.storage_hit_start = None
+    def _clip_storage_hit(req: Req) -> None:
+        req.storage_hit_length = req.fulfilled_storage_hit_len(len(req.prefix_indices))
         req.host_hit_is_storage = False
 
     def _refetch_staged(self, f: _StagedPrefetch) -> None:

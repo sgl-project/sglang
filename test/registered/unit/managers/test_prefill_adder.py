@@ -122,6 +122,7 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.host_loaded_spans = None
         req.materialized_host_hit_len.return_value = 0
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
@@ -390,6 +391,43 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_device_hit_tokens, 8)
         self.assertEqual(adder.log_host_hit_tokens, 0)
         self.assertEqual(adder.log_storage_hit_tokens, 12)
+
+    def test_alignment_rejection_precedes_load_back_and_preserves_tiers(self):
+        import torch
+
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        req = self._create_delayer_req(num_tokens=1280)
+        req.prefix_indices = torch.arange(256)
+        req.kv = SimpleNamespace(cache_protected_len=256, holds_mamba=False)
+        req.best_match_node = req.last_node
+        req.host_hit_length = 768
+        req.storage_hit_start = 768
+        req.storage_hit_length = 256
+        req.fulfilled_storage_hit_len.return_value = 256
+        req.needs_host_load_back.return_value = True
+        req.host_loaded_spans = []
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.arange(256, 1024),
+            req.last_node,
+        )
+        first = self.create_adder(self.create_running_batch(), rem_chunk_tokens=64)
+        result = first.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=128
+        )
+        self.assertIs(result, AddReqResult.OTHER)
+        self.assertEqual(first.can_run_list, [])
+        self.assertEqual(req.host_loaded_spans, [])
+        self.mock_tree_cache.init_load_back.assert_not_called()
+
+        retry = self.create_adder(self.create_running_batch(), rem_chunk_tokens=512)
+        retry.add_one_req(req, has_chunked_req=False, truncation_align_size=128)
+        self.assertIn(req, retry.can_run_list)
+        self.assertEqual(retry.log_device_hit_tokens, 256)
+        self.assertEqual(retry.log_host_hit_tokens, 512)
+        self.assertEqual(retry.log_storage_hit_tokens, 256)
+        self.assertEqual(req.host_loaded_spans, [(256, 1024)])
+        self.mock_tree_cache.init_load_back.assert_called_once()
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())
@@ -945,6 +983,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator, self.mock_tree_cache
             )
             req = self.create_mock_req("dropped-fetch", priority=0, max_new_tokens=8)
+            req.host_loaded_spans = []
             req.prefix_indices = torch.empty(0, dtype=torch.int64)
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
@@ -996,6 +1035,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def _create_host_hit_req(self, *, prefix_len=0, host_hit=8192, tail=1024):
         req = self._create_delayer_req(prefix_len + host_hit + tail)
+        req.host_loaded_spans = []
         req.prefix_indices = torch.arange(prefix_len)
         req.host_hit_length = host_hit
         req.needs_host_load_back.return_value = True
