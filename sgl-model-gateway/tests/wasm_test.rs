@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use axum::{
     body::{to_bytes, Body},
@@ -32,6 +32,7 @@ use smg::{
             WasmModuleDescriptor, WasmModuleListResponse, WasmModuleType,
         },
         module_manager::WasmModuleManager,
+        module_roots::ModuleRoots,
     },
 };
 use tempfile::TempDir;
@@ -40,8 +41,15 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Create a test AppContext with WASM manager initialized
-async fn create_test_context_with_wasm() -> Arc<AppContext> {
+async fn create_test_context_with_wasm(module_root: &Path) -> Arc<AppContext> {
     let config = RouterConfig::default();
+
+    // Modules may only be loaded from a configured root, so a hand-built context
+    // needs one too — otherwise every registration is refused before it starts.
+    let module_roots = Arc::new(
+        ModuleRoots::load(&[module_root.to_string_lossy().into_owned()])
+            .expect("Failed to load module roots"),
+    );
 
     // Initialize WASM manager first
     let wasm_manager = Arc::new(
@@ -92,6 +100,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .wasm_manager(Some(wasm_manager))
+            .wasm_module_roots(Some(module_roots))
             .build()
             .expect("Failed to build AppContext with WASM manager"),
     );
@@ -166,7 +175,7 @@ async fn create_test_wasm_component(temp_dir: &TempDir) -> String {
 /// Create a test app with WASM support
 async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let app_context = create_test_context_with_wasm().await;
+    let app_context = create_test_context_with_wasm(temp_dir.path()).await;
 
     // Create a dummy router (we only need the app for WASM endpoints)
     let router = RouterFactory::create_router(&app_context)
@@ -315,6 +324,80 @@ async fn test_wasm_api_add_module_invalid_file() {
     } else {
         panic!("Expected error result for invalid file path");
     }
+}
+
+/// POST /wasm with `file_path` and return the rejection message the client sees.
+async fn rejection_message(app: &axum::Router, file_path: &str) -> String {
+    let add_request = WasmModuleAddRequest {
+        modules: vec![WasmModuleDescriptor {
+            name: "probe".to_string(),
+            file_path: file_path.to_string(),
+            module_type: WasmModuleType::Middleware,
+            attach_points: vec![WasmModuleAttachPoint::Middleware(
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
+            )],
+            add_result: None,
+        }],
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/wasm")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&add_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let parsed: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.modules.len(), 1);
+
+    match parsed.modules[0].add_result.as_ref() {
+        Some(smg::wasm::module::WasmModuleAddResult::Error(message)) => message.clone(),
+        other => panic!("expected a rejection for {file_path}, got {other:?}"),
+    }
+}
+
+/// The disclosure property, asserted where it actually matters: at the HTTP
+/// boundary, not on the error type.
+///
+/// The unit test in `module_roots` pins the `Display` impl. This one pins what
+/// reaches the client, so a change at the call site — formatting the error with
+/// `{:?}`, say, or appending the resolved path — cannot reopen the leak while
+/// the unit test stays green.
+#[tokio::test]
+async fn test_wasm_api_rejection_does_not_reveal_path_existence() {
+    let (app, _app_context, temp_dir) = create_test_app_with_wasm().await;
+
+    // Exists on disk, but outside every configured root.
+    let outside_dir = TempDir::new().expect("Failed to create temp directory");
+    let outside_file = outside_dir.path().join("outside.component.wasm");
+    fs::write(&outside_file, b"\0asm\x01\0\0\0")
+        .await
+        .expect("Failed to write file outside the root");
+
+    // Inside the root, but no such file.
+    let absent_file = temp_dir.path().join("absent.component.wasm");
+
+    let absent = rejection_message(&app, &absent_file.to_string_lossy()).await;
+    let outside = rejection_message(&app, &outside_file.to_string_lossy()).await;
+
+    assert_eq!(
+        absent, outside,
+        "rejection messages differ, so a caller can probe which paths exist: \
+         absent={absent:?} outside={outside:?}"
+    );
+
+    // And neither may echo the path back.
+    assert!(
+        !absent.contains("absent.component.wasm") && !outside.contains("outside.component.wasm"),
+        "rejection message echoes the requested path back to the caller"
+    );
 }
 
 #[tokio::test]
@@ -684,6 +767,7 @@ async fn test_wasm_module_execution() {
     let config_request = WasmModuleConfigRequest { descriptor };
     let workflow_data = WasmRegistrationWorkflowData {
         config: config_request,
+        canonical_path: None,
         wasm_bytes: None,
         sha256_hash: None,
         file_size_bytes: None,
