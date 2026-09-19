@@ -279,6 +279,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    allocate_distinct_stream,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -1899,13 +1900,10 @@ class Scheduler(
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            _redraws = 0
-            while (
-                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
-                and _redraws < 64
-            ):
-                self.schedule_stream = self.device_module.Stream(priority=0)
-                _redraws += 1
+            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+                self.schedule_stream = allocate_distinct_stream(
+                    self.device_module, (self.forward_stream,)
+                )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -4890,9 +4888,12 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
-                # Storage workers need the GIL between I/O calls. Yield while
-                # there is no GPU batch so polling cannot starve their acks.
+            if (
+                self.enable_hicache_storage
+                or self.disaggregation_mode != DisaggregationMode.NULL
+            ):
+                # Storage and transfer workers need the GIL between I/O calls.
+                # Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
