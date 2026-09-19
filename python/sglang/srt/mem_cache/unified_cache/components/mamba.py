@@ -237,10 +237,12 @@ class MambaComponent(TreeComponent):
                 node.id, self.component_type, params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
+            self.tree_core._touch_full_eviction_key(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
+        self.tree_core._touch_full_eviction_key(node)
         result.mamba_exist = True
 
     def _emit_excess_path_states_eviction(
