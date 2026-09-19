@@ -33,7 +33,6 @@ from sglang.kernels.ops.elementwise.elementwise import (
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -1056,7 +1055,7 @@ class Qwen2MoeModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.moe_dp_size = get_parallel().moe_dp_size
 
@@ -1206,7 +1205,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None

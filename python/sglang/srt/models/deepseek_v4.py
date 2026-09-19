@@ -42,10 +42,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tp_group,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -82,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     is_cp_active,
 )
+from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -263,6 +260,7 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
@@ -885,11 +883,7 @@ class MqaAttentionBase(nn.Module):
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
         elif fp8:
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            )
+            self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
@@ -2412,12 +2406,11 @@ class MQALayer(MqaAttentionBase):
             elif self.wo_a_fp8:
                 import deep_gemm
 
-                from sglang.srt.layers import deep_gemm_wrapper
-
                 T, G, D = o.shape
                 R = self.o_lora_rank
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                    # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+                if _FP8_WO_A_UE8M0:
+                    # Blackwell (including SM120): UE8M0 scales via the dedicated
+                    # JIT kernel.
                     o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                     recipe = (1, 1, 128)
                 else:
@@ -2872,7 +2865,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # all-reduce input. Gated by is_allocation_symmetric() (mirrors the
         # TileLang path in _mhc_pre_impl / mhc_fused_post_pre).
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
@@ -3181,7 +3174,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x.is_cuda
                 and get_platform().is_blackwell
                 and (
-                    0 < x.shape[0] <= 8
+                    0 < x.shape[0] <= 96
                     or (
                         self.config.model_type == "deepseek_v41"
                         and 4096 <= x.shape[0] <= 65536
@@ -3611,7 +3604,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
@@ -3661,7 +3654,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
@@ -3669,7 +3662,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
-                get_tp_group().reduce_scatterv(
+                get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
@@ -3987,7 +3980,7 @@ class DeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -4376,7 +4369,7 @@ class DeepseekV4Model(nn.Module):
         # once across DP ranks, then populate each child's global_num_tokens +
         # global_dp_buffer_len so the gatherv/reduce_scatterv buffers size correctly.
         if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
-            tp_group = get_tp_group()
+            tp_group = get_parallel().tp_group
             world = tp_group.world_size
             children = forward_batch.tbo_children
             local_lens = torch.tensor(
@@ -4620,7 +4613,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
             if (
                 get_parallel().attn_cp_size != 1
-                or get_pp_group().world_size != 1
+                or get_parallel().pp_group.world_size != 1
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
@@ -4636,7 +4629,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -4900,9 +4893,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
-        from sglang.srt.layers import deep_gemm_wrapper
-
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if _FP8_WO_A_UE8M0:
             from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
@@ -4941,7 +4932,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 continue
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if _FP8_WO_A_UE8M0:
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                     raw_scale,
                     mn=R,
@@ -5108,7 +5099,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
         torch.cuda.empty_cache()
-        get_tp_group().barrier()
+        get_parallel().tp_group.barrier()
         logger.info(
             "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
             compile_secs,
