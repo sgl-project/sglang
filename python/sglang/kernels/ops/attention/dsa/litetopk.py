@@ -41,7 +41,7 @@ _REFRESH_EVERY = 64
 # topk/sample_len of every row (25% at the defaults), so the scan opens with an
 # estimate of the row's own topk quantile, scaled by the margin, and rows whose
 # candidate count comes back short are rescanned from the safe threshold.
-_GATE_MARGIN = 2.0
+_GATE_MARGIN = 1.5
 _GATE_K_MIN = 64
 
 
@@ -72,14 +72,6 @@ def _jit_dsa_litetopk_module() -> Module:
         # Also supplies the deep_gemm headers the kernel includes.
         extra_dependencies=["cutlass"],
     )
-
-
-def _pad_scales_for_tma(kv_scales: torch.Tensor) -> torch.Tensor:
-    """The scan TMA descriptor rounds the scales dim up to 16B; pad if needed."""
-    rem = kv_scales.shape[0] % 4
-    if rem == 0:
-        return kv_scales
-    return torch.nn.functional.pad(kv_scales, (0, 4 - rem))
 
 
 def _tma_aligned_scales(kv_scales: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
@@ -170,10 +162,14 @@ def _rescan_short_rows(
     row_mask = qblock_mask.repeat_interleave(_BLOCK_Q)[:num_q]
     torch.where(row_mask, th_safe, th_bucket, out=th_bucket)
     cand_cnt.masked_fill_(row_mask, 0)
+    # The refresh histogram must restart with the candidate list: counts left
+    # from the first pass would be doubled by the re-emitted positions and
+    # tighten the threshold past the true k-th score.
+    bcount.masked_fill_(row_mask.unsqueeze(1), 0)
     module.scan(
         q_fp8,
         kv_fp8,
-        _pad_scales_for_tma(kv_scales),
+        kv_scales,
         weights,
         ks,
         ke,
@@ -305,7 +301,7 @@ def dsa_litetopk_indexer(
     module.scan(
         q_fp8,
         kv_fp8,
-        _pad_scales_for_tma(kv_scales),
+        kv_scales,
         weights,
         ks,
         ke,

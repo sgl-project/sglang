@@ -82,7 +82,7 @@ void dsa_litetopk_seed_prep(
       << "sample logits row stride " << slog_stride << " misaligns float4 row loads; pad rows to a multiple of 4";
   const int nb = static_cast<int>(num_buckets);
   const int cap = static_cast<int>(cand_cap);
-  CHECK_HOST(nb >= 2 && nb <= 4096) << "num_buckets out of range: " << nb;
+  CHECK_HOST(nb >= 32 && nb <= 4096 && nb % 32 == 0) << "num_buckets must be a multiple of 32 in [32, 4096]: " << nb;
   CHECK_HOST(static_cast<int64_t>(NB.unwrap()) == nb) << "bcount width != num_buckets";
   CHECK_HOST(topk >= 1 && cap >= topk) << "need cand_cap >= topk >= 1";
   CHECK_HOST(gate_k >= 1 && gate_k <= topk) << "need 1 <= gate_k <= topk, got " << gate_k;
@@ -131,8 +131,8 @@ void dsa_litetopk_seed_prep(
 // scan: the fused UMMA scoring + gate + candidate-emit pass over all KV.
 //   q          [num_q, 32, 128]  fp8_e4m3 (contiguous)
 //   kv         [seq_len_kv, 128] fp8_e4m3 (gathered, contiguous)
-//   kv_scales  [seq_len_kv]      fp32 (allocation padded to a multiple of 4:
-//              the TMA descriptor rounds the global dim up to 16B)
+//   kv_scales  [seq_len_kv]      fp32 (read by the math warps with a clamped
+//              index; any length covering the KV works)
 //   weights    [num_q, 32]       fp32 (q-scale and softmax scale folded in)
 //   cu_start / cu_end [num_q]    int32 per-row causal KV range into `kv`
 //   refresh_every < 0 selects the external-refresh mode (daemon off, one
@@ -191,17 +191,15 @@ void dsa_litetopk_scan(
   const DLDevice device = device_.unwrap();
   CHECK_HOST(static_cast<int64_t>(NB.unwrap()) == nb) << "bcount width != num_buckets";
   CHECK_HOST(runtime::get_cc_major(device.device_id) == 10) << "dsa_litetopk_scan requires SM100 (Blackwell)";
-  // The TMA descriptor for kv_scales rounds the global inner dim up to 16B;
-  // the tail elements must be readable, so require a padded allocation.
+  // The math warps read the scales with a clamped index: any length that
+  // covers the KV works.
   const int64_t scales_len = static_cast<int64_t>(SPAD.unwrap());
-  CHECK_HOST(scales_len % 4 == 0) << "kv_scales must be padded to a multiple of 4 floats, got " << scales_len;
   CHECK_HOST(scales_len >= seq_len_kv) << "kv_scales shorter than kv";
 
   const bool external_refresh = (refresh_every < 0);
   const int refresh_every_i = external_refresh ? 0x7fffffff : static_cast<int>(refresh_every);
 
   const int esz_f32 = 4;
-  const int ks_aligned = cutlass::round_up(seq_len_kv, 16 / esz_f32);
   auto tm_q = make_2d(
       const_cast<void*>(q.data_ptr()),
       CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -222,16 +220,6 @@ void dsa_litetopk_scan(
       BLOCK_KV,
       HEAD_DIM,
       HEAD_DIM);
-  auto tm_ks = make_2d(
-      const_cast<void*>(kv_scales.data_ptr()),
-      CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
-      esz_f32,
-      ks_aligned,
-      1,
-      BLOCK_KV,
-      1,
-      0,
-      0);
   auto tm_w = make_2d(
       const_cast<void*>(weights.data_ptr()),
       CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
@@ -311,9 +299,10 @@ void dsa_litetopk_scan(
       static_cast<int32_t*>(cand_cnt.data_ptr()),
       static_cast<uint32_t>(cand_cap),
       qblock_mask_ptr,
+      static_cast<const float*>(kv_scales.data_ptr()),
+      static_cast<uint32_t>(scales_len),
       tm_q,
       tm_kv,
-      tm_ks,
       tm_w);
 
   if (external_refresh) {

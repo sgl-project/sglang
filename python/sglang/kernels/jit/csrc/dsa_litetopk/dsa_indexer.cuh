@@ -170,11 +170,17 @@ __global__ void seed_prep_kernel(
     s_mn[tid >> 5] = mn;
   }
   __syncthreads();
-  if (tid == 0) {
+  if (tid < 32) {
+    mx = s_mx[lane];
+    mn = s_mn[lane];
 #pragma unroll
-    for (int wgi = 1; wgi < BT / 32; ++wgi) {
-      s_mx[0] = fmaxf(s_mx[0], s_mx[wgi]);
-      s_mn[0] = fminf(s_mn[0], s_mn[wgi]);
+    for (int off = 16; off > 0; off >>= 1) {
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+      mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, off));
+    }
+    if (lane == 0) {
+      s_mx[0] = mx;
+      s_mn[0] = mn;
     }
   }
   __syncthreads();
@@ -248,27 +254,44 @@ __global__ void seed_prep_kernel(
     // counts — write zeros here, saving the caller a separate memset.
     bcount[(size_t)row * NB + b] = (emit_limit == 0) ? 0 : s_hist[b];
   __shared__ int s_th;
-  if (tid == 0) {
+  if (tid < 32) {
+    // Warp-parallel cumulative count over the buckets: lane l owns buckets
+    // [l*NB/32, (l+1)*NB/32); first bucket whose inclusive count reaches the
+    // gate rank / the safe rank.
     const int kk = K < head ? K : head;
     const int kg = K_gate < kk ? K_gate : kk;
-    int cum = 0, th = NB - 1, th_gate = NB - 1;
-    bool gate_found = false;
-    for (int b = 0; b < NB; ++b) {
-      cum += s_hist[b];
-      if (!gate_found && cum >= kg) {
-        th_gate = b;
-        gate_found = true;
-      }
-      if (cum >= kk) {
-        th = b;
-        break;
-      }
+    const int per_lane = NB / 32;
+    const int b0 = lane * per_lane;
+    int local = 0;
+    for (int t = 0; t < per_lane; ++t)
+      local += s_hist[b0 + t];
+    int incl = local;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const int n = __shfl_up_sync(0xffffffffu, incl, off);
+      if (lane >= off) incl += n;
     }
-    s_th = th;
-    th_bucket[row] = th_gate;
-    th_safe[row] = th;
-    origin[row] = o;
-    inv_delta[row] = inv;
+    int cum = incl - local;
+    int th_gate_l = NB, th_l = NB;
+    for (int t = 0; t < per_lane; ++t) {
+      cum += s_hist[b0 + t];
+      if (th_gate_l == NB && cum >= kg) th_gate_l = b0 + t;
+      if (th_l == NB && cum >= kk) th_l = b0 + t;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      th_gate_l = min(th_gate_l, __shfl_xor_sync(0xffffffffu, th_gate_l, off));
+      th_l = min(th_l, __shfl_xor_sync(0xffffffffu, th_l, off));
+    }
+    if (lane == 0) {
+      const int th = th_l < NB ? th_l : NB - 1;
+      const int th_gate = th_gate_l < NB ? th_gate_l : NB - 1;
+      s_th = th;
+      th_bucket[row] = th_gate;
+      th_safe[row] = th;
+      origin[row] = o;
+      inv_delta[row] = inv;
+    }
   }
   __syncthreads();
   const int th_emit = s_th;
@@ -449,17 +472,44 @@ __global__ void compact_topk_min_thr_litetopk_kernel(
       if ((e & mask) == (d & mask)) atomicAdd(&hist[(e >> shift) & 0xffu], 1u);
     }
     __syncthreads();
-    if (tid == 0) {
-      uint32_t acc = 0;
-      uint32_t kf = kfind;
-      for (int b = 0; b < RADIX; ++b) {
-        uint32_t h = hist[b];
-        if (acc < kf && kf <= acc + h) {
-          desired = d | (uint32_t(b) << shift);
-          kfind = kf - acc;
-          break;
+    if (tid < 32) {
+      // Warp-parallel cumulative count over the 256 buckets: lane l owns
+      // buckets [8l, 8l+8); the bucket whose inclusive count reaches kfind
+      // extends the pivot.
+      const uint32_t kf = kfind;
+      uint32_t hv[8];
+      uint32_t local = 0;
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        hv[t] = hist[tid * 8 + t];
+        local += hv[t];
+      }
+      uint32_t incl = local;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t nsh = __shfl_up_sync(0xffffffffu, incl, off);
+        if (tid >= off) incl += nsh;
+      }
+      uint32_t acc = incl - local;
+      int found = RADIX;
+      uint32_t found_acc = 0;
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        if (found == RADIX && acc < kf && kf <= acc + hv[t]) {
+          found = tid * 8 + t;
+          found_acc = acc;
         }
-        acc += h;
+        acc += hv[t];
+      }
+      const unsigned hit = __ballot_sync(0xffffffffu, found != RADIX);
+      if (hit != 0) {
+        const int src = __ffs(hit) - 1;
+        found = __shfl_sync(0xffffffffu, found, src);
+        found_acc = __shfl_sync(0xffffffffu, found_acc, src);
+        if (tid == 0) {
+          desired = d | (uint32_t(found) << shift);
+          kfind = kf - found_acc;
+        }
       }
     }
     __syncthreads();
@@ -537,18 +587,20 @@ static int compute_smem_bytes() {
   const int smem_q = BLOCK_Q * NUM_HEADS * HEAD_DIM * esz_fp8;
   const int smem_w = BLOCK_Q * NUM_HEADS * esz_f32;
   const int smem_kv = BLOCK_KV * HEAD_DIM * esz_fp8;
-  const int smem_ks = cutlass::round_up(BLOCK_KV * esz_f32, 512);
   const int num_barriers =
       NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * dsa_litetopk::kNumTmemStagesPerWG * 2;
   const int smem_barriers = num_barriers * 8;
   const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
-  const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q *
-                         ((int)sizeof(int32_t) + DSA_WARP_QUEUE_CAP * ((int)sizeof(float) + (int)sizeof(int32_t)));
+  // Per-row counters for every (warp, row) plus one (value, index) queue per
+  // (warp, row-of-its-warpgroup).
+  const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q * (int)sizeof(int32_t) +
+                         (MATH_THREADS / 32) * (BLOCK_Q / (MATH_THREADS / 128)) * DSA_WARP_QUEUE_CAP *
+                             ((int)sizeof(float) + (int)sizeof(int32_t));
   const int smem_hist = BLOCK_Q * 256 * (int)sizeof(int32_t);  // per-CTA refresh
                                                                // histogram (NB<=256)
   const int smem_safe = 0;
-  return NUM_Q_STAGES * smem_q + NUM_Q_STAGES * smem_w + NUM_KV_STAGES * smem_kv + NUM_KV_STAGES * smem_ks +
-         smem_barriers + smem_slots + smem_warpq + smem_hist + smem_safe;
+  return NUM_Q_STAGES * smem_q + NUM_Q_STAGES * smem_w + NUM_KV_STAGES * smem_kv + smem_barriers + smem_slots +
+         smem_warpq + smem_hist + smem_safe;
 }
 
 }  // anonymous namespace
