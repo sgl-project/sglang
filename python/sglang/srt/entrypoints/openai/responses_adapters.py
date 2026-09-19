@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Translations between Responses-API wire shapes and SGLang's chat internals.
 
-Two things the Responses API expresses that the chat-completions path has no
+Three things the Responses API expresses that the chat-completions path has no
 representation for:
 
 * ``custom`` tools, whose payload is freeform text rather than JSON-object
   arguments. Each is surfaced to the model as a function tool with a single
   string property, and the resulting call is translated back into a
   ``custom_tool_call``.
+* ``namespace`` tools, which group inner function schemas. Each member is
+  surfaced as a ``{namespace}.{name}`` function the model can call, and the
+  emitted call splits the pair back into ``name`` plus ``namespace``.
 * ``reasoning.encrypted_content``, the opaque blob a ``store=false`` client
   replays to hand a reasoning trace back to the server.
 """
@@ -17,7 +20,9 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
 
 CUSTOM_TOOL_INPUT_KEY = "input"
 
@@ -165,6 +170,55 @@ def decode_custom_tool_input_prefix(buffer: str) -> str:
             continue
         break
     return "".join(out)
+
+
+def namespace_tool_names(tools: Any) -> Set[str]:
+    """Declared ``namespace`` prefixes; only these split on the way out."""
+    return {tool.name for tool in tools or [] if tool.type == "namespace" and tool.name}
+
+
+def namespace_members_to_chat_tools(tool: Any) -> List[Any]:
+    """Flatten one ``namespace`` declaration into chat function tools named
+    ``{namespace}.{member}``.
+
+    Inner description and strict flags survive; the namespace description
+    fills members that omit one, the way OpenAI documents the grouping.
+    """
+    members = []
+    for inner in tool.tools or []:
+        inner_name = inner.get("name") if isinstance(inner, dict) else None
+        if not isinstance(inner_name, str) or not inner_name:
+            raise ValueError(
+                f"namespace tool {tool.name!r} has an inner tool without a name."
+            )
+        members.append(
+            Tool(
+                type="function",
+                function=Function(
+                    name=f"{tool.name}.{inner_name}",
+                    description=inner.get("description") or tool.description,
+                    parameters=inner.get("parameters"),
+                    strict=bool(inner.get("strict", False)),
+                ),
+            )
+        )
+    return members
+
+
+def split_namespaced_call(
+    name: str, namespaces: Set[str], declared_names: Set[str]
+) -> Tuple[str, Optional[str]]:
+    """Map one model-facing call name onto its wire-item fields.
+
+    Returns ``(name, namespace)``. An exact declaration outranks a prefix
+    split, so a plain function whose name contains a dot is never
+    reinterpreted; undeclared dotted names pass through unchanged.
+    """
+    if name not in declared_names:
+        namespace, _, inner = name.partition(".")
+        if namespace in namespaces and inner:
+            return inner, namespace
+    return name, None
 
 
 DEVELOPER_BLOCK_LABEL = "Developer instructions:"
