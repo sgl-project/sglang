@@ -40,7 +40,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_dp_size,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
@@ -766,7 +765,7 @@ class EngramEmbedding(nn.Module):
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
-        if self.tp_size > 1 and get_attention_dp_size() > 1:
+        if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
 
@@ -832,7 +831,7 @@ class EngramEmbedding(nn.Module):
         if (
             padding is not None
             and padding.is_max_len()
-            and self.tp_size == get_attention_dp_size()
+            and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
         ) or is_dp_gatherv_active():
             dp_reduce_scatter_tensor(local, values)
