@@ -54,6 +54,22 @@ def handle_ppu_backends(server_args: Any):
     # Disable DeepSeek-V4 topk_v2 on PPU by default.
     if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    # Disable shared experts fusion for mxfp4 and mixed_precision_w4: those
+    # models use a different quant method for routed experts and shared
+    # experts, so the fused shared-expert path cannot run.
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.utils.common import get_quantization_config
+
+    quant_method = get_quantization_config(model_config_of(server_args).hf_config)
+    if quant_method in ("mxfp4", "mixed_precision_w4"):
+        declare_resolution(
+            server_args,
+            "_handle_ppu_backends",
+            disable_shared_experts_fusion=True,
+        )
+        logger.info(
+            f"{quant_method} model uses different quant method for routed experts and shared experts. --disable-shared-experts-fusion is automatically set."
+        )
     # Disable custom allreduce by default on PPU (use pccl allreduce for perf).
     if not cfg.disable_custom_all_reduce:
         declare_resolution(
