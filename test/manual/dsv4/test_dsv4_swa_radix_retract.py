@@ -1,7 +1,10 @@
 """DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
-Reproduces the assert in the SWA path of `cache_unfinished_req`:
+Regression test for the former SWA `cache_unfinished_req` assertion:
     assert old_prefix_len <= len(new_indices)
+The unified cache reads `req.kv.cache_protected_len` and tolerates page_size - 1
+of alignment slack, so this reproduces the historical trip conditions rather
+than a line that still exists.
 
 Trip conditions (all required):
   1. Fork-only SWA leaf early-release on (`SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
