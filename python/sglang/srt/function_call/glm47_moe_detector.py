@@ -341,7 +341,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
-        self._buffer_arguments = None
+        self._buffer_arguments = True
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -600,12 +600,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         current_raw_length = len(func_args_raw)
 
-        if self._buffer_arguments is None:
-            self._buffer_arguments = any(
-                tool.function.name == func_name
-                and _needs_argument_context(tool.function.parameters)
-                for tool in tools
-            )
         if self._buffer_arguments:
             return None
 
