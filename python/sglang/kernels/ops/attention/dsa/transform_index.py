@@ -101,19 +101,22 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
     page_table_ptr = page_table_ptr + req_id * page_table_row_stride
     topk_indices_ptr = topk_indices_ptr + req_id * TOPK
     result_ptr = result_ptr + req_id * TOPK
 
-    offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
+    offset = tl.arange(0, BLOCK_TOPK)
+    loaded_topk_indices = tl.load(
+        topk_indices_ptr + offset, mask=offset < TOPK, other=-1
+    )
     mask = loaded_topk_indices >= 0
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
+    tl.store(result_ptr + offset, -1, mask=(~mask) & (offset < TOPK))
 
 
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
@@ -194,8 +197,8 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
-    assert topk_indices.shape[1] == 2048
     qo_len = topk_indices.shape[0]
+    topk = topk_indices.shape[1]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     # Launch triton kernel
@@ -206,6 +209,8 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        TOPK=topk,
+        BLOCK_TOPK=triton.next_power_of_2(topk),
     )
     return result
 
@@ -220,7 +225,7 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    topk = topk_indices.shape[1]
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
@@ -238,7 +243,7 @@ def transform_index_page_table_prefill_fast(
     grid = (
         cu_seqlens_q.shape[0] - 1,
         triton.cdiv(max_extend_len, block_q),
-        triton.cdiv(topk_indices.shape[1], block_topk),
+        triton.cdiv(topk, block_topk),
     )
     transform_index_page_table_prefill_kernel[grid](
         page_table,
@@ -252,7 +257,7 @@ def transform_index_page_table_prefill_fast(
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
-        TOPK=topk_indices.shape[1],
+        TOPK=topk,
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
         num_warps=4,

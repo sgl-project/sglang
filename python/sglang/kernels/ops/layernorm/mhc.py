@@ -18,7 +18,8 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
@@ -1847,6 +1848,22 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if is_hip() and is_gfx95_supported() and envs.SGLANG_USE_AITER.get():
+        from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+
+        post_mix, comb_mix, layer_input = aiter_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
@@ -1861,6 +1878,12 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
+    # The gfx95 HIP TileLang output-normalization path does not match the
+    # caller's RMSNorm contract. Keep its existing mHC math, but leave that
+    # normalization to MHCState just as the AITER and Torch paths do.
+    use_caller_norm = is_hip() and is_gfx95_supported()
+    native_norm_weight = None if use_caller_norm else norm_weight
+    native_norm_eps = None if use_caller_norm else norm_eps
     post_mix, comb_mix, layer_input = mhc_pre(
         residual=residual,
         fn=fn,
@@ -1871,10 +1894,10 @@ def _mhc_pre_dispatch(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
+        norm_weight=native_norm_weight,
+        norm_eps=native_norm_eps,
     )
-    return post_mix, comb_mix, layer_input, norm_weight is not None
+    return post_mix, comb_mix, layer_input, native_norm_weight is not None
 
 
 @torch._dynamo.disable
@@ -1886,6 +1909,12 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+    if is_hip() and is_gfx95_supported() and envs.SGLANG_USE_AITER.get():
+        from aiter.ops.mhc import mhc_post as aiter_mhc_post
+
+        out = torch.empty_like(residual)
+        aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
+        return out
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)

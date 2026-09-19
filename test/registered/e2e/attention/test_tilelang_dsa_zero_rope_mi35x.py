@@ -1,0 +1,95 @@
+import math
+import unittest
+
+import torch
+
+from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+    FP8_DTYPE,
+    tilelang_sparse_fwd,
+)
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+def _torch_sparse_attention(q, kv, indices, scale, d_v):
+    rows = indices[:, 0]
+    valid = rows >= 0
+    selected = kv[rows.clamp_min(0), 0]
+    scores = torch.einsum("thd,tkd->thk", q.float(), selected.float()) * scale
+    scores.masked_fill_(~valid[:, None, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(valid[:, None, :], probs, 0)
+    return torch.einsum("thk,tkd->thd", probs, selected[..., :d_v].float()).to(
+        torch.bfloat16
+    )
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.version.hip is None, "ROCm required"
+)
+class TestTileLangDSAZeroRope(CustomTestCase):
+    def _fwd(self, q, kv, indices, scale, d_v):
+        out = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+        return out.squeeze(0) if out.ndim == 4 else out
+
+    def _run_case(self, tokens, topk, use_fp8, padded, d_v=256, d_tail=0):
+        torch.manual_seed(7)
+        heads, slots = 64, 2112
+        dim = d_v + d_tail
+        q = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(slots, 1, dim, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(topk, device="cuda", dtype=torch.int32)
+        indices = (
+            indices.remainder(slots).view(1, 1, topk).expand(tokens, -1, -1).clone()
+        )
+        if padded:
+            indices[..., 2051:] = -1
+
+        if use_fp8:
+            q = q.to(FP8_DTYPE)
+            kv = kv.to(FP8_DTYPE)
+
+        scale = 1.0 / math.sqrt(dim)
+        expected = _torch_sparse_attention(q, kv, indices, scale, d_v)
+        actual = self._fwd(q, kv, indices, scale, d_v)
+
+        self.assertEqual(actual.shape, (tokens, heads, d_v))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(actual).all())
+        torch.testing.assert_close(
+            actual,
+            expected,
+            atol=0.20 if use_fp8 else 0.04,
+            rtol=0.12 if use_fp8 else 0.04,
+        )
+        repeated = self._fwd(q, kv, indices, scale, d_v)
+        torch.testing.assert_close(actual, repeated, atol=0, rtol=0)
+
+    def test_glm_zero_rope_no_tail(self):
+        # One unpadded single-token and one padded 17-token case per dtype cover
+        # the d_tail=0 kernel path at both batch extents. The previous
+        # (1,8,17) x (2048,2112) matrix ran the same production branches six
+        # times per dtype; 8 was not a kernel boundary.
+        for use_fp8 in (False, True):
+            with self.subTest(use_fp8=use_fp8):
+                self._run_case(tokens=1, topk=2048, use_fp8=use_fp8, padded=False)
+                self._run_case(tokens=17, topk=2112, use_fp8=use_fp8, padded=True)
+
+    def test_deepseek_tail64_regression(self):
+        # d_v=512 with d_tail=64 is the distinct has_tail=True kernel branch.
+        for use_fp8 in (False, True):
+            with self.subTest(use_fp8=use_fp8):
+                self._run_case(
+                    tokens=1,
+                    topk=2048,
+                    use_fp8=use_fp8,
+                    padded=False,
+                    d_v=512,
+                    d_tail=64,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

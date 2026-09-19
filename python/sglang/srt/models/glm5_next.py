@@ -31,6 +31,7 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -291,11 +292,14 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             swiglu_limit=vision_config.swiglu_limit,
         )
 
-        self.downsample = nn.Conv2d(
+        # These non-overlapping patches are equivalent to unfold + linear and
+        # avoid MIOpen's expensive per-shape convolution search on ROCm.
+        self.downsample = Conv2dLayer(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
+            disable_linear=False,
         )
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
@@ -1084,7 +1088,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         orig_to_new_substr={
             "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
 
     packed_modules_mapping = {
@@ -1424,6 +1429,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            # Quark stores dequantization scales without native block-FP8's
+            # "_inv" suffix, including fused w13/w2 expert parameters.
+            if name not in params_dict and name.endswith("weight_scale"):
+                candidate = name + "_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1487,6 +1502,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1515,6 +1531,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1566,6 +1583,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1576,6 +1594,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 
