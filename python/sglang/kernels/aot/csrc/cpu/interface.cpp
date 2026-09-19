@@ -1,8 +1,8 @@
 #include <ATen/record_function.h>
 #include <torch/all.h>
 
+#include "group_shm.h"
 #include "shm.h"
-
 // Communication settings
 static int world_rank = -1;
 static int world_size = -1;
@@ -89,4 +89,25 @@ void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
   reduce_scatter_outer_loop(output_tensor, data, numel, data_size);
 
   return;
+}
+void shm_group_allgather(int64_t handle, torch::Tensor& output, torch::Tensor& input) {
+  RECORD_FUNCTION("sgl-kernel::shm_group_allgather", std::vector<c10::IValue>({input}));
+  const size_t data_size = input.numel() * input.element_size();
+  group_all_gather(handle, static_cast<char*>(output.data_ptr()), static_cast<char*>(input.data_ptr()), data_size);
+}
+
+void shm_group_alltoall(int64_t handle, torch::Tensor& output, torch::Tensor& input) {
+  RECORD_FUNCTION("sgl-kernel::shm_group_alltoall", std::vector<c10::IValue>({input}));
+  const size_t data_size = input.numel() * input.element_size();
+  group_all_to_all(handle, static_cast<char*>(output.data_ptr()), static_cast<char*>(input.data_ptr()), data_size);
+}
+
+void shm_group_allreduce(int64_t handle, torch::Tensor& input) {
+  RECORD_FUNCTION("sgl-kernel::shm_group_allreduce", std::vector<c10::IValue>({input}));
+  group_all_reduce(
+      handle,
+      static_cast<char*>(input.data_ptr()),
+      input.scalar_type(),
+      input.numel() * input.element_size(),
+      input.numel());
 }
