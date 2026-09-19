@@ -284,7 +284,6 @@ def load_model_with_memory_saver(
                 )
             else:
                 from sglang.srt.models.qwen4_exp_ple_table import (
-                    check_file_backend_supported,
                     default_ple_table_dir,
                 )
 
@@ -292,10 +291,6 @@ def load_model_with_memory_saver(
                     get_exec().offload.ple_offload_dir
                     or default_ple_table_dir(get_model().model_path)
                 )
-                if ple_offload_embedding and device == "cuda":
-                    check_file_backend_supported(
-                        torch.cuda.current_device() if torch.cuda.is_available() else 0
-                    )
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup

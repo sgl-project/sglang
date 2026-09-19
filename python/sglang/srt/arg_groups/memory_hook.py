@@ -43,6 +43,16 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "the file-backed table is the offloaded table."
         )
 
+    if (
+        cfg.ple_offload_backend == "file"
+        and cfg.device is not None
+        and cfg.device != "cuda"
+    ):
+        raise ValueError(
+            "--ple-offload-backend file needs a CUDA device; "
+            "use --ple-offload-backend pinned"
+        )
+
 
 def handle_gpu_memory_settings(server_args: Any):
     """

@@ -1,7 +1,9 @@
 import os
 import tempfile
 from types import SimpleNamespace
+from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -18,7 +20,7 @@ from sglang.srt.models.qwen4_exp import (
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for this test."
@@ -169,23 +171,23 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     )
     layer._graph_prefetch_buffers = {}
     layer._eager_prefetch_buffer = None
-    lookup_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
+    device = torch.device("cuda")
 
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
-    eager_large = layer._get_prefetch_buffer(8, lookup_ids)
-    eager_small = layer._get_prefetch_buffer(3, lookup_ids)
+    eager_large = layer._get_prefetch_buffer(8, device)
+    eager_small = layer._get_prefetch_buffer(3, device)
     assert eager_small.data_ptr() == eager_large.data_ptr()
     assert layer._eager_prefetch_buffer.shape == (8, layer.ple_embed_dim)
 
-    eager_grown = layer._get_prefetch_buffer(12, lookup_ids)
-    eager_grown_small = layer._get_prefetch_buffer(4, lookup_ids)
+    eager_grown = layer._get_prefetch_buffer(12, device)
+    eager_grown_small = layer._get_prefetch_buffer(4, device)
     assert eager_grown_small.data_ptr() == eager_grown.data_ptr()
     assert layer._eager_prefetch_buffer.shape == (12, layer.ple_embed_dim)
 
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: True)
-    graph_three = layer._get_prefetch_buffer(3, lookup_ids)
-    graph_five = layer._get_prefetch_buffer(5, lookup_ids)
-    graph_three_reused = layer._get_prefetch_buffer(3, lookup_ids)
+    graph_three = layer._get_prefetch_buffer(3, device)
+    graph_five = layer._get_prefetch_buffer(5, device)
+    graph_three_reused = layer._get_prefetch_buffer(3, device)
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
     assert graph_five.data_ptr() != graph_three.data_ptr()
     assert set(layer._graph_prefetch_buffers) == {3, 5}
@@ -261,6 +263,77 @@ def test_qwen4_ple_file_backend_fp8_table():
             .reshape(1, 3, embedding_dim)
         )
         torch.testing.assert_close(filed(ids), expected, rtol=0, atol=0)
+
+
+@pytest.fixture(params=[torch.bfloat16, torch.float8_e4m3fn])
+def staged_file_embedding(request):
+    dtype = request.param
+    with tempfile.TemporaryDirectory() as directory:
+        with mock.patch.object(
+            qwen4_exp_module, "device_uses_host_page_tables", return_value=False
+        ):
+            embedding = Qwen4ExpPinnedHostEmbedding(
+                _make_source_embedding(
+                    dtype=dtype, vocab_start=4, vocab_end=12, org_vocab_size=16
+                ),
+                backend="file",
+                table_dir=directory,
+            )
+        reference = torch.arange(56, dtype=torch.float32).reshape(8, 7).to(dtype)
+        embedding.weight.data.copy_(reference)
+        try:
+            yield embedding, reference
+        finally:
+            embedding.host_staging.close()
+            if embedding._file_rss_trimmer is not None:
+                embedding._file_rss_trimmer.close()
+
+
+def test_file_staged_graph_reads_new_rows(staged_file_embedding):
+    embedding, reference = staged_file_embedding
+    ids = torch.tensor([4, 11, 3, 12], device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with mock.patch(
+        "sglang.srt.model_executor.runner_utils.capture_mode.is_capture_mode", True
+    ):
+        with torch.cuda.stream(stream):
+            embedding.host_staging.capture_contexts(ids[:, None])
+            embedding.gather_staged(rows=ids.numel(), device=ids.device)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            embedding.host_staging.capture_contexts(ids[:, None])
+            output = embedding.gather_staged(rows=ids.numel(), device=ids.device)
+    for rows in ([4, 11, 3, 12], [5, 7, 8, 6]):
+        ids.copy_(torch.tensor(rows, device="cuda"))
+        embedding.host_staging.expect_replay(np.array(rows)[:, None])
+        embedding.host_staging.begin(np.array(rows), "cuda", graph=True)
+        embedding.host_staging.finish()
+        graph.replay()
+        embedding.host_staging.check_replay()
+        expected = torch.zeros((4, 7), dtype=torch.bfloat16)
+        for index, row in enumerate(rows):
+            if 4 <= row < 12:
+                expected[index] = reference[row - 4].to(torch.bfloat16)
+        torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+def test_file_staged_eager_reuses_host_slots(staged_file_embedding):
+    embedding, reference = staged_file_embedding
+    # More than two chunks exercises host-slot reuse during async copies.
+    eager_rows = np.random.default_rng(31).integers(
+        3, 13, 4 * embedding.host_staging.chunk_rows + 1, dtype=np.int64
+    )
+    embedding.host_staging.begin(eager_rows, "cuda")
+    eager_output = embedding.gather_staged(
+        rows=len(eager_rows), device=torch.device("cuda")
+    )
+    expected = torch.zeros((len(eager_rows), 7), dtype=torch.bfloat16)
+    valid = (eager_rows >= 4) & (eager_rows < 12)
+    expected[valid] = reference.to(torch.bfloat16)[eager_rows[valid] - 4]
+    torch.testing.assert_close(eager_output.cpu(), expected, rtol=0, atol=0)
+    assert len(embedding.host_staging._eager) <= embedding.host_staging.chunk_rows
 
 
 if __name__ == "__main__":
