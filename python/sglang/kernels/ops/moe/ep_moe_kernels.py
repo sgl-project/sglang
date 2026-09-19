@@ -606,7 +606,11 @@ def silu_and_mul_masked_post_quant_fwd(
         gpb = 4
         while gpb > 1:
             block_n = quant_group_size * gpb
-            if (block_n & (block_n - 1) == 0) and (groups_total % gpb == 0):
+            if (
+                (block_n & (block_n - 1) == 0)
+                and groups_total >= gpb
+                and (groups_total % gpb == 0)
+            ):
                 break
             gpb //= 2
         BLOCK_N = quant_group_size * gpb
