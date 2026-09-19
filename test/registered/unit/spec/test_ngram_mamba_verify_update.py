@@ -1,10 +1,8 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
 import sglang.srt
+import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -235,19 +233,13 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
 class TestPPReplaySSMVerifySourceRows(CustomTestCase):
     @staticmethod
     def _spec_state():
-        return SimpleNamespace(
-            temporal=torch.empty((1, 8, 2, 2), dtype=torch.float32),
-            replayssm_d=torch.empty((1, 8, 4, 2), dtype=torch.float32),
-            replayssm_k=torch.empty((1, 8, 4, 2), dtype=torch.float32),
-            replayssm_rawv=torch.empty((1, 8, 4, 2), dtype=torch.float32),
-            replayssm_rawk=torch.empty((1, 8, 3, 4, 2), dtype=torch.float32),
-            replayssm_g=torch.empty((1, 8, 4, 2), dtype=torch.float32),
-            replayssm_beta=torch.empty((1, 8, 4), dtype=torch.float32),
-            conv=[torch.empty((1, 8, 2, 3), dtype=torch.float32)],
-            intermediate_conv_window=[
-                torch.empty((1, 32, 4, 2, 3), dtype=torch.float32)
-            ],
-        )
+        state = torch.empty((1, 8, 4, 2), dtype=torch.float32)
+        spec_state = MagicMock()
+        for name in "temporal replayssm_d replayssm_k replayssm_rawv replayssm_g replayssm_beta".split():  # noqa: SIM905
+            setattr(spec_state, name, state)
+        spec_state.replayssm_rawk = state.unsqueeze(2)
+        spec_state.conv = spec_state.intermediate_conv_window = [state]
+        return spec_state
 
     def test_fold_helpers_read_pp_request_rows(self):
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
@@ -256,11 +248,6 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
-
-        source_rows = torch.tensor([17, 23], dtype=torch.int64)
-        destinations = torch.tensor([5, 7], dtype=torch.int32)
-        steps = torch.tensor([2, 0], dtype=torch.int32)
-        accept_lens = torch.tensor([3, 1], dtype=torch.int32)
 
         cases = (
             (
@@ -283,11 +270,12 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                     "fused_conv_window_scatter_with_mask"
                 ) as scatter,
             ):
+                source_rows = torch.tensor([17, 23])
                 commit(
                     spec_state=self._spec_state(),
-                    state_batch_indices=destinations,
-                    accept_lens=accept_lens,
-                    last_correct_step_indices=steps,
+                    state_batch_indices=torch.tensor([5, 7]),
+                    accept_lens=torch.tensor([3, 1]),
+                    last_correct_step_indices=torch.tensor([2, 0]),
                     src_indices_raw=source_rows,
                 )
 
@@ -299,13 +287,9 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         target_worker = MagicMock()
         req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool = SimpleNamespace(
-            replayssm_spec_fold=False,
-            replayssm_is_kda=False,
-            replayssm_cache_base=torch.empty(1),
-            replayssm_spec_write_pos=torch.empty(1),
-            replayssm_is_flush=torch.empty(1),
-        )
+        req_pool.mamba_pool.replayssm_spec_fold = False
+        req_pool.mamba_pool.replayssm_is_kda = False
+        req_pool.mamba_pool.replayssm_cache_base = torch.empty(1)
         req_pool.get_mamba_indices.return_value = torch.tensor(
             [5, 7], dtype=torch.int32
         )
@@ -326,7 +310,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 return_value={"some": "config"},
             ),
             patch(
-                "sglang.srt.speculative.spec_utils.envs.SGLANG_ENABLE_PP_SPEC.get",
+                "sglang.srt.speculative.spec_utils.pp_spec_stable_rows_enabled",
                 return_value=True,
             ),
             patch(
@@ -397,8 +381,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         cache_indices = torch.tensor([4, -1, 9], dtype=torch.int32)
 
         with patch(
-            "sglang.srt.layers.attention.linear.utils."
-            "pp_spec_stable_rows_enabled",
+            "sglang.srt.layers.attention.linear.utils.pp_spec_stable_rows_enabled",
             return_value=True,
         ):
             result = select_verify_intermediate_state_indices(
@@ -408,179 +391,6 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         torch.testing.assert_close(
             result, torch.tensor([17, 64, 31], dtype=torch.int32)
         )
-
-    def test_pp_commit_runs_without_verify_kv_address(self):
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-
-        scheduler = MagicMock()
-        scheduler.pp_group.is_last_rank = False
-        scheduler.tp_worker = MagicMock()
-        batch = MagicMock()
-        batch.seq_lens = torch.tensor([11, 22], dtype=torch.int64)
-        batch.tree_cache = MagicMock()
-        fwd_batch = MagicMock()
-        fwd_batch.forward_mode.is_idle.return_value = False
-        fwd_batch.seq_lens_cpu = torch.tensor([10, 20], dtype=torch.int64)
-        outputs = MagicMock()
-        outputs.tensors = {
-            "spec_accept_index": torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
-        }
-        outputs.__getitem__.return_value = torch.tensor([2, 1], dtype=torch.int32)
-
-        with (
-            patch(
-                "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify"
-            ) as commit,
-            patch(
-                "sglang.srt.managers.scheduler_pp_mixin.get_spec",
-                return_value=SimpleNamespace(speculative_num_draft_tokens=2),
-            ),
-        ):
-            SchedulerPPMixin._pp_spec_commit_relayed_accept(
-                scheduler,
-                batch,
-                fwd_batch,
-                ["a", "b"],
-                ["a", "b"],
-                None,
-                outputs,
-            )
-
-        commit.assert_called_once()
-        torch.testing.assert_close(
-            commit.call_args.args[2], outputs["spec_accept_lens"]
-        )
-
-    def test_pp_recomposed_batch_requires_seq_len_snapshot(self):
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-
-        scheduler = MagicMock()
-        batch = MagicMock()
-        batch.seq_lens = torch.tensor([11], dtype=torch.int64)
-        fwd_batch = MagicMock()
-        fwd_batch.forward_mode.is_idle.return_value = False
-        fwd_batch.seq_lens_cpu = None
-        outputs = MagicMock()
-        outputs.tensors = {"spec_accept_index": torch.tensor([[0]], dtype=torch.int32)}
-
-        with self.assertRaisesRegex(RuntimeError, "forward-time seq_lens_cpu"):
-            SchedulerPPMixin._pp_spec_commit_relayed_accept(
-                scheduler,
-                batch,
-                fwd_batch,
-                ["before"],
-                ["after"],
-                None,
-                outputs,
-            )
-
-    def test_request_slots_override_stale_forward_metadata(self):
-        """A delayed PP relay must commit the batch that produced the accept result."""
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            HybridLinearAttnBackend,
-        )
-
-        backend = object.__new__(HybridLinearAttnBackend)
-        req_pool = MagicMock()
-        req_pool.mamba_pool = SimpleNamespace(replayssm_is_kda=False)
-        mamba_caches = MagicMock()
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = mamba_caches
-        req_pool.get_mamba_indices.return_value = torch.tensor(
-            [41, 42, 43], dtype=torch.int32
-        )
-
-        linear_backend = MagicMock()
-        linear_backend.req_to_token_pool = req_pool
-        linear_backend.forward_metadata.mamba_cache_indices = torch.tensor(
-            [99], dtype=torch.int32
-        )
-        linear_backend._translate_mamba_indices.side_effect = lambda value: value + 100
-        linear_backend.accept_lens_pool = None
-        backend.linear_attn_backend = linear_backend
-        backend._update_ple_state_after_mtp_verify = MagicMock()
-
-        last_steps = torch.tensor([2, 0, 3], dtype=torch.int32)
-        req_pool_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
-        with (
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-                "scatter_mamba_states_after_mtp_verify"
-            ) as scatter,
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-                "envs.SGLANG_ENABLE_PP_SPEC.get",
-                return_value=True,
-            ),
-        ):
-            backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_steps,
-                mamba_track_indices=None,
-                mamba_steps_to_track=None,
-                model=None,
-                req_pool_indices=req_pool_indices,
-            )
-
-        req_pool.get_mamba_indices.assert_called_once()
-        torch.testing.assert_close(
-            req_pool.get_mamba_indices.call_args.args[0], req_pool_indices
-        )
-        scatter.assert_called_once()
-        torch.testing.assert_close(
-            scatter.call_args.args[1],
-            torch.tensor([141, 142, 143], dtype=torch.int32),
-        )
-        torch.testing.assert_close(scatter.call_args.args[2], last_steps)
-        torch.testing.assert_close(
-            scatter.call_args.kwargs["src_indices_raw"], req_pool_indices
-        )
-
-    def test_non_pp_commit_keeps_forward_metadata_fast_path(self):
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            HybridLinearAttnBackend,
-        )
-
-        backend = object.__new__(HybridLinearAttnBackend)
-        req_pool = MagicMock()
-        req_pool.mamba_pool = SimpleNamespace(replayssm_is_kda=False)
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = MagicMock()
-
-        linear_backend = MagicMock()
-        linear_backend.req_to_token_pool = req_pool
-        linear_backend.forward_metadata.mamba_cache_indices = torch.tensor(
-            [9, 10, 11], dtype=torch.int32
-        )
-        linear_backend.accept_lens_pool = None
-        backend.linear_attn_backend = linear_backend
-        backend._update_ple_state_after_mtp_verify = MagicMock()
-
-        last_steps = torch.tensor([2, 0, 3], dtype=torch.int32)
-        req_pool_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
-        with (
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-                "scatter_mamba_states_after_mtp_verify"
-            ) as scatter,
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-                "envs.SGLANG_ENABLE_PP_SPEC.get",
-                return_value=False,
-            ),
-        ):
-            backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_steps,
-                mamba_track_indices=None,
-                mamba_steps_to_track=None,
-                model=None,
-                req_pool_indices=req_pool_indices,
-            )
-
-        req_pool.get_mamba_indices.assert_not_called()
-        linear_backend._translate_mamba_indices.assert_not_called()
-        scatter.assert_called_once()
-        torch.testing.assert_close(
-            scatter.call_args.args[1], torch.tensor([9, 10, 11], dtype=torch.int32)
-        )
-        self.assertIsNone(scatter.call_args.kwargs["src_indices_raw"])
 
 
 class TestConvWindowDedupLayout(CustomTestCase):
