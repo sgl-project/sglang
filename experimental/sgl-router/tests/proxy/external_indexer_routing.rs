@@ -114,7 +114,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
     );
     ctx.prefix_index = Some(Arc::new(
         GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint,
+            endpoints: vec![endpoint],
             query_deadline: Duration::from_secs(1),
             max_inflight: 4,
         })

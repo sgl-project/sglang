@@ -370,7 +370,7 @@ fn prefix_index_config(
     indexer: &sgl_router::config::KvIndexerEndpointConfig,
 ) -> sgl_kv_indexer::PrefixIndexConfig {
     sgl_kv_indexer::PrefixIndexConfig {
-        endpoint: indexer.url.clone(),
+        endpoints: indexer.urls.clone(),
         query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
         max_inflight: indexer.query_max_inflight,
     }
@@ -492,11 +492,21 @@ mod tests {
     #[test]
     fn prefix_index_config_preserves_router_limits() {
         let config = prefix_index_config(&sgl_router::config::KvIndexerEndpointConfig {
-            url: "http://127.0.0.1:50051".to_string(),
+            urls: vec![
+                "http://127.0.0.1:50051".to_string(),
+                "http://127.0.0.1:50052".to_string(),
+            ],
             query_timeout_ms: 25,
             query_max_inflight: 17,
         });
-        assert_eq!(config.endpoint, "http://127.0.0.1:50051");
+        // Order is the client's failover preference, so it must survive intact.
+        assert_eq!(
+            config.endpoints,
+            vec![
+                "http://127.0.0.1:50051".to_string(),
+                "http://127.0.0.1:50052".to_string()
+            ]
+        );
         assert_eq!(config.query_deadline, std::time::Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
     }
