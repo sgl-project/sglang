@@ -13,12 +13,10 @@ use futures::StreamExt;
 use http::StatusCode;
 
 use super::app::AppState;
-use super::response::{
-    HttpResponse, error_response, json_response, json_typed_response, read_json, sse_encode,
-};
+use super::response::{HttpResponse, error_response, json_response, read_json, sse_encode};
 use crate::api_server::core::openai::chat::{
     ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_sampling, chat_sse_payload,
-    prepare_chat_request, unary_chat,
+    chat_stream_usage_options, prepare_chat_request, unary_chat,
 };
 use crate::api_server::core::openai::completions::{
     CompletionFrameShaper, CompletionRenderingOptions, PromptSpec, completion_event_stream,
@@ -190,10 +188,10 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let model = request.model;
-    let include_usage = request
-        .stream_options
-        .is_some_and(|options| options.include_usage)
-        || state.server_args.stream_response_default_include_usage;
+    let (include_usage, continuous_usage) = chat_stream_usage_options(
+        request.stream_options.as_ref(),
+        state.server_args.stream_response_default_include_usage,
+    );
     let mut requests = Vec::with_capacity(n);
 
     for index in 0..n {
@@ -242,16 +240,16 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
     if stream {
         let event_stream = chat_event_stream(
             plan,
-            n,
             options,
             include_usage,
+            continuous_usage,
             stream_tool_choice,
             uses_tool_call_structural_tag,
         );
         sse_encode(event_stream.map(chat_sse_payload))
     } else {
         match unary_chat(plan, options).await {
-            Ok(response) => json_typed_response(StatusCode::OK, &response),
+            Ok(value) => json_response(StatusCode::OK, &value),
             Err(e) => openai_error(e.http_status(), e.message, false),
         }
     }

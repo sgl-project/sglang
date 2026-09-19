@@ -20,6 +20,20 @@ pub(crate) fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
+/// The native finish reason's `matched` value as OpenAI wire JSON: a token id
+/// or a string; a multi-token match (native-only) is carried as its id list.
+pub(crate) fn matched_stop_value(
+    reason: &crate::message::finish_reason::FinishReason,
+) -> Option<serde_json::Value> {
+    use crate::message::finish_reason::Matched;
+
+    reason.matched().map(|matched| match matched {
+        Matched::Token(id) => serde_json::json!(id),
+        Matched::Str(value) => serde_json::json!(value),
+        Matched::Tokens(ids) => serde_json::json!(ids.ids),
+    })
+}
+
 /// The OpenAI error payload — the body shape every OpenAI-compatible surface
 /// answers errors with, regardless of transport framing.
 pub(crate) fn error_payload_value(code: u16, message: &str) -> serde_json::Value {

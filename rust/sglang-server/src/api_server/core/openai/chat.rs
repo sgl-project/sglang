@@ -4,15 +4,16 @@
 //! `api_server::openai::chat`.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    ChatCompletionResponseMessage, ChatCompletionStreamOptions, ChatCompletionTokenLogprob,
+    ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, ResponseFormat, Role,
+    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use futures::StreamExt;
 
@@ -24,6 +25,7 @@ use crate::api_server::core::generate::{
     generation_event_stream_with, unary_output,
 };
 use crate::api_server::core::openai::completions::completion_usage;
+use crate::api_server::core::openai::matched_stop_value;
 use crate::api_server::core::openai::reasoning::ReasoningStreamSplitter;
 use crate::api_server::core::openai::template::ChatFormatter;
 use crate::api_server::core::openai::tools::{
@@ -35,6 +37,22 @@ use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::response::{ChunkEvent, ChunkExtras};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+
+/// Python's `should_include_usage`: with `stream_options` present the client
+/// picks `continuous_usage_stats` and may only raise `include_usage` through
+/// the server default; without options both come from defaults.
+pub(crate) fn chat_stream_usage_options(
+    options: Option<&ChatCompletionStreamOptions>,
+    include_usage_default: bool,
+) -> (bool, bool) {
+    match options {
+        Some(options) => (
+            options.include_usage || include_usage_default,
+            options.continuous_usage_stats,
+        ),
+        None => (include_usage_default, false),
+    }
+}
 
 /// Render the chat template for an OpenAI request, mapping a missing
 /// formatter or a render failure to the standard 400. The rendered prompt is
@@ -216,12 +234,15 @@ pub(crate) struct ChatRenderingOptions {
     pub(crate) service_tier: Option<ChatServiceTier>,
 }
 
+/// The unary fan-in returns the serialized response so the native matched stop
+/// can be added per choice: Dynamo's `ChatChoice` has no slot for it.
 pub(crate) async fn unary_chat(
     plan: GeneratePlan,
     options: ChatRenderingOptions,
-) -> Result<CreateChatCompletionResponse, ApiError> {
+) -> Result<serde_json::Value, ApiError> {
     let drained = drain_plan_unary(plan, UnaryDrainPolicy::AggregateFailFast).await?;
     let mut choices = Vec::with_capacity(drained.len());
+    let mut matched_stops = Vec::with_capacity(drained.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
 
@@ -232,6 +253,7 @@ pub(crate) async fn unary_chat(
             prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        matched_stops.push(output.finish_reason.as_ref().and_then(matched_stop_value));
         let logprobs = options
             .want_logprobs
             .then(|| chat_logprobs(output.extras.as_deref()));
@@ -273,7 +295,7 @@ pub(crate) async fn unary_chat(
         });
     }
 
-    Ok(CreateChatCompletionResponse {
+    let response = CreateChatCompletionResponse {
         id: options.response_id,
         choices,
         created: options.created,
@@ -285,7 +307,79 @@ pub(crate) async fn unary_chat(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         )),
-    })
+    };
+    // Add the native matched stop per choice; Dynamo's `ChatChoice` has no slot
+    // for it. Python always emits the key, null when nothing matched.
+    let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
+    if let Some(choices) = value["choices"].as_array_mut() {
+        for (choice, matched_stop) in choices.iter_mut().zip(&matched_stops) {
+            choice["matched_stop"] = matched_stop.clone().unwrap_or(serde_json::Value::Null);
+        }
+    }
+    Ok(value)
+}
+
+/// Accumulated usage and native matched stops for one chat stream. The tool
+/// jail can drop, rewrite, or synthesize chunks after the shaper, so the
+/// post-jail loop attaches usage and matched stops from this snapshot: a
+/// generation event is counted once per choice even when it expands into
+/// several chunks.
+#[derive(Default)]
+struct ChatStreamState {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Vec<u64>,
+    matched_stop: Vec<Option<serde_json::Value>>,
+}
+
+impl ChatStreamState {
+    fn new(count: usize) -> Self {
+        Self {
+            completion_tokens: vec![0; count],
+            matched_stop: vec![None; count],
+            ..Default::default()
+        }
+    }
+
+    /// Record one generation event for `choice_index`; `completion_tokens` is
+    /// the choice's running count from the shared accumulator.
+    fn record(&mut self, choice_index: usize, output: &ChunkEvent, completion_tokens: u64) {
+        // First non-zero count wins: an early frame may carry 0 before the
+        // scheduler reports the real prompt token count.
+        if self.prompt_tokens.unwrap_or(0) == 0 {
+            self.prompt_tokens = Some(output.prompt_tokens);
+        }
+        self.completion_tokens[choice_index] = completion_tokens;
+        if output.finish_reason.is_some() {
+            self.matched_stop[choice_index] =
+                output.finish_reason.as_ref().and_then(matched_stop_value);
+        }
+    }
+
+    fn choice_usage(&self, choice_index: usize) -> dynamo_protocols::types::CompletionUsage {
+        completion_usage(
+            self.prompt_tokens.unwrap_or_default(),
+            u32::try_from(
+                self.completion_tokens
+                    .get(choice_index)
+                    .copied()
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u32::MAX),
+        )
+    }
+
+    fn total_usage(&self) -> dynamo_protocols::types::CompletionUsage {
+        completion_usage(
+            self.prompt_tokens.unwrap_or_default(),
+            u32::try_from(
+                self.completion_tokens
+                    .iter()
+                    .copied()
+                    .fold(0u64, u64::saturating_add),
+            )
+            .unwrap_or(u32::MAX),
+        )
+    }
 }
 
 struct ChatStreamFrameShaper {
@@ -293,11 +387,9 @@ struct ChatStreamFrameShaper {
     model: String,
     created: u32,
     want_logprobs: bool,
-    include_usage: bool,
     reasoning_splitters: Vec<ReasoningStreamSplitter>,
     prelude_emitted: Vec<bool>,
-    prompt_tokens: Option<u32>,
-    completion_tokens: u64,
+    state: Arc<Mutex<ChatStreamState>>,
     service_tier: Option<ChatServiceTier>,
 }
 
@@ -361,17 +453,14 @@ impl ChatStreamFrameShaper {
         &mut self,
         choice_index: usize,
         mut output: ChunkEvent,
+        completion_tokens: u64,
         terminal: bool,
     ) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
         let index = u32::try_from(choice_index).unwrap_or(u32::MAX);
-        // First non-zero count wins, matching the unary fan-in: an early frame may
-        // carry 0 before the scheduler reports the real prompt token count.
-        if self.prompt_tokens.unwrap_or(0) == 0 {
-            self.prompt_tokens = Some(output.prompt_tokens);
-        }
-        self.completion_tokens = self
-            .completion_tokens
-            .saturating_add(output.completion_tokens);
+        self.state
+            .lock()
+            .expect("chat stream state poisoned")
+            .record(choice_index, &output, completion_tokens);
         let finish_reason = if terminal {
             chat_finish_reason(&output)
         } else {
@@ -461,11 +550,16 @@ impl FrameShaper for ChatStreamFrameShaper {
     fn delta(
         &mut self,
         out: ChunkEvent,
-        _acc: &OutputAccumulator,
+        acc: &OutputAccumulator,
         _rid: &str,
         index: Option<usize>,
     ) -> Self::Frame {
-        self.render_output(index.unwrap_or(0), out, false)
+        self.render_output(
+            index.unwrap_or(0),
+            out,
+            acc.snapshot().completion_tokens,
+            false,
+        )
     }
 
     fn coalesced(
@@ -480,13 +574,18 @@ impl FrameShaper for ChatStreamFrameShaper {
     fn terminal(
         &mut self,
         out: ChunkEvent,
-        _acc: &OutputAccumulator,
+        acc: &OutputAccumulator,
         _incremental: bool,
         _rid: &str,
         index: Option<usize>,
         _timing: &RequestTiming,
     ) -> Self::Frame {
-        self.render_output(index.unwrap_or(0), out, true)
+        self.render_output(
+            index.unwrap_or(0),
+            out,
+            acc.snapshot().completion_tokens,
+            true,
+        )
     }
 
     fn item_error(&mut self, code: u16, message: &str, index: Option<usize>) -> Self::Frame {
@@ -494,29 +593,17 @@ impl FrameShaper for ChatStreamFrameShaper {
         frames.push(self.error_frame(&ApiError::new(code, message)));
         frames
     }
-
-    fn finish(&mut self) -> Option<Self::Frame> {
-        if !self.include_usage {
-            return None;
-        }
-        Some(vec![self.response(
-            vec![],
-            Some(completion_usage(
-                self.prompt_tokens.unwrap_or_default(),
-                u32::try_from(self.completion_tokens).unwrap_or(u32::MAX),
-            )),
-        )])
-    }
 }
 
 pub(crate) fn chat_event_stream(
     plan: GeneratePlan,
-    count: usize,
     options: ChatRenderingOptions,
     include_usage: bool,
+    continuous_usage: bool,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
-) -> impl futures::Stream<Item = CoreEvent<CreateChatCompletionStreamResponse>> {
+) -> impl futures::Stream<Item = CoreEvent<serde_json::Value>> {
+    let count = plan.receivers.len();
     let ChatRenderingOptions {
         response_id,
         model,
@@ -536,6 +623,7 @@ pub(crate) fn chat_event_stream(
                 .collect()
         })
         .unwrap_or_default();
+    let state = Arc::new(Mutex::new(ChatStreamState::new(count)));
     let plan = GeneratePlan {
         incremental: true,
         ..plan
@@ -543,16 +631,14 @@ pub(crate) fn chat_event_stream(
     let raw = generation_event_stream_with(
         plan,
         ChatStreamFrameShaper {
-            response_id,
-            model,
+            response_id: response_id.clone(),
+            model: model.clone(),
             created,
             want_logprobs,
-            include_usage,
             reasoning_splitters,
             prelude_emitted: vec![false; count],
-            prompt_tokens: None,
-            completion_tokens: 0,
-            service_tier,
+            state: Arc::clone(&state),
+            service_tier: service_tier.clone(),
         },
     )
     .flat_map(futures::stream::iter);
@@ -594,12 +680,96 @@ pub(crate) fn chat_event_stream(
                         }
                     }
                 }
-                yield CoreEvent::Item(response);
+                // The parser can pack several choices into one event and only
+                // flush them at EOF, but usage and the matched stop are per
+                // choice and Python emits one choice per event: split only
+                // packed events, leaving ordinary single-choice chunks as-is.
+                if response.choices.len() <= 1 {
+                    yield CoreEvent::Item(chat_chunk_value(response, &state, continuous_usage));
+                } else {
+                    for choice in std::mem::take(&mut response.choices) {
+                        let mut chunk = response.clone();
+                        chunk.choices = vec![choice];
+                        yield CoreEvent::Item(chat_chunk_value(chunk, &state, continuous_usage));
+                    }
+                }
             } else if let Some(error) = item.error {
                 yield CoreEvent::ItemError(decode_stream_error(error));
             }
         }
+
+        // The final usage trailer follows the parser's EOF flush, so buffered
+        // content and terminal choices always precede it.
+        if include_usage {
+            let usage = state
+                .lock()
+                .expect("chat stream state poisoned")
+                .total_usage();
+            let trailer = CreateChatCompletionStreamResponse {
+                id: response_id,
+                choices: Vec::new(),
+                created,
+                model,
+                service_tier,
+                system_fingerprint: None,
+                object: "chat.completion.chunk".into(),
+                usage: Some(usage),
+            };
+            yield CoreEvent::Item(
+                serde_json::to_value(trailer).expect("OpenAI response must serialize"),
+            );
+        }
     }
+}
+
+/// Serialize one single-choice chunk the way Python's SSE choice does: force
+/// `reasoning_content` present-as-null in the delta, attach continuous usage
+/// when enabled, and always emit `matched_stop` (null when nothing matched).
+fn chat_chunk_value(
+    mut chunk: CreateChatCompletionStreamResponse,
+    state: &Mutex<ChatStreamState>,
+    continuous_usage: bool,
+) -> serde_json::Value {
+    let index = chunk.choices.first().map(|choice| choice.index as usize);
+    let carries_delta = chunk.choices.first().is_some_and(choice_carries_delta);
+    let terminal = chunk
+        .choices
+        .first()
+        .is_some_and(|choice| choice.finish_reason.is_some());
+    let (usage, matched_stop) = {
+        let state = state.lock().expect("chat stream state poisoned");
+        let usage =
+            (continuous_usage && carries_delta).then(|| state.choice_usage(index.unwrap_or(0)));
+        let matched_stop = terminal
+            .then(|| index.and_then(|index| state.matched_stop.get(index).cloned().flatten()))
+            .flatten();
+        (usage, matched_stop)
+    };
+    if let Some(usage) = usage {
+        chunk.usage = Some(usage);
+    }
+    let mut value = serde_json::to_value(chunk).expect("OpenAI response must serialize");
+    if let Some(delta) = value
+        .pointer_mut("/choices/0/delta")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        delta
+            .entry("reasoning_content")
+            .or_insert(serde_json::Value::Null);
+    }
+    if let Some(choice) = value["choices"].get_mut(0) {
+        choice["matched_stop"] = matched_stop.unwrap_or(serde_json::Value::Null);
+    }
+    value
+}
+
+/// Content-bearing chunk: Python attaches continuous usage to reasoning,
+/// content, and tool-call chunks, but not to the role prelude or an
+/// empty-delta terminal chunk.
+fn choice_carries_delta(choice: &ChatChoiceStream) -> bool {
+    choice.delta.content.is_some()
+        || choice.delta.reasoning_content.is_some()
+        || choice.delta.tool_calls.is_some()
 }
 
 /// [`ApiError`] rides the jail's string-typed `Annotated::error` slot
@@ -614,29 +784,15 @@ fn decode_stream_error(encoded: String) -> ApiError {
 }
 
 /// One chat stream event as its SSE `data` payload: the chunk's OpenAI JSON
-/// (with `reasoning_content` forced present-as-null in the delta — Python
-/// always emits the key) or the OpenAI error body.
-pub(crate) fn chat_sse_payload(event: CoreEvent<CreateChatCompletionStreamResponse>) -> String {
+/// (already extension-shaped by the adapter) or the OpenAI error body.
+pub(crate) fn chat_sse_payload(event: CoreEvent<serde_json::Value>) -> String {
     match event {
-        CoreEvent::Item(response) => serialize_chat_stream_response(response),
+        CoreEvent::Item(value) => value.to_string(),
         CoreEvent::ItemError(e) => {
             crate::api_server::core::openai::error_payload_value(e.http_code, &e.message)
                 .to_string()
         }
     }
-}
-
-fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
-    let mut response = serde_json::to_value(response).expect("OpenAI response must serialize");
-    if let Some(delta) = response
-        .pointer_mut("/choices/0/delta")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        delta
-            .entry("reasoning_content")
-            .or_insert(serde_json::Value::Null);
-    }
-    response.to_string()
 }
 
 #[allow(deprecated)]
@@ -695,7 +851,7 @@ pub(crate) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::{
         ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_logprobs,
-        chat_sampling_params, merge_template_stops, unary_chat,
+        chat_sampling_params, chat_stream_usage_options, merge_template_stops, unary_chat,
     };
     use crate::api_server::core::openai::template::ChatFormatter;
     use crate::api_server::core::test_utils::{
@@ -703,7 +859,7 @@ mod tests {
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::{ChunkExtras, ResponseItem};
-    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use dynamo_protocols::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
     /// The common rendering options; tests override one field with struct-update
@@ -722,6 +878,40 @@ mod tests {
         }
     }
 
+    fn chunk_with_finish(rid: &str, text: &str, finish: serde_json::Value) -> ResponseItem {
+        let mut item = chunk(rid, text, true);
+        if let ResponseItem::Done(event) = &mut item {
+            event.finish_reason = Some(serde_json::from_value(finish).unwrap());
+        }
+        item
+    }
+
+    #[test]
+    fn chat_stream_usage_options_mirrors_python() {
+        let options = |include_usage, continuous_usage_stats| ChatCompletionStreamOptions {
+            include_usage,
+            continuous_usage_stats,
+        };
+        assert_eq!(chat_stream_usage_options(None, false), (false, false));
+        assert_eq!(chat_stream_usage_options(None, true), (true, false));
+        assert_eq!(
+            chat_stream_usage_options(Some(&options(false, false)), true),
+            (true, false)
+        );
+        assert_eq!(
+            chat_stream_usage_options(Some(&options(false, true)), true),
+            (true, true)
+        );
+        assert_eq!(
+            chat_stream_usage_options(Some(&options(true, false)), false),
+            (true, false)
+        );
+        assert_eq!(
+            chat_stream_usage_options(Some(&options(true, true)), false),
+            (true, true)
+        );
+    }
+
     #[tokio::test]
     async fn dropping_during_chat_frame_expansion_aborts_only_unfinished_choices() {
         for terminal in [false, true] {
@@ -732,7 +922,7 @@ mod tests {
             let plan = plan(vec![choice0, choice1], senders);
 
             {
-                let stream = chat_event_stream(plan, 2, chat_options(), false, None, false);
+                let stream = chat_event_stream(plan, chat_options(), false, false, None, false);
                 futures::pin_mut!(stream);
                 let role: serde_json::Value =
                     serde_json::from_str(&super::chat_sse_payload(stream.next().await.unwrap()))
@@ -915,10 +1105,9 @@ mod tests {
         tx0.send(chunk("r0", "Paris", true)).await.unwrap();
         tx1.send(chunk("r1", "London", true)).await.unwrap();
 
-        let response = unary_chat(plan(vec![choice0, choice1], senders()), chat_options())
+        let value = unary_chat(plan(vec![choice0, choice1], senders()), chat_options())
             .await
             .expect("unary chat succeeds");
-        let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
@@ -938,7 +1127,7 @@ mod tests {
         .await
         .unwrap();
 
-        let response = unary_chat(
+        let value = unary_chat(
             plan(vec![choice], senders()),
             ChatRenderingOptions {
                 reasoning_parser: Some("deepseek-r1".into()),
@@ -947,7 +1136,6 @@ mod tests {
         )
         .await
         .expect("unary chat succeeds");
-        let value = serde_json::to_value(response).unwrap();
         assert_eq!(
             value["choices"][0]["message"]["reasoning_content"],
             "because Paris is famous"
@@ -969,7 +1157,7 @@ mod tests {
         .await
         .unwrap();
 
-        let response = unary_chat(
+        let value = unary_chat(
             plan(vec![choice], senders()),
             ChatRenderingOptions {
                 reasoning_parser: Some("qwen3".into()),
@@ -979,7 +1167,6 @@ mod tests {
         )
         .await
         .expect("unary chat succeeds");
-        let value = serde_json::to_value(response).unwrap();
         assert_eq!(
             value["choices"][0]["message"]["reasoning_content"],
             "\nOkay \n"
@@ -1010,12 +1197,12 @@ mod tests {
 
         let stream = chat_event_stream(
             plan(vec![choice], senders()),
-            1,
             ChatRenderingOptions {
                 reasoning_parser: Some("deepseek-r1".into()),
                 ..chat_options()
             },
             true,
+            false,
             None,
             false,
         );
@@ -1053,9 +1240,9 @@ mod tests {
 
         let stream = chat_event_stream(
             plan(vec![choice], senders()),
-            1,
             chat_options(),
             true,
+            false,
             None,
             false,
         );
@@ -1086,8 +1273,8 @@ mod tests {
 
         let stream = chat_event_stream(
             plan(vec![choice], senders()),
-            1,
             chat_options(),
+            false,
             false,
             None,
             false,
@@ -1119,9 +1306,9 @@ mod tests {
 
         let stream = chat_event_stream(
             plan(vec![choice], senders()),
-            1,
             chat_options(),
             true,
+            false,
             None,
             false,
         );
@@ -1129,5 +1316,352 @@ mod tests {
         let frames: Vec<String> = stream.map(super::chat_sse_payload).collect().await;
         let usage: serde_json::Value = serde_json::from_str(frames.last().unwrap()).unwrap();
         assert_eq!(usage["usage"]["prompt_tokens"], 19);
+    }
+
+    /// One generation event can expand into a reasoning chunk and a content
+    /// chunk: both share the same usage snapshot, the trailer counts the tokens
+    /// once, and the role prelude carries no usage (Python behavior).
+    #[tokio::test]
+    async fn stream_continuous_usage_counts_each_generation_event_once() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "<think>be", false)).await.unwrap();
+        tx.send(chunk("r0", "cause</think>Par", false))
+            .await
+            .unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                reasoning_parser: Some("deepseek-r1".into()),
+                ..chat_options()
+            },
+            true,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            frames.len(),
+            6,
+            "role + 2 reasoning + content + terminal + usage"
+        );
+        assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
+        assert!(
+            frames[0]["usage"].is_null(),
+            "role prelude carries no usage"
+        );
+        assert_eq!(frames[1]["usage"]["completion_tokens"], 1);
+        assert_eq!(frames[2]["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            frames[3]["usage"]["completion_tokens"], 2,
+            "content shares its event's snapshot, not a second increment"
+        );
+        assert_eq!(frames[4]["usage"]["completion_tokens"], 3);
+        assert_eq!(frames[4]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(frames[4]["choices"][0]["matched_stop"], "</s>");
+
+        let trailer = frames.last().unwrap();
+        assert_eq!(trailer["usage"]["prompt_tokens"], 5);
+        assert_eq!(trailer["usage"]["completion_tokens"], 3);
+        assert_eq!(trailer["usage"]["total_tokens"], 8);
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+    }
+
+    /// Continuous usage survives the tool jail: the synthesized tool-call
+    /// chunk and its terminal carry the accumulated snapshot.
+    #[tokio::test]
+    async fn stream_continuous_usage_reaches_tool_call_chunks() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk(
+            "r0",
+            r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            false,
+        ))
+        .await
+        .unwrap();
+        tx.send(chunk("r0", "", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                parser: Some("llama3_json".into()),
+                ..chat_options()
+            },
+            true,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        let tool_chunk = frames
+            .iter()
+            .find(|frame| !frame["choices"][0]["delta"]["tool_calls"].is_null())
+            .expect("tool-call chunk");
+        assert_eq!(
+            tool_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(tool_chunk["usage"]["prompt_tokens"], 5);
+
+        let terminal = frames
+            .iter()
+            .find(|frame| frame["choices"][0]["finish_reason"] == "tool_calls")
+            .expect("tool-calls terminal");
+        assert_eq!(terminal["choices"][0]["matched_stop"], "</s>");
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["prompt_tokens"], 5);
+        assert_eq!(trailer["usage"]["completion_tokens"], 2);
+    }
+
+    /// The parser can flush several buffered choices in one packed event; the
+    /// adapter splits them so each terminal keeps its own usage and matched
+    /// stop, and the final trailer follows the flush.
+    #[tokio::test]
+    async fn stream_splits_packed_parser_output_with_per_choice_metadata() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        // A truncated tool marker: the parser buffers both choices until EOF
+        // and releases them packed into one event.
+        let partial = r#"<|python_tag|>{"name":"get_weather","par"#;
+        tx0.send(chunk("r0", partial, false)).await.unwrap();
+        tx0.send(chunk("r0", "tial", false)).await.unwrap();
+        tx0.send(chunk_with_finish(
+            "r0",
+            "",
+            serde_json::json!({"type": "stop", "matched": "Paris"}),
+        ))
+        .await
+        .unwrap();
+        tx1.send(chunk("r1", partial, false)).await.unwrap();
+        tx1.send(chunk_with_finish(
+            "r1",
+            "",
+            serde_json::json!({"type": "stop", "matched": 151645}),
+        ))
+        .await
+        .unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            ChatRenderingOptions {
+                parser: Some("llama3_json".into()),
+                ..chat_options()
+            },
+            true,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        let terminal_of = |index: u64| {
+            frames
+                .iter()
+                .find(|frame| {
+                    frame["choices"][0]["index"] == index
+                        && !frame["choices"][0]["finish_reason"].is_null()
+                })
+                .unwrap_or_else(|| panic!("terminal for choice {index}"))
+        };
+        let first = terminal_of(0);
+        assert_eq!(first["choices"][0]["matched_stop"], "Paris");
+        assert_eq!(first["usage"]["completion_tokens"], 3);
+        let second = terminal_of(1);
+        assert_eq!(second["choices"][0]["matched_stop"], 151645);
+        assert_eq!(second["usage"]["completion_tokens"], 2);
+
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["prompt_tokens"], 5);
+        assert_eq!(trailer["usage"]["completion_tokens"], 5);
+        assert_eq!(trailer["usage"]["total_tokens"], 10);
+    }
+
+    /// Continuous usage can be requested without the final trailer: every
+    /// content-bearing chunk carries a snapshot and no empty-choices event is
+    /// emitted.
+    #[tokio::test]
+    async fn stream_continuous_usage_without_final_trailer() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "a", false)).await.unwrap();
+        tx.send(chunk("r0", "b", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            chat_options(),
+            false,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 3, "role + 2 chunks, no usage-only trailer");
+        assert!(
+            frames
+                .iter()
+                .all(|frame| !frame["choices"].as_array().unwrap().is_empty())
+        );
+        assert_eq!(frames[1]["usage"]["completion_tokens"], 1);
+        assert_eq!(frames[2]["usage"]["completion_tokens"], 2);
+    }
+
+    /// Python always emits `matched_stop` in a choice: content chunks carry
+    /// null and a length finish carries null on the terminal too.
+    #[tokio::test]
+    async fn stream_choices_emit_null_matched_stop_without_a_match() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "a", false)).await.unwrap();
+        tx.send(chunk_with_finish(
+            "r0",
+            "b",
+            serde_json::json!({"type": "length", "length": 8}),
+        ))
+        .await
+        .unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            chat_options(),
+            false,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            frames[1]["choices"][0]["matched_stop"],
+            serde_json::Value::Null
+        );
+        assert!(frames[1]["choices"][0].get("matched_stop").is_some());
+        assert_eq!(frames[2]["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            frames[2]["choices"][0]["matched_stop"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// The final trailer counts the shared prompt once but sums every choice's
+    /// completion tokens; continuous chunks report each choice's own count.
+    #[tokio::test]
+    async fn stream_usage_trailer_deduplicates_shared_prompt_across_choices() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(chunk("r0", "a", false)).await.unwrap();
+        tx0.send(chunk("r0", "b", true)).await.unwrap();
+        tx1.send(chunk("r1", "x", false)).await.unwrap();
+        tx1.send(chunk("r1", "y", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            chat_options(),
+            true,
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+
+        let mut completion_by_choice = std::collections::BTreeMap::new();
+        for frame in &frames[..frames.len() - 1] {
+            if frame["choices"][0]["delta"]["content"].is_null() {
+                continue; // the role prelude carries no usage (Python parity)
+            }
+            assert!(
+                !frame["usage"].is_null(),
+                "every content chunk carries usage"
+            );
+            let index = frame["choices"][0]["index"].as_u64().unwrap();
+            let completion = frame["usage"]["completion_tokens"].as_u64().unwrap();
+            completion_by_choice
+                .entry(index)
+                .and_modify(|value: &mut u64| *value = (*value).max(completion))
+                .or_insert(completion);
+        }
+        assert_eq!(
+            completion_by_choice,
+            std::collections::BTreeMap::from([(0, 2), (1, 2)])
+        );
+
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["prompt_tokens"], 5);
+        assert_eq!(trailer["usage"]["completion_tokens"], 4);
+        assert_eq!(trailer["usage"]["total_tokens"], 9);
+    }
+
+    /// Unary choices carry the native matched stop when there is one: a
+    /// matched string, an EOS token id, and null when nothing matched.
+    #[tokio::test]
+    async fn unary_chat_preserves_matched_stop() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        let (choice2, tx2) = planned("r2");
+        tx0.send(chunk_with_finish(
+            "r0",
+            "a",
+            serde_json::json!({"type": "stop", "matched": "Paris"}),
+        ))
+        .await
+        .unwrap();
+        tx1.send(chunk_with_finish(
+            "r1",
+            "b",
+            serde_json::json!({"type": "stop", "matched": 151645}),
+        ))
+        .await
+        .unwrap();
+        tx2.send(chunk_with_finish(
+            "r2",
+            "c",
+            serde_json::json!({"type": "length", "length": 8}),
+        ))
+        .await
+        .unwrap();
+
+        let value = unary_chat(
+            plan(vec![choice0, choice1, choice2], senders()),
+            chat_options(),
+        )
+        .await
+        .expect("unary chat succeeds");
+        assert_eq!(value["choices"][0]["matched_stop"], "Paris");
+        assert_eq!(value["choices"][1]["matched_stop"], 151645);
+        assert_eq!(
+            value["choices"][2]["matched_stop"],
+            serde_json::Value::Null,
+            "no match still emits the key, as null"
+        );
     }
 }

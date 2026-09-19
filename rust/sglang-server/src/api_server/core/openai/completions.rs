@@ -11,7 +11,6 @@ use crate::api_server::core::generate::{
     FrameShaper, GeneratePlan, RequestTiming, UnaryDrainPolicy, drain_plan_unary,
     generation_event_stream_with, unary_output,
 };
-use crate::message::finish_reason::Matched;
 use crate::message::response::{ChunkEvent, ChunkExtras};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -219,15 +218,7 @@ fn completion_choice(
             None => (None, None),
         }
     };
-    let matched_stop = reason
-        .and_then(|reason| reason.matched())
-        .map(|matched| match matched {
-            Matched::Token(id) => serde_json::json!(id),
-            Matched::Str(value) => serde_json::json!(value),
-            // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
-            Matched::Tokens(ids) => serde_json::json!(ids.ids),
-        });
+    let matched_stop = reason.and_then(super::matched_stop_value);
     Ok((
         Choice {
             text: output.text,
