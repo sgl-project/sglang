@@ -48,16 +48,60 @@ pub(super) async fn chat_completions(
         })
         .transpose()?;
 
-    // Select exactly one bucket before inspecting its serving mode or workers.
-    let bucket = resolver
+    let buckets = resolver
         .resolve(input_tokens, expected_peak_tokens)
         .map_err(|error| selection_error(error, &request.model, None))?;
+    if buckets.is_empty() {
+        return Err(selection_error(
+            PickError::NoMatchingBucket,
+            &request.model,
+            None,
+        ));
+    }
+    let mut rejections: Option<Vec<_>> = None;
+    let mut missing_stage = None;
+    for bucket in buckets {
+        match pick_bucket(ctx, &request, &headers, bucket, expected_peak_tokens).await {
+            Ok(workers) => {
+                // Dispatch only after this bucket supplies the entire plain or PD selection.
+                return forward_chat_request(ctx, request, workers, headers, start).await;
+            }
+            Err((stage, error)) => {
+                tracing::debug!(bucket = %bucket.id, ?stage, %error, "bucket selection failed");
+                match error {
+                    PickError::NoCandidates => missing_stage = Some(stage),
+                    PickError::NoAdmissibleEngine(reasons) => {
+                        rejections.get_or_insert_with(Vec::new).extend(reasons);
+                    }
+                    PickError::AdmissionRejected(reason) => {
+                        rejections.get_or_insert_with(Vec::new).push(reason);
+                    }
+                    error => return Err(selection_error(error, &request.model, Some(stage))),
+                }
+            }
+        }
+    }
+    // Preserve admission exhaustion even if a later bucket has no candidates.
+    let error = match rejections {
+        Some(reasons) => PickError::NoAdmissibleEngine(reasons),
+        None => PickError::NoCandidates,
+    };
+    Err(selection_error(error, &request.model, missing_stage))
+}
+
+async fn pick_bucket(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    headers: &HeaderMap,
+    bucket: &Bucket,
+    expected_peak_tokens: Option<u64>,
+) -> Result<SelectedWorkers, (Stage, PickError)> {
     let (prefill, decode) = match &bucket.groups {
         BucketGroups::Plain(group) => (
             pick_engine(
                 ctx,
-                &request,
-                &headers,
+                request,
+                headers,
                 bucket,
                 group,
                 Stage::Plain,
@@ -69,8 +113,8 @@ pub(super) async fn chat_completions(
         BucketGroups::Pd { prefill, decode } => {
             let prefill = pick_engine(
                 ctx,
-                &request,
-                &headers,
+                request,
+                headers,
                 bucket,
                 prefill,
                 Stage::Prefill,
@@ -79,8 +123,8 @@ pub(super) async fn chat_completions(
             .await?;
             let decode = pick_engine(
                 ctx,
-                &request,
-                &headers,
+                request,
+                headers,
                 bucket,
                 decode,
                 Stage::Decode,
@@ -90,19 +134,11 @@ pub(super) async fn chat_completions(
             (prefill, Some(decode))
         }
     };
-    // Both PD selections must succeed before forwarding acquires dispatch guards.
-    forward_chat_request(
-        ctx,
-        request,
-        SelectedWorkers {
-            prefill,
-            decode,
-            track_dispatch_timestamps: false,
-        },
-        headers,
-        start,
-    )
-    .await
+    Ok(SelectedWorkers {
+        prefill,
+        decode,
+        track_dispatch_timestamps: false,
+    })
 }
 
 async fn pick_engine(
@@ -113,7 +149,7 @@ async fn pick_engine(
     group: &EngineGroup,
     stage: Stage,
     expected_peak_tokens: Option<u64>,
-) -> Result<Arc<Worker>, ApiError> {
+) -> Result<Arc<Worker>, (Stage, PickError)> {
     // One lazy report snapshot per stage, including its policy fallback/admission.
     let load = LoadView::new(&ctx.engine_load);
     let pick_request = PickRequest {
@@ -143,7 +179,7 @@ async fn pick_engine(
         .pick(&ctx.registry, &pick_request)
         .await
         .map(|pick| pick.engine)
-        .map_err(|error| selection_error(error, &request.model, Some(stage)))
+        .map_err(|error| (stage, error))
 }
 
 fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {
