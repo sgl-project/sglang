@@ -1190,16 +1190,25 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
                 "or a supported lm_head.quant_method."
             )
-        if get_parallel().tp_size == 1:
-            org = int(self.lm_head.org_vocab_size)
+        shard = getattr(self.lm_head, "shard_indices", None)
+        if get_parallel().tp_size == 1 or shard is None:
+            # A head without vocab-shard metadata holds the whole vocabulary on
+            # every rank, so its local top-k is already global. Tied heads such
+            # as Gemma's embedding module carry no org_vocab_size either; their
+            # weight rows are the vocabulary, as in the greedy draft sampler.
+            org = getattr(self.lm_head, "org_vocab_size", None)
+            if org is None:
+                org = self.lm_head.weight.shape[0]
             vals, ids = _radix_topk(
                 _project_candidate_logits(
-                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
+                    hidden,
+                    self.lm_head,
+                    num_org=int(org),
+                    use_quant_head=use_quant_head,
                 ),
                 k,
             )
             return ids.long(), self._transform_unary_logits(vals)
-        shard = self.lm_head.shard_indices
         vals, ids = _radix_topk(
             _project_candidate_logits(
                 hidden,
