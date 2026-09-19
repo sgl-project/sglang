@@ -138,7 +138,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -347,7 +347,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
