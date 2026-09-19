@@ -209,8 +209,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Draft extend already includes the written window in seq_lens.
+            # Keep global lengths for causal masking and local lengths for KV.
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
+            local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
             # Hoist: refresh the int32 global + rank-local lens once per step
@@ -246,8 +249,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 )
             elif (
                 forward_batch.forward_mode.is_decode_or_idle()
-                and self.forward_decode_metadata.seq_lens_k is not None
-            ):
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ) and self.forward_decode_metadata.seq_lens_k is not None:
                 # Same hoist as verify: the parent stored the int32 GLOBAL
                 # lens in seq_lens_k; keep it as global_seq_lens_k and derive
                 # the rank-local view once per step (forward_decode consumes

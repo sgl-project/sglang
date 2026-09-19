@@ -40,5 +40,11 @@ def fixup_zero_kv_rows(
         cum_seq_lens: [batch_size + 1]                        int32
         max_seq_len:  max Q tokens in any single sequence     int
     """
+    if cum_seq_lens.numel() != kv_lens.numel() + 1:
+        raise ValueError(
+            "fixup_zero_kv_rows requires one query offset per sequence plus "
+            f"the end offset; got {cum_seq_lens.numel()} offsets for "
+            f"{kv_lens.numel()} sequences"
+        )
     module = _jit_fixup_module(out.dtype)
     module.fixup_zero_kv_rows(out, lse, kv_lens, cum_seq_lens, max_seq_len)

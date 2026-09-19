@@ -240,6 +240,9 @@ AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
 AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
+# CuteDSL shares TRT-LLM's prefill implementation. Cached prefill must use
+# expanded MHA heads, not the default handler's absorbed-MLA dimensions.
+AttentionBackendRegistry.register("cutedsl_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)

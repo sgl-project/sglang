@@ -1,5 +1,5 @@
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
+    dcp_pack_slice_tokens,
     try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -36,10 +37,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
     def test_one_virtual_page_explicit_rows(self):
         # P=2, N=4. Prefill pages 5,2,11,4; decode virtual page 7.
         # pos 0..7 src rows: 10,11, 4,5, 22,23, 8,9
-        # draft dest page is P*N=8 → 56..63
-        # each rank stores local rows 14,15 (page P=2)
-        expected_draft_src = [10, 11, 4, 5, 22, 23, 8, 9]
-        expected_draft_dst = list(range(56, 64))
+        # draft follows the target's DCP sharding (owner mask + loc // dcp):
+        # each rank stores only its own shard at division rows 14,15 (page P=2)
         expected_target_src = {
             0: [10, 22],
             1: [11, 23],
@@ -56,20 +55,17 @@ class TestDcpTokenTransferPlan(CustomTestCase):
                 dcp_rank=rank,
                 num_kv_tokens=8,
             )
-            np.testing.assert_array_equal(
-                plan.draft_src_token_indices, expected_draft_src
-            )
-            np.testing.assert_array_equal(
-                plan.draft_dst_token_indices, expected_draft_dst
-            )
+            np.testing.assert_array_equal(plan.draft_src_token_indices, src)
+            np.testing.assert_array_equal(plan.draft_dst_token_indices, [14, 15])
             np.testing.assert_array_equal(plan.target_src_token_indices, src)
             np.testing.assert_array_equal(plan.target_dst_token_indices, [14, 15])
             seen_src.extend(plan.target_src_token_indices.tolist())
-        self.assertEqual(sorted(seen_src), sorted(expected_draft_src))
+        self.assertEqual(sorted(seen_src), sorted([10, 11, 4, 5, 22, 23, 8, 9]))
 
     def test_second_chunk_crosses_dest_pages(self):
         # Prefix already filled one virtual page (P*N=4). This chunk's 4 tokens
-        # start at dest pos 4 and spill from virtual page 4 onto page 6.
+        # start at dest pos 4 and spill onto the next division-row pages.
+        # draft follows the target's DCP sharding, so both plans coincide.
         plan = _plan(
             src=[9, 3],
             dst=[4, 6],
@@ -80,8 +76,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
-        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 19, 6, 7])
-        np.testing.assert_array_equal(plan.draft_dst_token_indices, [16, 17, 26, 27])
+        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 6])
+        np.testing.assert_array_equal(plan.draft_dst_token_indices, [12, 13])
         np.testing.assert_array_equal(plan.target_src_token_indices, [18, 6])
         np.testing.assert_array_equal(plan.target_dst_token_indices, [12, 13])
 
@@ -95,7 +91,8 @@ class TestDcpTokenTransferPlan(CustomTestCase):
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
-        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [18, 19, 6, 7])
+        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [19, 7])
+        np.testing.assert_array_equal(plan_r1.draft_dst_token_indices, [12, 13])
         np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
         np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [12, 13])
 
@@ -119,7 +116,7 @@ class TestDcpTokenTransferPlan(CustomTestCase):
 
 
 class TestPackedDcpGrouping(CustomTestCase):
-    def test_target_needs_pack_draft_does_not(self):
+    def test_draft_packs_like_target(self):
         plan = _plan(
             src=[0, 1, 2, 3],
             dst=[0],
@@ -144,8 +141,8 @@ class TestPackedDcpGrouping(CustomTestCase):
         draft_src, draft_dst = group_concurrent_contiguous(
             plan.draft_src_token_indices, plan.draft_dst_token_indices
         )
-        self.assertEqual(draft_src, [[0, 1, 2, 3, 4, 5, 6, 7]])
-        self.assertEqual(draft_dst, [[0, 1, 2, 3, 4, 5, 6, 7]])
+        self.assertEqual(draft_src, [[0], [4]])
+        self.assertEqual(draft_dst, [[0], [1]])
 
 
 def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
@@ -249,6 +246,415 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+
+class TestDcpPackSliceTokens(CustomTestCase):
+    def test_capacity_divides_buffer_by_per_token_bytes(self):
+        # 24 layers x 576 B = 13824 B/token; 226,492,416 B buffer -> 16,384.
+        self.assertEqual(dcp_pack_slice_tokens(24 * 576 * 16384, [576] * 24), 16384)
+        # Leftover room smaller than one token is dropped.
+        self.assertEqual(dcp_pack_slice_tokens(100, [60, 30]), 1)
+
+    def test_empty_item_lens_means_no_packing(self):
+        self.assertEqual(dcp_pack_slice_tokens(1024, []), 0)
+
+
+def _fake_pack_buffer(size_bytes, *, fits=True):
+    return SimpleNamespace(
+        buffer=torch.zeros(size_bytes, dtype=torch.uint8),
+        fits=lambda n: fits and n <= size_bytes,
+        get_ptr=lambda: 0x1000,
+        get_size=lambda: size_bytes,
+        get_gather_stream=lambda: Mock(),
+    )
+
+
+@contextmanager
+def _patched_dcp_pack_cuda():
+    with (
+        patch("sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"),
+        patch(
+            "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.stream",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "sglang.srt.disaggregation.common.dcp_pack.copy_mla_rows_into_pack"
+        ) as copy_mock,
+    ):
+        yield copy_mock
+
+
+def _bare_sender():
+    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+    sender = MooncakeKVManager.__new__(MooncakeKVManager)
+    sender.enable_custom_mem_pool = False
+    return sender
+
+
+class TestSendKvcacheDcpPackedSlices(CustomTestCase):
+    """_send_kvcache_dcp_packed_slices: slice sizing, ordering, fallback."""
+
+    ITEM_LEN = 16  # bytes per token per layer
+    NUM_LAYERS = 2
+
+    def _run(
+        self,
+        *,
+        n_tokens,
+        capacity_tokens,
+        num_draft=0,
+        draft_src_mismatch=False,
+        run_rets=None,
+        fits=True,
+    ):
+        num_entries = self.NUM_LAYERS + num_draft
+        per_token = self.ITEM_LEN * num_entries
+        buf = _fake_pack_buffer(capacity_tokens * per_token, fits=fits)
+        src_indices = 100 + 7 * np.arange(n_tokens, dtype=np.int64)
+        dst_indices = np.arange(200, 200 + n_tokens, dtype=np.int64)
+        draft_src_indices = (
+            src_indices + 1 if draft_src_mismatch else src_indices.copy()
+        )
+        draft_dst_indices = dst_indices.copy()
+        src_ptrs = [0xAAAA0000 + i * 0x10000 for i in range(num_entries)]
+        dst_ptrs = [0xBBBB0000 + i * 0x10000 for i in range(num_entries)]
+        item_lens = [self.ITEM_LEN] * num_entries
+
+        events = []
+
+        def run_layers(layers_params):
+            events.append(("run", layers_params))
+            if run_rets:
+                return run_rets[len([e for e in events if e[0] == "run"]) - 1]
+            return 0
+
+        with _patched_dcp_pack_cuda() as copy_mock:
+
+            def fake_gather(*args, **kwargs):
+                events.append(("gather", np.asarray(args[1]).copy()))
+
+            copy_mock.side_effect = fake_gather
+            sender = _bare_sender()
+            with patch(
+                "sglang.srt.disaggregation.mooncake.conn.logger.warning"
+            ) as warn_mock:
+                target_done, draft_done, ret = sender._send_kvcache_dcp_packed_slices(
+                    "session",
+                    pack_buffer=buf,
+                    src_kv_ptrs=src_ptrs,
+                    src_token_indices=src_indices,
+                    dst_token_indices=dst_indices,
+                    dst_kv_ptrs=dst_ptrs,
+                    token_item_lens=item_lens,
+                    num_target=self.NUM_LAYERS,
+                    draft_src_token_indices=draft_src_indices,
+                    draft_dst_token_indices=draft_dst_indices,
+                    run_layers=run_layers,
+                )
+        ctx = SimpleNamespace(
+            src_indices=src_indices,
+            dst_indices=dst_indices,
+            draft_dst_indices=draft_dst_indices,
+            src_ptrs=src_ptrs,
+            dst_ptrs=dst_ptrs,
+        )
+        return target_done, draft_done, ret, events, warn_mock, ctx
+
+    def test_single_slice_matches_legacy_pack_path(self):
+        target_done, draft_done, ret, events, warn_mock, ctx = self._run(
+            n_tokens=5, capacity_tokens=8
+        )
+        self.assertTrue(target_done)
+        self.assertFalse(draft_done)  # no draft entries configured
+        self.assertEqual(ret, 0)
+        warn_mock.assert_not_called()
+        # One gather of all 5 tokens, then exactly one transfer round.
+        self.assertEqual([e[0] for e in events], ["gather", "run"])
+        np.testing.assert_array_equal(events[0][1], ctx.src_indices)
+        layers_params = events[1][1]
+        self.assertEqual(len(layers_params), self.NUM_LAYERS)
+        for entry, (src_ptr, dst_ptr, item_len, groups) in enumerate(layers_params):
+            # Packed src rows are dense [0..n) inside the per-entry region.
+            self.assertEqual(src_ptr, 0x1000 + entry * 5 * self.ITEM_LEN)
+            self.assertEqual(dst_ptr, ctx.dst_ptrs[entry])
+            self.assertEqual(item_len, self.ITEM_LEN)
+            src_groups, dst_groups = groups
+            self.assertEqual(src_groups, [list(range(5))])
+            np.testing.assert_array_equal(np.asarray(dst_groups[0]), ctx.dst_indices)
+
+    def test_multi_slice_ordering_and_address_pairing(self):
+        target_done, _, ret, events, warn_mock, ctx = self._run(
+            n_tokens=10, capacity_tokens=4
+        )
+        self.assertTrue(target_done)
+        self.assertEqual(ret, 0)
+        warn_mock.assert_not_called()
+        # Slices of 4, 4, 2 tokens; each gather is followed by its transfer
+        # before the next gather reuses the buffer.
+        self.assertEqual(
+            [e[0] for e in events],
+            ["gather", "run", "gather", "run", "gather", "run"],
+        )
+        for slice_idx, (begin, end) in enumerate([(0, 4), (4, 8), (8, 10)]):
+            np.testing.assert_array_equal(
+                events[2 * slice_idx][1], ctx.src_indices[begin:end]
+            )
+            layers_params = events[2 * slice_idx + 1][1]
+            n_slice = end - begin
+            for entry, (src_ptr, dst_ptr, _, groups) in enumerate(layers_params):
+                self.assertEqual(src_ptr, 0x1000 + entry * n_slice * self.ITEM_LEN)
+                self.assertEqual(dst_ptr, ctx.dst_ptrs[entry])
+                src_groups, dst_groups = groups
+                self.assertEqual(src_groups, [list(range(n_slice))])
+                np.testing.assert_array_equal(
+                    np.asarray(dst_groups[0]), ctx.dst_indices[begin:end]
+                )
+
+    def test_draft_packed_in_same_buffer_after_target(self):
+        target_done, draft_done, ret, events, warn_mock, ctx = self._run(
+            n_tokens=5, capacity_tokens=8, num_draft=1
+        )
+        self.assertTrue(target_done)
+        self.assertTrue(draft_done)
+        self.assertEqual(ret, 0)
+        warn_mock.assert_not_called()
+        # A single gather covers target+draft rows, then one transfer round.
+        self.assertEqual([e[0] for e in events], ["gather", "run"])
+        layers_params = events[1][1]
+        self.assertEqual(len(layers_params), self.NUM_LAYERS + 1)
+        # Draft region starts after the target regions in the pack buffer.
+        draft_src_ptr, draft_dst_ptr, draft_item_len, draft_groups = layers_params[
+            self.NUM_LAYERS
+        ]
+        self.assertEqual(draft_src_ptr, 0x1000 + self.NUM_LAYERS * 5 * self.ITEM_LEN)
+        self.assertEqual(draft_dst_ptr, ctx.dst_ptrs[self.NUM_LAYERS])
+        self.assertEqual(draft_item_len, self.ITEM_LEN)
+        src_groups, dst_groups = draft_groups
+        self.assertEqual(src_groups, [list(range(5))])
+        np.testing.assert_array_equal(np.asarray(dst_groups[0]), ctx.draft_dst_indices)
+
+    def test_draft_packed_across_slices(self):
+        target_done, draft_done, ret, events, warn_mock, ctx = self._run(
+            n_tokens=10, capacity_tokens=4, num_draft=1
+        )
+        self.assertTrue(target_done)
+        self.assertTrue(draft_done)
+        self.assertEqual(ret, 0)
+        warn_mock.assert_not_called()
+        self.assertEqual(
+            [e[0] for e in events],
+            ["gather", "run", "gather", "run", "gather", "run"],
+        )
+        for slice_idx, (begin, end) in enumerate([(0, 4), (4, 8), (8, 10)]):
+            layers_params = events[2 * slice_idx + 1][1]
+            n_slice = end - begin
+            self.assertEqual(len(layers_params), self.NUM_LAYERS + 1)
+            draft_src_ptr, _, _, draft_groups = layers_params[self.NUM_LAYERS]
+            self.assertEqual(
+                draft_src_ptr,
+                0x1000 + self.NUM_LAYERS * n_slice * self.ITEM_LEN,
+            )
+            _, dst_groups = draft_groups
+            np.testing.assert_array_equal(
+                np.asarray(dst_groups[0]), ctx.draft_dst_indices[begin:end]
+            )
+
+    def test_draft_src_mismatch_keeps_draft_per_token(self):
+        # Draft not sharing the target's src rows cannot join the gather;
+        # target still packs, draft stays on the caller's per-token path.
+        target_done, draft_done, ret, events, warn_mock, ctx = self._run(
+            n_tokens=5, capacity_tokens=8, num_draft=1, draft_src_mismatch=True
+        )
+        self.assertTrue(target_done)
+        self.assertFalse(draft_done)
+        self.assertEqual(ret, 0)
+        self.assertEqual([e[0] for e in events], ["gather", "run"])
+        self.assertEqual(len(events[1][1]), self.NUM_LAYERS)
+
+    def test_transfer_failure_stops_remaining_slices(self):
+        target_done, draft_done, ret, events, warn_mock, _ = self._run(
+            n_tokens=10, capacity_tokens=4, num_draft=1, run_rets=[7]
+        )
+        self.assertTrue(target_done)
+        self.assertTrue(draft_done)
+        self.assertEqual(ret, 7)
+        self.assertEqual([e[0] for e in events], ["gather", "run"])
+
+    def test_tiny_buffer_falls_back_without_packing(self):
+        target_done, draft_done, ret, events, warn_mock, _ = self._run(
+            n_tokens=4, capacity_tokens=0, num_draft=1
+        )
+        self.assertFalse(target_done)
+        self.assertFalse(draft_done)
+        self.assertEqual(ret, 0)
+        self.assertEqual(events, [])
+        warn_mock.assert_not_called()
+
+    def test_pack_misfit_falls_back_with_warning(self):
+        target_done, draft_done, ret, events, warn_mock, _ = self._run(
+            n_tokens=4, capacity_tokens=4, num_draft=1, fits=False
+        )
+        self.assertFalse(target_done)
+        self.assertFalse(draft_done)
+        self.assertEqual(ret, 0)
+        warn_mock.assert_called_once()
+        self.assertIn("per-token RDMA", warn_mock.call_args.args[0])
+        # The misfit is detected before any gather or transfer.
+        self.assertEqual(events, [])
+
+
+class TestSendKvcacheDcpSlicedEndToEnd(CustomTestCase):
+    """send_kvcache_dcp with a real plan: sliced target + paired dst blocks."""
+
+    def _send(
+        self,
+        *,
+        n_pages,
+        capacity_tokens,
+        with_pack_buffer=True,
+        buffer_for_entries=None,
+    ):
+        page_size, dcp_size, dcp_rank = 2, 2, 0
+        num_target, num_draft = 2, 1
+        item_len = 16
+        src_pages = np.arange(10, 10 + n_pages, dtype=np.int32)
+        # Rank 0 owns offsets 0, 2, 4, ... -> n_pages tokens of dst shard.
+        dst_pages = np.arange(50, 50 + n_pages, dtype=np.int32)
+
+        src_ptrs = [0xAAAA0000 + i * 0x10000 for i in range(num_target + num_draft)]
+        dst_ptrs = [0xBBBB0000 + i * 0x10000 for i in range(num_target + num_draft)]
+        item_lens = [item_len] * (num_target + num_draft)
+
+        sender = _bare_sender()
+        sender.kv_args = SimpleNamespace(
+            page_size=page_size,
+            kv_data_ptrs=src_ptrs,
+            kv_layer_ids=[],
+            num_draft_entries=num_draft,
+        )
+        transfer_calls = []
+
+        def fake_transfer(session_id, blocks):
+            transfer_calls.append(blocks)
+            return 0
+
+        sender._transfer_data = fake_transfer
+        if buffer_for_entries is None:
+            buffer_for_entries = num_target + num_draft
+        pack_buffer = (
+            _fake_pack_buffer(capacity_tokens * item_len * buffer_for_entries)
+            if with_pack_buffer
+            else None
+        )
+        with _patched_dcp_pack_cuda():
+            ret = sender.send_kvcache_dcp(
+                "session",
+                src_pages,
+                dst_ptrs,
+                dst_pages,
+                dcp_token_item_lens=item_lens,
+                dst_dcp_size=dcp_size,
+                dst_dcp_rank=dcp_rank,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=n_pages * page_size,
+                executor=Mock(),
+                dst_layer_ids=[],
+                pack_buffer=pack_buffer,
+            )
+        self.assertEqual(ret, 0)
+        plan = build_dcp_token_transfer_plan(
+            src_pages,
+            dst_pages,
+            physical_page_size=page_size,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=n_pages * page_size,
+        )
+        return transfer_calls, dst_ptrs, item_len, num_target, plan
+
+    @staticmethod
+    def _covered_dst_tokens(calls, dst_ptr):
+        """Token positions written under one layer's dst base pointer."""
+        positions = []
+        for blocks in calls:
+            for _, dst, length in blocks:
+                if dst_ptr <= dst < dst_ptr + 0x10000:
+                    off = dst - dst_ptr
+                    positions.extend(range(off // 16, (off + length) // 16))
+        return sorted(positions)
+
+    def test_small_request_single_shot_packs_target_and_draft(self):
+        # 6 pages = 12 tokens -> rank shard 6 tokens <= capacity 8: one shot,
+        # now with the draft layer packed into the same transfer.
+        calls, dst_ptrs, item_len, num_target, plan = self._send(
+            n_pages=6, capacity_tokens=8
+        )
+        dst_tokens = plan.target_dst_token_indices.tolist()
+        self.assertEqual(len(calls), 1)
+        (blocks,) = calls
+        # One dense block per layer: 2 target + 1 draft, no per-token blocks.
+        self.assertEqual(len(blocks), num_target + 1)
+        for i, (src, dst, length) in enumerate(blocks):
+            self.assertEqual(dst, dst_ptrs[i] + dst_tokens[0] * item_len)
+            self.assertEqual(length, len(dst_tokens) * item_len)
+        for entry in range(num_target + 1):
+            self.assertEqual(
+                self._covered_dst_tokens(calls, dst_ptrs[entry]),
+                dst_tokens,
+            )
+
+    def test_large_request_is_sliced_not_per_token(self):
+        # 20 pages = 40 tokens -> rank shard 20 tokens > capacity 4:
+        # 5 packed slices (target + draft), never a per-token block.
+        calls, dst_ptrs, item_len, num_target, plan = self._send(
+            n_pages=20, capacity_tokens=4
+        )
+        dst_tokens = plan.target_dst_token_indices.tolist()
+        self.assertEqual(len(dst_tokens), 20)
+        self.assertEqual(len(calls), 5)
+        for slice_call in calls:
+            self.assertEqual(len(slice_call), num_target + 1)  # dense per layer
+            for _, _, length in slice_call:
+                self.assertEqual(length, 4 * item_len)
+        for entry in range(num_target + 1):
+            self.assertEqual(
+                self._covered_dst_tokens(calls, dst_ptrs[entry]),
+                dst_tokens,
+            )
+
+    def test_threshold_band_request_takes_one_extra_slice(self):
+        # Buffer sized for 8 target-only tokens; merged target+draft rows fit
+        # only 5. A shard of 8 tokens (the (125.8K, 131K] band in miniature)
+        # therefore takes 2 packed slices instead of 1 packed shot + 8
+        # per-token draft blocks -- still all bulk RDMA.
+        calls, dst_ptrs, item_len, num_target, plan = self._send(
+            n_pages=8, capacity_tokens=8, buffer_for_entries=2
+        )
+        dst_tokens = plan.target_dst_token_indices.tolist()
+        self.assertEqual(len(dst_tokens), 8)
+        self.assertEqual(len(calls), 2)  # slices of 5 and 3 tokens
+        expected_lengths = [5 * item_len, 3 * item_len]
+        for slice_call, slice_len in zip(calls, expected_lengths):
+            self.assertEqual(len(slice_call), num_target + 1)
+            for _, _, length in slice_call:
+                self.assertEqual(length, slice_len)
+        for entry in range(num_target + 1):
+            self.assertEqual(
+                self._covered_dst_tokens(calls, dst_ptrs[entry]),
+                dst_tokens,
+            )
+
+    def test_no_pack_buffer_keeps_per_token_fallback(self):
+        calls, dst_ptrs, item_len, num_target, plan = self._send(
+            n_pages=6, capacity_tokens=0, with_pack_buffer=False
+        )
+        self.assertEqual(len(calls), 1)  # target + draft in one batch
+        # 6 per-token blocks x (2 target + 1 draft) layers.
+        self.assertEqual(len(calls[0]), 6 * (num_target + 1))
 
 
 if __name__ == "__main__":

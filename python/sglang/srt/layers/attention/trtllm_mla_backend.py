@@ -1232,9 +1232,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
-        if (
-            self.data_type == torch.float8_e4m3fn
-        ) and forward_batch.forward_mode.is_target_verify():
+        if self.data_type == torch.float8_e4m3fn and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 q, k, k_rope = mla_quantize_without_rope_for_fp8(
@@ -1357,7 +1358,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 can_direct_view = bs > 0 and (total_tokens % bs == 0)
 
                 if can_direct_view:
-                    max_seq_len = metadata.max_seq_len_k + tokens_per_seq
+                    max_seq_len = metadata.max_seq_len_k + (
+                        0 if get_parallel().dcp_enabled else tokens_per_seq
+                    )
                     q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
                 else:
@@ -1399,10 +1402,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and get_parallel().dcp_enabled
-            ):
+            if get_parallel().dcp_enabled:
+                if needs_unpad:
+                    raise NotImplementedError("DCP MLA requires a dense draft window")
+                query_tokens_per_req = q.shape[1]
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,
@@ -1416,17 +1419,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     return_lse=True,
                 )
                 output = raw_out.view(
-                    bs * draft_token_num,
+                    bs * query_tokens_per_req,
                     layer.tp_q_head_num,
                     layer.v_head_dim,
                 )
-                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                lse = lse.view(bs * query_tokens_per_req, layer.tp_q_head_num)
                 fixup_zero_kv_rows(
                     output,
                     lse,
                     metadata.seq_lens_k,
-                    self._dense_q_indptr(bs, draft_token_num),
-                    draft_token_num,
+                    self._dense_q_indptr(bs, query_tokens_per_req),
+                    query_tokens_per_req,
                 )
                 return output.flatten(1), lse
 

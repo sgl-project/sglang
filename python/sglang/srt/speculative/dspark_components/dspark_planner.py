@@ -130,7 +130,10 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma,
+            max_verify_len=resolve_dspark_max_verify_len(gamma=self.gamma),
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
@@ -229,6 +232,21 @@ class DSparkVerifyPlanner:
         return self._is_verify_all
 
     @property
+    def max_verify_len(self) -> int:
+        return min(
+            self.verify_num_draft_tokens, self._schedule_cfg.resolved_max_verify_len()
+        )
+
+    @property
+    def uniform_verify_num_draft_tokens(self) -> int:
+        # The env cap shrinks the uniform layout only in verify-all mode, where
+        # busy and idle ranks all take the same uniform branch; scheduled
+        # compact ranks pin the cross-rank tier at the full window.
+        if self._is_verify_all:
+            return self.max_verify_len
+        return self.verify_num_draft_tokens
+
+    @property
     def mode_value(self) -> str:
         return self._ragged_verify_mode.value
 
@@ -302,7 +320,7 @@ class DSparkVerifyPlanner:
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            verify_num_draft_tokens=self.max_verify_len,
             min_verify_len=self._schedule_cfg.min_verify_len,
         )
         self._maybe_gather_dp_verify_tier(
@@ -429,7 +447,7 @@ class DSparkVerifyPlanner:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],
                     device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    verify_num_draft_tokens=self.uniform_verify_num_draft_tokens,
                     ragged_verify_mode=self._ragged_verify_mode,
                     model_runner=self.model_runner,
                     tier_num_reqs=global_num_reqs,
@@ -456,10 +474,14 @@ class DSparkVerifyPlanner:
                 return uniform_ragged_layout(
                     bs=len(req_pool_indices),
                     device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    verify_num_draft_tokens=self.max_verify_len,
                     ragged_verify_mode=self._ragged_verify_mode,
                     model_runner=self.model_runner,
                     tier_num_reqs=global_num_reqs,
+                    # Ranks with a budget pin the cross-rank tier at the full
+                    # window; keep this floor identical to theirs and cap only
+                    # the per-request lens.
+                    floor_num_draft_tokens=self.verify_num_draft_tokens,
                 )
             return None
         bs = int(verify_lens.shape[0])
@@ -474,7 +496,7 @@ class DSparkVerifyPlanner:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
                 verify_token_budget=budget,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                verify_num_draft_tokens=self.max_verify_len,
                 min_verify_len=self._schedule_cfg.min_verify_len,
             )
         else:
@@ -542,7 +564,7 @@ class DSparkVerifyPlanner:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
                 verify_token_budget=budget,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                verify_num_draft_tokens=self.max_verify_len,
                 min_verify_len=self._schedule_cfg.min_verify_len,
             )
         else:
@@ -561,7 +583,7 @@ class DSparkVerifyPlanner:
         return graph_tier_fill_budget(
             graph_num_tokens=graph_num_tokens,
             bs=int(req_pool_indices.shape[0]),
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            verify_num_draft_tokens=self.max_verify_len,
             min_verify_len=self._schedule_cfg.min_verify_len,
         )
 
@@ -725,11 +747,14 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    floor_num_draft_tokens: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
+    if floor_num_draft_tokens is None:
+        floor_num_draft_tokens = verify_num_draft_tokens
     if ragged_layout_exceeds_captured_grid(
         num_reqs=tier_num_reqs,
-        verify_num_draft_tokens=verify_num_draft_tokens,
+        verify_num_draft_tokens=floor_num_draft_tokens,
         model_runner=model_runner,
     ):
         return None
@@ -742,7 +767,7 @@ def uniform_ragged_layout(
     graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
         num_reqs=tier_num_reqs,
         ragged_verify_mode=ragged_verify_mode,
-        verify_num_draft_tokens=verify_num_draft_tokens,
+        verify_num_draft_tokens=floor_num_draft_tokens,
         model_runner=model_runner,
     )
     return RaggedVerifyLayout.from_verify_lens(
@@ -901,6 +926,13 @@ def compute_confidence(
     confidence = confidence_head.apply_sts(confidence_raw)
     expect(_CONFIDENCE, confidence)
     return confidence
+
+
+def resolve_dspark_max_verify_len(*, gamma: int) -> int:
+    raw = int(envs.SGLANG_DSPARK_MAX_VERIFY_LEN.get())
+    if raw <= 0:
+        return 0
+    return min(raw, gamma + 1)
 
 
 class DSparkScheduleConfig(msgspec.Struct):
