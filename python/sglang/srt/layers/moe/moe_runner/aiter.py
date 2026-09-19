@@ -20,7 +20,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -103,10 +103,32 @@ _AITER_ACTIVATIONS = {
 }
 
 
-def _aiter_activation(activation: str):
+# aiter's ActivationType.Swiglu is SwiGLU-OAI with alpha and the (up + beta) bias baked in
+_AITER_SWIGLU_OAI_ALPHA = 1.702
+_AITER_SWIGLU_OAI_BETA = 1.0
+
+
+def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
+    """Return the clamp limit for matching SwiGLU-OAI configs on gfx95."""
+    if not is_gfx95_supported():
+        return None
+    if config.activation != "silu" or not config.is_gated:
+        return None
+    if config.gemm1_alpha != _AITER_SWIGLU_OAI_ALPHA:
+        return None
+    if config.gemm1_beta not in (None, _AITER_SWIGLU_OAI_BETA):
+        return None
+    if config.gemm1_clamp_limit is None:
+        return None
+    return float(config.gemm1_clamp_limit)
+
+
+def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
-    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+    if aiter_swiglu_oai_limit(config) is not None:
+        return ActivationType.Swiglu
+    return getattr(ActivationType, _AITER_ACTIVATIONS.get(config.activation, "Gelu"))
 
 
 def _aiter_quant_type(quant_type: AiterQuantType):
@@ -220,6 +242,14 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
 
 
 class AiterRunnerCore(MoeRunnerCore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from sglang.kernels.ops.moe.moe_sorting_small import (
+            apply_aiter_small_moe_sort_patch,
+        )
+
+        apply_aiter_small_moe_sort_patch()
+
     def run(
         self,
         runner_input: AiterRunnerInput,
@@ -255,6 +285,7 @@ class AiterRunnerCore(MoeRunnerCore):
             else quant_info.a13_scale
         )
 
+        is_gfx95 = is_gfx95_supported()
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
@@ -270,6 +301,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+        elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
+            extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -277,19 +310,20 @@ class AiterRunnerCore(MoeRunnerCore):
             # lives elsewhere / is absent.
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
+            # Honor the weight layout on gfx95; elsewhere retain env-only selection.
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                if (not is_gfx95 or self.config.gate_up_interleaved)
+                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        activation = extra.pop("activation", None) if is_gfx95 else None
+        if activation is None:
+            activation = _aiter_activation(self.config)
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -298,7 +332,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
