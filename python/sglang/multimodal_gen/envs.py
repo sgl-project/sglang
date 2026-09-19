@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
-    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
@@ -243,13 +242,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
     ),
-    # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
-    "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
-        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
-    ),
-    # Internal per-worker platform override used by disaggregated role launch.
-    # Empty means normal platform auto-detection.
+    # Select a built-in platform or an installed platform entry point.
+    # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
