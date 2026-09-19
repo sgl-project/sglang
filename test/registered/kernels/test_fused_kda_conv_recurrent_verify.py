@@ -204,7 +204,7 @@ def _compare_case(case, num_warps, use_ring=False):
         rings_fus = {name: buf.clone() for name, buf in template.items()}
     else:
         rings_ref = rings_fus = None
-    o_ref, conv_ref, win_ref, ic_ref = _run_reference(
+    o_ref, _, win_ref, ic_ref = _run_reference(
         inp, B, T, H, HV, K, V, lower_bound, rings=rings_ref
     )
     o_fus, conv_fus, win_fus, ic_fus = _run_fused(
@@ -213,13 +213,13 @@ def _compare_case(case, num_warps, use_ring=False):
 
     idx_vals = inp["idx_vals"]
     valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
-    touched_slots = [slot for slot in idx_vals if slot >= 0]
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
     # One bf16 ulp: the fused and reference tiles reduce K in different orders.
     torch.testing.assert_close(o_fus_v, o_ref_v, rtol=2**-7, atol=1e-7)
-    assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
+    # conv_state is read-only in verify; the commit scatter advances it.
+    assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     if use_ring:
         # Full-tensor bitwise: ring values are elementwise (conv FMA chain,
@@ -237,6 +237,28 @@ def _compare_case(case, num_warps, use_ring=False):
 @pytest.mark.parametrize("case", _CASES)
 def test_matches_unfused_reference(case):
     _compare_case(case, num_warps=4)
+
+
+def test_output_does_not_depend_on_cta_scheduling():
+    """The verify output must not change with how the CTAs happen to be
+    scheduled. H=1 with HV=16 shares one Q/K history across 16 V tiles."""
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("green contexts need SM90 or newer")
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+    case = (1, 6, 1, 16, 128, 128, 4, False, None, False, 1)
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
+    full = _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps=4)[0]
+
+    streams, _ = split_device_green_ctx_by_sm_count(torch.device("cuda:0"), [8])
+    # The green stream is non-blocking, so it must be told to wait for the
+    # inputs produced above; synchronize() afterwards only waits on the consumer.
+    streams[0].wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(streams[0]):
+        squeezed = _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps=4)[0]
+    streams[0].synchronize()
+    assert torch.equal(full, squeezed)
 
 
 @pytest.mark.parametrize("case", _RING_CASES)
