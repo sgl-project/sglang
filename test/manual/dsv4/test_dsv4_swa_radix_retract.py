@@ -91,7 +91,6 @@ class TestDSV4FlashSWARadixRetract(CustomTestCase):
         env = {
             "SGLANG_DSV4_FP4_EXPERTS": "0",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-            "SGLANG_OPT_SWA_RADIX_CACHE_COMPACT": "0",
             "SGLANG_TEST_RETRACT": "1",
             "SGLANG_TEST_RETRACT_INTERVAL": "3",
         }
