@@ -13,12 +13,11 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::discovery::{ModelId, WorkerId};
-use crate::state::LoadView;
 use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
 
-/// Request facts used for bucket matching and engine selection.
+/// Request facts for engine selection. Policies own their shared-state handles.
 #[derive(Debug, Clone, Copy)]
 pub struct PickRequest<'a> {
     pub model: &'a ModelId,
@@ -29,16 +28,10 @@ pub struct PickRequest<'a> {
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
-    pub load: &'a LoadView<'a>,
 }
 
 impl<'a> PickRequest<'a> {
-    pub fn new(
-        model: &'a ModelId,
-        stage: Stage,
-        input_tokens: u64,
-        load: &'a LoadView<'a>,
-    ) -> Self {
+    pub fn new(model: &'a ModelId, stage: Stage, input_tokens: u64) -> Self {
         Self {
             model,
             stage,
@@ -48,7 +41,6 @@ impl<'a> PickRequest<'a> {
             token_ids: None,
             session_key: None,
             routing_key: None,
-            load,
         }
     }
 }
@@ -84,6 +76,8 @@ pub enum PickError {
 }
 
 /// Returns one admitted engine from exactly the supplied candidates.
+/// Implementations receive shared load, KV, and affinity handles at construction;
+/// they obtain their own observations rather than asking callers to supply them.
 pub trait Policy: Send + Sync + Debug {
     fn pick<'a>(
         &'a self,
