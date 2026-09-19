@@ -2420,10 +2420,14 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
         # Strictly on the far side of EVERY source: keeps the batched move
         # src/dst-disjoint and actually retreats the edge.
+        # Sources retreat inward, so the last source is the far-side boundary.
+        source_boundary = srcs[-1]
         if side == "high":
-            usable_holes = sorted(h for h in holes if h < min(srcs))
+            usable_holes = sorted(h for h in holes if h < source_boundary)
         else:
-            usable_holes = sorted((h for h in holes if h > max(srcs)), reverse=True)
+            usable_holes = sorted(
+                (h for h in holes if h > source_boundary), reverse=True
+            )
         dsts: List[int] = list(usable_holes[: len(srcs)])
         n_fresh = len(srcs) - len(dsts)
         if n_fresh > 0:

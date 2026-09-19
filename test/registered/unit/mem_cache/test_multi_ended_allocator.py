@@ -3083,6 +3083,37 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(fla._hole_pages(), 0)
         self._check_float_state(fla, kv)
 
+    def test_make_room_skips_holes_between_sources(self):
+        for side in ("low", "high"):
+            with self.subTest(side=side):
+                _, _, fla, _, kv = self._build_tri()
+                v = fla.alloc(12)
+                self._stamp(fla, kv, v)
+                start = fla.low_wm_page
+                holes = torch.tensor([1, 3, 8, 10]) + start
+                fla.free(fla.physical_to_virtual[holes].clone())
+                if side == "high":
+                    sources = [11, 9, 7]
+                    destinations = [1, 3, -1]
+                else:
+                    sources = [0, 2, 4]
+                    destinations = [10, 8, 12]
+                source_pages = torch.tensor(sources) + start
+                destination_pages = torch.tensor(destinations) + start
+                moved_ids = fla.physical_to_virtual[source_pages].clone()
+                gap_low, gap_high = fla._gap_pages()
+                gap = gap_low if side == "low" else gap_high
+                ask = (gap + 3) * fla.entry_bytes_per_page
+
+                self.assertGreaterEqual(fla.make_room(side=side, min_bytes=ask), ask)
+
+                # Only the two far-side holes can receive these three pages;
+                # the remaining destination must come from the far gap.
+                self.assertTrue(
+                    torch.equal(fla.virtual_to_physical[moved_ids], destination_pages)
+                )
+                self._check_float_state(fla, kv)
+
     def test_compact_holes_ordered_pack(self):
         _, _, fla, _, kv = self._build_tri()
         vs = [fla.alloc(2) for _ in range(4)]
