@@ -475,7 +475,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
                 return_value=SimpleNamespace(speculative_num_draft_tokens=2),
             ),
         ):
-            SchedulerPPMixin._pp_spec_compact_accept_kv(
+            SchedulerPPMixin._pp_spec_commit_relayed_accept(
                 scheduler,
                 batch,
                 fwd_batch,
@@ -502,8 +502,8 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         outputs = MagicMock()
         outputs.tensors = {"spec_accept_index": torch.tensor([[0]], dtype=torch.int32)}
 
-        with self.assertRaisesRegex(AssertionError, "forward-time seq_lens_cpu"):
-            SchedulerPPMixin._pp_spec_compact_accept_kv(
+        with self.assertRaisesRegex(RuntimeError, "forward-time seq_lens_cpu"):
+            SchedulerPPMixin._pp_spec_commit_relayed_accept(
                 scheduler,
                 batch,
                 fwd_batch,

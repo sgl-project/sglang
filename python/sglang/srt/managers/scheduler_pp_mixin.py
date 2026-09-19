@@ -1012,7 +1012,7 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
-            self._pp_spec_compact_accept_kv(
+            self._pp_spec_commit_relayed_accept(
                 batch,
                 fwd_batch,
                 fwd_rids,
@@ -1137,7 +1137,7 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-    def _pp_spec_compact_accept_kv(
+    def _pp_spec_commit_relayed_accept(
         self: Scheduler,
         batch: ScheduleBatch,
         fwd_batch: ScheduleBatch,
@@ -1146,17 +1146,9 @@ class SchedulerPPMixin:
         verify_out_cache_loc: Optional[torch.Tensor],
         pp_outputs,
     ) -> None:
-        """Move this stage's accepted-path KV to the front of each request block.
+        """Commit relayed recurrent state, then compact tree KV when present.
 
-        The verify forward writes one KV slot per tree node, in node order. The
-        committed prefix that every later read assumes is the accepted path laid
-        out contiguously, so the two have to be reconciled once per round -- and
-        each stage has to do it for its own layers, since KV is not relayed.
-        The last stage does it inside verify (_finalize_accept_tree_path); this
-        is the same step for the stages that only ran the target forward.
-
-        Must run before seq_lens advances: the move writes into the block that
-        starts at the pre-advance length.
+        Must run before the live batch advances ``seq_lens``.
         """
         accept_index = pp_outputs.tensors.get("spec_accept_index")
         if accept_index is None or fwd_batch.forward_mode.is_idle():
@@ -1181,7 +1173,7 @@ class SchedulerPPMixin:
         elif live_rids == fwd_rids:
             seq_lens = batch.seq_lens
         else:
-            raise AssertionError(
+            raise RuntimeError(
                 "PP-spec delayed relay cannot commit a recomposed micro-batch "
                 "without its forward-time seq_lens_cpu snapshot"
             )
