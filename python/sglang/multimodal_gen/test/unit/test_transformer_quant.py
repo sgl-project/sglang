@@ -58,8 +58,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
     ComfyFp8Config,
     ComfyFullPrecisionFp8LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -70,12 +70,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+    ConvRotInt8ComfyKitchenLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
-    KitchenInt8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -140,6 +140,13 @@ from sglang.srt.layers.quantization.bitsandbytes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
+
+# convrot_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
+# cases do not depend on the runner.
+_CONVROT_SGL_AVAILABLE = (
+    "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config."
+    "_sgl_kernel_available"
+)
 
 
 class _FakeFluxTransformer:
@@ -707,7 +714,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
     @patch(
-        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self, _load):
@@ -847,10 +854,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             }
         )
 
-        self.assertIsInstance(config, KitchenInt8Config)
+        self.assertIsInstance(config, ConvRotInt8Config)
         self.assertTrue(config.is_checkpoint_int8_serialized)
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
-        self.assertFalse(KitchenInt8Config().checkpoint_uses_native_qkv_layout)
+        self.assertFalse(ConvRotInt8Config().checkpoint_uses_native_qkv_layout)
         self.assertFalse(_needs_device_weight_postprocess(config))
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
@@ -1003,9 +1010,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 new=object(),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+                "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
                 "_load_comfy_kitchen"
             ),
+            patch(_CONVROT_SGL_AVAILABLE, return_value=False),
         ):
             config = resolve_minimax_h3_checkpoint_quantization(markers)
             w4a4 = ReplicatedLinear(
@@ -1030,12 +1038,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(int8.weight.shape, (3, 256))
         self.assertEqual(set(config.selected), {"w4a4", "int8"})
 
+    @patch(_CONVROT_SGL_AVAILABLE, return_value=False)
     @patch(
-        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
-    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load):
-        config = KitchenInt8Config(
+    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load, _sgl):
+        config = ConvRotInt8Config(
             layer_markers={
                 "proj": {
                     "format": "int8_tensorwise",
@@ -1731,16 +1740,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 ModelOptFp4LinearMethod,
             )
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.quantization."
-            "kitchen_int8._load_comfy_kitchen"
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization."
+                "convrot_int8_comfy_kitchen._load_comfy_kitchen"
+            ),
+            patch(_CONVROT_SGL_AVAILABLE, return_value=False),
         ):
             self.assertIsInstance(
                 config.get_quant_method(
                     LinearBase(input_size=256, output_size=32),
                     "blocks.0.attn.out_proj",
                 ),
-                KitchenInt8LinearMethod,
+                ConvRotInt8ComfyKitchenLinearMethod,
             )
         self.assertIsInstance(
             config.get_quant_method(
