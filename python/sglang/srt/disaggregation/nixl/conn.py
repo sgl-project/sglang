@@ -17,6 +17,10 @@ import zmq
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
+    from sglang.srt.disaggregation.layerwise_kv import (
+        LayerwiseKVJob,
+        LayerwiseStateJob,
+    )
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -39,6 +43,11 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
+)
+from sglang.srt.disaggregation.layerwise_kv import (
+    compact_layer_block_ids,
+    select_compact_layer_entries,
+    select_prepped_layer_indices,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -1263,6 +1272,68 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
                         )
 
+                        layerwise_slots = None
+                        layerwise_controller = getattr(
+                            self, "layerwise_kv_controller", None
+                        )
+                        if (
+                            layerwise_controller is not None
+                            and self.supports_layerwise_kv(dst_info)
+                        ):
+                            drained = layerwise_controller.drain(
+                                room,
+                                kv_chunk.chunk_id,
+                                req.agent_name,
+                                src_prefill_kv_indices,
+                                chunked_dst_kv_indice,
+                            )
+                            if drained.handles:
+                                settled, failed = self._await_handles(
+                                    drained.handles, failure_seen=False
+                                )
+                                if not settled:
+                                    settle_timed_out = True
+                                    raise RuntimeError(
+                                        "Layer-wise NIXL handles did not settle before "
+                                        f"the canonical notification for room={room}, "
+                                        f"chunk={kv_chunk.chunk_id}"
+                                    )
+                                if failed:
+                                    raise RuntimeError(
+                                        "Layer-wise NIXL transfer failed before tail "
+                                        f"completion for room={room}, "
+                                        f"chunk={kv_chunk.chunk_id}"
+                                    )
+                            layerwise_slots = drained.missing_slots
+
+                        if layerwise_slots is not None:
+                            # The canonical notification must be attached only
+                            # after every streamed write has settled. If all
+                            # layers were streamed, rewrite one page of compact
+                            # slot zero to carry that notification; the write is
+                            # byte-identical and avoids a notification-only API
+                            # dependency in NIXL.
+                            tail_src_indices = src_prefill_kv_indices
+                            tail_dst_indices = chunked_dst_kv_indice
+                            if not layerwise_slots:
+                                layerwise_slots = [0]
+                                tail_src_indices = src_prefill_kv_indices[:1]
+                                tail_dst_indices = chunked_dst_kv_indice[:1]
+                            kv_xfer_handle = self.send_kvcache_layers(
+                                req.agent_name,
+                                tail_src_indices,
+                                dst_info.dst_kv_ptrs,
+                                tail_dst_indices,
+                                dst_info.gpu_id,
+                                notif,
+                                layerwise_slots,
+                            )
+                            if kv_xfer_handle is not None:
+                                handles.append(kv_xfer_handle)
+                            continue_regular_kv_send = False
+                        else:
+                            continue_regular_kv_send = True
+
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
                         #      registered staging, watermark/alloc ready)
@@ -1270,7 +1341,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         #   3. send_kvcache_slice (heterogeneous TP fallback,
                         #      or staging hard-failed for this chunk)
                         use_staging = (
-                            self.enable_staging
+                            continue_regular_kv_send
+                            and self.enable_staging
                             and staging_strategy is not None
                             and not self.is_mla_backend
                             and not self.is_hybrid_mla_backend
@@ -1298,7 +1370,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 break
 
-                        if kv_xfer_handle is None:
+                        if kv_xfer_handle is None and continue_regular_kv_send:
                             if is_dcp_transfer:
                                 pack_buffer = (
                                     self._dcp_pack_buffers[worker_index]
@@ -1378,22 +1450,73 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
                         if kv_chunk.state_indices:
-                            state_xfer_handles = self.maybe_send_extra(
-                                req.agent_name,
-                                kv_chunk.state_indices,
-                                dst_info.dst_state_data_ptrs,
-                                req.dst_state_indices,
-                                dst_info.gpu_id,
-                                f"{req.room}_state_{self.transfer_source_rank}",
-                                decode_tp_size,
-                                decode_tp_rank=dst_info.decode_tp_rank,
-                                dst_state_item_lens=dst_info.dst_state_item_lens,
-                                dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
-                                dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                            continue_regular_state_send = True
+                            layerwise_controller = getattr(
+                                self, "layerwise_kv_controller", None
                             )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
-                            )
+                            if (
+                                layerwise_controller is not None
+                                and self.supports_layerwise_state(dst_info)
+                                and len(kv_chunk.state_indices) == 1
+                                and len(kv_chunk.state_indices[0]) == 1
+                                and len(req.dst_state_indices) == 1
+                                and len(req.dst_state_indices[0]) == 1
+                            ):
+                                src_state_index = int(kv_chunk.state_indices[0][0])
+                                dst_state_index = int(req.dst_state_indices[0][0])
+                                drained_state = layerwise_controller.drain_state(
+                                    room,
+                                    req.agent_name,
+                                    src_state_index,
+                                    dst_state_index,
+                                )
+                                if drained_state.handles:
+                                    settled, failed = self._await_handles(
+                                        drained_state.handles, failure_seen=False
+                                    )
+                                    if not settled:
+                                        settle_timed_out = True
+                                        raise RuntimeError(
+                                            "Layer-wise NIXL state handles did not "
+                                            "settle before the canonical notification "
+                                            f"for room={room}"
+                                        )
+                                    if failed:
+                                        raise RuntimeError(
+                                            "Layer-wise NIXL state transfer failed "
+                                            f"before tail completion for room={room}"
+                                        )
+                                if drained_state.missing_slots is not None:
+                                    state_slots = drained_state.missing_slots or [0]
+                                    state_handle = self.send_mamba_state_layers(
+                                        req.agent_name,
+                                        src_state_index,
+                                        dst_state_index,
+                                        dst_info,
+                                        f"{req.room}_state_{self.transfer_source_rank}",
+                                        state_slots,
+                                    )
+                                    if state_handle is not None:
+                                        handles.append(state_handle)
+                                    continue_regular_state_send = False
+
+                            if continue_regular_state_send:
+                                state_xfer_handles = self.maybe_send_extra(
+                                    req.agent_name,
+                                    kv_chunk.state_indices,
+                                    dst_info.dst_state_data_ptrs,
+                                    req.dst_state_indices,
+                                    dst_info.gpu_id,
+                                    f"{req.room}_state_{self.transfer_source_rank}",
+                                    decode_tp_size,
+                                    decode_tp_rank=dst_info.decode_tp_rank,
+                                    dst_state_item_lens=dst_info.dst_state_item_lens,
+                                    dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                                    dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                                )
+                                handles.extend(
+                                    h for h in state_xfer_handles if h is not None
+                                )
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
@@ -1583,6 +1706,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_item_lens: Optional[List[int]] = None,
+        layer_slots: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1605,13 +1729,32 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            num_layers = len(item_lens)
-            src_indices = repeat_indices_over_layers(
-                prefill_data_indices, num_layers, self._num_slots_src
-            )
-            dst_indices = repeat_indices_over_layers(
-                dst_data_indices, num_layers, num_slots_dst
-            )
+            num_blocks = len(item_lens)
+            if layer_slots is None:
+                src_indices = repeat_indices_over_layers(
+                    prefill_data_indices, num_blocks, self._num_slots_src
+                )
+                dst_indices = repeat_indices_over_layers(
+                    dst_data_indices, num_blocks, num_slots_dst
+                )
+            else:
+                if self.is_mla_backend:
+                    raise NotImplementedError(
+                        "Layer-wise NIXL transfer currently supports MHA KV layout only"
+                    )
+                if num_blocks % 2 != 0:
+                    raise RuntimeError(
+                        f"MHA KV pointer count must be even, got {num_blocks}"
+                    )
+                block_ids = compact_layer_block_ids(
+                    layer_slots, num_blocks // 2, num_tensor_kinds=2
+                )
+                src_indices = select_prepped_layer_indices(
+                    prefill_data_indices, block_ids, self._num_slots_src
+                )
+                dst_indices = select_prepped_layer_indices(
+                    dst_data_indices, block_ids, num_slots_dst
+                )
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 src_prep,
@@ -1699,6 +1842,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+            if layer_slots is not None:
+                block_ids = compact_layer_block_ids(
+                    layer_slots, layers_current_pp_stage, num_tensor_kinds=2
+                )
+                layers_params = [layers_params[block_id] for block_id in block_ids]
 
         if not layers_params:
             return None
@@ -1786,6 +1934,163 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             notif=notif,
             src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_mem_kind,
+        )
+
+    def supports_layerwise_kv(self, dst_info: KVArgsRegisterInfo) -> bool:
+        """Whether the peer uses the first-phase, strictly supported KV path."""
+        return (
+            not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and self.pp_size == 1
+            and not self.enable_staging
+            and not self.enable_all_cp_ranks_for_transfer
+            and not self.is_dummy_cp_rank
+            and not dst_info.requires_dcp_relayout
+            and dst_info.decode_tp_size == self.attn_tp_size
+            and self.src_mem_kind == "VRAM"
+            and dst_info.dst_homogeneous_mem_kind == "VRAM"
+            and dst_info.kv_xfer_segments is None
+            and self.kv_args.num_draft_entries == 0
+        )
+
+    def supports_layerwise_state(self, dst_info: KVArgsRegisterInfo) -> bool:
+        """Whether Mamba state metadata is safe for compact-layer streaming."""
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        src_ptrs = self.kv_args.state_data_ptrs or []
+        src_lens = self.kv_args.state_item_lens or []
+        src_layer_ids = self.kv_args.state_layer_ids or []
+        dst_ptrs = dst_info.dst_state_data_ptrs
+        dst_lens = dst_info.dst_state_item_lens
+        dst_layer_ids = dst_info.dst_state_layer_ids
+        metadata_valid = (
+            len(src_ptrs) == len(src_lens) == len(src_layer_ids) == 1
+            and len(dst_ptrs) == len(dst_lens) == len(dst_layer_ids) == 1
+            and len(src_ptrs[0]) == len(src_lens[0]) == len(src_layer_ids[0])
+            and len(dst_ptrs[0]) == len(dst_lens[0]) == len(dst_layer_ids[0])
+        )
+        if state_types != [StateType.MAMBA] or not metadata_valid:
+            return False
+        try:
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids[0],
+                dst_layer_ids[0],
+                len(src_ptrs[0]),
+                len(dst_ptrs[0]),
+            )
+        except RuntimeError:
+            return False
+        return (
+            self.supports_layerwise_kv(dst_info)
+            and len(pairs) == len(dst_ptrs[0])
+            and all(
+                src_lens[0][src_pos] == dst_lens[0][dst_pos]
+                for src_pos, dst_pos in pairs
+            )
+        )
+
+    def _state_slot_global_ids(self) -> list[int]:
+        """Return compact Mamba slot order from tensor-major state metadata."""
+        ordered = []
+        seen = set()
+        for layer_id in self.kv_args.state_layer_ids[0]:
+            if layer_id not in seen:
+                ordered.append(layer_id)
+                seen.add(layer_id)
+        return ordered
+
+    def submit_layerwise_state(self, job: LayerwiseStateJob, layer_slots: List[int]):
+        dst_info = self.decode_kv_args_table.get(job.agent_name)
+        if dst_info is None or not self.supports_layerwise_state(dst_info):
+            return None
+        return self.send_mamba_state_layers(
+            job.agent_name,
+            job.src_state_index,
+            job.dst_state_index,
+            dst_info,
+            f"{job.room}_lwstate_{self.transfer_source_rank}_{layer_slots[0]}",
+            layer_slots,
+        )
+
+    def send_mamba_state_layers(
+        self,
+        peer_name: str,
+        src_state_index: int,
+        dst_state_index: int,
+        dst_info: KVArgsRegisterInfo,
+        notif: str,
+        layer_slots: List[int],
+    ):
+        """Send all Mamba state entries belonging to selected compact layers."""
+        global_ids = self._state_slot_global_ids()
+        src_layer_ids = self.kv_args.state_layer_ids[0]
+        src_positions = select_compact_layer_entries(
+            src_layer_ids, global_ids, layer_slots
+        )
+        dst_layer_ids = dst_info.dst_state_layer_ids[0]
+        dst_positions = select_compact_layer_entries(
+            dst_layer_ids, global_ids, layer_slots
+        )
+
+        return self._send_mamba_state(
+            peer_name,
+            [src_state_index],
+            [self.kv_args.state_data_ptrs[0][i] for i in src_positions],
+            [self.kv_args.state_item_lens[0][i] for i in src_positions],
+            [dst_info.dst_state_data_ptrs[0][i] for i in dst_positions],
+            [dst_state_index],
+            dst_info.gpu_id,
+            notif,
+            src_layer_ids=[src_layer_ids[i] for i in src_positions],
+            dst_layer_ids=[dst_layer_ids[i] for i in dst_positions],
+        )
+
+    def submit_layerwise_kv(self, job: LayerwiseKVJob, layer_slots: List[int]):
+        """Post selected layers with a non-canonical progress notification."""
+        dst_info = self.decode_kv_args_table.get(job.agent_name)
+        if dst_info is None or not self.supports_layerwise_kv(dst_info):
+            return None
+        return self.send_kvcache_layers(
+            job.agent_name,
+            job.page_indices,
+            dst_info.dst_kv_ptrs,
+            job.dst_page_indices,
+            dst_info.gpu_id,
+            f"{job.room}_lwkv_{job.chunk_id}_{self.transfer_source_rank}"
+            f"_{layer_slots[0]}",
+            layer_slots,
+        )
+
+    def send_kvcache_layers(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        notif: str,
+        layer_slots: List[int],
+    ):
+        """Send selected compact MHA KV layers with a non-canonical tag.
+
+        The decode notification parser intentionally ignores the ``lwkv`` tag;
+        the transfer worker later emits the one canonical ``kv`` notification
+        only after streamed handles and all missing layers have completed.
+        """
+        assert self.src_mem_kind is not None
+        if not layer_slots:
+            return None
+        return self._send_kvcache_generic(
+            peer_name=peer_name,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            dst_gpu_id=dst_gpu_id,
+            notif=notif,
+            src_mem_kind=self.src_mem_kind,
+            dst_mem_kind="VRAM",
+            layer_slots=layer_slots,
         )
 
     def _pack_dcp_rank_once(
@@ -3117,7 +3422,27 @@ class NixlKVSender(CommonKVSender):
             )
         return status
 
+    def _drain_layerwise_handles(self) -> None:
+        controller = getattr(self.kv_mgr, "layerwise_kv_controller", None)
+        if controller is None:
+            return
+        handles = controller.close_room(self.bootstrap_room)
+        if not handles:
+            return
+        settled, failed = self.kv_mgr._await_handles(handles, failure_seen=False)
+        if not settled:
+            raise RuntimeError(
+                "Layer-wise NIXL handles did not settle while clearing room "
+                f"{self.bootstrap_room}"
+            )
+        if failed:
+            logger.warning(
+                "A layer-wise NIXL transfer failed while clearing room %s",
+                self.bootstrap_room,
+            )
+
     def clear(self) -> None:
+        self._drain_layerwise_handles()
         super().clear()
         if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
@@ -3126,6 +3451,10 @@ class NixlKVSender(CommonKVSender):
                 for key in self.kv_mgr._staging_ctx.prefetch_requested
                 if key[0] != self.bootstrap_room
             }
+
+    def abort(self):
+        self._drain_layerwise_handles()
+        super().abort()
 
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)

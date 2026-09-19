@@ -42,6 +42,12 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.layerwise_kv import (
+    LayerwiseKVController,
+    LayerwiseKVJob,
+    LayerwiseStateJob,
+    reserve_layerwise_kv_chunk,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -628,6 +634,270 @@ class SchedulerDisaggregationPrefillMixin:
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
+    def _init_layerwise_kv(self: Scheduler) -> Optional[LayerwiseKVController]:
+        if not envs.SGLANG_DISAGG_LAYERWISE_NIXL.get():
+            return None
+        if getattr(self, "_layerwise_kv_init_failed", False):
+            return None
+        try:
+            kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+            progress = getattr(self.req_to_token_pool, "layerwise_progress", None)
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            full_map = getattr(kv_pool, "full_attention_layer_id_mapping", None)
+            if progress is None or not full_map:
+                raise RuntimeError(
+                    "Hybrid layer progress or compact KV mapping is missing"
+                )
+
+            num_layers = self.model_config.num_hidden_layers
+            layer_to_kv_slot = [-1] * num_layers
+            for global_layer_id, compact_slot in full_map.items():
+                if global_layer_id < 0 or global_layer_id >= num_layers:
+                    raise ValueError(
+                        f"full-attention layer id {global_layer_id} is out of range"
+                    )
+                layer_to_kv_slot[global_layer_id] = compact_slot
+
+            layer_to_state_slot = [-1] * num_layers
+            num_state_layers = 0
+            mamba_map = getattr(self.req_to_token_pool, "mamba_map", None) or {}
+            if mamba_map:
+                expected_state_order = [
+                    layer_id
+                    for layer_id, _ in sorted(
+                        mamba_map.items(), key=lambda item: item[1]
+                    )
+                ]
+                try:
+                    state_order = kv_manager._state_slot_global_ids()
+                except (AttributeError, IndexError):
+                    state_order = []
+                if state_order == expected_state_order:
+                    for global_layer_id, compact_slot in mamba_map.items():
+                        if global_layer_id < 0 or global_layer_id >= num_layers:
+                            raise ValueError(
+                                f"Mamba layer id {global_layer_id} is out of range"
+                            )
+                        layer_to_state_slot[global_layer_id] = compact_slot
+                    num_state_layers = len(mamba_map)
+                else:
+                    logger.warning(
+                        "Layer-wise Mamba state streaming is unavailable because "
+                        "the compact-slot order does not match NIXL metadata; "
+                        "KV layers will still stream"
+                    )
+
+            controller = LayerwiseKVController(
+                submitter=kv_manager,
+                progress=progress,
+                layer_to_kv_slot=layer_to_kv_slot,
+                num_kv_layers=len(full_map),
+                submit_batch=envs.SGLANG_DISAGG_LAYERWISE_KV_BATCH_SIZE.get(),
+                layer_to_state_slot=layer_to_state_slot,
+                num_state_layers=num_state_layers,
+                state_submit_batch=(
+                    envs.SGLANG_DISAGG_LAYERWISE_STATE_BATCH_SIZE.get()
+                ),
+            )
+            kv_manager.layerwise_kv_controller = controller
+            self._layerwise_kv_controller = controller
+            return controller
+        except Exception as exc:
+            logger.warning(
+                "Layer-wise NIXL KV streaming is unavailable (%s); using the "
+                "existing whole-chunk transfer path",
+                exc,
+            )
+            self._layerwise_kv_init_failed = True
+            return None
+
+    def _plan_layerwise_kv_jobs(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        controller: LayerwiseKVController,
+        generation: int,
+    ) -> List[LayerwiseKVJob]:
+        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if (
+            getattr(kv_manager, "enable_all_cp_ranks_for_transfer", False)
+            or getattr(kv_manager, "is_dummy_cp_rank", False)
+            or self.enable_staging
+        ):
+            return []
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        jobs = []
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            sender = getattr(req, "disagg_kv_sender", None)
+            req_pool_idx = req.kv.req_pool_idx
+            if (
+                room is None
+                or sender is None
+                or req_pool_idx is None
+                or req.extend_range is None
+                or req.pending_bootstrap
+                or getattr(sender, "_send_failed", False)
+            ):
+                continue
+            transfer_infos = kv_manager.transfer_infos.get(room)
+            if not transfer_infos:
+                continue
+            required = next(iter(transfer_infos.values())).required_dst_info_num
+            if len(transfer_infos) != required or any(
+                info.is_dummy for info in transfer_infos.values()
+            ):
+                continue
+
+            dst_infos = {
+                info.agent_name: kv_manager.decode_kv_args_table.get(info.agent_name)
+                for info in transfer_infos.values()
+            }
+            if any(
+                dst_info is None or not kv_manager.supports_layerwise_kv(dst_info)
+                for dst_info in dst_infos.values()
+            ):
+                continue
+
+            is_last_chunk = req is not self.chunked_req
+            start_idx = getattr(
+                sender, "_layerwise_reserved_start_idx", req.start_send_idx
+            )
+            end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+            if not is_last_chunk:
+                end_idx -= end_idx % page_size
+            if end_idx <= start_idx:
+                continue
+
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req_pool_idx, start_idx:end_idx
+            ]
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if not sender.should_send_kv_chunk(len(page_indices), is_last_chunk):
+                continue
+
+            reserved_curr_idx = getattr(
+                sender, "_layerwise_reserved_curr_idx", sender.curr_idx
+            )
+            candidate_slice = slice(
+                reserved_curr_idx, reserved_curr_idx + len(page_indices)
+            )
+            dst_page_indices_by_peer = {
+                info.agent_name: info.dst_kv_indices[candidate_slice]
+                for info in transfer_infos.values()
+            }
+            if any(
+                len(dst_page_indices) != len(page_indices)
+                for dst_page_indices in dst_page_indices_by_peer.values()
+            ):
+                continue
+
+            reservation = reserve_layerwise_kv_chunk(
+                sender, start_idx, end_idx, len(page_indices)
+            )
+            for info in transfer_infos.values():
+                dst_page_indices = dst_page_indices_by_peer[info.agent_name]
+                jobs.append(
+                    LayerwiseKVJob(
+                        room=room,
+                        chunk_id=reservation.chunk_id,
+                        agent_name=info.agent_name,
+                        generation=generation,
+                        page_indices=page_indices,
+                        dst_page_indices=dst_page_indices,
+                    )
+                )
+        return jobs
+
+    def _plan_layerwise_state_jobs(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        controller: LayerwiseKVController,
+        generation: int,
+    ) -> List[LayerwiseStateJob]:
+        if controller.num_state_layers == 0:
+            return []
+        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if kv_manager.kv_args.state_types != [StateType.MAMBA]:
+            return []
+
+        jobs = []
+        for req in batch.reqs:
+            if req is self.chunked_req:
+                continue
+            room = getattr(req, "bootstrap_room", None)
+            sender = getattr(req, "disagg_kv_sender", None)
+            req_pool_idx = req.kv.req_pool_idx
+            if (
+                room is None
+                or sender is None
+                or req_pool_idx is None
+                or req.extend_range is None
+                or req.pending_bootstrap
+                or getattr(sender, "_send_failed", False)
+            ):
+                continue
+            transfer_infos = kv_manager.transfer_infos.get(room)
+            if not transfer_infos:
+                continue
+            required = next(iter(transfer_infos.values())).required_dst_info_num
+            if len(transfer_infos) != required or any(
+                info.is_dummy for info in transfer_infos.values()
+            ):
+                continue
+
+            source_indices = (
+                self.req_to_token_pool.translate_mamba_indices(
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        req_pool_idx
+                    ]
+                )
+                .cpu()
+                .numpy()
+            )
+            if len(source_indices) != 1:
+                continue
+            source_index = int(source_indices[0])
+            planned_jobs = []
+            for info in transfer_infos.values():
+                dst_info = kv_manager.decode_kv_args_table.get(info.agent_name)
+                if (
+                    dst_info is None
+                    or not kv_manager.supports_layerwise_state(dst_info)
+                    or len(info.dst_state_indices) != 1
+                    or len(info.dst_state_indices[0]) != 1
+                ):
+                    planned_jobs = []
+                    break
+                planned_jobs.append(
+                    LayerwiseStateJob(
+                        room=room,
+                        agent_name=info.agent_name,
+                        generation=generation,
+                        src_state_index=source_index,
+                        dst_state_index=int(info.dst_state_indices[0][0]),
+                    )
+                )
+            jobs.extend(planned_jobs)
+        return jobs
+
+    def _maybe_arm_layerwise_kv(self: Scheduler, batch: ScheduleBatch) -> None:
+        controller = getattr(self, "_layerwise_kv_controller", None)
+        if controller is None:
+            controller = self._init_layerwise_kv()
+        if controller is None:
+            return
+        generation = controller.progress.start_forward(self.forward_stream)
+        controller.arm(self._plan_layerwise_kv_jobs(batch, controller, generation))
+        controller.arm_state(
+            self._plan_layerwise_state_jobs(batch, controller, generation)
+        )
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -656,6 +926,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                self._maybe_arm_layerwise_kv(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -696,6 +967,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                self._maybe_arm_layerwise_kv(batch)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -1110,6 +1382,15 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is not None:
+            for attr in (
+                "_layerwise_reserved_chunk_id",
+                "_layerwise_reserved_curr_idx",
+                "_layerwise_reserved_start_idx",
+            ):
+                if hasattr(sender, attr):
+                    delattr(sender, attr)
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
