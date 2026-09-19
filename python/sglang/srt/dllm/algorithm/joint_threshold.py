@@ -60,7 +60,7 @@ def joint_threshold_update_step_vectorized(
         -1
     )
 
-    mask_pos = input_ids.eq(mask_id)
+    mask_pos = input_ids.eq(mask_id) & ~prompt_masks
     has_mask = mask_pos.any(dim=1)
 
     # ---------- post-edit ----------
@@ -137,7 +137,7 @@ class JointThreshold(DllmAlgorithm):
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         # Built once as a GPU tensor and reused across steps (no per-step
         # host/device transfer); the FDFO carry keeps it in-process.
-        prompt_mask = input_ids != self.mask_id
+        prompt_mask = self._prompt_mask(forward_batch)
         if self._use_shared_state:
             # One shared batched state, advanced in place across every step of the
             # synchronous loop.
@@ -278,7 +278,7 @@ class JointThreshold(DllmAlgorithm):
                 -1,
             )
 
-            mask_index = curr_input_ids == self.mask_id
+            mask_index = (curr_input_ids == self.mask_id) & ~curr_prompt_mask
             has_mask = mask_index.any()
 
             # Mask to token (M2T)
