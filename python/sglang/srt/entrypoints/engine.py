@@ -20,19 +20,19 @@ This file implements python APIs for the inference engine.
 from __future__ import annotations
 
 import asyncio
-import copy
 import atexit
+import copy
 import dataclasses
 import gc
 import logging
 import multiprocessing as mp
 import os
-import types
 import random
 import signal
 import tempfile
 import threading
 import time
+import types
 from typing import (
     Any,
     AsyncIterator,
@@ -341,8 +341,8 @@ class Engine(EngineScoreMixin, EngineBase):
             self._multi_tokenizer_shm = write_data_for_multi_tokenizer(
                 port_args, server_args, scheduler_info
             )
-            self.tokenizer_manager, self.template_manager = (
-                self._init_tokenizer_worker(server_args, port_args, scheduler_info)
+            self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
+                server_args, port_args, scheduler_info
             )
             self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
@@ -1318,7 +1318,7 @@ class Engine(EngineScoreMixin, EngineBase):
         return tokenizer_manager, template_manager
 
     @classmethod
-    def attach_tokenizer_worker(cls, parent_pid: Optional[int] = None) -> "Engine":
+    def attach_tokenizer_worker(cls, parent_pid: Optional[int] = None) -> Engine:
         """Join an Engine launched with ``tokenizer_worker_num > 1`` from another
         process on the same host.
 
