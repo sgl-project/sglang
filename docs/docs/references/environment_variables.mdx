@@ -1064,6 +1064,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated wildcard patterns for kernel API names to exclude from level-10 dumps.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_HOST_POOL_IO</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log one metadata-only line per host-pool KV transfer (device &lt;-&gt; host), so an asynchronous CUDA fault can be attributed to the transfer that caused it instead of the synchronization point where it surfaced.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_CRASH_SNAPSHOT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep the recent host-pool KV transfers in a bounded, CPU-only ring and write it to the crash-dump folder when the scheduler process handles a crash.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_CRASH_SNAPSHOT_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How many recent host-pool KV transfers <code>SGLANG_DEBUG_CRASH_SNAPSHOT</code> keeps.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>128</code></td>
+    </tr>
 </tbody>
 </table>
 
