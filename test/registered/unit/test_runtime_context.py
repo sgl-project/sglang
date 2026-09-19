@@ -2338,6 +2338,45 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().pp_size, 2)
         self.assertEqual(get_parallel().pp_rank, 1)
 
+    def _group(self, world_size, rank):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = world_size
+        group.rank_in_group = rank
+        return group
+
+    def test_the_tensor_swap_states_the_draft_has_no_attention_replica(self):
+        """The draft runs the whole model on the group being installed. Its
+        attention identity is therefore that group, with one replica -- while
+        the target this process also serves is attention-DP over four ranks."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().attn_tp_size, 2)
+
+        group = self._group(world_size=2, rank=1)
+        with patch.object(parallel_state, "_TP", group):
+            with parallel_state.patch_tensor_parallel_group(group):
+                parallel = get_parallel()
+                self.assertEqual(parallel.tp_size, 2)
+                self.assertEqual(parallel.attn_tp_size, 2)
+                self.assertEqual(parallel.attn_tp_rank, 1)
+                self.assertEqual(parallel.attn_dp_size, 1)
+                self.assertEqual(parallel.attn_dp_rank, 0)
+                self.assertEqual(parallel.dp_size, 1)
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().dp_size, 2)
+
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         """A weight check is an on-demand request served from the scheduler
         loop, so it runs outside the scope that describes a draft runner. Its
