@@ -43,7 +43,7 @@ _DTYPE = torch.bfloat16
 
 
 def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
-    return (t // ps) * (ps * _L) + t % ps
+    return t  # token-major views: the kernel id is the physical token id
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):

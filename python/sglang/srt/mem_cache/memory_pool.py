@@ -85,7 +85,6 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import (
-    maybe_detect_kernel_facing_loc,
     maybe_detect_oob,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1839,10 +1838,6 @@ class KVCache(abc.ABC):
     ):
         self.size = size
         self.page_size = page_size
-        # Row-blocks one page holds in this pool's kernel-facing id space; >1
-        # only for the unified pool's per-layer views, and then a write loc must
-        # have been translated into that space first.
-        self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -2265,7 +2260,7 @@ class MHATokenToKVPool(KVCache):
         )
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in slot_move_pointer_buffers
             ],
             device=self.device,
@@ -2583,9 +2578,6 @@ class MHATokenToKVPool(KVCache):
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MHA)"
-        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -2634,6 +2626,8 @@ class MHATokenToKVPool(KVCache):
                 cache_k.stride(1),
                 cache_v.stride(0),
                 cache_v.stride(1),
+                self.k_buffer[layer_id - self.start_layer].stride(0),
+                self.v_buffer[layer_id - self.start_layer].stride(0),
             )
             return
 
@@ -3197,7 +3191,7 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,
@@ -3583,7 +3577,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,
@@ -4510,9 +4504,7 @@ class MLATokenToKVPool(KVCache):
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
-    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
-    # full-attention layer is translated with blocks_per_page 1.
+    # `KVIndexTranslator.rebind_write_loc` and flips this.
     write_loc_is_dcp_resolved = False
 
     @property
@@ -4544,9 +4536,6 @@ class MLATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MLA)"
-        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4629,9 +4618,6 @@ class MLATokenToKVPool(KVCache):
             0,
             (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
-        )
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_mla_kv_buffer (MLA)"
         )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
@@ -5283,6 +5269,8 @@ def masked_set_kv_buffer_kernel(
     k_stride_H: tl.constexpr,
     v_stride_B: tl.constexpr,
     v_stride_H: tl.constexpr,
+    k_buffer_stride: tl.constexpr,
+    v_buffer_stride: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= N:
@@ -5304,10 +5292,10 @@ def masked_set_kv_buffer_kernel(
         col = idx % D
 
         key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
-        tl.store(k_buffer_ptr + loc * H * D + idx, key, mask=mask)
+        tl.store(k_buffer_ptr + loc * k_buffer_stride + idx, key, mask=mask)
 
         value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
-        tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
+        tl.store(v_buffer_ptr + loc * v_buffer_stride + idx, value, mask=mask)
 
 
 class MHATokenToKOnlyPool(KVCache):
