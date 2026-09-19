@@ -164,6 +164,12 @@ def handle_shared_experts_tp(server_args: Any):
 def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
+    if cfg.dcp_size > 1 and get_platform().is_npu:
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        assert not is_npu_arch35(), (
+            "NPU A5 currently does not support decode context parallelism"
+        )
     if cfg.dcp_size < 1:
         raise ValueError(
             "Decode context parallel size (--dcp-size / "
