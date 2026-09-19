@@ -1288,6 +1288,7 @@ class MossVLForConditionalGeneration(nn.Module):
         pixel_values_list = []
         grid_thw_list = []
         vision_pos_ids_list = []
+        device = forward_batch.seq_lens.device
 
         for i, mm_input in enumerate(forward_batch.mm_inputs):
             if forward_batch.encoder_cached[i] or mm_input is None:
@@ -1296,7 +1297,13 @@ class MossVLForConditionalGeneration(nn.Module):
                 continue
 
             item = mm_input.mm_items[0]
-            pixel_values_list.append(item.feature)
+            feature = item.feature
+            if feature is None:
+                raise RuntimeError(
+                    "MossVL cannot re-encode an uncached request without its "
+                    "vision features. Keep them until the request finishes."
+                )
+            pixel_values_list.append(feature.to(device, non_blocking=True))
             grid_thw = getattr(item, "grid_thw", None)
             if grid_thw is not None:
                 grid_thw_list.append(torch.as_tensor(grid_thw, dtype=torch.long))
@@ -1304,7 +1311,9 @@ class MossVLForConditionalGeneration(nn.Module):
 
             vp = mm_input.vision_position_ids
             if vp is not None:
-                vision_pos_ids_list.append(vp[:, :encoder_len])
+                vision_pos_ids_list.append(
+                    vp[:, :encoder_len].to(device, non_blocking=True)
+                )
 
         if not pixel_values_list:
             return None, None, None
@@ -1383,6 +1392,18 @@ class MossVLForConditionalGeneration(nn.Module):
         custom_mask = self._build_cross_attention_custom_mask(forward_batch)
         if custom_mask is not None:
             forward_batch.cross_attention_custom_mask = custom_mask
+
+    @staticmethod
+    def _slice_vis_counts_with_pad(
+        visible_frame_counts, offset: int, length: int, device
+    ) -> torch.Tensor:
+        """Preserve prompt visibility and repeat its last row for generated tokens."""
+        counts = torch.as_tensor(visible_frame_counts)
+        vis_counts = counts[offset : offset + length].to(device)
+        if vis_counts.numel() < length:
+            pad = counts[-1:].to(device).expand(length - vis_counts.numel())
+            vis_counts = torch.cat([vis_counts, pad])
+        return vis_counts
 
     def _build_cross_attention_custom_mask(
         self, forward_batch: ForwardBatch
@@ -1466,8 +1487,8 @@ class MossVLForConditionalGeneration(nn.Module):
             # is the cached-text offset into the full text sequence.
             text_offset = extend_prefix_len
 
-            vis_counts = visible_frame_counts[text_offset : text_offset + q_len].to(
-                device
+            vis_counts = self._slice_vis_counts_with_pad(
+                visible_frame_counts, text_offset, q_len, device
             )
 
             mask = torch.zeros(q_len, kv_len, dtype=torch.uint8, device=device)
@@ -1571,23 +1592,70 @@ class MossVLForConditionalGeneration(nn.Module):
                 # cached-text offset into the full text sequence.
                 text_offset = extend_prefix_len
 
-                vis_counts = visible_frame_counts[
-                    text_offset : text_offset + extend_seq_len
-                ].to(device)
+                vis_counts = self._slice_vis_counts_with_pad(
+                    visible_frame_counts, text_offset, extend_seq_len, device
+                )
                 full_text_row_masked_out_mask[offset : offset + extend_seq_len] = (
                     vis_counts > 0
                 )
 
-                # Last prefill chunk for this request: decode will only need
-                # visible_frame_counts[-1], so shrink the tensor to that single
-                # element and drop the rest. .clone() detaches the view from
-                # the original storage so the large tensor can be freed.
-                if text_offset + extend_seq_len >= visible_frame_counts.shape[0]:
-                    mm_input.visible_frame_counts = visible_frame_counts[-1:].clone()
-
                 offset += extend_seq_len
 
         return full_text_row_masked_out_mask.reshape(-1, 1)
+
+    def _repair_mrope_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Fill generated-token positions missing from a re-prefill's prompt table."""
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return forward_batch.mrope_positions
+
+        mm_inputs = forward_batch.mm_inputs or [None] * forward_batch.batch_size
+        lengths = forward_batch.extend_seq_lens_cpu
+        prefixes = forward_batch.extend_prefix_lens_cpu
+        if not any(
+            length > 0
+            and mm_input is not None
+            and mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] < prefix + length
+            for mm_input, prefix, length in zip(mm_inputs, prefixes, lengths)
+        ):
+            return forward_batch.mrope_positions
+
+        device = forward_batch.mrope_positions.device
+        positions_list = []
+        for mm_input, prefix, length in zip(mm_inputs, prefixes, lengths):
+            if length == 0:
+                continue
+            if mm_input is None or mm_input.mrope_positions is None:
+                text_positions = torch.arange(
+                    prefix, prefix + length, dtype=torch.int64, device=device
+                )
+                positions_list.append(text_positions.unsqueeze(0).repeat(3, 1))
+                continue
+
+            head = mm_input.mrope_positions[:, prefix : prefix + length].to(
+                device=device, dtype=torch.int64
+            )
+            if head.shape[1] < length:
+                if mm_input.mrope_position_delta is None:
+                    raise ValueError(
+                        "MossVL needs mrope_position_delta to rebuild generated-token positions"
+                    )
+                # Match decode: all three axes use delta + absolute text position.
+                tail = mm_input.mrope_position_delta.flatten().to(
+                    device
+                ) + torch.arange(
+                    prefix + head.shape[1],
+                    prefix + length,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                head = torch.cat([head, tail.unsqueeze(0).repeat(3, 1)], dim=1)
+            positions_list.append(head)
+
+        return torch.cat(positions_list, dim=1)
 
     # ---- Forward ----
 
@@ -1600,7 +1668,7 @@ class MossVLForConditionalGeneration(nn.Module):
         pp_proxy_tensors=None,
     ):
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+            positions = self._repair_mrope_positions(forward_batch)
 
         # 1. Collect vision inputs for uncached requests
         pixel_values, grid_thw, vision_position_ids = self._collect_mm_data(
@@ -1634,21 +1702,18 @@ class MossVLForConditionalGeneration(nn.Module):
             cross_attention_states = self._insert_separator_tokens(
                 vision_hidden_states, grid_thw
             )
-            # Drop heavy per-request vision tensors now that the encoder KV
-            # has been produced and will be cached. Otherwise pixel_values and
-            # vision_position_ids stay pinned on req.multimodal_inputs across
-            # the entire decode phase. (visible_frame_counts is shrunk to a
-            # single scalar element at the end of the last prefill chunk in
-            # get_full_text_row_masked_out_mask, so decode still works.)
-            # Note: the local `vision_position_ids` is still needed by the LM
-            # cross-attention below, so we keep it; but we drop the per-request
-            # copy on mm_input, which we won't read again.
+            # Release device memory, but keep CPU inputs for re-encoding after
+            # retraction. The local vision_position_ids still serves this forward.
             del pixel_values, vision_hidden_states
             for i, mm_input in enumerate(forward_batch.mm_inputs):
                 if forward_batch.encoder_cached[i] or mm_input is None:
                     continue
-                mm_input.release_features()
-                mm_input.vision_position_ids = None
+                for item in mm_input.mm_items:
+                    if item.feature is not None:
+                        item.feature = item.feature.to("cpu")
+                vpid = mm_input.vision_position_ids
+                if vpid is not None:
+                    mm_input.vision_position_ids = vpid.cpu()
 
         # 4. Run language model with cross attention
         hidden_states = self.language_model(
