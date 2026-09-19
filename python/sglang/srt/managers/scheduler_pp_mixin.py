@@ -822,9 +822,7 @@ class SchedulerPPMixin:
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
             if result.accept_index is not None:
-                # Tree verification needs this to compact KV. Hybrid linear
-                # attention also needs it for the accepted-step recurrent-state
-                # commit on non-last PP stages, including topk=1 chains.
+                # Relayed recurrent commits also need chain accept indices.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -1150,11 +1148,7 @@ class SchedulerPPMixin:
             move_accept_tokens_to_target_kvcache,
         )
 
-        # The destination base is the length each request had when the forward
-        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
-        # that snapshot is already in the forward's row order -- the live batch
-        # may have been filtered or merged since, and reindexing it would skip
-        # exactly the rounds whose composition changed.
+        # Preserve the forward batch's row order after live-batch recomposition.
         device = (
             verify_out_cache_loc.device
             if verify_out_cache_loc is not None
@@ -1170,19 +1164,12 @@ class SchedulerPPMixin:
                 "without its forward-time seq_lens_cpu snapshot"
             )
         fwd_batch.seq_lens = seq_lens
-        # ScheduleBatch.copy() intentionally keeps only result-processing
-        # fields and drops tree_cache.  The shared commit helper needs its page
-        # size to derive the Mamba tracking grid, so restore this scheduler's
-        # live cache context on the forward snapshot.
+        # copy() drops tree_cache, which the tracking-grid commit needs.
         fwd_batch.tree_cache = batch.tree_cache
         accept_index = accept_index.to(device)
         accept_lens = pp_outputs["spec_accept_lens"].to(device)
 
-        # The last stage commits its accepted recurrent state inside
-        # run_eagle_verify. Earlier stages only run target verify, so perform
-        # the same commit after acceptance has returned through the PP relay
-        # and before seq_lens advances below. Without this, hybrid KDA/Mamba
-        # stages keep the pre-verify state while the last stage advances.
+        # The last stage already commits inside run_eagle_verify.
         if not self.pp_group.is_last_rank:
             commit_mamba_states_after_verify(
                 self.tp_worker,
@@ -1192,8 +1179,6 @@ class SchedulerPPMixin:
                 get_spec().speculative_num_draft_tokens,
             )
 
-        # A recurrent target still needs the accepted state commit even when
-        # this stage has no dense-attention KV address to compact.
         if verify_out_cache_loc is None:
             return
         fwd_batch.out_cache_loc = verify_out_cache_loc

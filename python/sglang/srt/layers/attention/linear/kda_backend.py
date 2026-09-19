@@ -462,7 +462,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # accept_lens_pool holds last round's accept length per mamba slot;
         # extend stages fresh requests with 1 (read slot 0). Its presence is the
         # signal that switches the post-verify commit to conv-only.
-        # FlashInfer-only mamba-slot scratch; PP KDA verify falls back to Triton.
         if self._can_fuse_accept_state(verify_backend):
             self.accept_lens_pool = torch.ones(
                 self.req_to_token_pool.size + 1,

@@ -1350,7 +1350,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
-            # Match delayed PP acceptance to its request-row scratch.
             src_indices_raw = req_pool_indices[:request_number]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1360,14 +1359,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
         if src_indices_raw is not None:
-            # Active metadata may belong to a later in-flight micro-batch.
             state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
                 self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
                     req_pool_indices[:request_number]
                 )
             )
         else:
-            # Direct commits still own the active verify metadata.
             state_indices_tensor = (
                 self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                     :request_number

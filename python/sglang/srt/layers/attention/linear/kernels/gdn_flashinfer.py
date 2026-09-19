@@ -643,10 +643,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if intermediate_states_buffer is not None and (
             self.use_state_pool or stable_rows
         ):
-            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
-            # per-call batch id, while SGLang's speculative state cache is
-            # Graph padding can exceed the pool-scoped scratch; use exact-B storage
-            # and copy owned rows back before post-verify commit reads the pool.
+            # FlashInfer writes positional rows; isolate them in exact-B scratch.
             (
                 intermediate_states_buffer_mtp,
                 copy_verify_intermediate_back,
@@ -719,11 +716,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         if stable_rows and intermediate_states_buffer is not None:
-            # FlashInfer's SM100 kernel always writes scratch rows 0..B-1.
-            # PP acceptance returns after other micro-batches have run, so move
-            # those snapshots to the stable request rows consumed by the delayed
-            # commit. A separate positional buffer above avoids aliasing when a
-            # request itself owns one of the low-numbered rows.
+            # Persist positional output under PP-stable request rows.
             copy_verify_intermediate_rows(
                 intermediate_states_buffer,
                 intermediate_states_buffer_mtp,
