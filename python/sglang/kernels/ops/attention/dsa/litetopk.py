@@ -20,6 +20,7 @@ Caveats:
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
@@ -31,9 +32,17 @@ if TYPE_CHECKING:
 
 NUM_HEADS = 32
 HEAD_DIM = 128
+_BLOCK_Q = 4  # q rows per scan CTA (dsa_indexer.cuh BLOCK_Q)
 _NUM_BUCKETS = 256
 _SAMPLE_LEN = 8192
 _REFRESH_EVERY = 64
+# Initial gate: the rank within the calibration sample whose score becomes the
+# first threshold. The safe rank (topk) is a guaranteed bound but admits
+# topk/sample_len of every row (25% at the defaults), so the scan opens with an
+# estimate of the row's own topk quantile, scaled by the margin, and rows whose
+# candidate count comes back short are rescanned from the safe threshold.
+_GATE_MARGIN = 2.0
+_GATE_K_MIN = 64
 
 
 @cache_once
@@ -100,14 +109,89 @@ def _tma_aligned_scales(kv_scales: torch.Tensor, lo: int, hi: int) -> torch.Tens
 
 def _pad_sample_logits_for_vec4(slog: torch.Tensor) -> torch.Tensor:
     """seed_prep reads each row with 16B float4 loads, so the row stride must
-    be a multiple of 4 floats or every odd row is misaligned (CUDA fault). The
-    per-request sample width min(sample_len, kv_len) is arbitrary; pad with
-    -inf, which every seed_prep pass already skips via its isfinite guard
+    be a multiple of 4 floats or every odd row is misaligned (CUDA fault).
+    deep_gemm's logits already have an aligned row stride (the width itself
+    is arbitrary: min(sample_len, kv_len)), so they pass through without the
+    512MB copy a .contiguous() would cost; a strided or misaligned buffer is
+    padded with -inf, which every seed_prep pass skips via its isfinite guard
     (the same fill clean_logits uses for the out-of-causal-range tail)."""
-    rem = slog.shape[1] % 4
-    if rem == 0:
+    if slog.stride(1) == 1 and slog.stride(0) % 4 == 0:
         return slog
-    return torch.nn.functional.pad(slog, (0, 4 - rem), value=float("-inf"))
+    rem = slog.shape[1] % 4
+    return torch.nn.functional.pad(
+        slog, (0, (4 - rem) % 4), value=float("-inf")
+    ).contiguous()
+
+
+def _gate_k(kv_len: int, sample_len: int, topk: int) -> int:
+    if kv_len <= sample_len:
+        return topk
+    est = math.ceil(_GATE_MARGIN * topk * sample_len / kv_len)
+    return min(topk, max(_GATE_K_MIN, est))
+
+
+def _rescan_short_rows(
+    *,
+    module: Module,
+    q_fp8: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    origin: torch.Tensor,
+    inv_delta: torch.Tensor,
+    th_bucket: torch.Tensor,
+    th_safe: torch.Tensor,
+    cand_val: torch.Tensor,
+    cand_idx: torch.Tensor,
+    cand_cnt: torch.Tensor,
+    bcount: torch.Tensor,
+    num_buckets: int,
+    topk: int,
+    cap: int,
+    refresh_every: int,
+) -> None:
+    """Verify the estimated gate and rescan the q-blocks it failed on.
+
+    A row is exact when at least ``topk`` scores passed its gate (the k-th best
+    score then lies above the threshold, so every top-k element was emitted)
+    and none were dropped at ``cand_cap``. Every row of a q-block with a
+    failing row restarts from its safe threshold with an empty candidate list;
+    the scan skips the other q-blocks. No host sync: the mask is built on the
+    device and an all-clear pass costs one near-empty launch.
+    """
+    num_q = cand_cnt.shape[0]
+    num_q_blocks = (num_q + _BLOCK_Q - 1) // _BLOCK_Q
+    bad = (cand_cnt < topk) | (cand_cnt > cap)
+    bad_pad = torch.zeros(num_q_blocks * _BLOCK_Q, dtype=torch.bool, device=bad.device)
+    bad_pad[:num_q] = bad
+    qblock_mask = bad_pad.view(num_q_blocks, _BLOCK_Q).any(dim=1)
+    row_mask = qblock_mask.repeat_interleave(_BLOCK_Q)[:num_q]
+    torch.where(row_mask, th_safe, th_bucket, out=th_bucket)
+    cand_cnt.masked_fill_(row_mask, 0)
+    module.scan(
+        q_fp8,
+        kv_fp8,
+        _pad_scales_for_tma(kv_scales),
+        weights,
+        ks,
+        ke,
+        origin,
+        inv_delta,
+        th_bucket,
+        cand_val,
+        cand_idx,
+        cand_cnt,
+        bcount,
+        num_buckets,
+        topk,
+        refresh_every,
+        -1,
+        0,
+        0,
+        qblock_mask.to(torch.int32),
+    )
 
 
 def dsa_litetopk_indexer(
@@ -158,6 +242,7 @@ def dsa_litetopk_indexer(
     origin = torch.empty(num_q, dtype=torch.float32, device=dev)
     inv_delta = torch.empty(num_q, dtype=torch.float32, device=dev)
     th_bucket = torch.empty(num_q, dtype=torch.int32, device=dev)
+    th_safe = torch.empty(num_q, dtype=torch.int32, device=dev)
     bcount = torch.zeros(num_q, num_buckets, dtype=torch.int32, device=dev)
     cand_val = torch.empty(num_q, cap, dtype=torch.float32, device=dev)
     cand_idx = torch.empty(num_q, cap, dtype=torch.int32, device=dev)
@@ -172,10 +257,13 @@ def dsa_litetopk_indexer(
     # candidates, bcount zeroed -- recall comes from the full scan below.
     # clean_logits=True + per-row causal ke keep the sample rows free of both
     # uninitialized columns and causally-invalid scores.
+    any_tight = False
     for row_start, row_end, kv_start, kv_end in req_bounds:
         if row_end <= row_start:
             continue
         sl = min(sample_len, kv_end - kv_start)
+        gate_k = _gate_k(kv_end - kv_start, sample_len, topk)
+        any_tight |= gate_k < topk
         rows = slice(row_start, row_end)
         ks0 = torch.zeros(row_end - row_start, dtype=torch.int32, device=dev)
         ke_s = (ke[rows].to(torch.int32) - kv_start).clamp_(min=0, max=sl)
@@ -190,7 +278,7 @@ def dsa_litetopk_indexer(
                 ks0,
                 ke_s,
                 clean_logits=True,
-            ).contiguous()
+            )
         )
         module.seed_prep(
             sample_logits,
@@ -208,15 +296,19 @@ def dsa_litetopk_indexer(
             cand_val[rows],
             cand_idx[rows],
             cand_cnt[rows],
+            gate_k,
+            th_safe[rows],
         )
 
+    ks = ks.to(torch.int32)
+    ke = ke.to(torch.int32)
     module.scan(
         q_fp8,
         kv_fp8,
         _pad_scales_for_tma(kv_scales),
         weights,
-        ks.to(torch.int32),
-        ke.to(torch.int32),
+        ks,
+        ke,
         origin,
         inv_delta,
         th_bucket,
@@ -230,7 +322,31 @@ def dsa_litetopk_indexer(
         -1,  # num_kv_splits_override: auto
         0,  # probe_group: probe compaction off
         0,  # probe_add_max
+        None,
     )
+
+    if any_tight:
+        _rescan_short_rows(
+            module=module,
+            q_fp8=q_fp8,
+            kv_fp8=kv_fp8,
+            kv_scales=kv_scales,
+            weights=weights,
+            ks=ks,
+            ke=ke,
+            origin=origin,
+            inv_delta=inv_delta,
+            th_bucket=th_bucket,
+            th_safe=th_safe,
+            cand_val=cand_val,
+            cand_idx=cand_idx,
+            cand_cnt=cand_cnt,
+            bcount=bcount,
+            num_buckets=num_buckets,
+            topk=topk,
+            cap=cap,
+            refresh_every=refresh_every,
+        )
 
     # Candidate values are already in bucket space (the scan folds the per-row
     # affine into the register weights), so select rebases with identity.

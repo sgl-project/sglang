@@ -38,6 +38,11 @@ namespace dsa_litetopk {
 
 using namespace deep_gemm;
 
+// Each math warpgroup owns two TMEM accumulators and alternates between them
+// per KV block, so the UMMA warp issues block k+1 while the warpgroup is still
+// draining block k. Two warpgroups x two stages x 128 columns fills TMEM.
+constexpr uint32_t kNumTmemStagesPerWG = 2;
+
 #define DSA_WARP_QUEUE_CAP 64
 #define DSA_REFRESH_STRIDE 16
 #define DSA_GATE_STRIDE 16
@@ -82,11 +87,13 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
                                      // cand_cap]
     int32_t* __restrict__ cand_cnt,  // [seq_len]
     const uint32_t cand_cap,
+    const int32_t* __restrict__ qblock_mask,  // [num_q_blocks] or null: 0 skips the q-block
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
     const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
     const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
     const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
   const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
+  if (qblock_mask != nullptr and qblock_mask[blockIdx.x] == 0) return;
 
   using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -117,7 +124,8 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
   DG_STATIC_ASSERT(SMEM_WEIGHT_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
   DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
 
-  constexpr uint32_t kNumTmemCols = BLOCK_Q * kNumHeads * kNumMathWarpGroups;
+  constexpr uint32_t kNumUmmaSlots = kNumMathWarpGroups * kNumTmemStagesPerWG;
+  constexpr uint32_t kNumTmemCols = BLOCK_Q * kNumHeads * kNumUmmaSlots;
   DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
 
   auto smem_q = utils::PatternVisitor(
@@ -145,10 +153,10 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
   auto full_umma_barriers =
       utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + i); });
   auto empty_umma_barriers = utils::PatternVisitor(
-      [&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups + i); });
+      [&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + kNumUmmaSlots + i); });
 
   auto tmem_ptr_in_smem =
-      reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups * 2);
+      reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2 + kNumUmmaSlots * 2);
   auto scan_done_flag = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 1);
   auto kv_progress_ptr = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 2);
   auto warpq_count = reinterpret_cast<int32_t*>(tmem_ptr_in_smem + 4);
@@ -182,7 +190,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
   if (warp_idx == kSpecWarpStart + 1) {
     if (cute::elect_one_sync()) {
 #pragma unroll
-      for (uint32_t i = 0; i < kNumMathWarpGroups; ++i) {
+      for (uint32_t i = 0; i < kNumUmmaSlots; ++i) {
         full_umma_barriers[i]->init(1);
         empty_umma_barriers[i]->init(128);
       }
@@ -300,9 +308,12 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
 
         DG_STATIC_ASSERT(BLOCK_KV == kNumMathThreads, "Invalid block size");
         DG_STATIC_ASSERT(kHeadDim % UMMA_K == 0, "Invalid head dim");
+        const uint32_t tmem_stage = kvg % kNumTmemStagesPerWG;
+        const uint32_t tmem_phase = (kvg / kNumTmemStagesPerWG) & 1;
 #pragma unroll
         for (uint32_t i = 0; i < kNumMathWarpGroups; ++i) {
-          empty_umma_barriers[i]->wait((kvg & 1) ^ 1);
+          const uint32_t slot = i * kNumTmemStagesPerWG + tmem_stage;
+          empty_umma_barriers[slot]->wait(tmem_phase ^ 1);
           ptx::tcgen05_after_thread_sync();
 #pragma unroll
           for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++k) {
@@ -310,9 +321,9 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
                 smem_kv[kv_stage_idx], i * UMMA_M, k * UMMA_K);
             auto b_desc =
                 mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(smem_q[0], 0, k * UMMA_K);
-            cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, i * UMMA_N, k, runtime_instr_desc);
+            cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, slot * UMMA_N, k, runtime_instr_desc);
           }
-          cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(full_umma_barriers[i]));
+          cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(full_umma_barriers[slot]));
         }
       }
       empty_q_barriers[0]->arrive();
@@ -374,14 +385,13 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
           }
           break;
         } else {
-          __nanosleep(256);
+          __nanosleep(2000);
         }
       }
     }
   } else if (warp_idx < kSpecWarpStart) {
     cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-    const auto tmem_start = warpgroup_idx * UMMA_N;
     const auto math_thread_idx = warp_idx * 32 + lane_idx;
 
     auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
@@ -403,9 +413,6 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
     // bucket space AND a hit-frequency-only costing.
     float weights[BLOCK_Q][kNumHeads];
     float o_reg[BLOCK_Q], inv_reg[BLOCK_Q], vth_reg[BLOCK_Q];
-    uint32_t kstart_reg[BLOCK_Q],
-        kspan_reg[BLOCK_Q];  // unsigned range-check trick
-    int gate_reg[BLOCK_Q];
     const unsigned FULL = 0xffffffffu;
 
     if (block_q_idx < num_q_blocks) {
@@ -444,27 +451,25 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
         // repurposed at consume time to hold the edge float.
         vth_reg[i] = -o_reg[i] * inv_reg[i];
         o_reg[i] = 0.0f;  // gate closed until the first consume
-        gate_reg[i] = cute::numeric_limits<int32_t>::max();
         qn_reg[i] = 0;
-        kstart_reg[i] = seq_k_start[i];
-        kspan_reg[i] = seq_k_end[i] > seq_k_start[i] ? seq_k_end[i] - seq_k_start[i] : 0;
       }
 // Fold -inv into the register weights: the whole ReLU-weighted
 // chain then accumulates directly in bucket units. 128 FMULs
-// once per qb, amortized over thousands of kv blocks.
+// once per qb, amortized over thousands of kv blocks. The 1/2
+// undoes the (a + |a|) = 2 relu(a) form of the epilogue exactly.
 #pragma unroll
       for (uint32_t i = 0; i < BLOCK_Q; ++i) {
 #pragma unroll
         for (uint32_t j = 0; j < kNumHeads; ++j)
-          weights[i][j] *= -inv_reg[i];
+          weights[i][j] *= -0.5f * inv_reg[i];
       }
       // Interior-block bounds (warp-uniform): a kv block fully inside
       // every row's [ks, ke) needs no per-element range checks.
       uint32_t rs_max = 0, re_min = 0xffffffffu;
 #pragma unroll
       for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-        rs_max = max(rs_max, kstart_reg[i]);
-        re_min = min(re_min, kstart_reg[i] + kspan_reg[i]);
+        rs_max = max(rs_max, seq_k_start[i]);
+        re_min = min(re_min, max(seq_k_end[i], seq_k_start[i]));
       }
 
       // Gate PREFETCH: th_bucket lives in global and is tightened
@@ -515,13 +520,9 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
         if ((kv_block_idx % DSA_GATE_STRIDE) == 0) {
 #pragma unroll
           for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-            const int g = th_pf[i];
-            if (g != gate_reg[i]) {
-              gate_reg[i] = g;
-              // edge = float(g+1): exact for small ints, no
-              // division. The gate compares BITS against it.
-              o_reg[i] = static_cast<float>(g + 1);
-            }
+            // edge = float(g+1): exact for small ints, no
+            // division. The gate compares BITS against it.
+            o_reg[i] = static_cast<float>(th_pf[i] + 1);
           }
 #pragma unroll
           for (uint32_t i = 0; i < BLOCK_Q; ++i)
@@ -530,7 +531,9 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
 
         float scale_kv = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + math_thread_idx);
 
-        full_umma_barriers[warpgroup_idx]->wait(kvg & 1);
+        const uint32_t umma_slot = warpgroup_idx * kNumTmemStagesPerWG + kvg % kNumTmemStagesPerWG;
+        const uint32_t tmem_start = umma_slot * UMMA_N;
+        full_umma_barriers[umma_slot]->wait((kvg / kNumTmemStagesPerWG) & 1);
         ptx::tcgen05_after_thread_sync();
 
         empty_kv_barriers[kv_stage_idx]->arrive();
@@ -541,23 +544,21 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
         uint32_t pass_bits = 0;
         float v_row[BLOCK_Q];
 
-        // P1: row-PAIR TMEM loads (32dp32b64x): half the tcgen05.ld
-        // instructions and half the fences on the governor loop; the
-        // UMMA release also moves one row earlier.
+        // Row-pair 64-wide TMEM loads: half the tcgen05.ld instructions and
+        // fences per block; the UMMA release moves one row-pair earlier.
         // Interior-block gate elision: one warp-uniform branch per
         // block picks a loop body WITHOUT the per-element range
         // checks (SASS: saves 4x VIADD + 4x ISETP per column) for the
         // >99% of blocks fully inside every row's [ks, ke).
-        DG_STATIC_ASSERT(BLOCK_Q % 2 == 0, "row-pair loads need even BLOCK_Q");
 // GATE4: column cost IDENTICAL to the sign gate (FFMA whose
 // addend is c0 instead of th_x, ISETP on bits instead of the
 // sign). NaN bq maps to a large positive pattern -> DROPPED
 // (old FSETP semantics; recall check is the arbiter).
-#define DSA_SCORE_GATE(i, RC)                                               \
-  const float bq = fmaf(scale_kv, sum.x + sum.y, vth_reg[i]);               \
-  v_row[i] = bq;                                                            \
-  bool g = __float_as_int(bq) < __float_as_int(o_reg[i]);                   \
-  if constexpr (RC) g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]); \
+#define DSA_SCORE_GATE(i, RC)                                                             \
+  const float bq = fmaf(scale_kv, sum.x + sum.y, vth_reg[i]);                             \
+  v_row[i] = bq;                                                                          \
+  bool g = __float_as_int(bq) < __float_as_int(o_reg[i]);                                 \
+  if constexpr (RC) g = g and (kv_offset >= seq_k_start[i] and kv_offset < seq_k_end[i]); \
   pass_bits |= g ? (1u << i) : 0u;
         const uint32_t kv_base = kv_start + kv_block_idx * BLOCK_KV;
         const bool interior = (kv_base >= rs_max) && (kv_base + BLOCK_KV <= re_min);
@@ -567,7 +568,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
     tmem_load(cute::Int<kNumHeads * 2>{}, tmem_start + pr * 2 * kNumHeads, accum2); \
     if (pr == BLOCK_Q / 2 - 1) {                                                    \
       ptx::tcgen05_before_thread_sync();                                            \
-      empty_umma_barriers[warpgroup_idx]->arrive();                                 \
+      empty_umma_barriers[umma_slot]->arrive();                                     \
     }                                                                               \
     _Pragma("unroll") for (uint32_t k = 0; k < 2; ++k) {                            \
       const uint32_t i = pr * 2 + k;                                                \
@@ -575,9 +576,10 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) vo
       auto sum_0 = make_float2(0, 0);                                               \
       auto sum_1 = make_float2(0, 0);                                               \
       const auto transform = [&](const uint32_t& j, const float2& sum) {            \
-        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));           \
+        auto a_0 = make_float2(accum[j], accum[j + 1]);                             \
+        auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));               \
         auto b = make_float2(weights[i][j], weights[i][j + 1]);                     \
-        return __ffma2_rn(a, b, sum);                                               \
+        return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);                            \
       };                                                                            \
       _Pragma("unroll") for (uint32_t j = 0; j < kNumHeads; j += 4) {               \
         sum_0 = transform(j, sum_0);                                                \

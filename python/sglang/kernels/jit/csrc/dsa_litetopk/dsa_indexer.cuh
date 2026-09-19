@@ -105,7 +105,8 @@ __global__ void seed_prep_kernel(
     const int64_t slog_stride,
     const int head,
     const int NB,
-    const int K,
+    const int K,       // safe threshold rank: the K-th best sample score bounds the true K-th
+    const int K_gate,  // initial gate rank (<= K): tighter, verified by the candidate count
     const int cap,
     const int emit_limit,        // only columns j < emit_limit may emit seeds;
                                  // probe columns beyond it are histogram/scale-only
@@ -124,6 +125,7 @@ __global__ void seed_prep_kernel(
     float* __restrict__ origin,
     float* __restrict__ inv_delta,
     int32_t* __restrict__ th_bucket,
+    int32_t* __restrict__ th_safe,
     int32_t* __restrict__ bcount,
     float* __restrict__ cand_val,
     int32_t* __restrict__ cand_idx,
@@ -248,16 +250,23 @@ __global__ void seed_prep_kernel(
   __shared__ int s_th;
   if (tid == 0) {
     const int kk = K < head ? K : head;
-    int cum = 0, th = NB - 1;
+    const int kg = K_gate < kk ? K_gate : kk;
+    int cum = 0, th = NB - 1, th_gate = NB - 1;
+    bool gate_found = false;
     for (int b = 0; b < NB; ++b) {
       cum += s_hist[b];
+      if (!gate_found && cum >= kg) {
+        th_gate = b;
+        gate_found = true;
+      }
       if (cum >= kk) {
         th = b;
         break;
       }
     }
     s_th = th;
-    th_bucket[row] = th;
+    th_bucket[row] = th_gate;
+    th_safe[row] = th;
     origin[row] = o;
     inv_delta[row] = inv;
   }
@@ -529,7 +538,8 @@ static int compute_smem_bytes() {
   const int smem_w = BLOCK_Q * NUM_HEADS * esz_f32;
   const int smem_kv = BLOCK_KV * HEAD_DIM * esz_fp8;
   const int smem_ks = cutlass::round_up(BLOCK_KV * esz_f32, 512);
-  const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * 2;
+  const int num_barriers =
+      NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * dsa_litetopk::kNumTmemStagesPerWG * 2;
   const int smem_barriers = num_barriers * 8;
   const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
   const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q *

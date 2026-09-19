@@ -115,9 +115,9 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         sel = out_idx[r]
         sel_valid = sel[sel >= 0]
         # count: exactly min(topk, n_valid) selected, rest -1 padded
-        assert (
-            sel_valid.numel() == expect
-        ), f"row {r}: selected {sel_valid.numel()}, expected {expect}"
+        assert sel_valid.numel() == expect, (
+            f"row {r}: selected {sel_valid.numel()}, expected {expect}"
+        )
         assert (sel[expect:] == -1).all(), f"row {r}: padding must be -1"
         # no duplicates, all causally valid
         uniq = torch.unique(sel_valid)
@@ -137,9 +137,9 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         # every index strictly above kth + eps is selected
         must = torch.nonzero(row_scores > kth + eps).flatten()
         missing = ~torch.isin(must, sel_valid.long())
-        assert (
-            not missing.any()
-        ), f"row {r}: {int(missing.sum())} strictly-above-threshold indices missing"
+        assert not missing.any(), (
+            f"row {r}: {int(missing.sum())} strictly-above-threshold indices missing"
+        )
 
 
 @requires_sm100
@@ -165,6 +165,32 @@ def test_litetopk_matches_reference(req_specs, topk):
 
     case = _make_case(req_specs, seed=len(req_specs) * 7 + topk)
     out = dsa_litetopk_indexer(
+        case["q_fp8"],
+        case["kv_fp8"],
+        case["kv_scale"],
+        case["weights"],
+        case["ks"],
+        case["ke"],
+        topk,
+        req_bounds=case["req_bounds"],
+    )
+    torch.cuda.synchronize()
+    scores, valid = _ref_scores(case)
+    _check_topk_indices(out, scores, valid, topk)
+
+
+@requires_sm100
+def test_litetopk_tight_gate_fallback(monkeypatch):
+    """An initial gate far below the sample quantile leaves most rows short of
+    topk candidates; the verification must rescan them from the safe threshold
+    and the result must stay exact."""
+    from sglang.kernels.ops.attention.dsa import litetopk
+
+    monkeypatch.setattr(litetopk, "_GATE_MARGIN", 0.25)
+    monkeypatch.setattr(litetopk, "_GATE_K_MIN", 8)
+    topk = 2048
+    case = _make_case([(16, 32768), (12, 20480)], seed=11)
+    out = litetopk.dsa_litetopk_indexer(
         case["q_fp8"],
         case["kv_fp8"],
         case["kv_scale"],

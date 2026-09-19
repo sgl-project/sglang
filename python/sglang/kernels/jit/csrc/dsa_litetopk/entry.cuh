@@ -52,7 +52,9 @@ void dsa_litetopk_seed_prep(
     TensorView bcount,
     TensorView cand_val,
     TensorView cand_idx,
-    TensorView cand_cnt) {
+    TensorView cand_cnt,
+    int64_t gate_k,
+    TensorView th_safe) {
   using namespace host;
   auto Q = SymbolicSize{"num_q"};
   auto HEAD = SymbolicSize{"sample_len"};
@@ -61,9 +63,10 @@ void dsa_litetopk_seed_prep(
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({Q, HEAD}).with_dtype<fp32_t>().with_device(device_).verify(slog);
+  auto SLS = SymbolicSize{"slog_row_stride"};
+  TensorMatcher({Q, HEAD}).with_strides({SLS, 1}).with_dtype<fp32_t>().with_device(device_).verify(slog);
   TensorMatcher({Q}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(inv_delta);
-  TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(th_bucket).verify(cand_cnt);
+  TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(th_bucket).verify(th_safe).verify(cand_cnt);
   TensorMatcher({Q, NB}).with_dtype<int32_t>().with_device(device_).verify(bcount);
   TensorMatcher({Q, CAP}).with_dtype<fp32_t>().with_device(device_).verify(cand_val);
   TensorMatcher({Q, CAP}).with_dtype<int32_t>().with_device(device_).verify(cand_idx);
@@ -71,16 +74,18 @@ void dsa_litetopk_seed_prep(
   const int q_rows = static_cast<int>(Q.unwrap());
   const int head = static_cast<int>(HEAD.unwrap());
   // The kernel reads each row with 16B float4 loads whenever head >= 4, so
-  // with more than one row the row stride (== head for contiguous slog) must
-  // keep every row base 16B-aligned; a misaligned base is a device-side
-  // fault, so fail loudly here instead (callers pad the width with -inf).
-  CHECK_HOST(q_rows <= 1 || head < 4 || head % 4 == 0)
-      << "sample width " << head << " misaligns float4 row loads; pad sample logits to a multiple of 4";
+  // with more than one row the row stride must keep every row base
+  // 16B-aligned; a misaligned base is a device-side fault, so fail loudly
+  // here instead (callers pad the width with -inf).
+  const int64_t slog_stride = static_cast<int64_t>(SLS.unwrap());
+  CHECK_HOST(q_rows <= 1 || head < 4 || slog_stride % 4 == 0)
+      << "sample logits row stride " << slog_stride << " misaligns float4 row loads; pad rows to a multiple of 4";
   const int nb = static_cast<int>(num_buckets);
   const int cap = static_cast<int>(cand_cap);
   CHECK_HOST(nb >= 2 && nb <= 4096) << "num_buckets out of range: " << nb;
   CHECK_HOST(static_cast<int64_t>(NB.unwrap()) == nb) << "bcount width != num_buckets";
   CHECK_HOST(topk >= 1 && cap >= topk) << "need cand_cap >= topk >= 1";
+  CHECK_HOST(gate_k >= 1 && gate_k <= topk) << "need 1 <= gate_k <= topk, got " << gate_k;
   CHECK_HOST(static_cast<int64_t>(CAP.unwrap()) == cap) << "cand width != cand_cap";
   const DLDevice device = device_.unwrap();
 
@@ -102,10 +107,11 @@ void dsa_litetopk_seed_prep(
   LaunchKernel(q_rows, 1024, device, seed_smem)(
       seed_prep_kernel,
       static_cast<const float*>(slog.data_ptr()),
-      static_cast<int64_t>(slog.stride(0)),
+      slog_stride,
       head,
       nb,
       static_cast<int>(topk),
+      static_cast<int>(gate_k),
       cap,
       emit_lim,
       pst,
@@ -114,6 +120,7 @@ void dsa_litetopk_seed_prep(
       static_cast<float*>(origin.data_ptr()),
       static_cast<float*>(inv_delta.data_ptr()),
       static_cast<int32_t*>(th_bucket.data_ptr()),
+      static_cast<int32_t*>(th_safe.data_ptr()),
       static_cast<int32_t*>(bcount.data_ptr()),
       static_cast<float*>(cand_val.data_ptr()),
       static_cast<int32_t*>(cand_idx.data_ptr()),
@@ -150,7 +157,8 @@ void dsa_litetopk_scan(
     int64_t refresh_every,
     int64_t num_kv_splits_override,
     int64_t probe_group,
-    int64_t probe_add_max) {
+    int64_t probe_add_max,
+    const tvm::ffi::Optional<TensorView> qblock_mask) {
   using namespace host;
   auto Q = SymbolicSize{"num_q"};
   auto SKV = SymbolicSize{"seq_len_kv"};
@@ -254,6 +262,13 @@ void dsa_litetopk_scan(
 
   const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
   const int total_kv_blocks = (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
+  const int32_t* qblock_mask_ptr = nullptr;
+  if (qblock_mask.has_value()) {
+    auto QB = SymbolicSize{"num_q_blocks"};
+    TensorMatcher({QB}).with_dtype<int32_t>().with_device(device_).verify(qblock_mask.value());
+    CHECK_HOST(static_cast<int64_t>(QB.unwrap()) == num_q_blocks) << "qblock_mask length != num_q_blocks";
+    qblock_mask_ptr = static_cast<const int32_t*>(qblock_mask.value().data_ptr());
+  }
   int num_kv_splits;
   if (num_kv_splits_override > 0) {
     num_kv_splits = static_cast<int>(num_kv_splits_override);
@@ -295,6 +310,7 @@ void dsa_litetopk_scan(
       static_cast<int32_t*>(cand_idx.data_ptr()),
       static_cast<int32_t*>(cand_cnt.data_ptr()),
       static_cast<uint32_t>(cand_cap),
+      qblock_mask_ptr,
       tm_q,
       tm_kv,
       tm_ks,
