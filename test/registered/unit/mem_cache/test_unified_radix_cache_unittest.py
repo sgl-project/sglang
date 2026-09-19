@@ -3822,6 +3822,85 @@ class UnifiedRadixCacheSuite:
 
         cons.sanity_check()
 
+    def test_release_aborted_request_after_prefetch_completed(self):
+        """Abort after the prefetch result has already been handled.
+
+        Once _handle_prefetch_result runs, the request leaves ongoing_prefetch and
+        its loaded span lands in prefetch_loaded_tokens_by_reqid /
+        prefetch_loaded_storage_start_by_reqid.  An abort in that window must drop
+        both entries: admission is the only other reader, so a miss here leaks
+        until reset().
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 prefetch is out of scope for this unit fixture")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        num_pages = 4
+        if self.cfg.has_swa:
+            # SWA L3 prefetch is all-or-nothing over one full sliding window.
+            sw_pages = (
+                self.cfg.sliding_window_size + self.cfg.page_size - 1
+            ) // self.cfg.page_size
+            num_pages = max(num_pages, sw_pages + 1)
+        seq = self._make_seq(1, num_pages)
+
+        # --- Producer tree: fill KV, backup D->H, offload H->L3. ---
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = mp.last_device_node
+        self._backup_node(prod, prod_leaf)
+        self._write_path_to_l3(prod, prod_leaf)
+        self._flush_l3_backups(prod)
+
+        # --- Consumer tree: prefetch the same tokens straight from L3. ---
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        req_id = CacheRequestHandle("abort-after-prefetch", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+
+        # Pump the control queues until the prefetch reports done.  A buffer-mode
+        # staged prefetch is deliberately left unconsumed: the abort must clear
+        # the bookkeeping in both host memory modes.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            cons.drain_storage_control_queues()
+            if cons.check_prefetch_progress(req_id):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(f"prefetch {req_id} did not complete in time")
+
+        # Guard: without a recorded span the assertions below would be vacuous,
+        # which is exactly why the existing in-flight abort tests miss this bug.
+        self.assertNotIn(req_id, cons.ongoing_prefetch)
+        self.assertIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
+        self.assertGreater(cons.prefetch_loaded_tokens_by_reqid[req_id], 0)
+        self.assertIn(req_id, cons.prefetch_loaded_storage_start_by_reqid)
+
+        # --- Act: abort before the request is ever admitted. ---
+        cons.finish(req_id, CacheRequestOutcome.ABORT)
+
+        self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
+        self.assertNotIn(req_id, cons.prefetch_loaded_storage_start_by_reqid)
+
     # ================================================================
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
