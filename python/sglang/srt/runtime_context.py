@@ -1119,7 +1119,7 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
     """
     import importlib
 
-    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.arg_utils import _NO_DEFAULT, Derived
     from sglang.srt.arg_groups.overrides import resolved_view
 
     namespaces = getattr(type(server_args), "_NAMESPACES", None)
@@ -1131,7 +1131,18 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
         if path is None:
             continue
         for name, decl in vars(source).items():
-            if not isinstance(decl, Derived) or not decl.fn:
+            if not isinstance(decl, Derived):
+                continue
+            if not decl.fn:
+                # Nothing computes it. Seed the ones whose absence is itself an
+                # answer, so a process that never states one still reads it;
+                # the rest stay unwritten and say so when read.
+                if decl.default is not _NO_DEFAULT:
+                    bag = tops.get(path.split(".")[0])
+                    for segment in path.split(".")[1:]:
+                        bag = bag and getattr(bag, segment, None)
+                    if bag is not None:
+                        bag._set(name, decl.default)
                 continue
             module, _, attr = decl.fn.rpartition(".")
             bag = tops.get(path.split(".")[0])
@@ -1251,7 +1262,20 @@ class RuntimeContext:
         # Snapshot resolved config into the namespace bags (the single source of
         # truth for config reads). Placed by `namespace_of`; a mock/partial
         # config that declares no namespace yields an empty tree (no bags).
+        # A name the configuration does not carry survives the re-projection.
+        # `gpu_id` is stated by the spawn, not derived, so rebuilding the bags
+        # from the record must not unwrite it -- the record has no field for it
+        # to be rebuilt from.
+        stated = {}
+        if self._config_bags is not None:
+            device = self._config_bags.get("device")
+            fields = object.__getattribute__(device, "_fields") if device else {}
+            if "gpu_id" in fields:
+                stated["gpu_id"] = fields["gpu_id"]
         self._config_bags = _build_config_bags(server_args)
+        device = self._config_bags.get("device")
+        if stated and device is not None:
+            device._set("gpu_id", stated["gpu_id"])
         spec = self._config_bags.get("spec")
         if spec is not None:
             from sglang.srt.arg_groups.overrides import (
@@ -1818,8 +1842,13 @@ def publish(
     # never built. With DCP on it is a position, and the bundle below states it.
     if not _CONTEXT.parallel.dcp_enabled:
         _CONTEXT.parallel.override_permanently(attn_dcp_rank=0)
-    if ranks is not None and ranks.gpu_id is not None:
-        _CONTEXT.override("spawn", gpu_id=ranks.gpu_id)
+    # Stated on the bag directly: `gpu_id` is declared but not configured, so
+    # it is not a leaf `override` can route, and the spawn is the only thing
+    # that knows it. Written whatever it is, `None` included -- most roles run
+    # on no device, and that is an answer rather than a name nobody wrote.
+    _CONTEXT.config_bag("device")._set(
+        "gpu_id", ranks.gpu_id if ranks is not None else None
+    )
     if ranks is not None:
         # The placement, worked out here rather than carried: the widths are on
         # the bag a moment ago, and `world_rank` fixes the rest. A read of any

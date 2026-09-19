@@ -276,6 +276,7 @@ class WeightCacheDaemon:
         server_args = self.server_args
         # The launcher told this daemon where it sits, and it builds the same
         # groups a scheduler does, so the same one number places it.
+        server_args.gpu_id = self.gpu_id
         publish(
             server_args,
             role="weight_cache_daemon",

@@ -85,6 +85,7 @@ class SchedulerActor:
 
         # This actor takes the place of run_scheduler_process, which is where
         # a forked scheduler publishes.
+        server_args.gpu_id = actual_gpu_id
         publish(
             server_args,
             role="scheduler",

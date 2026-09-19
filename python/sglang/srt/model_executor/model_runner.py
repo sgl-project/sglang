@@ -416,12 +416,12 @@ class ModelRunner:
         # Set device early so that TransferEngine init (e.g. Ascend NPU)
         # can access the device context.
         try:
-            torch.get_device_module(self.device).set_device(ps.gpu_id)
+            torch.get_device_module(self.device).set_device(get_device().gpu_id)
         except Exception:
             import os
 
             logger.warning(
-                f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
+                f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
             raise
 

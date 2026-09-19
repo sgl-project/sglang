@@ -28,6 +28,7 @@ from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_parallel,
@@ -74,7 +75,7 @@ def init_torch_distributed(
 
     backend = _resolve_backend(device=device)
 
-    before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
+    before_avail_memory = get_available_gpu_memory(device, get_device().gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
@@ -97,7 +98,7 @@ def init_torch_distributed(
             dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
-            gpu_id=ps.gpu_id,
+            gpu_id=get_device().gpu_id,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
@@ -130,12 +131,12 @@ def init_torch_distributed(
     # including them in this WORLD reduction would deadlock on absent peers.
     pre_model_load_memory = get_available_gpu_memory(
         device,
-        ps.gpu_id,
+        get_device().gpu_id,
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
     # Check memory for tensor parallelism
-    local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
+    local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
     if parallel.tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
