@@ -174,9 +174,9 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy: bool = False
-    # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
-    # end so positional construction in from_zmq() continues to work.
+    # Keep staging as the final positional field for existing constructors.
     staging: Optional[StagingTransferInfo] = None
+    prefill_logprobs_version: int = dataclasses.field(default=0, kw_only=True)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -214,6 +214,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=decode_prefix_len,
             is_dummy=is_dummy,
+            prefill_logprobs_version=int(msg[10]) if len(msg) > 10 else 0,
         )
 
 
@@ -408,6 +409,7 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    supports_prefill_logprobs = True
     # The decode control socket multiplexes tagged messages, so the status
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
@@ -622,6 +624,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if self.handle_prefill_logprobs(msg):
+                    continue
                 if msg[0] == b"STAGING_REQ":
                     if self.enable_staging:
                         self._handle_staging_req(msg)
@@ -1441,6 +1445,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # was aborted and nothing else is outstanding.
                     self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
+                    self.send_prefill_logprobs(room)
                     self.update_status(room, KVPoll.Success)
                 elif self.check_status(room) != KVPoll.Success:
                     # A deferred earlier chunk can complete after the last chunk
@@ -3222,6 +3227,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            b"1" if self.want_prefill_logprobs else b"0",
                         ]
                     )
             except zmq.ZMQError:

@@ -35,6 +35,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation import prefill_logprobs
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -1607,6 +1608,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            decode_req.kv_receiver.want_prefill_logprobs = decode_req.req.return_logprob
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -2261,6 +2263,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
+        metadata = (
+            decode_req.kv_receiver.prefill_logprobs()
+            if decode_req.req.return_logprob
+            else None
+        )
+        if metadata is not None and not decode_req.is_rebootstrap:
+            prefill_logprobs.restore_inputs(decode_req.req.logprob, metadata)
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
@@ -2309,22 +2318,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
         if decode_req.req.return_logprob and not replayed_boundary:
-            decode_req.req.logprob.output_token_logprobs_val.append(
-                output_token_logprobs_val[0].item()
-            )
-            decode_req.req.logprob.output_token_logprobs_idx.append(
-                output_token_logprobs_idx[0].item()
-            )
-            decode_req.req.logprob.output_top_logprobs_val.append(
-                output_top_logprobs_val[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            decode_req.req.logprob.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
+            if metadata is not None:
+                prefill_logprobs.append_output(decode_req.req.logprob, metadata)
+            else:
+                decode_req.req.logprob.output_token_logprobs_val.append(
+                    output_token_logprobs_val[0].item()
+                )
+                decode_req.req.logprob.output_token_logprobs_idx.append(
+                    output_token_logprobs_idx[0].item()
+                )
+                decode_req.req.logprob.output_top_logprobs_val.append(
+                    output_top_logprobs_val[
+                        : decode_req.req.logprob.top_logprobs_num
+                    ].tolist()
+                )
+                decode_req.req.logprob.output_top_logprobs_idx.append(
+                    output_top_logprobs_idx[
+                        : decode_req.req.logprob.top_logprobs_num
+                    ].tolist()
+                )
         if decode_req.req.return_sampling_mask:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"

@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -16,6 +17,7 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
+from sglang.srt.disaggregation import prefill_logprobs
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -139,6 +141,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    prefill_logprobs_version: int = 0
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -146,6 +149,8 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    supports_prefill_logprobs = False
+
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
     # ``[room, status, prefill_rank]``; backends whose control socket also
@@ -235,6 +240,9 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self.prefill_logprobs_send: Dict[int, bytes] = {}
+        self.prefill_logprobs_recv: Dict[int, tuple[set[int], Optional[list]]] = {}
+        self.prefill_logprobs_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -441,6 +449,60 @@ class CommonKVManager(BaseKVManager):
                 targets.append(target)
         return targets
 
+    def send_prefill_logprobs(self, room: int) -> None:
+        if not self.supports_prefill_logprobs:
+            return
+        payload = self.prefill_logprobs_send.get(room, b"\xc0")
+        parts = [
+            b"PREFILL_LOGPROBS_V1",
+            str(room).encode("ascii"),
+            str(self._prefill_unique_rank()).encode("ascii"),
+            payload,
+        ]
+        targets = {
+            (info.endpoint, info.dst_port)
+            for info in list(self.transfer_infos.get(room, {}).values())
+            if not info.is_dummy and info.prefill_logprobs_version == 1
+        }
+        for host, port in targets:
+            address = NetworkAddress(host, port)
+            self._send_multipart_locked(
+                address.to_tcp(), parts, is_ipv6=address.is_ipv6
+            )
+
+    def handle_prefill_logprobs(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"PREFILL_LOGPROBS_V1":
+            return False
+        if len(msg) != 4:
+            logger.warning("Dropping malformed prompt logprob message")
+            return True
+        try:
+            room, rank = int(msg[1]), int(msg[2])
+        except ValueError:
+            logger.warning("Dropping invalid prompt logprob room/rank")
+            return True
+        try:
+            values = prefill_logprobs.decode(msg[3])
+        except (msgspec.DecodeError, ValueError, TypeError, OverflowError) as error:
+            with self.prefill_logprobs_lock:
+                if room in self.request_status:
+                    self.record_failure(room, f"Invalid prompt metadata: {error}")
+                    self.update_status(room, KVPoll.Failed)
+            return True
+        # Decode outside the lock, then recheck ownership. A concurrent clear
+        # must not leave late metadata retained for a finished room.
+        with self.prefill_logprobs_lock:
+            if room in self.request_status:
+                ranks, current = self.prefill_logprobs_recv.get(room, (set(), values))
+                ranks.add(rank)
+                # PP ranks without logits carry a null payload. They must not
+                # overwrite prompt values supplied by the final PP stage.
+                self.prefill_logprobs_recv[room] = (
+                    ranks,
+                    values if values is not None and values[0] is not None else current,
+                )
+        return True
+
     def _encode_kv_status_message(
         self,
         *,
@@ -550,6 +612,8 @@ class CommonKVManager(BaseKVManager):
 
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
+        if status == KVPoll.Success:
+            self.send_prefill_logprobs(bootstrap_room)
         self.update_status(bootstrap_room, status)
         self.send_kv_status_message(
             targets=targets,
@@ -1112,6 +1176,7 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            "prefill_logprobs_version": int(self.supports_prefill_logprobs),
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
@@ -1466,6 +1531,23 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    def set_prefill_logprobs(self, logprob) -> bool:
+        if not self.kv_mgr.supports_prefill_logprobs:
+            return False
+        peers = [
+            info
+            for info in list(
+                self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values()
+            )
+            if not info.is_dummy
+        ]
+        if any(info.prefill_logprobs_version == 1 for info in peers):
+            self.kv_mgr.prefill_logprobs_send[self.bootstrap_room] = (
+                prefill_logprobs.encode(logprob)
+            )
+            return all(info.prefill_logprobs_version == 1 for info in peers)
+        return False
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -1627,6 +1709,7 @@ class CommonKVSender(BaseKVSender):
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.prefill_logprobs_send.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1646,6 +1729,39 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
+    want_prefill_logprobs = False
+
+    def expects_prefill_logprobs(self) -> bool:
+        return (
+            self.kv_mgr.supports_prefill_logprobs
+            and bool(self.bootstrap_infos)
+            and all(
+                info.get("prefill_logprobs_version") == 1
+                for info in self.bootstrap_infos
+                if not info.get("is_dummy")
+            )
+        )
+
+    def prefill_logprobs(self):
+        with self.kv_mgr.prefill_logprobs_lock:
+            value = self.kv_mgr.prefill_logprobs_recv.get(self.bootstrap_room)
+        return value[1] if value is not None else None
+
+    def poll_prefill_logprobs(self) -> KVPoll:
+        if not self.expects_prefill_logprobs():
+            return KVPoll.Success
+        with self.kv_mgr.prefill_logprobs_lock:
+            if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+                return KVPoll.Failed
+            value = self.kv_mgr.prefill_logprobs_recv.get(self.bootstrap_room)
+            if (
+                value is not None
+                and len(value[0]) >= self.required_prefill_response_num
+            ):
+                return KVPoll.Success
+        timeout = self._check_waiting_timeout()
+        return timeout if timeout is not None else KVPoll.Transferring
+
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
@@ -1933,7 +2049,9 @@ class CommonKVReceiver(BaseKVReceiver):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr.prefill_logprobs_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.prefill_logprobs_recv.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
@@ -2122,6 +2240,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                prefill_logprobs_version=data.get("prefill_logprobs_version", 0),
             )
 
             self._registered_count += 1

@@ -171,6 +171,10 @@ class BaseKVSender(ABC):
     def pop_decode_prefix_len(self) -> int:
         return 0
 
+    def set_prefill_logprobs(self, logprob) -> bool:
+        """Optional variable-sized metadata, independent of fixed RDMA buffers."""
+        return False
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
@@ -207,6 +211,15 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
+    def poll_prefill_logprobs(self) -> KVPoll:
+        return KVPoll.Success
+
+    def expects_prefill_logprobs(self) -> bool:
+        return False
+
+    def prefill_logprobs(self):
+        return None
+
     @abstractmethod
     def __init__(
         self,

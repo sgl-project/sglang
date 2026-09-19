@@ -181,6 +181,8 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            elif decode_req.req.return_logprob:
+                polls[i] = int(decode_req.kv_receiver.poll_prefill_logprobs())
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
@@ -452,7 +454,7 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req, *, skip_logprobs: bool = False):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -473,7 +475,7 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
-        if req.return_logprob:
+        if req.return_logprob and not skip_logprobs:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
                     req.logprob.output_token_logprobs_val[0]

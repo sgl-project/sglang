@@ -855,6 +855,13 @@ async def server_info():
                     "version": 1,
                     "incarnation": _global_state.tokenizer_manager.request_lifecycle.incarnation,
                     "header_overrides": envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+                    # V1 supports identical native bodies on both stages,
+                    # including parallel sampling and prefill logprob transfer.
+                    "native_disaggregation_version": int(
+                        server_args.disaggregation_mode in ("prefill", "decode")
+                        and server_args.disaggregation_transfer_backend
+                        in ("nixl", "mooncake")
+                    ),
                 }
                 if _global_state.tokenizer_manager.request_lifecycle is not None
                 else None
