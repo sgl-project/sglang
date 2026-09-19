@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
@@ -633,6 +634,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TokenspeedMLABackend,
             FlashInferAttnBackend,
             QwenSparseAttnBackend,
+            # FlashAttention already implements the draft-extend graph on both
+            # sides: `init_forward_metadata_in_graph` and
+            # `init_forward_metadata_out_graph` each branch on
+            # `forward_mode.is_draft_extend_v2()`, and `init_cuda_graph_state`
+            # allocates `draft_extend_metadata` whenever
+            # speculative_num_draft_tokens > 0. Without it here, serving with
+            # `--attention-backend fa3` runs one EAGER draft-extend forward per
+            # accepted chunk while every other phase replays a graph.
+            FlashAttentionBackend,
         ]
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
