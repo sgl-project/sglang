@@ -775,6 +775,7 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         del grammar_barrier
         self._validate_batch(batch)
