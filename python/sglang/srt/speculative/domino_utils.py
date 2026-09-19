@@ -328,9 +328,12 @@ def domino_greedy_rollout(
             f"bonus_tokens must have shape ({batch_size},), got {tuple(bonus_tokens.shape)}."
         )
 
-    num_proposals = int(block_size) - 1
+    # `block_size` here is the draft block width: an anchor-first (shift_label) drafter
+    # is one query narrower, so every query it runs proposes.
+    start = 0 if shift_label else 1
+    num_proposals = int(block_size) - start
     if num_proposals < 1:
-        raise ValueError(f"Domino requires block_size > 1, got {block_size}.")
+        raise ValueError(f"Domino requires block_size > {start}, got {block_size}.")
     candidate_pool_size = int(candidate_pool_size)
     if candidate_pool_size < 0:
         raise ValueError(
@@ -338,7 +341,6 @@ def domino_greedy_rollout(
             f"got {candidate_pool_size}."
         )
     candidate_pool_size = min(candidate_pool_size, int(vocab_size))
-    start = 0 if shift_label else 1
     z = draft_hidden[:, start : start + num_proposals, :]
     if int(z.shape[1]) != num_proposals:
         raise ValueError(

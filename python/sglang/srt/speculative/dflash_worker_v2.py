@@ -62,6 +62,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    select_dflash_pred_hidden,
 )
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
@@ -121,15 +122,24 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        num_draft_queries,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        pred_start,
+        tp_group=None,
     ):
         self.weight = weight
-        self.block_size = int(block_size)
+        self.num_draft_queries = int(num_draft_queries)
+        self.pred_start = int(pred_start)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        max_tokens = int(max_bs) * (self.num_draft_queries - self.pred_start)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
@@ -154,11 +164,13 @@ class _DflashDraftSampler:
             )
 
     def __call__(self, hidden_states, input_ids=None):
-        # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
-        bs = hidden_states.shape[0] // self.block_size
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
-            -1, hidden_states.shape[-1]
-        )
+        bs = hidden_states.shape[0] // self.num_draft_queries
+        hs = select_dflash_pred_hidden(
+            hidden_states,
+            bs=bs,
+            num_draft_queries=self.num_draft_queries,
+            pred_start=self.pred_start,
+        ).reshape(-1, hidden_states.shape[-1])
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
@@ -233,13 +245,22 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool
+        self,
+        *,
+        draft_model,
+        num_draft_queries,
+        max_bs,
+        device,
+        pred_start: int,
+        sampling_enabled: bool,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
-        self.block_size = int(block_size)
+        self.num_draft_queries = int(num_draft_queries)
+        self.pred_start = int(pred_start)
         self.sampling_enabled = sampling_enabled
-        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        gamma = self.num_draft_queries - self.pred_start
+        max_bs, top_k = int(max_bs), self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -272,9 +293,14 @@ class _SelectorDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.block_size
-        block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        bs = hidden_states.shape[0] // self.num_draft_queries
+        block_ids = input_ids.view(bs, self.num_draft_queries)
+        hs = select_dflash_pred_hidden(
+            hidden_states,
+            bs=bs,
+            num_draft_queries=self.num_draft_queries,
+            pred_start=self.pred_start,
+        )
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -300,7 +326,7 @@ class _DominoDraftSampler:
         prefix_gru,
         embed_proj,
         vocab_size,
-        block_size,
+        num_draft_queries,
         shift_label,
         max_bs,
         candidate_pool_size,
@@ -314,24 +340,26 @@ class _DominoDraftSampler:
         self.prefix_gru = prefix_gru
         self.embed_proj = embed_proj
         self.vocab_size = int(vocab_size)
-        self.block_size = int(block_size)
+        self.num_draft_queries = int(num_draft_queries)
         self.shift_label = bool(shift_label)
         self.candidate_pool_size = int(candidate_pool_size)
         self.tp_group = tp_group
         self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
         self.lm_head_num_org = lm_head_num_org
         self.lm_head_num_org_padded = lm_head_num_org_padded
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.num_proposals = self.num_draft_queries - (0 if self.shift_label else 1)
         self.out = torch.empty(
-            (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
+            (int(max_bs) * self.num_proposals,),
+            dtype=torch.int64,
+            device=lm_head_weight.device,
         )
 
     def __call__(self, hidden_states, input_ids=None):
         if input_ids is None:
             raise RuntimeError("Domino draft sampler requires block input_ids.")
-        bs = hidden_states.shape[0] // self.block_size
-        draft_hidden = hidden_states.view(bs, self.block_size, -1)
-        bonus_tokens = input_ids.view(bs, self.block_size)[:, 0]
+        bs = hidden_states.shape[0] // self.num_draft_queries
+        draft_hidden = hidden_states.view(bs, self.num_draft_queries, -1)
+        bonus_tokens = input_ids.view(bs, self.num_draft_queries)[:, 0]
         proposals = domino_greedy_rollout(
             draft_hidden=draft_hidden,
             bonus_tokens=bonus_tokens,
@@ -348,7 +376,7 @@ class _DominoDraftSampler:
             lm_head_num_org_padded=self.lm_head_num_org_padded,
             prefer_tp_candidate_pool=bs > 1,
         )
-        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
+        self.out[: bs * self.num_proposals].copy_(proposals.reshape(-1))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -468,7 +496,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.block_size,
                     model_block_size,
                 )
-        self.draft_model.set_block_size(self.block_size)
+        self._anchor_first = draft_config.anchor_first
+        self._draft_pred_start = draft_config.draft_pred_start
+        # The draft block is sized to produce exactly block_size - 1 drafts, so an
+        # anchor-first drafter runs one query fewer rather than discarding its tail.
+        self._num_draft_queries = draft_config.resolve_num_draft_queries(
+            verify_block_size=self.block_size
+        )
+        # The conv indexes by flattened-token-index % block_size, so it must be told
+        # the draft block width, not the verify width.
+        self.draft_model.set_block_size(self._num_draft_queries)
         self.speculative_num_draft_tokens = int(self.block_size)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -506,7 +543,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.domino_candidate_pool_size,
                 )
             logger.info(
-                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s, noise_embed_scale=%s",
+                "DFLASH draft runner ready. anchor_first=%s, num_draft_queries=%s, mask_token=%s, mask_token_id=%s, mask_token_id_override=%s, noise_embed_scale=%s",
+                self._anchor_first,
+                self._num_draft_queries,
                 self._mask_token,
                 self._mask_token_id,
                 self._mask_token_id_override,
@@ -530,7 +569,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.block_size), device=self.device
+            draft_token_num=int(self._num_draft_queries), device=self.device
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -794,9 +833,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
-                block_size=self.block_size,
+                num_draft_queries=self._num_draft_queries,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
+                pred_start=self._draft_pred_start,
                 sampling_enabled=self._selector_sampling_enabled,
             )
         if not hasattr(lm_head, "weight"):
@@ -822,7 +862,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
                 vocab_size=int(self.model_runner.model_config.vocab_size),
-                block_size=self.block_size,
+                num_draft_queries=self._num_draft_queries,
                 shift_label=self.draft_model.shift_label,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 candidate_pool_size=self.domino_candidate_pool_size,
@@ -856,10 +896,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         return _DflashDraftSampler(
             weight=lm_head.weight,
-            block_size=self.block_size,
+            num_draft_queries=self._num_draft_queries,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            pred_start=self._draft_pred_start,
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -1373,8 +1414,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
+        pred_hidden = select_dflash_pred_hidden(
+            draft_hidden,
+            bs=bs,
+            num_draft_queries=self._num_draft_queries,
+            pred_start=self._draft_pred_start,
+        )
         num_pred = pred_hidden.shape[1]
 
         candidate_ids, scores = _selector_lattice(
@@ -2409,14 +2454,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
+        # The draft runs the leading num_draft_queries slots of the verify block; an
+        # anchor-first drafter needs one fewer query to fill the same block.
+        num_draft_queries = int(self._num_draft_queries)
+        draft_block_ids = block_ids[:, :num_draft_queries]
+        draft_input_ids = draft_block_ids.flatten()
+        draft_positions = positions_2d[:, :num_draft_queries].flatten()
+        draft_out_cache_loc = verify_out_cache_loc_2d[:, :num_draft_queries].flatten()
+
         if self._full_embed_gpu is not None:
             # Replicated lookup avoids the mismatched attn-TP all_reduce
             # inside VocabParallelEmbedding under dp attention.
             noise_embedding = torch.nn.functional.embedding(
-                block_ids, self._full_embed_gpu
+                draft_block_ids, self._full_embed_gpu
             )
         else:
-            noise_embedding = embed_module(block_ids)
+            noise_embedding = embed_module(draft_block_ids)
         if self._noise_embed_scale != 1.0:
             noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -2465,13 +2518,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
-            input_ids=block_ids.flatten(),
+            input_ids=draft_input_ids,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
+            positions=draft_positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -2511,7 +2564,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_hidden = draft_hidden.view(bs, int(self._num_draft_queries), -1)
             prefix_gru = self.draft_model.prefix_gru
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
@@ -2565,12 +2618,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            pred_hidden = select_dflash_pred_hidden(
+                draft_hidden,
+                bs=bs,
+                num_draft_queries=self._num_draft_queries,
+                pred_start=self._draft_pred_start,
+            )
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
-                    ),
+                    hidden_states=pred_hidden.reshape(-1, pred_hidden.shape[-1]),
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
