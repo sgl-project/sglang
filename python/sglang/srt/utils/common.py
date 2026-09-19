@@ -266,8 +266,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -582,6 +584,16 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
+    # Resolve from the platform checks: torch.get_device_module() with no
+    # argument initializes the CUDA runtime, which poisons fork() startup.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
     return torch.get_device_module()
 
 
@@ -630,8 +642,55 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    """Compute capability of torch device 0 from NVML, leaving torch.cuda
+    uninitialized. None when NVML cannot answer; the caller falls back."""
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("get_device_sm: pynvml is not installed, using torch.cuda")
+        return None
+    # Private torch API, read defensively: it maps the torch ordinal to the NVML
+    # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if getter is None:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index is missing, "
+            "using torch.cuda"
+        )
+        return None
+    try:
+        idx = getter(0)
+    except Exception:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index(0) failed, "
+            "using torch.cuda",
+            exc_info=True,
+        )
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        logger.debug(
+            "get_device_sm: NVML query failed, using torch.cuda", exc_info=True
+        )
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Called at import time (e.g. by the DeepGEMM configurer): initializing
+        # torch.cuda here would create a context and poison fork() startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
