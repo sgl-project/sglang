@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
 register_cuda_ci(est_time=480, stage="extra-b", runner_config="2-gpu-large")
@@ -23,12 +24,14 @@ MTP_ARGS = """
 
 
 class TestPPSpecHybridGDN(CustomTestCase):
+    model = try_cached_model(DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST)
+
     def _run(self, pp_size):
         args = MTP_ARGS.copy()
         if pp_size > 1:
             args += ["--pp-size", str(pp_size), "--disable-overlap-schedule"]
         process = popen_launch_server(
-            DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
+            self.model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=args,
@@ -38,7 +41,7 @@ class TestPPSpecHybridGDN(CustomTestCase):
             return run_eval(
                 SimpleNamespace(
                     base_url=DEFAULT_URL_FOR_TEST,
-                    model=DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
+                    model=self.model,
                     eval_name="gsm8k",
                     api="completion",
                     max_tokens=2048,
