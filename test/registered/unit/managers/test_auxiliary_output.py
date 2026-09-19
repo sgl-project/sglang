@@ -574,6 +574,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     batch = SimpleNamespace(
         reqs=[req],
         spec_info=None,
+        return_hidden_states=False,
         prefill_stats=None,
         dp_cooperation_info=None,
     )
@@ -645,17 +646,25 @@ def test_logprob_only_clears_stale_output_before_early_return():
     runner.sampler.compute_logprobs_only.assert_not_called()
 
 
-def test_pipeline_parallel_auxiliary_output_round_trip():
+@pytest.mark.parametrize("return_hidden_states", [False, True])
+@pytest.mark.parametrize("return_logprob", [False, True])
+def test_pipeline_parallel_auxiliary_output_round_trip(
+    return_hidden_states, return_logprob
+):
     device_output = DeviceOutput(torch.tensor([1.0, 2.0]))
+    hidden_states = torch.arange(12).reshape(3, 4)
     result = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=None,
             auxiliary_device_output=device_output,
+            hidden_states=hidden_states,
         ),
         next_token_ids=torch.tensor([7]),
+        extend_input_len_per_req=[3],
     )
     batch = SimpleNamespace(
-        return_logprob=False,
+        return_logprob=return_logprob,
+        return_hidden_states=return_hidden_states,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
     )
@@ -684,6 +693,14 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
     assert torch.equal(output_result.auxiliary_host_output.values, device_output.values)
     assert all("sampling_observer_output" not in key for key in tensors)
     receiver.future_map.stash.assert_called_once()
+    if return_hidden_states:
+        torch.testing.assert_close(
+            output_result.logits_output.hidden_states, hidden_states
+        )
+        assert output_result.extend_input_len_per_req == [3]
+    else:
+        assert "output_hidden_states" not in tensors
+        assert output_result.logits_output.hidden_states is None
 
 
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():

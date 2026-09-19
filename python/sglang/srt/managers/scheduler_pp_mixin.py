@@ -18,6 +18,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
+    _async_d2h,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
@@ -50,6 +51,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not batch.return_hidden_states
     )
 
 
@@ -846,6 +848,15 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logits_output_dict,
             }
+        if (
+            result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+            and batch.return_hidden_states
+        ):
+            tensor_dict["output_hidden_states"] = (
+                result.logits_output.hidden_states.contiguous()
+            )
+            tensor_dict["extend_input_len_per_req"] = result.extend_input_len_per_req
         auxiliary_output = (
             result.logits_output.auxiliary_device_output
             if result.logits_output is not None
@@ -973,6 +984,14 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        hidden_states = pp_outputs.tensors.get("output_hidden_states")
+        if hidden_states is not None:
+            if logits_output is None:
+                logits_output = LogitsProcessorOutput(next_token_logits=None)
+            # The enclosing copy stream/event also fences this host copy; keep
+            # the device tensor in pp_outputs for forwarding around the ring.
+            logits_output.hidden_states = _async_d2h(hidden_states)
+            extend_input_len_per_req = pp_outputs["extend_input_len_per_req"]
         if self.pp_group.is_first_rank:
             observer = self.tp_worker.model_runner.sampling_observer
             auxiliary_output = pop_auxiliary_output_from_pp_tensors(

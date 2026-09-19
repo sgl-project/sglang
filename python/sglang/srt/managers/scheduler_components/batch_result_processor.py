@@ -319,6 +319,7 @@ class SchedulerBatchResultProcessor:
                     )
                 if (
                     batch.return_hidden_states
+                    and logits_output is not None
                     and logits_output.hidden_states is not None
                 ):
                     assert extend_input_len_per_req is not None
@@ -1037,7 +1038,11 @@ class SchedulerBatchResultProcessor:
                 # request entry, so this remains one support mask per token.
                 self.add_sampling_mask_return_values(i, req, logits_output)
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if (
+                req.return_hidden_states
+                and logits_output is not None
+                and logits_output.hidden_states is not None
+            ):
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
                 # token; speculative workers record their padded row width.
                 stride = _get_speculative_output_stride(result) if is_spec else 1

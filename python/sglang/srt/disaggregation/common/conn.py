@@ -142,6 +142,7 @@ class PrefillRankInfo:
     rank_ip: str
     rank_port: int
     prefill_logprobs_version: int = 0
+    prefill_metadata_version: int = 0
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -240,7 +241,7 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        self.prefill_logprobs_send: Dict[int, bytes] = {}
+        self.prefill_logprobs_send: Dict[int, Dict[int, bytes]] = {}
         self.prefill_logprobs_recv: Dict[int, tuple[set[int], Optional[list]]] = {}
         self.prefill_logprobs_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
@@ -452,19 +453,20 @@ class CommonKVManager(BaseKVManager):
     def send_prefill_logprobs(self, room: int) -> None:
         if not self.supports_prefill_logprobs:
             return
-        payload = self.prefill_logprobs_send.get(room, b"\xc0")
+        payloads = self.prefill_logprobs_send.get(room, {})
         parts = [
             b"PREFILL_LOGPROBS_V1",
             str(room).encode("ascii"),
             str(self._prefill_unique_rank()).encode("ascii"),
-            payload,
+            b"\xc0",
         ]
         targets = {
-            (info.endpoint, info.dst_port)
+            (info.endpoint, info.dst_port, info.prefill_logprobs_version)
             for info in list(self.transfer_infos.get(room, {}).values())
-            if not info.is_dummy and info.prefill_logprobs_version == 1
+            if not info.is_dummy and info.prefill_logprobs_version in (1, 2)
         }
-        for host, port in targets:
+        for host, port, version in targets:
+            parts[3] = payloads.get(version, b"\xc0")
             address = NetworkAddress(host, port)
             self._send_multipart_locked(
                 address.to_tcp(), parts, is_ipv6=address.is_ipv6
@@ -499,7 +501,11 @@ class CommonKVManager(BaseKVManager):
                 # overwrite prompt values supplied by the final PP stage.
                 self.prefill_logprobs_recv[room] = (
                     ranks,
-                    values if values is not None and values[0] is not None else current,
+                    (
+                        values
+                        if values is not None and (values[0] is not None or values[-1])
+                        else current
+                    ),
                 )
         return True
 
@@ -1177,6 +1183,7 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
             "prefill_logprobs_version": int(self.supports_prefill_logprobs),
+            "prefill_metadata_version": 2 if self.supports_prefill_logprobs else 0,
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
@@ -1531,7 +1538,7 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
-    def set_prefill_logprobs(self, logprob) -> bool:
+    def set_prefill_logprobs(self, logprob, *, hidden_states=None) -> bool:
         if not self.kv_mgr.supports_prefill_logprobs:
             return False
         peers = [
@@ -1541,11 +1548,15 @@ class CommonKVSender(BaseKVSender):
             )
             if not info.is_dummy
         ]
-        if any(info.prefill_logprobs_version == 1 for info in peers):
-            self.kv_mgr.prefill_logprobs_send[self.bootstrap_room] = (
-                prefill_logprobs.encode(logprob)
-            )
-            return all(info.prefill_logprobs_version == 1 for info in peers)
+        versions = {info.prefill_logprobs_version for info in peers}
+        if versions & {1, 2}:
+            self.kv_mgr.prefill_logprobs_send[self.bootstrap_room] = {
+                version: prefill_logprobs.encode(
+                    logprob, hidden_states=hidden_states, version=version
+                )
+                for version in versions & {1, 2}
+            }
+            return versions <= {1, 2}
         return False
 
     def __init__(
@@ -1730,6 +1741,16 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     want_prefill_logprobs = False
+    want_prefill_hidden_states = False
+
+    def prefill_metadata_version(self, bootstrap_info: dict) -> bytes:
+        # Keep the V1 handshake with old senders and for logprob-only requests.
+        if (
+            self.want_prefill_hidden_states
+            and bootstrap_info.get("prefill_metadata_version", 0) >= 2
+        ):
+            return b"2"
+        return b"1" if self.want_prefill_logprobs else b"0"
 
     def expects_prefill_logprobs(self) -> bool:
         return (
@@ -1737,6 +1758,7 @@ class CommonKVReceiver(BaseKVReceiver):
             and bool(self.bootstrap_infos)
             and all(
                 info.get("prefill_logprobs_version") == 1
+                and self.prefill_metadata_version(info) != b"0"
                 for info in self.bootstrap_infos
                 if not info.get("is_dummy")
             )
@@ -2241,6 +2263,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 rank_ip=rank_ip,
                 rank_port=rank_port,
                 prefill_logprobs_version=data.get("prefill_logprobs_version", 0),
+                prefill_metadata_version=data.get("prefill_metadata_version", 0),
             )
 
             self._registered_count += 1

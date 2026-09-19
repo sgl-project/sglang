@@ -194,19 +194,19 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
 
 class TestPrefillSkippedOutput(CustomTestCase):
-    def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
+    def test_sampling_metadata_middle_chunk_does_not_require_logits_output(self):
         """A non-token-producing PP chunk may omit its logits output."""
         req = _PrefillReq(
             rid="middle",
             inflight_middle_chunks=1,
-            return_hidden_states=False,
+            return_hidden_states=True,
         )
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
             return_logprob=False,
-            return_hidden_states=False,
-            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            return_hidden_states=True,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
             spec_info=None,
             prefill_stats=None,
             dp_cooperation_info=None,
@@ -235,6 +235,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
 
         self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertEqual(req.output_ids, [])
+        self.assertEqual(req.hidden_states, [])
         processor.output_streamer.stream_output.assert_called_once_with(
             [req], False, req
         )
@@ -244,7 +245,6 @@ class TestDecodeWithoutLogits(CustomTestCase):
     def test_pipeline_result_commits_token_without_sampling_metadata(self):
         processor = _make_processor(self)
         req = _DecodeReq()
-        req.return_hidden_states = False
         batch = SimpleNamespace(
             reqs=[req],
             return_logprob=False,
@@ -267,6 +267,7 @@ class TestDecodeWithoutLogits(CustomTestCase):
             processor.process_batch_result_decode(batch, result)
 
         self.assertEqual(req.output_ids, [8])
+        self.assertEqual(req.hidden_states, [])
         self.assertEqual(processor.metrics_reporter.num_generated_tokens, 1)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 

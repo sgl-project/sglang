@@ -2876,7 +2876,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
-                            b"1" if self.want_prefill_logprobs else b"0",
+                            self.prefill_metadata_version(bootstrap_info),
                         ]
                     )
             except zmq.ZMQError:

@@ -754,6 +754,16 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        hidden_state_offset = 0
+        capture_hidden = (
+            batch.return_hidden_states
+            and logits_output is not None
+            and logits_output.hidden_states is not None
+        )
+        if capture_hidden:
+            hidden_capture_mode = (
+                self.batch_result_processor._get_prefill_hidden_capture_mode(batch)
+            )
         aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
@@ -790,6 +800,18 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            req_hidden_state_offset = hidden_state_offset
+            if capture_hidden:
+                hidden_state_offset = (
+                    self.batch_result_processor._append_prefill_hidden_states(
+                        req=req,
+                        logits_output=logits_output,
+                        hidden_state_offset=hidden_state_offset,
+                        capture_hidden_mode=hidden_capture_mode,
+                        extend_input_len=extend_input_len_per_req[i],
+                        store=False,
+                    )
+                )
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -846,6 +868,14 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
+                if capture_hidden:
+                    self.batch_result_processor._append_prefill_hidden_states(
+                        req=req,
+                        logits_output=logits_output,
+                        hidden_state_offset=req_hidden_state_offset,
+                        capture_hidden_mode=hidden_capture_mode,
+                        extend_input_len=extend_input_len_per_req[i],
+                    )
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -1340,8 +1370,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            separate_logprobs = req.return_logprob and (
-                req.disagg_kv_sender.set_prefill_logprobs(req.logprob)
+            separate_logprobs = (req.return_logprob or req.return_hidden_states) and (
+                req.disagg_kv_sender.set_prefill_logprobs(
+                    req.logprob,
+                    hidden_states=req.hidden_states
+                    if req.return_hidden_states
+                    else None,
+                )
             )
             self.disagg_metadata_buffers.set_buf(req, skip_logprobs=separate_logprobs)
 
