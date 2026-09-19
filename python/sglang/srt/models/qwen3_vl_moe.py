@@ -105,10 +105,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx += self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            captured_last_layer_outputs = (
+                aux_hidden_states if layer_idx in self.layers_to_capture else None
+            )
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -122,6 +121,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
                     post_residual_addition=deepstack_embeds,
                 )
             else:
@@ -132,6 +132,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
                 )
                 if (
                     input_deepstack_embeds is not None
