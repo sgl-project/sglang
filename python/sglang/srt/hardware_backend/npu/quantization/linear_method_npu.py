@@ -6,6 +6,10 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -19,9 +23,6 @@ MXFP8_BLOCK_SIZE = 32
 MXFP4_BLOCK_SIZE = 32
 
 
-# NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
-# by the runtime), so this module needs no top-level `import torch_npu` and stays
-# importable on CUDA/CPU/AMD/XPU CI.
 def _get_float8_e8m0fnu_dtype():
     # Resolve lazily rather than as a module-level constant: this module is
     # imported early (during quant-scheme registration), so reading the dtype at
@@ -39,11 +40,6 @@ def _get_float4_e2m1fn_x2_dtype():
     # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
     # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
     # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
-    #
-    # Lazy import so this NPU-only path keeps the module importable on
-    # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
-    from sglang.srt.utils import is_npu
-
     if is_npu():
         import torch_npu
 
@@ -109,7 +105,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             quant_bias = None
         else:
             quant_bias = layer.quant_bias
-        return torch.ops.npu.npu_quant_matmul(
+        return torch_npu.npu_quant_matmul(
             x,
             layer.weight,
             layer.deq_scale,
@@ -141,8 +137,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             quant_out, dynamic_scale = x
         else:
             original_dtype = x.dtype
-            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
-        return torch.ops.npu.npu_quant_matmul(
+            quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+        return torch_npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -298,7 +294,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             quant_bias = bias.to(torch.float32)
 
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        output = torch.ops.npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             qx,
             layer.weight,
             layer.weight_scale_inv,
@@ -353,7 +349,7 @@ def npu_w8a8_mxfp8_linear(
         if bias is not None and bias.dtype != torch.float32
         else bias
     )
-    output_2d = torch.ops.npu.npu_quant_matmul(
+    output_2d = torch_npu.npu_quant_matmul(
         x_fp8,
         weight,
         scale=weight_scale,
@@ -389,10 +385,10 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+        quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(
             x, dst_type=torch.quint4x2
         )
-        return torch.ops.npu.npu_quant_matmul(
+        return torch_npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -554,7 +550,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             quant_bias = bias.to(torch.float32)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
-        output = torch.ops.npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             quantized_x,
             layer.weight,
             layer.weight_scale,
@@ -667,7 +663,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             bias = bias.to(torch.float32)
 
         # W4(weight)A8(activation) matmul.
-        output = torch.ops.npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             quantized_x,
             layer.weight,
             layer.weight_scale,
@@ -805,7 +801,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
         # time): x1_dtype = x2_dtype = fp4, group_sizes=[1, 1, block].
-        output = torch.ops.npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             qx,
             layer.weight,
             layer.weight_scale,
