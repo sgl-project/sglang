@@ -31,7 +31,6 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     get_dsv41_spec_layout,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -259,7 +258,7 @@ class CommonKVManager(BaseKVManager):
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
-            self.pp_group = get_pp_group()
+            self.pp_group = get_parallel().pp_group
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -1059,7 +1058,7 @@ class CommonKVManager(BaseKVManager):
                 "multi-node prefill mode."
             )
 
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         synced_port = world_group.broadcast_object(local_port, src=0)
         if synced_port != local_port:
             logger.info(
@@ -1111,7 +1110,7 @@ class CommonKVManager(BaseKVManager):
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
-            topology_rows = get_world_group().all_gather_object(payload)
+            topology_rows = get_parallel().world_group.all_gather_object(payload)
             # Every scheduler contributes a topology row. Only the scheduler
             # ranks that own a Rust listener populate their local registry.
             if self.kv_args.rust_http_port is None:

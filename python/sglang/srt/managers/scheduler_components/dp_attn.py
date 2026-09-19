@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
@@ -192,9 +191,9 @@ class MLPSyncBatchInfo:
         )
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
+            tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
         else:
-            tp_active_ranks = get_tp_group().active_ranks
+            tp_active_ranks = get_parallel().tp_group.active_ranks
         if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
             tp_active_ranks = torch.ones(
                 num_ranks_in_tp_info,
@@ -432,9 +431,9 @@ def prepare_mlp_sync_batch_raw(
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
-        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
-        world = get_world_group()
+        world = get_parallel().world_group
         group = torch.distributed.group.WORLD
         device = world.device
     elif len(offload_tags) == 0 and (

@@ -17,6 +17,20 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
+@pytest.fixture
+def stated_tp_group():
+    """A TP group for a test that runs in a process without one.
+
+    The production call passes the group *into* `use_symmetric_memory`, so
+    stubbing that context manager does not stop the read -- the argument is
+    evaluated first. Stating it on the context answers every spelling.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
 def _random_weights(num_experts: int, hidden: int, intermediate: int):
     generator = torch.Generator(device="cuda").manual_seed(0)
     w13 = torch.randint(
@@ -110,7 +124,7 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
-def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
+def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 12:
@@ -134,7 +148,6 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 256, 256
     w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
@@ -254,7 +267,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
+def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (12, 0):
@@ -277,7 +290,6 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 160, 160
     padded_hidden = padded_intermediate = 256
