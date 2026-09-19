@@ -2,20 +2,9 @@ import math
 from typing import Optional
 
 import torch
-from sgl_kernel_npu.fla.kda_chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h_npu,
-)
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-from sgl_kernel_npu.fla.kda_prefill import (
-    chunk_gla_fwd_o_gk_npu,
-    recompute_w_u_fwd_npu,
-)
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
-from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
-from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
@@ -48,67 +37,54 @@ class _AscendKDAExtendKernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
         v = v.contiguous()
+        g = g.contiguous()
         beta = beta.contiguous()
-        chunk_indices = prepare_chunk_indices(query_start_loc, chunk_size)
-        g = chunk_local_cumsum(
-            g.contiguous(),
-            chunk_size=chunk_size,
-            scale=_LOG2_E,
+        # chunk_kda_fwd accepts one initial state per logical sequence, while
+        # SGLang owns a slot-indexed persistent pool. Gather the active slots in
+        # canonical contiguous [N, H, V, K] layout and scatter final_state back.
+        num_sequences = query_start_loc.shape[0] - 1
+        source_indices = cache_indices[:num_sequences].to(torch.long)
+        valid_state_mask = source_indices >= 0
+        # Forward metadata may use -1 for a padded request.  index_select would
+        # otherwise read the last cache slot and index_copy_ would overwrite it.
+        # Slot 0 is a gather placeholder for that padded row; its computed result
+        # is irrelevant because padded rows are filtered before state writeback.
+        gather_indices = source_indices.clamp_min(0)
+        initial_state = (
+            ssm_states.index_select(0, gather_indices)
+            .to(dtype=torch.float32)
+            .contiguous()
+        )
+        scale = k.shape[-1] ** -0.5
+        query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
+
+        outputs = torch.ops.npu.chunk_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
             cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            layout="BSND",
+            safe_gate=False,
+            use_gate_in_kernel=False,
+            state_v_first=True,
+            output_h=return_intermediate_states,
+        )
+        out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
+        valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
+        ssm_states.index_copy_(
+            0,
+            source_indices.index_select(0, valid_positions),
+            final_state.index_select(0, valid_positions).to(dtype=ssm_states.dtype),
         )
 
-        triangular, query_key = chunk_kda_scaled_dot_kkt_fwd(
-            q=q,
-            k=k,
-            gk=g,
-            beta=beta,
-            scale=k.shape[-1] ** -0.5,
-            cu_seqlens=query_start_loc,
-            output_dtype=torch.float32,
-        )
-        triangular = solve_tril_npu(
-            A=triangular,
-            cu_seqlens=query_start_loc,
-            output_dtype=k.dtype,
-        )
-        w, u, gated_k = recompute_w_u_fwd_npu(
-            k=k,
-            v=v,
-            beta=beta,
-            A=triangular,
-            gk=g,
-            cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
-        )
-        del triangular
-        chunk_states, new_values = chunk_gated_delta_rule_fwd_h_npu(
-            k=gated_k,
-            w=w,
-            u=u,
-            gk=g,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
-            use_exp2=True,
-        )
-        del w, u, gated_k
-        out = chunk_gla_fwd_o_gk_npu(
-            q=q,
-            v=new_values,
-            g=g,
-            A=query_key,
-            h=chunk_states,
-            out=v,
-            scale=k.shape[-1] ** -0.5,
-            cu_seqlens=query_start_loc,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-        )
-        del query_key, new_values
         if return_intermediate_states:
-            return out, chunk_states.transpose(-1, -2).contiguous()
+            return out, chunk_states
         return out
 
 
@@ -304,6 +280,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             layer, a, b
         )
         track_ssm = self.forward_metadata.has_mamba_track_mask
+
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -323,6 +300,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
         )
+
         if track_ssm:
             core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
@@ -458,7 +436,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             intermediate_states_buffer=intermediate_state,
             intermediate_state_indices=intermediate_indices,
             cache_steps=draft_token_num,
-            lower_bound=None,
             gates_are_preactivated=True,
         )
         if dense_token_indices is None:
@@ -599,6 +576,8 @@ class AscendKDAHybridLinearAttnBackend:
                             mamba_steps_to_track,
                         )
                     else:
+                        # No-op self-copy for non-tracked entries so we never run
+                        # bool-mask indexing (aten::nonzero) or a host numel check.
                         track_mask = mamba_steps_to_track >= 0
                         src_slots = torch.where(
                             track_mask, dst_indices_tensor, mamba_track_indices

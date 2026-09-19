@@ -16,7 +16,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -861,7 +860,7 @@ class Glm5NextModel(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1123,7 +1122,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             and getattr(text_config, "q_lora_rank", None) is not None
         )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
