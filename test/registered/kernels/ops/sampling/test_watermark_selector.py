@@ -176,7 +176,8 @@ def test_fused_force_matches_torch_truncation(dtype, vocab_size, dual_key):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
+@pytest.mark.parametrize("max_probability", [0.7, 1.0])
+def test_finite_top_k_fast_path_matches_sort_with_ties(dtype, max_probability):
     vocab_size = 8193
     token_ids = torch.arange(vocab_size, device="cuda", dtype=torch.float32)
     logits = torch.stack(
@@ -209,6 +210,7 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
         top_ps,
         min_ps,
         keys,
+        max_probability=max_probability,
     )
     fast_logits = logits.clone()
     fast_selected = force_watermark_tokens_triton(
@@ -221,6 +223,7 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
         min_ps,
         keys,
         max_top_k=64,
+        max_probability=max_probability,
     )
 
     assert torch.equal(fast_selected, sort_selected)
@@ -246,6 +249,7 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
         keys,
         keys_b,
         mixing_thresholds,
+        max_probability=max_probability,
     )
     dual_fast_logits = logits.clone()
     dual_fast_selected = force_watermark_tokens_triton(
@@ -260,6 +264,7 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
         keys_b,
         mixing_thresholds,
         max_top_k=64,
+        max_probability=max_probability,
     )
 
     assert torch.equal(dual_fast_selected, dual_sort_selected)

@@ -98,6 +98,11 @@ class ExecFeatures(msgspec.Struct):
         float,
         "Probability of selecting watermark key A at each eligible position.",
     ] = 0.5
+    watermark_max_probability: A[
+        float,
+        "Skip watermark forcing when the truncated distribution's maximum "
+        "probability exceeds this value.",
+    ] = 1.0
     watermark_config: A[
         Optional[str],
         "Path to a JSON file containing key, optional key_b, and context_window.",

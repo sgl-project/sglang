@@ -37,6 +37,7 @@ def check_watermark_server_args(server_args: Any) -> None:
             cfg.watermark_key_b is not None,
             cfg.watermark_config is not None,
             cfg.watermark_mixing_probability != 0.5,
+            cfg.watermark_max_probability != 1.0,
             cfg.watermark_default_enabled,
             cfg.watermark_enforce_all,
         )
@@ -67,6 +68,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
         raise ValueError("--watermark-mixing-probability requires --watermark-key-b")
+    if not 0 < cfg.watermark_max_probability <= 1:
+        raise ValueError(
+            "--watermark-max-probability must be greater than 0 and at most 1"
+        )
     if (
         cfg.watermark_default_enabled or cfg.watermark_enforce_all
     ) and cfg.watermark_key is None:

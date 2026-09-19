@@ -59,6 +59,42 @@ def test_repeated_context_and_greedy_bypass():
     assert state.num_watermarked_contexts.tolist() == [1, 0]
 
 
+def test_low_entropy_bypass_does_not_consume_context():
+    state = WatermarkState(
+        max_num_reqs=1,
+        context_window=2,
+        max_contexts_per_req=8,
+        key="0123456789abcdef",
+        device="cuda",
+        default_enabled=True,
+        max_probability=0.5,
+    )
+    req_pool_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    state.init_from_prompt(req_pool_indices, [[10, 11]])
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((1, 1), device="cuda"),
+        top_ks=torch.tensor([2], device="cuda", dtype=torch.int32),
+        top_ps=torch.ones(1, device="cuda"),
+        min_ps=torch.zeros(1, device="cuda"),
+        max_top_k=2,
+    )
+
+    low_entropy_logits = torch.full((1, 64), -torch.inf, device="cuda")
+    low_entropy_logits[0, :2] = torch.tensor([1.0, 0.0], device="cuda")
+    original = low_entropy_logits.clone()
+    state.force(low_entropy_logits, req_pool_indices, sampling_info)
+
+    assert torch.equal(low_entropy_logits, original)
+    assert state.num_watermarked_contexts[0].item() == 0
+
+    boundary_logits = torch.full((1, 64), -torch.inf, device="cuda")
+    boundary_logits[0, :2] = 0
+    state.force(boundary_logits, req_pool_indices, sampling_info)
+
+    assert torch.isfinite(boundary_logits).sum().item() == 1
+    assert state.num_watermarked_contexts[0].item() == 1
+
+
 @pytest.mark.parametrize("enabled,top_k", [(False, 64), (True, 1)])
 def test_inactive_batch_skips_watermark_state(monkeypatch, enabled, top_k):
     state = WatermarkState(

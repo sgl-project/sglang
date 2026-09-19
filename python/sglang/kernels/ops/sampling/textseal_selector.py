@@ -136,10 +136,12 @@ def _select_topk_watermark_token(
     key,
     key_b,
     mixing_threshold,
+    max_probability_threshold,
     row,
     candidate_count: tl.constexpr,
     BLOCK_K: tl.constexpr,
     DUAL_KEY: tl.constexpr,
+    APPLY_ENTROPY_GATE: tl.constexpr,
 ):
     ranks = tl.arange(0, BLOCK_K)
     in_bounds = ranks < candidate_count
@@ -157,6 +159,12 @@ def _select_topk_watermark_token(
         & ((cumulative - probabilities) <= top_p)
         & (probabilities >= max_probability * min_p)
     )
+    below_probability_threshold = True
+    if APPLY_ENTROPY_GATE:
+        candidate_mass = tl.sum(tl.where(is_candidate, probabilities, 0.0), axis=0)
+        below_probability_threshold = (
+            max_probability / candidate_mass <= max_probability_threshold
+        )
 
     state: tl.uint32 = 0
     state = murmur3_mix(state, (key & 0xFFFFFFFF).to(tl.uint32))
@@ -188,9 +196,10 @@ def _select_topk_watermark_token(
         -float("inf"),
     )
     max_score = tl.max(scores, axis=0)
-    return tl.min(tl.where(scores == max_score, token_ids, 0x7FFFFFFF), axis=0).to(
+    token_id = tl.min(tl.where(scores == max_score, token_ids, 0x7FFFFFFF), axis=0).to(
         tl.int32
     )
+    return token_id, below_probability_threshold
 
 
 @triton.jit
@@ -228,12 +237,14 @@ def _watermark_force_topk_kernel(
     keys,
     keys_b,
     mixing_thresholds,
+    max_probability_threshold,
     output_token_ids,
     vocab_size: tl.constexpr,
     candidate_count: tl.constexpr,
     BLOCK_K: tl.constexpr,
     CLEAR_BLOCK_SIZE: tl.constexpr,
     DUAL_KEY: tl.constexpr,
+    APPLY_ENTROPY_GATE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     row_eligible = tl.load(eligible + row)
@@ -241,7 +252,7 @@ def _watermark_force_topk_kernel(
     key = tl.load(keys + row).to(tl.uint64)
     key_b = tl.load(keys_b + row).to(tl.uint64)
     mixing_threshold = tl.load(mixing_thresholds + row).to(tl.uint64)
-    token_id = _select_topk_watermark_token(
+    token_id, below_probability_threshold = _select_topk_watermark_token(
         topk_probabilities,
         topk_token_ids,
         context_hash,
@@ -251,11 +262,14 @@ def _watermark_force_topk_kernel(
         key,
         key_b,
         mixing_threshold,
+        max_probability_threshold,
         row,
         candidate_count,
         BLOCK_K,
         DUAL_KEY,
+        APPLY_ENTROPY_GATE,
     )
+    row_eligible &= below_probability_threshold
     _force_selected_token(
         logits,
         row,
@@ -368,6 +382,7 @@ def _prepare_watermark_contexts_kernel(
     context_window: tl.constexpr,
     max_contexts_per_req: tl.constexpr,
     HISTORY_BLOCK_SIZE: tl.constexpr,
+    RECORD_CONTEXT: tl.constexpr,
 ):
     row = tl.program_id(0)
     pool_index = tl.load(req_pool_indices + row).to(tl.int64)
@@ -413,12 +428,13 @@ def _prepare_watermark_contexts_kernel(
 
     tl.store(output_context_hashes + row, context_hash.to(tl.int64))
     tl.store(output_eligible + row, eligible)
-    tl.store(
-        watermarked_context_hashes + pool_index * max_contexts_per_req + count,
-        context_hash.to(tl.int32),
-        mask=eligible,
-    )
-    tl.store(num_watermarked_contexts + pool_index, count + 1, mask=eligible)
+    if RECORD_CONTEXT:
+        tl.store(
+            watermarked_context_hashes + pool_index * max_contexts_per_req + count,
+            context_hash.to(tl.int32),
+            mask=eligible,
+        )
+        tl.store(num_watermarked_contexts + pool_index, count + 1, mask=eligible)
 
 
 @triton.jit
@@ -440,6 +456,7 @@ def _watermark_force_topk_with_state_kernel(
     keys,
     keys_b,
     mixing_thresholds,
+    max_probability_threshold,
     output_context_hashes,
     output_eligible,
     output_token_ids,
@@ -451,6 +468,7 @@ def _watermark_force_topk_with_state_kernel(
     HISTORY_BLOCK_SIZE: tl.constexpr,
     CLEAR_BLOCK_SIZE: tl.constexpr,
     DUAL_KEY: tl.constexpr,
+    APPLY_ENTROPY_GATE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     pool_index = tl.load(req_pool_indices + row).to(tl.int64)
@@ -497,7 +515,7 @@ def _watermark_force_topk_with_state_kernel(
     key = tl.load(keys + row).to(tl.uint64)
     key_b = tl.load(keys_b + row).to(tl.uint64)
     mixing_threshold = tl.load(mixing_thresholds + row).to(tl.uint64)
-    token_id = _select_topk_watermark_token(
+    token_id, below_probability_threshold = _select_topk_watermark_token(
         topk_probabilities,
         topk_token_ids,
         context_hash,
@@ -507,11 +525,14 @@ def _watermark_force_topk_with_state_kernel(
         key,
         key_b,
         mixing_threshold,
+        max_probability_threshold,
         row,
         candidate_count,
         BLOCK_K,
         DUAL_KEY,
+        APPLY_ENTROPY_GATE,
     )
+    eligible &= below_probability_threshold
     _force_selected_token(
         logits,
         row,
@@ -769,6 +790,8 @@ def prepare_watermark_contexts_triton(
     top_ks: torch.Tensor,
     output_context_hashes: torch.Tensor,
     output_eligible: torch.Tensor,
+    *,
+    record_context: bool = True,
 ) -> None:
     batch_size = req_pool_indices.shape[0]
     if batch_size == 0:
@@ -790,6 +813,7 @@ def prepare_watermark_contexts_triton(
         context_window=context_window,
         max_contexts_per_req=max_contexts_per_req,
         HISTORY_BLOCK_SIZE=_HISTORY_BLOCK_SIZE,
+        RECORD_CONTEXT=record_context,
         num_warps=8,
     )
 
@@ -855,6 +879,7 @@ def force_watermark_tokens_with_state_triton(
     output_eligible: torch.Tensor,
     output_token_ids: torch.Tensor,
     max_top_k: int,
+    max_probability: float = 1.0,
 ) -> None:
     batch_size, vocab_size = logits.shape
     if batch_size == 0:
@@ -890,6 +915,7 @@ def force_watermark_tokens_with_state_triton(
         keys,
         keys_b,
         mixing_thresholds,
+        max_probability,
         output_context_hashes,
         output_eligible,
         output_token_ids,
@@ -901,6 +927,7 @@ def force_watermark_tokens_with_state_triton(
         HISTORY_BLOCK_SIZE=_HISTORY_BLOCK_SIZE,
         CLEAR_BLOCK_SIZE=_CLEAR_BLOCK_SIZE,
         DUAL_KEY=dual_key,
+        APPLY_ENTROPY_GATE=max_probability < 1.0,
         num_warps=8,
     )
 
@@ -921,6 +948,7 @@ def force_watermark_tokens_triton(
     partial_scores: torch.Tensor | None = None,
     partial_token_ids: torch.Tensor | None = None,
     output_token_ids: torch.Tensor | None = None,
+    max_probability: float = 1.0,
 ) -> torch.Tensor:
     if (keys_b is None) != (mixing_thresholds is None):
         raise ValueError(
@@ -960,18 +988,29 @@ def force_watermark_tokens_triton(
             keys,
             keys_b,
             mixing_thresholds,
+            max_probability,
             output_token_ids,
             vocab_size=vocab_size,
             candidate_count=max_top_k,
             BLOCK_K=triton.next_power_of_2(max_top_k),
             CLEAR_BLOCK_SIZE=_CLEAR_BLOCK_SIZE,
             DUAL_KEY=dual_key,
+            APPLY_ENTROPY_GATE=max_probability < 1.0,
             num_warps=8,
         )
         return output_token_ids
 
     sorted_probabilities, sorted_token_ids = probabilities.sort(dim=-1, descending=True)
     cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
+    if max_probability < 1.0:
+        ranks = torch.arange(vocab_size, device=logits.device).view(1, -1)
+        keep = ranks < top_ks.view(-1, 1)
+        keep &= (cumulative_probabilities - sorted_probabilities) <= top_ps.view(-1, 1)
+        keep &= sorted_probabilities >= (
+            sorted_probabilities[:, :1] * min_ps.view(-1, 1)
+        )
+        candidate_mass = torch.where(keep, sorted_probabilities, 0.0).sum(dim=-1)
+        eligible &= sorted_probabilities[:, 0] / candidate_mass <= max_probability
 
     num_splits = watermark_selector_num_splits(vocab_size)
     partial_size = batch_size * num_splits

@@ -430,7 +430,8 @@ def force_watermark_tokens(
     partial_scores: Optional[torch.Tensor] = None,
     partial_token_ids: Optional[torch.Tensor] = None,
     output_token_ids: Optional[torch.Tensor] = None,
-) -> None:
+    max_probability: float = 1.0,
+) -> torch.Tensor:
     if logits.is_cuda:
         try:
             from sglang.kernels.ops.sampling.textseal_selector import (
@@ -439,7 +440,7 @@ def force_watermark_tokens(
         except ImportError:
             pass
         else:
-            force_watermark_tokens_triton(
+            selected = force_watermark_tokens_triton(
                 logits,
                 context_hashes,
                 eligible,
@@ -454,15 +455,17 @@ def force_watermark_tokens(
                 partial_scores=partial_scores,
                 partial_token_ids=partial_token_ids,
                 output_token_ids=output_token_ids,
+                max_probability=max_probability,
             )
-            return
+            return eligible & (selected >= 0)
 
     probabilities = _truncate_probabilities(
         logits, temperatures, top_ks, top_ps, min_ps
     )
+    eligible = eligible & (probabilities.amax(dim=-1) <= max_probability)
     rows = eligible.nonzero(as_tuple=True)[0]
     if rows.numel() == 0:
-        return
+        return eligible
     candidate_probabilities = probabilities[rows].to(torch.float32).contiguous()
     candidate_context_hashes = context_hashes[rows].contiguous()
     candidate_keys = keys[rows].contiguous()
@@ -501,6 +504,7 @@ def force_watermark_tokens(
         )
     logits[rows] = -torch.inf
     logits[rows, selected] = 0.0
+    return eligible
 
 
 class WatermarkState:
@@ -515,6 +519,7 @@ class WatermarkState:
         vocab_size: int = 0,
         key_b: Optional[str] = None,
         mixing_probability: float = 0.5,
+        max_probability: float = 1.0,
         default_enabled: bool = False,
         enforce_all: bool = False,
     ) -> None:
@@ -527,7 +532,12 @@ class WatermarkState:
             raise ValueError(
                 "watermark mixing probability must be strictly between 0 and 1"
             )
+        if not 0 < max_probability <= 1:
+            raise ValueError(
+                "watermark max probability must be greater than 0 and at most 1"
+            )
         self.mixing_threshold = int(mixing_probability * (1 << 32))
+        self.max_probability = max_probability
         self.default_enabled = default_enabled
         self.enforce_all = enforce_all
         self.context_window = context_window
@@ -600,6 +610,7 @@ class WatermarkState:
         vocab_size: int = 0,
         key_b: Optional[str] = None,
         mixing_probability: float = 0.5,
+        max_probability: float = 1.0,
         default_enabled: bool = False,
         enforce_all: bool = False,
     ) -> Optional[WatermarkState]:
@@ -613,6 +624,7 @@ class WatermarkState:
             key=key,
             key_b=key_b,
             mixing_probability=mixing_probability,
+            max_probability=max_probability,
             device=device,
             default_enabled=default_enabled,
             enforce_all=enforce_all,
@@ -992,7 +1004,7 @@ class WatermarkState:
         partial_scores, partial_token_ids, output_token_ids = (
             self._ensure_selection_buffers(logits.shape[0], logits.shape[1])
         )
-        force_watermark_tokens(
+        selected = force_watermark_tokens(
             logits=logits,
             context_hashes=context_hashes,
             eligible=selected,
@@ -1009,6 +1021,7 @@ class WatermarkState:
             partial_scores=partial_scores,
             partial_token_ids=partial_token_ids,
             output_token_ids=output_token_ids,
+            max_probability=self.max_probability,
         )
         return context_hashes, selected
 
@@ -1108,6 +1121,7 @@ class WatermarkState:
                         eligible,
                         output_token_ids,
                         max_top_k,
+                        self.max_probability,
                     )
                     return
                 prepare_watermark_contexts_triton(
@@ -1122,8 +1136,9 @@ class WatermarkState:
                     sampling_info.top_ks,
                     context_hashes,
                     eligible,
+                    record_context=False,
                 )
-                force_watermark_tokens(
+                selected = force_watermark_tokens(
                     logits=logits,
                     context_hashes=context_hashes,
                     eligible=eligible,
@@ -1138,7 +1153,9 @@ class WatermarkState:
                     partial_scores=partial_scores,
                     partial_token_ids=partial_token_ids,
                     output_token_ids=output_token_ids,
+                    max_probability=self.max_probability,
                 )
+                self._record_contexts(req_pool_indices, context_hashes, selected)
                 return
 
         contexts, context_lengths = self.contexts_tail(
@@ -1151,7 +1168,7 @@ class WatermarkState:
             & (context_lengths > 0)
         )
         selected = self._new_context_mask(req_pool_indices, context_hashes, eligible)
-        force_watermark_tokens(
+        selected = force_watermark_tokens(
             logits=logits,
             context_hashes=context_hashes,
             eligible=selected,
@@ -1174,6 +1191,7 @@ class WatermarkState:
             partial_scores=partial_scores,
             partial_token_ids=partial_token_ids,
             output_token_ids=output_token_ids,
+            max_probability=self.max_probability,
         )
         self._record_contexts(req_pool_indices, context_hashes, selected)
 

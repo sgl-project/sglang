@@ -202,6 +202,20 @@ def test_dual_key_mixing_probability_is_open_interval(mixing_probability):
         check_watermark_server_args(server_args)
 
 
+@pytest.mark.parametrize("max_probability", [0.0, 1.01])
+def test_watermark_max_probability_is_validated(max_probability):
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key="0123456789abcdef",
+        watermark_max_probability=max_probability,
+    )
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="greater than 0 and at most 1"):
+        check_watermark_server_args(server_args)
+
+
 def test_dual_key_requires_complete_server_config():
     server_args = ServerArgs(
         model_path="dummy",

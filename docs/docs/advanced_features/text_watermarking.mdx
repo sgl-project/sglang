@@ -56,6 +56,7 @@ The server arguments are:
 | `--watermark-key HEX` | unset | Makes a server-owned 64-bit key available to opted-in or default-enabled requests. Prefer the file option. |
 | `--watermark-key-b HEX` | unset | Opts into dual-key mode with a second server-owned 64-bit key. Requires a primary server key. |
 | `--watermark-mixing-probability P` | `0.5` | In dual-key mode, sets the probability of selecting key A at each eligible position. Must be strictly between 0 and 1. |
+| `--watermark-max-probability P` | `1.0` | Skips forcing when the maximum probability after truncation and renormalization exceeds `P`. Must be greater than 0 and at most 1. |
 | `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select, from 1 to 64 tokens. |
 | `--watermark-default-enabled` | disabled | Uses the server key when a request omits the `watermark` field. Requests may still opt out. |
 | `--watermark-enforce-all` | disabled | Uses the server key by default and rejects `{"enabled": false}`. |
@@ -142,6 +143,12 @@ the repeated position uses ordinary sampling. This prevents a repeated context
 from forcing the same token indefinitely and matches the detector's one-score-
 per-context rule. Greedy requests (`temperature=0`, normalized internally to
 `top_k=1`) also use ordinary token selection and carry no watermark signal.
+
+Set `--watermark-max-probability` below 1 to leave low-entropy positions
+unchanged. Skipped positions are not added to repeated-context history, so the
+same context remains eligible at a later higher-entropy position. This option
+can improve speculative draft acceptance, but its ordinary-sampling positions
+dilute the detector statistic.
 
 In dual-key mode, each eligible context deterministically selects key A with
 probability `P` and key B otherwise. Both token hashes are evaluated in the same
@@ -269,6 +276,8 @@ signal.
 
 - `temperature=0` produces no signal. Very low-entropy distributions also leave
   few meaningful alternatives for the selector.
+- A `--watermark-max-probability` value below 1 weakens detection in exchange
+  for preserving ordinary selection at low-entropy positions.
 - Short completions provide few independent contexts and therefore weak
   statistical power.
 - Paraphrasing, rewriting, translation, and retokenization can weaken or remove
