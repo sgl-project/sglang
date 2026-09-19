@@ -275,7 +275,7 @@ class ResponseParser:
                     self._accumulate(events, self._buffer[self._pos : m.start()])
                 self._pos = m.end()
                 if kind == "open":
-                    self._close_current(events, start=m.start(), end=m.start())
+                    self._close_current(events, end=m.start())
                     self._open_explicit(events, field, m)
                 else:  # "close" (always the implicit region's close here,
                     #   since explicit regions only expose their own close)
@@ -283,7 +283,6 @@ class ResponseParser:
                     self._close_current(
                         events,
                         raw=m.group(0),
-                        start=m.start(),
                         end=m.end(),
                         closed=True,
                     )
@@ -441,7 +440,6 @@ class ResponseParser:
         self,
         events: list[dict],
         raw: str = "",
-        start: int | None = None,
         end: int | None = None,
         closed: bool = False,
     ) -> None:
@@ -453,7 +451,7 @@ class ResponseParser:
             return
         field = self._spec.fields[self._current]
         end = self._pos if end is None else end
-        start = end - len(raw) if start is None else start
+        start = end - len(raw)
         try:
             value = process_field(self._body, field, self._captures)
             if self._tool_params:
