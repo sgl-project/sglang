@@ -105,6 +105,20 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 
+    def test_lmcache_storage_backend_type(self):
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(),
+            tree_cache=SimpleNamespace(),
+            ps=SimpleNamespace(),
+            server_args=SimpleNamespace(enable_lmcache=True),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: True,
+        )
+
+        self.assertEqual(streamer._get_storage_backend_type(), "LMCache")
+
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
 
