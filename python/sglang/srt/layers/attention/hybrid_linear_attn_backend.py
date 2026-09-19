@@ -377,8 +377,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary. Also returns ``track_ssm_h_batch_src``: the batch rows of
-        the unaligned tracked seqs, used to integer-index the fp32 snapshot
-        buffer on the KDA path so the copy stays free of GPU syncs."""
+        the unaligned tracked seqs (see ForwardMetadata)."""
         state_chunk_size = self.mamba_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
@@ -921,11 +920,8 @@ class MambaAttnBackendBase(AttentionBackend):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`).
 
-        Unaligned rows read the fp32 ``h_track_buf`` snapshot written in-kernel
-        when given (its rows follow the batch, selected by the integer index
-        ``track_ssm_h_batch_src`` — a boolean mask would nonzero() and sync the
-        stream once per layer); otherwise they fall back to the per-chunk
-        states ``h`` (already rounded to the activation dtype)."""
+        Unaligned rows read the in-kernel fp32 ``h_track_buf`` snapshot when
+        given, else fall back to the per-chunk states ``h``."""
         if forward_metadata.has_mamba_track_mask:
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.

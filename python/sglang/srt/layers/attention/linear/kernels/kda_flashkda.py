@@ -87,8 +87,6 @@ class FlashKDAKernel(LinearAttnKernelBase):
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
-    # Tracked batches always take the Triton fallback, which forwards the
-    # fp32 snapshot arguments (see _triton_fallback).
     supports_track_state_snapshot: bool = True
 
     def decode(
