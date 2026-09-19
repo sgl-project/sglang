@@ -1484,6 +1484,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                obj.positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1536,6 +1542,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1556,6 +1568,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_positional_embed_overrides_hidden_dim(
+        self,
+        positional_embed_overrides: Optional[PositionalEmbeds],
+    ) -> None:
+        """Validate the positional embed overrides reaching the scheduler.
+
+        Called from ``_create_tokenized_object``, which always operates on a
+        single request: batch and score requests are split via ``obj[i]`` before
+        this point, and ``__getitem__`` already reduces a per-item list to its
+        i-th element. The only valid shapes here are therefore a single
+        ``PositionalEmbeds`` or ``None``; a list is rejected rather than iterated,
+        since ``TokenizedGenerateReqInput``/``TokenizedEmbeddingReqInput`` are
+        typed ``Optional[PositionalEmbeds]`` and a list (even ``[null]``) would
+        otherwise be forwarded and fail opaquely inside the scheduler.
+
+        The field is typed ``Any`` on the request dataclasses and those are used
+        directly as FastAPI bodies, so arbitrary JSON can land here. Anything that
+        is not the expected type is rejected with ValueError (mapped to HTTP 400)
+        rather than forwarded: msgpack encoding is untyped, so a malformed value
+        encodes fine and then fails ``msgpack_decode`` inside the scheduler's
+        receive loop, which only catches ``zmq.ZMQError`` and would take the
+        scheduler process down.
+        """
+        if positional_embed_overrides is None:
+            return
+        if not isinstance(positional_embed_overrides, PositionalEmbeds):
+            raise ValueError(
+                "positional_embed_overrides must be a PositionalEmbeds or null, got "
+                f"{type(positional_embed_overrides).__name__}."
+            )
+        positional_embed_overrides.validate_hidden_dim(self.model_config.hidden_size)
 
     @staticmethod
     def _resolve_embed_overrides(
