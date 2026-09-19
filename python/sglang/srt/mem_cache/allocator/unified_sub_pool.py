@@ -292,7 +292,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        kernel_page_multiplier: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -316,13 +315,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Kernel-facing page-stride scale, from the spec that owns the layout;
-        # `kernel_page_multiplier=` overrides it only for tests.
-        self.kernel_page_multiplier = (
-            spec.blocks_per_page()
-            if kernel_page_multiplier is None
-            else kernel_page_multiplier
-        )
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
@@ -1049,13 +1041,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Virtual token ids -> kernel-facing ids:
+        """Virtual token ids -> kernel-facing ids, which under the token-major
+        views are the physical token ids:
 
-            kernel_id(t) = (t // ps) * (ps * kernel_page_multiplier) + t % ps
+            kernel_id(t) = v2p[t // ps] * ps + t % ps
 
-        Internal machinery (compaction, in-flight write sets) MUST keep using
-        `translate_kv_loc`: kernel-facing ids are for kernels only. Tombstones (-1)
-        clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
+        Same id as `translate_kv_loc` for any mapped virtual token; this one
+        is one Triton launch, and it is the path that sends an unmapped or
+        negative loc to id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
@@ -1086,7 +1079,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,
-            stride=self.pool_page_size * self.kernel_page_multiplier,
+            stride=self.pool_page_size,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,
