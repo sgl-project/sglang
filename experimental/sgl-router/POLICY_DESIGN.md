@@ -50,7 +50,7 @@ src/
   buckets.rs                    Bucket resolution and engine-group selection
   policies/
     mod.rs                      Policy contract and construction
-    admission.rs                Acceptance checks and placement
+    admission.rs                Per-engine acceptance checks
     cache_aware.rs               Cache selection and local/remote adapter
     session_aware.rs             Session selection and fallback
     sticky.rs                   Routing-key selection and fallback
@@ -202,7 +202,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 ```
 
 `PickContext` contains only attempt-local observations. Admission receives the
-same context through `before`/`after` and `EngineAdmission::check`. Nested fallback
+same context through `EngineAdmission::check`. Nested fallback
 uses `pick_fallback(..., context)`, which calls the fallback's `pick_with_context`
 without creating another context. Buckets and HTTP handlers continue to call
 `Policy::pick` with only candidates and request facts; they never supply state
@@ -218,7 +218,7 @@ no HTTP body, bucket resolver, state handles, snapshots, or backend configuratio
 | `Pick` | The chosen engine belongs to the supplied set and passed admission |
 | `NoMatchingBucket` | No bucket supports the requested length |
 | `NoCandidates` | No eligible member or policy selection miss |
-| `NoAdmissibleEngine` | Before-selection checks rejected all candidates |
+| `NoAdmissibleEngine` | A policy exhausted its candidates; includes rejection reasons |
 | `AdmissionRejected` | The chosen engine failed after-selection admission |
 | `InvalidSignal` / `InvalidConfiguration` | Invalid policy input or configuration |
 | `OutsideCandidates` | Policy returned an engine outside its exact candidate set |
@@ -237,21 +237,17 @@ change buckets, or mutate affinity.
 | `QueueLimitAdmission` | Engine-reported waiting requests are below the limit |
 | `AllOfAdmission` | Every attached check allows the request |
 
-One `EngineAdmission` interface supports checking an engine or a list of engines
-against the same prepared context. Batch results preserve input order and carry
-one decision per engine. Filtering cannot add candidates. Invalid inputs are
-errors, distinct from an explicit acceptance rejection.
+`EngineAdmission::check(engine, request, context)` checks one engine and returns
+`Allow`, `Reject(reason)`, or an error for invalid inputs. Policies attach the
+checker directly as `Arc<dyn EngineAdmission>`. There is no placement setting,
+filtering wrapper, or before/after API; each policy decides where checking
+belongs in its selection algorithm.
 
-Each policy has an admission attachment and a placement:
-
-| Placement | Execution | On rejection |
-| --- | --- | --- |
-| `BeforeSelection` | Prepare signals, filter candidates through admission, then select | Return `NoAdmissibleEngine` if none survive |
-| `AfterSelection` | Prepare signals, select an engine, then check it | Return `AdmissionRejected`; do not silently try another engine |
-
-Both placements return `NoCandidates` for an empty original set. If a cache
-policy prefers A but only B passes admission, before-selection can choose B;
-after-selection rejects A and the handler advances to the next compatible bucket.
+Power-of-two first selects an engine, then calls admission exactly once on that
+engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
+resample, choose the other sampled engine, or run a policy fallback. No candidates
+returns `NoCandidates` without invoking admission. The empty and single-candidate
+paths are implemented; two-candidate sampling and load comparison remain in #40271.
 
 Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
@@ -296,7 +292,7 @@ fallback within the group; hard admission rejection remains an error.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
 with round-robin as the default. Nested fallbacks use `AllowAll`; the owning
-policy applies hard admission once at its configured placement.
+policy explicitly checks the engine returned by its fallback.
 
 ### Cache-aware behavior
 
@@ -307,8 +303,8 @@ set. Its responsibilities are:
 2. Apply minimum matched-token and optional ratio thresholds.
 3. Bound candidates using prefix/pressure ordering and the configured minimum,
    ratio, and maximum worker counts.
-4. Apply the soft queue gate and saturation rules, together with hard admission
-   at its configured placement.
+4. Apply the soft queue gate and saturation rules, and call admission explicitly
+   as required by the cache policy's candidate-selection algorithm.
 5. Choose among usable prefix holders using uncached work, the switch margin,
    and the pressure guard.
 6. On a miss, run the load fallback, preferring engines admitted by the soft
@@ -394,9 +390,9 @@ a duplicate local cache tree.
 atomic updates. Policies decide when to reuse or replace an assignment.
 
 Concurrent first assignments must converge on an effective binding that is
-still a candidate and passes admission. Before-selection requires membership in
-the admitted subset; after-selection must check a different engine returned by
-a concurrent binding. Reconcile conflicts with bounded retry.
+still a candidate and passes admission. If a concurrent binding returns a
+different engine, the policy must check that engine before returning it.
+Reconcile conflicts with bounded retry.
 
 Create or replace a binding only after admission succeeds. A binding records
 preferred placement, not successful execution, so it may remain if later PD
@@ -419,12 +415,12 @@ buckets:
           worker_ids: [P1, P2]
           policy:
             type: cache_aware
-            admission: {type: capacity, placement: before_selection}
+            admission: {type: capacity}
         decode:
           worker_ids: [D1, D2]
           policy:
             type: power_of_two
-            admission: {type: capacity, placement: before_selection}
+            admission: {type: capacity}
 
   - id: long-context
     rank: 20
@@ -436,12 +432,12 @@ buckets:
           worker_ids: [P3, P4]
           policy:
             type: cache_aware
-            admission: {type: capacity, placement: before_selection}
+            admission: {type: capacity}
         decode:
           worker_ids: [D3, D4]
           policy:
             type: power_of_two
-            admission: {type: capacity, placement: after_selection}
+            admission: {type: capacity}
 ```
 
 A request with 4k input tokens and a 16k expected peak cannot fit the short
@@ -481,11 +477,11 @@ do not accept and ignore them.
   four sticky fallback choices. Global modes need a bucket-first migration design.
 - Translate `--filter overloaded` and `--max-in-flight` into
   `InFlightLimitAdmission`, composed with other checks through `AllOfAdmission`.
-- When migrating existing configuration, attach before-selection capacity
-  checks to plain/prefill power-of-two, session-aware, cache-aware, and decode
-  power-of-two. Retain applicable pending-prefill and in-flight checks, including
-  their missing-report behavior. Other paths use `AllowAll` unless a check is
-  configured. Never silently discard a configured budget.
+- Preserve configured capacity, pending-prefill, and in-flight checks, including
+  their missing-report behavior. Power-of-two applies admission to its selected
+  engine; other policies explicitly place checks in their selection logic.
+  Other paths use `AllowAll` unless a check is configured. Never silently discard
+  a configured budget.
 
 Listener and shutdown configuration, discovery, worker health and circuit
 breakers, tokenizer loading, request timeouts, sampling overrides, and logging
@@ -496,6 +492,7 @@ validation, including dispatch-time breaker probes and request cancellation.
 
 | Behavior | Target |
 | --- | --- |
+| Power-of-two admission | Check only the chosen engine; rejection advances to the next bucket |
 | Round-robin cursor | One cursor per role-group policy instance |
 | Capacity exhaustion | Try the next compatible bucket; return accumulated rejection details if all fail |
 | Primary/backup proposals and post-policy substitution | Removed; each policy returns one engine |
@@ -543,7 +540,8 @@ Implemented here:
 - `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
-- `Policy::pick`, within-group fallback interface, admission placement, and `AllowAll`.
+- `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
+  and `AllowAll`. Power-of-two checks its selected engine with no replacement on rejection.
 - Policy-owned load dependency and a fresh `PickContext` per group attempt.
   Admission, selection, and nested fallback share lazy snapshots per source.
   `PickRequest` and bucket APIs carry no load state or observation context.
@@ -558,7 +556,7 @@ in a separate PR, followed by remaining policies and production configuration.
 
 Not yet implemented in the reorg path:
 
-- Concrete power-of-two selection (its body is still a placeholder), other
+- Power-of-two sampling/load comparison for multiple candidates, other
   policies, and capacity/in-flight admission checks.
 - SLO estimates, targets, and bucket preference ordering.
 - CLI/configuration parsing, validation, and model-specific construction.
