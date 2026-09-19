@@ -2300,16 +2300,13 @@ class KVCacheConfigurator:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = get_schedule().max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.attn_dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
-        else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
+        requested_per_worker, max_num_reqs = estimate_max_running_requests(
+            token_capacity=token_capacity,
+            context_len=self.model_config.context_len,
+            server_args=self.server_args,
+            attn_dp_size=self.attn_dp_size,
+            mamba_req_cap=None,
+        )
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
@@ -2351,6 +2348,48 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def _estimate_req_to_token_pool_bytes(self, available_bytes: int) -> int:
+        """Bytes to carve out of the KV budget for the req_to_token map.
+
+        _init_pools allocates the req_to_token pool *before* the KV pools, out
+        of the same free memory the budget is measured against, but its size
+        (num_req_slots x max_context_len x int32) is not part of any per-token
+        cell_size. For long-context models this is gigabytes (e.g. a 1M-context
+        model hits the 2048-request floor and costs ~8 GiB), so KV pools sized
+        to the full budget OOM in the tail sub-pool.
+
+        One-iteration fixed point: a provisional token capacity T0 is an upper
+        bound (the budget only shrinks after the deduction), the request
+        estimate is monotone in token capacity and clamped to [2048, 4096], so
+        deducting for the T0 estimate and re-sizing yields T1 <= T0 whose own
+        request estimate never exceeds the deducted one -- a single pass never
+        under-deducts.
+        """
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mamba_req_cap = None
+        if self.mambaish_config is not None:
+            mamba_req_cap = (
+                get_schedule().max_mamba_cache_size // self._calculate_mamba_ratio()
+            )
+
+        configurator = create_memory_pool_configurator(self)
+        provisional = configurator.calculate_pool_sizes(
+            available_bytes, get_schedule().page_size
+        )
+        provisional_tokens = self._apply_token_constraints(
+            provisional.max_total_num_tokens
+        )
+        return estimate_req_to_token_pool_bytes(
+            token_capacity=provisional_tokens,
+            context_len=self.model_config.context_len,
+            server_args=self.server_args,
+            attn_dp_size=self.attn_dp_size,
+            mamba_req_cap=mamba_req_cap,
+        )
+
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -2360,7 +2399,15 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self.config_from_budget(available_bytes)
+        # Charge the req_to_token map against the budget before sizing the
+        # token pools; it is allocated first out of the same free memory.
+        req_pool_bytes = self._estimate_req_to_token_pool_bytes(available_bytes)
+        if req_pool_bytes > 0:
+            logger.info(
+                f"Reserving {req_pool_bytes / (1 << 30):.2f} GB of the KV cache "
+                "budget for the req_to_token pool."
+            )
+        config = self.config_from_budget(max(available_bytes - req_pool_bytes, 0))
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
@@ -2632,3 +2679,87 @@ def calculate_mla_kv_cache_dim(
         )
 
     return kv_cache_dim
+
+
+def estimate_max_running_requests(
+    token_capacity: int,
+    context_len: int,
+    server_args: ServerArgs,
+    attn_dp_size: int,
+    mamba_req_cap: Optional[int] = None,
+) -> int:
+    """Single source of truth for the max_running_requests derivation.
+
+    Called twice per boot with the same formula so the two call sites can
+    never drift apart:
+    - KVCacheConfigurator._estimate_req_to_token_pool_bytes sizes the
+      req_to_token pool deduction during memory profiling (one-iteration
+      estimate from a provisional token capacity);
+    - KVCacheConfigurator.resolve_max_num_reqs resolves the final
+      max_running_requests once token capacity is fixed.
+
+    ``mamba_req_cap`` is the hybrid-mamba state-cache clamp
+    (max_mamba_cache_size // mamba_ratio); pass None for non-mamba models.
+    """
+    # Estimate pool size (used as upper bound when user specifies max_running_requests)
+    estimated = int(token_capacity / context_len * 512)
+    estimated = max(min(estimated, 4096), 2048)
+
+    # Read through the resolution view: hooks (e.g. the DSV4 default of 256)
+    # declare max_running_requests without writing the raw field, so a direct
+    # field read here would miss the declaration and silently fall into the
+    # estimated branch, desynchronizing the c128_state reservation (sized from
+    # the schedule bag) from the pool actually allocated (sized from this).
+    max_num_reqs = resolving_view(server_args).max_running_requests
+    if max_num_reqs is not None:
+        requested_per_worker = max_num_reqs // attn_dp_size
+        max_num_reqs = min(requested_per_worker, token_capacity // 2)
+    else:
+        requested_per_worker = None
+        max_num_reqs = min(estimated, token_capacity // 2)
+
+    if mamba_req_cap is not None:
+        max_num_reqs = min(max_num_reqs, mamba_req_cap)
+    return requested_per_worker, max_num_reqs
+
+
+def get_req_to_token_pool_num_slots(max_num_reqs: int, server_args: ServerArgs) -> int:
+    """Rows in the req_to_token map for a given max_running_requests.
+
+    The +1 is the padding row at index 0 (ReqToTokenPool._alloc_size); decode
+    mode additionally subscribes rows for pre-allocated in-transfer requests
+    (DecodeReqToTokenPool._alloc_size).
+    """
+    num_slots = max_num_reqs + 1
+    # Read through the resolution view (matching estimate_max_running_requests
+    # above): disaggregation_mode / disaggregation_decode_extra_slots are
+    # resolvable disagg-bag fields, so a raw server_args.<field> read would miss
+    # hook declarations. The rest of this module reads them via get_disagg().
+    view = resolving_view(server_args)
+    if view.disaggregation_mode == "decode":
+        num_slots += view.disaggregation_decode_extra_slots or 0
+    return num_slots
+
+
+def estimate_req_to_token_pool_bytes(
+    token_capacity: int,
+    context_len: int,
+    server_args: ServerArgs,
+    attn_dp_size: int,
+    mamba_req_cap: Optional[int] = None,
+) -> int:
+    """GPU bytes the req_to_token map will occupy for this token capacity
+    (num_slots x max_context_len x int32)."""
+    _, max_num_reqs = estimate_max_running_requests(
+        token_capacity=token_capacity,
+        context_len=context_len,
+        server_args=server_args,
+        attn_dp_size=attn_dp_size,
+        mamba_req_cap=mamba_req_cap,
+    )
+    max_context_len = context_len + get_req_to_token_extra_context_len()
+    return (
+        get_req_to_token_pool_num_slots(max_num_reqs, server_args)
+        * max_context_len
+        * 4  # int32
+    )
