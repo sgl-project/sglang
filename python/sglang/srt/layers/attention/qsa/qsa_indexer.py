@@ -628,6 +628,20 @@ class QSAIndexer(MultiPlatformOp):
             row_sequence_lengths,
         )
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        # forward_cuda's fast paths are gated on `tensor.is_cuda`, which is
+        # False for XPU tensors, so it already falls back to the portable
+        # implementation. Reuse it instead of duplicating the orchestration.
+        return self.forward_cuda(
+            hidden_states, positions, forward_batch, indexer_metadata
+        )
+
 
 __all__ = [
     "QSAIndexer",
