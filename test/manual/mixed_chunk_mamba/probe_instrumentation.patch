@@ -1,0 +1,217 @@
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index b1e4ac897..ae45b76d0 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -260,2 +260,27 @@ class MambaAttnBackendBase(AttentionBackend):
+                 )
++                _probe_lens = forward_batch.extend_seq_lens_cpu
++                _probe_mask = forward_batch.mamba_track_mask
++                logger.info(
++                    "[39342] forward mode=%s bs=%d one_token_rows=%s pools=%s "
++                    "tracked=%s",
++                    forward_batch.forward_mode.name,
++                    bs,
++                    (
++                        None
++                        if _probe_lens is None
++                        else sum(1 for _l in _probe_lens if int(_l) == 1)
++                    ),
++                    forward_batch.req_pool_indices.tolist(),
++                    (
++                        None
++                        if _probe_mask is None
++                        else list(
++                            zip(
++                                forward_batch.req_pool_indices[_probe_mask].tolist(),
++                                forward_batch.mamba_track_indices[_probe_mask].tolist(),
++                                forward_batch.mamba_track_seqlens[_probe_mask].tolist(),
++                            )
++                        )
++                    ),
++                )
+                 if has_mamba_track_mask:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index b2036984b..d13b80a4f 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2971,2 +2971,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
++            logger.info(
++                "[39342] claim rid=%s pool=%s slot=%s depth=%s track_seqlen=%s "
++                "last_idx=%s next_idx=%s extend=[%s,%s)",
++                req.rid,
++                req.kv.req_pool_idx,
++                track_index,
++                mamba_track_seqlen_aligned,
++                mamba_track_seqlen,
++                req.kv.mamba_last_track_idx,
++                req.kv.mamba_next_track_idx,
++                len(req.prefix_indices),
++                req.extend_range.end,
++            )
+
+@@ -3077,2 +3090,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         self.is_prefill_only = False
++        logger.info(
++            "[39342] mixed bs=%d extend_rows=%d decode_rows=%d pools=%s rids=%s "
++            "mask=%s seqlens=%s",
++            self.batch_size(),
++            self.batch_size() - running_bs,
++            running_bs,
++            self.req_pool_indices_cpu.tolist(),
++            [r.rid for r in self.reqs],
++            None if self.mamba_track_mask is None else self.mamba_track_mask.tolist(),
++            (
++                None
++                if self.mamba_track_seqlens is None
++                else self.mamba_track_seqlens.tolist()
++            ),
++        )
+
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index e98bdec52..cf8c0da84 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -72,2 +72,23 @@ _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
+
++def _probe_fp(req_to_token_pool, slot) -> tuple:
++    """Validation-only fingerprint of one mamba slot (first mamba layer):
++    (ssm sum, ssm sumsq, ssm absmax, conv sum, conv sumsq). Syncs the GPU."""
++    slot_t = torch.as_tensor([int(slot)], dtype=torch.int64)
++    phys = int(
++        req_to_token_pool.translate_mamba_indices(
++            slot_t.to(req_to_token_pool.device)
++        ).item()
++    )
++    cache = req_to_token_pool.mamba_pool.mamba_cache
++    t = cache.temporal[0][phys].double()
++    c = cache.conv[0][0][phys].double()
++    return (
++        float(t.sum().item()),
++        float((t * t).sum().item()),
++        float(t.abs().max().item()),
++        float(c.sum().item()),
++        float((c * c).sum().item()),
++    )
++
++
+ class TreeNode:
+@@ -658,2 +679,11 @@ class MambaRadixCache(BasePrefixCache):
+             mamba_exist = result.mamba_exist
++            logger.info(
++                "[39342] donate rid=%s kind=finished chunked=False depth=%s slot=%s "
++                "mamba_exist=%s fp=%s",
++                req.rid,
++                cache_len,
++                int(mamba_value.view(-1)[0].item()),
++                mamba_exist,
++                _probe_fp(self.req_to_token_pool, mamba_value.view(-1)[0]),
++            )
+             if mamba_exist and self.int8_ckpt_pool is not None:
+@@ -711,2 +741,3 @@ class MambaRadixCache(BasePrefixCache):
+         if self.disable or cache_len is None:
++            logger.info("[39342] donate-skip rid=%s kind=unfinished", req.rid)
+             return _skip_cache_unfinished_req(req)
+@@ -778,2 +809,12 @@ class MambaRadixCache(BasePrefixCache):
+         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
++        logger.info(
++            "[39342] donate rid=%s kind=unfinished chunked=%s depth=%s slot=%s "
++            "mamba_exist=%s fp=%s",
++            req.rid,
++            chunked,
++            cache_len,
++            int(mamba_value_donated.view(-1)[0].item()),
++            mamba_exist,
++            _probe_fp(self.req_to_token_pool, mamba_value_donated.view(-1)[0]),
++        )
+         if mamba_exist:
+@@ -1211,2 +1252,9 @@ class MambaRadixCache(BasePrefixCache):
+             req.kv.mamba_needs_clear = False
++            logger.info(
++                "[39342] restore rid=%s matched=%d slot=%s fp=%s",
++                req.rid,
++                sum(len(v) for v in value[:best_value_len]),
++                int(last_node.mamba_value.view(-1)[0].item()),
++                _probe_fp(self.req_to_token_pool, last_node.mamba_value.view(-1)[0]),
++            )
+
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
+index 70d7683de..8aee1929d 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
+@@ -58,2 +58,28 @@ if TYPE_CHECKING:
+
++import logging as _probe_logging
++
++_probe_logger = _probe_logging.getLogger(__name__)
++
++
++def _probe_fp(req_to_token_pool, slot) -> tuple:
++    """Validation-only fingerprint of one mamba slot (first mamba layer):
++    (ssm sum, ssm sumsq, ssm absmax, conv sum, conv sumsq). Syncs the GPU."""
++    slot_t = torch.as_tensor([int(slot)], dtype=torch.int64)
++    phys = int(
++        req_to_token_pool.translate_mamba_indices(
++            slot_t.to(req_to_token_pool.device)
++        ).item()
++    )
++    cache = req_to_token_pool.mamba_pool.mamba_cache
++    t = cache.temporal[0][phys].double()
++    c = cache.conv[0][0][phys].double()
++    return (
++        float(t.sum().item()),
++        float((t * t).sum().item()),
++        float(t.abs().max().item()),
++        float(c.sum().item()),
++        float((c * c).sum().item()),
++    )
++
++
+ class MambaComponent(TreeComponent):
+@@ -215,2 +241,9 @@ class MambaComponent(TreeComponent):
+         req.kv.mamba_needs_clear = False
++        _probe_logger.info(
++            "[39342] restore rid=%s matched=%d slot=%s fp=%s",
++            req.rid,
++            len(result.device_indices),
++            int(src_index.view(-1)[0].item()),
++            _probe_fp(self.cache.req_to_token_pool, src_index.view(-1)[0]),
++        )
+         return result
+@@ -565,2 +598,10 @@ class MambaComponent(TreeComponent):
+                 insert_params.mamba_value = active_value
++            _probe_logger.info(
++                "[39342] donate rid=%s kind=finished chunked=NA depth=%s slot=%s "
++                "mamba_exist=? fp=%s",
++                req.rid,
++                cache_len,
++                int(active_value.view(-1)[0].item()),
++                _probe_fp(self.cache.req_to_token_pool, active_value.view(-1)[0]),
++            )
+             return cache_len
+@@ -568,2 +609,3 @@ class MambaComponent(TreeComponent):
+             if cache_len is None:
++                _probe_logger.info("[39342] donate-skip rid=%s kind=unfinished", req.rid)
+                 return 0
+@@ -601,2 +643,12 @@ class MambaComponent(TreeComponent):
+             insert_params.mamba_value = mamba_value_donated
++            _probe_logger.info(
++                "[39342] donate rid=%s kind=unfinished chunked=NA depth=%s slot=%s "
++                "mamba_exist=? fp=%s",
++                req.rid,
++                cache_len,
++                int(mamba_value_donated.view(-1)[0].item()),
++                _probe_fp(
++                    self.cache.req_to_token_pool, mamba_value_donated.view(-1)[0]
++                ),
++            )
+             return cache_len
+@@ -610,2 +662,8 @@ class MambaComponent(TreeComponent):
+     ) -> None:
++        _probe_logger.info(
++            "[39342] donate-result rid=%s is_finished=%s mamba_exist=%s",
++            req.rid,
++            is_finished,
++            None if insert_result is None else insert_result.mamba_exist,
++        )
+         if is_finished:
