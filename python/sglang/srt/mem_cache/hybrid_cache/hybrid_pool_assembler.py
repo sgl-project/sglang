@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost, DSAIndexerStateDesc
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -1140,13 +1140,12 @@ def build_anchor_sidecar_stack(
     *,
     params: CacheInitParams,
     kv_pool: Any,
-    sidecar_pool_name: PoolName,
+    indexer_desc: DSAIndexerStateDesc,
     full_layer_mapping: dict[int, int],
     load_cache_event,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
-    sidecar_host_pool_factory: Callable[[Any], Any],
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
@@ -1163,7 +1162,12 @@ def build_anchor_sidecar_stack(
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
-    sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
+    sidecar_host_pool = DSAIndexerPoolHost(
+        indexer_desc,
+        kv_pool,
+        kv_host_pool,
+        allocator_type=_get_allocator_type(),
+    )
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -1183,7 +1187,7 @@ def build_anchor_sidecar_stack(
             packed_draft_device_pools=mtp_draft_device_pools,
         ),
         build_pool_entry(
-            name=sidecar_pool_name,
+            name=indexer_desc.pool_name,
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
@@ -1796,21 +1800,16 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        indexer_desc = DSAIndexerStateDesc.from_device_pool(full_kv_pool)
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             kv_pool=full_kv_pool,
-            sidecar_pool_name=PoolName.INDEXER,
+            indexer_desc=indexer_desc,
             full_layer_mapping=full_layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
-                full_kv_pool,
-                kv_host_pool,
-                get_memory().hicache_mem_layout,
-                allocator_type=_get_allocator_type(),
-            ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -1822,12 +1821,7 @@ class _DsaStrategy(StackStrategy):
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[
-                SidecarPoolSpec(
-                    pool_name=PoolName.INDEXER,
-                    indices_from_pool=PoolName.KV,
-                ),
-            ],
+            sidecars=[indexer_desc.sidecar_spec()],
             transfer_layer_num=len(full_layer_mapping),
             pools_desc="KV + INDEXER",
         )
@@ -2225,19 +2219,13 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             kv_pool=kv,
-            sidecar_pool_name=PoolName.INDEXER,
+            indexer_desc=DSAIndexerStateDesc.from_device_pool(kv),
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=get_memory().hicache_storage_backend,
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
-                kv,
-                kv_host_pool,
-                get_memory().hicache_mem_layout,
-                allocator_type=_get_allocator_type(),
-            ),
             model_name=get_serving().served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,

@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
 )
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost, DSAIndexerStateDesc
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -82,9 +82,9 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             quant_block_size=4,
         )
         indexer_host = DSAIndexerPoolHost(
+            DSAIndexerStateDesc.from_device_pool(dsa_device_pool),
             dsa_device_pool,
             mla_host,
-            layout="page_first",
             pin_memory=False,
             is_dummy=True,
         )
