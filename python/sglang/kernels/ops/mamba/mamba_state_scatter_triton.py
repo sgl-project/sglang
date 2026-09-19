@@ -220,6 +220,16 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
+def _prepare_src_rows(src: torch.Tensor | None, steps: torch.Tensor) -> torch.Tensor:
+    if src is None:
+        src = torch.arange(steps.shape[0], dtype=torch.int32, device=steps.device)
+    if src.ndim != 1 or src.shape != steps.shape:
+        raise ValueError(
+            f"source indices length mismatch: {src.shape=} vs {steps.shape=}"
+        )
+    return src.to(torch.int32).contiguous()
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
@@ -289,20 +299,10 @@ def fused_mamba_state_scatter_with_mask(
     dst_layer_stride = dst.stride(0)
     dst_req_stride = dst.stride(1)
 
-    if src_indices_raw is None:
-        src_indices_raw = torch.arange(
-            total_requests, dtype=torch.int32, device=step_indices_raw.device
-        )
-    if src_indices_raw.ndim != 1 or src_indices_raw.shape[0] != total_requests:
-        raise ValueError(
-            f"source indices length mismatch: {src_indices_raw.shape=} vs "
-            f"{step_indices_raw.shape=}"
-        )
-
     # Ensure indices are int32 and contiguous
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
-    src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
+    src_indices_raw = _prepare_src_rows(src_indices_raw, step_indices_raw)
 
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
@@ -459,19 +459,9 @@ def fused_conv_window_scatter_with_mask(
     # (unlike the dense scatter).
     _require_entry_contiguous_dst(dst, 2, "fused_conv_window_scatter_with_mask")
 
-    if src_indices_raw is None:
-        src_indices_raw = torch.arange(
-            total_requests, dtype=torch.int32, device=step_indices_raw.device
-        )
-    if src_indices_raw.ndim != 1 or src_indices_raw.shape[0] != total_requests:
-        raise ValueError(
-            f"source indices length mismatch: {src_indices_raw.shape=} vs "
-            f"{step_indices_raw.shape=}"
-        )
-
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
-    src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
+    src_indices_raw = _prepare_src_rows(src_indices_raw, step_indices_raw)
 
     BLOCK_SIZE = 1024
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
