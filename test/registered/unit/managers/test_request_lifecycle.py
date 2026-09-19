@@ -2,11 +2,18 @@
 
 import asyncio
 import importlib.util
+import runpy
 import sys
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+
+# CI parses this no-op registration; load it without importing the engine.
+register_cpu_ci = runpy.run_path(
+    str(Path(__file__).resolve().parents[4] / "python/sglang/test/ci/ci_register.py")
+)["register_cpu_ci"]
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # This module has no engine dependencies. Keep these failure/recovery tests
 # runnable on control-plane hosts without installing torch or GPU kernels.

@@ -23,6 +23,8 @@ import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
@@ -57,7 +59,6 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
