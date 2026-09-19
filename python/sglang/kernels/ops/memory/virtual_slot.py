@@ -204,6 +204,7 @@ def write_loc_to_kernel_id_kernel(
     N,  # runtime: live element count
     W,  # runtime: lanes to write; [N, W) get 0
     stride,  # runtime: pool_page_size (a physical id IS the kernel id)
+    num_v_pages,  # runtime: rows of v2p; a page at or past it is unmapped
     cols,  # runtime: row width of the (rows, cols) view; STRIDED only
     loc_row_stride,  # runtime: element strides of `loc`; STRIDED only
     loc_col_stride,
@@ -256,7 +257,9 @@ def write_loc_to_kernel_id_kernel(
 
     page = loc // PAGE_SIZE if PAGE_SIZE > 1 else loc
     offset = loc % PAGE_SIZE if PAGE_SIZE > 1 else 0
-    # `keep` already excludes negatives, so the gather index is in range.
+    # Torch's gather bounds-checks and `tl.load` does not, so an id past the
+    # table is excluded here rather than read out of bounds.
+    keep = keep & (page < num_v_pages)
     phys = tl.load(v2p_ptr + tl.where(keep, page, 0), mask=mask, other=0).to(tl.int64)
     ids = tl.maximum(phys * stride + offset, 0)
     tl.store(out_ptr + out_off, tl.where(keep, ids, 0), mask=in_range)
@@ -329,7 +332,9 @@ def write_loc_to_kernel_ids(
         if dcp_size > 1:
             keep = keep & (big % dcp_size == dcp_rank)
             big = torch.div(big, dcp_size, rounding_mode="floor")
-        page = torch.where(keep, torch.div(big, page_size, rounding_mode="floor"), 0)
+        page = torch.div(big, page_size, rounding_mode="floor")
+        keep = keep & (page < v2p.numel())
+        page = torch.where(keep, page, 0)
         offset = big % page_size if page_size > 1 else 0
         ids = (v2p[page] * stride + offset).clamp_(min=0)
         ids = torch.where(keep, ids, torch.zeros_like(ids))
@@ -360,6 +365,7 @@ def write_loc_to_kernel_ids(
         N,
         width,
         stride,
+        int(v2p.numel()),
         cols,
         loc_row_stride,
         loc_col_stride,

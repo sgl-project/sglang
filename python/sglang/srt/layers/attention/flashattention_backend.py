@@ -744,9 +744,9 @@ class FlashAttentionBackend(AttentionBackend):
             )
             # Under the unified pool `out_cache_loc` was rebound to FULL-side
             # KERNEL-FACING ids at ForwardBatch construction, so the full->swa
-            # map cannot be re-run on it -- those values index far past the swa
-            # v2p table (a device-side "index out of bounds" assert). Phase 2 of
-            # the write contract derives the swa loc from them instead.
+            # map cannot be re-run on it -- those values index past the swa v2p
+            # table and resolve to the sink, silently. Phase 2 of the write
+            # contract derives the swa loc from them instead.
             swa_write_loc = (
                 self.kv_index_translator.sliding_window_write_loc_for(
                     forward_batch.out_cache_loc

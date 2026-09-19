@@ -400,20 +400,51 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc.translate_kv_loc(page_table, out=dst)
             self.assertTrue(torch.equal(dst.reshape(-1), want))
 
-    def test_a_negative_loc_no_longer_raises(self):
+    def test_a_negative_loc_lands_on_the_sink(self):
         """A padded read table carries -1 in the slots a shorter sequence does
-        not use, and `translate_kv_loc` is now on the path that sees them. The
-        torch gather it used before rejected a negative index outright, which
-        would take the scheduler down; it must resolve to an addressable id
-        instead. WHICH id is not pinned here: this path lets the v2p lookup
-        wrap while the fused kernel sends it to the page-0 sink, and making the
-        two agree is the fold the TODO on `translate_kv_loc` describes."""
+        not use, and `translate_kv_loc` is on the path that sees them."""
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
             got = alloc.translate_kv_loc(torch.tensor([-1], dtype=torch.int64))
-            self.assertTrue(bool((got >= 0).all()), f"ps={ps}: {got}")
-            self.assertTrue(bool((got < alloc.max_slots).all()), f"ps={ps}: {got}")
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_a_loc_past_the_sentinel_lands_on_the_sink(self):
+        """Only `-1` reaches the trailing v2p sentinel; a loc below it floors
+        onto a REAL page, so a translate that merely indexes with it hands back
+        a live slot belonging to another request."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            alloc.virtual_to_physical[-2] = 7  # bind the last real page
+            got = alloc.translate_kv_loc(torch.tensor([-(ps + 1)], dtype=torch.int64))
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_an_out_of_range_loc_lands_on_the_sink(self):
+        """A misuse -- re-running a full->swa map on already-translated ids --
+        indexes past the table; the read must resolve, not fault."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            past = int(alloc.virtual_to_physical.numel()) * ps * 4
+            got = alloc.translate_kv_loc(torch.tensor([past], dtype=torch.int64))
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_translate_accepts_a_strided_page_table(self):
+        """The SWA read path hands down `page_table[:bs, :max_seq_len]`, a
+        column slice of the capture-stable buffer."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            v = alloc.alloc(4 * ps)
+            self.assertIsNotNone(v)
+            want = alloc.translate_kv_loc(v)
+            backing = torch.full((2, 2 * v.numel()), -1, dtype=torch.int64)
+            view = backing[:, : v.numel() // 2]
+            view.copy_(v.view(2, -1))
+            self.assertFalse(view.is_contiguous())
+            got = alloc.translate_kv_loc(view)
+            self.assertEqual(got.shape, view.shape)
+            self.assertTrue(torch.equal(got.reshape(-1), want))
 
     def test_translate_follows_compaction(self):
         alloc = self._build(ps=1)
