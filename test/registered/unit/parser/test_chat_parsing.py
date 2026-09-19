@@ -15,7 +15,7 @@
 # limitations under the License.
 """Tests for the new declarative response_template parser.
 
-All six real-model template fixtures from the legacy test suite are re-expressed
+All seven real-model template fixtures from the legacy test suite are re-expressed
 here in the new region-spec shape and asserted against the same expected
 output dicts. Any divergence indicates a regression in the new executor."""
 
@@ -1131,6 +1131,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual(result, {"role": "assistant"})
         self.assertEqual(final_events, [])
 
+
 class PrefixAndTruncationTest(unittest.TestCase):
     def test_prefix_lands_inside_explicit_region(self):
         """A Qwen-style template emits `<|im_start|>assistant\\n<think>\\n` as the
@@ -1447,7 +1448,7 @@ class ToolArgCoercionTest(unittest.TestCase):
         # Non-tool-call values pass through untouched.
         self.assertEqual(parser._coerce_tool_calls("hello"), "hello")
 
-    def test_schema_types_handles_get_json_schema_dialect(self):
+    def test_schema_types_handles_supported_schema_dialects(self):
         self.assertEqual(_schema_types({"type": "integer"}), ("integer",))
         self.assertEqual(_schema_types({"type": ["integer", "string"]}), ("integer", "string"))
         self.assertEqual(_schema_types({"anyOf": [{"type": "boolean"}, {"type": "string"}]}), ("boolean", "string"))

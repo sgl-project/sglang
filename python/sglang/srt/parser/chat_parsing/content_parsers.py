@@ -40,7 +40,7 @@ def _bool(text: str, args: dict) -> bool:
     return _text(text, args).lower() in ("true", "1")
 
 
-# Sentinel characters for lax-JSON string pre-extraction: ASCII control chars
+# Sentinel characters for lax-JSON string pre-extraction — ASCII control chars
 # that should never appear in real LLM output.
 _LAX_OPEN, _LAX_CLOSE = "\x01", "\x02"
 
@@ -149,7 +149,7 @@ CONTENT_PARSERS = {
     "kv-lines": _kv_lines,
 }
 
-# Parsers whose output is the verbatim body text (modulo whitespace): chunks
+# Parsers whose output is the verbatim body text (modulo whitespace) — chunks
 # from these fields stream with `dirty=False` because each chunk is part of
 # the final value. Structured parsers (`json`, `xml-inline`, `kv-lines`) only
 # produce a meaningful value on close, so their chunks stream raw bytes
