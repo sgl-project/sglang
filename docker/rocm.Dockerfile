@@ -737,8 +737,8 @@ RUN cd sglang \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
-            echo 'transformers==5.12.1' >> /tmp/constraints.txt ; \
-            echo 'tokenizers==0.22.2' >> /tmp/constraints.txt ; \
+            echo 'transformers==5.17.0' >> /tmp/constraints.txt ; \
+            echo 'tokenizers==0.23.2' >> /tmp/constraints.txt ; \
             echo 'huggingface_hub==1.27.0' >> /tmp/constraints.txt ; \
             ;; \
        esac \
@@ -1119,10 +1119,6 @@ RUN cd /tmp/whl \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
-
-# transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
-# (transformers#46618, not yet released).
-RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_utils as m; p=Path(m.__file__); t=p.read_text(); p.write_text(t.replace('Path(resolved_module_file).resolve()','Path(resolved_module_file)').replace('Path(source_file).resolve()','Path(source_file)'))"
 
 # -----------------------
 # Install AMD's ROCm Triton, replacing the base image's. The local version is

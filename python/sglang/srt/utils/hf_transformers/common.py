@@ -264,6 +264,11 @@ try:
 except ImportError:
     pass
 
+# Bare register: `get_config` re-parses every registry entry through the class
+# below, so AutoConfig need not resolve to it.
+#
+# `_LazyAutoMapping` keys on the config class `__name__`, so a differently-named
+# shadow drops out of PROCESSOR/TOKENIZER/MODEL_MAPPING.
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
@@ -277,6 +282,9 @@ for name, cls in _CONFIG_REGISTRY.items():
 # flattened onto the top-level config in `get_config` — the same path the base
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
+#
+# transformers owns `cosmos3_omni` as `Cosmos3OmniConfig`, so the name
+# constraint above means this registration must lose to it.
 try:
     AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
 except ValueError as e:
@@ -289,6 +297,9 @@ except ValueError as e:
 # `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
 # root config after `AutoConfig.from_pretrained`, matching other multimodal
 # configs that use a text sub-config.
+#
+# `exist_ok=True`: no registry re-parse backs these up, so AutoConfig itself
+# must resolve to SGLang's. Safe because they reuse the native class names.
 for _cosmos3_edge_config_cls in (
     Cosmos3EdgeTextConfig,
     Cosmos3EdgeVisionConfig,
@@ -297,16 +308,16 @@ for _cosmos3_edge_config_cls in (
 ):
     try:
         AutoConfig.register(
-            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
+            _cosmos3_edge_config_cls.model_type,
+            _cosmos3_edge_config_cls,
+            exist_ok=True,
         )
     except ValueError as e:
-        err = str(e).lower()
-        if "already registered" not in err and "already used" not in err:
-            logger.warning(
-                "Failed to register config %s: %s",
-                _cosmos3_edge_config_cls.model_type,
-                e,
-            )
+        logger.warning(
+            "Failed to register config %s: %s",
+            _cosmos3_edge_config_cls.model_type,
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------
