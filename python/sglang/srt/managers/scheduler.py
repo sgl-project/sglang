@@ -6084,6 +6084,9 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        # Build host mirror for EPLB async expert weight updates
+        scheduler.tp_worker.model_runner.build_eplb_async_host_mirror()
+
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 

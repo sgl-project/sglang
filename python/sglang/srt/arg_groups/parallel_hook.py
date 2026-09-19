@@ -616,6 +616,22 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_eplb_async:
+        assert cfg.enable_eplb, (
+            "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+            "passed together."
+        )
+        assert cfg.device == "cuda", "EPLB async is only supported on CUDA."
+        assert cfg.elastic_ep_backend is None, (
+            "EPLB async is incompatible with elastic EP."
+        )
+        os.environ["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] = "1"
+        # avoid warmup request timeout
+        os.environ["SGLANG_WARMUP_TIMEOUT"] = "3600"
+
+        if envs.SGLANG_PROFILE_NVTX.get():
+            os.environ["SGLANG_EPLB_RUNTIME_NVTX"] = "1"
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,

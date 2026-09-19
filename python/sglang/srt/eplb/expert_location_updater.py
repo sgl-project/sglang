@@ -11,9 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import atexit
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
 
 import einops
 import torch
@@ -22,6 +24,23 @@ from torch.distributed import P2POp
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
+from sglang.srt.eplb.cpp_async_runtime import (
+    create_eplb_async_runtime,
+)
+from sglang.srt.eplb.cpp_async_runtime import create_layer_plan as create_cpp_layer_plan
+from sglang.srt.eplb.cpp_async_runtime import (
+    create_metadata_field_pair,
+)
+from sglang.srt.eplb.cpp_async_runtime import (
+    create_prepared_plan as create_cpp_prepared_plan,
+)
+from sglang.srt.eplb.cpp_async_runtime import (
+    create_reset_tensor_spec,
+)
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    get_global_eplb_async_host_mirror_manager,
+)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -49,11 +68,180 @@ def _comm_view(t: torch.Tensor) -> torch.Tensor:
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+_LOG_ASYNC_SYNC_DEBUG = get_bool_env_var("SGLANG_EPLB_ASYNC_SYNC_DEBUG")
+_GLOBAL_EXPERT_LOCATION_UPDATER = None
+
+
+def get_global_expert_location_updater():
+    return _GLOBAL_EXPERT_LOCATION_UPDATER
+
+
+def set_global_expert_location_updater(updater):
+    global _GLOBAL_EXPERT_LOCATION_UPDATER
+    _GLOBAL_EXPERT_LOCATION_UPDATER = updater
+
+
+@dataclass
+class _AsyncLayerUpdatePlan:
+    layer_id: int
+    routed_experts_weights: List[torch.Tensor]
+    copy_pairs: List[Tuple[int, int]]
 
 
 class ExpertLocationUpdater:
-    def __init__(self):
+    def __init__(self, enable_async: bool = False):
         self._first_execution = True
+        self._enable_async = enable_async
+        self._prepared_async_layer_ids: Set[int] = set()
+        self._current_step = 0
+        self._registered_atexit = False
+        self._runtime = None
+        self.async_eplb_stream = torch.cuda.Stream()
+        self.layer_id = None
+        self._skip_current_layer = False
+        if self._enable_async and torch.cuda.is_available():
+            self._runtime = create_eplb_async_runtime(torch.cuda.current_device())
+            self._maybe_register_atexit()
+
+    def _maybe_register_atexit(self):
+        if self._registered_atexit:
+            return
+        self._registered_atexit = True
+        atexit.register(self.close)
+
+    def close(self):
+        if self._runtime is None:
+            return
+        self._runtime.shutdown()
+        self._runtime = None
+
+    def _disable_async_due_to_missing_layers(self):
+        logger.warning_once(
+            "EPLB async is disabled because the model does not expose "
+            "routed_experts_weights_of_layer. Expert location updates will "
+            "fall back to no-op behavior for this model."
+        )
+        self.close()
+        self._enable_async = False
+
+    # Register layers with the C++ async runtime.
+    def prepare_async_layers(
+        self, routed_experts_weights_of_layer: Optional[Dict[int, List[torch.Tensor]]]
+    ):
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+        if not routed_experts_weights_of_layer:
+            self._disable_async_due_to_missing_layers()
+            return
+
+        for layer_id in sorted(routed_experts_weights_of_layer):
+            if layer_id in self._prepared_async_layer_ids:
+                continue
+            assert self._runtime is not None
+            self._runtime.register_layer(layer_id)
+            self._prepared_async_layer_ids.add(layer_id)
+
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] prepared_async_layers layer_ids=%s",
+                sorted(self._prepared_async_layer_ids),
+            )
+
+    # give owner to GPU before forward
+    def on_capture_start(self):
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+
+        target_step = self._current_step + 1
+        assert self._runtime is not None
+        self._runtime.prepare_capture_step(target_step)
+
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] capture_prepare step=%s prepared_layers=%s",
+                target_step,
+                sorted(self._prepared_async_layer_ids),
+            )
+
+    # Transfer iteration info to eplb_async_runtime
+    def on_forward_pass_start(self):
+        self._current_step += 1
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+
+        target_step = self._current_step
+        assert self._runtime is not None
+        self._runtime.start_iter(
+            target_step,
+            get_global_expert_distribution_recorder().recording,
+        )
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info("[EPLBAsyncSync] start_iter step=%s", target_step)
+
+    def set_current_layer_id(self, layer_id: int, is_nextn: bool = False):
+        self.layer_id = layer_id
+        self._skip_current_layer = is_nextn
+
+    def wait_gpu_stage(self):
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+        if self._skip_current_layer:
+            return
+        self._ensure_async_layer_prepared(self.layer_id)
+        assert self._runtime is not None
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] layer_wait_gpu_before layer_id=%s", self.layer_id
+            )
+        # Launch signal kernel directly on the current stream.
+        # The spin-wait kernel MUST complete before subsequent operations
+        # (e.g. TopK) on the same stream, ensuring correct ordering.
+        self._runtime.wait_gpu_stage(self.layer_id)
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] layer_wait_gpu_after layer_id=%s", self.layer_id
+            )
+
+    def set_cpu_stage(self):
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+        if self._skip_current_layer:
+            return
+        self._ensure_async_layer_prepared(self.layer_id)
+        assert self._runtime is not None
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] layer_set_cpu_before layer_id=%s", self.layer_id
+            )
+        # SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE=True: dispatch set_cpu_stage
+        # to async_eplb_stream so it can overlap with subsequent operations.
+        # SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE=False (default): launch
+        # directly on the current CUDA stream, avoiding extra inter-stream sync
+        # but executing sequentially.
+        if envs.SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE.get():
+            current_stream = torch.cuda.current_stream()
+            self.async_eplb_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.async_eplb_stream):
+                self._runtime.set_cpu_stage(self.layer_id)
+            current_stream.wait_stream(self.async_eplb_stream)
+        else:
+            self._runtime.set_cpu_stage(self.layer_id)
+        if _LOG_ASYNC_SYNC_DEBUG:
+            logger.info(
+                "[EPLBAsyncSync] layer_set_cpu_after layer_id=%s", self.layer_id
+            )
+
+    def _ensure_async_layer_prepared(self, layer_id: int):
+        if layer_id not in self._prepared_async_layer_ids:
+            raise RuntimeError(
+                f"Async EPLB layer is not prepared for layer_id={layer_id}."
+            )
+
+    def _get_host_expert_tensors(self, layer_id: int, logical_expert_id: int):
+        host_mirror = get_global_eplb_async_host_mirror_manager()
+        if host_mirror is None:
+            raise RuntimeError("EPLB async host mirror manager is not initialized.")
+        return host_mirror.get_expert_tensors(layer_id, logical_expert_id)
 
     def update(
         self,
@@ -85,18 +273,116 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=topology_num_nodes,
             rank=rank,
+            enable_async=self._enable_async,
         )
-        old_expert_location_metadata.update(
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-        )
-
+        if not self._enable_async:
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
         return missing_logical_experts_by_layers
+
+    def submit_prepared_async_plan(
+        self,
+        *,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
+        layer_plans: Dict[int, _AsyncLayerUpdatePlan],
+    ):
+        if not self._enable_async or not torch.cuda.is_available():
+            return
+        assert self._runtime is not None
+        current_metadata = get_global_expert_location_metadata()
+        assert current_metadata is not None
+        if _LOG_ASYNC_SYNC_DEBUG:
+            copy_pairs_per_layer = {
+                layer_id: len(layer_plans[layer_id].copy_pairs)
+                for layer_id in update_layer_ids
+            }
+            metadata_equal_per_layer = {
+                layer_id: bool(
+                    torch.equal(
+                        current_metadata.physical_to_logical_map_cpu[layer_id],
+                        new_expert_location_metadata.physical_to_logical_map_cpu[
+                            layer_id
+                        ],
+                    )
+                )
+                for layer_id in update_layer_ids
+            }
+            logger.info(
+                "[EPLBAsyncSync] submit_async_plan update_layers=%s layer_plan_keys=%s copy_pairs_per_layer=%s metadata_equal_per_layer=%s",
+                list(update_layer_ids),
+                sorted(layer_plans.keys()),
+                copy_pairs_per_layer,
+                metadata_equal_per_layer,
+            )
+        cpp_layer_plans = []
+        for layer_id in update_layer_ids:
+            if layer_id not in layer_plans:
+                raise RuntimeError(
+                    "Async EPLB prepared plan is missing layer "
+                    f"{layer_id}. update_layer_ids={update_layer_ids}, "
+                    f"layer_plan_keys={sorted(layer_plans.keys())}"
+                )
+            plan = layer_plans[layer_id]
+            host_expert_tensors_per_copy = [
+                list(self._get_host_expert_tensors(layer_id, logical_expert_id))
+                for logical_expert_id, _ in plan.copy_pairs
+            ]
+            cpp_layer_plans.append(
+                create_cpp_layer_plan(
+                    layer_id=layer_id,
+                    routed_experts_weights=plan.routed_experts_weights,
+                    host_expert_tensors_per_copy=host_expert_tensors_per_copy,
+                    dst_slots=[dst_slot for _, dst_slot in plan.copy_pairs],
+                )
+            )
+        gpu_metadata_fields = []
+        cpu_metadata_fields = []
+        for current_field, next_field in current_metadata.iter_metadata_field_pairs(
+            new_expert_location_metadata
+        ):
+            pair = create_metadata_field_pair(current_field, next_field)
+            if current_field.is_cuda:
+                gpu_metadata_fields.append(pair)
+            else:
+                cpu_metadata_fields.append(pair)
+
+        gpu_reset_tensors = []
+        cpu_reset_tensors = []
+        for (
+            tensor,
+            layer_dim,
+        ) in get_global_expert_distribution_recorder().get_async_runtime_reset_tensor_specs():
+            spec = create_reset_tensor_spec(tensor, layer_dim)
+            if tensor.is_cuda:
+                gpu_reset_tensors.append(spec)
+            else:
+                cpu_reset_tensors.append(spec)
+
+        self._runtime.submit_plan(
+            create_cpp_prepared_plan(
+                update_layer_ids=list(update_layer_ids),
+                layer_plans=cpp_layer_plans,
+                gpu_metadata_fields=gpu_metadata_fields,
+                cpu_metadata_fields=cpu_metadata_fields,
+                gpu_reset_tensors=gpu_reset_tensors,
+                cpu_reset_tensors=cpu_reset_tensors,
+            )
+        )
 
 
 def _update_expert_weights(**kwargs):
+    enable_async = kwargs.pop("enable_async", False)
     if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
+        if enable_async:
+            assert False, (
+                "SGLANG_EXPERT_LOCATION_UPDATER_CANARY is not compatible with EPLB Async"
+            )
         return _update_expert_weights_with_canary(**kwargs)
+    elif enable_async:
+        return _update_expert_weights_raw_async(**kwargs)
     else:
         return _update_expert_weights_raw(**kwargs)
 
@@ -149,6 +435,55 @@ def _update_expert_weights_with_canary(
         )
 
     return missing_logical_experts_by_layers
+
+
+def _update_expert_weights_raw_async(
+    routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+    old_expert_location_metadata: ExpertLocationMetadata,
+    new_expert_location_metadata: ExpertLocationMetadata,
+    update_layer_ids: List[int],
+    nnodes: int,
+    rank: int,
+):
+    """Async version of expert weights update using EPLB async runtime."""
+    log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
+    world_size = torch.distributed.get_world_size()
+    num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
+    num_gpu_per_node = world_size // nnodes
+    host_mirror = get_global_eplb_async_host_mirror_manager()
+    if host_mirror is None:
+        raise RuntimeError("EPLB async host mirror manager is not initialized.")
+
+    layer_plans: Dict[int, _AsyncLayerUpdatePlan] = {}
+    for layer_id in update_layer_ids:
+        common_kwargs = dict(
+            routed_experts_weights=routed_experts_weights_of_layer[layer_id],
+            old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
+                layer_id
+            ].tolist(),
+            new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map_cpu[
+                layer_id
+            ].tolist(),
+            num_local_physical_experts=num_local_physical_experts,
+            num_gpu_per_node=num_gpu_per_node,
+            rank=rank,
+            world_size=world_size,
+            log_metrics=log_metrics,
+        )
+        layer_plans[layer_id] = _AsyncLayerUpdatePlan(
+            layer_id=layer_id,
+            routed_experts_weights=routed_experts_weights_of_layer[layer_id],
+            copy_pairs=build_async_h2d_copy_plan_single_layer(**common_kwargs),
+        )
+
+    updater = get_global_expert_location_updater()
+    if updater is None:
+        raise RuntimeError("Global expert location updater is not initialized.")
+    updater.submit_prepared_async_plan(
+        new_expert_location_metadata=new_expert_location_metadata,
+        update_layer_ids=update_layer_ids,
+        layer_plans=layer_plans,
+    )
 
 
 def _update_expert_weights_raw(
@@ -546,6 +881,32 @@ def update_expert_weights_single_layer(
     _entrypoint()
 
     return output_logs
+
+
+def build_async_h2d_copy_plan_single_layer(
+    routed_experts_weights: List[torch.Tensor],
+    old_physical_to_logical_map: List[int],
+    new_physical_to_logical_map: List[int],
+    num_local_physical_experts: int,
+    num_gpu_per_node: int,
+    rank: int,
+    world_size: Optional[int] = None,
+    debug: bool = False,
+    log_metrics: bool = False,
+) -> List[Tuple[int, int]]:
+    del routed_experts_weights, num_gpu_per_node, world_size, debug, log_metrics
+    copy_pairs = []
+    local_expert_location_range = (
+        rank * num_local_physical_experts,
+        (rank + 1) * num_local_physical_experts,
+    )
+    for dst_expert_location in range(*local_expert_location_range):
+        logical_expert_id = new_physical_to_logical_map[dst_expert_location]
+        if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
+            continue
+        dst_slot = dst_expert_location % num_local_physical_experts
+        copy_pairs.append((logical_expert_id, dst_slot))
+    return copy_pairs
 
 
 class _ChunkUtils:

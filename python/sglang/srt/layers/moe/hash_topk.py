@@ -14,6 +14,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
@@ -48,6 +49,7 @@ class HashTopK(nn.Module):
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
         layer_id: Optional[int] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -67,6 +69,8 @@ class HashTopK(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
+        self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
@@ -229,6 +233,10 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
+            updater.wait_gpu_stage()
         assert input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0], (
             f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
         )

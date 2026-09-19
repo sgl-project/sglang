@@ -715,6 +715,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                is_nextn=is_nextn,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -732,6 +733,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                is_nextn=is_nextn,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
@@ -1955,10 +1957,13 @@ class DeepseekV2MoE(nn.Module):
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                self.experts.dispatcher.combine_a(
+                    combine_input=state.pop("combine_input"),
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
             state.pop("dispatch_output")
 
     def op_combine_b(self, state):

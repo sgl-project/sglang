@@ -35,6 +35,7 @@ class EPLBManager:
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
         get_expert_backup_client: Callable[[], Any],
         get_weight_updater: Callable[[], Any],
+        get_forward_pass_id: Callable[[], int],
     ):
         super().__init__()
         # These collaborators are set on ModelRunner AFTER EPLBManager is
@@ -45,6 +46,7 @@ class EPLBManager:
         self._get_expert_location_updater = get_expert_location_updater
         self._get_expert_backup_client = get_expert_backup_client
         self._get_weight_updater = get_weight_updater
+        self._get_forward_pass_id = get_forward_pass_id
         self._rebalance_layers_per_chunk = (
             get_exec().moe.eplb_rebalance_layers_per_chunk
         )
@@ -67,12 +69,32 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        self._prepared_rebalance_metadata = None
+        self._prepared_rebalance_apply_event = None
+        self._prepared_update_layer_ids_chunks = None
+        self._pending_logical_count = None
+        self._pending_logical_count_ready_event = None
+        self._prepare_stream = (
+            torch.cuda.Stream()
+            if get_exec().moe.enable_eplb_async and torch.cuda.is_available()
+            else None
+        )
+        self._async_main_generator = self._async_entrypoint()
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
+        if get_exec().moe.enable_eplb_async:
+            next(self._async_main_generator)
+            return
         next(self._main_generator)
 
     def reset_generator(self):
+        self._prepared_rebalance_metadata = None
+        self._prepared_rebalance_apply_event = None
+        self._prepared_update_layer_ids_chunks = None
+        self._pending_logical_count = None
+        self._pending_logical_count_ready_event = None
+        self._async_main_generator = self._async_entrypoint()
         self._main_generator = self._entrypoint()
 
     def disable_rebalance(self, reason: str):
@@ -86,6 +108,23 @@ class EPLBManager:
         self.reset_generator()
 
     # can be more complex if needed
+    def _async_entrypoint(self):
+        while True:
+            forward_pass_id = self._get_forward_pass_id()
+            if self._prepared_rebalance_metadata is not None:
+                self._apply_prepared_async_rebalance()
+                logger.info("[EPLBManager] async rebalance end")
+            if self._pending_logical_count is not None:
+                self._prepare_async_rebalance()
+            if (
+                forward_pass_id % self._rebalance_num_iterations == 0
+                and self._pending_logical_count is None
+                and self._prepared_rebalance_metadata is None
+            ):
+                logger.info("[EPLBManager] async rebalance start")
+                self._start_async_rebalance_logical_count_fetch()
+            yield
+
     def _entrypoint(self):
         while True:
             for _ in range(self._rebalance_num_iterations):
@@ -112,7 +151,8 @@ class EPLBManager:
         ):
             return
 
-        logger.info("[EPLBManager] rebalance start")
+        mode = "async" if get_exec().moe.enable_eplb_async else "sync"
+        logger.info(f"[EPLBManager] rebalance start mode={mode}")
 
         enable_timing = self._rebalance_layers_per_chunk is None
 
@@ -222,6 +262,95 @@ class EPLBManager:
     def _elastic_global_rank(self) -> int:
         return get_parallel().tp_rank + get_parallel().ep_join_rank_offset
 
+    def _prepare_async_rebalance(self):
+        if self._pending_logical_count is None:
+            return
+        if (
+            self._pending_logical_count_ready_event is not None
+            and not self._pending_logical_count_ready_event.query()
+        ):
+            return
+
+        logical_count = self._pending_logical_count
+        logical_count_ready_event = self._pending_logical_count_ready_event
+        self._pending_logical_count = None
+        self._pending_logical_count_ready_event = None
+
+        (
+            self._prepared_rebalance_metadata,
+            self._prepared_rebalance_apply_event,
+        ) = self._init_async_prepare_expert_location_metadata(
+            logical_count,
+            logical_count_ready_event=logical_count_ready_event,
+        )
+        self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
+
+    def _start_async_rebalance_logical_count_fetch(self):
+        dump_record_output = get_global_expert_distribution_recorder().dump_record(
+            output_mode="object"
+        )
+        logical_count = dump_record_output["logical_count"]
+        average_utilization_rate_over_window = dump_record_output[
+            "average_utilization_rate_over_window"
+        ]
+
+        if not self._check_rebalance_needed(average_utilization_rate_over_window):
+            self._pending_logical_count = None
+            self._pending_logical_count_ready_event = None
+            self._prepared_rebalance_metadata = None
+            self._prepared_rebalance_apply_event = None
+            self._prepared_update_layer_ids_chunks = None
+            return
+
+        self._pending_logical_count = logical_count
+        self._pending_logical_count_ready_event = (
+            self._record_logical_count_ready_event(logical_count)
+        )
+
+    def _record_logical_count_ready_event(self, logical_count: torch.Tensor):
+        if logical_count.device.type != "cuda":
+            return None
+        ready_event = torch.cuda.Event()
+        torch.cuda.current_stream(device=logical_count.device).record_event(ready_event)
+        return ready_event
+
+    def _init_async_prepare_expert_location_metadata(
+        self,
+        logical_count: torch.Tensor,
+        logical_count_ready_event=None,
+    ):
+        if self._prepare_stream is None:
+            return (
+                ExpertLocationMetadata.init_by_eplb(self._model_config, logical_count),
+                None,
+            )
+        with torch.cuda.stream(self._prepare_stream):
+            if logical_count_ready_event is not None:
+                self._prepare_stream.wait_event(logical_count_ready_event)
+            metadata = ExpertLocationMetadata.init_by_eplb(
+                self._model_config, logical_count
+            )
+            apply_event = torch.cuda.Event()
+            apply_event.record(self._prepare_stream)
+        return metadata, apply_event
+
+    def _apply_prepared_async_rebalance(self):
+        if self._prepared_rebalance_metadata is None:
+            return
+        if self._prepared_rebalance_apply_event is not None:
+            self._prepared_rebalance_apply_event.synchronize()
+        for update_layer_ids in self._prepared_update_layer_ids_chunks:
+            self._get_expert_location_updater().update(
+                self._get_model().routed_experts_weights_of_layer,
+                self._prepared_rebalance_metadata,
+                update_layer_ids=update_layer_ids,
+                nnodes=get_parallel().nnodes,
+                rank=self._ps.tp_rank,
+            )
+        self._prepared_rebalance_metadata = None
+        self._prepared_rebalance_apply_event = None
+        self._prepared_update_layer_ids_chunks = None
+
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:
             return True
@@ -238,9 +367,12 @@ class EPLBManager:
         return True
 
     def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
-        all_layer_ids = sorted(
-            list(self._get_model().routed_experts_weights_of_layer.keys())
+        routed_experts_weights_of_layer = getattr(
+            self._get_model(), "routed_experts_weights_of_layer", None
         )
+        if not routed_experts_weights_of_layer:
+            return []
+        all_layer_ids = sorted(list(routed_experts_weights_of_layer.keys()))
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 

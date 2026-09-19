@@ -296,6 +296,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {}
+
     @torch.no_grad()
     def forward(
         self,
