@@ -11,7 +11,7 @@
 //! already carries `input_ids` it skips tokenization (handled upstream in the
 //! TokenizerManager `classify`); otherwise the prompt text is encoded here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::message::request::{Request, RequestKind};
@@ -82,7 +82,7 @@ pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) ->
 /// Locate a file for an HF Hub repo id in the local cache. Offline —
 /// the scheduler pre-downloads the model. `None` if not cached.
 fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
-    use hf_hub::{Cache, Repo, RepoType};
+    use hf_hub::Cache;
 
     // Python resolves the cache dir as HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE >
     // HF_HOME/hub > ~/.cache/huggingface/hub; the hf-hub crate only knows
@@ -94,15 +94,33 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
         .map(|dir| Cache::new(dir.into()))
         .unwrap_or_else(Cache::from_env);
 
+    cached_model_file(&cache, repo_id, revision, filename).map(|p| p.to_string_lossy().into_owned())
+}
+
+fn cached_model_file(
+    cache: &hf_hub::Cache,
+    repo_id: &str,
+    revision: Option<&str>,
+    filename: &str,
+) -> Option<PathBuf> {
+    use hf_hub::{Repo, RepoType};
+
     let rev = revision.unwrap_or("main");
-    cache
-        .repo(Repo::with_revision(
-            repo_id.to_string(),
-            RepoType::Model,
-            rev.to_string(),
-        ))
-        .get(filename)
-        .map(|p| p.to_string_lossy().into_owned())
+    let repo = Repo::with_revision(repo_id.to_string(), RepoType::Model, rev.to_string());
+    // hf-hub 0.4 requires refs/<revision>, even for commit-pinned snapshots.
+    // Resolve full commits directly, as 1.0 does; keep other lookups on 0.4.
+    // https://github.com/huggingface/hf-hub/blob/dcf865adacf7cbb750038d6521deb16c670ffd42/hf-hub/src/repository/download.rs#L348-L379
+    if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let file = cache
+            .path()
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join(rev)
+            .join(filename);
+        return file.exists().then_some(file);
+    }
+
+    cache.repo(repo).get(filename)
 }
 
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
@@ -235,6 +253,91 @@ mod tests {
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn cached_model_files_resolve_exact_commits_and_named_refs() {
+        const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        let dir = std::env::temp_dir().join(format!("sglang-hub-{}", uuid::Uuid::new_v4()));
+        let cache = hf_hub::Cache::new(dir.clone());
+        let repo_dir = dir.join("models--org--model");
+        let snapshot = repo_dir.join("snapshots").join(TEST_COMMIT);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let tokenizer = snapshot.join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").unwrap();
+        let config = snapshot.join("tokenizer_config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let directory = snapshot.join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(repo_dir.join("blobs")).unwrap();
+            std::fs::rename(&config, repo_dir.join("blobs/config")).unwrap();
+            std::os::unix::fs::symlink("../../blobs/config", &config).unwrap();
+            std::os::unix::fs::symlink("../../blobs/absent", snapshot.join("broken.json")).unwrap();
+        }
+        assert_eq!(
+            cached_model_file(&cache, "org/model", Some(TEST_COMMIT), "tokenizer.json"),
+            Some(tokenizer.clone())
+        );
+        assert!(!repo_dir.join("refs").exists());
+
+        let other = "ffffffffffffffffffffffffffffffffffffffff";
+        let other_snapshot = repo_dir.join("snapshots").join(other);
+        std::fs::create_dir(&other_snapshot).unwrap();
+        let other_tokenizer = other_snapshot.join("tokenizer.json");
+        std::fs::write(&other_tokenizer, "{}").unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs/feature")).unwrap();
+        for (name, commit) in [
+            ("main", TEST_COMMIT),
+            ("v1", TEST_COMMIT),
+            ("feature/nested", TEST_COMMIT),
+            ("whitespace", &format!(" \n{TEST_COMMIT}\t")),
+            (TEST_COMMIT, other),
+            ("0123", other),
+        ] {
+            std::fs::write(repo_dir.join("refs").join(name), commit).unwrap();
+        }
+        // Preserve 0.4's untrimmed refs and existence checks, including directories.
+        for (revision, filename, expected) in [
+            (None, "tokenizer.json", Some(&tokenizer)),
+            (Some("main"), "tokenizer_config.json", Some(&config)),
+            (Some("v1"), "tokenizer.json", Some(&tokenizer)),
+            (Some("feature/nested"), "tokenizer.json", Some(&tokenizer)),
+            (Some("whitespace"), "tokenizer.json", None),
+            (Some(TEST_COMMIT), "tokenizer.json", Some(&tokenizer)),
+            (Some(TEST_COMMIT), "tokenizer_config.json", Some(&config)),
+            (Some(other), "tokenizer.json", Some(&other_tokenizer)),
+            (Some(other), "tokenizer_config.json", None),
+            (Some("0123"), "tokenizer.json", Some(&other_tokenizer)),
+            (Some("0123456789ab"), "tokenizer.json", None),
+            (Some("missing"), "tokenizer.json", None),
+            (
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "tokenizer.json",
+                None,
+            ),
+            (Some(TEST_COMMIT), "missing.json", None),
+            (Some("main"), "uncached.json", None),
+            (Some(TEST_COMMIT), "broken.json", None),
+            (Some("main"), "broken.json", None),
+            (Some(TEST_COMMIT), "directory.json", Some(&directory)),
+            (Some("main"), "directory.json", Some(&directory)),
+        ] {
+            assert_eq!(
+                cached_model_file(&cache, "org/model", revision, filename).as_ref(),
+                expected,
+                "{revision:?}/{filename}"
+            );
+        }
+        // Local-file sibling lookup keeps snapshot paths, including symlinks.
+        for source in [snapshot.as_path(), tokenizer.as_path()] {
+            assert_eq!(
+                resolve_model_file(source.to_str().unwrap(), None, "tokenizer_config.json"),
+                Some(config.to_string_lossy().into_owned())
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// One token per whitespace-separated word, so a stop's token count differs
     /// from its byte count and the two units cannot be confused.
