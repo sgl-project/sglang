@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod power_of_two;
+pub mod session_aware;
 
 use std::fmt::Debug;
 use std::sync::Arc;
