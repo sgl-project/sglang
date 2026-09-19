@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -43,7 +41,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
-        lower_bound: Optional[float] = None,
+        lower_bound: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -135,7 +133,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        lower_bound: Optional[float] = None,
+        lower_bound: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -172,14 +170,14 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: Optional[torch.Tensor],
-        lower_bound: Optional[float] = None,
+        retrieve_parent_token: torch.Tensor | None,
+        lower_bound: float | None = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
-        replayssm_rawv: Optional[torch.Tensor] = None,
-        replayssm_rawk: Optional[torch.Tensor] = None,
-        replayssm_g: Optional[torch.Tensor] = None,
-        replayssm_beta: Optional[torch.Tensor] = None,
+        replayssm_rawv: torch.Tensor | None = None,
+        replayssm_rawk: torch.Tensor | None = None,
+        replayssm_g: torch.Tensor | None = None,
+        replayssm_beta: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -227,9 +225,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        lower_bound: Optional[float] = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        lower_bound: float | None = None,
         beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
@@ -251,4 +249,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             output_intermediate_states=return_intermediate_states,
             track_state=kwargs.get("track_state"),
             track_chunk_idx=kwargs.get("track_chunk_idx"),
+            fused_intra=kwargs.get("fused_intra"),
         )

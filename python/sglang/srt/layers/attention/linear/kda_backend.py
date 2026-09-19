@@ -1,5 +1,4 @@
 import importlib.util
-from typing import Optional, Tuple, Union
 
 import torch
 
@@ -224,7 +223,7 @@ class KDAKernelDispatcher:
         num_v_heads: int,
         head_v_dim: int,
         **kwargs,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Attempt packed decode. Returns output tensor or None if the decode
         kernel does not support packed decode."""
         if not self.supports_packed_decode:
@@ -256,7 +255,7 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        lower_bound: Optional[float] = None,
+        lower_bound: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if lower_bound is not None and not isinstance(
@@ -297,8 +296,8 @@ class KDAKernelDispatcher:
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: Optional[torch.Tensor],
-        lower_bound: Optional[float] = None,
+        retrieve_parent_token: torch.Tensor | None,
+        lower_bound: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
@@ -331,7 +330,7 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float]):
+    def effective_extend_kernel(self, lower_bound: float | None):
         """The kernel ``extend`` will actually run: safe-gate models reroute
         kernels without ``supports_safe_gate`` to Triton."""
         kernel = self.extend_kernel
@@ -546,7 +545,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor | tuple[torch.Tensor, ...],
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,
@@ -796,7 +795,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor | tuple[torch.Tensor, ...],
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,
@@ -916,6 +915,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            fused_intra=getattr(layer, "kda_fused_intra", None),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -1212,17 +1212,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         draft_token_num: int,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
-        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_state_cache: torch.Tensor | None,
         intermediate_conv_window_cache: torch.Tensor,
         cache_indices: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
-        retrieve_next_token: Optional[torch.Tensor],
-        retrieve_next_sibling: Optional[torch.Tensor],
-        retrieve_parent_token: Optional[torch.Tensor],
-        replayssm_rawv: Optional[torch.Tensor],
-        replayssm_rawk: Optional[torch.Tensor],
-        replayssm_g: Optional[torch.Tensor],
-        replayssm_beta: Optional[torch.Tensor],
+        retrieve_next_token: torch.Tensor | None,
+        retrieve_next_sibling: torch.Tensor | None,
+        retrieve_parent_token: torch.Tensor | None,
+        replayssm_rawv: torch.Tensor | None,
+        replayssm_rawk: torch.Tensor | None,
+        replayssm_g: torch.Tensor | None,
+        replayssm_beta: torch.Tensor | None,
     ) -> bool:
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
             return False
@@ -1384,9 +1384,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         draft_token_num: int,
         mixed_qkv: torch.Tensor,
         replayssm_rawv: torch.Tensor,
-        replayssm_rawk: Optional[torch.Tensor],
-        replayssm_g: Optional[torch.Tensor],
-        replayssm_beta: Optional[torch.Tensor],
+        replayssm_rawk: torch.Tensor | None,
+        replayssm_g: torch.Tensor | None,
+        replayssm_beta: torch.Tensor | None,
     ) -> bool:
         """Whether the per-layer ReplaySSM rings fit the fused ring-write.
 
@@ -1449,8 +1449,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         intermediate_state_cache: torch.Tensor,
         intermediate_conv_window_cache: torch.Tensor,
-        retrieve_parent_token: Optional[torch.Tensor],
-        replayssm_rawv: Optional[torch.Tensor],
+        retrieve_parent_token: torch.Tensor | None,
+        replayssm_rawv: torch.Tensor | None,
     ) -> bool:
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
@@ -1536,10 +1536,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        replayssm_rawv: Optional[torch.Tensor] = None,
-        replayssm_rawk: Optional[torch.Tensor] = None,
-        replayssm_g: Optional[torch.Tensor] = None,
-        replayssm_beta: Optional[torch.Tensor] = None,
+        replayssm_rawv: torch.Tensor | None = None,
+        replayssm_rawk: torch.Tensor | None = None,
+        replayssm_g: torch.Tensor | None = None,
+        replayssm_beta: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
