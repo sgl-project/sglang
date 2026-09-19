@@ -21,6 +21,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
+    get_marlin_workspace_for_forward,
+    marlin_init_stream_workspaces,
     marlin_make_workspace,
     marlin_moe_permute_scales,
     moe_awq_to_marlin_zero_points,
@@ -401,6 +403,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             replace_tensor("w2_weight_zero_point", marlin_w2_zp)
 
         layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
+        marlin_init_stream_workspaces(layer, max_blocks_per_sm=4)
         layer.is_marlin_converted = True
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
@@ -491,7 +494,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             clamp_limit=self.moe_runner_config.swiglu_limit,
-            workspace=layer.workspace,
+            workspace=get_marlin_workspace_for_forward(layer),
         )
         return StandardCombineInput(hidden_states=output)
 
