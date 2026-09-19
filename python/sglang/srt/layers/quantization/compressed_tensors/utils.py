@@ -52,6 +52,10 @@ def should_ignore_layer(
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
+            if not should_ignore_shard:
+                should_ignore_shard = check_equal_or_regex_match(
+                    layer_name=f"{shard_name}.linear", targets=ignore
+                )
 
             # If shard_idx=0, set layer ignore to match shard.
             if should_ignore_layer is None:
