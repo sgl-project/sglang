@@ -99,6 +99,11 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
             (DisaggregationMode.NULL, None, [None] * 8),
             (DisaggregationMode.PREFILL, 100, [100, 102, 104, 101, 103, 105]),
             (DisaggregationMode.DECODE, 100, [100, 102, 104, 101, 103, 105]),
+            (
+                DisaggregationMode.DECODE,
+                2**63,
+                [2**63 + offset for offset in (0, 2, 4, 1, 3, 5)],
+            ),
             (DisaggregationMode.PREFILL, [100, 200], [100, 101, 102, 200, 201, 202]),
             (DisaggregationMode.DECODE, [100, 200], [100, 101, 102, 200, 201, 202]),
         ):
@@ -165,7 +170,7 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_parallel_rooms_rejected_before_dispatch(self):
         self.manager.disaggregation_mode = DisaggregationMode.PREFILL
         self.manager._send_one_request = Mock(side_effect=AssertionError("dispatched"))
-        for rooms, message in (([100, 101], "overlap"), (2**63 - 2, "int64")):
+        for rooms, message in (([100, 101], "overlap"), (2**64 - 2, "uint64")):
             with self.subTest(rooms=rooms):
                 obj = GenerateReqInput(
                     input_ids=[[1, 2], [3, 4]],

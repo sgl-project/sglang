@@ -2055,8 +2055,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rooms = [room for room in obj.bootstrap_room if room is not None]
                 if len(rooms) != len(set(rooms)):
                     raise ValueError("Parallel sample bootstrap room ranges overlap")
-                if any(room < 0 or room >= 1 << 63 for room in rooms):
-                    raise ValueError("Bootstrap rooms must fit a nonnegative int64")
+                if any(room < 0 or room >= 1 << 64 for room in rooms):
+                    raise ValueError("Bootstrap rooms must fit a uint64")
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
