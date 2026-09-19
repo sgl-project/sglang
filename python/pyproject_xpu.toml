@@ -57,6 +57,7 @@ dependencies = [
   "setproctitle",
   "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.2.0+xpu/sglang_kernel_xpu-0.2.0-cp310-abi3-manylinux_2_38_x86_64.whl",
   "smg-grpc-servicer>=0.9.0",
+  "triton_kernels @ git+https://github.com/intel/intel-xpu-backend-for-triton.git@main#subdirectory=python/triton_kernels",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
