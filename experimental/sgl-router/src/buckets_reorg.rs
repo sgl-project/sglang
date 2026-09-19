@@ -64,10 +64,12 @@ impl EngineGroup {
 #[derive(Debug, Default)]
 pub struct Bucket {
     pub id: String,
-    // Context length based bucketing.
+    // Context length and SLO metadata.
     /// Shared capacity: input length for plain/prefill, peak sequence for decode
     /// (or input length when the output budget is unknown).
     pub max_context_tokens: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
 
     // Engine groups: plain or PD.
     pub plain: Option<EngineGroup>,
@@ -83,11 +85,34 @@ impl Bucket {
             Stage::Decode => self.decode.as_ref(),
         }
     }
+
+    fn matches_slo(&self, request: &PickRequest<'_>) -> bool {
+        match request.stage {
+            Stage::Plain | Stage::Prefill => request
+                .ttft_ms
+                .is_none_or(|target| self.ttft_ms.is_some_and(|estimate| estimate <= target)),
+            Stage::Decode => request.tokens_per_second.is_none_or(|target| {
+                self.tokens_per_second
+                    .is_some_and(|estimate| estimate >= target)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SloPreference {
+    #[default]
+    Disabled,
+    SloFirst,
+    BestEffort,
 }
 
 pub struct BucketResolver {
     pub workers: Arc<WorkerRegistry>,
     pub buckets: Vec<Bucket>,
+    /// TTFT preference for plain and prefill; throughput preference for decode.
+    pub prefill_slo: SloPreference,
+    pub decode_slo: SloPreference,
     pub fallback_on_rejection: bool,
 }
 
@@ -96,12 +121,14 @@ impl BucketResolver {
         Self {
             workers,
             buckets,
+            prefill_slo: SloPreference::Disabled,
+            decode_slo: SloPreference::Disabled,
             fallback_on_rejection: true,
         }
     }
 
-    /// Buckets whose requested role and context/token limits fit, ordered by rank
-    /// then ID. Engine availability and policy selection are handled by `pick`.
+    /// Buckets whose requested role and context/token limits fit, ordered by SLO
+    /// preference, rank, then ID. Engine availability is handled by `pick`.
     pub fn matching_buckets(&self, request: &PickRequest<'_>) -> Result<Vec<&Bucket>, PickError> {
         if request
             .expected_peak_tokens
@@ -109,6 +136,14 @@ impl BucketResolver {
         {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
+            ));
+        }
+        if request
+            .tokens_per_second
+            .is_some_and(|tps| !tps.is_finite() || tps <= 0.0)
+        {
+            return Err(PickError::InvalidSignal(
+                "requested tokens per second must be finite and positive".into(),
             ));
         }
         let context_tokens = match request.stage {
@@ -126,7 +161,18 @@ impl BucketResolver {
             .filter_map(|bucket| bucket.group(request.stage).map(|group| (bucket, group)))
             .filter(|(_, group)| group.limits.fits(request))
             .collect();
-        buckets.sort_by_key(|(bucket, group)| (group.rank, &bucket.id));
+        let slo = match request.stage {
+            Stage::Plain | Stage::Prefill => self.prefill_slo,
+            Stage::Decode => self.decode_slo,
+        };
+        buckets.sort_by_key(|(bucket, group)| {
+            let demoted = match slo {
+                SloPreference::Disabled => false,
+                SloPreference::SloFirst => !bucket.matches_slo(request),
+                SloPreference::BestEffort => bucket.matches_slo(request),
+            };
+            (demoted, group.rank, &bucket.id)
+        });
         Ok(buckets.into_iter().map(|(bucket, _)| bucket).collect())
     }
 

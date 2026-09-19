@@ -26,6 +26,9 @@ pub struct PickRequest<'a> {
     pub bucket: &'a str,
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
+    /// Optional bucket ordering targets; they do not relax length or admission limits.
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
@@ -45,6 +48,8 @@ impl<'a> PickRequest<'a> {
             bucket: "",
             input_tokens,
             expected_peak_tokens: None,
+            ttft_ms: None,
+            tokens_per_second: None,
             token_ids: None,
             session_key: None,
             routing_key: None,
