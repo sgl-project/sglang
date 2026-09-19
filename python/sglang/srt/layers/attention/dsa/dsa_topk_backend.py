@@ -160,6 +160,22 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
+                if batch_idx_list is not None:
+                    from sglang.kernels.ops.attention.dsa.transform_index import (
+                        transform_index_page_table_row_map,
+                    )
+
+                    logical_topk = self.topk_func(
+                        logits,
+                        lengths,
+                        topk,
+                        row_starts=row_starts,
+                    )
+                    return transform_index_page_table_row_map(
+                        attn_metadata.page_table_1,
+                        logical_topk,
+                        batch_idx_list,
+                    )
                 page_table_size_1 = (
                     attn_metadata.page_table_1[batch_idx_list]
                     if batch_idx_list is not None
