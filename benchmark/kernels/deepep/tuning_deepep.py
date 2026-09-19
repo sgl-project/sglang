@@ -16,15 +16,39 @@ from pathlib import Path
 import deep_ep
 import torch
 import torch.distributed as dist
-from deepep_utils import (
+
+from sglang.test.test_deepep_utils import (
     bench,
     calc_diff,
     create_grouped_scores,
-    init_dist,
     inplace_unique,
     per_token_cast_back,
     per_token_cast_to_fp8,
 )
+
+
+def init_dist(local_rank: int, num_local_ranks: int, args):
+    ip = args.master_addr
+    port = args.master_port
+    num_nodes = args.nnodes
+    node_rank = args.node_rank
+    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://{ip}:{port}",
+        world_size=num_nodes * num_local_ranks,
+        rank=node_rank * num_local_ranks + local_rank,
+    )
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    torch.cuda.set_device(local_rank)
+
+    return (
+        dist.get_rank(),
+        dist.get_world_size(),
+        dist.new_group(list(range(num_local_ranks * num_nodes))),
+    )
 
 
 def test_main(

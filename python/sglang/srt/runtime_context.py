@@ -132,6 +132,10 @@ class Live(msgspec.Struct, frozen=True):
 
     source: Any = None
     doc: str = ""
+    # For a stamp-only name (`source=None`): what a reader should be told when
+    # nothing has stamped it. These names have no fallback by construction, so
+    # the message is the only thing pointing at what did not happen.
+    unstamped: str = ""
 
 
 _LIVE_READS: dict = {
@@ -177,7 +181,35 @@ _LIVE_READS: dict = {
     "attn_cp_rank": "get_attn_context_model_parallel_rank",
     "dcp_rank": "get_dcp_rank",
     "attn_dcp_rank": lambda self: self.dcp_rank if self.dcp_enabled else 0,
-    "attn_dp_rank": None,
+    "attn_dp_rank": Live(
+        source=None,
+        doc=(
+            "This process's index in the attention-DP group. Computed from "
+            "`tp_rank` when the attention topology is initialized, and moved "
+            "by an elastic scale-up, so no coordinator can answer it."
+        ),
+        unstamped=(
+            "it is computed from this process's `tp_rank` when the attention "
+            "topology is initialized, so a process that never ran "
+            "`initialize_dp_attention` has no answer to give"
+        ),
+    ),
+    "dp_rank": Live(
+        source=None,
+        doc=(
+            "Which data-parallel replica this process serves, as the data "
+            "parallel controller numbered them at spawn. `None` when there is "
+            "no controller. Unlike `attn_dp_rank` and `moe_dp_rank` it is not "
+            "a position in any process group -- no group has one member per "
+            "replica -- which is why nothing can derive it and the spawn "
+            "states it instead."
+        ),
+        unstamped=(
+            "it is a spawn identity, handed to `publish(..., ranks=...)` by "
+            "the process entry; a process that published without a rank "
+            "bundle has no replica index to report"
+        ),
+    ),
     "world_group": "get_world_group",
     "tp_group": "get_tp_group",
     "pp_group": "get_pp_group",
@@ -225,6 +257,80 @@ def derive_attention_widths(
     """
     attn_dp_size = dp_size if enable_dp_attention else 1
     return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+
+
+def derive_attention_ranks(
+    *, tp_rank: int, attn_tp_size: int, attn_cp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_tp_rank, attn_dp_rank) for a process at `tp_rank`.
+
+    The rank layout is (dp, cp, tp) with tp the fastest-changing dimension::
+
+        tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size
+                  + attn_tp_rank
+
+    Split out beside `derive_attention_widths` because two places need it from
+    different inputs: `publish` has this process's `tp_rank` from the spawn and
+    the widths from the configuration, while `initialize_dp_attention` has them
+    from the groups it just built. They must not carry separate copies of the
+    arithmetic -- the point of computing it at publish is that the two agree.
+    """
+    attn_tp_rank = tp_rank % attn_tp_size
+    if not enable_dp_attention:
+        return attn_tp_rank, 0
+    return attn_tp_rank, tp_rank // (attn_tp_size * attn_cp_size)
+
+
+def spawn_world_rank(server_args, *, tp_rank: int, pp_rank: int) -> int:
+    """This process's place in WORLD, from the ranks its entry was given.
+
+    The inverse of `derive_spawn_ranks`, for the entries that have the pieces
+    but not the whole: the same expression `bootstrap` hands to
+    `init_distributed_environment` when it builds the group.
+
+    Reads a resolving view because it runs before `publish`.
+    """
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    cfg = resolving_view(server_args)
+    return cfg.ep_join_rank_offset + cfg.tp_size * pp_rank + tp_rank
+
+
+def derive_spawn_ranks(
+    *,
+    world_rank: int,
+    tp_size: int,
+    ep_join_rank_offset: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    moe_dp_size: int,
+    moe_ep_size: int,
+) -> dict:
+    """Every rank a process group would answer, from its place in WORLD.
+
+    WORLD is laid out `rank = ep_join_rank_offset + tp_size * pp_rank +
+    tp_rank`: `initialize_model_parallel` builds tensor-parallel groups as
+    contiguous blocks of `tp_size` and pipeline groups strided by it, so the
+    map is a bijection and this is its inverse. The attention and MoE ranks
+    are then positions inside the tensor-parallel block, which is what the
+    launcher computes when it decides what to spawn.
+
+    Pure arithmetic over the published widths: no group is consulted, which is
+    the point -- this runs at publish, before any of them exist.
+    """
+    local = world_rank - ep_join_rank_offset
+    tp_rank = local % tp_size
+    return {
+        "tp_rank": tp_rank,
+        "pp_rank": local // tp_size,
+        "attn_cp_rank": (tp_rank // attn_tp_size) % attn_cp_size,
+        "moe_dp_rank": tp_rank // (tp_size // moe_dp_size),
+        "moe_ep_rank": (
+            tp_rank
+            % (tp_size // moe_dp_size)
+            // (tp_size // moe_dp_size // moe_ep_size)
+        ),
+    }
 
 
 def derive_parallel_widths(
@@ -327,6 +433,31 @@ def dcp_enabled_of(cfg: Any):
     return parallel_widths_of(cfg)["dcp_enabled"]
 
 
+class SpawnRanks(msgspec.Struct, frozen=True):
+    """Where the launcher put this process, in the two numbers only it knows.
+
+    `world_rank` is this process's place in the WORLD group, which fixes every
+    other rank: the groups are laid out from the published widths, so
+    `tp_rank`, `pp_rank` and the attention / MoE ranks are functions of it (see
+    `derive_spawn_ranks`). Passing them separately would be passing the same
+    fact five more times, with five more ways for an entry to contradict
+    itself.
+
+    `dp_rank` is the exception, because data-parallel replicas are separate
+    WORLD groups: with `--dp-size 2` each replica holds ranks `0 .. n-1`, so
+    the rank cannot say which replica this is. `None` means "no controller",
+    which is an answer rather than an absence, and it is recorded as one.
+
+    Nothing else belongs here. A device index, for instance, is a placement
+    decision rather than a position -- the launcher may reindex it, and Ray
+    assigns it from its own allocator -- so it stays an argument to whoever
+    was handed it.
+    """
+
+    world_rank: int
+    dp_rank: Optional[int] = None
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
@@ -394,11 +525,10 @@ class ParallelContext:
                 return getattr(_ps(), source)()
             if source is not None:
                 return source(self)
+            why = live.unstamped if isinstance(live, Live) else ""
             raise RuntimeError(
-                f"parallel rank {name!r} is not available: it is computed from "
-                "this process's `tp_rank` when the attention topology is "
-                "initialized, so a process that never ran "
-                "`initialize_dp_attention` has no answer to give"
+                f"parallel name {name!r} is not available: "
+                + (why or "nothing has stamped it in this process")
             )
         if config is None and name in _parallel_config_leaves():
             raise ValueError("config namespace 'parallel' not published")
@@ -1598,7 +1728,13 @@ def _dump_recorded_namespace_reads() -> None:
         )
 
 
-def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+def publish(
+    server_args,
+    *,
+    role: str,
+    hf_config: Any = None,
+    ranks: SpawnRanks | None = None,
+) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
     Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
@@ -1608,6 +1744,12 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
+
+    ``ranks`` is who this process is, from the entry that spawned it. It is
+    optional because most roles are not placed in the topology at all -- a
+    tokenizer has no ``tp_rank`` -- and those processes raise on a rank read
+    exactly as they do today, with a message naming the missing bundle rather
+    than an absent process group.
 
     A process holds at most one live config: the bags always describe the
     engine running now. Re-publish is allowed and is **last-publish-wins**
@@ -1634,6 +1776,36 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             ),
         )
     _CONTEXT._publish_role = role
+    if ranks is not None:
+        # The placement, worked out here rather than carried: the widths are on
+        # the bag a moment ago, and `world_rank` fixes the rest. A read of any
+        # of these then needs no process group, which is the point -- they are
+        # read long before one exists. The scoped overrides that swap a group
+        # for a draft worker sit above the record in the read chain, so a
+        # scope still wins.
+        parallel = _CONTEXT.parallel
+        placement = derive_spawn_ranks(
+            world_rank=ranks.world_rank,
+            tp_size=parallel.tp_size,
+            ep_join_rank_offset=parallel.ep_join_rank_offset,
+            attn_cp_size=parallel.attn_cp_size,
+            attn_tp_size=parallel.attn_tp_size,
+            moe_dp_size=parallel.moe_dp_size,
+            moe_ep_size=parallel.moe_ep_size,
+        )
+        # `moe_dp_rank` is a different quantity when the MoE-DP group is
+        # aliased to the attention-CP one: the group answers the CP index,
+        # while this computes the MoE-DP index. Leave it to the group there, so
+        # one name does not mean two things.
+        if parallel.moe_dp_size < parallel.attn_cp_size:
+            placement.pop("moe_dp_rank")
+        # `dp_rank` is recorded whatever it is, None included: replicas are
+        # separate WORLD groups, so no rank implies it and `None` is the answer
+        # "no controller" rather than an absence.
+        placement["dp_rank"] = ranks.dp_rank
+        placement["launch_world_rank"] = ranks.world_rank
+        parallel.override_permanently(**placement)
+        _stamp_attention_ranks(parallel, placement["tp_rank"])
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
@@ -1646,6 +1818,27 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def _stamp_attention_ranks(parallel, tp_rank: int) -> None:
+    """Place this process in the attention topology, from the configuration.
+
+    The widths are already on the bag -- `publish` computed them a moment ago --
+    and the rank comes from the spawn, so the position is known here, before any
+    process group exists. That is the point: a rank read then works in a process
+    that never initialises distributed, which is what `ParallelState` provided
+    by being a plain frozen record.
+
+    It is a stamp rather than a bag leaf because it is a per-process fact, and
+    nothing about the configuration distinguishes one rank from another.
+    """
+    attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+        tp_rank=tp_rank,
+        attn_tp_size=parallel.attn_tp_size,
+        attn_cp_size=parallel.attn_cp_size,
+        enable_dp_attention=parallel.enable_dp_attention,
+    )
+    parallel.override_permanently(attn_tp_rank=attn_tp_rank, attn_dp_rank=attn_dp_rank)
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:

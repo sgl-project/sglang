@@ -21,7 +21,7 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -207,10 +207,13 @@ class SchedulerProfilerManager:
 
             self.rpd_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
+                "rpd-"
+                + str(time.time())
+                + f"-TP-{get_parallel().tp_rank}"
+                + ".trace.json.gz",
             )
 
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 import sqlite3
 
                 from rocpd.schema import RocpdSchema
@@ -282,13 +285,13 @@ class SchedulerProfilerManager:
         if not self.merge_profiles:
             return ""
 
-        if self.ps.tp_rank != 0:
+        if get_parallel().tp_rank != 0:
             return ""
-        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
+        if self.ps.dp_size > 1 and get_parallel().dp_rank != 0:
             return ""
-        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+        if get_parallel().pp_size > 1 and get_parallel().pp_rank != 0:
             return ""
-        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
+        if get_parallel().moe_ep_size > 1 and get_parallel().moe_ep_rank != 0:
             return ""
 
         try:
@@ -336,15 +339,15 @@ class SchedulerProfilerManager:
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
+                filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
                 if self.ps.dp_size > 1:
-                    filename_parts.append(f"DP-{self.ps.dp_rank}")
-                if self.ps.pp_size > 1:
-                    filename_parts.append(f"PP-{self.ps.pp_rank}")
-                if self.ps.moe_ep_size > 1:
-                    filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
+                    filename_parts.append(f"DP-{get_parallel().dp_rank}")
+                if get_parallel().pp_size > 1:
+                    filename_parts.append(f"PP-{get_parallel().pp_rank}")
+                if get_parallel().moe_ep_size > 1:
+                    filename_parts.append(f"EP-{get_parallel().moe_ep_rank}")
 
                 filename = (
                     stage_prefix
@@ -364,7 +367,7 @@ class SchedulerProfilerManager:
             self.rpd_profiler.flush()
 
             torch.distributed.barrier(self.dp_tp_cpu_group)
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
@@ -376,7 +379,7 @@ class SchedulerProfilerManager:
                 self.torch_profiler_output_dir,
                 stage_prefix
                 + str(time.time())
-                + f"-TP-{self.ps.tp_rank}-memory"
+                + f"-TP-{get_parallel().tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
             )
