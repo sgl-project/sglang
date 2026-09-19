@@ -890,7 +890,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
-        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        request_rids = (
+            {obj.rid} if obj.is_single else {obj[i].rid for i in range(obj.batch_size)}
+        )
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -3671,7 +3673,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else None
                     ),
                 )
-                for i in range(len(obj.rid))
+                for i in range(obj.batch_size)
             ]
 
         # Check the entire batch before mutating state. Otherwise a duplicate
@@ -3684,6 +3686,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lifecycle_attempt_id, rids, lifecycle_kind
             )
             if lifecycle_attempt_id is not None
+            and getattr(obj, "parallel_sample_num", 1) == 1
             else [None] * len(items)
         )
         for (rid, sub_obj, bootstrap_room), child_id in zip(items, child_ids):
