@@ -465,6 +465,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         is_causal: bool,
         return_lse: bool,
         out_buffer: torch.Tensor,
+        # Accepted to match the hook;
+        # this override never reaches the flashinfer ragged wrapper they configure.
+        q_seq_lens_cpu: torch.Tensor,
+        kv_seq_lens_cpu: torch.Tensor,
+        all_rows_active: bool,
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
