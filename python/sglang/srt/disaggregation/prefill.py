@@ -1134,8 +1134,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
@@ -1166,8 +1165,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
