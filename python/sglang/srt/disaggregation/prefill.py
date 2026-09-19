@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
+    CustomizedInfoError,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -1343,7 +1344,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            try:
+                self.disagg_metadata_buffers.set_buf(req)
+            except CustomizedInfoError as exc:
+                prepare_abort(
+                    req, str(exc), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                req.disagg_kv_sender.abort()
+                self.clear_pending_chunk_send(req)
+                # Keep the request queued for rank-consistent transfer-failure cleanup.
+                return
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
