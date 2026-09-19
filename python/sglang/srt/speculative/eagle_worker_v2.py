@@ -265,11 +265,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if (
+        # One decision, used twice: whether the draft runs on an attention-TP
+        # slice of its own. It picks how the runner is built, and then what the
+        # scope may say about attention every time it is entered -- a draft
+        # built outside the scope keeps the target's replica count and still
+        # gathers with it.
+        self.draft_owns_attention = (
             get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
-        ):
-            ctx = draft_tp_context(get_parallel().attn_tp_group)
+        )
+        if self.draft_owns_attention:
+            ctx = draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
         else:
             ctx = empty_context()
         with (
@@ -339,7 +345,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -349,7 +358,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -1358,7 +1370,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.adaptive_controller is not None:
             with (
                 self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group
+                    self._draft_worker.draft_runner.tp_group,
+                    owns_attention=self._draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -1418,7 +1431,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Draft prefill
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -1465,7 +1479,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             else:
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1490,7 +1505,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             else:
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1522,7 +1538,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
