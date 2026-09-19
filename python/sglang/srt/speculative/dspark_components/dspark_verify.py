@@ -66,6 +66,11 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
         return False
+    # copy_for_forward drops the orchestrator but keeps the per-step block
+    # penalty snapshot; a prepared state means penalties must reshape the
+    # verify logits, so acceptance cannot fold into the graph.
+    if getattr(sampling_info, "dflash_block_penalty_state", None) is not None:
+        return False
     if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
     if getattr(sampling_info, "logit_bias", None) is not None:
@@ -318,6 +323,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                candidates=verify_ids_2d,
             )
 
         return result
@@ -440,6 +446,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         draft_block_ids: torch.Tensor,
         draft_tokens: torch.Tensor,
+        verify_ids_2d: torch.Tensor,
         bs: int,
         device: str,
         sampling_info,
@@ -498,6 +505,7 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            candidates=verify_ids_2d,
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided

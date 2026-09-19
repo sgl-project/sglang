@@ -1114,6 +1114,35 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_output_tokens_since_last()
+            from sglang.srt.speculative.dflash_utils import DFlashBlockPenaltyState
+
+            anchor_unresolved = None
+            if batch.enable_overlap:
+                # The previous verify block's commit publishes to
+                # kv_committed_len before it resolves into output_ids; the
+                # cursor above only feeds resolved tokens. Mark rows whose
+                # anchor is committed-but-unresolved so the block path can
+                # fold it into the rolled state (it is never fed twice: the
+                # cursor picks it up after resolution).
+                anchor_unresolved = torch.tensor(
+                    [
+                        (req.kv.kv_committed_len - len(req.origin_input_ids))
+                        > req.penalty_cumulated_len
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.bool,
+                    device=batch.sampling_info.penalizer_orchestrator.device,
+                )
+            batch.sampling_info.dflash_block_penalty_state = (
+                DFlashBlockPenaltyState.from_orchestrator(
+                    batch.sampling_info.penalizer_orchestrator,
+                    anchor_unresolved=anchor_unresolved,
+                )
+            )
+        else:
+            batch.sampling_info.dflash_block_penalty_state = None
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput
