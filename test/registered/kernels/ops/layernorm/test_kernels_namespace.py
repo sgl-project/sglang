@@ -176,5 +176,156 @@ def test_import_stays_metadata_only():
     assert "CLEAN" in r.stdout
 
 
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_kernel_resolution_torch_compile_fullgraph(monkeypatch, tmp_path, warm_cache):
+    import torch
+
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+
+    # Exercise the production wrapper and lazy import with a CPU implementation
+    # of its in-place ABI. No PPU or sgl_kernel wheel is needed for this test.
+    module_name = "_sglang_test_compile_quant_kernel"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def quantize(x, output_q, output_s):\n"
+        "    output_q.copy_(x * 2)\n"
+        "    output_s.fill_(3)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    registry = K.KernelRegistry()
+    registry.register(
+        K.KernelSpec(
+            op="quantization.sgl_per_token_quant_fp8",
+            backend=KernelBackend.JIT,
+            target=f"{module_name}:quantize",
+        )
+    )
+    monkeypatch.setattr(sel, "registry", registry)
+    sel.clear_cache()
+    torch._dynamo.reset()
+    try:
+        if warm_cache:
+            sel.get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)
+        else:
+            assert module_name not in sys.modules
+
+        def quantize(x):
+            output_q = torch.empty_like(x)
+            output_s = x.new_empty((x.shape[0], 1))
+            sgl_per_token_quant_fp8(x, output_q, output_s)
+            return output_q, output_s
+
+        compiled = torch.compile(quantize, backend="aot_eager", fullgraph=True)
+        for rows in (3, 3, 7):
+            x = torch.randn(rows, 16)
+            output_q, output_s = compiled(x)
+            torch.testing.assert_close(output_q, x * 2)
+            torch.testing.assert_close(output_s, x.new_full((rows, 1), 3))
+        assert module_name in sys.modules
+    finally:
+        torch._dynamo.reset()
+        sel.clear_cache()
+        sys.modules.pop(module_name, None)
+
+
+def test_kernel_cache_preserves_backend_and_clears(monkeypatch):
+    registry = K.KernelRegistry()
+    for backend, target in (
+        (KernelBackend.AOT, "operator:neg"),
+        (KernelBackend.TORCH, "operator:pos"),
+    ):
+        registry.register(K.KernelSpec(op="test.sign", backend=backend, target=target))
+    monkeypatch.setattr(sel, "registry", registry)
+    original_select = sel.select_kernel
+    selections = []
+
+    def select(op, backend=None):
+        selections.append((op, backend))
+        return original_select(op, backend)
+
+    monkeypatch.setattr(sel, "select_kernel", select)
+    sel.clear_cache()
+    try:
+        for _ in range(2):
+            assert sel.get_kernel("test.sign", KernelBackend.AOT)(2) == -2
+            assert sel.get_kernel("test.sign", KernelBackend.TORCH)(2) == 2
+        assert len(selections) == 2
+        sel.clear_cache()
+        assert sel.get_kernel("test.sign", KernelBackend.AOT)(2) == -2
+        assert len(selections) == 3
+    finally:
+        sel.clear_cache()
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize("pause_before_resolve", [False, True])
+def test_kernel_cache_clear_during_lookup(
+    monkeypatch, warm_cache, pause_before_resolve
+):
+    import operator
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    registry = K.KernelRegistry()
+    registry.register(
+        K.KernelSpec(
+            op="test.concurrent_neg",
+            backend=KernelBackend.AOT,
+            target="operator:neg",
+        )
+    )
+    monkeypatch.setattr(sel, "registry", registry)
+    original_select = sel.select_kernel
+    selections = []
+
+    def select(op, backend=None):
+        selections.append((op, backend))
+        return original_select(op, backend)
+
+    monkeypatch.setattr(sel, "select_kernel", select)
+    sel.clear_cache()
+    try:
+        if warm_cache:
+            sel.get_kernel("test.concurrent_neg", KernelBackend.AOT)
+
+        original_resolve = sel._resolve
+        paused = Event()
+        resume = Event()
+
+        def pause():
+            paused.set()
+            assert resume.wait(timeout=10), "cache-clear thread did not resume lookup"
+
+        def resolve(*args):
+            if pause_before_resolve:
+                pause()
+            original_resolve(*args)
+            if not pause_before_resolve:
+                pause()
+
+        monkeypatch.setattr(sel, "_resolve", resolve)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                sel.get_kernel, "test.concurrent_neg", KernelBackend.AOT
+            )
+            try:
+                assert paused.wait(timeout=10), "lookup did not reach the pause point"
+                sel.clear_cache()
+            finally:
+                resume.set()
+            assert pending.result(timeout=10) is operator.neg
+
+        monkeypatch.setattr(sel, "_resolve", original_resolve)
+        # The in-flight lookup must not populate the new cache after a clear.
+        # A fresh lookup resolves once, and subsequent lookups reuse it.
+        for _ in range(2):
+            assert (
+                sel.get_kernel("test.concurrent_neg", KernelBackend.AOT) is operator.neg
+            )
+        assert len(selections) == 2
+    finally:
+        sel.clear_cache()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
