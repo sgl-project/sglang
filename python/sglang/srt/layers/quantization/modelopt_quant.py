@@ -1497,6 +1497,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def get_min_capability(cls) -> int:
         return 80
 
+    def can_fuse_shared_expert(self) -> bool:
+        # Shared experts kept BF16 via exclude_modules cannot share the packed
+        # FP4 FusedMoE buffers; TP=1 fails to load and TP>1 loads them silently wrong.
+        return not any("shared_expert" in name for name in self.exclude_modules)
+
     @staticmethod
     def common_group_size(cfg: dict) -> int:
         """Return the unique group_size across the config; raise if missing/mismatched."""
