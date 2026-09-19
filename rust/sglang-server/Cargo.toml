@@ -17,6 +17,12 @@ name = "sglang_server"
 # rlib:   so optional standalone bins / integration tests can link the core.
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+# Supplies platform-specific linker flags for the manually built PyO3 module.
+# In particular, macOS needs `-undefined dynamic_lookup` when Python provides
+# the C API symbols at runtime.
+pyo3-build-config = { workspace = true }
+
 [dependencies]
 async-stream = { workspace = true }
 bytes = { workspace = true }
