@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -10,9 +12,9 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 _is_hip = is_hip_runtime()
@@ -113,10 +115,6 @@ def use_hicache_tma_kernel(
     A chunk that straddles pages degrades to one bulk op per row, so pages must
     tile the chunk; `page_size=None` (caller unaware of paging) trusts the indices.
     """
-    import torch
-
-    from sglang.srt.environ import envs
-
     if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
         return False
     if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
