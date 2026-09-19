@@ -139,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    ExpireCacheSaltsReq,
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
@@ -290,6 +291,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.kv_zeroize import build_kv_zeroizer, warmup_zero_kv_rows
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -500,6 +502,7 @@ class Scheduler(
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.cache_salt_ttl_enabled = server_args.cache_salt_ttl_seconds is not None
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -624,6 +627,7 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        self.init_cache_salt_ttl_zeroize()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1761,6 +1765,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (ExpireCacheSaltsReq, self.handle_expire_cache_salts),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -2138,6 +2143,14 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        # Retry the part of a cache-salt expiry an in-flight request was
+        # still holding. Same point in the loop as the session reaper,
+        # which already mutates the tree and frees KV here.
+        if (
+            self.cache_salt_ttl_enabled
+            and self.tree_cache.has_pending_cache_salt_expiry()
+        ):
+            self.tree_cache.drain_expiring_cache_salts()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2768,12 +2781,58 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def init_cache_salt_ttl_zeroize(self) -> None:
+        """Wire up --cache-salt-ttl-zeroize, or fail startup if it cannot run.
+
+        Built here rather than inside the cache because the plan has to read
+        the live KV pool's buffers, and a pool family whose bytes it cannot
+        enumerate must stop the server: a partial wipe reads as a guarantee.
+        """
+        if not (self.cache_salt_ttl_enabled and get_memory().cache_salt_ttl_zeroize):
+            return
+        zeroizer = build_kv_zeroizer(
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            self.tree_cache.components.keys(),
+        )
+        self.tree_cache.enable_cache_salt_ttl_zeroize(
+            zeroizer,
+            get_memory().cache_salt_ttl_zeroize_max_bytes_per_iteration,
+        )
+        # Compile the kernel now: the first expiry would otherwise JIT inside a
+        # scheduler iteration, and SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY
+        # treats a post-readiness Triton load as a fault.
+        warmup_zero_kv_rows(self.token_to_kv_pool_allocator.device)
+
+    def handle_expire_cache_salts(self, recv_req: ExpireCacheSaltsReq):
+        """Drop the radix KV of cache salts whose TTL elapsed.
+
+        Reached as a control request, so every TP rank runs it in the same loop
+        iteration with the same salt list and the trees stay identical.
+        """
+        retained_nodes = self.tree_cache.expire_cache_salts(recv_req.salts)
+        if retained_nodes:
+            # The retention bound is overrun while this is nonzero, so say so
+            # rather than letting the deferral look like a clean expiry. Counts
+            # only: a salt string identifies a caller.
+            logger.warning(
+                "cache-salt TTL: %d salt(s) still hold %d node(s) pinned by "
+                "in-flight requests; retrying each scheduler iteration",
+                len(recv_req.salts),
+                retained_nodes,
+            )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
         *,
         mm_input_error: Optional[str] = None,
     ):
+        if self.cache_salt_ttl_enabled:
+            # A new request under this salt opens a fresh TTL epoch; stop
+            # tearing the previous one down so its inserts are not swept.
+            self.tree_cache.cancel_pending_cache_salt_expiry(recv_req.cache_salt)
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None

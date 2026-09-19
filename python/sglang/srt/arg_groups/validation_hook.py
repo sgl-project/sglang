@@ -35,10 +35,102 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+def validate_cache_salt_ttl(server_args: Any) -> None:
+    """Reject configurations whose cache-salt retention the TTL cannot bound."""
+    cfg = resolving_view(server_args)
+    if cfg.cache_salt_ttl_seconds is None:
+        return
+
+    if cfg.cache_salt_ttl_seconds <= 0:
+        raise ValueError(
+            "--cache-salt-ttl-seconds must be positive; omit the flag to "
+            "disable the cache-salt TTL."
+        )
+    if cfg.cache_salt_ttl_max_seconds is None:
+        server_args.cache_salt_ttl_max_seconds = cfg.cache_salt_ttl_seconds
+    elif cfg.cache_salt_ttl_max_seconds < cfg.cache_salt_ttl_seconds:
+        raise ValueError(
+            "--cache-salt-ttl-max-seconds must be >= --cache-salt-ttl-seconds, "
+            f"got {cfg.cache_salt_ttl_max_seconds} < {cfg.cache_salt_ttl_seconds}."
+        )
+    if cfg.cache_salt_ttl_sweep_interval_seconds <= 0:
+        raise ValueError("--cache-salt-ttl-sweep-interval-seconds must be positive.")
+    if cfg.cache_salt_ttl_max_tracked_salts <= 0:
+        raise ValueError("--cache-salt-ttl-max-tracked-salts must be positive.")
+
+    if cfg.disable_radix_cache:
+        raise ValueError(
+            "--cache-salt-ttl-seconds requires the radix cache; it has nothing "
+            "to expire with --disable-radix-cache."
+        )
+    # Host-tier and storage-backend copies are keyed by a salt-free token hash
+    # (compute_node_hash_values) and the storage interface has no per-key
+    # delete, so evicting a salt from the device tree would leave copies the
+    # TTL cannot reach. Every flag that builds a host pool has to be rejected,
+    # not just --enable-hierarchical-cache.
+    host_tier_flag = (
+        "--enable-hierarchical-cache"
+        if cfg.enable_hierarchical_cache
+        else (
+            "--hicache-storage-backend"
+            if cfg.hicache_storage_backend is not None
+            else (
+                "--disaggregation-decode-retraction-backup=host_pool"
+                if cfg.disaggregation_decode_retraction_backup == "host_pool"
+                else None
+            )
+        )
+    )
+    if host_tier_flag is not None:
+        raise ValueError(
+            f"--cache-salt-ttl-seconds does not support {host_tier_flag}: it "
+            "copies KV to a tier keyed by a salt-free token hash with no "
+            "per-key delete, so the TTL could not bound that copy's retention."
+        )
+    # The TTL clock lives in the TokenizerManager process so its expiry command
+    # reaches every TP rank in one iteration. With several tokenizer workers
+    # each would time the same salt off its own subset of requests.
+    if cfg.tokenizer_worker_num > 1:
+        raise ValueError(
+            "--cache-salt-ttl-seconds does not support --tokenizer-worker-num "
+            "> 1: each worker would time the same salt off its own subset of "
+            "requests."
+        )
+    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+        raise ValueError(
+            "--cache-salt-ttl-seconds does not support the experimental C++ "
+            "radix tree, which rejects cache_salt outright."
+        )
+    if envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python":
+        raise ValueError(
+            "--cache-salt-ttl-seconds requires "
+            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python: expire_cache_salts "
+            "is not implemented for the Rust tree core."
+        )
+
+    if cfg.cache_salt_ttl_zeroize:
+        if cfg.cache_salt_ttl_zeroize_max_bytes_per_iteration <= 0:
+            raise ValueError(
+                "--cache-salt-ttl-zeroize-max-bytes-per-iteration must be positive."
+            )
+        # The wipe is issued on the scheduler's current stream, which orders it
+        # after the attention kernels already queued there. A second forward
+        # stream would run its reads concurrently with those writes.
+        if cfg.enable_two_batch_overlap:
+            raise ValueError(
+                "--cache-salt-ttl-zeroize does not support "
+                "--enable-two-batch-overlap: the wipe is ordered against the "
+                "current stream only, so the other microbatch's attention "
+                "reads would race it."
+            )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+
+    validate_cache_salt_ttl(server_args)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

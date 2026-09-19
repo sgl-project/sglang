@@ -405,6 +405,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
+    def expire_cache_salts(self, salts):
+        # The Rust node carries only `extra_key`, not `cache_salt`, so it has
+        # no per-salt subtree to walk. --cache-salt-ttl-seconds rejects this
+        # backend at startup; this guards the path if that check is bypassed.
+        raise NotImplementedError(
+            "expire_cache_salts: not yet ported to the Rust tree core"
+        )
+
     def swa_tombstone_ranges(
         self, key: RadixKey, start: int, end: int
     ) -> list[tuple[int, int]]:

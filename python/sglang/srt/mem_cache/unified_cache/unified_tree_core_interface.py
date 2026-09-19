@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, AbstractSet, Optional, Sequence
 
 import msgspec
 
@@ -60,6 +60,14 @@ class EvictDeviceLeafResult(BaseEvictionResult):
 
 class DemoteResult(BaseEvictionResult):
     pass
+
+
+class CacheSaltExpiryResult(BaseEvictionResult):
+    """Carries the freed values like every other step result, plus `retained` --
+    the per-salt count of nodes an in-flight request pinned. A salt missing
+    from it is fully gone."""
+
+    retained: dict[str, int] = {}
 
 
 class DropSubtreeNoHostResult(BaseEvictionResult):
@@ -314,6 +322,17 @@ class UnifiedTreeCoreInterface(ABC):
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
+        ...
+
+    @abstractmethod
+    def expire_cache_salts(self, salts: AbstractSet[str]) -> CacheSaltExpiryResult:
+        """Evict every node whose key carries one of these cache salts.
+
+        Unlike `evict`, which is budget-driven, this is unconditional: the
+        caller is bounding how long the salt's KV may be retained, not
+        reclaiming space. A node an in-flight request holds is skipped along
+        with its ancestors and reported in `retained` for the caller to retry.
+        """
         ...
 
     @abstractmethod

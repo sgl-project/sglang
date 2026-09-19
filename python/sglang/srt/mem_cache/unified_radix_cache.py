@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -43,6 +51,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv_zeroize import KvZeroizer, PendingZeroize
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -238,6 +247,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
+        # Cache salts told to expire whose subtree is not gone yet
+        # (--cache-salt-ttl-seconds).
+        self._pending_cache_salt_expiry: set[str] = set()
+        # Set by the scheduler under --cache-salt-ttl-zeroize.
+        self._kv_zeroizer: Optional[KvZeroizer] = None
+        self._zeroize_budget_bytes = 0
+        # Slots whose nodes are gone but whose bytes are not cleared yet. They
+        # are still allocated as far as the allocator is concerned.
+        self._pending_zeroize: list[PendingZeroize] = []
+
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
         # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
@@ -379,6 +398,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        # The tree is gone, so nothing is left to expire. Anything still
+        # queued for zeroization belongs to slots this reset reclaims
+        # wholesale, so drop the queue rather than free the same slots twice.
+        self._pending_cache_salt_expiry = set()
+        self._pending_zeroize = []
 
         # Reset Controller.
         self.session.slots.clear()
@@ -602,6 +626,145 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(self.tree_core.end_insert())
 
     @rank_consensus(same_params=True, same_results=True)
+    def expire_cache_salts(self, salts: Iterable[str]) -> int:
+        """Evict the KV of salts whose TTL elapsed; returns the pinned node
+        count still held back.
+
+        Not budget-driven like `evict`: the caller is bounding retention, not
+        reclaiming space.
+        """
+        self._pending_cache_salt_expiry.update(salts)
+        return self.drain_expiring_cache_salts()
+
+    def cancel_pending_cache_salt_expiry(self, salt: Optional[str]) -> None:
+        """A new request under `salt` opens a fresh TTL epoch, so stop tearing
+        the old one down. Only nodes a live request pinned can still be there:
+        everything unpinned was freed when the expiry landed."""
+        if salt is not None:
+            self._pending_cache_salt_expiry.discard(salt)
+
+    def has_pending_cache_salt_expiry(self) -> bool:
+        return bool(self._pending_cache_salt_expiry) or bool(self._pending_zeroize)
+
+    def enable_cache_salt_ttl_zeroize(
+        self, zeroizer: KvZeroizer, budget_bytes: int
+    ) -> None:
+        """Turn on --cache-salt-ttl-zeroize (see `_drain_pending_zeroize`)."""
+        self._kv_zeroizer = zeroizer
+        self._zeroize_budget_bytes = budget_bytes
+
+    def drain_expiring_cache_salts(self) -> int:
+        """Retry the part of an expiry an in-flight request was holding."""
+        retained_nodes = self._expire_pending_cache_salts()
+        self._drain_pending_zeroize()
+        return retained_nodes
+
+    def _expire_pending_cache_salts(self) -> int:
+        if not self._pending_cache_salt_expiry:
+            return 0
+        # A suspended insert walk holds node references across its barrier;
+        # deleting one under it would corrupt the walk.
+        if self.tree_core.has_ongoing_insert():
+            return 0
+
+        result = self.tree_core.expire_cache_salts(self._pending_cache_salt_expiry)
+        try:
+            if self._kv_zeroizer is None:
+                self._free_values(result.device_frees, result.host_frees)
+            else:
+                # Hold the device slots back until their bytes are cleared.
+                self._drain_host_frees(result.host_frees)
+                for ct in list(result.device_frees):
+                    for indices in result.device_frees.pop(ct):
+                        self._queue_zeroize(ct, indices)
+        finally:
+            num_expired = len(self._pending_cache_salt_expiry) - len(result.retained)
+            self._pending_cache_salt_expiry = set(result.retained)
+        if num_expired:
+            logger.info("cache-salt TTL: expired %d salt(s)", num_expired)
+        return sum(result.retained.values())
+
+    def _queue_zeroize(self, ct: ComponentType, indices: torch.Tensor) -> None:
+        if indices.numel() == 0:
+            return
+        self._pending_zeroize.append(
+            PendingZeroize(
+                component_type=ct,
+                free_indices=indices,
+                zero_indices=self._kv_zeroizer.prepare(ct, indices),
+                # A radix node's value is a page-aligned run of the request's
+                # kv row; the translated SWA set is filtered and unordered.
+                page_aligned_run=ct is not ComponentType.SWA,
+            )
+        )
+
+    def _drain_pending_zeroize(self) -> None:
+        """Clear up to the per-iteration budget, then free exactly what was
+        cleared.
+
+        A slot that has not been zeroized has not been freed, which is what
+        lets the wipe be spread over several iterations without a page ever
+        being handed out dirty. Spreading it matters because a TTL teardown is
+        bursty by construction: one departing tenant can release a whole cached
+        prefix in a single iteration.
+        """
+        if not self._pending_zeroize:
+            return
+
+        budget = self._zeroize_budget_bytes
+        cleared: dict[ComponentType, list[torch.Tensor]] = {}
+        spent = 0
+        while self._pending_zeroize and spent < budget:
+            entry = self._pending_zeroize.pop(0)
+            head, tail = self._split_within_zeroize_budget(entry, budget - spent)
+            if tail is not None:
+                self._pending_zeroize.insert(0, tail)
+            self._kv_zeroizer.zeroize(
+                head.component_type,
+                head.zero_indices,
+                page_aligned_run=head.page_aligned_run,
+            )
+            cleared.setdefault(head.component_type, []).append(head.free_indices)
+            spent += head.zero_indices.numel() * self._kv_zeroizer.bytes_per_token(
+                head.component_type
+            )
+
+        self._drain_device_frees(cleared)
+
+    def _split_within_zeroize_budget(
+        self, entry: PendingZeroize, remaining: int
+    ) -> tuple[PendingZeroize, Optional[PendingZeroize]]:
+        """Split a node's slots so the budget is real for a long prefix.
+
+        Only the FULL side splits: there the free and zero index sets are the
+        same tensor, so a split stays consistent. The SWA side is a filtered
+        translation with no such correspondence, and it is window-bounded, so
+        it is taken whole.
+
+        Splits on a page boundary: the allocator frees a whole page for any
+        touched token, so two halves sharing a page would free it twice.
+        """
+        if entry.component_type is ComponentType.SWA:
+            return entry, None
+        bytes_per_token = self._kv_zeroizer.bytes_per_token(entry.component_type)
+        affordable = remaining // max(bytes_per_token, 1)
+        affordable -= affordable % self.page_size
+        if affordable <= 0 or affordable >= entry.free_indices.numel():
+            return entry, None
+        head = PendingZeroize(
+            component_type=entry.component_type,
+            free_indices=entry.free_indices[:affordable],
+            zero_indices=entry.zero_indices[:affordable],
+            page_aligned_run=entry.page_aligned_run,
+        )
+        tail = PendingZeroize(
+            component_type=entry.component_type,
+            free_indices=entry.free_indices[affordable:],
+            zero_indices=entry.zero_indices[affordable:],
+            page_aligned_run=entry.page_aligned_run,
+        )
+        return head, tail
+
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 

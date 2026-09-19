@@ -351,6 +351,11 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Retention window for the KV cached under this request's cache_salt.
+    # Clamped to --cache-salt-ttl-max-seconds: a client may shorten its own
+    # window, never extend it. None uses --cache-salt-ttl-seconds.
+    cache_salt_ttl_seconds: Optional[Union[List[Optional[float]], float]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -570,6 +575,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_cache_salt_ttl_seconds(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -831,6 +837,22 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_cache_salt_ttl_seconds(self, num):
+        """Normalize cache_salt_ttl_seconds for batch processing."""
+        if self.cache_salt_ttl_seconds is None:
+            return
+        if isinstance(self.cache_salt_ttl_seconds, list):
+            if len(self.cache_salt_ttl_seconds) != self.batch_size:
+                raise ValueError(
+                    "The length of cache_salt_ttl_seconds should be equal to "
+                    "the batch size."
+                )
+            self.cache_salt_ttl_seconds = (
+                self.cache_salt_ttl_seconds * self.parallel_sample_num
+            )
+        else:
+            self.cache_salt_ttl_seconds = [self.cache_salt_ttl_seconds] * num
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -962,6 +984,11 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            cache_salt_ttl_seconds=(
+                self.cache_salt_ttl_seconds[i]
+                if self.cache_salt_ttl_seconds is not None
+                else None
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1670,6 +1697,19 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+
+
+class ExpireCacheSaltsReq(BaseReq):
+    """Tell the scheduler to drop the radix KV of these cache salts.
+
+    Not a work request, so the request receiver classifies it as a control
+    request and broadcasts it: every TP rank runs the same expiry in the same
+    loop iteration. A per-rank wall clock would expire different salts on
+    different ranks, and divergent tree shapes change match_prefix hit lengths,
+    which mismatches the per-iteration DP all-gather.
+    """
+
+    salts: List[str] = []
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):

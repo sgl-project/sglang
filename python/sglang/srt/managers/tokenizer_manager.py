@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    ExpireCacheSaltsReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -117,6 +118,7 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
 )
+from sglang.srt.mem_cache.cache_salt_ttl import build_cache_salt_ttl_reaper
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
@@ -657,6 +659,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        # Cache-salt TTL. The clock lives here, not in the scheduler:
+        # this is one process, so the expiry command it emits lands on
+        # every TP rank in the same loop iteration. Per-rank wall clocks
+        # would expire different salts on different ranks.
+        self.cache_salt_ttl_reaper = build_cache_salt_ttl_reaper(self.server_args)
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -1441,6 +1448,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _observe_cache_salt(self, obj) -> None:
+        """Arm or refresh the TTL of the salt this request carries.
+
+        Only generate requests: EmbeddingReqInput has no cache_salt, so an
+        embedding never enters a cache namespace.
+        """
+        if self.cache_salt_ttl_reaper is None:
+            return
+        if not isinstance(obj, GenerateReqInput) or not obj.cache_salt:
+            return
+        self.cache_salt_ttl_reaper.observe(
+            obj.cache_salt, time.monotonic(), obj.cache_salt_ttl_seconds
+        )
+
+    async def _cache_salt_ttl_loop(self):
+        """Tell the scheduler which cache salts have outlived their TTL."""
+        interval = self.cache_salt_ttl_reaper.policy.sweep_interval_s
+        while True:
+            await asyncio.sleep(interval)
+            expired = self.cache_salt_ttl_reaper.sweep(time.monotonic())
+            if not expired:
+                continue
+            logger.info("cache-salt TTL: expiring %d salt(s)", len(expired))
+            await self._async_dispatch_to_scheduler(ExpireCacheSaltsReq(salts=expired))
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1451,6 +1483,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        # The single funnel for both the one-request and the batch-tokenization
+        # paths, so every request carrying a salt refreshes its TTL exactly once.
+        self._observe_cache_salt(obj)
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -2295,6 +2330,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
+        if self.cache_salt_ttl_reaper is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self._cache_salt_ttl_loop))
+            )
 
         # We only add signal handler when the tokenizer manager is in the main thread
         # due to the CPython limitation.
