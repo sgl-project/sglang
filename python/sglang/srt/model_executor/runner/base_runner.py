@@ -289,16 +289,45 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            pre_initialize_workspaces,
+            resolve_flashinfer_allreduce_fusion_backend,
+            uses_cutedsl_ar_fusion,
+        )
+
         if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
+        if uses_cutedsl_ar_fusion():
+            # cutedsl builds its own workspace from the model's pre-capture
+            # hook, and nothing else resolves its configured value, so the
+            # platform check runs here or not at all.
+            resolve_flashinfer_allreduce_fusion_backend()
+            if not mr.is_draft_worker:
+                # install_cutedsl_fusion() declines inside
+                # draft_model_build_scope(), so a draft carries no communicator.
+                self._assert_model_installs_cutedsl_fusion()
+            return
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
+        )
+
+    def _assert_model_installs_cutedsl_fusion(self):
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            model_installs_cutedsl_fusion,
+        )
+
+        if model_installs_cutedsl_fusion(self.model_runner.model):
+            return
+        raise ValueError(
+            "--flashinfer-allreduce-fusion-backend cutedsl is set, but "
+            f"{type(self.model_runner.model).__name__} installed no CuTe DSL "
+            "fusion communicator, so no allreduce fusion would run at all. "
+            "Drop the flag, or choose 'auto', 'trtllm' or 'mnnvl'."
         )
 
     def _pre_initialize_fi_a2a_workspace(self):

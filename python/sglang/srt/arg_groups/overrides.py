@@ -1025,20 +1025,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and view.nnodes == 1
         and not view.disable_custom_all_reduce
     )
-    if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        # The Qwen backend owns one workspace for ordinary AR and MoE finalize;
-        # do not allocate or fall back to the legacy TRTLLM/MNNVL workspace.
-        if view.flashinfer_allreduce_fusion_backend is not None:
-            logger.warning(
-                "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION owns both Qwen3.5 "
-                "AllReduce fusion patterns; suppressing the separately configured "
-                "--flashinfer-allreduce-fusion-backend=%s",
-                view.flashinfer_allreduce_fusion_backend,
-            )
-        return {"flashinfer_allreduce_fusion_backend": None}
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS

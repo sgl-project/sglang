@@ -77,6 +77,10 @@ class DeepseekModelNextN(nn.Module):
 
         self.vocab_size = config.vocab_size
 
+        # The MTP draft layer has no successor to consume a deferred finalize.
+        # DeepseekV2ForCausalLM's pre-capture hook reads this off self.model.
+        self.flashinfer_mnnvl_cutedsl_fusion = None
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
