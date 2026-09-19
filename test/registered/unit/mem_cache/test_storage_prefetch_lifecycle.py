@@ -181,6 +181,9 @@ def _cache_mode_host_capacity_fixture():
     cache._log_storage_prefetch_deferred = Mock()
     cache.evict_host = Mock(return_value=0)
     cache.buffer_pipeline = None
+    cache.pending_storage_hits = deque()
+    cache.storage_prefetch_retry_max_attempts = 2
+    cache.enable_cache_mode_storage_hit_pending = True
     cache.cache_controller = SimpleNamespace(
         prefetch_hit_queue=Queue(),
         ack_prefetch_queue=Queue(),
@@ -202,6 +205,7 @@ def _cache_mode_host_capacity_fixture():
         storage_hit_count=8,
         stats_requested_tokens=8,
         storage_start=0,
+        host_capacity_retries=0,
         is_terminated=lambda: False,
         hash_value=["h0", "h1", "h2", "h3"],
     )
@@ -545,8 +549,8 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
 
-    def test_cache_mode_full_hit_does_not_shrink_to_available_host_capacity(self):
-        """A complete L3 hit must not silently become a partial storage hit."""
+    def test_cache_mode_full_hit_parks_instead_of_shrinking(self):
+        """A complete L3 hit must park rather than become a partial storage hit."""
         cache, operation = _cache_mode_host_capacity_fixture()
 
         cache._drain_storage_control_queues_impl(
@@ -562,12 +566,102 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(operation.hash_value, ["h0", "h1", "h2", "h3"])
         self.assertFalse(hasattr(operation, "host_indices"))
         self.assertEqual(cache.cache_controller.prefetch_buffer.qsize(), 0)
+        self.assertEqual(list(cache.pending_storage_hits), [operation])
+        self.assertEqual(operation.host_capacity_retries, 1)
+        cache._finish_storage_prefetch.assert_not_called()
+        cache.revoke_pending_prefetch.assert_not_called()
+        cache._log_storage_prefetch_deferred.assert_called_once_with(8, "host_capacity")
+        cache._resolve_storage_prefetch_tokens.assert_not_called()
+
+    def test_cache_mode_parked_hit_resumes_when_host_capacity_returns(self):
+        """A parked full hit resumes without shrinking its storage span."""
+        cache, operation = _cache_mode_host_capacity_fixture()
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        host_indices = torch.arange(8)
+        cache.cache_controller.mem_pool_host.alloc = Mock(return_value=host_indices)
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+
+        self.assertEqual(list(cache.pending_storage_hits), [])
+        self.assertEqual(operation.storage_hit_count, 8)
+        self.assertEqual(operation.hash_value, ["h0", "h1", "h2", "h3"])
+        self.assertEqual(operation.host_indices.tolist(), host_indices.tolist())
+        self.assertEqual(cache.cache_controller.prefetch_buffer.qsize(), 1)
+        cache._finish_storage_prefetch.assert_not_called()
+        cache.revoke_pending_prefetch.assert_not_called()
+        cache._resolve_storage_prefetch_tokens.assert_called_once_with(
+            operation.handle, 0, reason="host_capacity"
+        )
+
+    def test_cache_mode_parked_hit_times_out_after_retry_budget(self):
+        """A parked full hit falls back to a safe miss after bounded retries."""
+        cache, operation = _cache_mode_host_capacity_fixture()
+        cache.storage_prefetch_retry_max_attempts = 1
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        self.assertEqual(list(cache.pending_storage_hits), [operation])
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+
+        self.assertEqual(list(cache.pending_storage_hits), [])
+        self.assertEqual(operation.storage_hit_count, 8)
+        self.assertEqual(operation.hash_value, ["h0", "h1", "h2", "h3"])
+        self.assertFalse(hasattr(operation, "host_indices"))
+        self.assertEqual(cache.cache_controller.prefetch_buffer.qsize(), 0)
         cache._finish_storage_prefetch.assert_called_once_with(
             operation.handle, fulfilled_tokens=0, reason="host_capacity"
         )
         cache.revoke_pending_prefetch.assert_called_once_with(operation.handle)
-        cache._log_storage_prefetch_deferred.assert_called_once_with(8, "host_capacity")
-        cache._resolve_storage_prefetch_tokens.assert_not_called()
+
+    def test_distributed_cache_mode_full_hit_does_not_park(self):
+        """Distributed ranks keep the deterministic immediate safe miss."""
+        cache, operation = _cache_mode_host_capacity_fixture()
+        cache.enable_cache_mode_storage_hit_pending = False
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+
+        self.assertEqual(list(cache.pending_storage_hits), [])
+        self.assertFalse(hasattr(operation, "host_indices"))
+        self.assertEqual(cache.cache_controller.prefetch_buffer.qsize(), 0)
+        cache._finish_storage_prefetch.assert_called_once_with(
+            operation.handle, fulfilled_tokens=0, reason="host_capacity"
+        )
+        cache.revoke_pending_prefetch.assert_called_once_with(operation.handle)
 
 
 if __name__ == "__main__":
