@@ -54,14 +54,18 @@ class KDAKernelDispatcher:
         verify_backend: LinearAttnKernelBackend,
     ):
         if is_ppu():
-            requested = (decode_backend, prefill_backend, verify_backend)
-            if any(not backend.is_triton() for backend in requested):
+            if (
+                not decode_backend.is_triton()
+                or not (prefill_backend.is_triton() or prefill_backend.is_flashkda())
+                or not verify_backend.is_triton()
+            ):
                 rank0_log(
-                    "PPU KDA requires Triton kernels; overriding decode, prefill, "
-                    "and verify backends to triton."
+                    "PPU KDA only supports fused decode and FlashKDA prefill; "
+                    "using Triton for unsupported backends."
                 )
             decode_backend = LinearAttnKernelBackend.TRITON
-            prefill_backend = LinearAttnKernelBackend.TRITON
+            if not prefill_backend.is_flashkda():
+                prefill_backend = LinearAttnKernelBackend.TRITON
             verify_backend = LinearAttnKernelBackend.TRITON
 
         self.verify_backend = verify_backend
@@ -712,6 +716,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     scale=layer.head_k_dim**-0.5,
                     onorm_eps=onorm_eps,
                     lower_bound=layer.lower_bound,
+                    fused_weight=getattr(layer, "_k3_fused_decode_weight", None),
+                    actual_batch_size=getattr(
+                        forward_batch, "_original_batch_size", None
+                    ),
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(

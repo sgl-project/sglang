@@ -33,6 +33,18 @@ def _jit_situ_and_mul_module(in_dtype: torch.dtype, out_dtype: torch.dtype) -> M
     )
 
 
+@cache_once
+def _jit_situ_and_mul_masked_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        _make_name("situ_and_mul_masked"),
+        *args,
+        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_wrappers=[("run", f"SituAndMulMaskedKernel<{args}>::run")],
+        extra_cuda_cflags=get_activation_cuda_cflags(),
+    )
+
+
 def situ_and_mul(
     input: torch.Tensor,
     out: Optional[torch.Tensor],
@@ -71,6 +83,35 @@ def situ_and_mul(
     module.run(
         input_2d,
         out_2d,
+        float(beta),
+        float(linear_beta) if has_linear_beta else 0.0,
+        has_linear_beta,
+    )
+    return out
+
+
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    """Fused masked SiTU activation: bf16 -> bf16."""
+    hidden_size = input.shape[-1] // 2
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], hidden_size)
+
+    has_linear_beta = linear_beta is not None
+    module = _jit_situ_and_mul_masked_module()
+    module.run(
+        input,
+        out,
+        masked_m,
+        topk,
+        int(expected_m) if expected_m is not None else int(input.shape[1]),
         float(beta),
         float(linear_beta) if has_linear_beta else 0.0,
         has_linear_beta,

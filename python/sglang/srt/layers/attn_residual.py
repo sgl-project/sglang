@@ -136,12 +136,12 @@ def _aggregate_fast(
 
 
 @triton.jit
-def _aggregate_sm8x_kernel(
+def _attn_res_sm8x_kernel(
     prefix_ptr,  # [T, H]
     delta_ptr,  # [T, H] when HAS_DELTA
     prefix_out_ptr,  # [T, H], receives prefix + delta when HAS_DELTA
     bank_ptr,  # [T, NB_total, H]
-    cw_ptr,  # [H], fp32
+    cw_ptr,  # [H], bf16 on the SM8x path
     out_weight_ptr,  # [H]
     out_ptr,  # [T, H]
     stride_pm: tl.constexpr,
@@ -167,78 +167,160 @@ def _aggregate_sm8x_kernel(
     offs_h = tl.max_contiguous(tl.arange(0, BLOCK_H), BLOCK_H)
     mask_h = offs_h < H
 
-    updated_prefix = tl.load(
-        prefix_ptr + pid_t * stride_pm + offs_h, mask=mask_h, other=0.0
-    ).to(tl.float32)
-    if HAS_DELTA:
-        delta = tl.load(
-            delta_ptr + pid_t * stride_dm + offs_h, mask=mask_h, other=0.0
-        ).to(tl.float32)
-        updated_prefix = updated_prefix + delta
-        updated_prefix = updated_prefix.to(prefix_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(
-            prefix_out_ptr + pid_t * stride_pm + offs_h, updated_prefix, mask=mask_h
-        )
-
-    if WRITE_BANK:
-        tl.store(
-            bank_ptr + pid_t * stride_bm + NVB * stride_bb + offs_h,
-            updated_prefix,
-            mask=mask_h,
-        )
-
     # A block write with NVB == 0 is the first K3 attention-residual point:
     # the sole source has softmax weight one, so it needs no score pass.
     if NVB == 0:
+        updated_prefix = tl.load(
+            prefix_ptr + pid_t * stride_pm + offs_h, mask=mask_h, other=0.0
+        ).to(tl.float32)
+        if HAS_DELTA:
+            delta = tl.load(
+                delta_ptr + pid_t * stride_dm + offs_h, mask=mask_h, other=0.0
+            ).to(tl.float32)
+            updated_prefix = updated_prefix + delta
+            updated_prefix = updated_prefix.to(prefix_ptr.dtype.element_ty).to(
+                tl.float32
+            )
+            tl.store(
+                prefix_out_ptr + pid_t * stride_pm + offs_h,
+                updated_prefix,
+                mask=mask_h,
+            )
+        if WRITE_BANK:
+            tl.store(
+                bank_ptr + pid_t * stride_bm + offs_h,
+                updated_prefix,
+                mask=mask_h,
+            )
         mixed = updated_prefix
     else:
-        # Do not retain the 8192-wide prefix vector over the source loop.
-        # Selecting source pointers lets Triton reload it in the prefix tile,
-        # avoiding the severe register pressure observed on SM89/PPU.
-        if HAS_DELTA:
-            tl.debug_barrier()
-            prefix_source_ptr = prefix_out_ptr
-        else:
-            prefix_source_ptr = prefix_ptr
         cw = tl.load(cw_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
         max_score = tl.full((), -float("inf"), tl.float32)
         denom = tl.zeros((), tl.float32)
         mixed = tl.zeros([BLOCK_H], tl.float32)
 
-        # Process bank rows plus current prefix in small tiles. Online softmax
-        # avoids materializing scores and preserves a single kernel launch.
-        for row0 in tl.static_range(0, NVB + 1, BLOCK_ROWS):
-            offs_r = row0 + tl.arange(0, BLOCK_ROWS)
-            row_mask = offs_r <= NVB
-            is_prefix = offs_r == NVB
-            bank_ptrs = (
-                bank_ptr
-                + pid_t * stride_bm
-                + offs_r[:, None] * stride_bb
-                + offs_h[None, :]
-            )
-            prefix_ptrs = (
-                prefix_source_ptr
-                + pid_t * stride_pm
-                + offs_r[:, None] * 0
-                + offs_h[None, :]
-            )
-            values = tl.load(
-                tl.where(is_prefix[:, None], prefix_ptrs, bank_ptrs),
-                mask=row_mask[:, None] & mask_h[None, :],
+        if BLOCK_ROWS == 1:
+            # Production T uses scalar rows. Keep bank accesses one-dimensional
+            # and produce the rounded prefix only when its final row is consumed.
+            for row in tl.static_range(0, NVB):
+                values = tl.load(
+                    bank_ptr + pid_t * stride_bm + row * stride_bb + offs_h,
+                    mask=mask_h,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                ).to(tl.float32)
+                inv_rms = tl.rsqrt(tl.sum(values * values, axis=0) * (1.0 / H) + EPS)
+                score = tl.sum(values * cw, axis=0) * inv_rms
+                new_max = tl.maximum(max_score, score)
+                old_scale = tl.exp(max_score - new_max)
+                scale = tl.exp(score - new_max)
+                denom = denom * old_scale + scale
+                mixed = mixed * old_scale + scale * values
+                max_score = new_max
+
+            updated_prefix = tl.load(
+                prefix_ptr + pid_t * stride_pm + offs_h,
+                mask=mask_h,
                 other=0.0,
                 eviction_policy="evict_first",
             ).to(tl.float32)
-            inv_rms = tl.rsqrt(tl.sum(values * values, axis=1) * (1.0 / H) + EPS)
-            scores = tl.sum(values * cw[None, :], axis=1) * inv_rms
-            scores = tl.where(row_mask, scores, -float("inf"))
+            if HAS_DELTA:
+                delta = tl.load(
+                    delta_ptr + pid_t * stride_dm + offs_h,
+                    mask=mask_h,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                ).to(tl.float32)
+                updated_prefix = updated_prefix + delta
+                updated_prefix = updated_prefix.to(prefix_ptr.dtype.element_ty).to(
+                    tl.float32
+                )
+                tl.store(
+                    prefix_out_ptr + pid_t * stride_pm + offs_h,
+                    updated_prefix,
+                    mask=mask_h,
+                )
+            if WRITE_BANK:
+                tl.store(
+                    bank_ptr + pid_t * stride_bm + NVB * stride_bb + offs_h,
+                    updated_prefix,
+                    mask=mask_h,
+                )
 
-            new_max = tl.maximum(max_score, tl.max(scores, axis=0))
+            inv_rms = tl.rsqrt(
+                tl.sum(updated_prefix * updated_prefix, axis=0) * (1.0 / H) + EPS
+            )
+            score = tl.sum(updated_prefix * cw, axis=0) * inv_rms
+            new_max = tl.maximum(max_score, score)
             old_scale = tl.exp(max_score - new_max)
-            scales = tl.exp(scores - new_max)
-            denom = denom * old_scale + tl.sum(scales, axis=0)
-            mixed = mixed * old_scale + tl.sum(scales[:, None] * values, axis=0)
+            scale = tl.exp(score - new_max)
+            denom = denom * old_scale + scale
+            mixed = mixed * old_scale + scale * updated_prefix
             max_score = new_max
+        else:
+            updated_prefix = tl.load(
+                prefix_ptr + pid_t * stride_pm + offs_h, mask=mask_h, other=0.0
+            ).to(tl.float32)
+            if HAS_DELTA:
+                delta = tl.load(
+                    delta_ptr + pid_t * stride_dm + offs_h,
+                    mask=mask_h,
+                    other=0.0,
+                ).to(tl.float32)
+                updated_prefix = updated_prefix + delta
+                updated_prefix = updated_prefix.to(prefix_ptr.dtype.element_ty).to(
+                    tl.float32
+                )
+                tl.store(
+                    prefix_out_ptr + pid_t * stride_pm + offs_h,
+                    updated_prefix,
+                    mask=mask_h,
+                )
+                tl.debug_barrier()
+                prefix_source_ptr = prefix_out_ptr
+            else:
+                prefix_source_ptr = prefix_ptr
+            if WRITE_BANK:
+                tl.store(
+                    bank_ptr + pid_t * stride_bm + NVB * stride_bb + offs_h,
+                    updated_prefix,
+                    mask=mask_h,
+                )
+
+            # Process bank rows plus current prefix in small tiles. Online
+            # softmax avoids materializing scores and preserves one launch.
+            for row0 in tl.static_range(0, NVB + 1, BLOCK_ROWS):
+                offs_r = row0 + tl.arange(0, BLOCK_ROWS)
+                row_mask = offs_r <= NVB
+                is_prefix = offs_r == NVB
+                bank_ptrs = (
+                    bank_ptr
+                    + pid_t * stride_bm
+                    + offs_r[:, None] * stride_bb
+                    + offs_h[None, :]
+                )
+                prefix_ptrs = (
+                    prefix_source_ptr
+                    + pid_t * stride_pm
+                    + offs_r[:, None] * 0
+                    + offs_h[None, :]
+                )
+                values = tl.load(
+                    tl.where(is_prefix[:, None], prefix_ptrs, bank_ptrs),
+                    mask=row_mask[:, None] & mask_h[None, :],
+                    other=0.0,
+                    eviction_policy="evict_first",
+                ).to(tl.float32)
+                inv_rms = tl.rsqrt(tl.sum(values * values, axis=1) * (1.0 / H) + EPS)
+                scores = tl.sum(values * cw[None, :], axis=1) * inv_rms
+                scores = tl.where(row_mask, scores, -float("inf"))
+
+                new_max = tl.maximum(max_score, tl.max(scores, axis=0))
+                old_scale = tl.exp(max_score - new_max)
+                scales = tl.exp(scores - new_max)
+                denom = denom * old_scale + tl.sum(scales, axis=0)
+                mixed = mixed * old_scale + tl.sum(scales[:, None] * values, axis=0)
+                max_score = new_max
 
         mixed = mixed / denom
 
@@ -274,12 +356,15 @@ def _aggregate_sm8x(
     out = torch.empty_like(prefix_sum)
     prefix = torch.empty_like(prefix_sum) if delta is not None else prefix_sum
     block_rows = 1 if T >= 256 or nvb <= 1 else 4
-    _aggregate_sm8x_kernel[(T,)](
+    num_warps = 8 if block_rows > 1 else 4
+    if T >= 256 and (nvb >= 4 or nvb == 1):
+        num_warps = 8
+    _attn_res_sm8x_kernel[(T,)](
         prefix_sum,
         prefix_sum if delta is None else delta,
         prefix,
         bank,
-        get_cw(score_proj, score_norm),
+        get_cw(score_proj, score_norm, dtype=torch.bfloat16),
         out_norm.weight,
         out,
         prefix_sum.stride(0),
@@ -294,7 +379,7 @@ def _aggregate_sm8x(
         BLOCK_ROWS=block_rows,
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
-        num_warps=4 if block_rows == 1 else 8,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out, prefix

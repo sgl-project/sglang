@@ -956,6 +956,8 @@ def is_mnnvl_fabric_device() -> bool:
     v2 multinode, DCP fi_a2a)."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
+    if is_ppu():
+        return True
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
 

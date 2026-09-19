@@ -728,6 +728,14 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
 
 
+def _get_w4a16_weight_shape(weight: torch.Tensor) -> Tuple[int, int, int]:
+    if weight.dtype == torch.uint8:
+        # W4FA16 MMA: [E, N, K/2], two FP4 values per byte.
+        num_groups, n, packed_k = weight.shape
+        return num_groups, n, packed_k * 2
+    return weight.shape[0], weight.shape[2] // 2, weight.shape[1] * 16
+
+
 def grouped_gemm_nt_bf16i4bf16_masked(
     lhs: torch.Tensor,
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -746,7 +754,7 @@ def grouped_gemm_nt_bf16i4bf16_masked(
     assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_bf16i4bf16_masked"
 
     num_groups, _, k = lhs.shape
-    n = rhs[0].shape[2] // 2
+    _, n, _ = _get_w4a16_weight_shape(rhs[0])
 
     best_config = (
         configs
@@ -756,7 +764,11 @@ def grouped_gemm_nt_bf16i4bf16_masked(
         )
     )
 
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED
+        if rhs[0].dtype == torch.uint8
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
+    )
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -796,9 +808,13 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_bf16i4bf16_nopad"
 
     m, k = lhs.shape
-    num_groups, n = rhs[0].shape[0], rhs[0].shape[2] // 2
+    num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
 
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
+        if rhs[0].dtype == torch.uint8
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
+    )
 
     best_config = (
         configs
@@ -816,6 +832,44 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
             m_indices,
             m_rows,
             best_config,
+        )
+
+
+def grouped_gemm_nt_bf16i4bf16_fused(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = lhs.shape
+    num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
+    if rhs[0].dtype == torch.uint8:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
+        )
+    elif rhs[1].dtype == torch.uint8:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
+        )
+    else:
+        kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_w4a16_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
         )
 
 
@@ -961,7 +1015,11 @@ def moe_align_block_size(
     elif A.dtype == torch.int8:
         gemm_dtype = "int8"
     elif A.dtype == torch.bfloat16:
-        gemm_dtype = "bf16"
+        if B.dtype in (torch.int32, torch.uint8):
+            num_groups, n, _ = _get_w4a16_weight_shape(B)
+            gemm_dtype = "int4"
+        else:
+            gemm_dtype = "bf16"
     elif A.dtype == torch.uint8:
         gemm_dtype = "fp4"
     else:

@@ -45,23 +45,21 @@ def handle_ppu_backends(server_args: Any):
     # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
     if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
         envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
-    # Use CUDA FLA fast path by default on PPU.
-    if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
-        envs.SGLANG_SAIL_FLA_CUDA.set(True)
-    # Disable DeepSeek-V4 topk_v2 on PPU by default.
-    if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
-        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    # Use CUDA PLA fast path by default on PPU.
+    if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
+        envs.SGLANG_SAIL_PLA_CUDA.set(True)
     # Disable DeepSeek-V4 topk_v2 on PPU by default.
     if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
     # K3's Blackwell-specific fused paths cannot run on PPU. Keep the
     # flags false so an explicit environment setting cannot re-enable them.
+    # SGLANG_K3_FUSED_FRONT stays at its default (True): the PPU W4A16
+    # MMA/fused-MoE path relies on the fused MoE front.
     for field in (
         envs.SGLANG_K3_AR_FUSION,
         envs.SGLANG_K3_SP_COLLECTIVE,
         envs.SGLANG_K3_SP_ATTN_RES,
         envs.SGLANG_K3_GEMM_AR,
-        envs.SGLANG_K3_FUSED_FRONT,
     ):
         field.set(False)
     # Disable shared experts fusion for mxfp4 and mixed_precision_w4: those

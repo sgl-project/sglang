@@ -31,11 +31,14 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_ppu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _SUPPORTED_HEADS = {3, 6, 12}
+if is_ppu():
+    _SUPPORTED_HEADS = {12, 24, 48, 96}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -64,16 +67,14 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
-    from sglang.srt.utils import is_ppu
-
-    if is_ppu():
-        return False
-
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
     if H not in _SUPPORTED_HEADS:
         return False
+    if is_ppu():
+        return True
+
     seg = H * 128
     conv_dim = 3 * seg
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
@@ -132,6 +133,8 @@ def kda_fused_decode(
     scale: float,
     onorm_eps: float,
     lower_bound: Optional[float] = None,
+    fused_weight: Optional[torch.Tensor] = None,
+    actual_batch_size: Optional[int] = None,
 ) -> torch.Tensor:
     """In-place fused decode step: shifts `conv_states` and updates
     `ssm_states` rows selected by `cache_indices` (rows < 0 are padded
@@ -141,6 +144,37 @@ def kda_fused_decode(
     B = mixed_qkv.shape[0]
     H = ssm_states.shape[-3]
     seg = H * 128
+
+    if is_ppu():
+        from pla.decode.kda import fused_kda_decode_mega_forward
+
+        if actual_batch_size is None:
+            actual_batch_size = B
+        output_shape = (1, B, H, 128)
+        out = (
+            mixed_qkv.new_empty(output_shape)
+            if actual_batch_size == B
+            else mixed_qkv.new_zeros(output_shape)
+        )
+        fused_kda_decode_mega_forward(
+            x=mixed_qkv[:actual_batch_size],
+            weight=fused_weight,
+            bias=conv_bias,
+            conv_state=conv_states.transpose(-1, -2),
+            raw_g=a[:actual_batch_size].reshape(1, actual_batch_size, H, 128),
+            raw_beta=b[:actual_batch_size].unsqueeze(0),
+            a_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=cache_indices[:actual_batch_size],
+            state=ssm_states,
+            out=out[:, :actual_batch_size],
+            lower_bound=lower_bound,
+            output_gate=onorm_g[:actual_batch_size].reshape(actual_batch_size, H, 128),
+            norm_weight=onorm_weight,
+            norm_eps=onorm_eps,
+        )
+        return out
+
     out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
     _jit_kda_fused_decode_module().run(
         mixed_qkv,

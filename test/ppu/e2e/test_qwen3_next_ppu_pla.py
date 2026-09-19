@@ -1,7 +1,7 @@
 """E2E: Qwen3-Next-80B-A3B-Instruct W8A8-INT8 on PPU with pla kernel.
 
 This test verifies that the pla (PPU FLA) adaptation works correctly by:
-1. Launching a Qwen3-Next server on PPU (SGLANG_SAIL_FLA_CUDA auto-enabled).
+1. Launching a Qwen3-Next server on PPU (SGLANG_SAIL_PLA_CUDA auto-enabled).
 2. Sending a generation request to exercise the GDN linear attention path.
 3. Verifying the server responds correctly without crashes.
 
@@ -111,10 +111,10 @@ class TestQwen3NextPpuPla(CustomTestCase):
         combined = stderr_output + stdout_output
 
         self.assertIn(
-            "USE PPU SAIL CUDA FLA kernel",
+            "USE PPU SAIL CUDA PLA kernel",
             combined,
             "pla kernel was NOT used by the server! "
-            "Check that SGLANG_SAIL_FLA_CUDA is enabled and pla is installed.",
+            "Check that SGLANG_SAIL_PLA_CUDA is enabled and pla is installed.",
         )
 
 

@@ -4,7 +4,7 @@ This test checks:
 1. pla package is importable (user installed it, uninstalled fla).
 2. The two required kernel functions exist in pla with the expected signatures.
 3. The compatibility import layer (try pla -> fallback fla) resolves correctly.
-4. The SGLANG_SAIL_FLA_CUDA environment variable is properly set on PPU.
+4. The SGLANG_SAIL_PLA_CUDA environment variable is properly set on PPU.
 """
 
 import importlib
@@ -126,7 +126,7 @@ class TestPLACompatImportLayer(CustomTestCase):
             self.fail(f"fused_recurrent failed to import: {e}")
 
     def test_compat_layer_uses_pla(self):
-        """当 SGLANG_SAIL_FLA_CUDA 为 True 时，代码应直接使用 pla.decode。"""
+        """当 SGLANG_SAIL_PLA_CUDA 为 True 时，代码应直接使用 pla.decode。"""
         # 验证源码中包含 from pla.decode import
         import sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent as mod
 
@@ -161,11 +161,11 @@ class TestPLACompatImportLayer(CustomTestCase):
         )
 
 
-class TestSGLANGSAILFLACUDAEnvVar(CustomTestCase):
-    """Verify the SGLANG_SAIL_FLA_CUDA environment variable behavior."""
+class TestSGLANGSAILPLACUDAEnvVar(CustomTestCase):
+    """Verify the SGLANG_SAIL_PLA_CUDA environment variable behavior."""
 
     def test_env_var_set_on_ppu(self):
-        """On PPU, SGLANG_SAIL_FLA_CUDA should be auto-enabled by ServerArgs.__post_init__.
+        """On PPU, SGLANG_SAIL_PLA_CUDA should be auto-enabled by ServerArgs.__post_init__.
 
         This test verifies the behavior by directly setting the env var,
         since ServerArgs creation may fail in test environments.
@@ -176,15 +176,15 @@ class TestSGLANGSAILFLACUDAEnvVar(CustomTestCase):
         from sglang.srt.environ import envs
 
         # Manually set the env var to simulate ServerArgs.__post_init__ behavior
-        envs.SGLANG_SAIL_FLA_CUDA.set(True)
+        envs.SGLANG_SAIL_PLA_CUDA.set(True)
 
         self.assertTrue(
-            envs.SGLANG_SAIL_FLA_CUDA.get(),
-            "SGLANG_SAIL_FLA_CUDA should be True on PPU",
+            envs.SGLANG_SAIL_PLA_CUDA.get(),
+            "SGLANG_SAIL_PLA_CUDA should be True on PPU",
         )
 
     def test_env_var_default_false_off_ppu(self):
-        """Off PPU, SGLANG_SAIL_FLA_CUDA defaults to False."""
+        """Off PPU, SGLANG_SAIL_PLA_CUDA defaults to False."""
         if is_ppu():
             self.skipTest("Running on PPU; skipping off-PPU check")
 
@@ -192,8 +192,8 @@ class TestSGLANGSAILFLACUDAEnvVar(CustomTestCase):
 
         # Default is False unless explicitly set
         self.assertFalse(
-            envs.SGLANG_SAIL_FLA_CUDA.get(),
-            "SGLANG_SAIL_FLA_CUDA should default to False off PPU",
+            envs.SGLANG_SAIL_PLA_CUDA.get(),
+            "SGLANG_SAIL_PLA_CUDA should default to False off PPU",
         )
 
 

@@ -185,6 +185,17 @@ struct SituAndMulKernel {
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+struct SituMulVarlenParams {
+  const bf16_t* __restrict__ input;
+  bf16_t* __restrict__ output;
+  const int32_t* __restrict__ masked_m;
+  float beta;
+  float linear_beta;
+  int64_t hidden_dim;
+  uint32_t num_tokens;
+  uint32_t num_experts;
+};
+
 struct SituMulQuantVarlenParams {
   const bf16_t* __restrict__ input;
   fp8_e4m3_t* __restrict__ output;
@@ -204,6 +215,13 @@ struct alignas(16) CTAWork {
   uint32_t expert_token_id;
   bool valid;
 };
+
+dim3 get_masked_grid(uint32_t num_experts, uint32_t max_masked_m) {
+  constexpr uint32_t kBlocksTarget = 2048;
+  auto blocks_per_expert = (kBlocksTarget + num_experts - 1) / num_experts;
+  if (max_masked_m > 0 && blocks_per_expert > max_masked_m) blocks_per_expert = max_masked_m;
+  return dim3(blocks_per_expert, num_experts);
+}
 
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
@@ -261,6 +279,51 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   }
   __syncthreads();
   return result;
+}
+
+template <bool kHasLinearBeta, bool kUsePDL>
+__global__ __launch_bounds__(1024, 2) void situ_mul_varlen_kernel(const SituMulVarlenParams __grid_constant__ params) {
+  using namespace device;
+
+  constexpr uint32_t kValuesPerThread = 8u;
+  using Vec = AlignedVector<bf16x2_t, kValuesPerThread / 2>;
+
+  const auto expert_id = blockIdx.y;
+  const auto num_tokens = static_cast<uint32_t>(params.masked_m[expert_id]);
+  if (blockIdx.x >= num_tokens) return;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const float beta = params.beta;
+  const float linear_beta = params.linear_beta;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = kHasLinearBeta ? 1.0f / linear_beta : 0.0f;
+
+  for (uint32_t token_id = blockIdx.x; token_id < num_tokens; token_id += gridDim.x) {
+    const auto offset = expert_id * params.num_tokens + token_id;
+    const auto input = params.input + offset * params.hidden_dim * 2;
+    const auto output = params.output + offset * params.hidden_dim;
+
+    Vec gate_vec, up_vec;
+    gate_vec.load(input, threadIdx.x);
+    up_vec.load(input, threadIdx.x + blockDim.x);
+
+    if (token_id == blockIdx.x) PDLTriggerSecondary<kUsePDL>();
+
+    Vec out_vec;
+
+#pragma unroll
+    for (uint32_t i = 0; i < kValuesPerThread / 2; ++i) {
+      const auto [g0, g1] = cast<fp32x2_t>(gate_vec[i]);
+      const auto [u0, u1] = cast<fp32x2_t>(up_vec[i]);
+      out_vec[i] = cast<bf16x2_t>(fp32x2_t{
+          sglang::kimi_k3::situ_activate<kHasLinearBeta>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta),
+          sglang::kimi_k3::situ_activate<kHasLinearBeta>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta),
+      });
+    }
+
+    out_vec.store(output, threadIdx.x);
+  }
 }
 
 template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL>
@@ -366,6 +429,73 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 // ---- Host wrapper
 
+template <bool kUsePDL>
+struct SituAndMulMaskedKernel {
+  static constexpr auto kernel_with_linear_beta = situ_mul_varlen_kernel<true, kUsePDL>;
+  static constexpr auto kernel_without_linear_beta = situ_mul_varlen_kernel<false, kUsePDL>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView masked_m,
+      const uint32_t topk,
+      const uint32_t max_masked_m,
+      const double beta,
+      const double linear_beta,
+      const bool has_linear_beta) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto E = SymbolicSize{"num_experts"};
+    auto T = SymbolicSize{"num_tokens_padded"};
+    auto D = SymbolicSize{"hidden_dim x 2"};
+    auto N = SymbolicSize{"hidden_dim"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({E, T, D})  // input
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({E, T, N})  // output
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    TensorMatcher({E})  // masked_m
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(masked_m);
+
+    const auto num_experts = static_cast<uint32_t>(E.unwrap());
+    const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    const auto hidden_dim = static_cast<uint32_t>(N.unwrap());
+
+    RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
+    RuntimeCheck(hidden_dim % 8 == 0, "hidden dimension must be divisible by 8");
+    RuntimeCheck(num_experts <= kMaxExperts, "num_experts exceeds maximum (256)");
+    if (num_tokens == 0) return;
+
+    const auto params = SituMulVarlenParams{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<bf16_t*>(output.data_ptr()),
+        .masked_m = static_cast<const int32_t*>(masked_m.data_ptr()),
+        .beta = static_cast<float>(beta),
+        .linear_beta = static_cast<float>(linear_beta),
+        .hidden_dim = hidden_dim,
+        .num_tokens = num_tokens,
+        .num_experts = num_experts,
+    };
+
+    const auto num_threads = hidden_dim / 8;
+    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads >= num_experts);
+
+    const auto kernel = has_linear_beta ? kernel_with_linear_beta : kernel_without_linear_beta;
+    const auto grid_m = max_masked_m > 0 ? max_masked_m : num_tokens * topk;
+    LaunchKernel(get_masked_grid(num_experts, grid_m), num_threads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL>
 struct SituAndMulMaskedPostQuantKernel {
   static_assert(kGroupSize == 128);
@@ -445,6 +575,215 @@ struct SituAndMulMaskedPostQuantKernel {
     RuntimeCheck(num_threads >= num_experts);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+struct SituMulQuantMxfp4Params {
+  const bf16_t* __restrict__ input;
+  uint8_t* __restrict__ output;
+  uint8_t* __restrict__ output_scale;
+  const int32_t* __restrict__ masked_m;
+  float beta;
+  float linear_beta;
+  int64_t hidden_dim;
+  uint32_t num_tokens;
+  uint32_t num_experts;
+};
+
+SGL_DEVICE uint32_t pack_mxfp4(float q0, float q1, float q2, float q3, float q4, float q5, float q6, float q7) {
+  uint32_t packed;
+  asm volatile(
+      "{\n\t"
+      ".reg .b8 r0, r1, r2, r3;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 r0, %2, %1;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 r1, %4, %3;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 r2, %6, %5;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 r3, %8, %7;\n\t"
+      "mov.b32 %0, {r0, r1, r2, r3};\n\t"
+      "}\n"
+      : "=r"(packed)
+      : "f"(q0), "f"(q1), "f"(q2), "f"(q3), "f"(q4), "f"(q5), "f"(q6), "f"(q7));
+  return packed;
+}
+
+template <bool kMasked, bool kUsePDL>
+__global__
+__launch_bounds__(1024, 2) void situ_mul_quant_mxfp4_kernel(const SituMulQuantMxfp4Params __grid_constant__ params) {
+  using namespace device;
+
+  constexpr uint32_t kGroupSize = 32u;
+  constexpr uint32_t kWorkThreads = 4u;
+  constexpr uint32_t kValuesPerThread = 8u;
+  using InputVec = AlignedVector<bf16x2_t, kValuesPerThread / 2>;
+
+  const auto expert_id = kMasked ? blockIdx.y : 0u;
+  const auto num_tokens = kMasked ? static_cast<uint32_t>(params.masked_m[expert_id]) : params.num_tokens;
+  if (blockIdx.x >= num_tokens) return;
+
+  const float beta = params.beta;
+  const float linear_beta = params.linear_beta;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = 1.0f / linear_beta;
+  const auto group_id = threadIdx.x / kWorkThreads;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  for (uint32_t token_id = blockIdx.x; token_id < num_tokens; token_id += gridDim.x) {
+    const auto offset = expert_id * params.num_tokens + token_id;
+    const auto input = params.input + offset * params.hidden_dim * 2;
+    const auto output = params.output + offset * params.hidden_dim / 2;
+    const auto output_scale = [&] {
+      const auto num_groups = params.hidden_dim / kGroupSize;
+      const auto expert_offset = kMasked ? expert_id * num_groups * params.num_tokens : 0;
+      return params.output_scale + expert_offset + (group_id / 2u) * (params.num_tokens * 2u) + token_id * 2u +
+             group_id % 2u;
+    }();
+
+    InputVec gate_vec, up_vec;
+    gate_vec.load(input, threadIdx.x);
+    up_vec.load(input, threadIdx.x + blockDim.x);
+
+    float local_max = 0.0f;
+    float results[kValuesPerThread];
+#pragma unroll
+    for (uint32_t i = 0; i < kValuesPerThread / 2; ++i) {
+      const auto [x, y] = situ_and_mul<false>(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+      results[2 * i + 0] = x;
+      results[2 * i + 1] = y;
+      local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
+
+    local_max = warp::reduce_max<kWorkThreads>(local_max);
+    const float absmax = fmaxf(local_max, 1e-10f);
+    const uint32_t scale_bits = (__float_as_uint(absmax / 6.0f) + 0x007FFFFFu) & 0x7F800000u;
+    const float inv_scale = __uint_as_float(0x7F000000u - scale_bits);
+
+    if (token_id == blockIdx.x) PDLTriggerSecondary<kUsePDL>();
+
+    reinterpret_cast<uint32_t*>(output)[threadIdx.x] = pack_mxfp4(
+        results[0] * inv_scale,
+        results[1] * inv_scale,
+        results[2] * inv_scale,
+        results[3] * inv_scale,
+        results[4] * inv_scale,
+        results[5] * inv_scale,
+        results[6] * inv_scale,
+        results[7] * inv_scale);
+    if (threadIdx.x % kWorkThreads == 0) {
+      *output_scale = static_cast<uint8_t>(scale_bits >> 23);
+    }
+  }
+}
+
+template <bool kUsePDL>
+struct SituAndMulPostQuantMxfp4Kernel {
+  static constexpr auto kernel = situ_mul_quant_mxfp4_kernel<false, kUsePDL>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const double beta,
+      const double linear_beta) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto T = SymbolicSize{"num_tokens"};
+    auto D = SymbolicSize{"hidden_dim x 2"};
+    auto N = SymbolicSize{"hidden_dim"};
+    auto P = SymbolicSize{"packed_hidden_dim"};
+    auto S = SymbolicSize{"num_scale_pairs"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({T, D}).with_dtype<bf16_t>().with_device(device).verify(input);
+    TensorMatcher({T, P}).with_dtype<uint8_t>().with_device(device).verify(output);
+    TensorMatcher({S, T}).with_dtype<uint16_t>().with_device(device).verify(output_scale);
+
+    N.set_value(P.unwrap() * 2);
+    const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    const auto hidden_dim = static_cast<uint32_t>(N.unwrap());
+
+    RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
+    RuntimeCheck(hidden_dim % 32 == 0, "hidden dimension must be divisible by 32");
+    RuntimeCheck(S.unwrap() * 64 == hidden_dim, "invalid scale dimension");
+    if (num_tokens == 0) return;
+
+    const auto params = SituMulQuantMxfp4Params{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<uint8_t*>(output.data_ptr()),
+        .output_scale = static_cast<uint8_t*>(output_scale.data_ptr()),
+        .masked_m = nullptr,
+        .beta = static_cast<float>(beta),
+        .linear_beta = static_cast<float>(linear_beta),
+        .hidden_dim = hidden_dim,
+        .num_tokens = num_tokens,
+        .num_experts = 1,
+    };
+
+    const auto num_threads = hidden_dim / 8;
+    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    LaunchKernel(num_tokens, num_threads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+template <bool kUsePDL>
+struct SituAndMulMaskedPostQuantMxfp4Kernel {
+  static constexpr auto kernel = situ_mul_quant_mxfp4_kernel<true, kUsePDL>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView masked_m,
+      const uint32_t topk,
+      const uint32_t max_masked_m,
+      const double beta,
+      const double linear_beta) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto E = SymbolicSize{"num_experts"};
+    auto T = SymbolicSize{"num_tokens_padded"};
+    auto D = SymbolicSize{"hidden_dim x 2"};
+    auto N = SymbolicSize{"hidden_dim"};
+    auto P = SymbolicSize{"packed_hidden_dim"};
+    auto S = SymbolicSize{"num_scale_pairs"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({E, T, D}).with_dtype<bf16_t>().with_device(device).verify(input);
+    TensorMatcher({E, T, P}).with_dtype<uint8_t>().with_device(device).verify(output);
+    TensorMatcher({E, S, T}).with_dtype<uint16_t>().with_device(device).verify(output_scale);
+    TensorMatcher({E}).with_dtype<int32_t>().with_device(device).verify(masked_m);
+
+    N.set_value(P.unwrap() * 2);
+    const auto num_experts = static_cast<uint32_t>(E.unwrap());
+    const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    const auto hidden_dim = static_cast<uint32_t>(N.unwrap());
+
+    RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
+    RuntimeCheck(hidden_dim % 32 == 0, "hidden dimension must be divisible by 32");
+    RuntimeCheck(S.unwrap() * 64 == hidden_dim, "invalid scale dimension");
+    RuntimeCheck(num_experts <= kMaxExperts, "num_experts exceeds maximum (256)");
+    if (num_tokens == 0) return;
+
+    const auto params = SituMulQuantMxfp4Params{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<uint8_t*>(output.data_ptr()),
+        .output_scale = static_cast<uint8_t*>(output_scale.data_ptr()),
+        .masked_m = static_cast<const int32_t*>(masked_m.data_ptr()),
+        .beta = static_cast<float>(beta),
+        .linear_beta = static_cast<float>(linear_beta),
+        .hidden_dim = hidden_dim,
+        .num_tokens = num_tokens,
+        .num_experts = num_experts,
+    };
+
+    const auto num_threads = hidden_dim / 8;
+    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads >= num_experts);
+    const auto grid_m = max_masked_m > 0 ? max_masked_m : num_tokens * topk;
+    LaunchKernel(get_masked_grid(num_experts, grid_m), num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };

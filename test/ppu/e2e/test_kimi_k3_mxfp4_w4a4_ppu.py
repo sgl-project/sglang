@@ -39,7 +39,7 @@ class TestKimiK3MXFp4W4A4Ppu(GSM8KMixin, CustomTestCase):
             "600",
             "--served-model-name",
             SERVED_MODEL_NAME,
-            "--max-taotal-tokens",
+            "--max-total-tokens",
             "32768",
             "--max-running-requests",
             "1",

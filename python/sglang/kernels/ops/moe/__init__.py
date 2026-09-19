@@ -158,7 +158,42 @@ def situ_and_mul_masked_post_quant(
     )
 
 
-__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
+def situ_and_mul_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+) -> None:
+    from ._jit_situ_and_mul_quant import situ_and_mul_post_quant_mxfp4 as impl
+
+    return impl(input, output, output_scale, beta, linear_beta)
+
+
+def situ_and_mul_masked_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> None:
+    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant_mxfp4 as impl
+
+    return impl(
+        input, output, output_scale, masked_m, beta, linear_beta, topk, expected_m
+    )
+
+
+__all__ = [
+    "situ_and_mul_masked_post_quant",
+    "situ_and_mul_post_quant_mxfp4",
+    "situ_and_mul_masked_post_quant_mxfp4",
+    "moe_align_block_size",
+    "topk_softmax",
+]
 
 
 # Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);

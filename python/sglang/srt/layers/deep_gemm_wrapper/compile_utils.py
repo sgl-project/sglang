@@ -153,6 +153,13 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_FUSED = auto()
     GROUPED_GEMM_NT_F4F4BF16_FUSED = auto()
 
+    # Append new kernel types to preserve all existing IntEnum values.
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
+
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
@@ -363,6 +370,21 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED: (
+                _GroupedMaskedWarmupExecutor_int4_mma
+            ),
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD: (
+                _GroupedNopadWarmupExecutor_int4_mma
+            ),
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED: (
+                _GroupedFusedWarmupExecutor_int4_mma
+            ),
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED: (
+                _GroupedFusedWarmupExecutor_int4
+            ),
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED: (
+                _GroupedFusedWarmupExecutor_mxfp4_valu
+            ),
             # fused variants
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED: _GroupedFusedWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
@@ -457,12 +479,31 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD]:
+            return (
+                max_m * k * 2
+                + num_groups * n * (k // 2)
+                + num_groups * n * (k // 32)
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED]:
+            return (
+                num_groups * max_m * k * 2
+                + num_groups * n * (k // 2)
+                + num_groups * n * (k // 32)
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
         elif kernel_type in [
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED,
         ]:
             # moe_align output memory (all int32)
             _BLOCK_M_MIN = 16  # min block_m config, used for conservative upper bound of max_num_m_blocks
@@ -489,7 +530,34 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + _numel * 4  # m_indices
                 + (2 * _num_blocks_pad + 2) * num_groups * 4  # intermediate_buffer
             )
-            if kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED]:
+            if kernel_type in [
+                DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED,
+                DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED,
+            ]:
+                scale_bytes = (
+                    1
+                    if kernel_type
+                    == DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
+                    else 2
+                )
+                return (
+                    max_m * k * 2
+                    + num_groups * (k // 16) * (n * 2) * 4
+                    + num_groups * (k // 32) * n * scale_bytes
+                    + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
+            elif kernel_type in [
+                DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
+            ]:
+                return (
+                    max_m * k * 2
+                    + num_groups * n * (k // 2)
+                    + num_groups * n * (k // 32)
+                    + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
+            elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED]:
                 # lhs(fp8) + lhs_scale(f32 blockwise) + rhs(fp8) + rhs_scale(f32 blockwise) + out(bf16)
                 return (
                     max_m * k
@@ -872,7 +940,7 @@ def _empty_block_uint8(size):
     )
 
 
-def _empty_marlin_int4(size):
+def _empty_marlin_int4(size, scale_dtype=torch.bfloat16):
     # Currently deepgemm w4a16 only supports group_size=32
     *dims, n, k = size
     group_size = 32
@@ -885,8 +953,18 @@ def _empty_marlin_int4(size):
         torch.empty(
             (*dims, k // group_size, n),
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=scale_dtype,
         ),
+    )
+
+
+def _empty_mxfp4_w4a16_mma(size):
+    *dims, n, k = size
+    if n % 64 != 0 or k % 64 != 0:
+        raise ValueError(f"W4A16 MMA requires 64-aligned N/K, got N={n}, K={k}.")
+    return (
+        torch.empty((*dims, n, k // 2), device="cuda", dtype=torch.uint8),
+        torch.empty((*dims, n // 64, k * 2), device="cuda", dtype=torch.uint8),
     )
 
 
@@ -1213,6 +1291,78 @@ class _GroupedNopadWarmupExecutor_int4(_BaseWarmupExecutor):
             self.out[:m],
             m_indices=self.m_indices[:m],
         )
+
+
+class _GroupedMaskedWarmupExecutor_int4_mma(_GroupedMaskedWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+
+class _GroupedNopadWarmupExecutor_int4_mma(_GroupedNopadWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+
+class _GroupedFusedWarmupExecutor_int4(_BaseWarmupExecutor):
+    scale_dtype = torch.bfloat16
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4(
+            (num_groups, n, k), self.scale_dtype
+        )
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
+        )
+        deep_gemm.m_grouped_gemm_w4a16_fused(
+            self.lhs[:m],
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_int4_mma(_GroupedFusedWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+
+class _GroupedFusedWarmupExecutor_mxfp4_valu(_GroupedFusedWarmupExecutor_int4):
+    scale_dtype = torch.uint8
 
 
 class _GroupedFusedWarmupExecutor(_BaseWarmupExecutor):

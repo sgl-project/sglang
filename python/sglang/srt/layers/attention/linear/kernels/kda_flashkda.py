@@ -5,6 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.utils import is_ppu
 
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
@@ -189,6 +190,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # gate them here rather than relying on the decode/target_verify stubs.
         if is_spec_decode:
             return True
+        if is_ppu():
+            return False
         # Short sequences (< chunk size) and long sequences (> the crossover
         # where Triton's chunked prefill wins) are faster on Triton. Read the
         # per-request lengths from the CPU-side extend_seq_lens to avoid a
@@ -223,8 +226,6 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
     ) -> torch.Tensor:
-        flash_kda = _load_flash_kda()
-
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
         #   g    = [1, packed_seq, HV, K]  beta = [1, packed_seq, H]
@@ -262,21 +263,42 @@ class FlashKDAKernel(LinearAttnKernelBase):
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
 
-        flash_kda.fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            out_buf,
-            A_log,
-            dt_bias,
-            lower_bound,
-            initial_state=initial_state,
-            final_state=final_state,
-            cu_seqlens=cu_seqlens,
-        )
+        if is_ppu():
+            from pla.prefill.flashkdapro import flashkda_fwd
+
+            batch_size, seq_len, num_heads, head_dim = q.shape
+            flashkda_fwd(
+                q=q.view(batch_size * seq_len, num_heads, head_dim),
+                k=k.view(batch_size * seq_len, num_heads, head_dim),
+                v=v.view(batch_size * seq_len, num_heads, head_dim),
+                g=g.view(batch_size * seq_len, num_heads, head_dim),
+                beta=beta.view(batch_size * seq_len, num_heads),
+                A_log=A_log,
+                dt_bias=dt_bias.reshape(-1),
+                out=out_buf.view(batch_size * seq_len, num_heads, head_dim),
+                scale=scale,
+                lower_bound=lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+            )
+        else:
+            flash_kda = _load_flash_kda()
+            flash_kda.fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                out_buf,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+            )
 
         ssm_states[cache_indices] = final_state
 

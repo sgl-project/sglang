@@ -7,6 +7,44 @@ from sglang.srt.utils import get_device_sm, is_ppu
 MXFP_BLOCK_SIZE: tl.constexpr = tl.constexpr(32)
 
 
+def preprocess_mxfp4_w4a16_mma_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder group-32 E8M0 scales for the PPU W4A16 MMA kernels."""
+    if scales.ndim != 3:
+        raise ValueError(f"Expected [E, N, K/32] scales, got {scales.shape}.")
+    if scales.dtype == torch.float8_e8m0fnu:
+        scales = scales.view(torch.uint8)
+    elif scales.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8/E8M0 scales, got {scales.dtype}.")
+
+    num_experts, n, k_groups = scales.shape
+    k = k_groups * 32
+    if n % 64 != 0 or k % 64 != 0:
+        raise ValueError(
+            f"PPU W4A16 MMA requires N and K to be multiples of 64, got N={n}, K={k}."
+        )
+
+    scale_perm = torch.tensor(
+        [
+            2 * i + j * 16 + offset
+            for i in range(8)
+            for j in range(8)
+            for offset in (0, 1)
+        ],
+        dtype=torch.long,
+        device=scales.device,
+    )
+    scales = (
+        scales.reshape(num_experts, n // 64, 64, k // 64, 2)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(-1, 128)
+    )
+    return (
+        scales.index_select(1, scale_perm)
+        .reshape(num_experts, n // 64, k * 2)
+        .contiguous()
+    )
+
+
 @triton.jit
 def _downcast_to_mxfp4(
     # Output: packed e2m1 tensor (uint8, two fp4 per byte)

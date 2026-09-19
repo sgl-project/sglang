@@ -40,6 +40,7 @@ def _make_owner(with_stream: bool):
 
     owner = SimpleNamespace(
         use_full_rank_gate=True,
+        use_fused_input_projection=False,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
@@ -177,6 +178,38 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         )
 
         self.assertEqual(_get_k3_dense_weight(module).data_ptr(), weight.data_ptr())
+
+    def test_ppu_fused_input_projection_matches_linear_slices(self):
+        def linear(rows, cols):
+            weight = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+            return SimpleNamespace(weight=torch.nn.Parameter(weight, False))
+
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            use_fused_input_projection=True,
+            _bfa_uses_block_fp8=False,
+            fused_qkvg_proj=linear(12, 8),
+            f_a_proj=linear(2, 8),
+            b_proj=linear(1, 8),
+            f_b_proj=linear(3, 2),
+            split_sizes=[9, 3],
+            _bfa_w=None,
+        )
+        KimiK3DeltaAttention._merge_bfa_weights(owner)
+        x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+
+        qkv, beta, forget_gate, gate = _run(owner, x)
+        fused = torch.nn.functional.linear(x, owner._bfa_w)
+        expected_qkv, expected_gate, f_a, expected_beta, _ = fused.split(
+            [9, 3, 2, 1, 1], dim=-1
+        )
+        expected_forget_gate = torch.nn.functional.linear(f_a, owner.f_b_proj.weight)
+
+        for got, ref in zip(
+            (qkv, beta, forget_gate, gate),
+            (expected_qkv, expected_beta, expected_forget_gate, expected_gate),
+        ):
+            self.assertTrue(torch.equal(got, ref))
 
 
 if __name__ == "__main__":

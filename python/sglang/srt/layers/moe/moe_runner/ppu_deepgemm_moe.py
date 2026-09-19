@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import silu_and_mul
 
-from sglang.kernels.ops.kimi_k3 import situ_and_mul
+from sglang.kernels.ops.activation import situ_and_mul
 from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
@@ -177,6 +177,57 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     m_rows: torch.Tensor,
 ) -> None:
     deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(A, (B, Bs), C, m_indices, m_rows)
+
+
+def grouped_gemm_nt_bf16i4bf16_fused_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    numel = A.shape[0] * topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(B.shape[0], dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+    )
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_bf16i4bf16_fused_fake)
+def grouped_gemm_nt_bf16i4bf16_fused(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        configs_list,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        inv_perm,
+        expert_ids,
+    ) = deep_gemm_wrapper.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=False, configs=configs
+    )
+
+    deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_fused(
+        A,
+        (B, Bs),
+        C,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        configs_list,
+    )
+    return m_rows, inv_perm, expert_ids
 
 
 # ---- fused variants: register_custom_op for CUDA graph / torch.compile ----
@@ -610,7 +661,8 @@ def deep_moe_impl_fused(
     _, top_k = topk_ids.shape
 
     use_w4a16 = use_int4_w4a16 or use_mxfp4_w4a16
-    if use_w4a16:
+    use_w4a16_mma = use_mxfp4_w4a16 and w1.dtype == torch.uint8
+    if use_w4a16 and not use_w4a16_mma:
         N = w2.shape[1] * 32
 
     if out_hidden_states is None:
@@ -622,8 +674,7 @@ def deep_moe_impl_fused(
         w2_scale = w2_scale.unsqueeze(-1) if w2_scale.ndim != w2.ndim else w2_scale
 
     # Hybrid fused path: requires DeepGemm commit 53ea8ff (refactor fused MoE API)
-    use_tp_fused = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
-    use_fused_path = use_tp_fused and not use_w4a16
+    use_fused_path = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
 
     if use_int8:
         assert per_channel_quant and block_shape is None, (
@@ -682,6 +733,14 @@ def deep_moe_impl_fused(
             m_rows, inv_perm, expert_ids = grouped_gemm_nt_f4f4bf16_fused(
                 hidden_states,
                 hidden_states_scale,
+                w1,
+                w1_scale,
+                out1,
+                topk_ids,
+            )
+        elif use_w4a16:
+            m_rows, inv_perm, expert_ids = grouped_gemm_nt_bf16i4bf16_fused(
+                hidden_states,
                 w1,
                 w1_scale,
                 out1,
@@ -775,7 +834,7 @@ def deep_moe_impl_fused(
                 a, w1, out1, expert_ids, num_recv_tokens_per_expert
             )
 
-    if use_w4a16:
+    if use_w4a16 and not use_fused_path:
         del a
 
     if (

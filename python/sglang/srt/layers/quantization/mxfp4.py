@@ -558,11 +558,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
-        self.use_deepgemm_mxfp4_w4a16 = (
-            self.use_deep_gemm and envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+        valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+        mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+        self._validate_ppu_mxfp4_w4a16(
+            valu_enabled,
+            mma_enabled,
         )
-        if _is_ppu and envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get():
-            self._validate_ppu_mxfp4_w4a16()
+        self.use_deepgemm_mxfp4_w4a16_valu = (
+            _is_ppu and self.use_deep_gemm and valu_enabled
+        )
+        self.use_deepgemm_mxfp4_w4a16_mma = (
+            _is_ppu and self.use_deep_gemm and mma_enabled
+        )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -625,18 +632,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return False
 
     @staticmethod
-    def _validate_ppu_mxfp4_w4a16() -> None:
+    def _validate_ppu_mxfp4_w4a16(
+        valu_enabled: bool,
+        mma_enabled: bool,
+    ) -> None:
+        if not _is_ppu:
+            return
+        if valu_enabled and mma_enabled:
+            raise ValueError(
+                "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 and "
+                "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA are mutually exclusive."
+            )
+        if not (valu_enabled or mma_enabled):
+            return
+        if mma_enabled and get_device_sm() < 89:
+            raise ValueError("PPU MXFP4 W4A16 MMA requires SM89 or newer.")
+
+        selector = (
+            "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA"
+            if mma_enabled
+            else "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16"
+        )
         moe_runner_backend = get_moe_runner_backend()
         if not moe_runner_backend.is_deep_gemm():
             raise ValueError(
-                "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16=1 requires "
+                f"{selector}=1 requires "
                 "--moe-runner-backend deep_gemm; only DeepGEMM "
                 "supports PPU MXFP4 W4A16."
             )
-        if not get_moe_a2a_backend().is_none():
+        moe_a2a_backend = get_moe_a2a_backend()
+        if not (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()):
             raise ValueError(
-                "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16=1 only supports "
-                "--moe-a2a-backend none."
+                f"{selector}=1 only supports --moe-a2a-backend none or deepep."
             )
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -661,6 +688,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
+        use_ppu_w4a16_valu = self.use_deepgemm_mxfp4_w4a16_valu
+        use_ppu_w4a16_mma = self.use_deepgemm_mxfp4_w4a16_mma
+        use_ppu_w4a16 = use_ppu_w4a16_valu or use_ppu_w4a16_mma
+        if use_ppu_w4a16_mma and with_bias:
+            raise ValueError("PPU MXFP4 W4A16 MMA does not support expert bias.")
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
         extra_weight_attrs.update(
@@ -670,13 +702,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if (self.use_marlin and not self.use_mega_moe) or (
-            _is_ppu and self.use_deepgemm_mxfp4_w4a16
-        ):
+        if (self.use_marlin and not self.use_mega_moe) or (use_ppu_w4a16_valu):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 128
             )
             hidden_size = round_up(hidden_size, 256)
+            self.hidden_pad = hidden_size - layer.hidden_size
+            self.intermediate_pad = (
+                intermediate_size_per_partition_after_pad
+                - layer.intermediate_size_per_partition
+            )
+        elif use_ppu_w4a16_mma:
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 64
+            )
+            hidden_size = round_up(hidden_size, 64)
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
@@ -793,10 +833,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         w13_weight_scale.quant_method = "group"
 
-        create_bias = with_bias or not _is_hip
+        create_bias = (with_bias or not _is_hip) and not use_ppu_w4a16_mma
         if create_bias or not (
-            (_is_ppu and self.use_deepgemm_mxfp4_w4a16)
-            or self.is_deepgemm_moe_runner_backend_enabled()
+            use_ppu_w4a16 or self.is_deepgemm_moe_runner_backend_enabled()
         ):
             w13_weight_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -838,10 +877,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         w2_weight_scale.quant_method = "group"
 
-        create_bias = with_bias or not _is_hip
         if create_bias or not (
-            (_is_ppu and self.use_deepgemm_mxfp4_w4a16)
-            or self.is_deepgemm_moe_runner_backend_enabled()
+            use_ppu_w4a16 or self.is_deepgemm_moe_runner_backend_enabled()
         ):
             w2_weight_bias = torch.nn.Parameter(
                 torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
@@ -851,8 +888,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if _is_ppu and self.use_deepgemm_mxfp4_w4a16_mma:
+            from sglang.srt.layers.quantization.ppu_mxfp4_utils import (
+                preprocess_mxfp4_w4a16_mma_scales,
+            )
+
+            for weight_name in ("w13_weight", "w2_weight"):
+                weight = getattr(layer, weight_name)
+                if weight.dtype != torch.uint8 or weight.ndim != 3:
+                    raise ValueError(
+                        "PPU MXFP4 W4A16 MMA requires direct uint8 weights, "
+                        f"got {weight_name} with dtype={weight.dtype}, "
+                        f"shape={tuple(weight.shape)}."
+                    )
+            for scale_name in ("w13_weight_scale", "w2_weight_scale"):
+                scale = getattr(layer, scale_name)
+                setattr(
+                    layer,
+                    scale_name,
+                    Parameter(
+                        preprocess_mxfp4_w4a16_mma_scales(scale),
+                        requires_grad=False,
+                    ),
+                )
+            del scale, weight
+            torch.cuda.empty_cache()
+            return
+
         if (self.use_marlin and not self.use_mega_moe) or (
-            _is_ppu and self.use_deepgemm_mxfp4_w4a16
+            _is_ppu and self.use_deepgemm_mxfp4_w4a16_valu
         ):
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -878,7 +942,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
-            if _is_ppu and self.use_deepgemm_mxfp4_w4a16:
+            if _is_ppu and self.use_deepgemm_mxfp4_w4a16_valu:
                 # DeepGEMM uses uint8 E8M0 scales to select its MXFP4/E2M1 path.
                 for scale_name in ("w13_weight_scale", "w2_weight_scale"):
                     scale = getattr(layer, scale_name)
@@ -1859,7 +1923,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        if _is_ppu and self.use_deepgemm_mxfp4_w4a16:
+        if _is_ppu and (
+            self.use_deepgemm_mxfp4_w4a16_valu or self.use_deepgemm_mxfp4_w4a16_mma
+        ):
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
             quant_info = DeepGemmMoeQuantInfo(
