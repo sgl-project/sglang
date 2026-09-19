@@ -756,6 +756,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_REASONING_EFFORT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek-V4.1 chat encoder when a request does not set it: one of <code>low</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>, or an integer budget in [1, 100]. Unset means the encoder default <code>high</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -811,8 +816,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize for best performance. Deterministic inference overrides this to <code>false</code>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize. Disabled by default for better numerical accuracy. Set to <code>1</code> to opt in for more aggressive performance. Deterministic inference overrides this to <code>false</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>

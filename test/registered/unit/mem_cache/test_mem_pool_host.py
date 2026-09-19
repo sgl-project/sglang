@@ -270,8 +270,9 @@ class TestHostMemoryBudget(CustomTestCase):
             unittest.mock.patch.object(
                 torch.distributed, "is_initialized", return_value=True
             ),
-            unittest.mock.patch.object(
-                base, "get_world_group", return_value=fake_group
+            unittest.mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=fake_group,
             ),
         ):
             self.assertEqual(base.ranks_per_host(), 8)

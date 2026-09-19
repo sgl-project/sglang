@@ -17,6 +17,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -71,7 +74,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
-        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
@@ -80,6 +84,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
+        )
+        queue._allocatable_token_budgets = MagicMock(
+            side_effect=lambda **_: physical_available
         )
         queue._swa_tail_allocatable_token_budget = MagicMock(
             side_effect=lambda **_: physical_available
@@ -120,6 +127,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = []
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -127,6 +138,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.metrics_reporter.enable_metrics = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -174,6 +186,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -181,6 +197,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -232,8 +249,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.tree_cache = MagicMock()
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
@@ -241,6 +265,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
