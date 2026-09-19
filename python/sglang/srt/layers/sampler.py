@@ -790,6 +790,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
     if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
+        top_ps = top_ps.to(logits.dtype)
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
