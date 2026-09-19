@@ -613,7 +613,8 @@ class ModelRunner:
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
-            ps=self.ps,
+            attn_dp_size=self.attn_dp_size,
+            pp_size=self.pp_size,
             pp_group=self.pp_group,
             model=self.model,
             model_config=self.model_config,
@@ -1184,6 +1185,10 @@ class ModelRunner:
         self.tp_size = parallel.tp_size
         self.dp_size = parallel.dp_size
         self.attn_dp_size = parallel.attn_dp_size
+        self.pp_rank = parallel.pp_rank
+        self.pp_size = parallel.pp_size
+        self.attn_cp_rank = parallel.attn_cp_rank
+        self.attn_cp_size = parallel.attn_cp_size
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
