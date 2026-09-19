@@ -172,6 +172,98 @@ class TestHermesDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    # ==================== finish() / stream-end Tests ====================
+    # These cover the finish() override added for the base-class contract:
+    # "Called once when the stream ends; flush any buffered state. Detectors
+    # that hold text back while waiting for a marker that can no longer
+    # arrive (the stream is over) override this to release it." Before this
+    # override existed, HermesDetector inherited the no-op default and
+    # silently dropped whatever was still buffered.
+
+    def test_finish_flushes_partial_marker_at_stream_end(self):
+        """Generation stops (e.g. hits max_tokens) right after a chunk
+        boundary makes the tail look like the start of '<tool_call>'. That
+        text can never complete now that the stream is over, so finish()
+        must hand it back instead of losing it."""
+        detector = HermesDetector()
+        chunks = ["The format looks like ", "<tool_", "call"]
+        streamed = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            streamed += result.normal_text
+
+        # Without finish(), "<tool_call" is stuck in the buffer forever.
+        self.assertEqual(streamed, "The format looks like ")
+        self.assertEqual(detector._buffer, "<tool_call")
+
+        final = detector.finish(self.tools)
+        self.assertEqual(final.normal_text, "<tool_call")
+        self.assertEqual(len(final.calls), 0)
+        self.assertEqual(
+            streamed + final.normal_text, "The format looks like <tool_call"
+        )
+        # Buffers are drained so a reused detector instance can't leak state.
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector._normal_text_buffer, "")
+
+    def test_finish_after_complete_tool_call_is_unchanged(self):
+        """Regression: a complete, well-formed tool call must still parse
+        exactly as before, and finish() afterwards must be a no-op."""
+        detector = HermesDetector()
+        chunks = [
+            "Sure, let me check. ",
+            '<tool_call>{"name": "get_weather",',
+            ' "arguments": {"city": "Tokyo"',
+            "}}</tool_call>",
+        ]
+        all_calls = []
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            all_normal_text += result.normal_text
+
+        self.assertEqual(all_normal_text, "Sure, let me check. ")
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        self.assertEqual(json.loads(full_params), {"city": "Tokyo"})
+
+        final = detector.finish(self.tools)
+        self.assertEqual(final.normal_text, "")
+        self.assertEqual(len(final.calls), 0)
+
+    def test_finish_drops_unterminated_tool_call_without_raising(self):
+        """If generation stops mid-argument (bot_token seen, no eot_token),
+        the buffered content is neither valid normal text nor a parseable
+        tool call. finish() must warn and drop it, not raise or emit
+        garbage as a call/normal_text."""
+        detector = HermesDetector()
+        chunks = ['<tool_call>{"name": "get_weather", "arguments": {"ci']
+        for chunk in chunks:
+            detector.parse_streaming_increment(chunk, self.tools)
+
+        self.assertIn(detector.bot_token, detector._buffer)
+
+        final = detector.finish(self.tools)  # must not raise
+        self.assertEqual(final.normal_text, "")
+        self.assertEqual(len(final.calls), 0)
+        self.assertEqual(detector._buffer, "")
+
+    def test_finish_with_no_partial_marker_is_unchanged(self):
+        """Regression: a stream that ends cleanly, with nothing buffered,
+        must be unaffected by the new finish() override."""
+        detector = HermesDetector()
+        result = detector.parse_streaming_increment(
+            "The weather is nice today.", self.tools
+        )
+        self.assertEqual(result.normal_text, "The weather is nice today.")
+
+        final = detector.finish(self.tools)
+        self.assertEqual(final.normal_text, "")
+        self.assertEqual(len(final.calls), 0)
+
 
 if __name__ == "__main__":
     import unittest
