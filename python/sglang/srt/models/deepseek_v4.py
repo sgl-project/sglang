@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     is_cp_active,
 )
+from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -259,6 +260,7 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
@@ -881,11 +883,7 @@ class MqaAttentionBase(nn.Module):
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
         elif fp8:
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            )
+            self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
@@ -2408,12 +2406,11 @@ class MQALayer(MqaAttentionBase):
             elif self.wo_a_fp8:
                 import deep_gemm
 
-                from sglang.srt.layers import deep_gemm_wrapper
-
                 T, G, D = o.shape
                 R = self.o_lora_rank
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                    # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+                if _FP8_WO_A_UE8M0:
+                    # Blackwell (including SM120): UE8M0 scales via the dedicated
+                    # JIT kernel.
                     o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                     recipe = (1, 1, 128)
                 else:
@@ -4896,9 +4893,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
-        from sglang.srt.layers import deep_gemm_wrapper
-
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if _FP8_WO_A_UE8M0:
             from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
@@ -4937,7 +4932,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 continue
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if _FP8_WO_A_UE8M0:
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                     raw_scale,
                     mn=R,
