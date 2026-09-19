@@ -2276,9 +2276,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
-            for rid in rids:
-                if rid in self.rid_to_state:
+            is_single = not isinstance(obj.rid, list)
+            rids = [obj.rid] if is_single else obj.rid
+            for index, rid in enumerate(rids):
+                state = self.rid_to_state.get(rid)
+                owned_obj = (
+                    obj
+                    if is_single
+                    else obj.__dict__.get("_sub_obj_cache", {}).get(index)
+                )
+                # A delayed cleanup must not abort a new request reusing this ID.
+                if state is not None and state.obj is owned_obj:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
