@@ -25,16 +25,14 @@ use thiserror::Error;
 
 use crate::OneOrMany;
 
-use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
+pub(crate) use self::deepseek_v4::DeepSeekV4Profile;
+use self::{
+    deepseek_v4::dynamo_reasoning_effort,
+    kimi_k25::{deep_sort, encode_tools_to_typescript},
+};
 
+mod deepseek_v4;
 mod kimi_k25;
-
-const DSV4_BOS: &str = "<｜begin▁of▁sentence｜>";
-const DSV4_OFFICIAL_MAX: &str = concat!(
-    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
-    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
-    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
-);
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
@@ -84,12 +82,6 @@ pub(crate) enum ChatFormatter {
         environment_effort: Option<String>,
     },
     Legacy(Box<LegacyFormatter>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeepSeekV4Profile {
-    Preview,
-    Official,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -424,35 +416,13 @@ impl ChatFormatter {
                 let requested = args
                     .get("reasoning_effort")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| environment_effort.clone());
+                    .or(environment_effort.as_deref());
+                let mapped = dynamo_reasoning_effort(*profile, requested);
                 let thinking =
                     dynamo_renderer::thinking_bool_from_args(Some(&args)).unwrap_or(false);
                 args.insert("thinking".into(), Value::Bool(thinking));
-                let official_max = thinking
-                    && *profile == DeepSeekV4Profile::Official
-                    && requested.as_deref() == Some("max");
-                let mapped = match (*profile, requested.as_deref()) {
-                    (DeepSeekV4Profile::Preview, Some("max")) => "max",
-                    (DeepSeekV4Profile::Official, Some("high")) => "max",
-                    _ => "high",
-                };
                 args.insert("reasoning_effort".into(), Value::String(mapped.into()));
-                let rendered = render_oai(formatter, &TemplateArgsRequest { request, args })?;
-                if official_max {
-                    let prompt = rendered.into_text();
-                    let prompt =
-                        prompt
-                            .strip_prefix(DSV4_BOS)
-                            .ok_or_else(|| TemplateError::Renderer {
-                                message: "DeepSeek V4 formatter omitted the BOS token".into(),
-                            })?;
-                    Ok(RenderedPrompt::text(format!(
-                        "{DSV4_BOS}{DSV4_OFFICIAL_MAX}{prompt}"
-                    )))
-                } else {
-                    Ok(rendered)
-                }
+                render_oai(formatter, &TemplateArgsRequest { request, args })
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
@@ -508,6 +478,9 @@ fn render_oai(
         })
 }
 
+/// Formatter-facing request view over adapted template arguments.
+/// Native effort access and template arguments share the adapted value without
+/// changing the original request.
 struct TemplateArgsRequest<'a> {
     request: &'a dyn OAIChatLikeRequest,
     args: HashMap<String, Value>,
@@ -539,7 +512,11 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 
     fn reasoning_effort(&self) -> Option<minijinja::Value> {
-        self.request.reasoning_effort()
+        // Native formatters read this accessor before consulting template arguments.
+        self.args
+            .get("reasoning_effort")
+            .map(minijinja::Value::from_serialize)
+            .or_else(|| self.request.reasoning_effort())
     }
 
     fn should_add_generation_prompt(&self) -> bool {
@@ -1824,22 +1801,17 @@ pub(crate) fn builtin_template(name: &str) -> Option<LegacySpec> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
         ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
         ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequest,
     };
-    use dynamo_renderer::PromptFormatter;
-    use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
 
     use super::{
-        ChatFormatter, DeepSeekV4Profile, LegacyFormatter, LegacySpec, OneOrMany,
-        TemplateArgsRequest, TemplateError, ThinkingPolicy, builtin_template,
-        detect_thinking_policy, infer_legacy_template_from_model_path, load_chat_formatter,
+        ChatFormatter, LegacyFormatter, LegacySpec, OneOrMany, TemplateError, ThinkingPolicy,
+        builtin_template, detect_thinking_policy, infer_legacy_template_from_model_path,
+        load_chat_formatter,
     };
 
     fn request() -> CreateChatCompletionRequest {
@@ -1865,61 +1837,6 @@ mod tests {
             stop_str: Some(OneOrMany::One("<stop>".into())),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn deepseek_v4_profiles_map_effort_without_coercing_unsupported_tiers() {
-        fn render(
-            profile: DeepSeekV4Profile,
-            effort: Option<&str>,
-            thinking: Option<bool>,
-        ) -> String {
-            let request = request();
-            let mut args = HashMap::new();
-            if let Some(effort) = effort {
-                args.insert("reasoning_effort".into(), serde_json::json!(effort));
-            }
-            if let Some(thinking) = thinking {
-                args.insert("thinking".into(), serde_json::json!(thinking));
-            }
-            ChatFormatter::DeepSeekV4 {
-                formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_chat())),
-                profile,
-                environment_effort: None,
-            }
-            .render(&TemplateArgsRequest {
-                request: &request,
-                args,
-            })
-            .unwrap()
-        }
-
-        assert_eq!(
-            render(DeepSeekV4Profile::Preview, None, None),
-            render(DeepSeekV4Profile::Preview, None, Some(false))
-        );
-        let preview_default = render(DeepSeekV4Profile::Preview, None, Some(true));
-        assert!(!preview_default.contains("Reasoning Effort:"));
-        assert!(
-            render(DeepSeekV4Profile::Preview, Some("max"), Some(true))
-                .contains("Reasoning Effort: Absolute maximum")
-        );
-        assert!(
-            render(DeepSeekV4Profile::Official, Some("high"), Some(true))
-                .contains("Reasoning Effort: Absolute maximum")
-        );
-        assert!(
-            render(DeepSeekV4Profile::Official, Some("max"), Some(true))
-                .contains("Reasoning Effort: Beyond maximum")
-        );
-        assert!(
-            !render(DeepSeekV4Profile::Official, Some("xhigh"), Some(true))
-                .contains("Reasoning Effort:")
-        );
-        assert!(
-            !render(DeepSeekV4Profile::Official, Some("max"), Some(false))
-                .contains("Reasoning Effort:")
-        );
     }
 
     #[test]

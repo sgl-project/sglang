@@ -901,11 +901,6 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("config.json"),
-            r#"{"model_type":"deepseek_v4"}"#,
-        )
-        .unwrap();
         let mut config = model_config(directory.to_string_lossy().into_owned());
         config.reasoning_parser = Some("deepseek-v4".into());
         let messages = serde_json::from_value(serde_json::json!([
@@ -919,7 +914,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             response_format: None,
-            reasoning_effort: Some(serde_json::from_value(serde_json::json!("max")).unwrap()),
+            reasoning_effort: None,
             continue_final_message: false,
             chat_template_args: None,
             sampling_params: SamplingParams::default(),
@@ -930,32 +925,70 @@ mod tests {
             parallel_tool_calls: true,
             metadata: GenerateRequestMetadata::default(),
         };
-        let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
-
-        let mut default_request = request.clone();
-        default_request.reasoning_effort = None;
-        let default_chat = service.preprocess_chat(default_request.clone()).unwrap();
-        assert!(!default_chat.text_requests[0].options.require_reasoning);
-
-        default_request.chat_template_args = Some(std::collections::HashMap::from([(
-            "thinking".into(),
-            serde_json::Value::Bool(false),
-        )]));
-        let explicit_chat = service.preprocess_chat(default_request).unwrap();
-        assert_eq!(
-            default_chat.text_requests[0].prompt,
-            explicit_chat.text_requests[0].prompt
-        );
-
-        let chat = service.preprocess_chat(request).unwrap();
-
-        assert!(chat.text_requests[0].options.require_reasoning);
-        assert!(
-            chat.text_requests[0]
-                .prompt
-                .as_str()
-                .contains("Reasoning Effort: Absolute maximum")
-        );
+        for (profile, max_prefix, high_prefix) in [
+            ("preview", "Absolute maximum", None),
+            ("official", "Beyond maximum", Some("Absolute maximum")),
+        ] {
+            std::fs::write(
+                directory.join("config.json"),
+                serde_json::json!({
+                    "model_type": "deepseek_v4",
+                    "dsv4_reasoning_effort_profile": profile,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let service = RendererService::with_tokenizer(
+                config.clone(),
+                Arc::new(UnexpectedTokenizer),
+                1,
+                1,
+            );
+            for (effort, args, thinking, prefix) in [
+                (None, serde_json::json!({}), false, None),
+                (Some("max"), serde_json::json!({}), true, Some(max_prefix)),
+                (Some("high"), serde_json::json!({}), true, high_prefix),
+                (Some("none"), serde_json::json!({}), false, None),
+                (
+                    Some("max"),
+                    serde_json::json!({"thinking": false}),
+                    false,
+                    None,
+                ),
+                (
+                    Some("none"),
+                    serde_json::json!({"thinking": true}),
+                    true,
+                    None,
+                ),
+                (
+                    Some("max"),
+                    serde_json::json!({"reasoning_effort": "low"}),
+                    true,
+                    None,
+                ),
+            ] {
+                let mut request = request.clone();
+                request.reasoning_effort =
+                    effort.map(|effort| serde_json::from_value(serde_json::json!(effort)).unwrap());
+                request.chat_template_args = Some(serde_json::from_value(args).unwrap());
+                let chat = service.preprocess_chat(request).unwrap();
+                let text_request = &chat.text_requests[0];
+                assert_eq!(text_request.options.require_reasoning, thinking);
+                let prompt = text_request.prompt.as_str();
+                assert!(prompt.ends_with(if thinking { "<think>" } else { "</think>" }));
+                assert_eq!(
+                    prompt.matches("Reasoning Effort:").count(),
+                    usize::from(prefix.is_some()),
+                    "{profile}, {effort:?}: {prompt}"
+                );
+                if let Some(prefix) = prefix {
+                    assert!(prompt.starts_with(&format!(
+                        "<｜begin▁of▁sentence｜>Reasoning Effort: {prefix}"
+                    )));
+                }
+            }
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
