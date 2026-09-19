@@ -1872,6 +1872,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
+        if num_new_tokens <= 0:
+            return
         adjusted_interval = internval / num_new_tokens
         his = self.histogram_inter_token_latency.labels(**labels)
 
