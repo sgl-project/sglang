@@ -46,13 +46,9 @@ def host_memory_budget_scope(budget_bytes: int):
 
 
 def ranks_per_host() -> int:
-    """Number of ranks of this job running on the same machine as this one.
+    """Return the launch ranks per host, assuming uniform placement.
 
-    Derived as the launch width // nnodes: the launcher slices ranks
-    uniformly across nodes (resolution asserts divisibility), so no hostname
-    collective is needed — a collective here would have to be issued the same
-    number of times on every rank, and ranks build different numbers of host
-    pools.
+    Avoid a collective: ranks may construct different numbers of host pools.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1

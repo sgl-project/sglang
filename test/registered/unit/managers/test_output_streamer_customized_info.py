@@ -103,7 +103,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         serving_patch.start()
         observability_patch.start()
-        # The streamer asks the context which rank it is streaming from.
         enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)

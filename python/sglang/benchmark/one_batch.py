@@ -327,7 +327,6 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         server_args=server_args,
     )
 
-    # Phase two: this entry has no scheduler to run it.
     bootstrap.init_parallel_runtime(
         server_args=server_args,
         model_config=model_config,

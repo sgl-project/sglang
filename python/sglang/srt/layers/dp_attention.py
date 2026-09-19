@@ -45,12 +45,10 @@ if TYPE_CHECKING:
 
 
 def deployment_attn_dp_size() -> int:
-    """Attention-DP replicas in the deployment, which no draft scope narrows.
+    """Return the deployment's attention-DP replica count.
 
-    A draft runs on one attention-DP replica and its scope says so, but the
-    metadata a draft gathers is shaped by the replicas it gathers *with* --
-    the target's. Those come from the configuration, which the scope leaves
-    alone, so this answers the same number inside the scope and outside it.
+    Draft scopes retain this count because their metadata gathers include
+    the target's replicas.
     """
     parallel = get_parallel()
     attn_dp_size, _ = derive_attention_widths(
@@ -63,25 +61,20 @@ def deployment_attn_dp_size() -> int:
 
 
 def dp_gather_width() -> int:
-    """How many replicas the DP sync gathers over.
+    """Return the DP gather width.
 
-    The attention-DP replicas, except after an elastic-EP scale-up, when the
-    gather spans the expanded WORLD -- whose width is the `dp_size` the
-    scale-up published. Read from the context either way: a scoped width has
-    to reach this, which is the whole reason the name has one home.
+    After elastic scale-up, the gather spans the expanded WORLD; otherwise
+    it spans the attention-DP replicas.
     """
     parallel = get_parallel()
     return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
 
 
 def dp_gather_slot() -> int:
-    """This process's index in the list the DP sync just gathered.
+    """Return this process's index in the DP gather.
 
-    The gather spans the attention-DP replicas, except after an elastic-EP
-    scale-up, when it spans the expanded WORLD and the joining cohort is
-    numbered from its offset. Which list was gathered is what the flag below
-    says, so the index is read from there rather than kept as a second name on
-    the topology.
+    After elastic scale-up, use the TP rank plus the join offset; otherwise
+    use the attention-DP rank.
     """
     parallel = get_parallel()
     if world_dp_gather_enabled():
@@ -100,12 +93,10 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    """Point the DP gather at the expanded WORLD.
+    """Switch DP gathers to the expanded WORLD.
 
-    The widths themselves are not written here: the caller scales `dp_size` on
-    the published bag, and the gather reads its width and this process's slot
-    from there. The arguments are the values the caller is about to publish,
-    kept so the log says which scale-up this was.
+    The caller updates the configured widths; these arguments identify the
+    scale-up in the log.
     """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
@@ -433,9 +424,6 @@ def initialize_dp_attention(
         if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
-    # Stamped together, after the elastic adjustment: the width and the rank
-    # describe one topology, and a reader that caught them mid-update would
-    # see this process placed in a group it is not in.
     get_parallel().override_permanently(
         attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
     )
@@ -457,9 +445,6 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    # The slot in the list that was gathered. A scale-up widens that list
-    # to WORLD, and this process's index in it is not its index among the
-    # launch replicas.
     dp_rank = dp_gather_slot()
 
     if forward_batch.dp_local_start_pos is None:
@@ -484,9 +469,6 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    # The slot in the list that was gathered. A scale-up widens that list
-    # to WORLD, and this process's index in it is not its index among the
-    # launch replicas.
     dp_rank = dp_gather_slot()
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:

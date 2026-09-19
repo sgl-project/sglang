@@ -517,8 +517,6 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        # The groups are the first thing that allocates, so this comes after the
-        # allocator switch above and before anything that reads a group.
         bootstrap.init_parallel_runtime(
             server_args=server_args,
             model_config=self.model_config,
@@ -5910,7 +5908,6 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
-    # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
@@ -5940,15 +5937,8 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
 
 
 def resolve_spawn_dp_rank(dp_rank: Optional[int]) -> Optional[int]:
-    """The `dp_rank` this process was spawned with, in either of its two forms.
-
-    A router does not pass it as an argument, it sets `SGLANG_DP_RANK`. Both
-    forms are the launcher naming this process's place, so both have to be in
-    hand before `publish` records the placement -- resolving one of them after
-    would leave the context answering `None` for a process that has a rank.
-    """
+    """Resolve the launcher DP rank, falling back to ``SGLANG_DP_RANK``."""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         return int(os.environ["SGLANG_DP_RANK"])
     return dp_rank
 
@@ -6034,10 +6024,6 @@ def run_scheduler_process(
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
-    # Publish before anything in this process reads configuration, with the
-    # placement the launcher decided: from here on a rank read is answered
-    # without a process group, which is what every reader needs before
-    # `init_torch_distributed` has run.
     publish(
         server_args,
         role="scheduler",
