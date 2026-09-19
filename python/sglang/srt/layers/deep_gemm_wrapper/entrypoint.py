@@ -461,7 +461,7 @@ def grouped_gemm_nt_f8f8bf16_nopad(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(
-            lhs, rhs, out, m_indices, m_rows, best_config
+            lhs, rhs, out, m_indices, m_rows, configs=best_config
         )
 
 
@@ -485,7 +485,7 @@ def gemm_nt_i8i8bf16(
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_I8I8BF16
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out, best_config)
+        deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out, configs=best_config)
 
 
 def grouped_gemm_nt_i8i8bf16_contig(
@@ -508,7 +508,7 @@ def grouped_gemm_nt_i8i8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(
-            lhs, rhs, out, m_indices, best_config
+            lhs, rhs, out, m_indices, configs=best_config
         )
 
 
@@ -544,7 +544,7 @@ def grouped_gemm_nt_i8i8bf16_masked(
             out,
             masked_m,
             expected_m,
-            best_config,
+            configs=best_config,
             **(
                 dict(
                     enable_sbo_overlap=True,
@@ -580,7 +580,7 @@ def grouped_gemm_nt_i8i8bf16_nopad(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(
-            lhs, rhs, out, m_indices, m_rows, best_config
+            lhs, rhs, out, m_indices, m_rows, configs=best_config
         )
 
 
@@ -607,7 +607,7 @@ def grouped_gemm_nt_bf16_nopad(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
-            lhs, rhs, out, m_indices, m_rows, best_config
+            lhs, rhs, out, m_indices, m_rows, configs=best_config
         )
 
 
@@ -637,7 +637,7 @@ def gemm_nt_f4f4bf16(
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, bias, out, best_config)
+        deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, bias, out, configs=best_config)
 
 
 def grouped_gemm_nt_f4f4bf16_masked(
@@ -682,7 +682,7 @@ def grouped_gemm_nt_f4f4bf16_masked(
                 out,
                 masked_m,
                 expected_m,
-                best_config,
+                configs=best_config,
                 **(
                     dict(
                         enable_sbo_overlap=True,
@@ -724,7 +724,7 @@ def grouped_gemm_nt_f4f4bf16_nopad(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-            lhs, rhs, bias, out, m_indices, m_rows, best_config
+            lhs, rhs, bias, out, m_indices, m_rows, configs=best_config
         )
 
 
