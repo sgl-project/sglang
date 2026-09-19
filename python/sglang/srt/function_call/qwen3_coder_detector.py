@@ -4,6 +4,7 @@ import re
 from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -190,6 +191,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if self.tool_call_prefix in text:
                     raw_tool_calls = [text]
 
+            tool_indices = self._get_tool_indices(tools)
             tool_idx = 0
             for tool_content in raw_tool_calls:
                 # Find function calls
@@ -202,6 +204,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     name_end = func_body.index(">")
                     func_name = func_body[:name_end]
                     params_str = func_body[name_end + 1 :]
+
+                    if func_name not in tool_indices:
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                            continue  # Skip unknown tools (default legacy behavior)
 
                     param_config = self._get_arguments_config(func_name, tools)
                     parsed_params = {}

@@ -11,6 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -5610,7 +5611,8 @@ class TestGemma4Detector(unittest.TestCase):
 
     def test_detect_and_parse_unknown_tool_index(self):
         text = '<|tool_call>call:unknown_func{arg:<|"|>val<|"|>}<tool_call|>'
-        result = self.detector.detect_and_parse(text, self.tools)
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].tool_index, -1)
 
