@@ -160,7 +160,7 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_draft_window_size: A[
         Optional[int],
-        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and DSPARK; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For DSPARK, requires causal trtllm_mha draft attention: N includes the current token, absolute positions and target attention are unchanged, and KV allocation is not reduced. Mixed or conflicting checkpoint windows are rejected. When unset, existing attention/context behavior (including checkpoint windows) is preserved.",
     ] = None
     speculative_moe_runner_backend: A[
         Optional[str],

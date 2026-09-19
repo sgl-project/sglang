@@ -182,6 +182,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        self._configure_draft_window(bundle.resolved_attention_backend)
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -389,6 +390,23 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _configure_draft_window(self, attention_backend: str) -> None:
+        window_size = get_spec().speculative_draft_window_size
+        if window_size is None:
+            return
+        if attention_backend != "trtllm_mha":
+            raise ValueError(
+                "DSpark --speculative-draft-window-size requires the "
+                "trtllm_mha draft attention backend, "
+                f"got {attention_backend!r}."
+            )
+        self.draft_model.set_attention_window(window_size)
+        # ModelRunner resolved this during loading, before the worker override.
+        # Refresh it before pool/backend initialization and graph capture.
+        self.draft_model_runner.sliding_window_size = (
+            self.draft_model.get_attention_sliding_window_size()
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
