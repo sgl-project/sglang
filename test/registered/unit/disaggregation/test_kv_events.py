@@ -8,6 +8,7 @@ the router can subscribe per replica (the `dp_size` it reads from
 """
 
 import unittest
+from typing import Optional
 
 import msgspec
 
@@ -16,6 +17,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     KVEventBatch,
+    RemovalReason,
     StorageMedium,
     ZmqEventPublisher,
     resolve_load_pub_range,
@@ -247,6 +249,94 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded[2], 0)
         self.assertIsInstance(decoded[1][0], dict)
         self.assertEqual(len(decoded), 3)
+
+
+class TestBlockRemovedReason(CustomTestCase):
+    """``reason`` says whether the content is gone or merely somewhere else."""
+
+    class _LegacyBlockRemoved(
+        msgspec.Struct,
+        omit_defaults=True,  # type: ignore[call-arg]
+        gc=False,  # type: ignore[call-arg]
+        tag="BlockRemoved",
+    ):
+        """``BlockRemoved`` as it was before ``reason`` existed.
+
+        Stands in for a consumer built against the old schema, to check that
+        the added field does not break it.
+        """
+
+        block_hashes: list[int]
+        medium: Optional[str] = None
+
+    def test_reason_is_a_named_field(self):
+        event = BlockRemoved(
+            block_hashes=[123],
+            medium=StorageMedium.GPU,
+            reason=RemovalReason.DEMOTED,
+        )
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded["type"], "BlockRemoved")
+        self.assertEqual(decoded["reason"], "demoted")
+
+    def test_omitting_the_reason_leaves_todays_wire_shape(self):
+        # The field is additive: an emitter that states nothing produces the
+        # exact map an old consumer already reads.
+        event = BlockRemoved(block_hashes=[123], medium=StorageMedium.GPU)
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(set(decoded), {"type", "block_hashes", "medium"})
+
+    def test_an_old_consumer_still_decodes_an_event_carrying_a_reason(self):
+        # The compatibility direction that matters: new engine, old consumer.
+        for reason in RemovalReason:
+            with self.subTest(reason=reason.value):
+                payload = msgspec.msgpack.encode(
+                    BlockRemoved(
+                        block_hashes=[1, 2],
+                        medium=StorageMedium.CPU,
+                        reason=reason,
+                    )
+                )
+                legacy = msgspec.msgpack.decode(payload, type=self._LegacyBlockRemoved)
+                self.assertEqual(legacy.block_hashes, [1, 2])
+                self.assertEqual(legacy.medium, "CPU_PINNED")
+
+    def test_a_new_consumer_reads_an_event_emitted_without_a_reason(self):
+        # The other direction: an old recording replayed into a new consumer
+        # must not be reported as an eviction it never claimed to be.
+        payload = msgspec.msgpack.encode(
+            self._LegacyBlockRemoved(block_hashes=[7], medium=StorageMedium.GPU)
+        )
+        decoded = msgspec.msgpack.decode(payload, type=BlockRemoved)
+        self.assertEqual(decoded.block_hashes, [7])
+        self.assertIsNone(decoded.reason)
+
+    def test_reasons_survive_a_mixed_batch(self):
+        batch = KVEventBatch(
+            ts=1.0,
+            events=[
+                BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU),
+                BlockRemoved(
+                    block_hashes=[2],
+                    medium=StorageMedium.GPU,
+                    reason=RemovalReason.EVICTED,
+                ),
+                BlockRemoved(
+                    block_hashes=[3],
+                    medium=StorageMedium.GPU,
+                    reason=RemovalReason.DEMOTED,
+                ),
+                AllBlocksCleared(),
+            ],
+        )
+        round_tripped = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(batch), type=KVEventBatch
+        )
+        self.assertEqual(
+            [e.reason for e in round_tripped.events[:3]],
+            [None, "evicted", "demoted"],
+        )
+        self.assertIsInstance(round_tripped.events[3], AllBlocksCleared)
 
 
 if __name__ == "__main__":
