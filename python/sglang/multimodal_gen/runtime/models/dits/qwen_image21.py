@@ -18,6 +18,14 @@ from sglang.kernels.ops.diffusion import (
     residual_gate_add,
     rmsnorm_preserve_reduction,
 )
+from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
+    can_use_qknorm_complex_rope_kv,
+    qknorm_complex_rope_kv,
+)
+from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
+    can_use_qknorm_complex_rope,
+    qknorm_complex_rope,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -44,6 +52,8 @@ from sglang.srt.layers.layernorm import RMSNorm
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
+_QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE")
+_KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
@@ -124,6 +134,21 @@ def apply_qk_norm(x, norm):
     out = norm(x)
     if fused is not None:
         return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
+    return out
+
+
+def apply_qk_norm_rope(x, norm, rope):
+    fused = None
+    if (
+        can_use_qknorm_complex_rope(x, norm.weight, rope)
+        and _QK_ROPE_FUSION.can_attempt_once()
+    ):
+        fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
+        if _QK_ROPE_FUSION.verified:
+            return fused
+    out = apply_rope(apply_qk_norm(x, norm), rope)
+    if fused is not None:
+        return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
 
 
@@ -267,13 +292,17 @@ class QwenImage21Attention(nn.Module):
             self.heads, self.head_dim, supported_attention_backends=backends
         )
 
-    def qkv(self, x, rope):
+    def project_qkv(self, x):
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
+        return q, k, v
+
+    def qkv(self, x, rope):
+        q, k, v = self.project_qkv(x)
         return (
-            apply_rope(apply_qk_norm(q, self.norm_q), rope),
-            apply_rope(apply_qk_norm(k, self.norm_k), rope),
+            apply_qk_norm_rope(q, self.norm_q, rope),
+            apply_qk_norm_rope(k, self.norm_k, rope),
             v,
         )
 
@@ -301,8 +330,33 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
-        q, k, v = self.qkv(x, rope)
-        out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
+        q, k, v = self.project_qkv(x)
+        q = apply_qk_norm_rope(q, self.norm_q, rope)
+        packed = None
+        if (
+            get_sp_world_size() == 1
+            and can_use_qknorm_complex_rope_kv(k, self.norm_k.weight, rope, v, kp, vp)
+            and _KV_ROPE_FUSION.can_attempt_once()
+        ):
+            packed = qknorm_complex_rope_kv(
+                k, self.norm_k.weight, rope, v, kp, vp, self.norm_k.variance_epsilon
+            )
+            if not _KV_ROPE_FUSION.verified:
+                reference = (
+                    torch.cat([kp, apply_rope(apply_qk_norm(k, self.norm_k), rope)], 1),
+                    torch.cat([vp, v], 1),
+                )
+                packed = _KV_ROPE_FUSION.accept_or_fallback(
+                    packed,
+                    reference,
+                    equal=lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),
+                    logger=logger,
+                )
+        if packed is not None:
+            out = self.target_attn(q, *packed)
+        else:
+            k = apply_qk_norm_rope(k, self.norm_k, rope)
+            out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
         return self.to_out[0](out.flatten(2))[0], prefix_output
 
 
@@ -331,10 +385,10 @@ class QwenImage21TransformerBlock(nn.Module):
         cache,
     ):
         prefix = prefix_state.get("hidden_states")
-        scale1, gate1, scale2, gate2 = modulation[:, None].chunk(4, dim=-1)
+        scale1, gate1, scale2, gate2 = modulation
         p = None
         if not cache:
-            ps1, pg1, ps2, pg2 = prefix_modulation[:, None].chunk(4, dim=-1)
+            ps1, pg1, ps2, pg2 = prefix_modulation
             p = apply_modulation(prefix, self.img_norm1, ps1)
         attention, prefix_attention = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
@@ -344,18 +398,18 @@ class QwenImage21TransformerBlock(nn.Module):
             layout["segments"],
             cache,
         )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1.tanh())
+        hidden_states = residual_gate_add(hidden_states, attention, gate1)
         hidden_states = residual_gate_add(
             hidden_states,
             self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
-            gate2.tanh(),
+            gate2,
         )
         if prefix_attention is not None:
-            prefix = residual_gate_add(prefix, prefix_attention, pg1.tanh())
+            prefix = residual_gate_add(prefix, prefix_attention, pg1)
             prefix = residual_gate_add(
                 prefix,
                 self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
-                pg2.tanh(),
+                pg2,
             )
         prefix_state["hidden_states"] = prefix
         return hidden_states
@@ -414,6 +468,12 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         self.norm_out = QwenImage21OutputNorm(ac.hidden_size, ac.eps)
         self.proj_out = nn.Linear(ac.hidden_size, ac.out_channels, bias=False)
 
+    def prepare_modulation(self, temb):
+        # All blocks share these gates. Preserve the native tanh and its dtype,
+        # but compute it once per timestep instead of once per block.
+        scale1, gate1, scale2, gate2 = self.modulation(temb)[:, None].chunk(4, dim=-1)
+        return scale1, gate1.tanh(), scale2, gate2.tanh()
+
     def forward(
         self,
         hidden_states,
@@ -437,13 +497,13 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         start, end = rank * local_len, (rank + 1) * local_len
         images = self.img_in(hidden_states[:, start:end])
         temb = self.time_text_embed((timestep.to(images.dtype) / 1000), images.dtype)
-        modulation = self.modulation(temb)
+        modulation = self.prepare_modulation(temb)
         prefix_modulation = None
         if prefix_caches is None or any(not cache[0] for cache in prefix_caches):
             zero_temb = self.time_text_embed(
                 timestep.new_zeros(1).to(images.dtype), images.dtype
             )
-            prefix_modulation = self.modulation(zero_temb)
+            prefix_modulation = self.prepare_modulation(zero_temb)
         outputs = []
         for sample, layout in enumerate(layouts):
             caches = (
@@ -462,10 +522,13 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                     )
             prefix_state = {"hidden_states": prefix}
             x = images[sample : sample + 1]
+            sample_modulation = tuple(
+                value[sample : sample + 1] for value in modulation
+            )
             for i, block in enumerate(self.transformer_blocks):
                 x = block(
                     x,
-                    modulation[sample : sample + 1],
+                    sample_modulation,
                     prefix_state,
                     prefix_modulation,
                     layout,
