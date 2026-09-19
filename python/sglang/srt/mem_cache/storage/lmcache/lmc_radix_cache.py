@@ -439,13 +439,11 @@ class LMCRadixCache(RadixCache):
             )
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(
-            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
-        )
+        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
@@ -460,9 +458,9 @@ class LMCRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
-        # super() already freed the KV past kv_len_to_handle, and a key beyond it
+        # super() already freed the KV past owned_kv_len, and a key beyond it
         # names tokens the client never saw.
-        kv_committed_len = min(kv_committed_len, kv_len_to_handle)
+        kv_committed_len = min(kv_committed_len, owned_kv_len)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[

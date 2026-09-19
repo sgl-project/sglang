@@ -60,9 +60,8 @@ class TestCanaryHeadroom(CustomTestCase):
                 ),
             ),
             patch.object(kv_pool_runtime.torch.cuda, "synchronize"),
-            patch.object(
-                kv_pool_runtime,
-                "get_world_group",
+            patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
                 return_value=SimpleNamespace(world_size=1, cpu_group=None),
             ),
             patch.object(kv_pool_runtime, "get_available_gpu_memory", return_value=20),

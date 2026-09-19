@@ -62,7 +62,6 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -89,6 +88,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -266,13 +266,14 @@ class PrefillBootstrapQueue:
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool
-            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            if transfer_draft_cache
+            and (not _is_npu or get_parallel().pp_group.is_last_rank)
             else None
         )
         num_draft_entries = 0
         if draft_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # Draft KV shares target virtual ids. Unified target KV is transferred
+            # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
@@ -1463,14 +1464,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
+            raw_kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+                    raw_kv_indices
                 )
             )
             page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1479,9 +1480,10 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            send_state_indices = state_indices if segment_is_last else None
             req.disagg_kv_sender.send(
                 page_indices,
-                state_indices if segment_is_last else None,
+                send_state_indices,
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
@@ -1496,6 +1498,17 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
+        # The cached prefix is evictable once the KV is released. Its length
+        # (capped at what a retry can match) seeds the retry's storage baseline,
+        # so an evicted prefix is looked up in L3 once before it is recomputed.
+        yielded_prefix_len = (
+            0
+            if req.skip_radix_cache_insert
+            else min(
+                req.kv.cache_protected_len,
+                req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+            )
+        )
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1510,6 +1523,9 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         req.advance_cache_request_handle()
+        # A fresh lookup budget for the new attempt, as after a retraction.
+        req.storage_prefetch_retry_attempts = 0
+        req.storage_prefetch_last_match_len = yielded_prefix_len or None
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "

@@ -219,9 +219,7 @@ class TestSpecOvershootCacheLen(CustomTestCase):
         req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
         req.update_finish_state(new_accepted_len=5)
         self.assertEqual(req.finished_len, 4)
-        self.assertEqual(
-            req.effective_kv_committed_len(), len(req.origin_input_ids) + 4
-        )
+        self.assertEqual(req.owned_kv_len(), len(req.origin_input_ids) + 4)
 
 
 if __name__ == "__main__":
