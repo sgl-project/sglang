@@ -2,6 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Order buckets by request length; each bucket owns the groups used to pick engines.
+//!
+//! ```text
+//! BucketResolver (one model's buckets)
+//!   -> Bucket (token limits, context capacity, rank)
+//!        -> BucketGroups::Plain: one EngineGroup
+//!        -> BucketGroups::Pd: prefill + decode EngineGroups
+//!             -> each EngineGroup: worker membership + its own Policy
+//! ```
+//!
+//! - [`BucketResolver::resolve`] returns length-compatible buckets in preference order.
+//! - [`Bucket::pick_engines`] takes a [`BucketRequest`] and asks its required groups
+//!   for one plain engine or a complete P/D pair, returned as [`BucketPick`].
+//! - [`EngineGroup::pick`] filters live workers by model, health, stage, and membership,
+//!   then calls [`Policy::pick`] and validates the returned engine.
+//!
+//! The handler tries buckets in order, advancing on missing candidates or admission
+//! rejection. Both P/D picks must succeed in the same bucket before dispatch.
+//! [`WorkerRegistry`] owns live workers; groups reference their IDs. Policies own
+//! their load/KV/affinity dependencies and share observations within each attempt.
 
 use std::collections::HashSet;
 use std::sync::Arc;
