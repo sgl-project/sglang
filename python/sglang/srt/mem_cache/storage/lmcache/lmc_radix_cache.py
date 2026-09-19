@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -497,6 +498,29 @@ class LMCRadixCache(RadixCache):
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
+
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Drop the LMCache state of a request aborted before ``init_load_back``.
+
+        A request aborted from the waiting queue never reaches
+        ``cache_finished_req``, so the marker written by ``_mp_match_prefix``
+        and the session ``lookup_kv`` opened would both leak, and the read
+        locks the daemon still holds for that rid would never be dropped.
+        ``end_session`` is the abort-path counterpart of the normal completion
+        path: it releases any locks still held, drops the pending lookup and
+        sends END_SESSION. It is idempotent, so a request aborted before it
+        ever matched is fine.
+        """
+        if self._mode is not LMCacheMode.MP:
+            return
+
+        # TODO: LMCache state is still keyed by rid rather than
+        # CacheRequestHandle, so overlapping attempts for the same rid are not
+        # independently isolated. Today the scheduler retires an attempt before
+        # starting the next one, which keeps this correct.
+        request_id = handle.rid
+        self._mp_load_back_markers.pop(request_id, None)
+        self.lmcache_connector.end_session(request_id)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
