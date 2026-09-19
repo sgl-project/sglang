@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -151,7 +150,6 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
-            ps=ParallelState.trivial(),
             nccl_port=12435,
             server_args=server_args,
         )

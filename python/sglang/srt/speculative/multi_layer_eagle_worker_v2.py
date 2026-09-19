@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -121,7 +120,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -130,7 +128,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
@@ -171,8 +168,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -1001,7 +996,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -1023,7 +1017,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
             gpu_id,
-            ps,
             nccl_port,
             target_worker,
         )
