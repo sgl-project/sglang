@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import (
     RuntimeContext,
     SpawnRanks,
     _FlagGroupBase,
+    _validate_parallel,
     assert_published,
     derive_parallel_widths,
     get_context,
@@ -1898,14 +1899,26 @@ class TestDerivedWidths(_IsolatedOverrides):
 
     def test_a_topology_is_stated_by_naming_the_width(self):
         """Overriding a leaf does not move the quotient -- the quotient is not
-        recomputed on read. Naming it is how a test states one."""
+        recomputed on read. Naming it is how a caller states one, and naming
+        only some of them is refused: the caller owns the arithmetic, the
+        context only checks it."""
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
         self.assertEqual(get_parallel().attn_tp_size, 8)
-        with get_parallel().override(tp_size=2):
-            self.assertEqual(get_parallel().attn_tp_size, 8)
-        with get_parallel().override(attn_tp_size=4):
+
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(tp_size=2):
+                pass
+        self.assertIn(
+            "tp_size == attn_tp_size * attn_dp_size * attn_cp_size",
+            str(caught.exception),
+        )
+
+        with get_parallel().override(tp_size=2, attn_tp_size=2):
+            self.assertEqual(get_parallel().tp_size, 2)
+            self.assertEqual(get_parallel().attn_tp_size, 2)
+        with get_parallel().override(attn_tp_size=4, tp_size=4):
             self.assertEqual(get_parallel().attn_tp_size, 4)
 
     def test_an_unstated_topology_still_fails(self):
@@ -2127,17 +2140,11 @@ class TestDerivedWidths(_IsolatedOverrides):
                 )
                 self.assertEqual(published, recomputed)
 
-    def test_initialize_model_parallel_no_longer_touches_the_bag(self):
-        """`initialize_model_parallel` used to recompute and
-        permanently override the six derived widths on `get_parallel()`
-        after building its groups; that call is gone. Publish a placeholder
-        config (tp_size defaults to 1), then build real groups at a
-        different width -- the published leaf must now stay exactly what it
-        was, because nothing corrects it. This is the behavior a caller
-        relies on being told about, loudly, the first time it publishes and
-        builds inconsistently -- see
-        `test_recomputing_from_published_leaves_matches_the_publish_bag`
-        for why every real caller must not do that.
+    def test_initialize_model_parallel_builds_at_the_published_widths(self):
+        """The build takes every width from the context rather than from an
+        argument, so "published one width, built another" is no longer a state
+        a caller can reach -- there is nothing left to translate, and nothing
+        to correct afterwards either.
         """
         from unittest.mock import Mock
 
@@ -2145,11 +2152,11 @@ class TestDerivedWidths(_IsolatedOverrides):
 
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="test")
-        self.assertEqual(get_parallel().attn_tp_size, 1)
-        self.assertEqual(get_parallel().moe_ep_size, 1)
-
         world_size = 8
+        publish(ServerArgs(model_path="dummy", tp_size=world_size), role="test")
+        self.assertEqual(get_parallel().attn_tp_size, world_size)
+
+        built_at = []
         with (
             patch.object(parallel_state, "_WORLD", None),
             patch.object(parallel_state, "_TP", None),
@@ -2168,25 +2175,20 @@ class TestDerivedWidths(_IsolatedOverrides):
             patch.object(
                 parallel_state,
                 "init_model_parallel_group",
-                return_value=Mock(device_group=Mock()),
+                side_effect=lambda group_ranks, *a, **k: (
+                    built_at.append(group_ranks),
+                    Mock(device_group=Mock()),
+                )[1],
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
             mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=world_size,
-                expert_model_parallel_size=world_size,
-            )
+            parallel_state.initialize_model_parallel()
         self.addCleanup(parallel_state.destroy_model_parallel)
 
-        self.assertEqual(
-            get_parallel().attn_tp_size,
-            1,
-            "initialize_model_parallel must not touch the published leaf -- "
-            "a caller that needs it corrected must publish a config that "
-            "already matches the width it is about to build",
-        )
-        self.assertEqual(get_parallel().moe_ep_size, 1)
+        # The first group built is TP, one group spanning the published width.
+        self.assertEqual(built_at[0], [list(range(world_size))])
+        self.assertEqual(get_parallel().attn_tp_size, world_size)
 
 
 class TestTheDerivedHalfIsDeclared(CustomTestCase):
@@ -2292,6 +2294,114 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
             "whose construction reads a recorded identity:\n  "
             + "\n  ".join(offenders),
         )
+
+
+class TestTheTopologyIdentities(CustomTestCase):
+    """One set of identities, checked wherever the layout is written.
+
+    Each one is injected in the direction that breaks it and in the direction
+    that keeps it: a guard that only ever fires is as uninformative as one that
+    never does. They hold unconditionally -- a caller that states one leaf owes
+    the quotients that follow from it, because a namespace describing no real
+    layout is what the guard exists to refuse.
+    """
+
+    def _publish_square(self):
+        """tp=4 over two attention-DP replicas of two: every identity holds."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=3, dp_rank=1),
+        )
+
+    def test_a_published_topology_is_consistent(self):
+        """The quiet direction, and the reason publish can check everything:
+        it is the one write that establishes the whole layout."""
+        self._publish_square()
+        parallel = get_parallel()
+        self.assertEqual(parallel.tp_size, 4)
+        self.assertEqual(parallel.attn_dp_size, 2)
+        self.assertEqual(parallel.attn_tp_size, 2)
+        self.assertEqual(parallel.tp_rank, 3)
+
+    def test_a_width_that_does_not_factor_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
+            ):
+                pass
+        message = str(caught.exception)
+        self.assertIn("set by override", message)
+        self.assertIn("attn_tp_size * attn_dp_size * attn_cp_size", message)
+        self.assertIn("4 != 3 * 1 * 1", message)
+
+    def test_a_rank_at_its_width_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(tp_rank=4, tp_size=4):
+                pass
+        self.assertIn("0 <= tp_rank < tp_size", str(caught.exception))
+
+    def test_a_refused_write_leaves_nothing_behind(self):
+        """The scope never opened, so the value it tried to state must not be
+        readable afterwards -- a half-applied override is the state this guard
+        exists to prevent."""
+        self._publish_square()
+        with self.assertRaises(ValueError):
+            with get_parallel().override(
+                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
+            ):
+                pass
+        self.assertEqual(get_parallel().attn_tp_size, 2)
+
+    def test_a_group_built_at_another_width_is_refused(self):
+        """The other end of the same identity: what the configuration says and
+        what the coordinators were actually built at, checked where the
+        disagreement is still attributable to the build."""
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        wrong = GroupCoordinator.__new__(GroupCoordinator)
+        wrong.world_size = 8
+        wrong.rank_in_group = 0
+        with patch.object(parallel_state, "_TP", wrong):
+            with self.assertRaises(ValueError) as caught:
+                _validate_parallel(get_parallel(), "group build")
+        message = str(caught.exception)
+        self.assertIn("set by group build", message)
+        self.assertIn("tp_group.world_size == tp_size", message)
+        self.assertIn("built 8, configured 4", message)
+
+    def test_a_group_built_at_the_configured_width_is_quiet(self):
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        right = GroupCoordinator.__new__(GroupCoordinator)
+        right.world_size = 4
+        right.rank_in_group = 3
+        with patch.object(parallel_state, "_TP", right):
+            _validate_parallel(get_parallel(), "group build")
+
+    def test_a_draft_scope_states_a_consistent_topology(self):
+        """The scope narrows four names at once, so the identity applies to it
+        -- and holds, which is what step lets the guard stay on."""
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = 2
+        group.rank_in_group = 1
+        with patch.object(parallel_state, "_TP", group):
+            with parallel_state.patch_tensor_parallel_group(group):
+                self.assertEqual(get_parallel().attn_tp_size, 2)
 
 
 class TestWhoAnswersDuringADraftScope(CustomTestCase):
