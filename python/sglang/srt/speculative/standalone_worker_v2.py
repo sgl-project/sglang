@@ -27,11 +27,12 @@ from sglang.srt.speculative.base_spec_worker import (
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context, get_plan_stream
-from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
-
-if is_cuda():
-    from sgl_kernel import segment_packbits  # noqa: F401
+from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
+    draft_tp_context,
+    get_plan_stream,
+)
+from sglang.srt.utils import empty_context, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
@@ -79,7 +80,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # whose MoE gates run during construction; the scope routes their
         # fusion decision to the speculative leaf (it does not swap
         # runner_backend — the draft's forwards run outside that context).
-        with empty_context(), draft_model_build_scope():
+        with draft_pp_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
