@@ -156,36 +156,42 @@ def rocm_absorb_q_bmm(
     q_nope: torch.Tensor,
     *,
     is_capture_mode: bool,
+    use_decode_weights: bool = False,
 ) -> torch.Tensor:
     """Absorb ``q_nope @ w_kc`` on HIP/AITER (pre-transpose layout)."""
+    w_kc = attn.w_kc_decode if use_decode_weights else attn.w_kc
+    w_scale = attn.w_scale_decode if use_decode_weights else attn.w_scale
+    assert w_kc is not None
+    assert w_scale is not None
+
     # TODO(haishaw): add bmm_fp8 to ROCm
-    if _use_aiter_gfx95 and attn.w_kc.dtype == torch.uint8:
+    if _use_aiter_gfx95 and w_kc.dtype == torch.uint8:
         x = q_nope.transpose(0, 1)
         q_nope_out = torch.empty(
             x.shape[0],
             x.shape[1],
-            attn.w_kc.shape[2],
+            w_kc.shape[2],
             device=x.device,
             dtype=torch.bfloat16,
         )
         batched_gemm_afp4wfp4_pre_quant(
             x,
-            attn.w_kc.transpose(-2, -1),
+            w_kc.transpose(-2, -1),
             attn.w_scale_k.transpose(-2, -1),
             torch.bfloat16,
             q_nope_out,
         )
     else:
-        if (_use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn) or (
-            is_capture_mode and attn.w_kc.dtype == torch.float8_e4m3fnuz
+        if (_use_aiter_gfx95 and w_kc.dtype == torch.float8_e4m3fn) or (
+            is_capture_mode and w_kc.dtype == torch.float8_e4m3fnuz
         ):
             # fp8 Triton kernel: always on gfx950,
             # cudagraph-only on gfx942 (hides launch overhead)
             q_nope_out = (
                 batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                     X=q_nope,
-                    WQ=attn.w_kc.transpose(-1, -2),
-                    w_scale=attn.w_scale,
+                    WQ=w_kc.transpose(-1, -2),
+                    w_scale=w_scale,
                     group_size=128,
                     YQ=None,  # allocate (B, M, N)
                     transpose_bm=False,  # (B, M, N)
@@ -196,7 +202,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_kc, attn.w_scale),
+                _absorb_weight_bf16(w_kc, w_scale),
             )
     return q_nope_out
 
@@ -204,13 +210,22 @@ def rocm_absorb_q_bmm(
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
+    *,
+    use_decode_weights: bool = False,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
+    w_kc = attn.w_kc_decode if use_decode_weights else attn.w_kc
+    w_vc = attn.w_vc_decode if use_decode_weights else attn.w_vc
+    w_scale = attn.w_scale_decode if use_decode_weights else attn.w_scale
+    assert w_kc is not None
+    assert w_vc is not None
+    assert w_scale is not None
+
     # TODO(haishaw): add bmm_fp8 to ROCm
-    if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
+    if _use_aiter_gfx95 and w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
         B_heads, M_batch = x.shape[0], x.shape[1]
-        N_vdim = attn.w_vc.shape[2]
+        N_vdim = w_vc.shape[2]
         # Allocate in (batch, heads, dim) so the post-GEMM
         # transpose+flatten is a free view instead of a copy.
         _bmm_buf = torch.empty(
@@ -223,27 +238,27 @@ def rocm_absorb_v_bmm(
         attn_bmm_output = _bmm_buf.transpose(0, 1)
         batched_gemm_afp4wfp4_pre_quant(
             x,
-            attn.w_vc.transpose(-2, -1),
+            w_vc.transpose(-2, -1),
             attn.w_scale_v.transpose(-2, -1),
             torch.bfloat16,
             attn_bmm_output,
         )
     else:
         _bmm_buf = None
-        if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
+        if _use_aiter_gfx95 and w_kc.dtype == torch.float8_e4m3fn:
             # As in the mxfp4 path above, write (batch, heads, dim) so the
             # post-GEMM flatten is a free view instead of a copy.
             _bmm_buf = torch.empty(
                 attn_output.shape[0],
                 attn.num_local_heads,
-                attn.w_vc.shape[-1],
+                w_vc.shape[-1],
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
             batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                 X=attn_output,
-                WQ=attn.w_vc.transpose(-1, -2),
-                w_scale=attn.w_scale,
+                WQ=w_vc.transpose(-1, -2),
+                w_scale=w_scale,
                 group_size=128,
                 YQ=_bmm_buf,
                 transpose_bm=True,
@@ -257,19 +272,19 @@ def rocm_absorb_v_bmm(
             _bmm_buf = torch.empty(
                 attn_output.shape[0],
                 attn.num_local_heads,
-                attn.w_vc.shape[2],
+                w_vc.shape[2],
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
             torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                _absorb_weight_bf16(w_vc, w_scale),
                 out=_bmm_buf.transpose(0, 1),
             )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                _absorb_weight_bf16(w_vc, w_scale),
             )
 
     if _bmm_buf is not None:
@@ -330,6 +345,23 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
+# Measured gfx950 crossover: below this many tokens the FP8 absorb weights beat
+# the BF16 ones, which also keeps ordinary decode and short speculative target
+# verification off the BF16 large-matrix path.
+_GLM_GFX950_LARGE_BATCH_MIN_TOKENS = 512
+
+
+def _use_glm_fp8_small_batch_absorb(
+    attn: DeepseekV2AttentionMLA,
+    num_tokens: int,
+) -> bool:
+    """Use FP8 absorb weights below the measured BF16 crossover shape."""
+    return bool(
+        getattr(attn, "use_glm_bf16_prefill_fp8_decode", False)
+        and num_tokens < _GLM_GFX950_LARGE_BATCH_MIN_TOKENS
+    )
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -381,6 +413,7 @@ class DeepseekMLARocmForwardMixin:
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
+            and not _use_glm_fp8_small_batch_absorb(self, hidden_states.shape[0])
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -576,8 +609,14 @@ class DeepseekMLARocmForwardMixin:
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
             else:
+                use_decode_weights = _use_glm_fp8_small_batch_absorb(
+                    self, q_nope.shape[0]
+                )
                 q_nope_out = rocm_absorb_q_bmm(
-                    self, q_nope, is_capture_mode=get_is_capture_mode()
+                    self,
+                    q_nope,
+                    is_capture_mode=get_is_capture_mode(),
+                    use_decode_weights=use_decode_weights,
                 )
 
             q_nope_out = q_nope_out.transpose(0, 1)
@@ -910,7 +949,13 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = rocm_absorb_v_bmm(
+                self,
+                attn_output,
+                use_decode_weights=_use_glm_fp8_small_batch_absorb(
+                    self, attn_output.shape[0]
+                ),
+            )
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
