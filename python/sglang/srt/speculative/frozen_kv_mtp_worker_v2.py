@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
@@ -71,6 +72,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -153,8 +155,17 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
+            target_runner = self.target_worker.model_runner
+            embed, head = resolve_draft_embed_and_head(
+                target_model=target_runner.model,
+                draft_model=self.draft_model_runner.model,
+                is_first_pp_rank=get_pp_group().is_first_rank,
+                pp_size=get_pp_group().world_size,
+                model_path=target_runner.model_config.model_path,
+                revision=target_runner.model_config.revision,
+                load_config=target_runner.load_config,
+            )
             self.draft_model_runner.model.set_embed_and_head(embed, head)
         else:
             logger.debug(

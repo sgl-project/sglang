@@ -98,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -139,85 +140,6 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
-
-
-# Checkpoint spellings of the input embedding across the model families the
-# PP+spec gate admits (GLM/DeepSeek NextN, Bailing MTP, Mistral-style drafts).
-_EMBED_TENSOR_NAMES = (
-    "model.embed_tokens.weight",
-    "embed.weight",
-    "model.word_embeddings.weight",
-    "tok_embeddings.weight",
-)
-
-
-def _find_draft_input_embedding(model) -> "torch.nn.Module":
-    """The draft's input embedding, found by type rather than attribute path.
-
-    Draft models hang it under different names (embed_tokens, word_embeddings,
-    embed, tok_embeddings), but it is always the one VocabParallelEmbedding
-    that is not the ParallelLMHead."""
-    from sglang.srt.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
-
-    found = [
-        (name, module)
-        for name, module in model.named_modules()
-        if isinstance(module, VocabParallelEmbedding)
-        and not isinstance(module, ParallelLMHead)
-    ]
-    if len(found) != 1:
-        raise ValueError(
-            "PP+spec needs exactly one input embedding on the draft model, "
-            f"found {[name for name, _ in found]!r}"
-        )
-    return found[0][1]
-
-
-def _load_checkpoint_tensor(
-    model_path: str, revision, tensor_names: tuple, load_config
-) -> torch.Tensor:
-    """Load one tensor from a checkpoint via the standard weight loader."""
-    from sglang.srt.configs.load_config import LoadFormat
-    from sglang.srt.model_loader.loader import DefaultModelLoader
-    from sglang.srt.model_loader.weight_utils import (
-        pt_weights_iterator,
-        safetensors_weights_iterator,
-    )
-
-    # Streaming and cache-transport formats have no weight files this helper
-    # could reopen; the dummy format is already skipped by the caller.
-    reopenable = (
-        LoadFormat.AUTO,
-        LoadFormat.SAFETENSORS,
-        LoadFormat.FASTSAFETENSORS,
-        LoadFormat.MISTRAL,
-        LoadFormat.PT,
-        LoadFormat.NPCACHE,
-    )
-    if load_config.load_format not in reopenable:
-        raise ValueError(
-            "PP+spec draft embedding loading cannot re-open weights under "
-            f"load format {load_config.load_format!r}; use a disk-backed "
-            "load format or disable SGLANG_ENABLE_PP_SPEC"
-        )
-    # The target's own load config keeps --download-dir, ignore patterns and
-    # the selected format, so hub ids resolve into the same cache the model
-    # was loaded from instead of a fresh default-location download.
-    _, weight_files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
-        model_path, revision, fall_back_to_pt=True
-    )
-    iterator = (
-        safetensors_weights_iterator(weight_files)
-        if use_safetensors
-        else pt_weights_iterator(weight_files)
-    )
-    for name, tensor in iterator:
-        if name in tensor_names:
-            return tensor
-    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
 
 
 def _qsa_index_share_requested(hf_config) -> bool:
@@ -397,32 +319,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
-            # This branch skips the hot-token-map / EAGLE3 head wiring below.
-            assert self.hot_token_id is None and not (
-                self.speculative_algorithm.is_eagle3()
-            ), "PP+spec does not support --speculative-token-map or EAGLE3 drafts yet"
-            # PP+spec: the target's embedding lives on the first PP stage
-            # (PPMissingLayer here on the last stage) and NextN/MTP layers
-            # carry no embedding of their own in the checkpoint, so the
-            # draft's embedding must be loaded from the checkpoint directly
-            # — otherwise it stays randomly initialized and accept_length
-            # collapses to ~1.
-            embed = _find_draft_input_embedding(self.draft_runner.model).weight
-            if get_model().load_format != "dummy":
-                target_runner = self.target_worker.model_runner
-                loaded_embed = _load_checkpoint_tensor(
-                    model_path=target_runner.model_config.model_path,
-                    revision=target_runner.model_config.revision,
-                    tensor_names=_EMBED_TENSOR_NAMES,
-                    load_config=target_runner.load_config,
-                )
-                embed.weight_loader(embed, loaded_embed)
-            head = self.target_worker.model_runner.model.lm_head.weight
-            self.draft_runner.model.set_embed_and_head(embed, head)
-            return
-
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = self._resolve_shared_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -463,6 +360,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _resolve_shared_embed_and_head(self):
+        target_runner = self.target_worker.model_runner
+        return resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            is_first_pp_rank=get_pp_group().is_first_rank,
+            pp_size=get_pp_group().world_size,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
