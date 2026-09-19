@@ -13,7 +13,9 @@ import logging
 import mmap
 import os
 import re
+import socket
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import msgspec
@@ -49,6 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.utils.numa_utils import bind_memory_to_node
 
 logger = logging.getLogger(__name__)
 
@@ -544,24 +547,168 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _NumaRankInfo:
+    rank: int
+    hostname: str
+    device_id: int
+    pci_bus_id: str
+    numa_node: int
+    visible_gpu_count: int
+
+
+@dataclass(frozen=True)
+class _NumaGroupPlan:
+    node: int
+    owner_rank: int
+    rank_in_node: int
+    ranks_in_node: int
+    owners: tuple[tuple[int, int], ...]
+
+
+def _plan_numa_group(ranks: list[_NumaRankInfo], current_rank: int) -> _NumaGroupPlan:
+    if not ranks:
+        raise RuntimeError("engram numa_shared: empty TP topology")
+    hosts = {rank.hostname for rank in ranks}
+    if len(hosts) != 1:
+        raise RuntimeError(
+            f"engram numa_shared requires one host/PID namespace, got {sorted(hosts)}"
+        )
+    if any(rank.numa_node < 0 for rank in ranks):
+        raise RuntimeError(f"engram numa_shared: unresolved NUMA node: {ranks}")
+    pci_ids = [rank.pci_bus_id for rank in ranks]
+    if len(set(pci_ids)) != len(pci_ids):
+        raise RuntimeError(f"engram numa_shared: duplicate GPU PCI mapping: {ranks}")
+    by_rank = {rank.rank: rank for rank in ranks}
+    if len(by_rank) != len(ranks) or current_rank not in by_rank:
+        raise RuntimeError(
+            f"engram numa_shared: invalid TP rank topology for rank {current_rank}: "
+            f"{ranks}"
+        )
+    by_node: dict[int, list[int]] = {}
+    for rank in ranks:
+        by_node.setdefault(rank.numa_node, []).append(rank.rank)
+    for peers in by_node.values():
+        peers.sort()
+    node = by_rank[current_rank].numa_node
+    peers = by_node[node]
+    owners = tuple(
+        (numa_node, node_ranks[0]) for numa_node, node_ranks in sorted(by_node.items())
+    )
+    return _NumaGroupPlan(node, peers[0], peers.index(current_rank), len(peers), owners)
+
+
+def _partition_rows(total: int, index: int, parts: int) -> tuple[int, int]:
+    if parts <= 0 or index < 0 or index >= parts:
+        raise ValueError((total, index, parts))
+    return total * index // parts, total * (index + 1) // parts
+
+
+def _gpu_numa_node(device_id: int) -> tuple[str, int]:
+    """PCI BDF and NUMA node of one CUDA/ROCm device.
+
+    ``torch.cuda.get_device_properties`` exposes domain/bus/device on both
+    builds (hipify keeps the field names). Function is 0, matching
+    ``torch.numa.binding``. The node id comes from sysfs, not NVML, so ROCm
+    does not need a vendor library.
+    """
+    props = torch.cuda.get_device_properties(device_id)
+    try:
+        pci_bus_id = (
+            f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+            f"{props.pci_device_id:02x}.0"
+        )
+    except AttributeError as exc:
+        raise RuntimeError(
+            "engram numa_shared: torch device properties have no PCI fields"
+        ) from exc
+    path = f"/sys/bus/pci/devices/{pci_bus_id}/numa_node"
+    try:
+        with open(path) as numa_file:
+            node = int(numa_file.read().strip())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"engram numa_shared: cannot read NUMA node for PCI device {pci_bus_id}"
+        ) from exc
+    if node < 0:
+        raise RuntimeError(
+            f"engram numa_shared: PCI device {pci_bus_id} has no NUMA node"
+        )
+    return pci_bus_id, node
+
+
+_numa_topology_logged = False
+
+
+def _discover_numa_group(group) -> _NumaGroupPlan:
+    device_id = torch.cuda.current_device()
+    pci_bus_id, numa_node = _gpu_numa_node(device_id)
+    info = _NumaRankInfo(
+        rank=group.rank_in_group,
+        hostname=socket.gethostname(),
+        device_id=device_id,
+        pci_bus_id=pci_bus_id,
+        numa_node=numa_node,
+        visible_gpu_count=torch.cuda.device_count(),
+    )
+    ranks = group.all_gather_object(info)
+    plan = _plan_numa_group(ranks, group.rank_in_group)
+    global _numa_topology_logged
+    if group.rank_in_group == 0 and not _numa_topology_logged:
+        _numa_topology_logged = True
+        logger.info(
+            "engram numa_shared topology: visible_gpu_count=%d ranks=%s owners=%s",
+            info.visible_gpu_count,
+            ranks,
+            plan.owners,
+        )
+    return plan
+
+
 class _HostTable:
-    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
+    """Host-memory backing for one engram table.
+
+    shared: one memfd for the whole TP group, mapped by every rank. No
+        lookup all-reduce. Huge pages need transparent_hugepage/shmem_enabled.
+    numa_shared: one complete memfd per GPU NUMA node, mapped only by the ranks
+        on that node and MPOL_BIND'd before the first page fault. No all-reduce.
+        Host memory scales with the number of NUMA nodes that hold a GPU.
+    per_rank: one anonymous mapping per rank holding only its own rows, so the
+        lookup keeps the sharded all-reduce.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
-        if layout not in ("shared", "per_rank"):
+        if layout not in ("shared", "numa_shared", "per_rank"):
             raise ValueError(
                 f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
-                "'shared' or 'per_rank'"
+                "'shared', 'numa_shared', or 'per_rank'"
             )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
+        self.numa_node = None
+        self.rank_in_numa = 0
+        self.ranks_in_numa = 1
+        if layout == "numa_shared":
+            plan = _discover_numa_group(group)
+            self.numa_node = plan.node
+            self.rank_in_numa = plan.rank_in_node
+            self.ranks_in_numa = plan.ranks_in_node
+            self.fd = self._open_numa_shared_fd(nbytes, name, plan)
+            self.mm = mmap.mmap(
+                self.fd,
+                nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+            # Bind before the first fault. madvise below does not touch pages.
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(self.mm))
+            bind_memory_to_node(addr, nbytes, plan.node)
+        elif layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
                 self.fd,
@@ -585,9 +732,9 @@ class _HostTable:
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == "shared":
-            # Every rank holds the fd before rank 0 continues; the /proc path only
-            # resolves while rank 0 keeps its descriptor.
+        if layout in ("shared", "numa_shared"):
+            # Every rank holds the fd before the owner continues; the /proc path
+            # only resolves while the owner keeps its descriptor.
             group.barrier()
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
@@ -609,6 +756,43 @@ class _HostTable:
                 "engram host table: cannot open rank 0's memfd through /proc; the "
                 "TP ranks must share a PID namespace"
             ) from e
+
+    def _open_numa_shared_fd(self, nbytes: int, name: str, plan: _NumaGroupPlan) -> int:
+        # Every rank walks the owner list. Each owner publishes its memfd; only
+        # ranks on that node keep a descriptor. Owners with rank != 0 must still
+        # publish, which is why this is not broadcast-from-0.
+        selected_fd = None
+        for node, owner_rank in plan.owners:
+            owner = None
+            fd = None
+            if self.group.rank_in_group == owner_rank:
+                fd = os.memfd_create(f"{name}_numa{node}", 0)
+                os.ftruncate(fd, nbytes)
+                owner = (os.getpid(), fd)
+            owners = self.group.all_gather_object(owner)
+            owner_info = owners[owner_rank]
+            if owner_info is None:
+                raise RuntimeError(
+                    f"engram numa_shared: rank {owner_rank} did not publish its memfd"
+                )
+            pid, owner_fd = owner_info
+            if node != plan.node:
+                continue
+            if self.group.rank_in_group == owner_rank:
+                selected_fd = fd
+            else:
+                try:
+                    selected_fd = os.open(f"/proc/{pid}/fd/{owner_fd}", os.O_RDWR)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "engram numa_shared: cannot open the NUMA owner's memfd; "
+                        "TP ranks must share one host and PID namespace"
+                    ) from exc
+        if selected_fd is None:
+            raise RuntimeError(
+                f"engram numa_shared: no memfd for NUMA node {plan.node}"
+            )
+        return selected_fd
 
     def _collapse(self, tries: int = 3) -> None:
         """Synchronously fold whatever is still on base pages into huge pages.
@@ -636,7 +820,7 @@ class _HostTable:
         if not self.dirty:
             return
         self.dirty = False
-        if self.layout == "shared":
+        if self.layout in ("shared", "numa_shared"):
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
@@ -646,13 +830,18 @@ class _HostTable:
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
+        numa = f", numa_node={self.numa_node}" if self.layout == "numa_shared" else ""
         msg = (
-            f"engram host table {label}: layout={self.layout}, "
+            f"engram host table {label}: layout={self.layout}{numa}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+            knob = (
+                "shmem_enabled"
+                if self.layout in ("shared", "numa_shared")
+                else "enabled"
+            )
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -669,8 +858,9 @@ class EngramEmbedding(nn.Module):
 
     Rows are sharded over the TP group in device memory; with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
-    one shared copy or one shard per rank (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range.
+    one shared copy, one complete copy per GPU NUMA node, or one shard per rank
+    (see _HostTable). Loading is sharded in every layout: a rank writes only
+    its own row range.
     """
 
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
@@ -681,6 +871,8 @@ class EngramEmbedding(nn.Module):
         self.row_start = num_embeddings * tp_rank // self.tp_size
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
+        self.load_row_start = self.row_start
+        self.load_rows = self.rows
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
@@ -700,7 +892,7 @@ class EngramEmbedding(nn.Module):
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        n = num_embeddings if layout == "shared" else self.rows
+        n = num_embeddings if layout in ("shared", "numa_shared") else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         self.host_table = _HostTable(
@@ -709,6 +901,13 @@ class EngramEmbedding(nn.Module):
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
         )
+        if layout == "numa_shared":
+            self.load_row_start, load_row_end = _partition_rows(
+                num_embeddings,
+                self.host_table.rank_in_numa,
+                self.host_table.ranks_in_numa,
+            )
+            self.load_rows = load_row_end - self.load_row_start
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
         scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
@@ -716,12 +915,15 @@ class EngramEmbedding(nn.Module):
         self.scale = nn.Parameter(scale, requires_grad=False)
 
     @property
-    def _shared(self) -> bool:
-        return self.host_table is not None and self.host_table.layout == "shared"
+    def _replicated(self) -> bool:
+        return self.host_table is not None and self.host_table.layout in (
+            "shared",
+            "numa_shared",
+        )
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
+        rows = slice(self.load_row_start, self.load_row_start + self.load_rows)
+        if self._replicated:
             param.data[rows].copy_(loaded_weight[rows])
         else:
             param.data.copy_(loaded_weight[rows])
@@ -740,7 +942,7 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        if self._shared:
+        if self._replicated:
             if indices.shape[0] == 0:
                 return self._empty(indices)
             out = self._empty(indices)

@@ -16,6 +16,7 @@ from sglang.srt.utils.numa_utils import (
     _query_numa_node_for_gpu,
     _read_pci_numa_node,
     _strip_memory_args,
+    bind_memory_to_node,
     configure_subprocess,
     get_numa_node_if_available,
     numa_bind_to_node,
@@ -599,6 +600,32 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
+
+
+class TestBindMemoryToNode(unittest.TestCase):
+    def test_missing_libnuma_fails_closed(self):
+        with patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                bind_memory_to_node(0x1000, 4096, 0)
+
+    def test_mbind_success_sets_bind_bit(self):
+        lib = MagicMock()
+        lib.mbind.return_value = 0
+        with patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=lib):
+            bind_memory_to_node(0x1000, 4096, 1)
+        args = lib.mbind.call_args[0]
+        self.assertEqual(args[2], 2)  # MPOL_BIND
+        self.assertEqual(args[3][0], 1 << 1)
+
+    def test_mbind_failure_raises(self):
+        lib = MagicMock()
+        lib.mbind.return_value = -1
+        with (
+            patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=lib),
+            patch("sglang.srt.utils.numa_utils.ctypes.get_errno", return_value=1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "errno 1"):
+                bind_memory_to_node(0x1000, 4096, 0)
 
 
 if __name__ == "__main__":

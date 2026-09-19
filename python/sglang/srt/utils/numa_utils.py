@@ -157,13 +157,60 @@ def get_libnuma():
 
     for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
         try:
-            libnuma = ctypes.CDLL(libnuma_so)
+            # use_errno so callers of mbind/get_mempolicy can read the failure.
+            libnuma = ctypes.CDLL(libnuma_so, use_errno=True)
         except OSError as e:
             logger.debug(f"{e}")
             libnuma = None
         if libnuma is not None:
             break
     return libnuma
+
+
+def bind_memory_to_node(addr: int, nbytes: int, node: int) -> None:
+    """Apply MPOL_BIND to an untouched mapping so its pages fault on ``node``.
+
+    Fail closed: a caller that asked for NUMA placement must not silently land
+    pages on another node. ``addr`` must not have been touched yet; mbind does
+    not migrate pages that are already resident.
+    """
+    if node < 0 or nbytes <= 0:
+        raise RuntimeError(
+            f"bind_memory_to_node: invalid placement node={node} bytes={nbytes}"
+        )
+    libnuma = get_libnuma()
+    mbind = getattr(libnuma, "mbind", None) if libnuma is not None else None
+    if mbind is None:
+        raise RuntimeError("bind_memory_to_node: libnuma mbind is unavailable")
+    bits = ctypes.sizeof(ctypes.c_ulong) * 8
+    words = node // bits + 1
+    mask = (ctypes.c_ulong * words)()
+    mask[node // bits] = 1 << (node % bits)
+    mbind.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_ulong,
+        ctypes.c_uint,
+    ]
+    mbind.restype = ctypes.c_long
+    if (
+        mbind(
+            ctypes.c_void_p(addr),
+            ctypes.c_ulong(nbytes),
+            2,  # MPOL_BIND
+            mask,
+            words * bits,
+            0,
+        )
+        != 0
+    ):
+        err = ctypes.get_errno()
+        raise RuntimeError(
+            f"bind_memory_to_node: mbind(node={node}, bytes={nbytes}) failed: "
+            f"errno {err} ({os.strerror(err)})"
+        )
 
 
 def numa_bind_to_node(node: int):
