@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -121,6 +122,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                                     object()
                                 ]
                         parallel = SimpleNamespace(
+                            pp_size=2,
                             pp_async_batch_depth=depth,
                             enable_dsa_prefill_context_parallel=False,
                         )
@@ -278,7 +280,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
-        with self.assertRaises(StopIteration):
+        with (
+            get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+            self.assertRaises(StopIteration),
+        ):
             event_loop(scheduler)
 
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
@@ -309,7 +314,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
@@ -358,7 +362,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
-        scheduler.ps.pp_size = 2
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
