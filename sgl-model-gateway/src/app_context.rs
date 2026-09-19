@@ -376,10 +376,10 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
+                // Validation rejects negative rates on normal startup paths. Keep unchecked
+                // programmatic construction fail-closed as a pure concurrency limiter instead
+                // of wrapping a negative i32 into a huge usize refill rate.
+                let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n).max(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -528,5 +528,58 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_zero_refill_rate_is_preserved() {
+        let mut config = RouterConfig::default();
+        config.max_concurrent_requests = 1_000;
+        config.rate_limit_tokens_per_second = Some(0);
+
+        let limiter = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("positive max_concurrent_requests should create a rate limiter");
+
+        limiter
+            .try_acquire(1_000.0)
+            .await
+            .expect("initial capacity should be available");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            limiter.try_acquire(1.0).await.is_err(),
+            "an explicit zero refill rate must not replenish tokens"
+        );
+
+        limiter.return_tokens_sync(1.0);
+        assert!(limiter.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unchecked_negative_refill_rate_fails_closed() {
+        let mut config = RouterConfig::default();
+        config.max_concurrent_requests = 1;
+        config.rate_limit_tokens_per_second = Some(-1);
+
+        let limiter = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("positive max_concurrent_requests should create a rate limiter");
+
+        limiter
+            .try_acquire(1.0)
+            .await
+            .expect("initial capacity should be available");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            limiter.try_acquire(1.0).await.is_err(),
+            "an unchecked negative refill rate must not wrap into unlimited capacity"
+        );
     }
 }
