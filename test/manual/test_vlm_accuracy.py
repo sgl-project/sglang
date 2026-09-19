@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import bootstrap
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -19,7 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import SpawnRanks, get_device, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import download_image_with_retry
 
@@ -145,9 +146,20 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             model_path=self.model_path,
             disable_cuda_graph=True,
         )
-        publish(server_args, role="scheduler")
+        publish(
+            server_args,
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, gpu_id=0),
+        )
+        model_config = ModelConfig(self.model_path, model_override_args="{}")
+        bootstrap.init_parallel_runtime(
+            server_args=server_args,
+            model_config=model_config,
+            device=get_device().device,
+            dist_port=12435,
+        )
         self.model_runner = ModelRunner(
-            model_config=ModelConfig(self.model_path, model_override_args="{}"),
+            model_config=model_config,
             mem_fraction_static=0.8,
             gpu_id=0,
             nccl_port=12435,

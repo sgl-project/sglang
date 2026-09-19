@@ -78,7 +78,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -318,18 +317,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (cfg.tp_size // cfg.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-        compute_dp_attention_world_info(
-            cfg.enable_dp_attention,
-            tp_rank,
-            cfg.tp_size,
-            cfg.dp_size,
-            cfg.attn_cp_size,
-        )
-    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,

@@ -140,6 +140,20 @@ def init_parallel_runtime(
     _set_all_reduce_flags()
 
     local_omp_cpuid = _bind_threads_if_cpu(device=device)
+    # Everything below allocates on the current device -- the NCCL warm-up, the
+    # mooncake all-reduce buffer -- and without this every rank on a node would
+    # pick device 0, because the default is not to reindex the visible set.
+    try:
+        torch.get_device_module(device).set_device(get_device().gpu_id)
+    except Exception:
+        logger.warning(
+            "Context: device=%s gpu_id=%s CUDA_VISIBLE_DEVICES=%s tp_rank=%s",
+            device,
+            get_device().gpu_id,
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            get_parallel().tp_rank,
+        )
+        raise
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()
