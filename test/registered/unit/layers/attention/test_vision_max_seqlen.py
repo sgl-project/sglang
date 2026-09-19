@@ -40,11 +40,15 @@ def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
         bsz=1,
         seq_len=3,
         max_seqlen=17,
+        causal=True,
+        window_size=(128, 0),
     )
 
     assert output is q
     assert recorded["max_seqlen_q"] == 17
     assert recorded["max_seqlen_k"] == 17
+    assert recorded["causal"] is True
+    assert recorded["window_size"] == (128, 0)
 
 
 def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
@@ -55,6 +59,7 @@ def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
     def fake_context_attention(q, k, v, output, *args, **kwargs):
         recorded["max_seqlen"] = args[2]
         recorded["sequence_lengths"] = args[1]
+        recorded["is_causal"] = kwargs["is_causal"]
         output.copy_(q)
 
     monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention)
@@ -72,11 +77,13 @@ def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
         seq_len=3,
         max_seqlen=17,
         sequence_lengths=sequence_lengths,
+        causal=True,
     )
 
     assert torch.equal(output, q)
     assert recorded["max_seqlen"] == 17
     assert recorded["sequence_lengths"] is sequence_lengths
+    assert recorded["is_causal"] is True
 
 
 def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
@@ -97,6 +104,7 @@ def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
     attention = vision.VisionFlash4Attention(use_data_parallel=True)
     q = torch.zeros(3, 1, 8)
     cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
+    sinks = torch.ones(1)
     output = attention(
         q,
         q,
@@ -105,11 +113,43 @@ def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
         bsz=1,
         seq_len=3,
         max_seqlen=17,
+        causal=True,
+        window_size=(128, 0),
+        s_aux=sinks,
     )
 
     assert output is q
     assert recorded["max_seqlen_q"] == 17
     assert recorded["max_seqlen_k"] == 17
+    assert recorded["causal"] is True
+    assert recorded["window_size"] == (128, 0)
+    assert recorded["sinks"] is sinks
+
+
+def test_vision_sdpa_honors_causal_sliding_window():
+    attention = vision.VisionSdpaAttention(
+        head_dim=2,
+        num_heads=1,
+        num_kv_heads=1,
+        flatten_batch=True,
+    )
+    q = torch.zeros(4, 1, 2)
+    k = torch.zeros_like(q)
+    values = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    v = values[:, None, None].expand(-1, 1, 2)
+
+    output = attention(
+        q,
+        k,
+        v,
+        cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+        bsz=1,
+        causal=True,
+        window_size=(1, 0),
+    )
+
+    expected = torch.tensor([1.0, 1.5, 3.0, 6.0])
+    torch.testing.assert_close(output[:, 0, 0], expected)
 
 
 def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
