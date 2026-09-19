@@ -666,6 +666,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 "request lifecycle currently requires one tokenizer worker"
             )
+        self._lifecycle_tasks: Dict[str, asyncio.Task] = {}
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -890,9 +891,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
-        request_rids = (
-            {obj.rid} if obj.is_single else {obj[i].rid for i in range(obj.batch_size)}
-        )
+        request_rids = {obj.rid} if obj.is_single else set(obj.rid[: obj.batch_size])
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -1727,6 +1726,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def cancel_lifecycle(self, attempt_id: str):
+        producer = self._lifecycle_tasks.get(attempt_id)
+        if producer is not None and producer is not asyncio.current_task():
+            producer.cancel()
         for child_id in self.request_lifecycle.cancel(attempt_id):
             self._dispatch_to_scheduler(AbortReq(lifecycle_id=child_id))
 
@@ -2341,6 +2343,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
+            attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
+            if attempt_id is not None:
+                self.cancel_lifecycle(attempt_id)
+                self.request_lifecycle.seal(attempt_id)
+                return
             await asyncio.sleep(2)
             rids = [obj.rid] if obj.is_single else obj.rid
             for rid in rids:
@@ -3690,8 +3697,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else [None] * len(items)
         )
         for (rid, sub_obj, bootstrap_room), child_id in zip(items, child_ids):
-            if rid in self.rid_to_state:
-                raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             state.lifecycle_id = child_id

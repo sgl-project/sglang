@@ -490,6 +490,7 @@ def _make_generate_obj(rid, is_single):
     obj = MagicMock(spec=GenerateReqInput)
     obj.routed_dp_rank = None
     obj.is_single = is_single
+    obj.batch_size = 1 if is_single else len(rid)
     obj.rid = rid
     obj.received_time = 0.0
     obj.external_trace_header = None

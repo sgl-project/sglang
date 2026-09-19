@@ -974,6 +974,8 @@ async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
     attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
     generator = manager.generate_request(obj, request)
     complete = False
+    if attempt_id is not None:
+        manager._lifecycle_tasks[attempt_id] = asyncio.current_task()
     try:
         async for result in generator:
             if not obj.stream:
@@ -985,6 +987,7 @@ async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
             await generator.aclose()
         finally:
             if attempt_id is not None:
+                manager._lifecycle_tasks.pop(attempt_id, None)
                 if not complete:
                     manager.cancel_lifecycle(attempt_id)
                 manager.request_lifecycle.seal(attempt_id)
@@ -1010,6 +1013,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         obj._lifecycle_attempt_id = attempt_id
+        _global_state.tokenizer_manager.auto_create_handle_loop()
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
