@@ -8,8 +8,6 @@ use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use crate::state::load_monitor::engine_load::EngineLoadTable;
-use crate::state::LoadView;
 use crate::workers::WorkerRegistry;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -82,7 +80,7 @@ pub enum BucketGroups {
 }
 
 /// Prepared request facts shared by all bucket attempts. The bucket supplies
-/// its ID, each group's stage, and a fresh load view when calling policies.
+/// its ID and each group's stage when calling policies.
 #[derive(Debug)]
 pub struct BucketRequest<'a> {
     pub model: &'a ModelId,
@@ -130,20 +128,19 @@ impl Bucket {
         &self,
         workers: &WorkerRegistry,
         request: &BucketRequest<'_>,
-        engine_load: &EngineLoadTable,
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => (
-                self.pick_group(group, Stage::Plain, workers, request, engine_load)
+                self.pick_group(group, Stage::Plain, workers, request)
                     .await?,
                 None,
             ),
             BucketGroups::Pd { prefill, decode } => {
                 let prefill = self
-                    .pick_group(prefill, Stage::Prefill, workers, request, engine_load)
+                    .pick_group(prefill, Stage::Prefill, workers, request)
                     .await?;
                 let decode = self
-                    .pick_group(decode, Stage::Decode, workers, request, engine_load)
+                    .pick_group(decode, Stage::Decode, workers, request)
                     .await?;
                 (prefill, Some(decode))
             }
@@ -157,10 +154,7 @@ impl Bucket {
         stage: Stage,
         workers: &WorkerRegistry,
         request: &BucketRequest<'_>,
-        engine_load: &EngineLoadTable,
     ) -> Result<Pick, (Stage, PickError)> {
-        // One lazy snapshot for this group attempt, including policy fallback/admission.
-        let load = LoadView::new(engine_load);
         let request = PickRequest {
             model: request.model,
             stage,
@@ -170,7 +164,6 @@ impl Bucket {
             token_ids: request.token_ids,
             session_key: request.session_key,
             routing_key: request.routing_key,
-            load: &load,
         };
         group
             .pick(workers, &request)

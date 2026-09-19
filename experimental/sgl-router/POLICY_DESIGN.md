@@ -15,8 +15,10 @@ listed at the end.
 3. **An engine group owns membership and its policy.** `EngineGroup::pick`
    filters live workers by model, health, stage, and membership, invokes the
    policy, and validates that its result belongs to the exact candidate set.
-4. **A policy owns selection, fallback, and admission within its candidates.**
-   It cannot choose another bucket or cross a PD role boundary.
+4. **A policy owns selection, fallback, admission, and its state dependencies.**
+   Construction injects the load, KV, or affinity handles it needs. Request-time
+   arguments contain facts and candidates. A policy cannot choose another bucket
+   or cross a PD role boundary.
 5. **The handler owns bucket fallback and dispatch.** It calls `pick_engines`
    on each bucket and dispatches only after a complete selection succeeds.
    Missing candidates or admission rejection advance to the next bucket, where
@@ -83,7 +85,7 @@ list of compatible bucket references (possibly empty), or an invalid-signal erro
 It does not receive a stage or a load view, resolve live engines, or invoke policies.
 The handler iterates this list until a bucket supplies the complete engine selection.
 
-`Bucket::pick_engines(workers, request, engine_load)` accepts a `BucketRequest`
+`Bucket::pick_engines(workers, request)` accepts a `BucketRequest`
 of prepared routing facts, invokes the required groups, and returns `BucketPick`
 (one plain pick or a complete P/D pair). Failures retain their stage. This API
 has no HTTP headers, `AppContext`, or forwarding dependency.
@@ -117,10 +119,12 @@ Complete selection -> forward_chat_request: acquire guards, attach PD bootstrap,
 ```
 
 The handler extracts token facts and header keys once into `BucketRequest`.
-The bucket creates a fresh `LoadView` and stage-specific `PickRequest` for each
-group call, supplying its own ID and the role associated with that group.
-The input length, expected peak, token IDs, and session/routing keys pass through. PD uses separate group
-policies, but never independently resolves a decode bucket. Decode selection
+The bucket creates a stage-specific `PickRequest` for each group call, supplying
+its own ID and the role associated with that group. Input length, expected peak,
+token IDs, and session/routing keys pass through. Policies obtain observations
+from their own shared-state handles; buckets and handlers do not provide load,
+KV, or affinity services on each call. PD uses separate group policies, but never
+independently resolves a decode bucket. Decode selection
 failure discards that tentative prefill choice and advances to the next bucket
 on missing candidates or admission rejection. No forwarding guards are acquired
 and no prefill request is sent until both picks in one bucket succeed.
@@ -196,8 +200,8 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 
 `Pick` identifies one engine and a selection reason for metrics and tracing.
 `PickRequest` carries model, stage, selected bucket ID, input and optional
-expected peak counts, optional token IDs, session/routing keys, and a lazy load
-view. It contains no HTTP body, bucket resolver, or backend configuration.
+expected peak counts, optional token IDs, and session/routing keys. It contains
+no HTTP body, bucket resolver, state handles, snapshots, or backend configuration.
 
 | Outcome | Meaning |
 | --- | --- |
@@ -242,8 +246,10 @@ after-selection rejects A and the handler advances to the next compatible bucket
 Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
 Decode capacity uses the expected peak sequence length when available, including
-on a cache hit. Admission and ranking share one load view for the selection pass.
-Synchronous checks do not fetch telemetry themselves.
+on a cache hit. The policy/admission implementation owns observation preparation
+and consistency; no load view is supplied by the bucket or HTTP handler.
+Concrete load-aware admission and its snapshot-sharing interface remain follow-up
+work. Synchronous checks do not fetch telemetry over the network themselves.
 
 `AllowAll` is the default for new explicit policy attachments. It leaves health,
 role, membership, and policy preferences in force. Migrated configurations must
@@ -314,9 +320,12 @@ applies to the current group.
 ## 6. Shared state and construction
 
 Application wiring starts shared services once. Policy construction validates
-configuration and passes the required handles to each policy. Policy instances
-do not create duplicate subscriptions, polling loops, indexes, or remote-client
-concurrency limits.
+configuration and passes the required handles to each policy and admission
+implementation. For example, `PowerOfTwoPolicy::new(Arc<EngineLoadTable>)`
+retains the application's shared load table. KV-aware and affinity-aware policies
+receive their corresponding shared handles when implemented. Policies with no
+state dependency require none. Policy instances do not create duplicate
+subscriptions, polling loops, indexes, or remote-client concurrency limits.
 
 Requirements come from all configured policies, their admission checks, and
 nested fallbacks. This includes tokenization, affinity-header extraction, load
@@ -333,10 +342,11 @@ or correction for dispatches since the report. Those follow-ups must preserve
 source, freshness, and available measurements without adding another independent
 in-flight counter.
 
-The bucket creates a fresh `LoadView` for each group selection attempt
-and lends it through `PickRequest`. Reuse it across admission, selection, and
-fallback in that pass; never store it on a bucket, group, or long-lived policy.
-A retry needs a new view. The type itself does not enforce this lifecycle.
+A load-aware policy owns an `Arc<EngineLoadTable>` and creates a fresh `LoadView`
+inside each pick. The table is long-lived; the view and its snapshot are local
+to the attempt, never stored on a bucket or long-lived policy. A retry creates
+a new view. The power-of-two skeleton has this constructor dependency and local
+view, but its concrete load comparison and admission integration remain in #40271.
 No snapshot is collected if no consumer reads it. Load and cache observations
 are not an atomic global snapshot. Preserve report freshness, rank aggregation,
 and request-guard cleanup.
@@ -513,7 +523,8 @@ Implemented here:
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, admission placement, and `AllowAll`.
-- Lazy report capture through one `LoadView` per group selection pass.
+- Policy-owned load dependency and pick-local lazy `LoadView` in the power-of-two
+  skeleton. `PickRequest` and bucket APIs carry no load state.
 - The reorg chat implementation iterates resolved buckets, calls `pick_engines`,
   advances on empty candidates/admission rejection, and
   dispatches only after one complete selection. Exhaustion retains admission reasons.

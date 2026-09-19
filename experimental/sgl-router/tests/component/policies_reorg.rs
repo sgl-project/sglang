@@ -10,8 +10,6 @@ use sgl_router::buckets_reorg::{
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
-use sgl_router::state::LoadView;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug, Default)]
@@ -107,11 +105,9 @@ fn bucket(id: &str, max: Option<u64>, policy: Arc<dyn Policy>) -> Bucket {
 
 #[tokio::test]
 async fn groups_isolate_model_health_stage_and_membership() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
     let workers = registry();
     let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+    let request = PickRequest::new(&model, Stage::Plain, 10);
     let group = EngineGroup::new(Arc::new(TestPolicy::default()));
     assert_eq!(
         group.pick(&workers, &request).await.unwrap().engine.id.0,
@@ -130,7 +126,7 @@ async fn groups_isolate_model_health_stage_and_membership() {
 
     let pd = ModelId("pd".into());
     for (stage, expected) in [(Stage::Prefill, "p"), (Stage::Decode, "d")] {
-        let request = PickRequest::new(&pd, stage, 10, &load);
+        let request = PickRequest::new(&pd, stage, 10);
         let group = self::group(
             &["p", "d", "other", "unhealthy"],
             Arc::new(TestPolicy::default()),
@@ -206,7 +202,6 @@ fn context_capacity_checks_peak_when_known_and_input_otherwise() {
 
 #[tokio::test]
 async fn selected_pd_bucket_owns_both_memberships_and_policies() {
-    let table = EngineLoadTable::new();
     let workers = registry();
     workers.add(spec("p2", Stage::Prefill, "pd")).unwrap();
     workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
@@ -229,10 +224,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         session_key: None,
         routing_key: None,
     };
-    let picks = bucket
-        .pick_engines(&workers, &request, &table)
-        .await
-        .unwrap();
+    let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "p2");
     assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
@@ -241,8 +233,6 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
 
 #[tokio::test]
 async fn resolver_includes_empty_groups_without_invoking_policies() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
     let workers = registry();
     let model = ModelId("m".into());
     let policy = Arc::new(TestPolicy::default());
@@ -269,7 +259,7 @@ async fn resolver_includes_empty_groups_without_invoking_policies() {
     };
     let request = PickRequest {
         bucket: &bucket.id,
-        ..PickRequest::new(&model, Stage::Plain, 10, &load)
+        ..PickRequest::new(&model, Stage::Plain, 10)
     };
     assert!(matches!(
         group.pick(&workers, &request).await,
@@ -280,11 +270,9 @@ async fn resolver_includes_empty_groups_without_invoking_policies() {
 
 #[tokio::test]
 async fn group_propagates_rejections_misses_and_invalid_signals() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
     let workers = registry();
     let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+    let request = PickRequest::new(&model, Stage::Plain, 10);
     for placement in [Placement::BeforeSelection, Placement::AfterSelection] {
         let group = group(
             &["a"],
@@ -330,11 +318,9 @@ async fn group_propagates_rejections_misses_and_invalid_signals() {
 
 #[tokio::test]
 async fn group_rejects_foreign_pick_even_with_same_worker_id() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
     let workers = registry();
     let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+    let request = PickRequest::new(&model, Stage::Plain, 10);
     let group = group(
         &["a"],
         Arc::new(TestPolicy {
@@ -350,10 +336,8 @@ async fn group_rejects_foreign_pick_even_with_same_worker_id() {
 
 #[tokio::test]
 async fn admission_placement_changes_whether_an_alternative_can_win() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
     let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+    let request = PickRequest::new(&model, Stage::Plain, 10);
     let engines = [
         Arc::new(Worker::new(spec("a", Stage::Plain, "m"))),
         Arc::new(Worker::new(spec("b", Stage::Plain, "m"))),
@@ -410,7 +394,6 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
 
     let workers = registry();
     let model = ModelId("m".into());
-    let table = EngineLoadTable::new();
     let bucket = Bucket::new(
         "plain-bucket",
         BucketGroups::Plain(group(&["b"], Arc::new(InspectRequest))),
@@ -423,10 +406,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         session_key: Some("session"),
         routing_key: Some("routing"),
     };
-    let picks = bucket
-        .pick_engines(&workers, &request, &table)
-        .await
-        .unwrap();
+    let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "b");
     assert_eq!(picks.prefill.reason, "inspected");
     assert!(picks.decode.is_none());

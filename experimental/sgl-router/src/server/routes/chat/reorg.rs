@@ -76,10 +76,7 @@ pub(super) async fn chat_completions(
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
     for bucket in buckets {
-        match bucket
-            .pick_engines(&ctx.registry, &bucket_request, &ctx.engine_load)
-            .await
-        {
+        match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 let workers = SelectedWorkers {
