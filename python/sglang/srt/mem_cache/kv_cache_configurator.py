@@ -28,7 +28,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -56,7 +55,10 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    select_dsv4_kv_layout,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -317,7 +319,9 @@ class KVCacheConfigurator:
             quant_name,
             num_layers=num_layers,
             device=self.device,
+            page_size=self.page_size,
         )
+        quant_method.configure_attention_backends_from_server_args(self.server_args)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
@@ -863,32 +867,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        if get_disagg().disaggregation_mode == "decode":
-            # A decode node hands out request rows to PREALLOCATED transfers on
-            # top of its running set, so it needs the extra-slot pool (and the
-            # `pre_alloc_size` the scheduler's invariant checker reads). Mirrors
-            # `_build_req_to_token_pool`'s decode branch; the mamba composite
-            # already takes `decode_pre_alloc_size` the same way.
-            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
-
-            req_to_token_pool = DecodeReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-                pre_alloc_size=get_disagg().disaggregation_decode_extra_slots,
-            )
-        else:
-            req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-            )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1237,6 +1216,7 @@ class KVCacheConfigurator:
         if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
                 c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
@@ -1340,6 +1320,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_running_requests: int,
+        full_max_total_num_tokens: int,
         swa_max_total_num_tokens: Optional[int],
         c4_max_total_num_tokens: int,
         c128_max_total_num_tokens: int,
@@ -1361,8 +1342,10 @@ class KVCacheConfigurator:
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
             ] * self.layer_info.num_effective_layers
+            kv_source_layers = []
         else:
             compression_ratios = self.model_config.compress_ratios
+            kv_source_layers = list(self.model_config.hf_config.kv_source_layer_ids)
 
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
@@ -1374,8 +1357,13 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
+            kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            kv_layout_kwargs = dict(
+                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+            )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1404,6 +1392,10 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            kv_source_layers=kv_source_layers,
+            full_size=full_max_total_num_tokens,
+            **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            **kv_layout_kwargs,
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only
@@ -2071,7 +2063,19 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
+                if (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and not token_to_kv_pool.needs_paged_swa_allocator
+                ):
+                    token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        sizes.full_max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2141,7 +2145,10 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa and (
+                not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                or token_to_kv_pool.needs_paged_swa_allocator
+            ):
                 if isinstance(
                     token_to_kv_pool_allocator,
                     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -2188,8 +2195,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_parallel().launch_world_size > 1,
+            cpu_group=get_parallel().world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2284,7 +2291,7 @@ class KVCacheConfigurator:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_parallel().world_group.cpu_group,
             )
             token_capacity = tensor.item()
 

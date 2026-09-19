@@ -194,6 +194,19 @@ def _evict_until_allocatable(
             return
 
 
+def dsv41_dspark_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return False
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+
+
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -203,6 +216,11 @@ def retraction_backup(
 ) -> bool:
     """Returns False when the host pool cannot hold the backup; the caller
     aborts the request since its KV cannot be preserved."""
+    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
+        # Drain the in-flight verify before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -266,11 +284,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.kv.mamba_pool_idx = None
         return
 
-    effective_kv_committed_len = req.effective_kv_committed_len()
+    owned_kv_len = req.owned_kv_len()
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
+        owned_kv_len=owned_kv_len,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
@@ -279,7 +297,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if not req.kv.holds_kv:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.

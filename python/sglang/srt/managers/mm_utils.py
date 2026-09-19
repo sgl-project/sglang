@@ -442,10 +442,19 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
+            pad_values = [item.pad_value for item in items]
+            if input_ids.device.type == "cuda":
+                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+                placeholder_cpu = torch.tensor(
+                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                placeholder_tensor = placeholder_cpu.to(
+                    input_ids.device, non_blocking=True
+                )
+            else:
+                placeholder_tensor = torch.as_tensor(
+                    pad_values, device=input_ids.device
+                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []

@@ -29,13 +29,9 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    get_dsv41_spec_layout,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
-)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -102,6 +98,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -152,6 +149,8 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    dsv41_spec_layout: Optional[dict] = None
+
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
         "Failed to get kvcache from prefill instance, it might be dead"
@@ -166,6 +165,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -192,8 +192,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.attn_dp_size = get_attention_dp_size()
-        self.attn_dp_rank = get_attention_dp_rank()
+        self.attn_dp_size = parallel.attn_dp_size
+        self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = (
             1 if get_parallel().enable_dp_attention else get_parallel().dp_size
         )
@@ -258,7 +258,7 @@ class CommonKVManager(BaseKVManager):
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
-            self.pp_group = get_pp_group()
+            self.pp_group = get_parallel().pp_group
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -918,6 +918,27 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        local_layout = self.dsv41_spec_layout
+        if local_layout is not None or info.dsv41_spec_layout is not None:
+            if local_layout != info.dsv41_spec_layout:
+                mismatched_fields = sorted(
+                    key
+                    for key in (local_layout or {}).keys()
+                    | (info.dsv41_spec_layout or {}).keys()
+                    if (local_layout or {}).get(key)
+                    != (info.dsv41_spec_layout or {}).get(key)
+                )
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD layout mismatch "
+                    f"({', '.join(mismatched_fields)}): both servers must "
+                    "enable DSpark with the same block size and target/draft KV "
+                    "layout. Upgrade both servers together."
+                )
+            if info.attn_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                )
+
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
@@ -1037,7 +1058,7 @@ class CommonKVManager(BaseKVManager):
                 "multi-node prefill mode."
             )
 
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         synced_port = world_group.broadcast_object(local_port, src=0)
         if synced_port != local_port:
             logger.info(
@@ -1079,6 +1100,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -1088,7 +1110,7 @@ class CommonKVManager(BaseKVManager):
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
-            topology_rows = get_world_group().all_gather_object(payload)
+            topology_rows = get_parallel().world_group.all_gather_object(payload)
             # Every scheduler contributes a topology row. Only the scheduler
             # ranks that own a Rust listener populate their local registry.
             if self.kv_args.rust_http_port is None:
@@ -1969,6 +1991,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2039,6 +2062,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        dsv41_spec_layout = data.get("dsv41_spec_layout")
+
+        if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
+            return web.Response(
+                text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+                status=400,
+            )
+        self.dsv41_spec_layout = dsv41_spec_layout
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2130,6 +2161,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -2138,7 +2170,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if info.dsv41_spec_layout is None:
+                payload.pop("dsv41_spec_layout")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(
