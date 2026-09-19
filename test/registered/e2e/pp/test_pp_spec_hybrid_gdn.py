@@ -1,4 +1,5 @@
 import os
+import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -54,5 +55,8 @@ class TestPPSpecHybridGDN(CustomTestCase):
 
     def test_pp2_matches_pp1(self):
         pp1_score, pp2_score = self._run(1), self._run(2)
-        print(f"Qwen3.5-4B MTP: PP1={pp1_score:.4f}, PP2={pp2_score:.4f}")
         self.assertLessEqual(abs(pp2_score - pp1_score), 0.02)
+
+
+if __name__ == "__main__":
+    unittest.main()
