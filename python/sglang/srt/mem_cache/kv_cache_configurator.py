@@ -868,32 +868,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        if get_disagg().disaggregation_mode == "decode":
-            # A decode node hands out request rows to PREALLOCATED transfers on
-            # top of its running set, so it needs the extra-slot pool (and the
-            # `pre_alloc_size` the scheduler's invariant checker reads). Mirrors
-            # `_build_req_to_token_pool`'s decode branch; the mamba composite
-            # already takes `decode_pre_alloc_size` the same way.
-            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
-
-            req_to_token_pool = DecodeReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-                pre_alloc_size=get_disagg().disaggregation_decode_extra_slots,
-            )
-        else:
-            req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-            )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
