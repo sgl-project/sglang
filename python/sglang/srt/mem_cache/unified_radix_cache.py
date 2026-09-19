@@ -2641,6 +2641,9 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        self.cache_controller._finish_op_trace(operation)
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)

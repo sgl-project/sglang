@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -42,10 +43,63 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+    _get_host_id,
+    get_thread_caller_info,
+    trace_set_thread_info,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+# --- per-op synthetic trace ids for backup when hicache tracing is off --------
+# With hicache tracing off, a backup op carries no request_id (backup is
+# per-node), so Mooncake would otherwise derive every op's trace_id from the
+# same caller_id/caller_role -- one constant trace_id per backup thread. We
+# instead synthesize a per-op 32-hex TraceId / 16-hex SpanId from the op counter
+# + current ns + host/pid salt, so each backup op gets its own trace on the
+# Mooncake side (rc.batch_put). counter alone is unsafe (resets per process),
+# so we mix in time_ns + host + pid. Prefetch is unchanged: it carries a
+# per-request request_id, which Mooncake already derives a per-request trace_id
+# from.
+_HOST_SALT: Optional[int] = None
+
+
+def _host_salt() -> int:
+    """Low-16-bit stable per-host salt (from _get_host_id) for cross-host
+    uniqueness of synthesized backup trace ids."""
+    global _HOST_SALT
+    if _HOST_SALT is None:
+        host_id = _get_host_id()
+        _HOST_SALT = abs(hash(host_id)) & 0xFFFF if host_id else 0
+    return _HOST_SALT
+
+
+def _synth_backup_trace_id(op_id: int) -> str:
+    """Synthesize a per-backup-op OTel TraceId: 32 lowercase hex (16 bytes),
+    non-zero. high 8 bytes = ns timestamp (time-of-op); low 8 bytes =
+    host/pid/op-id mix so concurrent ops and cross-process/cross-host backups
+    never collide."""
+    ts = time.time_ns()
+    low = (_host_salt() << 48) ^ (os.getpid() << 16) ^ (int(op_id) & 0xFFFF)
+    raw = ts.to_bytes(8, "big") + (low & (2**64 - 1)).to_bytes(8, "big")
+    # time.time_ns() is non-zero in practice -> raw is never all-zero.
+    return raw.hex()
+
+
+def _synth_backup_span_id(op_id: int) -> str:
+    """Synthesize a per-backup-op OTel SpanId: 16 lowercase hex (8 bytes),
+    non-zero, using a different mixing seed than the trace id."""
+    h = ((int(op_id) * 0x9E3779B97F4A7C15) ^ (os.getpid() << 8) ^ _host_salt()) & (
+        2**64 - 1
+    )
+    if h == 0:
+        h = 1
+    return h.to_bytes(8, "big").hex()
+
 
 device_module = get_device_module()
 
@@ -988,6 +1042,88 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
+    def _init_op_trace(self, operation, rid, role: str) -> None:
+        """Create an opt-in hicache root span for a prefetch/backup op.
+
+        Exported only when tracing is on and ``hicache`` is in
+        ``--trace-modules``; otherwise it collapses to ``TraceNullContext``.
+        When exported, ``trace_req_start`` also creates a per-storage-thread
+        child span under the root, and we forward *its* trace_id/span_id to
+        Mooncake so its hops nest under the rank's thread span. With tracing
+        off, prefetch keeps None ids (Mooncake derives per-request from
+        request_id) and backup synthesizes a per-op id so each backup op gets
+        a distinct Mooncake trace.
+        """
+        trace_ctx = TraceReqContext(rid=str(rid), role=role, module_name="hicache")
+        trace_id: Optional[str] = None
+        span_id: Optional[str] = None
+        if trace_ctx.tracing_enable:
+            trace_ctx.trace_req_start()
+            # Forward the per-storage-thread child span (created in
+            # trace_req_start) so Mooncake's hops nest under the rank's thread
+            # span, not the root.
+            span_context = trace_ctx.thread_context.thread_span.get_span_context()
+            trace_id = format(span_context.trace_id, "032x")
+            span_id = format(span_context.span_id, "016x")
+        else:
+            trace_ctx = TraceNullContext()
+            # Tracing off: backup would otherwise share one caller-derived
+            # trace_id per thread, so synthesize a per-op id. Prefetch keeps
+            # None (Mooncake derives per-request from request_id).
+            if role == "Backup":
+                trace_id = _synth_backup_trace_id(rid)
+                span_id = _synth_backup_span_id(rid)
+        operation.trace_ctx = trace_ctx
+        operation.trace_id = trace_id
+        operation.span_id = span_id
+
+    @staticmethod
+    def _finish_op_trace(operation) -> None:
+        """End the op's hicache root span if one was created.
+
+        Idempotent (``trace_req_finish`` is a no-op once the span is cleared,
+        and ``TraceNullContext.trace_req_finish`` is a no-op), so it is safe to
+        call from every retirement path."""
+        trace_ctx = getattr(operation, "trace_ctx", None)
+        if trace_ctx is not None:
+            trace_ctx.trace_req_finish()
+
+    @staticmethod
+    def _storage_trace_extra(operation, include_request_id: bool = True) -> dict:
+        """Build the per-RPC context dict carried to Mooncake via extra_info.
+
+        Always-on: ``caller_id``/``caller_role`` from the running storage
+        thread's registration (``Prefetch``/``Backup``); prefetch additionally
+        carries ``request_id``. When the hicache span was exported, also the
+        per-storage-thread child's ``trace_id``/``span_id`` (Mooncake uses the
+        span_id as remote parent). None/empty fields are omitted.
+        """
+        ed: dict = {}
+        caller = get_thread_caller_info()
+        if caller is not None:
+            ed["caller_id"], ed["caller_role"] = caller
+        if include_request_id:
+            req_id = getattr(operation, "request_id", None)
+            if req_id:
+                ed["request_id"] = req_id
+        tid = getattr(operation, "trace_id", None)
+        if tid:
+            ed["trace_id"] = tid
+        sid = getattr(operation, "span_id", None)
+        if sid:
+            ed["span_id"] = sid
+        # Debug: dump the rc fields when caller attribution is empty, to see
+        # why rc is still non-empty (e.g. a stale request_id on a thread that
+        # never registered caller info).
+        if caller is None:
+            logger.info(
+                "hicache: att (caller attribution) empty; rc fields=%s "
+                "(include_request_id=%s)",
+                ed,
+                include_request_id,
+            )
+        return ed
+
     def prefetch(
         self,
         request_id: str,
@@ -1088,7 +1224,13 @@ class HiCacheController:
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                extra_info = HiCacheStorageExtraInfo(
+                    prefix_keys=prefix_keys,
+                    extra_info=self._storage_trace_extra(
+                        operation, include_request_id=True
+                    )
+                    or None,
+                )
 
                 hit_pages = self._page_transfer_kv_batch(
                     operation,
@@ -1154,6 +1296,12 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        trace_set_thread_info(
+            "Prefetch",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1161,6 +1309,9 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
 
+                # Retire the op's hicache span on completion/termination of a
+                # transferred op.
+                self._finish_op_trace(operation)
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1205,7 +1356,11 @@ class HiCacheController:
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=self._storage_trace_extra(operation, include_request_id=True)
+                or None,
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -1220,11 +1375,22 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        trace_set_thread_info(
+            "Prefetch",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # Start the opt-in hicache "Prefetch" span off the scheduler hot
+                # path, before _storage_hit_query forwards ids to Mooncake.
+                self._init_op_trace(
+                    operation, rid=operation.request_id, role="Prefetch"
+                )
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
@@ -1245,6 +1411,13 @@ class HiCacheController:
                     : (storage_hit_count // self.page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
+                # Zero usable hits (terminated ops also report 0 here): the op
+                # will never be forwarded to prefetch_buffer, so retire the root
+                # span now instead of leaving it to __del__ on the revoke path.
+                # The op is still queued for the tree cache's absent-hash
+                # accounting, which does not need the span open.
+                if storage_hit_count == 0:
+                    self._finish_op_trace(operation)
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
@@ -1290,7 +1463,15 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            # Backup: caller_id/caller_role (role "Backup" from this thread) plus
+            # the span ids when exported; no request_id (backup is per-node).
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=self._storage_trace_extra(
+                    operation, include_request_id=False
+                )
+                or None,
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
@@ -1306,6 +1487,12 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        trace_set_thread_info(
+            "Backup",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
@@ -1313,7 +1500,12 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
+                    # Only ranks that run the put own a "Backup" span: backup_skip
+                    # (MLA) drops non-tp0 ranks that issue no storage RPC.
+                    self._init_op_trace(operation, rid=operation.id, role="Backup")
                     self._page_backup(operation)
+                    self._finish_op_trace(operation)
+                # Every rank acks for TP/PP sync, even the skipped ones.
                 self.ack_backup_queue.put(operation)
 
             except Empty:
@@ -1321,6 +1513,12 @@ class HiCacheController:
 
     def prefetch_sync_thread_func(self):
         """Synchronize prefetch results across all PP and TP ranks."""
+        trace_set_thread_info(
+            "Prefetch",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while not self.storage_stop_event.is_set():
             try:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
