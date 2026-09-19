@@ -15,7 +15,6 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1378,7 +1377,7 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self._remap_config(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))
