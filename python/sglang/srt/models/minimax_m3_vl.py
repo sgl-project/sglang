@@ -141,7 +141,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
-
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -194,6 +193,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         return MiniMaxM3SparseForCausalLM.get_model_config_for_expert_location(
             text_config
         )
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
@@ -259,9 +265,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # EAGLE3: when layers_to_capture is set, MiniMaxM3Model.forward returns
-        # (hidden_states, aux_hidden_states) once aux is non-empty; on idle/warmup
-        # forwards with no captured tokens it returns a bare hidden tensor.
+        # EAGLE3/DSpark: when layers_to_capture is set, MiniMaxM3Model.forward
+        # returns (hidden_states, aux_hidden_states) once aux is non-empty; on
+        # idle/warmup forwards with no captured tokens it returns a bare tensor.
         aux_hidden_states = None
         if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
