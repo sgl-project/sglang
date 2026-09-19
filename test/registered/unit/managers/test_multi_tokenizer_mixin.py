@@ -1,4 +1,6 @@
+import asyncio
 import unittest
+from unittest.mock import Mock
 
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -6,7 +8,12 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import BatchStrOutput
+from sglang.srt.managers.io_struct import (
+    BatchStrOutput,
+    ContinueGenerationReqInput,
+    PauseContinueBroadcastReq,
+    PauseGenerationReqInput,
+)
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
@@ -137,6 +144,62 @@ class TestMultiTokenizerMixin(unittest.TestCase):
     def test_get_tokenizer_worker_class_rejects_non_worker(self):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
+
+
+class TestColdTokenizerWorkerControl(unittest.IsolatedAsyncioTestCase):
+    async def _check_cold_control(self, *, pause):
+        """Deliver a router acknowledgment only after receive-loop initialization."""
+        worker = TokenizerWorker.__new__(TokenizerWorker)
+        worker.event_loop = None
+        worker.is_pause = not pause
+        worker.is_pause_cond = asyncio.Condition()
+        worker._pause_continue_future = None
+        inbox = asyncio.Queue()
+        receiver = None
+
+        async def receive():
+            """Apply queued broadcasts through the upstream worker implementation."""
+            while True:
+                await worker._apply_pause_continue_broadcast(await inbox.get())
+
+        def initialize():
+            """Start the simulated receive loop once, like the native initializer."""
+            nonlocal receiver
+            if worker.event_loop is None:
+                worker.event_loop = asyncio.get_running_loop()
+                receiver = asyncio.create_task(receive(), name="test-control-receiver")
+
+        worker.auto_create_handle_loop = Mock(side_effect=initialize)
+        worker._dispatch_to_scheduler = Mock(
+            side_effect=lambda obj: inbox.put_nowait(
+                PauseContinueBroadcastReq(is_pause=pause)
+            )
+        )
+        request = (
+            PauseGenerationReqInput(mode="retract")
+            if pause
+            else ContinueGenerationReqInput()
+        )
+        operation = worker.pause_generation if pause else worker.continue_generation
+        try:
+            await asyncio.wait_for(operation(request), timeout=1)
+            worker.auto_create_handle_loop.assert_called_once_with()
+            worker._dispatch_to_scheduler.assert_called_once_with(request)
+            self.assertEqual(worker.is_pause, pause)
+            self.assertTrue(inbox.empty())
+            self.assertIsNone(worker._pause_continue_future)
+        finally:
+            if receiver is not None:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+
+    async def test_pause_starts_receive_loop_on_cold_worker(self):
+        """A first pause request must consume its broadcast without prior generation."""
+        await self._check_cold_control(pause=True)
+
+    async def test_continue_starts_receive_loop_on_cold_worker(self):
+        """A first continue request must consume its broadcast without prior generation."""
+        await self._check_cold_control(pause=False)
 
 
 if __name__ == "__main__":
