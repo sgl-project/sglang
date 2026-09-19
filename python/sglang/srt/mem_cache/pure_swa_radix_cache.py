@@ -52,8 +52,8 @@ class PureSWARadixCache(RadixCache):
         return 0
 
     def sanity_check(self):
-        """No-op: PureSWARadixCache uses RadixCache's simple tree structure
-        which doesn't need a dual-LRU sanity check."""
+        """No-op: the invariant checker calls this on every SWA-capable cache,
+        and RadixCache's single LRU has no second tier to cross-check."""
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:
