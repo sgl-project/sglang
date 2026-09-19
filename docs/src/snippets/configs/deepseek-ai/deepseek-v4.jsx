@@ -2668,6 +2668,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
@@ -2696,6 +2697,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2729,6 +2731,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2972,6 +2975,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
@@ -3001,6 +3005,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
@@ -3041,6 +3046,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
@@ -3195,6 +3201,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
@@ -3224,6 +3231,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
@@ -3264,6 +3272,7 @@ sgl-eval run mmmu_pro \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
