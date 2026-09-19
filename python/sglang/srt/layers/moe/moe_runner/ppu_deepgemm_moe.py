@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import silu_and_mul
 
+from sglang.kernels.ops.kimi_k3 import situ_and_mul
 from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
@@ -376,6 +377,7 @@ def deep_moe_impl_fused(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    activation: str = "silu",
     out_hidden_states: Optional[torch.Tensor] = None,
 ):
     block_align = 1
@@ -503,10 +505,22 @@ def deep_moe_impl_fused(
             a, w1, out1, expert_ids, num_recv_tokens_per_expert
         )
 
-    if gemm1_alpha is None and gemm1_limit is None and use_mxfp4:
+    if (
+        activation != "situ"
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and use_mxfp4
+    ):
         a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
-        if gemm1_alpha is not None:
+        if activation == "situ":
+            out2 = situ_and_mul(
+                out1,
+                None,
+                gemm1_alpha if gemm1_alpha is not None else 4.0,
+                gemm1_limit,
+            )
+        elif gemm1_alpha is not None:
             out2 = swiglu_with_alpha_and_limit(
                 out1,
                 gemm1_alpha,
@@ -622,6 +636,7 @@ def fused_experts_none_to_deep_gemm(
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         swiglu_limit=moe_runner_config.swiglu_limit,
+        activation=moe_runner_config.activation,
         out_hidden_states=output,
     )
 

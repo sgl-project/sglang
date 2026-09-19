@@ -56,6 +56,13 @@ def fused_experts_none_to_acext(
         f"Only PPU support acext MoE backend, use other MoE backend on current platform please!"
     )
 
+    if runner_config.activation == "situ":
+        logger.info_once(
+            "ACEXT fused MoE does not expose a standalone activation stage; "
+            "using Triton GEMMs with naive SiTU on PPU."
+        )
+        return fused_experts_none_to_triton(dispatch_output, quant_info, runner_config)
+
     from acext import (
         fusedmoe_wrapper,
         get_enum_from_booleans,

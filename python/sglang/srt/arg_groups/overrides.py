@@ -1637,8 +1637,11 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
+    from sglang.srt.utils.common import is_ppu
 
     moe_a2a_backend = view.moe_a2a_backend
+    if is_ppu() and moe_a2a_backend == "megamoe":
+        raise ValueError("MegaMoE is not supported on PPU; use --moe-a2a-backend none.")
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "

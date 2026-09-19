@@ -54,6 +54,16 @@ def handle_ppu_backends(server_args: Any):
     # Disable DeepSeek-V4 topk_v2 on PPU by default.
     if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    # K3's Blackwell-specific fused paths cannot run on PPU. Keep the
+    # flags false so an explicit environment setting cannot re-enable them.
+    for field in (
+        envs.SGLANG_K3_AR_FUSION,
+        envs.SGLANG_K3_SP_COLLECTIVE,
+        envs.SGLANG_K3_SP_ATTN_RES,
+        envs.SGLANG_K3_GEMM_AR,
+        envs.SGLANG_K3_FUSED_FRONT,
+    ):
+        field.set(False)
     # Disable shared experts fusion for mxfp4 and mixed_precision_w4: those
     # models use a different quant method for routed experts and shared
     # experts, so the fused shared-expert path cannot run.

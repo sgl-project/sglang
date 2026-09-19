@@ -64,6 +64,11 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
+    from sglang.srt.utils import is_ppu
+
+    if is_ppu():
+        return False
+
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
