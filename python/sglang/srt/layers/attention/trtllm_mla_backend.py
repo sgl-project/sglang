@@ -167,6 +167,7 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    paged_metadata: Optional[TRTLLMMLADecodeMetadata] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -245,6 +246,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
         self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
+
+        self.use_native_paged_prefill = self._supports_native_paged_prefill()
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -327,6 +330,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
+        )
+
+    def _supports_native_paged_prefill(self) -> bool:
+        return (
+            type(self) is TRTLLMMLABackend
+            and self.backend == "trtllm-gen"
+            and torch.cuda.get_device_capability(self.device)[0] == 10
+            and self.q_data_type == torch.bfloat16
+            and self.data_type in (torch.bfloat16, torch.float8_e4m3fn)
+            and (self.kv_lora_rank, self.qk_rope_head_dim) == (512, 64)
+            and self.page_size in (32, 64)
+            and (self.num_q_heads <= 64 or self.num_q_heads == 128)
+            and not get_parallel().dcp_enabled
+            and get_parallel().attn_cp_size == 1
+            and self._kv_shard_pool is None
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -826,15 +844,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
-            # when chunked prefix cache is disabled.
-            # Also fallback to flashinfer MLA backend under a captured prefill graph
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 (self.disable_chunked_prefix_cache and has_prefix)
                 or is_in_tc_piecewise_cuda_graph()
                 or is_in_breakable_cuda_graph()
             )
+            use_paged_prefill = (
+                fallback_to_flashinfer_impl and self.use_native_paged_prefill
+            )
+            fallback_to_flashinfer_impl &= not use_paged_prefill
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -854,6 +873,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens,
                 fallback_to_flashinfer_impl,
             )
+            if use_paged_prefill:
+                seq_lens_k = forward_batch.seq_lens.to(torch.int32)
+                self.forward_prefill_metadata.paged_metadata = TRTLLMMLADecodeMetadata(
+                    block_kv_indices=self._create_block_kv_indices(
+                        forward_batch.batch_size,
+                        self._calc_padded_blocks(self.max_context_len),
+                        forward_batch.req_pool_indices,
+                        seq_lens_k,
+                        seq_lens_k.device,
+                    ),
+                    seq_lens_k=seq_lens_k,
+                    # A static bound avoids synchronizing GPU sequence lengths.
+                    max_seq_len_k=self.max_context_len,
+                )
+                self._multi_ctas_kv_counter_buffer = (
+                    grow_multi_ctas_kv_counter_buffer_if_needed(
+                        self._multi_ctas_kv_counter_buffer,
+                        seq_lens_k.device,
+                        self.num_q_heads,
+                        forward_batch.batch_size,
+                    )
+                )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
@@ -1462,6 +1503,65 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def _forward_paged_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q_rope: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+        llama_4_scaling: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        metadata = self.forward_prefill_metadata
+        paged = metadata.paged_metadata
+        if save_kv_cache and k is not None:
+            if k_rope is not None:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+
+        if q_rope is not None:
+            q = concat_mla_absorb_q_general(
+                q.view(-1, layer.tp_q_head_num, self.kv_lora_rank),
+                q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim),
+            )
+        q = q.view(-1, layer.tp_q_head_num, self.kv_cache_dim)
+        if llama_4_scaling is not None:
+            q = q * llama_4_scaling
+        q = q.to(self.data_type)
+
+        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, 1, self.page_size, self.kv_cache_dim
+        )
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=paged.block_kv_indices,
+            seq_lens=paged.seq_lens_k,
+            max_seq_len=paged.max_seq_len_k,
+            cum_seq_lens_q=metadata.cum_seq_lens,
+            max_q_len=metadata.max_seq_len,
+            # MLA pool writes cast to FP8 without applying checkpoint KV scales.
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
+            backend="trtllm-gen",
+            enable_pdl=_ENABLE_PDL,
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+        )
+        return out.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1488,11 +1588,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and self.forward_prefill_metadata is not None
-            and self.forward_prefill_metadata.fallback_to_flashinfer_impl
         ):
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
+            if self.forward_prefill_metadata.paged_metadata is not None:
+                return self._forward_paged_prefill(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    llama_4_scaling,
+                )
+            if self.forward_prefill_metadata.fallback_to_flashinfer_impl:
+                return super().forward_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+                )
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
