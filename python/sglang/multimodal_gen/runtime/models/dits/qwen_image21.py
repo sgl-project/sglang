@@ -17,6 +17,7 @@ from sglang.kernels.ops.diffusion import (
     fused_silu_mul_bitexact,
     residual_gate_add,
     rmsnorm_preserve_reduction,
+    tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     can_use_qknorm_complex_rope_kv,
@@ -349,7 +350,7 @@ class QwenImage21Attention(nn.Module):
                 packed = _KV_ROPE_FUSION.accept_or_fallback(
                     packed,
                     reference,
-                    equal=lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),
+                    equal=tensors_equal,
                     logger=logger,
                 )
         if packed is not None:

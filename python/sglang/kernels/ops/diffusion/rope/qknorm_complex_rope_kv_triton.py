@@ -57,7 +57,6 @@ def _qknorm_complex_rope_kv_kernel(
 def can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix):
     return (
         can_use_qknorm_complex_rope(k, weight, rope)
-        and k.shape[-1] == 128
         and v.shape == k.shape
         and k_prefix.ndim == 4
         and k_prefix.shape[0] == k.shape[0]

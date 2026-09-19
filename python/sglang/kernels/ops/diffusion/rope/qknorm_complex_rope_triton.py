@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fuse RMSNorm and complex RoPE with native rounding boundaries."""
+"""Fuse 128-wide RMSNorm and complex RoPE with native rounding boundaries."""
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.diffusion.norm.rmsnorm_preserve_reduction import (
-    _square_fp32_kernel,
     can_use_rmsnorm_preserve_reduction,
 )
 from sglang.kernels.ops.diffusion.rope.complex_rope_triton import (
@@ -81,60 +80,11 @@ def _qknorm_complex_rope_onepass_kernel(
     )
 
 
-@triton.jit
-def _qknorm_complex_rope_finish_kernel(
-    x_ptr,
-    variance_ptr,
-    weight_ptr,
-    rope_ptr,
-    out_ptr,
-    PAIRS: tl.constexpr,
-    SEQ: tl.constexpr,
-    HEADS: tl.constexpr,
-    DIM: tl.constexpr,
-    EPS: tl.constexpr,
-    FUSE_REAL_SIN: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pair = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = pair < PAIRS
-    index = pair * 2
-    column = index % DIM
-    token = pair // (HEADS * (DIM // 2)) % SEQ
-    variance = tl.load(variance_ptr + index // DIM, mask, 0)
-    inv = tl.rsqrt(variance + EPS)
-    component = tl.arange(0, 2)
-    value = tl.load(x_ptr + index[:, None] + component[None, :], mask[:, None], 0).to(
-        tl.float32
-    )
-    weight = tl.load(
-        weight_ptr + column[:, None] + component[None, :], mask[:, None], 0
-    ).to(tl.float32)
-    # RMSNorm rounds before its weight multiply, and again before RoPE.
-    value = (value * inv[:, None]).to(x_ptr.dtype.element_ty).to(tl.float32)
-    value = (value * weight).to(x_ptr.dtype.element_ty).to(tl.float32)
-    real, imag = tl.split(value)
-    rotation = tl.load(
-        rope_ptr + (token * DIM + column)[:, None] + component[None, :],
-        mask[:, None],
-        0,
-    )
-    cos, sin = tl.split(rotation)
-    out_real = tl.fma(real, cos, -imag * sin)
-    if FUSE_REAL_SIN:
-        out_imag = tl.fma(real, sin, imag * cos)
-    else:
-        out_imag = tl.fma(imag, cos, real * sin)
-    tl.store(
-        out_ptr + index[:, None] + component[None, :],
-        tl.join(out_real, out_imag),
-        mask[:, None],
-    )
-
-
 def can_use_qknorm_complex_rope(x, weight, rope):
-    return can_use_rmsnorm_preserve_reduction(x, weight) and can_use_fused_complex_rope(
-        x, rope
+    return (
+        can_use_rmsnorm_preserve_reduction(x, weight)
+        and can_use_fused_complex_rope(x, rope)
+        and x.shape[-1] == 128
     )
 
 
@@ -156,39 +106,17 @@ def qknorm_complex_rope(
     assert can_use_qknorm_complex_rope(x, weight, rope)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):
-        if x.shape[-1] == 128:
-            _qknorm_complex_rope_onepass_kernel[(triton.cdiv(x.numel() // 128, 4),)](
-                x,
-                weight,
-                torch.view_as_real(rope),
-                out,
-                x.numel() // 128,
-                x.shape[1],
-                x.shape[2],
-                eps,
-                _fuse_real_sin(x.device),
-                num_warps=4,
-                enable_fp_fusion=False,
-            )
-            return out
-        squares = torch.empty_like(x, dtype=torch.float32)
-        _square_fp32_kernel[(triton.cdiv(x.numel(), 1024),)](
-            x, squares, x.numel(), 1024
-        )
-        variance = squares.mean(dim=-1, keepdim=True)
-        _qknorm_complex_rope_finish_kernel[(triton.cdiv(x.numel() // 2, 256),)](
+        _qknorm_complex_rope_onepass_kernel[(triton.cdiv(x.numel() // 128, 4),)](
             x,
-            variance,
             weight,
             torch.view_as_real(rope),
             out,
-            x.numel() // 2,
+            x.numel() // 128,
             x.shape[1],
             x.shape[2],
-            x.shape[3],
             eps,
             _fuse_real_sin(x.device),
-            256,
+            num_warps=4,
             enable_fp_fusion=False,
         )
     return out
