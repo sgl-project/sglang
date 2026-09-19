@@ -93,7 +93,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.write_back_staging import WriteBackStaging
 
 
 logger = logging.getLogger(__name__)
@@ -1959,7 +1958,7 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-    hicache_write_back_staging: Optional[WriteBackStaging] = None
+    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __init__(
         self,

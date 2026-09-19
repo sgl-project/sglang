@@ -103,7 +103,7 @@ def prepare_hicache_staging(
             if staging is not None:
                 logger.info(
                     "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
-                    staging.nbytes / (1 << 20),
+                    sum(buffer.nbytes for buffer in staging) / (1 << 20),
                     pool.layer_num + len(packed_drafts),
                 )
 

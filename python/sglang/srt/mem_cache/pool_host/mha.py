@@ -43,7 +43,6 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
-from sglang.srt.mem_cache.write_back_staging import WriteBackStaging
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -79,7 +78,7 @@ def prepare_mha_write_back_staging(
     page_size: int,
     page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
     retain: bool = True,
-) -> WriteBackStaging | None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not (_is_cuda or _is_hip) or layer_num == 0:
         return None
     if not all(
@@ -96,13 +95,24 @@ def prepare_mha_write_back_staging(
     )
     staging = device_pool.hicache_write_back_staging
     if staging is None:
-        staging = WriteBackStaging.allocate(
-            shapes, dtype=device_pool.store_dtype, device=device_pool.device
+        staging = (
+            torch.empty(
+                shapes[0], dtype=device_pool.store_dtype, device=device_pool.device
+            ),
+            torch.empty(
+                shapes[1], dtype=device_pool.store_dtype, device=device_pool.device
+            ),
         )
         if retain:
             device_pool.hicache_write_back_staging = staging
     else:
-        staging.views(shapes, dtype=device_pool.store_dtype)
+        for buffer, shape in zip(staging, shapes):
+            if (
+                buffer.dtype != device_pool.store_dtype
+                or tuple(buffer.shape[1:]) != shape[1:]
+                or buffer.shape[0] < shape[0]
+            ):
+                raise ValueError("HiCache staging geometry changed after preparation")
     return staging
 
 
@@ -267,12 +277,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.can_use_write_back_jit = True
         self.staging_page_capacity = page_capacity
         self.staging_token_capacity = page_capacity * self.page_size
-        self.staging_k_buffer, self.staging_v_buffer = staging.views(
-            tuple(
-                (self.staging_token_capacity, self.layer_num, self.head_num, dim)
-                for dim in (self.device_pool.head_dim, self.device_pool.v_head_dim)
-            ),
-            dtype=self.dtype,
+        self.staging_k_buffer, self.staging_v_buffer = (
+            buffer[: self.staging_token_capacity] for buffer in staging
         )
 
     @property
