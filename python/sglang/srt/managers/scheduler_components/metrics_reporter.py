@@ -88,6 +88,14 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _avg_queue_wait_time(reqs: List[Req], now: float) -> float:
+    """Mean wait-so-far, in seconds, of requests currently in the queue."""
+    if not reqs:
+        return 0.0
+    total_wait = sum(now - req.time_stats.wait_queue_entry_time for req in reqs)
+    return total_wait / len(reqs)
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -788,6 +796,9 @@ class SchedulerMetricsReporter:
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
+            self.stats.avg_request_queue_latency = _avg_queue_wait_time(
+                self.scheduler.waiting_queue, now
+            )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
@@ -1005,6 +1016,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
+            )
+            self.stats.avg_request_queue_latency = _avg_queue_wait_time(
+                self.scheduler.waiting_queue, time.perf_counter()
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
@@ -1350,6 +1364,9 @@ class SchedulerMetricsReporter:
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             self.scheduler.waiting_queue, priority_enabled
+        )
+        self.stats.avg_request_queue_latency = _avg_queue_wait_time(
+            self.scheduler.waiting_queue, time.perf_counter()
         )
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
