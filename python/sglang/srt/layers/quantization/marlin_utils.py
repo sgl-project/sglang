@@ -410,6 +410,19 @@ def moe_awq_to_marlin_zero_points(
     return output
 
 
+def moe_ct_to_marlin_zero_points(
+    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    # CT pack-quantized zero-points have consecutive values within each word,
+    # unlike AWQ's interleaved columns. The loader has already transposed the
+    # checkpoint's packed output dimension to the last dimension.
+    output = torch.empty_like(q_zp_packed)
+    for e in range(q_zp_packed.shape[0]):
+        zero_points = unpack_cols(q_zp_packed[e], num_bits, size_k, size_n)
+        output[e] = marlin_zero_points(zero_points, size_k, size_n, num_bits)
+    return output
+
+
 def maybe_warn_marlin_atomic_add(device, dtype):
     if torch.compiler.is_dynamo_compiling():
         return
