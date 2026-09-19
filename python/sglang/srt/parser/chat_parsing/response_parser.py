@@ -277,8 +277,7 @@ class ResponseParser:
                 if kind == "open":
                     self._close_current(events, end=m.start())
                     self._open_explicit(events, field, m)
-                else:  # "close" (always the implicit region's close here,
-                    #   since explicit regions only expose their own close)
+                else:  # "close" for the current explicit or implicit region
                     had_content = self._opened
                     self._close_current(
                         events,
