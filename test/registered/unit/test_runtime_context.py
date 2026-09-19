@@ -407,7 +407,10 @@ class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
     def test_without_a_bundle_it_still_asks_the_group(self):
         """Unchanged for every process that publishes without a placement."""
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
-        with patch(f"{_PS}.get_attn_tensor_model_parallel_rank", return_value=3):
+        with patch(
+            f"{_PS}.get_attn_tp_group",
+            return_value=SimpleNamespace(rank_in_group=3),
+        ):
             self.assertEqual(get_parallel().attn_tp_rank, 3)
 
 
