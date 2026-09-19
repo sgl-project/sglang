@@ -2871,6 +2871,10 @@ class Scheduler(
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    # Rejection precedes queue admission, which normally
+                    # registers the child for scheduler cleanup reporting.
+                    if self.request_lifecycle is not None:
+                        self.request_lifecycle.retire(req)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
