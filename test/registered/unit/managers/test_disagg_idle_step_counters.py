@@ -18,7 +18,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -120,7 +120,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
                                 ]
+                        parallel = SimpleNamespace(
+                            pp_async_batch_depth=depth,
+                            enable_dsa_prefill_context_parallel=False,
+                        )
                         with (
+                            patch(f"{PP_MODULE}.get_parallel", return_value=parallel),
                             patch(
                                 f"{PP_MODULE}.get_disagg",
                                 return_value=SimpleNamespace(
@@ -130,12 +135,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             patch(f"{PP_MODULE}.set_time_batch"),
                         ):
                             self.run_and_check(
-                                scheduler,
-                                event_loop,
-                                mode,
-                                pattern == "idle_cycle",
-                                pp_size=2,
-                                pp_async_batch_depth=depth,
+                                scheduler, event_loop, mode, pattern == "idle_cycle"
                             )
                         # Transfers suppress housekeeping, not the idle flag.
                         self.assertEqual(
@@ -256,19 +256,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             for launch_ts in LAUNCH_TIMESTAMPS
         ]
 
-    def run_and_check(
-        self,
-        scheduler,
-        event_loop,
-        mode,
-        after_idle,
-        *,
-        pp_size=1,
-        pp_async_batch_depth=0,
-    ):
+    def run_and_check(self, scheduler, event_loop, mode, after_idle):
         observed_idle_flags = []
         observed_iters = []
-        completion_timestamps = []
 
         def run_batch(batch, pp_proxy_tensors=None):
             # Exercise the real timestamp, iteration, and flag handoff. Only
@@ -284,30 +274,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            # Results follow any launches already performed by the real loop;
-            # overlap and pipeline loops can have multiple batches in flight.
-            end_ts = (
-                max(
-                    LAUNCH_TIMESTAMPS[scheduler.forward_ct - 1],
-                    completion_timestamps[-1] if completion_timestamps else 0,
-                )
-                + 0.0625
-            )
-            completion_timestamps.append(end_ts)
-            with patch(
-                "sglang.srt.managers.scheduler.time.monotonic",
-                return_value=end_ts,
-            ):
-                scheduler._record_step_counters(batch, result)
+            scheduler._record_step_counters(batch, result)
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
-        with (
-            published_topology(
-                pp_size=pp_size, pp_async_batch_depth=pp_async_batch_depth
-            ),
-            self.assertRaises(StopIteration),
-        ):
+        with self.assertRaises(StopIteration):
             event_loop(scheduler)
 
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
@@ -322,13 +293,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         expected_samples = len(expected_intervals)
         expected_busy_us = round(sum(expected_intervals) * 1_000_000)
         if mode == ForwardMode.EXTEND:
-            expected_busy = completion_timestamps[-1] - LAUNCH_TIMESTAMPS[0]
-            if after_idle:
-                expected_busy -= LAUNCH_TIMESTAMPS[2] - completion_timestamps[1]
-            expected_busy_us = round(expected_busy * 1_000_000)
             self.assertEqual(scheduler.total_prefill_busy_us, expected_busy_us)
             self.assertEqual(
-                scheduler.total_prefill_uncached_tokens, len(LAUNCH_TIMESTAMPS) * 1024
+                scheduler.total_prefill_uncached_tokens, expected_samples * 1024
             )
         else:
             self.assertEqual(scheduler.decode_moment_totals[0], expected_samples)
@@ -339,10 +306,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
-        scheduler._prev_prefill_end_ts = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
@@ -391,6 +358,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
+        scheduler.ps.pp_size = 2
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
