@@ -6,6 +6,7 @@ import torch
 import triton
 from torch import nn
 
+from sglang.kernels.ops.attention import gdn_fused_prefill_aiter
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -242,6 +243,52 @@ class Qwen3GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
+        # Static half of the fused GDN prefill gate: platform, opt-in, and the
+        # model shape the AITER kernel hard-codes. The per-call tensor contract
+        # is checked in the backend, which falls back rather than raising.
+        _avail = gdn_fused_prefill_aiter.available()
+        self._gdn_fused_prefill_ready = (
+            _avail
+            and self.num_v_heads == 2 * self.num_k_heads
+            and self.head_k_dim == self.head_v_dim == 128
+            and self.conv_kernel_size == 4
+        )
+        self._gdn_fused_norm_weight = None
+        self._gdn_fused_conv_bias = None
+        self._gdn_out_proj_fp8 = False
+        if self._gdn_fused_prefill_ready:
+            # The kernel always applies a conv bias; models without one get zeros.
+            self._gdn_fused_conv_bias = self.conv1d.bias
+            if self._gdn_fused_conv_bias is None:
+                self._gdn_fused_conv_bias = torch.zeros(
+                    self.conv1d.weight.shape[0],
+                    device=self.conv1d.weight.device,
+                    dtype=self.conv1d.weight.dtype,
+                )
+
+    def _prepare_gdn_fused_prefill(self):
+        """Publish the output-norm weight to the fused path, once, after load.
+
+        The kernel reads norm_weight directly, so it must be resolved after the
+        weights exist and before graph capture.
+        """
+        if not self._gdn_fused_prefill_ready:
+            return
+        weight = self.norm.weight.data
+        # The kernel consumes a bf16 norm weight; cast if the checkpoint kept it
+        # in a higher precision (FP8 models often store RMSNorm scales in fp32).
+        self._gdn_fused_norm_weight = weight.to(torch.bfloat16).contiguous()
+
+        # If out_proj is block-FP8, feed it the kernel's per-head group-128 FP8
+        # activations directly (out_proj skips its own re-quant); else the model
+        # hands out_proj the bf16 normalized output and it quantizes as usual.
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        qm = self.out_proj.quant_method
+        self._gdn_out_proj_fp8 = isinstance(qm, Fp8LinearMethod) and getattr(
+            qm, "block_quant", False
+        )
+
     @staticmethod
     def _override_weight_loader(module, new_loader):
         """Override weight_loader on a module's weight parameter.
@@ -408,6 +455,34 @@ class Qwen3GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+
+        # Fused GDN prefill handoff (attempt-and-verify, side-effect-free on miss):
+        # offer the output-norm weight so a covered AITER kernel folds split +
+        # Conv1D + delta scan + gated RMSNorm + FP8 quant into one op. If the
+        # backend leaves the stash unconsumed (env off, wrong arch/Triton, shape
+        # not covered, spec-verify/MIS), everything below runs as before.
+        if self._gdn_fused_prefill_ready:
+            self.attn._gdn_onorm_args = (
+                self._gdn_fused_norm_weight,
+                self.layer_norm_epsilon,
+                self._gdn_fused_conv_bias,
+            )
+            self.attn._gdn_onorm_consumed = False
+            fused_out = self.attn.try_fused_gdn_prefill(
+                forward_batch, projected_states_qkvz, projected_states_ba
+            )
+            self.attn._gdn_onorm_args = None
+            if self.attn._gdn_onorm_consumed and fused_out is not None:
+                # Already gated-RMSNormed by the kernel; go straight to out_proj.
+                if self._gdn_out_proj_fp8:
+                    # Feed the per-head group-128 FP8 activations straight in;
+                    # the block-FP8 out_proj consumes (fp8, scales) without a
+                    # second quantization pass.
+                    output, _ = self.out_proj(self.attn._gdn_fp8_out)
+                else:
+                    core_attn_out = fused_out.reshape(*fused_out.shape[:-2], -1)
+                    output, _ = self.out_proj(core_attn_out)
+                return output
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
@@ -1245,6 +1320,13 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Publish the output-norm weight to the fused GDN prefill path now that
+        # the weights exist, and before CUDA graph capture.
+        for module in self.modules():
+            if isinstance(module, Qwen3GatedDeltaNet):
+                module._prepare_gdn_fused_prefill()
+
         return loaded_params
 
     @classmethod
