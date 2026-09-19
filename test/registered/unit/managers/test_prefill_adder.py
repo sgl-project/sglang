@@ -122,6 +122,7 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.external_cache_hit_length = None
         req.materialized_host_hit_len.return_value = 0
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
@@ -1006,6 +1007,7 @@ class TestPrefillAdder(CustomTestCase):
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (
             ("full", 0, 24, None, None, 8, 8),
+            ("pp_linker", 8, 16, None, None, 8, 8),
             ("full_unaligned", 0, 24, None, None, 7, 8),
             ("retracted_unaligned", 0, 24, None, None, 7, 8),
             ("chunk", 0, 24, 4, None, 4, 0),
@@ -1048,6 +1050,8 @@ class TestPrefillAdder(CustomTestCase):
                     tail=extend if chunk is None and dllm is None else 8,
                 )
                 req.retracted_stain = name == "retracted_unaligned"
+                if name == "pp_linker":
+                    req.external_cache_hit_length = prefix_len + host_hit
                 if name.startswith("overdelivery"):
                     req.host_hit_length -= 4
                 old_node, restored_node = req.last_node, object()
@@ -1068,6 +1072,10 @@ class TestPrefillAdder(CustomTestCase):
                     tile_gate.assert_called_once()
                 self.mock_tree_cache.init_load_back.assert_called_once()
                 self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(
+                    req.kv.cache_protected_len,
+                    prefix_len if name == "pp_linker" else 24,
+                )
                 req.set_extend_range.assert_called_once_with(24, 24 + extend)
                 self.mock_tree_cache.inc_lock_ref.assert_any_call(restored_node)
                 self.assertIs(
