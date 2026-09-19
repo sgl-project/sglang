@@ -4,8 +4,8 @@
 use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    RouterInflightLoadConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -47,7 +47,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: RouterInflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

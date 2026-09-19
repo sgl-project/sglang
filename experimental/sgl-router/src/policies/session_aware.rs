@@ -8,7 +8,7 @@ use crate::discovery::WorkerId;
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
-use crate::state::load_monitor::active_load::JanitorHandle;
+use crate::state::load_monitor::router_inflight_load::JanitorHandle;
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 use rand::Rng;
@@ -38,7 +38,7 @@ impl SessionAwarePolicy {
     #[cfg(test)]
     fn with_clock(
         config: AffinityConfig,
-        clock: Arc<dyn crate::state::load_monitor::active_load::Clock>,
+        clock: Arc<dyn crate::state::load_monitor::router_inflight_load::Clock>,
     ) -> Self {
         Self {
             store: AffinityStore::with_clock(Duration::from_secs(config.session_idle_secs), clock),
@@ -253,7 +253,7 @@ fn stable_backup(
 mod lifecycle_tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerMode, WorkerSpec};
-    use crate::state::load_monitor::active_load::MockClock;
+    use crate::state::load_monitor::router_inflight_load::MockClock;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 

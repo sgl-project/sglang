@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use super::load_monitor::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
+use super::load_monitor::router_inflight_load::{
+    spawn_sweeper, Clock, JanitorHandle, SystemTimeClock,
+};
 use crate::discovery::WorkerId;
 use crate::workers::Worker;
 
@@ -95,11 +97,15 @@ impl AffinityStore {
 
     pub fn sweep_expired(&self) -> usize {
         let now = self.clock.now();
-        let before = self.assignments.len();
+        let mut removed = 0;
         self.assignments.retain(|_, assignment| {
-            now.saturating_duration_since(assignment.last_seen) <= self.idle
+            let keep = now.saturating_duration_since(assignment.last_seen) <= self.idle;
+            if !keep {
+                removed += 1;
+            }
+            keep
         });
-        before - self.assignments.len()
+        removed
     }
 
     /// Periodic eviction; `None` outside a Tokio runtime.
@@ -115,7 +121,7 @@ impl AffinityStore {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerMode, WorkerSpec};
-    use crate::state::load_monitor::active_load::MockClock;
+    use crate::state::load_monitor::router_inflight_load::MockClock;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -151,5 +157,39 @@ mod tests {
         clock.advance(Duration::from_secs(8));
         assert_eq!(store.sweep_expired(), 1);
         assert!(store.contains("hot") && !store.contains("cold"));
+    }
+
+    #[test]
+    fn concurrent_bindings_do_not_count_as_evictions() {
+        use std::sync::Barrier;
+
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let store = AffinityStore::with_clock(Duration::from_secs(60), clock);
+        let engine = worker("a");
+        let start = Arc::new(Barrier::new(5));
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let store = Arc::clone(&store);
+                let engine = Arc::clone(&engine);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for key in 0..5000 {
+                        store.bind(
+                            format!("{writer}-{key}"),
+                            &engine,
+                            std::slice::from_ref(&engine),
+                        );
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..1000 {
+                // The clock never advances: every binding must survive,
+                // even when requests insert new keys during a sweep.
+                assert_eq!(store.sweep_expired(), 0);
+            }
+        });
+        assert_eq!(store.len(), 20_000);
     }
 }
