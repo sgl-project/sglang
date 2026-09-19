@@ -6,7 +6,7 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
     is_batch_invariant,
 )
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
@@ -39,7 +39,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+from sglang.srt.utils import add_prefix, get_current_device_stream_fast, is_xpu
 
 try:
     import cutlass.cute as cute
@@ -53,6 +53,13 @@ except Exception as _import_error:
     _cute_import_error = _import_error
 else:
     _cute_import_error = None
+
+_is_xpu = is_xpu()
+
+try:
+    from sgl_kernel import fused_qk_norm_rope
+except ImportError:
+    fused_qk_norm_rope = None
 
 
 @cache
@@ -353,6 +360,21 @@ class InklingAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
+        # fused_qk_norm_rope walks num_heads_q+num_heads_k heads but strides rows by
+        # all three counts, so the KV+R tail passes as untouched V heads -- only when
+        # it is a whole number of head_dim columns, i.e. d_rel * num_tp_heads % 128 == 0
+        # (TP <= 8 at d_rel=16, head_dim=128).
+        kvr_width = (
+            2 * self.head_dim * self.num_tp_kv_heads + self.d_rel * self.num_tp_heads
+        )
+        self._xpu_q_norm_pad = kvr_width // self.head_dim
+        self._xpu_q_norm_ok = (
+            _is_xpu
+            and fused_qk_norm_rope is not None
+            and kvr_width % self.head_dim == 0
+        )
+        self._xpu_q_norm_pos = None
+
         self.kv_conv = kv_conv
         self.sconv_kernel_size = sconv_kernel_size
         self.k_sconv = (
@@ -390,7 +412,9 @@ class InklingAttention(nn.Module):
     def _project_qkvr(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Returns the packed row alongside its four views; _xpu_norm_q_inplace needs
+        # the row itself, and the views do not expose their parent.
         num_tokens = hidden_states.size(0)
         qkvr, _ = self.qkvr(hidden_states)
         qkvr = qkvr.view(num_tokens, -1)
@@ -401,7 +425,34 @@ class InklingAttention(nn.Module):
             self.d_rel * self.num_tp_heads,
         ]
         q, k, v, r = qkvr.split(split_sizes, dim=-1)
-        return q, k, v, r
+        return qkvr, q, k, v, r
+
+    def _xpu_norm_q_inplace(self, qkvr: torch.Tensor) -> None:
+        """RMSNorm q in place on the packed QKVR row, without rotary."""
+        num_tokens = qkvr.size(0)
+        pos = self._xpu_q_norm_pos
+        if pos is None or pos.numel() < num_tokens:
+            # rotary_dim=0 leaves it unread, but the kernel requires int32 [num_tokens].
+            pos = torch.zeros(num_tokens, dtype=torch.int32, device=qkvr.device)
+            self._xpu_q_norm_pos = pos
+        weight = self.q_norm.weight.to(qkvr.dtype)
+        fused_qk_norm_rope(
+            qkvr,
+            num_heads_q=self.num_tp_heads,
+            # k is already through k_sconv here, so it no longer aliases the row.
+            num_heads_k=0,
+            num_heads_v=self._xpu_q_norm_pad,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=weight,
+            k_weight=weight,
+            base=1.0e4,
+            # is_neox=False skips the power-of-2 lane check that rotary_dim=0 fails.
+            is_neox=False,
+            position_ids=pos[:num_tokens],
+            # rotary_dim=0 disables rotary per lane; Inkling has no RoPE.
+            rotary_dim=0,
+        )
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
@@ -759,7 +810,7 @@ class InklingAttention(nn.Module):
         the fused decode {AR -> attn_sconv -> mlp_norm} kernel."""
         assert hidden_states.ndim == 2
         num_tokens = hidden_states.size(0)
-        q, k, v, r = self._project_qkvr(hidden_states)
+        qkvr, q, k, v, r = self._project_qkvr(hidden_states)
         r = r.view(num_tokens, -1, self.d_rel)
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
@@ -767,7 +818,13 @@ class InklingAttention(nn.Module):
         # The kwargs below must describe the backend `self.attn` dispatches
         # this forward to.
         attention_backend = serving_attention_backend(forward_batch)
-        assert attention_backend in ("fa4", "triton")
+        # intel_xpu is deliberately absent: XPUAttentionBackend.forward_extend takes
+        # no score_mod/aux_tensors (and no **kwargs), so it cannot carry the relative
+        # logit bias below. On XPU, serve Inkling with --attention-backend triton.
+        assert attention_backend in ("fa4", "triton"), (
+            f"Inkling attention has no path for backend {attention_backend!r}; "
+            "on XPU use --attention-backend triton"
+        )
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
@@ -882,6 +939,11 @@ class InklingAttention(nn.Module):
         # with v_sconv + rel_logits_proj. (The fused prologue already normed.)
         if fused_prologue:
             pass
+        elif self._xpu_q_norm_ok and q.dtype in (torch.bfloat16, torch.float16):
+            # q still aliases the packed row, so this normalizes it without the
+            # compaction copy the (T, H*D) -> (T*H, D) reshape would force.
+            self._xpu_norm_q_inplace(qkvr)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
         else:
             q, k = apply_qk_norm(
                 q=q,
