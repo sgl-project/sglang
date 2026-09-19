@@ -18,10 +18,10 @@ This module serves two purposes:
    :meth:`override_quantization_method` claims ``config.json`` blocks of
    the form ``{"group_size": <int>, "bits": <int>}`` with no
    ``quant_method`` key. ``bits=4`` / ``bits=8`` map to the on-the-fly
-   preset names; any other integer bit-width (5, 6, mixed Hub dumps, …)
-   maps to ``mlx``. ``mlx_lm.load`` already instantiated the quantized
-   modules, so the runner does not requantize. Resolves #25119 for 4/8
-   and the same validator failure for other MLX bit-widths.
+   preset names; any other positive integer bit-width maps to ``mlx``.
+   ``mlx_lm.load`` already instantiated the quantized modules, so the
+   runner does not requantize. Resolves #25119 for 4/8 and the same
+   validator failure for other MLX bit-widths.
 
 The PyTorch path constructors (``from_config``, ``get_quant_method``) raise
 ``NotImplementedError`` with a clear pointer to ``SGLANG_USE_MLX=1``, since
@@ -91,9 +91,10 @@ class MlxQuantizationConfig(QuantizationConfig):
         No ``quant_method`` key, no other identifying field. Without this
         override, :meth:`ModelConfig._verify_quantization` cannot match the
         shape to any registered method and raises ``Unknown quantization
-        method`` (see #25119). Match it here and return the preset whose
-        bit-width agrees, so pre-quantized HF repos load on Apple Silicon
-        without the user having to pass ``--quantization`` on the CLI.
+        method`` (see #25119). Map 4-bit / 8-bit to ``mlx_q4`` / ``mlx_q8``
+        and every other positive bit-width to the ``mlx`` passthrough
+        marker so pre-quantized HF repos load on Apple Silicon without
+        ``--quantization``.
 
         Returns ``None`` for any input that does not look like a bare MLX
         config: non-dict, dict with an explicit ``quant_method``, missing
@@ -123,9 +124,9 @@ class MlxQuantizationConfig(QuantizationConfig):
             return "mlx_q4"
         if bits == 8:
             return "mlx_q8"
-        # Pre-quantized Hub dumps (6-bit affine, 5-bit LM Studio, …). The
-        # MLX runner loads via mlx_lm and ignores on-the-fly presets when
-        # the checkpoint already has a quantization block.
+        # Pre-quantized Hub dumps that are not mlx_q4/mlx_q8. The MLX
+        # runner loads via mlx_lm and does not treat this name as an
+        # on-the-fly preset.
         return "mlx"
 
     def get_quant_method(

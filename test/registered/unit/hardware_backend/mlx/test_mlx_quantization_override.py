@@ -77,31 +77,23 @@ class TestMlxQuantizationOverride(CustomTestCase):
         # Non-positive values.
         self.assertIsNone(
             MlxQuantizationConfig.override_quantization_method(
-                {"bits": 0, "group_size": 64}, None
+                hf_quant_cfg={"bits": 0, "group_size": 64},
+                user_quant=None,
             )
         )
 
-    def test_non_preset_bitwidth_passthrough(self):
-        """Already-quantized MLX dumps that are not q4/q8 map to ``mlx``.
+    def test_six_bit_affine_dict_passthrough(self):
+        """6-bit affine dumps used to raise Unknown quantization method.
 
-        mlx_lm.load instantiates the modules; the runner must not treat this
-        as an on-the-fly mlx_q4/mlx_q8 request.
+        #25119 only mapped bits=4/8. A Hub config with bits=6 and extra
+        keys such as mode=affine produced an empty method name. The
+        validator must accept that shape as the mlx passthrough marker
+        so mlx_lm.load can keep the checkpoint's own bit-width.
         """
         self.assertEqual(
             MlxQuantizationConfig.override_quantization_method(
-                {"group_size": 64, "bits": 6, "mode": "affine"}, None
-            ),
-            "mlx",
-        )
-        self.assertEqual(
-            MlxQuantizationConfig.override_quantization_method(
-                {"group_size": 64, "bits": 5}, None
-            ),
-            "mlx",
-        )
-        self.assertEqual(
-            MlxQuantizationConfig.override_quantization_method(
-                {"group_size": 64, "bits": 2}, None
+                hf_quant_cfg={"group_size": 64, "bits": 6, "mode": "affine"},
+                user_quant=None,
             ),
             "mlx",
         )

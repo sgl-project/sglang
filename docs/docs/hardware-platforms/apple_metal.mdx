@@ -78,7 +78,7 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 
 The MLX backend supports two quantization paths on Apple Silicon:
 
-1. **Pre-quantized HF repos.** MLX checkpoints whose `quantization_config` is a `{group_size, bits}` dict (4-bit, 6-bit, 8-bit, and other affine widths) load directly through `mlx_lm.load(...)` — no extra flag needed. Do not pass `--quantization mlx_q8` to "satisfy" a 6-bit repo; the runner already skips on-the-fly quantization when the checkpoint is quantized.
+1. **Pre-quantized HF repos.** MLX checkpoints whose `quantization_config` is a `{group_size, bits}` dict (4-bit, 6-bit, 8-bit, and other affine widths) load through `mlx_lm.load(...)` with no `--quantization` flag.
    ```bash
    SGLANG_USE_MLX=1 python -m sglang.launch_server \
      --model-path mlx-community/Qwen3-0.6B-4bit \
