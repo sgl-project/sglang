@@ -1,0 +1,141 @@
+---
+title: "Image Quality Metrics"
+description: "Score generated images with CLIP, CLIP-IQA and ImageReward, and gate a test case on the result."
+---
+
+## What this measures
+
+`python/sglang/multimodal_gen/test/quality_metrics.py` scores a generated image
+three ways. The three see different inputs on purpose:
+
+| Metric | Input | Answers | Typical range |
+|---|---|---|---|
+| `clip_score` | image + its prompt | prompt adherence | 15 - 40 |
+| `clip_iqa` | image alone | no-reference aesthetics | 0 - 1 |
+| `image_reward` | image + its prompt | human-preference proxy | -2 - +2 |
+
+None of them measures realism: all three rate generated images *above* real
+photographs, so a value is low only relative to a control, never absolutely.
+Score a real-data control before calling any number bad.
+
+This is a different check from the CLIP *similarity* in
+`multimodal_gen/test/test_utils.py`, which compares an output against a stored
+reference image and answers "did the pipeline change?". The metrics here need no
+reference and answer "is the output any good?".
+
+`clip_score` is `100 * cosine` on `openai/clip-vit-base-patch32`, numerically
+equal to torchmetrics' `CLIPScore` but computed here on plain transformers:
+torchmetrics 1.9 calls `.norm()` on the return of `get_image_features`, which is
+an output object rather than a tensor in the pinned transformers 5.12.1. Scores
+are comparable only within one backbone -- ViT-L/14 reads several points away from
+ViT-B/32 on the same image.
+
+## Installation
+
+`clip_score` needs nothing beyond sglang. `clip_iqa` needs the eval extra, where
+`piq` holds the canonical `clip_iqa` weights:
+
+```bash
+pip install "sglang[diffusion-eval]"
+```
+
+ImageReward cannot share the interpreter: it imports `ImageReward/ReFL.py`, which
+needs `transformers<5`, while sglang pins `transformers==5.12.1`. Install it into
+a separate venv and point sglang at that python:
+
+```bash
+python -m venv /opt/imagereward
+/opt/imagereward/bin/pip install image-reward 'transformers==4.46.3' 'diffusers==0.31.0'
+export SGLANG_TEST_IMAGE_REWARD_PYTHON=/opt/imagereward/bin/python
+```
+
+With the variable unset, any case that enforces `min_image_reward` fails rather
+than skipping the metric.
+
+## Measuring a model
+
+Generate with `bench_offline_throughput`, then score the output directory against
+the manifest that produced it:
+
+```bash
+python -m sglang.multimodal_gen.benchmarks.bench_offline_throughput \
+    --model-path black-forest-labs/FLUX.2-klein \
+    --request-manifest prompts.jsonl --save-output-dir out_a/
+
+python -m sglang.multimodal_gen.benchmarks.bench_image_quality \
+    --request-manifest prompts.jsonl --images out_a/ --out-prefix klein_4b
+```
+
+This writes `klein_4b_per_image.jsonl` (one row per image) and
+`klein_4b_summary.json` (mean, std, sem per metric, plus the manifest's sha256).
+Pass `--metrics clip_score clip_iqa image_reward` to add ImageReward; the default
+is the two in-process metrics. ImageReward is scored in a single launch of the
+separate interpreter after the sweep, because that launch loads a 1.7 GB
+checkpoint.
+
+Images must be named `<index>-<request_id>.<ext>`, which is what
+`--save-output-dir` produces. The tool matches every image to its manifest row on
+both index and request id and refuses to score a directory that came from a
+different manifest -- otherwise every prompt would be silently mislabeled.
+
+## Comparing two arms
+
+Per-image spread dominates each mean: CLIP has a per-prompt sigma near 3.0, so a
+500-image mean carries a standard error around 0.14 and an unpaired comparison
+cannot see a small change. Generate both arms from a byte-identical manifest and
+pass the first arm's per-image JSONL as `--baseline`:
+
+```bash
+python -m sglang.multimodal_gen.benchmarks.bench_image_quality \
+    --request-manifest prompts.jsonl --images out_b/ --out-prefix klein_4b_fp8 \
+    --baseline klein_4b_per_image.jsonl
+```
+
+The paired test differences the two arms per prompt before averaging, which
+cancels the prompt-to-prompt spread and is several times tighter on the same data.
+The summary gains a `paired_vs_baseline` block with the mean delta, its standard
+error and `z` per metric. Mismatched prompts at the same index abort the run:
+a paired test is only valid on identical prompts.
+
+## Gating a test case
+
+Set `run_quality_check=True` on a `DiffusionTestCase` and add an entry for its id
+in `python/sglang/multimodal_gen/test/server/quality_thresholds.json`:
+
+```json
+{
+  "cases": {
+    "flux2_dev_image_t2i": {
+      "min_clip_score": 20.0
+    }
+  }
+}
+```
+
+Only the metrics present in the entry are computed and enforced. A metric that is
+enforced but produced no value -- a missing dependency, a failed download -- is a
+**failure**, not a pass. A case with `run_quality_check=True` and no entry fails
+immediately, pointing back at `bench_image_quality.py`: measure before gating.
+
+One table serves every backend. The floors are loose relative to the difference
+a GPU family makes, unlike latency, which is why `perf_baselines/` is per-device
+and this file is not.
+
+### Only `image_reward` can gate a single image
+
+Scoring klein-9B three ways -- the real output, a black frame, and uniform
+noise:
+
+| Metric | worst healthy | best broken | separation |
+|---|---|---|---|
+| `clip_score` | 24.70 | 25.28 (black) | **-0.58, overlaps** |
+| `clip_iqa` | 0.430 | 0.773 (noise) | **-0.34, overlaps** |
+| `image_reward` | -0.587 | -2.041 (black) | +1.45 |
+
+A black frame out-scores the worst real image on CLIP, and uniform noise lands at
+the healthy *mean* on CLIP-IQA, so no floor on either one separates a broken image
+from a good one -- a CLIP-IQA floor of 0.45 already rejects healthy images. Treat
+those two as distribution metrics and compare them with `--baseline`; gate on
+`image_reward`, whose floor sits between the worst healthy image and the best
+broken one. The `min_clip_score` floors that remain are non-image tripwires: they
+catch a decode failure, not a degenerate image.

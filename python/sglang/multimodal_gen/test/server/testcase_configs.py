@@ -322,6 +322,9 @@ class DiffusionTestCase:
     perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
+    # Prompt-adherence / no-reference floors from server/quality_thresholds.json;
+    # off by default, a case needs a measured entry there and the metrics installed.
+    run_quality_check: bool = False
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False

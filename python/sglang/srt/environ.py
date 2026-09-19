@@ -387,6 +387,9 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
+    # Interpreter with image-reward installed, for the diffusion quality check; it
+    # needs transformers<5 while sglang pins 5.12.1. None = metric unavailable.
+    SGLANG_TEST_IMAGE_REWARD_PYTHON = EnvStr(None)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
     # ===================================================================

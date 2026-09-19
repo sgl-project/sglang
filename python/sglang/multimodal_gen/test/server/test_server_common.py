@@ -24,6 +24,14 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.quality_metrics import (
+    QUALITY_THRESHOLD_PATH,
+    QualityScores,
+    check_quality,
+    compute_quality_scores,
+    format_quality_scores,
+    load_quality_thresholds,
+)
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
     pop_realtime_key_frames,
@@ -723,6 +731,62 @@ class DiffusionServerBase:
 
 """
         logger.error(output)
+
+    def _score_quality(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> tuple[QualityScores, list[str]]:
+        """Score the enforced quality metrics; returns them plus any violations.
+
+        Split from _validate_quality so a caller can report scores that failed.
+        """
+        thresholds = load_quality_thresholds(case.id)
+        if not thresholds.enforces_anything():
+            pytest.fail(
+                f"{case.id}: run_quality_check is on but {QUALITY_THRESHOLD_PATH} "
+                "has no floors for it. Measure the case first with "
+                "benchmarks/bench_image_quality.py, then add its entry."
+            )
+        if case.server_args.modality != "image":
+            pytest.fail(
+                f"{case.id}: run_quality_check scores images only, got "
+                f"modality={case.server_args.modality}"
+            )
+        if not content:
+            pytest.fail(f"{case.id}: quality check received no image")
+
+        prompt = case.sampling_params.prompt
+        needs_prompt = (
+            thresholds.min_clip_score is not None
+            or thresholds.min_image_reward is not None
+        )
+        # An empty prompt scores against the empty CLIP text embedding, which is
+        # a number rather than an error -- refuse it instead.
+        if needs_prompt and not prompt:
+            pytest.fail(
+                f"{case.id}: clip_score/image_reward need the case prompt, got {prompt!r}"
+            )
+
+        scores = compute_quality_scores(
+            image=image_bytes_to_numpy(content),
+            prompt=prompt or "",
+            thresholds=thresholds,
+        )
+        return scores, check_quality(scores=scores, thresholds=thresholds)
+
+    def _validate_quality(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> QualityScores:
+        scores, failures = self._score_quality(case, content)
+        logger.info("[Quality] %s: %s", case.id, format_quality_scores(scores))
+        if failures:
+            pytest.fail(
+                f"Quality check failed for {case.id}:\n  " + "\n  ".join(failures)
+            )
+        return scores
 
     def _validate_consistency(
         self,
@@ -1690,6 +1754,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     "audio consistency",
                     lambda: self._validate_audio_consistency(case, content),
                 )
+
+        if case.run_quality_check:
+            run_case_check(
+                "quality",
+                lambda: self._validate_quality(case, content),
+            )
 
         if case.run_lora_basic_api_check:
             run_case_check(
