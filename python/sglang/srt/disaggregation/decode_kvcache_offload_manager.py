@@ -22,12 +22,12 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
     get_serving,
 )
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -139,7 +139,7 @@ class DecodeKVCacheOffloadManager:
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
+                req, req.origin_input_ids[:prefill_offloaded_len]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
@@ -245,32 +245,9 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.effective_kv_committed_len()
-
-        # Prefill-aligned slots are freed only here, at request finish; freeing
-        # them mid-decode races with concurrent admission over live slots.
-        prefill_len = self._prefill_offloaded_len(req)
-        if prefill_len > 0:
-            prefill_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :prefill_len
-            ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = prefill_len
-        end = kv_committed_len
-        # Free the incremental part of the request (DSA-aware)
-        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
-
-        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
-        # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
-        if self.page_size > 1:
-            start_p = ceil_align(start_p, self.page_size)
-        if start_p < end_p:
-            overalloc_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, start_p:end_p
-            ]
-            self.token_to_kv_pool_allocator.free(overalloc_indices)
+        # Released only at request finish; a mid-decode free races with
+        # concurrent admission over live slots.
+        self.tree_cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
@@ -295,7 +272,7 @@ class DecodeKVCacheOffloadManager:
         self, req, host_indices, incremental_tokens, start_time, prior_hash
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
+        page_hashes = self._compute_prefix_hash(req, incremental_tokens, prior_hash)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
@@ -304,9 +281,10 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(self, tokens, prior_hash=""):
+    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
+        """Match prefill storage hashes."""
         page_hashes = []
-        last_hash = prior_hash
+        last_hash = prior_hash or storage_namespace_seed(req.extra_key, req.cache_salt)
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)

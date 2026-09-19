@@ -512,10 +512,10 @@ class HiSparseSpecSwapManager:
             mapping[canonical_locs[hot_mask]] = destination_locs[hot_mask]
             coordinator.req_device_buffer_tokens[
                 :, accept_req_indices[hot_mask], accept_positions[hot_mask]
-            ] = (accept_positions[hot_mask].to(torch.int32).unsqueeze(0))
+            ] = accept_positions[hot_mask].to(torch.int32).unsqueeze(0)
             coordinator.req_device_buffer_token_locs[
                 :, accept_req_indices[hot_mask], accept_positions[hot_mask]
-            ] = (destination_locs[hot_mask].to(torch.int32).unsqueeze(0))
+            ] = destination_locs[hot_mask].to(torch.int32).unsqueeze(0)
 
         mapping[canonical_locs[last_offsets]] = newest_locs
         coordinator.req_device_buffer_tokens[:, req_pool_indices, newest_columns] = (
@@ -1302,9 +1302,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1319,9 +1319,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"

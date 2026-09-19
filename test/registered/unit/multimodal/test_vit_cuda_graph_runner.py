@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
@@ -33,7 +33,7 @@ def _runner(*, use_data_parallel: bool) -> ViTCudaGraphRunner:
 def test_dp_vit_graph_capture_does_not_enter_tp_communication_capture():
     runner = _runner(use_data_parallel=True)
     with patch(
-        "sglang.srt.multimodal.vit_cuda_graph_runner.get_tp_group",
+        "sglang.srt.distributed.parallel_state.get_tp_group",
         side_effect=AssertionError("DP capture must be rank-local"),
     ):
         with runner._capture_context():
@@ -53,7 +53,7 @@ def test_non_dp_vit_graph_capture_uses_tp_communication_capture():
     group = SimpleNamespace(ca_comm=SimpleNamespace(capture=lambda: Capture()))
     runner = _runner(use_data_parallel=False)
     with patch(
-        "sglang.srt.multimodal.vit_cuda_graph_runner.get_tp_group", return_value=group
+        "sglang.srt.distributed.parallel_state.get_tp_group", return_value=group
     ):
         with runner._capture_context():
             pass

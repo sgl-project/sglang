@@ -14,7 +14,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMmProcessConfigValidation(CustomTestCase):
@@ -74,6 +74,21 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
+
+    def _patch_platform(self, cuda_alike, device_type):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        return patch.multiple(
+            "sglang.srt.multimodal.processors.base_processor",
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=platforms,
+        )
 
     def _make_processor(
         self,
@@ -210,11 +225,22 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         9.30 -> 4.02 req/s on GB300 for full-page images."""
         from transformers import BaseImageProcessor
 
-        proc = self._make_processor(
-            {}, image_processor=MagicMock(spec=BaseImageProcessor)
-        )
+        with self._patch_platform(cuda_alike=True, device_type="cuda"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_non_accelerator_fast_processor_gets_two_workers(self):
+        from transformers import BaseImageProcessor
+
+        with self._patch_platform(cuda_alike=False, device_type="custom"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
 
     def test_explicit_request_overrides_the_path_decision(self):
         """The server argument wins: an operator who measured their own workload
@@ -240,7 +266,10 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+        with (
+            patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3),
+            self._patch_platform(cuda_alike=True, device_type="cuda"),
+        ):
             proc = self._make_processor(
                 {}, image_processor=MagicMock(spec=BaseImageProcessor)
             )

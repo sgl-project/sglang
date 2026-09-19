@@ -125,7 +125,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
 
 class ResolvedConfidence(msgspec.Struct):
-
     confidence: torch.Tensor
     generation: torch.Tensor
 
@@ -169,7 +168,6 @@ class RelayPayload:
 
 
 class ConfidenceRelay(msgspec.Struct):
-
     device: torch.device
     req_pool_size: int
     pool: Any

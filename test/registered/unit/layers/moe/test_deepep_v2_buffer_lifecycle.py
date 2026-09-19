@@ -10,7 +10,7 @@ from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeGroup:
@@ -144,6 +144,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         impl = object.__new__(deepep_v2._DeepEPv2Impl)
         impl.num_max_dispatch_tokens_per_rank = 4
         impl.hidden_size = 128
+        impl.activation_scale_block_size = 128
         impl.router_topk = 2
         impl._validate_common(torch.empty(4, 128), torch.zeros(4, 2))
         with self.assertRaisesRegex(ValueError, "per-rank buffer capacity"):

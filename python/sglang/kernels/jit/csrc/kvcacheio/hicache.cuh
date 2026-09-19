@@ -3,6 +3,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
@@ -207,11 +208,16 @@ SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const __grid_constant__ Hicac
     const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
     const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
     const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
-    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    // Both loads are issued before either store: the compiler cannot prove
+    // dst_k and src_v disjoint, so it will not hoist the V load on its own.
+    std::decay_t<decltype(vec_k)> vec_v;
     if constexpr (!kIsMLA) {
       const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+      vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+    }
+    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    if constexpr (!kIsMLA) {
       const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-      const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
       store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
     }
   }
@@ -252,13 +258,18 @@ SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const __grid_constant__ Hicac
       const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
       const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
       const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
-      store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+      // Both loads are issued before either store: the compiler cannot prove
+      // dst_k and src_v disjoint, so it will not hoist the V load on its own.
+      std::decay_t<decltype(vec_k)> vec_v;
       if constexpr (!kIsMLA) {
         const auto v_cache_src = static_cast<const src_ptr_t*>(v_ptr_src)[layer];
-        const auto v_cache_dst = static_cast<const dst_ptr_t*>(v_ptr_dst)[layer];
         const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+        vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+      }
+      store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+      if constexpr (!kIsMLA) {
+        const auto v_cache_dst = static_cast<const dst_ptr_t*>(v_ptr_dst)[layer];
         const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-        const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
         store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
       }
     }
@@ -318,17 +329,17 @@ struct HiCacheKernel {
     const auto element_bytes = D.unwrap() * dtype_size;
     RuntimeCheck(kElementSize == element_bytes, "HicacheKernel: cache dimension mismatch.");
 
-    const auto k_cache_dst_ptr = k_cache_dst.data_ptr();
-    const auto v_cache_dst_ptr = v_cache_dst.data_ptr();
-    const auto k_cache_src_ptr = k_cache_src.data_ptr();
-    const auto v_cache_src_ptr = v_cache_src.data_ptr();
+    const auto device = indices_device.unwrap();
+    const auto k_cache_dst_ptr = runtime::get_device_accessible_ptr(k_cache_dst);
+    const auto v_cache_dst_ptr = runtime::get_device_accessible_ptr(v_cache_dst);
+    const auto k_cache_src_ptr = runtime::get_device_accessible_ptr(k_cache_src);
+    const auto v_cache_src_ptr = runtime::get_device_accessible_ptr(v_cache_src);
     const auto indices_dst_ptr = indices_dst.data_ptr();
     const auto indices_src_ptr = indices_src.data_ptr();
     const auto length = static_cast<uint32_t>(L.unwrap());
     const auto kv_cache_src_stride = static_cast<int64_t>(N.unwrap() * dtype_size);
     const auto kv_cache_dst_stride = static_cast<int64_t>(M.unwrap() * dtype_size);
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
-    const auto device = indices_device.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
@@ -440,15 +451,15 @@ struct HiCacheKernel {
     const auto element_bytes = D.unwrap() * dtype_size;
     RuntimeCheck(kElementSize == element_bytes, "HicacheKernel MLA: cache dimension mismatch.");
 
-    const auto cache_dst_ptr = cache_dst.data_ptr();
-    const auto cache_src_ptr = cache_src.data_ptr();
+    const auto device = indices_device.unwrap();
+    const auto cache_dst_ptr = runtime::get_device_accessible_ptr(cache_dst);
+    const auto cache_src_ptr = runtime::get_device_accessible_ptr(cache_src);
     const auto indices_dst_ptr = indices_dst.data_ptr();
     const auto indices_src_ptr = indices_src.data_ptr();
     const auto length = static_cast<uint32_t>(L.unwrap());
     const auto cache_src_stride = static_cast<int64_t>(N.unwrap() * dtype_size);
     const auto cache_dst_stride = static_cast<int64_t>(M.unwrap() * dtype_size);
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
-    const auto device = indices_device.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
