@@ -17,6 +17,11 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import get_schema_properties
 
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:  # pragma: no cover - jsonschema is a hard dependency of the server
+    Draft202012Validator = None
+
 logger = logging.getLogger(__name__)
 
 _KIMI_K2_SPECIAL_TOKENS = [
@@ -52,6 +57,13 @@ class KimiK2Detector(BaseFormatDetector):
     ```
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
+
+    Format Structure (client-style id — model copies an id shape it saw in the
+    conversation history, e.g. ``call_3``, ``call_<hex>``, ``toolu_01...``):
+    ```
+    <|tool_call_begin|>{client_id}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    ```
+    In the last two cases the function name is inferred from the arguments.
 
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
@@ -95,6 +107,8 @@ class KimiK2Detector(BaseFormatDetector):
 
         Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
         Bare counter:    "3" → call_index=3, infer name from arguments.
+        Anything else:   "call_3", "toolu_01..." → call_index=0, infer name
+                         from arguments (see ``_resolve_function_name``).
 
         The bare counter is a conversation-level auto-increment, NOT an index
         into the tools list. The function name is inferred by matching argument
@@ -104,21 +118,36 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name"), int(m.group("index"))
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            call_index = int(function_id)
-            name = self._infer_tool_name(tools, function_args)
-            if name:
-                return name, call_index
-            return None, call_index
-
-        logger.warning("Unexpected tool_call_id format: %s", function_id)
-        return None, 0
+        call_index = (
+            int(function_id)
+            if self.tool_call_id_counter_regex.match(function_id)
+            else 0
+        )
+        name = self._resolve_function_name(function_id, tools, function_args)
+        if name is None:
+            logger.warning(
+                "Could not resolve a tool name for tool_call_id %r; dropping the call",
+                function_id,
+            )
+        return name, call_index
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
-        """Infer function name when the model omits it (bare counter ID).
+        """Infer the function name when the tool_call_id does not carry one
+        (bare counter or client-style id).
 
-        Matches argument keys against tool parameter schemas, preferring the
-        tool whose declared properties best match the actual arguments.
+        With a single tool the answer is unambiguous. Otherwise the arguments
+        must be a JSON object that exactly one tool accepts, where "accepts"
+        means: the object validates against the tool's ``parameters`` schema
+        (Draft 2020-12, the same validator the request path uses), and it
+        carries no key the schema does not declare unless the schema explicitly
+        allows additional properties. The second rule is an inference policy
+        on top of JSON Schema, whose default for undeclared keys is "allowed":
+        a tool schema almost never means to accept arbitrary keys, and a model
+        that hallucinated one should not be matched to a tool on the rest.
+
+        Zero or several candidates return ``None`` so the caller drops the
+        call instead of guessing; a wrong guess would hand the client an
+        executable call to a tool the model did not choose.
         """
         if not tools:
             return None
@@ -132,30 +161,66 @@ class KimiK2Detector(BaseFormatDetector):
             return None
 
         try:
-            arg_keys = set(json.loads(function_args).keys())
+            args = json.loads(function_args)
         except (json.JSONDecodeError, TypeError):
             logger.debug(
                 "Could not parse function_args for tool name inference "
                 "(may be partial JSON in streaming)"
             )
             return None
+        if not isinstance(args, dict):
+            return None
+        arg_keys = set(args)
 
-        # Pick the tool whose properties best match the argument keys.
-        best_name = None
-        best_score = -1
+        candidates = []
         for tool in tools:
-            params = tool.function.parameters or {}
-            props = set(get_schema_properties(params).keys())
-            if not props:
-                continue
-            overlap = len(arg_keys & props)
-            extra = len(arg_keys - props)
-            score = overlap - extra
-            if score > best_score:
-                best_score = score
-                best_name = tool.function.name
+            if self._schema_accepts_arguments(tool.function.parameters, args, arg_keys):
+                candidates.append(tool.function.name)
 
-        return best_name
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            logger.warning(
+                "Tool name inference is ambiguous: arguments with keys %s satisfy %s",
+                sorted(arg_keys),
+                candidates,
+            )
+        return None
+
+    @staticmethod
+    def _schema_accepts_arguments(schema, args: dict, arg_keys: set) -> bool:
+        """Whether ``args`` is a plausible argument object for ``schema``.
+
+        Boolean schemas are legal (``true`` accepts anything, ``false``
+        nothing); a missing schema behaves like ``true``.
+        """
+        if schema is None or schema is True:
+            schema = {}
+        if schema is False or not isinstance(schema, dict):
+            return False
+
+        if Draft202012Validator is not None:
+            try:
+                if not Draft202012Validator(schema).is_valid(args):
+                    return False
+            except Exception:  # malformed schema: fall back to the key policy
+                logger.debug(
+                    "Could not validate arguments against tool schema", exc_info=True
+                )
+
+        props = set(get_schema_properties(schema).keys())
+        required = schema.get("required")
+        required = set(required) & props if isinstance(required, list) else set()
+        if not required <= arg_keys:
+            return False
+        extra_allowed = schema.get("additionalProperties")
+        if (
+            arg_keys <= props
+            or extra_allowed is True
+            or isinstance(extra_allowed, dict)
+        ):
+            return True
+        return False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -272,10 +337,11 @@ class KimiK2Detector(BaseFormatDetector):
                 # Resolve function name (cached across chunks within a section).
                 name_just_resolved = False
                 if self._current_stream_function_name is None:
+                    # Name inference needs the complete argument object, so
+                    # until the end marker arrives only ids that carry a name
+                    # (or a single-tool request) can resolve.
                     args_for_inference = (
-                        buffer[args_start:end_idx]
-                        if end_idx != -1
-                        else buffer[args_start:]
+                        buffer[args_start:end_idx] if end_idx != -1 else None
                     )
                     resolved = self._resolve_function_name(
                         function_id, tools, args_for_inference
@@ -285,7 +351,8 @@ class KimiK2Detector(BaseFormatDetector):
                             # Wait for the end marker before deciding.
                             break
                         logger.warning(
-                            "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
+                            "Kimi-K2 could not resolve a tool name for "
+                            "tool_call_id %r; skipping section.",
                             function_id,
                         )
                         self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
@@ -401,7 +468,16 @@ class KimiK2Detector(BaseFormatDetector):
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
     ) -> Optional[str]:
-        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown."""
+        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown.
+
+        Only the standard ``functions.{name}:{index}`` form carries the name.
+        Every other id shape falls back to inferring the name from the
+        arguments. Besides the bare counter, this covers client-style ids
+        (``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs): the chat template
+        renders history ``tool_call.id`` values verbatim, so when a client
+        rewrites the ids SGLang returned, the model copies that style on its
+        next call. The call itself is well-formed; only the id is foreign.
+        """
         if not function_id:
             return self._infer_tool_name(tools, function_args)
 
@@ -409,10 +485,14 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name")
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            return self._infer_tool_name(tools, function_args)
-
-        return None
+        if function_args is not None and not self.tool_call_id_counter_regex.match(
+            function_id
+        ):
+            logger.debug(
+                "Non-standard tool_call_id %r; inferring tool name from arguments",
+                function_id,
+            )
+        return self._infer_tool_name(tools, function_args)
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
