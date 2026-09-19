@@ -150,6 +150,14 @@ class StreamingSession(BasePrefixCache):
     def has_slot(self, session_id: str) -> bool:
         return session_id in self.slots
 
+    def get_session_kv(self, req: Req):
+        """Return reusable session KV without mutating the incoming request."""
+        session = req.session
+        if session is None or not session.streaming or req.to_finish is not None:
+            return None
+        slot = self.slots.get(session.session_id)
+        return slot.kv if slot is not None and slot.kv.holds_kv else None
+
     def any_holding_kv(self) -> bool:
         return any(s.kv.holds_kv for s in self.slots.values())
 
