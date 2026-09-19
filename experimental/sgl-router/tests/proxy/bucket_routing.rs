@@ -11,8 +11,8 @@ use axum::http::{Request, StatusCode};
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
     AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig, CachePrefixProvider,
-    Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, RouterInflightLoadConfig, ServerConfig, SessionAffinityMode,
+    Config, DiscoveryBackend, InflightLoadConfig, KvIndexerEndpointConfig, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -77,7 +77,7 @@ fn build_app_context(
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        router_inflight_load: RouterInflightLoadConfig::default(),
+        inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

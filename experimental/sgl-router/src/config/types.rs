@@ -11,7 +11,7 @@ pub struct Config {
     /// Discovery mode resolved from CLI options; static URLs are checked by [`Config::validate`].
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
-    pub router_inflight_load: RouterInflightLoadConfig,
+    pub inflight_load: InflightLoadConfig,
 }
 
 /// Outbound request timeout settings.
@@ -35,7 +35,7 @@ impl Default for ProxyConfig {
 
 /// Request-tracking timeout; defaults above the proxy timeout.
 #[derive(Debug, Clone, Copy)]
-pub struct RouterInflightLoadConfig {
+pub struct InflightLoadConfig {
     /// Maximum request-entry lifetime before cancellation with 504 `stale_request_expired`.
     pub stale_request_timeout_secs: u64,
 }
@@ -44,7 +44,7 @@ pub fn default_stale_request_timeout_secs() -> u64 {
     600
 }
 
-impl Default for RouterInflightLoadConfig {
+impl Default for InflightLoadConfig {
     fn default() -> Self {
         Self {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
