@@ -9,8 +9,10 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
 use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::active_load::MockClock;
-use sgl_router::state::load_monitor::engine_load::{EngineLoadTable, EngineWorkerLoad, LoadStat};
+use sgl_router::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadTable, EngineReportedWorkerLoad, LoadStat,
+};
+use sgl_router::state::load_monitor::router_inflight_load::MockClock;
 use sgl_router::state::AffinityStore;
 use sgl_router::workers::Worker;
 
@@ -37,7 +39,7 @@ fn request(model: &ModelId) -> PickRequest<'_> {
 fn policy() -> (SessionAwarePolicy, Arc<AffinityStore>) {
     let store = AffinityStore::new(Duration::from_secs(60));
     (
-        SessionAwarePolicy::new(store.clone(), EngineLoadTable::new()),
+        SessionAwarePolicy::new(store.clone(), EngineReportedLoadTable::new()),
         store,
     )
 }
@@ -54,7 +56,7 @@ impl EngineAdmission for Admission {
         &self,
         engine: &Worker,
         _: &PickRequest<'_>,
-        load: Option<&EngineWorkerLoad>,
+        load: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         self.calls
             .lock()
@@ -284,7 +286,7 @@ async fn empty_candidates_skip_admission_and_invalid_signals_never_bind() {
 #[tokio::test]
 async fn admission_receives_fresh_load_on_assignment_and_reuse() {
     let store = AffinityStore::new(Duration::from_secs(60));
-    let table = EngineLoadTable::new();
+    let table = EngineReportedLoadTable::new();
     let mut policy = SessionAwarePolicy::new(store, table.clone());
     let admission = Arc::new(Admission::default());
     policy.admission = admission.clone();
@@ -316,7 +318,7 @@ async fn admission_receives_fresh_load_on_assignment_and_reuse() {
 async fn shared_store_refreshes_active_sessions_and_expires_idle_ones() {
     let clock = Arc::new(MockClock::new(Instant::now()));
     let store = AffinityStore::with_clock(Duration::from_secs(10), clock.clone());
-    let policy = SessionAwarePolicy::new(store.clone(), EngineLoadTable::new());
+    let policy = SessionAwarePolicy::new(store.clone(), EngineReportedLoadTable::new());
     let model = ModelId("m".into());
     let fleet = [engine("a", 0), engine("b", 9)];
     let hot = request(&model);
@@ -348,7 +350,7 @@ impl EngineAdmission for RacingAdmission {
         &self,
         engine: &Worker,
         request: &PickRequest<'_>,
-        _: Option<&EngineWorkerLoad>,
+        _: Option<&EngineReportedWorkerLoad>,
     ) -> Result<Decision, PickError> {
         self.calls.lock().unwrap().push(engine.id.0.clone());
         if engine.id.0 == "a" {
@@ -373,7 +375,7 @@ async fn concurrent_assignment_winner_is_checked_and_preserved_on_rejection() {
         let (mut policy, store) = policy();
         let engines = [engine("a", 0), engine("b", 9)];
         let admission = Arc::new(RacingAdmission {
-            competitor: SessionAwarePolicy::new(store.clone(), EngineLoadTable::new()),
+            competitor: SessionAwarePolicy::new(store.clone(), EngineReportedLoadTable::new()),
             winner: engines[1].clone(),
             reject_winner,
             calls: Mutex::new(Vec::new()),

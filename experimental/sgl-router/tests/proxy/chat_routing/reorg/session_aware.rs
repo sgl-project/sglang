@@ -7,7 +7,7 @@ use super::*;
 async fn session_aware_reuses_custom_header_binding_after_load_changes() {
     use sgl_router::config::AffinityConfig;
     use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
-    use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
     use sgl_router::state::AffinityStore;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -17,7 +17,7 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
     let store = AffinityStore::new(Duration::from_secs(60));
     let policy = Arc::new(SessionAwarePolicy::new(
         store.clone(),
-        EngineLoadTable::new(),
+        EngineReportedLoadTable::new(),
     ));
     let mut ctx = context(
         &[
@@ -56,14 +56,14 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
 async fn rejected_session_binding_advances_buckets_without_reassignment_or_dispatch() {
     use sgl_router::config::AffinityConfig;
     use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
-    use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
     use sgl_router::state::AffinityStore;
     use std::time::Duration;
 
     let primary = MockWorker::start(vec![]).await;
     let backup = MockWorker::start(vec![]).await;
     let store = AffinityStore::new(Duration::from_secs(60));
-    let table = EngineLoadTable::new();
+    let table = EngineReportedLoadTable::new();
     let mut rejected = SessionAwarePolicy::new(store.clone(), table.clone());
     rejected.admission = Arc::new(RejectAll);
     let accepted = SessionAwarePolicy::new(store.clone(), table.clone());

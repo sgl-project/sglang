@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use futures::future::BoxFuture;
 
-use crate::state::load_monitor::engine_load::{EngineLoadSnapshot, EngineLoadTable};
+use crate::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadSnapshot, EngineReportedLoadTable,
+};
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 
@@ -20,7 +22,7 @@ use super::{Pick, PickError, PickRequest, Policy, Rejection};
 #[derive(Debug)]
 pub struct SessionAwarePolicy {
     store: Arc<AffinityStore>,
-    engine_load: Arc<EngineLoadTable>,
+    engine_load: Arc<EngineReportedLoadTable>,
     fallback: PowerOfTwoPolicy,
     pub admission: Arc<dyn EngineAdmission>,
 }
@@ -29,7 +31,7 @@ impl SessionAwarePolicy {
     /// The caller owns the shared store's idle timeout and sweeper lifecycle.
     /// This policy implements bucket-scoped affinity, without legacy global modes
     /// or primary/backup pressure escape.
-    pub fn new(store: Arc<AffinityStore>, engine_load: Arc<EngineLoadTable>) -> Self {
+    pub fn new(store: Arc<AffinityStore>, engine_load: Arc<EngineReportedLoadTable>) -> Self {
         Self {
             store,
             fallback: PowerOfTwoPolicy::new(Arc::clone(&engine_load)),
@@ -57,7 +59,7 @@ impl SessionAwarePolicy {
         &self,
         engine: &Worker,
         request: &PickRequest<'_>,
-        load: &EngineLoadSnapshot,
+        load: &EngineReportedLoadSnapshot,
     ) -> Result<(), PickError> {
         match self
             .admission
