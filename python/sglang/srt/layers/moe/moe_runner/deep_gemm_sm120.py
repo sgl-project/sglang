@@ -195,4 +195,5 @@ def _pre_permute_standard_contig(
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
+        activation_scale_block_size=128,
     )

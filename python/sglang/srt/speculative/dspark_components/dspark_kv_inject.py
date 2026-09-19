@@ -121,6 +121,24 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
             )
+        elif (
+            cache_loc.is_cuda
+            and cache_loc.is_contiguous()
+            and commit_lens is not None
+            and cache_loc_2d is not None
+            and commit_lens.is_contiguous()
+            and cache_loc.numel() == cache_loc_2d.numel()
+        ):
+            from sglang.kernels.ops.speculative.dspark.commit_swa import (
+                committed_swa_locations,
+            )
+
+            swa_loc = committed_swa_locations(
+                cache_loc,
+                pool.full_to_swa_index_mapping,
+                commit_lens,
+                cache_loc_2d.shape[1],
+            )
         else:
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:

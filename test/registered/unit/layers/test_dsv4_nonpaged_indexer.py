@@ -531,5 +531,26 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
 
 
+class TestCandidateIndexerGating(CustomTestCase):
+    def test_candidate_indexer_gating(self):
+        from sglang.srt.layers.attention.dsv4 import candidate_indexer
+
+        def platform(sm):
+            return patch.object(
+                candidate_indexer, "get_platform", lambda: SimpleNamespace(device_sm=sm)
+            )
+
+        flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
+        # V4 models have no candidate source; Hopper selects through masks inline.
+        with platform(100), patch(flag, True):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
+        with platform(90), patch(flag, False):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
+        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
+        with platform(100), patch(flag, False):
+            with self.assertRaises(RuntimeError):
+                candidate_indexer.make_candidate_indexer(2048, 8)
+
+
 if __name__ == "__main__":
     unittest.main()
