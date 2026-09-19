@@ -10,6 +10,8 @@ pub mod affinity_store;
 pub mod engine_load;
 pub mod kv_events;
 pub mod load_view;
+pub mod prefix;
 
 pub use affinity_store::AffinityStore;
 pub use load_view::LoadView;
+pub use prefix::{PrefixMemo, PrefixSource};

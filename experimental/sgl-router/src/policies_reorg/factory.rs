@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 use crate::buckets_reorg::{Bucket, Pool, Pools, SloPreference, TokenLimits};
 use crate::config::{
@@ -14,17 +14,19 @@ use crate::config::{
     SessionAffinityMode, SloBucketPolicy, StickyFallbackKind,
 };
 use crate::discovery::WorkerId;
-use crate::state::AffinityStore;
+use crate::state::{AffinityStore, PrefixSource};
 
 use super::admission::{
     Admission, AllOf, Capacity, EngineAdmission, InFlightLimit, PendingPrefill,
 };
 use super::affinity::{AffinityKind, AffinityPolicy};
+use super::cache_aware::CacheAwarePolicy;
 use super::{least_load, power_of_two, random, round_robin, Policy};
 
 /// Shared services policies hold handles to.
 pub struct Dependencies {
     pub affinity: Arc<AffinityStore>,
+    pub prefix: Option<Arc<PrefixSource>>,
 }
 
 pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
@@ -61,7 +63,7 @@ pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
         config.map_or(SloBucketPolicy::Disabled, |c| c.ttft_slo_policy),
     )?;
     let session_mode = session_mode(model);
-    let global = model.policy == PolicyKind::Sticky
+    let global = matches!(model.policy, PolicyKind::Sticky | PolicyKind::CacheAware)
         || (model.policy == PolicyKind::SessionAware
             && session_mode != SessionAffinityMode::Bucket);
     if global && config.is_some() {
@@ -131,6 +133,14 @@ pub fn build_policy(
             session_mode(model) != SessionAffinityMode::Bucket,
             Arc::new(power_of_two::PowerOfTwoPolicy::default()),
         ),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy {
+            source: deps
+                .prefix
+                .clone()
+                .ok_or_else(|| anyhow!("--policy cache_aware needs a prefix source"))?,
+            admission,
+            config: model.affinity.clone().unwrap_or_default(),
+        }),
         PolicyKind::Sticky => {
             let fallback = match model.sticky.as_ref().map(|s| s.fallback_policy) {
                 None | Some(StickyFallbackKind::RoundRobin) => PolicyKind::RoundRobin,
@@ -198,6 +208,7 @@ mod tests {
     fn deps() -> Dependencies {
         Dependencies {
             affinity: AffinityStore::new(Duration::from_secs(60)),
+            prefix: None,
         }
     }
 

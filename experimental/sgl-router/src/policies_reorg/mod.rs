@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod affinity;
+pub mod cache_aware;
 pub mod factory;
 pub mod least_load;
 pub mod power_of_two;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::discovery::{ModelId, WorkerId};
-use crate::state::LoadView;
+use crate::state::{LoadView, PrefixMemo};
 use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
@@ -43,6 +44,8 @@ pub struct PickRequest<'a> {
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub token_ids: Option<&'a [u32]>,
+    /// Per-request prefix lookup shared across buckets; `None` looks up each time.
+    pub prefix: Option<&'a PrefixMemo>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
     pub load: &'a LoadView<'a>,
@@ -64,6 +67,7 @@ impl<'a> PickRequest<'a> {
             input_tokens,
             expected_peak_tokens: None,
             token_ids: None,
+            prefix: None,
             session_key: None,
             routing_key: None,
             load,
