@@ -5,21 +5,13 @@ import unittest
 
 import torch
 
-try:
-    from sglang.test.test_utils import CustomTestCase
-except ImportError:
-    CustomTestCase = unittest.TestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-
-    register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-except ImportError:
-    pass
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeParam:
-
     def __init__(self):
         self.loaded = []
 
@@ -28,7 +20,6 @@ class _FakeParam:
 
 
 class TestGlm5NextMTPWeightLoading(CustomTestCase):
-
     def test_mtp_layer_skipped_with_various_prefixes(self):
         """Verify that layers >= num_hidden_layers are skipped prefix-agnostically when is_nextn=False."""
         fake_param = _FakeParam()

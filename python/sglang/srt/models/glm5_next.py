@@ -1454,6 +1454,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 if num_nextn_layers > 0:
                     import re
+
                     match = re.search(r"layers\.(\d+)", name)
                     if match and int(match.group(1)) >= self.config.num_hidden_layers:
                         continue
