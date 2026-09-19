@@ -523,3 +523,78 @@ async fn invalid_policy_signal_stops_bucket_iteration() {
     assert!(later.calls.lock().unwrap().is_empty());
     assert!(worker.captured.lock().unwrap().last_body.is_none());
 }
+
+#[tokio::test]
+async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
+    use sgl_router::config::AffinityConfig;
+    use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
+    use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
+    use sgl_router::state::kv_events::{
+        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+    };
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+
+    let rejected = MockWorker::start(vec![]).await;
+    let owner = MockWorker::start(vec![]).await;
+    let cold = MockWorker::start(vec![]).await;
+    let value = body("hello world");
+    let config = config_for("");
+    let tokenizers = TokenizerRegistry::load_from_config(&config).unwrap();
+    let ids =
+        sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
+            .unwrap()
+            .ids;
+    let hashes = compute_block_hashes(&ids, 1);
+    let tree = Arc::new(HashTree::new());
+    for worker in [&rejected, &owner] {
+        tree.insert(&KvWorkerId::new(worker.url.clone(), 0), None, &hashes);
+    }
+    let oracle = BlockSizeOracle::new();
+    oracle.try_set(1).unwrap();
+    let source = Arc::new(CacheSource::Local(RadixTreePrefixProvider::new(
+        tree, oracle,
+    )));
+    let table = EngineReportedLoadTable::new();
+    let config = AffinityConfig {
+        cache_affinity_min_matched_tokens: Some(1),
+        ..Default::default()
+    };
+    let mut rejecting =
+        CacheAwarePolicy::new(source.clone(), table.clone(), config.clone()).unwrap();
+    rejecting.admission = Arc::new(RejectAll);
+    let mut first = Bucket::new(
+        "first",
+        BucketGroups::Plain(EngineGroup {
+            worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
+            policy: Arc::new(rejecting),
+        }),
+    );
+    first.rank = 0;
+    let mut second = Bucket::new(
+        "second",
+        BucketGroups::Plain(EngineGroup {
+            worker_ids: Some(
+                [WorkerId("owner".into()), WorkerId("cold".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+            policy: Arc::new(CacheAwarePolicy::new(source, table, config).unwrap()),
+        }),
+    );
+    second.rank = 1;
+    let ctx = context(
+        &[
+            ("rejected", Stage::Plain, &rejected),
+            ("owner", Stage::Plain, &owner),
+            ("cold", Stage::Plain, &cold),
+        ],
+        vec![first, second],
+    );
+    let app = build_router(ctx);
+    let response = app.oneshot(request(value)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(rejected.captured.lock().unwrap().last_body.is_none());
+    assert!(cold.captured.lock().unwrap().last_body.is_none());
+    assert!(owner.captured.lock().unwrap().last_body.is_some());
+}

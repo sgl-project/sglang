@@ -240,6 +240,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
     )]);
     let bucket = resolver.resolve(10, Some(20)).unwrap()[0];
     let request = BucketRequest {
+        prefix: None,
         model: &model,
         input_tokens: 10,
         expected_peak_tokens: Some(20),
@@ -406,6 +407,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         BucketGroups::Plain(group(&["b"], Arc::new(InspectRequest))),
     );
     let request = BucketRequest {
+        prefix: None,
         model: &model,
         input_tokens: 2,
         expected_peak_tokens: Some(12),
