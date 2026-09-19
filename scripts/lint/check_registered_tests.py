@@ -2,23 +2,12 @@
 """
 Pre-commit hook: validate CI registry calls under test/registered/.
 
-1. Every test file must contain a CI registry call (register_cuda_ci,
-   register_amd_ci, etc.).
-2. A CUDA test must register its suite via the modern
-   `stage=`/`runner_config=` form. The legacy single-string `suite=` is reserved
-   for the stress family (and for AMD/CPU/NPU suites); any other CUDA `suite=`
-   resolves to a name no workflow invokes, so the test silently never runs.
-   Two shapes are rejected:
-     a. `{stage}-test-{runner_config}` -- the modern name stuffed back into the
-        legacy form. Reported with the exact stage/runner split to use.
-     b. an older `{stage}-{runner_config}` PR-test name (e.g. the pre-migration
-        `base-b-kernel-unit-1-gpu-large`) -- no longer matches any workflow
-        suite at all.
-   The modern form resolves to the identical suite (CIRegistry.effective_suite
-   is f"{stage}-test-{runner_config}") and is /rerun-test-able.
+Catches the ways a test silently never runs: a missing registry call, a CUDA
+`suite=` no workflow invokes, and TestCase classes `__main__` never executes.
+Each ERROR states the exact fix.
 
-Reuses ut_parse_one_file() from ci_register.py (AST-based parsing)
-to match the same logic used by run_suite.py's collect_tests().
+Reuses ut_parse_one_file() from ci_register.py (AST-based parsing) to match
+run_suite.py's collect_tests().
 """
 
 import ast
@@ -29,26 +18,17 @@ import re
 import subprocess
 import sys
 
-# Suite names of the form `{stage}-test-{runner_config}` are exactly what the
-# modern stage=/runner_config= form produces, so a legacy suite= carrying this
-# shape is always expressible (and should be expressed) the modern way.
+# Exactly what stage=/runner_config= produces, so a legacy suite= of this shape
+# is always expressible the modern way.
 _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 
-# The only CUDA suite family still allowed on the legacy single-string `suite=`
-# form. Anything else needs stage=/runner_config=, or its effective_suite matches
-# no suite any workflow invokes and the test silently never runs.
+# The only CUDA family still allowed on legacy `suite=`; anything else resolves
+# to a suite no workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-# Unit tests are the one tree with a structural contract: they cover a single
-# srt module, so they mirror python/sglang/srt/. Every other directory under
-# test/registered/ groups by topic and is free-form -- what a test costs, which
-# stage gates it and which runner it needs are declared by its registry call,
-# not by where the file sits.
 _UNIT_ROOT = "unit"
 _KERNEL_ROOT = "kernels"
 
-# Singular spelling of the kernel root. It is a typo for _KERNEL_ROOT, not a
-# topic of its own, and silently lands the file outside the kernel suites.
 _KERNEL_ROOT_TYPO = "kernel"
 
 
@@ -132,7 +112,6 @@ def _contains_call(tree: ast.AST, name: str) -> bool:
 
 
 def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
-    """Validate the structural contract for a newly admitted path."""
 
     parts = path.split("/")
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
@@ -154,7 +133,6 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
             "test/registered/kernels/{ops,benchmark}/<group>/"
         ]
     if relative_parts[0] != _UNIT_ROOT:
-        # Topic directory: the registry call already declares cost and placement.
         return []
 
     errors = []
@@ -206,7 +184,6 @@ def main() -> int:
         try:
             registries, _has_main_entry = ci_register.ut_parse_one_file(f)
         except Exception:
-            # Skip files that can't be parsed (syntax errors, etc.)
             continue
         if len(registries) == 0:
             missing.append(f)
