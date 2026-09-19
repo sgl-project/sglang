@@ -253,21 +253,21 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._submit_store(req, req.get_fill_ids())
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
     ) -> None:
         if not is_insert:
             self.release_aborted_request(req.cache_request_handle)
         else:
-            self._publish_external_loaded_prefix(req, token_ids_len=kv_len_to_handle)
+            self._publish_external_loaded_prefix(req, token_ids_len=owned_kv_len)
         super().cache_finished_req(
             req,
             is_insert=is_insert,
-            kv_len_to_handle=kv_len_to_handle,
+            owned_kv_len=owned_kv_len,
             **kwargs,
         )
         self._retire_loaded_flow(req.rid)
         if is_insert:
-            token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
             self._submit_store(req, token_ids)
             self._request_session_finish(req.rid)
 
