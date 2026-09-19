@@ -9,9 +9,8 @@ use sgl_router::buckets_reorg::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
-use sgl_router::policies_reorg::{
-    Pick, PickContext, PickError, PickRequest, Policy, Rejection, Stage,
-};
+use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
+use sgl_router::state::load_monitor::engine_load::EngineWorkerLoad;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug)]
@@ -36,11 +35,10 @@ impl Default for TestPolicy {
 }
 
 impl Policy for TestPolicy {
-    fn pick_with_context<'a>(
+    fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
-        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(request.bucket.to_owned());
@@ -54,7 +52,7 @@ impl Policy for TestPolicy {
                 return Err(PickError::NoCandidates);
             }
             let engine = self.result.clone().unwrap_or_else(|| engines[0].clone());
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, context)? {
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, None)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
@@ -76,7 +74,7 @@ impl EngineAdmission for Reject {
         &self,
         engine: &Worker,
         _: &PickRequest<'_>,
-        _: &PickContext,
+        _: Option<&EngineWorkerLoad>,
     ) -> Result<Decision, PickError> {
         Ok(if engine.id.0 == self.0 {
             Decision::Reject("full".into())
@@ -379,11 +377,10 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
     struct InspectRequest;
 
     impl Policy for InspectRequest {
-        fn pick_with_context<'a>(
+        fn pick<'a>(
             &'a self,
             engines: &'a [Arc<Worker>],
             request: &'a PickRequest<'a>,
-            _context: &'a PickContext,
         ) -> BoxFuture<'a, Result<Pick, PickError>> {
             Box::pin(async move {
                 assert_eq!(request.model.0, "m");
@@ -439,7 +436,7 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
             &self,
             engine: &Worker,
             _: &PickRequest<'_>,
-            _: &PickContext,
+            _: Option<&EngineWorkerLoad>,
         ) -> Result<Decision, PickError> {
             self.calls.lock().unwrap().push(engine.id.clone());
             if self.invalid {
