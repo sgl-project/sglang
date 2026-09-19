@@ -11,7 +11,7 @@ use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressu
 use crate::state::load_monitor::engine_load::EngineLoadTable;
 use crate::workers::Worker;
 
-use super::admission::{AdmissionConfig, AdmissionState, Decision, EngineAdmission};
+use super::admission::{AllowAll, Decision, EngineAdmission};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
 /// Samples two distinct engines and selects the one with lower stage pressure.
@@ -28,7 +28,7 @@ impl PowerOfTwoPolicy {
     pub fn new(engine_load: Arc<EngineLoadTable>) -> Self {
         Self {
             engine_load,
-            admission: Arc::new(AdmissionConfig::default()),
+            admission: Arc::new(AllowAll),
             fallback: None,
         }
     }
@@ -65,8 +65,8 @@ impl Policy for PowerOfTwoPolicy {
                     Arc::clone(if pressure.is_gt() { right } else { left })
                 }
             };
-            let state = AdmissionState::from_snapshot(&load, &engine);
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, state)? {
+            let engine_load = load.fresh_load_for_url(&engine.url);
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, engine_load)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,

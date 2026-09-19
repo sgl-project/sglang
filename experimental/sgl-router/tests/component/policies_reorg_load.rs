@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{AdmissionState, Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_load::{EngineLoadTable, LoadStat};
+use sgl_router::state::load_monitor::engine_load::{EngineLoadTable, EngineWorkerLoad, LoadStat};
 use sgl_router::workers::Worker;
 
 const URL: &str = "http://engine";
@@ -41,7 +41,7 @@ fn engine() -> Arc<Worker> {
 #[derive(Debug)]
 struct ObserveAdmission {
     table: Arc<EngineLoadTable>,
-    observations: Mutex<Vec<AdmissionState>>,
+    observations: Mutex<Vec<Option<EngineWorkerLoad>>>,
 }
 
 impl EngineAdmission for ObserveAdmission {
@@ -49,13 +49,13 @@ impl EngineAdmission for ObserveAdmission {
         &self,
         engine: &Worker,
         _: &PickRequest<'_>,
-        state: AdmissionState,
+        load: Option<&EngineWorkerLoad>,
     ) -> Result<Decision, PickError> {
         assert_eq!(engine.url, URL);
         // A new report arriving after selection must not change the observation
         // supplied to admission. The next pick should read the new report.
         report(&self.table, 0, 99, Instant::now());
-        self.observations.lock().unwrap().push(state);
+        self.observations.lock().unwrap().push(load.cloned());
         Ok(Decision::Allow)
     }
 }
@@ -95,12 +95,15 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
     assert_eq!(observations.len(), 2);
     assert_eq!(
         observations[0],
-        AdmissionState {
-            running_requests: Some(4),
-            kv_tokens: None,
-        }
+        Some(EngineWorkerLoad {
+            num_running_reqs: 4,
+            num_waiting_reqs: 4,
+            num_tokens: 60,
+            max_total_num_tokens: 200,
+            captured_at: first_at,
+        })
     );
-    assert_eq!(observations[1].running_requests, Some(102));
+    assert_eq!(observations[1].as_ref().unwrap().num_running_reqs, 102);
 }
 
 #[tokio::test]
@@ -128,10 +131,6 @@ async fn missing_stale_and_incomplete_reports_reach_admission_as_unknown() {
             .pick(&[engine()], &PickRequest::new(&model, Stage::Plain, 10))
             .await
             .unwrap();
-        assert_eq!(
-            *admission.observations.lock().unwrap(),
-            [AdmissionState::default()],
-            "{case}"
-        );
+        assert_eq!(*admission.observations.lock().unwrap(), [None], "{case}");
     }
 }
