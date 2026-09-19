@@ -95,7 +95,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -643,8 +642,8 @@ def get_amdgpu_memory_capacity():
 
 
 def _get_device_sm_via_nvml() -> Optional[int]:
-    """Compute capability of torch device 0 from NVML, leaving torch.cuda
-    uninitialized. None when NVML cannot answer; the caller falls back."""
+    # Compute capability of torch device 0, read while torch.cuda stays
+    # uninitialized; None when NVML cannot answer and the caller falls back.
     try:
         import pynvml
     except ImportError:
@@ -1918,6 +1917,8 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor

@@ -172,9 +172,7 @@ class _FakePynvml:
 
 class TestGetDeviceSmViaNvml(CustomTestCase):
     """The torch ordinal and the NVML index differ under CUDA_VISIBLE_DEVICES
-    and MIG, so the helper maps one to the other through a private torch API.
-    When that mapping is unavailable it must return None and let the caller
-    fall back to torch, not report whatever physical GPU 0 happens to be."""
+    and MIG; without that mapping the helper must return None, not GPU 0."""
 
     def test_torch_exposes_the_mapping_api(self):
         # The cases below install the private attribute themselves, so they stay
