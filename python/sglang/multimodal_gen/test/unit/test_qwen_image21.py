@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
+    Qwen3VLVisionRotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21RMS_norm,
@@ -98,6 +101,9 @@ def test_encoder_component_offload_preserves_loaded_dtypes(monkeypatch):
     encoder = torch.nn.Module()
     encoder.model = torch.nn.Module()
     encoder.model.visual = torch.nn.Module()
+    encoder.model.visual.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(36)
+    with torch.device("cuda"):
+        expected_rope = Qwen3VLVisionRotaryEmbedding(36)(64)
     encoder.register_parameter(
         "embedding", torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
     )
@@ -125,6 +131,9 @@ def test_encoder_component_offload_preserves_loaded_dtypes(monkeypatch):
         assert encoder.weight.dtype == torch.float8_e4m3fn
         assert encoder.inv_freq.dtype == torch.float32
         torch.testing.assert_close(encoder.inv_freq.cpu(), frequencies, atol=0, rtol=0)
+        torch.testing.assert_close(
+            encoder.model.visual.rotary_pos_emb(64), expected_rope, atol=0, rtol=0
+        )
         assert torch.equal(encoder.weight.view(torch.uint8).cpu(), weight_bytes)
         strategy.finish_use(encoder, use, state)
         torch.cuda.synchronize()
