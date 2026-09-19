@@ -130,6 +130,10 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
 
 # Parameters for a session
 class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        return msgspec_struct_pydantic_core_schema(cls, handler)
+
     # The session identifier. Used by the scheduler to look up or create the
     # Session object that groups all requests in a multi-turn conversation.
     id: Optional[str] = None
@@ -2225,6 +2229,8 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
+    # Assigned by the tokenizer for this open, shared across scheduler ranks.
+    session_incarnation: Optional[str] = None
 
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
@@ -2234,6 +2240,23 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool
+
+
+class SessionRoutingReqInput(BaseReq, kw_only=True):
+    session_params: SessionParams
+    dp_rank: int
+    # None inspects ownership only; [] restores a history-only prompt.
+    input_ids: Optional[List[int]] = None
+    query_id: str = ""
+
+
+class SessionRoutingReqOutput(BaseReq, kw_only=True):
+    query_id: str
+    dp_rank: int
+    session_incarnation: Optional[str] = None
+    input_ids: Optional[List[int]] = None
+    engine_processed_input: bool = False
+    error: Optional[str] = None
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):

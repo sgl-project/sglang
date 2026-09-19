@@ -139,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
+    SessionRoutingReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
@@ -861,6 +862,12 @@ async def server_info():
                         server_args.disaggregation_mode in ("prefill", "decode")
                         and server_args.disaggregation_transfer_backend
                         in ("nixl", "mooncake")
+                    ),
+                    # Read-only session ownership/history snapshots. This does
+                    # not advertise generation fencing or P/D session support.
+                    "session_routing_version": int(
+                        server_args.disaggregation_mode == "null"
+                        and not server_args.enable_dp_attention
                     ),
                 }
                 if _global_state.tokenizer_manager.request_lifecycle is not None
@@ -1766,6 +1773,31 @@ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Req
         return session_id
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/session_routing")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_routing(
+    obj: Annotated[SessionRoutingReqInput, Body()], request: Request
+):
+    """Read scheduler-owned session history without generating or mutating a turn.
+
+    The snapshot is advisory: it does not reserve the session or authorize a
+    later generation. Callers must retain and fence their own session owner.
+    """
+    _get_request_lifecycle(request)
+    try:
+        result = await _global_state.tokenizer_manager.session_routing(obj)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except asyncio.TimeoutError as error:
+        raise HTTPException(503, "session scheduler did not answer") from error
+    status = (
+        200
+        if result.error is None
+        else (404 if result.session_incarnation is None else 409)
+    )
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])

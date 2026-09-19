@@ -173,6 +173,8 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionRoutingReqInput,
+    SessionRoutingReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -1762,6 +1764,7 @@ class Scheduler(
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
+                (SessionRoutingReqInput, self.session_routing),
                 (CloseSessionReqInput, self.close_session),
                 (
                     UpdateWeightFromDiskReqInput,
@@ -5850,6 +5853,35 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def session_routing(self, recv_req: SessionRoutingReqInput):
+        # The control broadcast reaches every scheduler; only the requested
+        # DP rank's first TP/PP/CP process replies, identified by query_id.
+        if (
+            recv_req.dp_rank != (self.ps.dp_rank or 0)
+            or self.ps.pp_rank != 0
+            or self.ps.tp_rank != 0
+            or self.ps.attn_cp_rank != 0
+        ):
+            return None
+        output = SessionRoutingReqOutput(
+            query_id=recv_req.query_id, dp_rank=recv_req.dp_rank
+        )
+        session = self.session_controller.get(recv_req.session_params.id)
+        if session is None or session.close_on_finish or session.is_timed_out():
+            output.error = "session is missing, closing or expired"
+            return output
+        output.session_incarnation = session.incarnation
+        if recv_req.input_ids is not None:
+            try:
+                output.input_ids, output.engine_processed_input = (
+                    session.routing_input_ids(
+                        recv_req.session_params, recv_req.input_ids, self.tokenizer
+                    )
+                )
+            except ValueError as error:
+                output.error = str(error)
+        return output
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

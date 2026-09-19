@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -13,7 +14,14 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints import http_server
-from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput
+from sglang.srt.managers import tokenizer_control_mixin
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    GenerateReqInput,
+    SessionParams,
+    SessionRoutingReqInput,
+    SessionRoutingReqOutput,
+)
 from sglang.srt.managers.request_lifecycle import RequestLifecycle
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -30,6 +38,44 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
         self.manager._lifecycle_tasks = {}
         self.attempt = uuid.uuid4().hex
         self.manager.request_lifecycle.claim(self.attempt, "null")
+
+    async def test_session_routing_cancelled_query_cannot_capture_a_later_reply(self):
+        manager = self.manager
+        manager.session_routing_futures = {}
+        manager.elastic_worker_count = 2
+        manager.auto_create_handle_loop = Mock()
+        manager._dispatch_to_scheduler = Mock()
+
+        def query():
+            return SessionRoutingReqInput(
+                session_params=SessionParams(id="s"), dp_rank=1
+            )
+
+        with patch.object(
+            tokenizer_control_mixin,
+            "get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=False),
+        ):
+            first = asyncio.create_task(manager.session_routing(query()))
+            await asyncio.sleep(0)
+            first_id = manager._dispatch_to_scheduler.call_args.args[0].query_id
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertEqual(manager.session_routing_futures, {})
+            second = asyncio.create_task(manager.session_routing(query()))
+            await asyncio.sleep(0)
+            second_id = manager._dispatch_to_scheduler.call_args.args[0].query_id
+            manager._handle_session_routing_output(
+                SessionRoutingReqOutput(query_id=first_id, dp_rank=1)
+            )
+            self.assertFalse(second.done())
+            reply = SessionRoutingReqOutput(
+                query_id=second_id, dp_rank=1, session_incarnation="new"
+            )
+            manager._handle_session_routing_output(reply)
+            self.assertIs(await second, reply)
+            self.assertEqual(manager.session_routing_futures, {})
 
     async def test_invalid_json_is_terminal_without_entering_generation(self):
         app = FastAPI()
