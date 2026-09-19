@@ -6,11 +6,10 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::state::load_monitor::engine_load::EngineLoadTable;
-use crate::state::LoadView;
 use crate::workers::Worker;
 
 use super::admission::Admission;
-use super::{Pick, PickError, PickRequest, Policy};
+use super::{Pick, PickContext, PickError, PickRequest, Policy};
 
 /// Samples two candidates and keeps the one under lower stage load.
 #[derive(Debug)]
@@ -32,14 +31,15 @@ impl PowerOfTwoPolicy {
 }
 
 impl Policy for PowerOfTwoPolicy {
-    fn pick<'a>(
+    fn pick_with_context<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
+        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         Box::pin(async move {
-            let _load = LoadView::new(&self.engine_load);
-            let _admitted = self.admission.before(engines, request)?;
+            let _admitted = self.admission.before(engines, request, context)?;
+            let _load = context.load(&self.engine_load);
             todo!("sample two admitted engines and compare load for request.stage")
         })
     }

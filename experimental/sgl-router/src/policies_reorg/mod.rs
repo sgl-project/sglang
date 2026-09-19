@@ -5,7 +5,10 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod context;
 pub mod power_of_two;
+
+pub use context::PickContext;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -79,10 +82,26 @@ pub enum PickError {
 /// Implementations receive shared load, KV, and affinity handles at construction;
 /// they obtain their own observations rather than asking callers to supply them.
 pub trait Policy: Send + Sync + Debug {
+    /// Entry point for a fresh group attempt. Implement `pick_with_context` instead
+    /// of overriding this wrapper so observation lifetime stays local to the attempt.
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
+    ) -> BoxFuture<'a, Result<Pick, PickError>> {
+        Box::pin(async move {
+            let context = PickContext::default();
+            self.pick_with_context(engines, request, &context).await
+        })
+    }
+
+    /// Implement selection here, passing this context to admission and nested fallback.
+    /// Top-level calls use `pick` so every group attempt gets fresh observations.
+    fn pick_with_context<'a>(
+        &'a self,
+        engines: &'a [Arc<Worker>],
+        request: &'a PickRequest<'a>,
+        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
 
     /// Runs on a miss within the same candidates; never on an admission rejection.
@@ -90,13 +109,16 @@ pub trait Policy: Send + Sync + Debug {
         None
     }
 
+    /// Preserve the attempt's observations; calling the fallback's `pick` here
+    /// would incorrectly start a new observation context.
     fn pick_fallback<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
+        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         match self.fallback() {
-            Some(fallback) => fallback.pick(engines, request),
+            Some(fallback) => fallback.pick_with_context(engines, request, context),
             None => Box::pin(async { Err(PickError::NoCandidates) }),
         }
     }

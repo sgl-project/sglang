@@ -9,7 +9,7 @@ use sgl_router::buckets_reorg::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
-use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use sgl_router::policies_reorg::{Pick, PickContext, PickError, PickRequest, Policy, Stage};
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug, Default)]
@@ -22,10 +22,11 @@ struct TestPolicy {
 }
 
 impl Policy for TestPolicy {
-    fn pick<'a>(
+    fn pick_with_context<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
+        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(request.bucket.to_owned());
@@ -35,7 +36,7 @@ impl Policy for TestPolicy {
             if self.miss {
                 return Err(PickError::NoCandidates);
             }
-            let admitted = self.admission.before(engines, request)?;
+            let admitted = self.admission.before(engines, request, context)?;
             let engine = self.result.clone().unwrap_or_else(|| admitted[0].clone());
             self.admission.after(
                 Pick {
@@ -43,6 +44,7 @@ impl Policy for TestPolicy {
                     reason: "test",
                 },
                 request,
+                context,
             )
         })
     }
@@ -52,7 +54,12 @@ impl Policy for TestPolicy {
 struct Reject(&'static str);
 
 impl EngineAdmission for Reject {
-    fn check(&self, engine: &Worker, _: &PickRequest<'_>) -> Result<Decision, PickError> {
+    fn check(
+        &self,
+        engine: &Worker,
+        _: &PickRequest<'_>,
+        _: &PickContext,
+    ) -> Result<Decision, PickError> {
         Ok(if engine.id.0 == self.0 {
             Decision::Reject("full".into())
         } else {
@@ -370,10 +377,11 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
     struct InspectRequest;
 
     impl Policy for InspectRequest {
-        fn pick<'a>(
+        fn pick_with_context<'a>(
             &'a self,
             engines: &'a [Arc<Worker>],
             request: &'a PickRequest<'a>,
+            _context: &'a PickContext,
         ) -> BoxFuture<'a, Result<Pick, PickError>> {
             Box::pin(async move {
                 assert_eq!(request.model.0, "m");

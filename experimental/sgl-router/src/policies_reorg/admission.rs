@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::workers::Worker;
 
-use super::{Pick, PickError, PickRequest, Rejection};
+use super::{Pick, PickContext, PickError, PickRequest, Rejection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -14,15 +14,27 @@ pub enum Decision {
     Reject(String),
 }
 
+/// Checks use their injected state handles with the policy's observation context.
+/// Reuse that context for every candidate and for after-selection checks.
 pub trait EngineAdmission: Send + Sync + Debug {
-    fn check(&self, engine: &Worker, request: &PickRequest<'_>) -> Result<Decision, PickError>;
+    fn check(
+        &self,
+        engine: &Worker,
+        request: &PickRequest<'_>,
+        context: &PickContext,
+    ) -> Result<Decision, PickError>;
 }
 
 #[derive(Debug)]
 pub struct AllowAll;
 
 impl EngineAdmission for AllowAll {
-    fn check(&self, _: &Worker, _: &PickRequest<'_>) -> Result<Decision, PickError> {
+    fn check(
+        &self,
+        _: &Worker,
+        _: &PickRequest<'_>,
+        _: &PickContext,
+    ) -> Result<Decision, PickError> {
         Ok(Decision::Allow)
     }
 }
@@ -55,6 +67,7 @@ impl Admission {
         &self,
         engines: &[Arc<Worker>],
         request: &PickRequest<'_>,
+        context: &PickContext,
     ) -> Result<Vec<Arc<Worker>>, PickError> {
         if engines.is_empty() {
             return Err(PickError::NoCandidates);
@@ -65,7 +78,7 @@ impl Admission {
         let mut admitted = Vec::new();
         let mut rejected = Vec::new();
         for engine in engines {
-            match self.check.check(engine, request)? {
+            match self.check.check(engine, request, context)? {
                 Decision::Allow => admitted.push(engine.clone()),
                 Decision::Reject(reason) => rejected.push(Rejection {
                     engine: engine.id.clone(),
@@ -81,9 +94,14 @@ impl Admission {
     }
 
     /// Checks the chosen engine under `AfterSelection`; never picks a replacement.
-    pub fn after(&self, pick: Pick, request: &PickRequest<'_>) -> Result<Pick, PickError> {
+    pub fn after(
+        &self,
+        pick: Pick,
+        request: &PickRequest<'_>,
+        context: &PickContext,
+    ) -> Result<Pick, PickError> {
         if self.placement == Placement::AfterSelection {
-            if let Decision::Reject(reason) = self.check.check(&pick.engine, request)? {
+            if let Decision::Reject(reason) = self.check.check(&pick.engine, request, context)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: pick.engine.id.clone(),
                     reason,
