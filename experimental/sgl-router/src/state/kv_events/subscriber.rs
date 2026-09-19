@@ -7,7 +7,7 @@
 //! consumed by [`super::index::KvEventIndex`]. Each `(worker_url, dp_rank)`
 //! pair gets its own SUB socket on its own tokio task, decodes msgpack frames
 //! by [`SubKind`] (KV batches via [`super::wire`], load via
-//! [`crate::policies::engine_load`]), and forwards [`WorkerEvent`]s to a
+//! [`crate::state::engine_load`]), and forwards [`WorkerEvent`]s to a
 //! shared mpsc channel.
 //!
 //! # Wire format (3-frame multipart)
@@ -72,7 +72,7 @@ use zeromq::{Socket, SocketRecv, SubSocket, ZmqMessage};
 use super::discovery::EventConfig;
 use super::tree::KvWorkerId;
 use super::wire::{decode_event_batch, KvEventBatch};
-use crate::policies::engine_load::{decode_load_stat, LoadStat};
+use crate::state::engine_load::{decode_load_stat, LoadStat};
 
 /// Maximum number of consecutive `recv()` errors before the subscriber
 /// gives up and exits its task. ZMQ's internal reconnect handles transient
@@ -665,7 +665,7 @@ mod tests {
     use tokio::time::timeout;
     use zeromq::{Endpoint, PubSocket, Socket, SocketSend, ZmqMessage};
 
-    use crate::policies::kv_events::wire::KvCacheEvent;
+    use crate::state::kv_events::wire::KvCacheEvent;
 
     mod helpers {
         use super::*;

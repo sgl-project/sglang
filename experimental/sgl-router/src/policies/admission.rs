@@ -17,9 +17,9 @@
 //! fleet reads below the floor, the request pins to the least-pressured
 //! prefix owner instead of cold-prefilling on a non-owner.
 
-use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::policies::power_of_two::select_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::state::engine_load::{EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;

@@ -12,15 +12,13 @@
 //! and the idlest at 1.0, so every assertion below holds either way.
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
-use sgl_router::policies::kv_events::{
-    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
-};
 use sgl_router::policies::load_based::LoadBasedPolicy;
 use sgl_router::policies::scoring::{
     prefix_cache::PrefixCachePolicy, FusedScorePolicy, ScorePolicy,
 };
 use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::state::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
 use sgl_router::workers::Worker;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
