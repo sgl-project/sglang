@@ -41,6 +41,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
 )
 from sglang.benchmark.datasets.image import (
     ImageDataset,
+    create_mm_data_row,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -277,6 +278,25 @@ class KimiK3Processor(DummyProcessor):
         self.media_call_count += 1
         text_len = len(self.tokenizer.encode(text))
         return {"input_ids": _DummyTokenTensor(text_len + 4 * len(medias))}
+
+
+class KimiK25Processor(DummyProcessor):
+    """K2.5 leaves media placeholders unexpanded in its HF input_ids."""
+
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.media_processor = SimpleNamespace(
+            media_tokens_calculator=lambda media: {
+                (224, 224): 64,
+                (448, 448): 256,
+                (315, 513): 228,
+            }[media["image"].size]
+        )
+
+    def __call__(self, text, medias=None, **kwargs):
+        if medias is None:
+            raise ValueError("Provide both medias and text")
+        return {"input_ids": _DummyTokenTensor(len(self.tokenizer.encode(text)))}
 
 
 class _FakeMMMUDataset:
@@ -639,6 +659,59 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(processor.media_call_count, 1)
         self.assertTrue(rows[0].image_data)
+
+    def test_kimi_k25_counts_expanded_images_and_chat_template(self):
+        self.tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": [
+                    "[MEDIA_BEGIN]",
+                    "[IMAGE]",
+                    "[MEDIA_END]",
+                ]
+            }
+        )
+        self.tokenizer.chat_template = (
+            "tok_2 {% for message in messages %}"
+            "{% if message['content'] is string %}{{ message['content'] }} "
+            "{% else %}{% for item in message['content'] %}"
+            "{% if item['type'] == 'text' %}{{ item['text'] }} "
+            "{% else %}[MEDIA_BEGIN] [IMAGE] [MEDIA_END] "
+            "{% endif %}{% endfor %}{% endif %}"
+            "{% endfor %}{% if add_generation_prompt %}tok_3{% endif %}"
+        )
+        processor = KimiK25Processor(self.tokenizer)
+        # Two text tokens plus the template's prefix and generation prompt.
+        text_tokens = 4
+        for backend in ("sglang", "sglang-oai-chat"):
+            # Vision counts include both boundary markers for each image.
+            for sizes, vision_tokens in (
+                ([], 0),
+                ([(224, 224)], 66),
+                ([(448, 448)], 258),
+                ([(315, 513)], 230),
+                ([(224, 224), (224, 224)], 132),
+                ([(224, 224), (448, 448)], 324),
+                ([(315, 513), (224, 224)], 296),
+            ):
+                with self.subTest(backend=backend, sizes=sizes):
+                    row = create_mm_data_row(
+                        "tok_0 tok_1",
+                        [Image.new("RGB", size) for size in sizes],
+                        ["data:image/png;base64,unused"] * len(sizes),
+                        8,
+                        processor,
+                        backend,
+                    )
+                    self.assertEqual(row.prompt_len, text_tokens + vision_tokens)
+                    self.assertEqual(row.text_prompt_len, text_tokens)
+                    self.assertEqual(row.vision_prompt_len, vision_tokens)
+                    if backend == "sglang":
+                        # The server, not the client, expands the sent placeholders.
+                        self.assertEqual(row.prompt.count("[IMAGE]"), len(sizes))
+                        self.assertEqual(row.prompt.count("[MEDIA_BEGIN]"), len(sizes))
+                        self.assertEqual(row.prompt.count("[MEDIA_END]"), len(sizes))
+                    else:
+                        self.assertEqual(row.prompt, "tok_0 tok_1")
 
     def test_image_sampler_random_resolution(self):
         state = np.random.get_state()
