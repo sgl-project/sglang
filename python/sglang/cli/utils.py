@@ -96,20 +96,39 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return False
 
 
-def try_get_model_path(extra_argv) -> str | None:
-    """Return a model path from command-line arguments when one is present."""
-
-    model_path = None
-    for i, arg in enumerate(extra_argv):
+def _scan_argv_for_model_path(argv) -> str | None:
+    for i, arg in enumerate(argv):
         if arg in ("--model-path", "--model"):
-            if i + 1 < len(extra_argv):
-                model_path = extra_argv[i + 1]
-                break
+            if i + 1 < len(argv):
+                return argv[i + 1]
         elif arg.startswith("--model-path=") or arg.startswith("--model="):
-            model_path = arg.split("=", 1)[1]
-            break
+            return arg.split("=", 1)[1]
 
-    return model_path
+    return None
+
+
+def try_get_model_path(extra_argv) -> str | None:
+    """Return a model path from command-line arguments when one is present.
+
+    Backend auto-detection runs before ``prepare_server_args`` merges a
+    ``--config`` YAML file into argv, so a model-path given only inside the
+    config file must be resolved here too, or detection sees no model path
+    at all (GH #36105).
+    """
+
+    model_path = _scan_argv_for_model_path(extra_argv)
+    if model_path is not None or "--config" not in extra_argv:
+        return model_path
+
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+    try:
+        merged_argv = ConfigArgumentMerger().merge_config_with_args(list(extra_argv))
+    except ValueError:
+        # Malformed --config usage; defer to the real parser's error message.
+        return None
+
+    return _scan_argv_for_model_path(merged_argv)
 
 
 def get_model_path(extra_argv):
