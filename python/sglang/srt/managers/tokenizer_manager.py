@@ -2050,14 +2050,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "many threads to send them one by one with parallel sampling (n > 1)."
                 )
 
+            disaggregated = self.disaggregation_mode != DisaggregationMode.NULL
+            if disaggregated:
+                rooms = [room for room in obj.bootstrap_room if room is not None]
+                if len(rooms) != len(set(rooms)):
+                    raise ValueError("Parallel sample bootstrap room ranges overlap")
+                if any(room < 0 or room >= 1 << 63 for room in rooms):
+                    raise ValueError("Bootstrap rooms must fit a nonnegative int64")
+
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
+            # Local warmups request zero output tokens. Decode can finish these
+            # without a transfer, while prefill clamps them to one output token.
+            # In P/D, let the actual samples populate the prefill cache instead.
+            for i in range(batch_size if not disaggregated else 0):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2081,9 +2091,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    if disaggregated:
+                        # Both stages receive the same normalized request, so
+                        # each prompt/sample pair rendezvous in the same room.
+                        room = obj.bootstrap_room[i + sample * batch_size]
+                        tmp_obj.bootstrap_room = tokenized_obj.bootstrap_room = room
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)

@@ -854,7 +854,13 @@ class GenerateReqInput:
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
         elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            # Each prompt's room starts a range for its parallel samples. Keep
+            # the same sample-major layout as the other normalized inputs.
+            self.bootstrap_room = [
+                room + sample if room is not None else None
+                for sample in range(self.parallel_sample_num)
+                for room in self.bootstrap_room
+            ]
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:

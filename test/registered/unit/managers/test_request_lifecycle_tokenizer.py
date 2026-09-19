@@ -95,11 +95,25 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(legacy.matches(req) for req in (a, b, reused)))
 
     async def test_batch_sampling_tracks_only_executed_children(self):
+        for mode, rooms, expected in (
+            (DisaggregationMode.NULL, None, [None] * 8),
+            (DisaggregationMode.PREFILL, 100, [100, 102, 104, 101, 103, 105]),
+            (DisaggregationMode.DECODE, 100, [100, 102, 104, 101, 103, 105]),
+            (DisaggregationMode.PREFILL, [100, 200], [100, 101, 102, 200, 201, 202]),
+            (DisaggregationMode.DECODE, [100, 200], [100, 101, 102, 200, 201, 202]),
+        ):
+            with self.subTest(mode=mode, rooms=rooms):
+                self.setUp()
+                self.manager.disaggregation_mode = mode
+                await self._check_sampling_children(rooms, expected)
+
+    async def _check_sampling_children(self, rooms, expected):
         manager = self.manager
         obj = GenerateReqInput(
             input_ids=[[1, 2], [3, 4]],
             sampling_params={"n": 3, "max_new_tokens": 1},
             rid="native",
+            bootstrap_room=rooms,
         )
         obj._lifecycle_attempt_id = self.attempt
         obj.normalize_batch_and_arguments()
@@ -116,9 +130,13 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
                 sampling_params=SimpleNamespace(max_new_tokens=1),
                 mm_inputs=None,
                 stream=False,
+                bootstrap_room=item.bootstrap_room,
             )
 
+        dispatched_rooms = []
+
         async def send(item):
+            dispatched_rooms.append(item.bootstrap_room)
             manager._prepare_lifecycle_dispatch(item)
             manager.request_lifecycle.scheduler_event(item.lifecycle_id, 0, "prefill")
             manager.request_lifecycle.scheduler_event(item.lifecycle_id, 0, "terminal")
@@ -134,13 +152,31 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
         result = await generator.__anext__()
         await generator.aclose()
         self.assertEqual(len(result), 6)
+        self.assertEqual(dispatched_rooms, expected)
         self.assertEqual(manager.rid_to_state, {})
         snapshot = manager.request_lifecycle.snapshot(self.attempt)
         self.assertTrue(snapshot["terminal"])
-        self.assertEqual(len(snapshot["children"]), 8)
+        self.assertEqual(len(snapshot["children"]), len(expected))
         self.assertEqual(
-            sum(child["kind"] == "warmup" for child in snapshot["children"]), 2
+            sum(child["kind"] == "warmup" for child in snapshot["children"]),
+            len(expected) - 6,
         )
+
+    async def test_invalid_parallel_rooms_rejected_before_dispatch(self):
+        self.manager.disaggregation_mode = DisaggregationMode.PREFILL
+        self.manager._send_one_request = Mock(side_effect=AssertionError("dispatched"))
+        for rooms, message in (([100, 101], "overlap"), (2**63 - 2, "int64")):
+            with self.subTest(rooms=rooms):
+                obj = GenerateReqInput(
+                    input_ids=[[1, 2], [3, 4]],
+                    sampling_params={"n": 3},
+                    bootstrap_room=rooms,
+                )
+                obj.normalize_batch_and_arguments()
+                generator = self.manager._handle_batch_request(obj)
+                with self.assertRaisesRegex(ValueError, message):
+                    await generator.__anext__()
+                await generator.aclose()
 
     def test_duplicate_batch_rejection_is_atomic(self):
         obj = GenerateReqInput(input_ids=[[1], [2]], rid=["a", "b"])
