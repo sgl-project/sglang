@@ -8,6 +8,9 @@ from typing import Any
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
+)
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -57,6 +60,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
+    reference_resize_mode: str = field(default="diffusers")
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -71,6 +75,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "output_mode",
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
+                "reference_resize_mode",
             }
         )
 
@@ -265,6 +270,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
             raise ValueError(
                 "MiniMax H3 scalar seed plus output index must fit the "
                 "signed int64 upper bound"
+            )
+        self.reference_resize_mode = str(self.reference_resize_mode).strip().lower()
+        if self.reference_resize_mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+            raise ValueError(
+                "reference_resize_mode must be one of {'match', 'max', 'diffusers'}, "
+                f"got {self.reference_resize_mode!r}"
             )
 
     def build_request_extra(self, *, _seed_override: int | None = None) -> dict:
