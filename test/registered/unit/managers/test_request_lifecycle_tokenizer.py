@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 from fastapi import FastAPI, Request
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
