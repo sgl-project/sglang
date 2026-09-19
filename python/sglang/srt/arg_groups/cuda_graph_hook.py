@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
+    ceil_align,
     is_cpu,
     is_mps,
     parse_connector_type,
@@ -531,12 +532,61 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
         )
 
 
+def apply_dp_attn_capture_alignment(server_args: Any):
+    """Align prefill CUDA graph capture sizes to attn_tp_size.
+
+    Under DP attention with attn_tp_size > 1, the DP gather path
+    (_dp_gather_via_all_gather) calls reduce_scatter_tensor on the
+    attn_tp_group, which requires the per-rank token count to be
+    divisible by attn_tp_size. The eager path (prepare_mlp_sync_batch)
+    applies ceil_align, but the prefill CUDA graph capture path
+    (capture_prepare) does not. Align the capture bucket sizes here
+    so that capture and replay both use attn_tp_size-aligned counts.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_dp_attention:
+        return
+
+    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
+    if attn_dp_size == 0:
+        return
+    attn_tp_size = cfg.tp_size // attn_dp_size
+    if attn_tp_size <= 1:
+        return
+
+    bs = cfg.cuda_graph_config.prefill.bs
+    if bs is None:
+        max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
+        bs = generate_prefill_cuda_graph_batch_sizes(max_bs)
+    aligned = sorted({ceil_align(b, attn_tp_size) for b in bs})
+    if aligned != sorted(bs):
+        logger.info(
+            "Prefill CUDA graph with DP attention (attn_tp_size=%d) "
+            "requires bucket sizes divisible by %d; aligning %s -> %s.",
+            attn_tp_size,
+            attn_tp_size,
+            sorted(bs),
+            aligned,
+        )
+        declare_resolution(
+            server_args,
+            "apply_dp_attn_capture_alignment",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config,
+                Phase.PREFILL,
+                bs=aligned,
+                max_bs=aligned[-1],
+            ),
+        )
+
+
 def handle_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
 
     parse_cuda_graph_config(server_args)
     apply_cuda_graph_compatibility(server_args)
     apply_deepep_adjustments(server_args)
+    apply_dp_attn_capture_alignment(server_args)
     apply_cuda_graph_disaggregation_roles(server_args)
     validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
