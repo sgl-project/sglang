@@ -2205,7 +2205,7 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_parallel().world_group.world_size > 1,
+            distributed=get_parallel().launch_world_size > 1,
             cpu_group=get_parallel().world_group.cpu_group,
         )
 
