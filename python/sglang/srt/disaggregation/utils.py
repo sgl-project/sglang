@@ -181,7 +181,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
-            elif decode_req.req.return_logprob:
+            elif decode_req.req.return_logprob or decode_req.req.return_hidden_states:
                 polls[i] = int(decode_req.kv_receiver.poll_prefill_logprobs())
 
 

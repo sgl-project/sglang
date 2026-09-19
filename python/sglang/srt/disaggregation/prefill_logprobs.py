@@ -1,4 +1,4 @@
-"""Variable-sized prefill logprobs carried beside the P/D completion signal."""
+"""Variable-sized prefill metadata carried beside the P/D completion signal."""
 
 import msgspec
 import numpy as np
@@ -25,14 +25,18 @@ OUTPUT_FIELDS = (
 FIELDS = INPUT_FIELDS + OUTPUT_FIELDS
 
 
-def encode(logprob) -> bytes:
+def encode(logprob, *, hidden_states=None, version=1) -> bytes:
     values = [getattr(logprob, name) for name in FIELDS]
     for index in (6, 7):
         array = values[index]
         if array is not None:
             values[index] = (array.shape, array.tobytes())
+    if version == 2:
+        values.append(hidden_states)
     # Scheduler output logprobs may still contain CPU scalar tensors.
-    return msgspec.msgpack.encode((1, values), enc_hook=lambda value: value.tolist())
+    return msgspec.msgpack.encode(
+        (version, values), enc_hook=lambda value: value.tolist()
+    )
 
 
 def decode(payload: bytes) -> list | None:
@@ -40,12 +44,18 @@ def decode(payload: bytes) -> list | None:
     if message is None:
         return None
     version, values = message
-    if version != 1 or not isinstance(values, list) or len(values) != len(FIELDS):
+    if (
+        version not in (1, 2)
+        or not isinstance(values, list)
+        or len(values) != len(FIELDS) + (version == 2)
+    ):
         raise ValueError("Invalid P/D prompt logprob metadata")
     for index, dtype in ((6, np.float32), (7, np.int32)):
         if values[index] is not None:
             shape, data = values[index]
             values[index] = np.frombuffer(data, dtype=dtype).reshape(shape)
+    if version == 1:
+        values.append(None)
     return values
 
 
@@ -55,6 +65,8 @@ def restore_inputs(logprob, values: list) -> None:
 
 
 def append_output(logprob, values: list) -> None:
-    for name, value in zip(OUTPUT_FIELDS, values[len(INPUT_FIELDS) :], strict=True):
+    for name, value in zip(
+        OUTPUT_FIELDS, values[len(INPUT_FIELDS) : len(FIELDS)], strict=True
+    ):
         if value:
             getattr(logprob, name).extend(value)

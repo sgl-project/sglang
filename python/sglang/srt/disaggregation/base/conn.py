@@ -171,7 +171,7 @@ class BaseKVSender(ABC):
     def pop_decode_prefix_len(self) -> int:
         return 0
 
-    def set_prefill_logprobs(self, logprob) -> bool:
+    def set_prefill_logprobs(self, logprob, *, hidden_states=None) -> bool:
         """Optional variable-sized metadata, independent of fixed RDMA buffers."""
         return False
 

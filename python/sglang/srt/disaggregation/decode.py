@@ -1609,6 +1609,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.bootstrap_room, decode_req
                 )
             decode_req.kv_receiver.want_prefill_logprobs = decode_req.req.return_logprob
+            decode_req.kv_receiver.want_prefill_hidden_states = bool(
+                decode_req.req.return_hidden_states
+            )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -2265,11 +2268,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         metadata = (
             decode_req.kv_receiver.prefill_logprobs()
-            if decode_req.req.return_logprob
+            if decode_req.req.return_logprob or decode_req.req.return_hidden_states
             else None
         )
         if metadata is not None and not decode_req.is_rebootstrap:
-            prefill_logprobs.restore_inputs(decode_req.req.logprob, metadata)
+            if decode_req.req.return_logprob:
+                prefill_logprobs.restore_inputs(decode_req.req.logprob, metadata)
+            if decode_req.req.return_hidden_states and metadata[-1] is not None:
+                decode_req.req.hidden_states = metadata[-1]
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None

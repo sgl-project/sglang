@@ -3227,7 +3227,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
-                            b"1" if self.want_prefill_logprobs else b"0",
+                            self.prefill_metadata_version(bootstrap_info),
                         ]
                     )
             except zmq.ZMQError:
