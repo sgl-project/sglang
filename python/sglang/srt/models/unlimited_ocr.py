@@ -242,8 +242,10 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
         return images_in_this_batch
 
-    def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Process multimodal data items into concatenated vision features."""
+    def _process_image_input_batch(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> torch.Tensor:
+        """Process a batch of items whose local crop shapes are compatible."""
         target_dtype = self.vision_model.dtype
         has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
@@ -283,6 +285,20 @@ class UnlimitedOCRForCausalLM(nn.Module):
         )
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
         return vision_features
+
+    def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Process multimodal data items into concatenated vision features."""
+        crop_shapes = {tuple(item.images_crop.shape) for item in mm_items}
+        if len(crop_shapes) > 1:
+            # Local crop counts depend on the image aspect ratio. Keep items in
+            # their original order while avoiding a stack across incompatible
+            # crop tensors.
+            vision_feature_lists = [
+                self._process_image_input_batch([item]) for item in mm_items
+            ]
+            return torch.cat(vision_feature_lists, dim=0)
+
+        return self._process_image_input_batch(mm_items)
 
     def get_language_model(self) -> torch.nn.Module:
         """Return the underlying language model."""
