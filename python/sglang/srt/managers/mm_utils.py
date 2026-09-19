@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
 import os
 import pickle
 import sys
@@ -441,10 +442,19 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
+            pad_values = [item.pad_value for item in items]
+            if input_ids.device.type == "cuda":
+                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+                placeholder_cpu = torch.tensor(
+                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                placeholder_tensor = placeholder_cpu.to(
+                    input_ids.device, non_blocking=True
+                )
+            else:
+                placeholder_tensor = torch.as_tensor(
+                    pad_values, device=input_ids.device
+                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
@@ -736,7 +746,12 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
+            forward_batch.mm_input_embeds = (
+                input_embeds.clone()
+                if forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_eagle()
+                else input_embeds
+            )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
@@ -1294,10 +1309,28 @@ class ShmPointerMMData:
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
+        """Return independently writable storage, then release the SHM handle.
+
+        On Linux the tensor owns a private copy-on-write mapping. Reading the
+        pixels needs no clone, and writes remain local to this receiver just
+        as with the old clone. torch.frombuffer keeps the mapping alive until
+        the tensor and all derived views are released. Other platforms retain
+        the clone path.
+        """
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if sys.platform == "linux":
+                owned = mmap.mmap(
+                    self._shm_handle._fd,
+                    self.tensor.numel() * self.tensor.element_size(),
+                    access=mmap.ACCESS_COPY,
+                )
+                try:
+                    return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
+                except BaseException:
+                    owned.close()
+                    raise
             return self.tensor.clone()
         finally:
             self.close_and_unlink()
