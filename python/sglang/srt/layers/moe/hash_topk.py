@@ -19,12 +19,16 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _mask_topk_ids_padded_region_to_int64,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
+)
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_ppu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +300,10 @@ class HashTopK(nn.Module):
             )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        elif is_ppu() and topk_ids.dtype == torch.int32 and is_deepep_class_backend():
+            topk_ids = _mask_topk_ids_padded_region_to_int64(
+                topk_ids, num_token_non_padded
+            )
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
             if recorder_topk_ids is not None:

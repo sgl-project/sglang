@@ -103,7 +103,10 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -116,6 +119,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
     is_xpu,
 )
 
@@ -135,6 +139,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -1685,11 +1690,33 @@ def _zero_topk_weights_padded_region(
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
+def _mask_topk_ids_padded_region_to_int64(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mask padded rows then return int64 topk_ids.
+    On PPU with int32 input, fuses mask+cast in one kernel.
+    """
+    if (
+        num_token_non_padded is not None
+        and _is_ppu
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+    ):
+        from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
+
+        return mask_topk_ids_to_int64(topk_ids, num_token_non_padded)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids.to(torch.int64)
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids, expert_location_dispatch_info, num_token_non_padded, cast_to_int64=False
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    if cast_to_int64:
+        return _mask_topk_ids_padded_region_to_int64(topk_ids, num_token_non_padded)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -2280,6 +2307,10 @@ def _post_process_topk_ids(
         else:
             # A remap table indexed by -1 aliases its last entry, so only the
             # identity-remap branch may drop the padded-row mask.
+            # PPU + DeepEP: fuse int32->int64 cast into the mask kernel.
+            cast_to_int64 = (
+                _is_ppu and topk_ids.dtype == torch.int32 and is_deepep_class_backend()
+            )
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 expert_location_dispatch_info,
@@ -2288,6 +2319,7 @@ def _post_process_topk_ids(
                     if padded_rows_masked and expert_location_dispatch_info is None
                     else num_token_non_padded
                 ),
+                cast_to_int64=cast_to_int64,
             )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely

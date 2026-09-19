@@ -362,6 +362,32 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+
+        # Only Support for PPU fp8 channelwise.
+        if (
+            _is_ppu
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.float8_e4m3fn
+            and getattr(self.down_proj, "weight_scale", None) is not None
+            and self.down_proj.weight_scale.numel() == self.down_proj.weight.shape[1]
+        ):
+            from sglang.kernels.ops.elementwise.silu_mul_quant import (
+                silu_and_mul_post_per_token_quant_fp8,
+            )
+
+            M = gate_up.shape[0]
+            down_input_fp8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
+                gate_up, swiglu_limit=self.swiglu_limit
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (down_input_fp8, down_input_scale),
+                (self.down_proj.weight.t(), self.down_proj.weight_scale),
+                down_output,
+            )
+            return down_output
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).

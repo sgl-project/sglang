@@ -27,6 +27,9 @@ if get_device_sm() >= 89:
         sglang_per_token_quant_fp8,
     )
     from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+    from sglang.kernels.ops.elementwise.silu_mul_quant import (
+        silu_and_mul_post_quant_mxfp4,
+    )
 
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -500,38 +503,41 @@ def deep_moe_impl_fused(
             a, w1, out1, expert_ids, num_recv_tokens_per_expert
         )
 
-    if gemm1_alpha is not None:
-        out2 = swiglu_with_alpha_and_limit(
-            out1,
-            gemm1_alpha,
-            gemm1_limit,
-        )
-    elif gemm1_limit is not None:
-        out2 = _swiglu_silu_clamp_mul(out1, gemm1_limit)
+    if gemm1_alpha is None and gemm1_limit is None and use_mxfp4:
+        a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
-        if swiglu_limit is not None:
-            out1 = _apply_swiglu_limit(out1, swiglu_limit=swiglu_limit)
-        out2 = torch.empty(
-            (num_tokens_padded, N // 2),
-            device=hidden_states.device,
-            dtype=torch.bfloat16,
-        )
-        silu_and_mul(out1, out2)
-
-    if use_int8:
-        a, a_scale = per_token_quant_int8(out2)
-    elif use_fp8:
-        if per_channel_quant:
-            a, a_scale = sglang_per_token_quant_fp8(out2)
-        else:
-            a, a_scale = sglang_per_token_group_quant_fp8(
-                out2, block_k, column_major_scales=False
+        if gemm1_alpha is not None:
+            out2 = swiglu_with_alpha_and_limit(
+                out1,
+                gemm1_alpha,
+                gemm1_limit,
             )
-    elif use_mxfp4:
-        a, a_scale = downcast_to_mxfp4(out2, axis=1)
-    else:
-        a = out2
-        a_scale = None
+        elif gemm1_limit is not None:
+            out2 = _swiglu_silu_clamp_mul(out1, gemm1_limit)
+        else:
+            if swiglu_limit is not None:
+                out1 = _apply_swiglu_limit(out1, swiglu_limit=swiglu_limit)
+            out2 = torch.empty(
+                (num_tokens_padded, N // 2),
+                device=hidden_states.device,
+                dtype=torch.bfloat16,
+            )
+            silu_and_mul(out1, out2)
+
+        if use_int8:
+            a, a_scale = per_token_quant_int8(out2)
+        elif use_fp8:
+            if per_channel_quant:
+                a, a_scale = sglang_per_token_quant_fp8(out2)
+            else:
+                a, a_scale = sglang_per_token_group_quant_fp8(
+                    out2, block_k, column_major_scales=False
+                )
+        elif use_mxfp4:
+            a, a_scale = downcast_to_mxfp4(out2, axis=1)
+        else:
+            a = out2
+            a_scale = None
 
     if use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(

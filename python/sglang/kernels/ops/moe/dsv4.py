@@ -28,6 +28,15 @@ def _jit_mask_topk_module():
 
 
 @cache_once
+def _jit_mask_topk_cast_to_i64_module():
+    return load_jit(
+        make_name("mask_topk_cast_to_i64"),
+        cuda_files=["deepseek_v4/hash_topk.cuh"],
+        cuda_wrappers=[("run", "MaskCastInt64Kernel::run")],
+    )
+
+
+@cache_once
 def _jit_hash_topk_module():
     args = make_cpp_args("act_sqrt_softplus", is_arch_support_pdl())
     return load_jit(
@@ -109,6 +118,15 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
 
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
     return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
+def mask_topk_ids_to_int64(
+    topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> torch.Tensor:
+    """Fused (mask padded region + cast int32->int64) for EP dispatchers."""
+    out = torch.empty_like(topk_ids, dtype=torch.int64)
+    _jit_mask_topk_cast_to_i64_module().run(topk_ids, out, num_token_non_padded)
+    return out
 
 
 def hash_topk(
