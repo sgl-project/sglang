@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::buckets_reorg::BucketResolver;
 use crate::server::app_context::AppContext;
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
-use axum::Router;
+use axum::routing::{get, post, MethodRouter};
+use axum::{Extension, Router};
 use std::sync::Arc;
 
 /// Edge counters: `requests_total{route,method}` at entry (true intake, incl.
@@ -56,6 +57,20 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    build_router_with_chat(ctx, post(crate::server::routes::chat::chat_completions))
+}
+
+/// Mount the experimental handler with explicitly constructed buckets/policies.
+/// Used by integration tests until configuration-driven construction is available.
+pub fn build_router_with_new_policy(ctx: Arc<AppContext>, resolver: BucketResolver) -> Router {
+    build_router_with_chat(
+        ctx,
+        post(crate::server::routes::chat::chat_completions_with_new_policy)
+            .layer(Extension(Arc::new(resolver))),
+    )
+}
+
+fn build_router_with_chat(ctx: Arc<AppContext>, chat: MethodRouter<Arc<AppContext>>) -> Router {
     Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
@@ -74,8 +89,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         )
         .route(
             "/v1/chat/completions",
-            post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+            chat.layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(

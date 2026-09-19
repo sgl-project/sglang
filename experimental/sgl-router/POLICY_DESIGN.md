@@ -623,8 +623,30 @@ Selection metrics must not imply that dispatch or execution succeeded.
 
 ## Implementation status
 
-The series adds the side-by-side selection implementation in `src/buckets_reorg.rs` and
-`src/policies_reorg/`. The live `src/policies/` path still serves traffic.
+The series adds the side-by-side selection implementation in
+`src/buckets_reorg.rs` and `src/policies_reorg/`. The default router still serves
+traffic through the legacy policies.
+
+### HTTP integration testing
+
+`build_router_with_new_policy(ctx, resolver)` mounts
+`chat_completions_with_new_policy` at `/v1/chat/completions` with an explicitly
+constructed `BucketResolver`. Integration tests inject groups and real policy
+instances here. There is no runtime configuration switch yet.
+
+The alternate builder shares the normal routes, body limit, metrics, and HTTP
+lifetime middleware. The handler reuses `PreparedChatRequest` and
+`forward_chat_request`, including tokenization, sampling rules, P/D bootstrap
+injection, JSON/SSE forwarding, and request accounting. It builds one load view
+per stage and completes both PD selections before dispatch. It does not consult
+the legacy policy registry or fall back to a legacy selection on failure.
+
+`tests/proxy/new_policy_routing.rs` exercises power-of-two against live HTTP mock
+workers, including length matching, role separation, admission rejection,
+streaming cleanup, and invalid requests. New policies can use the same builder
+as they are implemented.
+
+### Selection implementation
 
 Implemented here:
 
@@ -650,8 +672,8 @@ Not yet implemented or wired in this path:
 - Affinity probes, session modes, prefix memoization, and cache-aware selection.
 - A unified load interpretation layer; power-of-two currently reuses the
   existing stage-specific load comparisons.
-- Request-handler wiring, PD compatibility filtering, retry integration, and
-  removal of the legacy path.
+- Production configuration/handler wiring, PD compatibility filtering, retry
+  integration, and removal of the legacy path.
 
 The preceding sections describe the target behavior for those follow-ups; they
 do not claim those capabilities are present in this PR.
