@@ -129,6 +129,44 @@ def test_decode_topk_small_num_blocks(seq_len):
         assert out[0, 0, :nb].tolist() == list(range(nb))
 
 
+@pytest.mark.parametrize("S", [4096, 4097, 8192, 8193, 16384])
+def test_decode_topk_register_buckets(S):
+    """Cover every register bucket, including both boundaries.
+
+    The radix path is instantiated per bucket (4096 / 8192 / 16384 rows), so a row
+    length that crosses a boundary selects a different instantiation. S=4096 is the
+    largest the other cases reach, which leaves the 8192 and 16384 instantiations
+    unexercised without this.
+    """
+    block_size, topk = 128, 16
+    H, B = 1, 1
+    torch.manual_seed(S)
+    score = torch.randn(H, B, S, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([S * block_size], device="cuda", dtype=torch.int32)
+
+    out = minimax_decode_topk(score, seq_lens, block_size, topk)
+    _check_contract(out, seq_lens, block_size, topk, S)
+    # Tie-robust: compare the selected scores, not the indices.
+    for got, want in zip(
+        _selected_scores_sorted(score, out),
+        _selected_scores_sorted(score, _ref(score, seq_lens, block_size, topk)),
+    ):
+        torch.testing.assert_close(got, want)
+    sel = out[0, 0]
+    sel = sel[sel >= 0]
+    assert torch.equal(sel, torch.sort(sel).values), f"not ascending: {sel}"
+
+
+def test_decode_topk_rejects_over_cap():
+    """Above the largest bucket the kernel must raise, not silently truncate."""
+    block_size, topk = 128, 16
+    S = 16385
+    score = torch.randn(1, 1, S, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([S * block_size], device="cuda", dtype=torch.int32)
+    with pytest.raises(Exception):
+        minimax_decode_topk(score, seq_lens, block_size, topk)
+
+
 def test_decode_topk_out_param():
     block_size = 128
     H, B, S, topk = 1, 4, 1024, 16
