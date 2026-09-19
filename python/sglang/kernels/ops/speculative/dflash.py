@@ -271,8 +271,18 @@ def _selector_walk_kernel(
             tl.float32
         )
         if greedy:
-            best = tl.max(scores, axis=0)
-            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            # Match torch.argmax (the reference walk's greedy selection): NaN
+            # counts as maximal, so a row with any NaN resolves to the first NaN.
+            # Otherwise take the first candidate that no other candidate
+            # strictly beats. Both cases are total over any row (a strict-beat
+            # relation always leaves some candidate unbeaten), so index < top_k
+            # and the walk never reads a neighbour's candidate row.
+            nan = scores != scores
+            has_nan = tl.sum(nan.to(tl.int32), axis=0) > 0
+            first_nan = tl.min(tl.where(nan, offsets, top_k), axis=0)
+            beaten = tl.sum((scores[None, :] > scores[:, None]).to(tl.int32), axis=1)
+            first_unbeaten = tl.min(tl.where(beaten == 0, offsets, top_k), axis=0)
+            index = tl.where(has_nan, first_nan, first_unbeaten)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
             scaled = scores / temperature
