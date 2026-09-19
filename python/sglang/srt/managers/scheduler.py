@@ -977,6 +977,14 @@ class Scheduler(
                     )
                 ]
 
+        # Encoder embeddings depend on the trailing separator token; preserve it
+        # when auto-truncating instead of head-slicing it off (embedding-only).
+        self._embedding_preserve_last_token_id = None
+        if not self.is_generation and self.tokenizer is not None:
+            self._embedding_preserve_last_token_id = getattr(
+                self.tokenizer, "sep_token_id", None
+            )
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)
@@ -3042,6 +3050,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -3506,6 +3515,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             self._add_request_to_queue(req)
