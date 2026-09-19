@@ -805,6 +805,40 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _norm_and_out_proj(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        z_shape_og: torch.Size,
+    ) -> torch.Tensor:
+        scheme = getattr(self.out_proj, "scheme", None)
+        prepare_input = getattr(scheme, "prepare_fused_rmsnorm_gated_input", None)
+        if (
+            prepare_input is not None
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+        ):
+            prequantized = prepare_input(
+                self.out_proj,
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                num_heads=self.num_v_heads // self.attn_tp_size,
+                activation=self.norm.activation,
+            )
+            if prequantized is not None:
+                output, _ = self.out_proj(prequantized)
+                return output
+
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -914,15 +948,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
-            *core_attn_out.shape[:-2],
-            core_attn_out.shape[-2] * core_attn_out.shape[-1],
-        )
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
+        return self._norm_and_out_proj(core_attn_out, z, z_shape_og)
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
