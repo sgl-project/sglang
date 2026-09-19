@@ -124,6 +124,11 @@ struct TopKRaggedParams {
   int32_t* __restrict__ topk_indices;
   int64_t score_stride;
   uint32_t topk;
+  // Optional [batch, *] per-block keep flags (kMasked kernels only): window
+  // position p of row b takes part iff block_mask[b * mask_stride + (p >> mask_bits)].
+  const uint8_t* __restrict__ block_mask;
+  int64_t mask_stride;
+  uint32_t mask_bits;
 };
 
 template <typename F>
@@ -199,7 +204,7 @@ SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const 
  *     reordering.
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
-template <bool kPDL>
+template <bool kPDL, bool kMasked = false>
 TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
@@ -210,11 +215,15 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   const auto row_start = params.row_starts == nullptr ? 0u : params.row_starts[bx];
   const auto topk = params.topk;
   const auto out = params.topk_indices + bx * static_cast<int64_t>(topk);
+  const uint8_t* mask = nullptr;
+  if constexpr (kMasked) mask = params.block_mask + bx * params.mask_stride;
 
   if (seq_len <= topk) {
     device::PDLWaitPrimary<kPDL>();
     for_each_item(topk, [&](uint32_t tx, uint32_t) {
-      out[tx] = tx < seq_len ? static_cast<int32_t>(tx) + offset : -1;  // note: need offset
+      bool keep = tx < seq_len;
+      if constexpr (kMasked) keep = keep && mask[tx >> params.mask_bits] != 0;
+      out[tx] = keep ? static_cast<int32_t>(tx) + offset : -1;  // note: need offset
     });
     return;
   }
@@ -238,14 +247,16 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
       .seq_len = seq_len + rem,
       .bias = broadcast(offset - static_cast<int32_t>(rem)),
       .input_start = broadcast(rem),
+      .mask = mask,
+      .mask_bits = params.mask_bits,
   };
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
   if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL>(problem, &smem);
+    Register2::forward<kPDL, kMasked>(problem, &smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL>(problem, &smem);
+    Register4::forward<kPDL, kMasked>(problem, &smem);
   } else {
-    Streaming::forward<kPDL>(problem, &smem);
+    Streaming::forward<kPDL, kMasked>(problem, &smem);
   }
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
@@ -733,7 +744,9 @@ struct TopKKernel {
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
       const tvm::ffi::TensorView out_offsets,
-      const tvm::ffi::TensorView topk_indices) {
+      const tvm::ffi::TensorView topk_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> block_mask,
+      const int64_t mask_bits) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -772,6 +785,25 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
+    const uint8_t* block_mask_ptr = nullptr;
+    int64_t mask_stride = 0;
+    if (block_mask.has_value()) {
+      auto M = SymbolicSize{"mask_width"};
+      auto MS = SymbolicSize{"mask_stride"};
+      TensorMatcher({B, M})  // block_mask
+          .with_strides({MS, 1})
+          .with_dtype<uint8_t>()
+          .with_device(device_)
+          .verify(block_mask.value());
+      RuntimeCheck(mask_bits >= 0 && mask_bits < 31, "mask_bits must be in [0, 31)");
+      // every window position of every row must have a flag
+      RuntimeCheck(
+          (M.unwrap() << mask_bits) >= L.unwrap(),
+          "block_mask must cover ceil(max_seq_len / 2^mask_bits) blocks per row");
+      block_mask_ptr = static_cast<const uint8_t*>(block_mask.value().data_ptr());
+      mask_stride = MS.unwrap();
+    }
+
     const auto params = TopKRaggedParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -780,10 +812,20 @@ struct TopKKernel {
         .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
         .score_stride = S.unwrap(),
         .topk = topk,
+        .block_mask = block_mask_ptr,
+        .mask_stride = mask_stride,
+        .mask_bits = static_cast<uint32_t>(mask_bits),
     };
-    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
-        .config({.use_pdl = kUsePDL})
-        .launch(topk_ragged_kernel<kUsePDL>, params);
+    const auto grid = static_cast<uint32_t>(B.unwrap());
+    if (block_mask_ptr != nullptr) {
+      LaunchKernel(grid, kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_ragged_kernel<kUsePDL, true>, params);
+    } else {
+      LaunchKernel(grid, kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_ragged_kernel<kUsePDL, false>, params);
+    }
   }
 };
 

@@ -68,6 +68,12 @@ def make_candidate_indexer(
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    # dense fp4 prefill: per request [rows_b, blocks] uint8 keep flags over blocks
+    # of `block_size` compressed positions, all the same width and consecutive
+    # row slices of one buffer, so a consumer hands them to the fused masked
+    # top-k as one [rows, blocks] tensor (`select_candidate_block_masks`)
+    block_masks: Optional[List[torch.Tensor]] = None
+    block_size: int = 0
 
 
 def published_masks(candidate) -> CandidateMasks:
@@ -89,6 +95,43 @@ def mask_topk_scores(
         (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
     )
     return indices.masked_fill(~valid, -1)
+
+
+def select_candidate_block_masks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+    *,
+    out: torch.Tensor,
+) -> None:
+    """The selection of :func:`select_candidate_blocks` (unreachable positions
+    at -inf) as ``uint8`` keep flags ``out[i, block]``, without the score copy,
+    the compare or the position mask: block keys in one pass, then the fused
+    ragged top-k over them. ``out`` is zeroed beforehand and one column wider
+    than the block count: rows with fewer than ``topk_blocks`` blocks park their
+    ``-1`` padding there. ``logits`` rows must be 32-byte aligned."""
+    from sglang.kernels.ops.attention.dsv4.candidate_table import amax8_varlen
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    assert block_size == 8, "amax8_varlen keys blocks of 8 positions"
+    rows, width = logits.shape
+    device = logits.device
+    spare = out.shape[1] - 1
+    nblocks = (compress_lens + (block_size - 1)) // block_size
+    # keys past a row's block count stay uninitialised: the top-k reads a row
+    # up to its block count only (v2 wants the stride a multiple of 4)
+    nblocks_max = (width + block_size - 1) // block_size
+    keys = logits.new_empty(rows, (nblocks_max + 3) // 4 * 4)
+    amax8_varlen(logits, compress_lens, out=keys)
+    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
+    topk_transform_ragged_v2(
+        keys,
+        nblocks,
+        out_offsets=torch.zeros(rows, dtype=torch.int32, device=device),
+        out_indices=blocks,
+    )
+    out.scatter_(1, blocks.masked_fill(blocks < 0, spare).to(torch.int64), 1)
 
 
 def select_candidate_blocks(

@@ -162,6 +162,8 @@ def topk_transform_ragged_v2(
     out_offsets: torch.Tensor,
     out_indices: torch.Tensor,
     row_starts: Optional[torch.Tensor] = None,
+    block_mask: Optional[torch.Tensor] = None,
+    block_size: int = 1,
 ) -> None:
     """Ragged (prefill) fused top-k for a contiguous-KV score matrix.
 
@@ -170,6 +172,14 @@ def topk_transform_ragged_v2(
     ``selected_position + out_offsets[i]`` into ``out_indices``, ``-1`` padded.
     With the production convention ``out_offsets == row_starts`` that is the
     column index itself, i.e. the token's slot in the batch's flattened KV.
+
+    ``block_mask`` (``[rows, >= ceil(max_seq_len / block_size)]`` bool/uint8,
+    rows contiguous) restricts row ``i`` to the window positions ``p`` with
+    ``block_mask[i, p // block_size]`` set, ``block_size`` a power of two. The
+    others rank below every score and are never selected: the result equals a
+    top-k over the window with them at ``-inf``, minus those ``-inf`` entries,
+    without materialising the masked scores. A slot the mask leaves unfilled
+    is ``-1``.
 
     Unlike :func:`topk_transform_paged_v2` this needs no page table and no plan
     (the cluster path only pays off for very few rows, and prefill has many).
@@ -180,6 +190,7 @@ def topk_transform_ragged_v2(
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
     if is_xpu():
+        assert block_mask is None, "block_mask is not supported on XPU"
         torch.ops.sgl_kernel.topk_transform_ragged(
             scores,
             seq_lens,
@@ -188,8 +199,16 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
+    mask_bits = 0
+    if block_mask is not None:
+        assert block_size > 0 and block_size & (block_size - 1) == 0, block_size
+        mask_bits = block_size.bit_length() - 1
+        if block_mask.dtype == torch.bool:
+            block_mask = block_mask.view(torch.uint8)
     module = _jit_topk_v2_module()
-    module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+    module.topk_transform_ragged(
+        scores, seq_lens, row_starts, out_offsets, out_indices, block_mask, mask_bits
+    )
 
 
 def topk_transform_paged_v2(

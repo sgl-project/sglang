@@ -465,5 +465,74 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
+# (start, length, kept blocks of 8) per row: one row per dispatch template, a
+# trivial row (length <= k) and a row whose mask leaves fewer than k positions.
+BLOCK_MASK_ROWS = [
+    (0, 300, 40),  # trivial: length <= 512, 40 * 8 = 320 >= length
+    (3, 3000, 128),  # Register2, unaligned window
+    (0, 12000, 300),  # Register4
+    (5, 40000, 1000),  # Streaming, unaligned window
+    (0, 200000, 2048),  # Streaming, the production candidate count
+    (2, 20000, 40),  # Streaming, 320 candidates < k: -1 fills the rest
+]
+
+
+def _block_mask_reference(window, keep_blocks, k):
+    """Positions of the top-k after the masked ones are -inf, minus the -inf ones."""
+    positions = keep_blocks.repeat_interleave(8)[: window.numel()]
+    masked = window.masked_fill(~positions, -torch.inf)
+    top = torch.topk(masked, min(k, window.numel()), sorted=False)
+    return top.indices[top.values > -torch.inf].cpu().tolist()
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@torch.inference_mode()
+def test_topk_v2_ragged_block_mask(k: int) -> None:
+    """A block keep-mask must select exactly what a -inf-masked top-k selects,
+    without touching the scores: masked positions never come out, and slots the
+    candidates cannot fill are -1."""
+    torch.manual_seed(1234 + k)
+    device = "cuda"
+    rows = [(s, n) for s, n, _ in BLOCK_MASK_ROWS]
+    scores, starts, lengths, offsets = _make_ragged(rows, 777, device)
+    blocks = max((n + 7) // 8 for _, n in rows)
+    keep = torch.zeros(len(rows), blocks, dtype=torch.bool, device=device)
+    for i, (_, n, kept) in enumerate(BLOCK_MASK_ROWS):
+        chosen = torch.randperm((n + 7) // 8, device=device)[:kept]
+        keep[i, chosen] = True
+    before = scores.clone()
+
+    out = torch.full((len(rows), k), -2, dtype=torch.int32, device=device)
+    topk_transform_ragged_v2(
+        scores,
+        lengths,
+        out_offsets=offsets,
+        out_indices=out,
+        row_starts=starts,
+        block_mask=keep,
+        block_size=8,
+    )
+    torch.cuda.synchronize()
+
+    off = offsets.cpu().tolist()
+    for i, (start, n, kept) in enumerate(BLOCK_MASK_ROWS):
+        window = before[i, start : start + n]
+        ref = set(_block_mask_reference(window, keep[i, : (n + 7) // 8], k))
+        row = out[i].cpu().tolist()
+        assert all(v == -1 or v - off[i] >= 0 for v in row), row[:8]
+        got = [v - off[i] for v in row if v != -1]
+        assert len(got) == len(set(got)) == len(ref), (i, len(got), len(ref))
+        more, less = set(got) - ref, ref - set(got)
+        if more or less:  # only equal-score ties may differ
+            mv = sorted(window[list(more)].tolist())
+            lv = sorted(window[list(less)].tolist())
+            assert mv == lv, (i, list(more)[:4], list(less)[:4])
+        positions = keep[i, : (n + 7) // 8].repeat_interleave(8)[:n]
+        assert positions[got].all(), f"row {i} selected a masked position"
+    # the window contents are not rewritten (only the alignment head may be)
+    for i, (start, n) in enumerate(rows):
+        assert torch.equal(scores[i, start : start + n], before[i, start : start + n])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
