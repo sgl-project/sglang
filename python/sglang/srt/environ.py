@@ -821,6 +821,10 @@ class Envs:
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     # ===================================================================
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    # Capacity of the per-scheduler belief table of pages already in L3 storage
+    # (entries across all pools, ~150-250 B each). It must outlive a page's L1+L2
+    # residency or the page is re-put on eviction instead of skipped.
+    SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = EnvInt(512 * 1024)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================
