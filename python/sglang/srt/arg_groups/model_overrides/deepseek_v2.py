@@ -82,6 +82,31 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
                     )
 
+        # HYV4 manages its attention scatter/gather at the model level: it has
+        # no LayerCommunicator, its layers keep the full padded sequence at
+        # every boundary, and models/hunyuan_v4.py calls
+        # self.mlp(hidden_states, forward_batch) on that full width. It is
+        # therefore the case --disable-attn-tp-gather exists for, and leaving
+        # the gather on is not merely slower, it is silently wrong:
+        # require_attn_tp_gather() is True on "an a2a backend is set" alone, so
+        # the scheduler derives num_token_non_padded as this attn-TP rank's
+        # sequence SHARD, and DeepseekV2MoE.forward_deepep hands that
+        # shard-local count to a full-width batch -- every row at or past it
+        # gets topk_ids = -1. Measured on tp8/ep8 with a 5-token prompt padded
+        # to 8: tokens_per_rank = 1, so ranks 0-4 computed row 0 only and ranks
+        # 5-7 returned exactly 0.0, i.e. one token in eight, with no error and
+        # fluent output. Declared unconditionally rather than gated on
+        # moe_a2a_backend/moe_dense_tp_size: it is a no-op whenever
+        # require_attn_tp_gather() would have returned False anyway, and those
+        # two have post-declaration writers (--enable-waterfill forces
+        # moe_a2a_backend=deepep in a post-process), so a gate here would let
+        # the wrong-output path back in.
+        overrides["disable_attn_tp_gather"] = True
+        logger.info(
+            "HYV4 keeps the full sequence at its MoE and consumes no "
+            "gathered_buffer: disabling attn_tp_gather."
+        )
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
