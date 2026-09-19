@@ -39,12 +39,17 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-_TEST_KINDS = {"unit", "e2e", "accuracy", "perf", "stress"}
+# Unit tests are the one tree with a structural contract: they cover a single
+# srt module, so they mirror python/sglang/srt/. Every other directory under
+# test/registered/ groups by topic and is free-form -- what a test costs, which
+# stage gates it and which runner it needs are declared by its registry call,
+# not by where the file sits.
+_UNIT_ROOT = "unit"
 _KERNEL_ROOT = "kernels"
 
-# Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
-# carries the `-kernel-` infix the kernel tree needs, and these launch device work.
-_VENDOR_DIRS = {"amd", "mlx", "musa", "npu", "xpu"}
+# Singular spelling of the kernel root. It is a typo for _KERNEL_ROOT, not a
+# topic of its own, and silently lands the file outside the kernel suites.
+_KERNEL_ROOT_TYPO = "kernel"
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
@@ -127,13 +132,13 @@ def _contains_call(tree: ast.AST, name: str) -> bool:
 
 
 def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
-    """Validate the kind/subsystem contract for a newly admitted path."""
+    """Validate the structural contract for a newly admitted path."""
 
     parts = path.split("/")
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
-    if relative_parts and relative_parts[0] in _VENDOR_DIRS:
+    if not relative_parts:
         return []
-    if relative_parts and relative_parts[0] == _KERNEL_ROOT:
+    if relative_parts[0] == _KERNEL_ROOT:
         errors = []
         if len(relative_parts) < 4 or relative_parts[1] not in {"ops", "benchmark"}:
             errors.append(
@@ -143,45 +148,32 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
         if any("-kernel-" not in (r.effective_suite or "") for r in registries):
             errors.append(f"{path}: kernel tests must use a *-kernel-* suite")
         return errors
-    if len(relative_parts) < 3 or relative_parts[0] not in _TEST_KINDS:
+    if relative_parts[0] == _KERNEL_ROOT_TYPO:
         return [
-            f"{path}: registered tests must live under "
-            "test/registered/<kind>/<subsystem>/; kind must be one of "
-            + ", ".join(sorted(_TEST_KINDS))
-            + "; kernel tests use test/registered/kernels/{ops,benchmark}/<group>/"
+            f"{path}: kernel tests use the plural root: "
+            "test/registered/kernels/{ops,benchmark}/<group>/"
         ]
+    if relative_parts[0] != _UNIT_ROOT:
+        # Topic directory: the registry call already declares cost and placement.
+        return []
 
-    kind = relative_parts[0]
     errors = []
-    if kind == "unit":
-        invalid = [
-            r
-            for r in registries
-            if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
-        ]
-        if invalid:
-            errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
-        if any(r.est_time > 60 for r in registries):
-            errors.append(f"{path}: unit test est_time must be <= 60 seconds")
-        if _contains_call(tree, "popen_launch_server"):
-            errors.append(f"{path}: unit tests may not launch a server")
-    elif kind in {"accuracy", "perf"}:
-        invalid = [
-            r
-            for r in registries
-            if not (r.effective_suite or "").startswith(("nightly-", "weekly-"))
-        ]
-        if invalid:
-            errors.append(f"{path}: {kind} tests must use nightly/weekly suites")
-    elif kind == "stress":
-        invalid = [
-            r
-            for r in registries
-            if (r.effective_suite or "") != "stress"
-            and not (r.effective_suite or "").startswith("weekly-")
-        ]
-        if invalid:
-            errors.append(f"{path}: stress tests must use stress/weekly suites")
+    if len(relative_parts) < 3:
+        errors.append(
+            f"{path}: unit tests mirror the srt tree: "
+            "test/registered/unit/<srt_module>/test_*.py"
+        )
+    invalid = [
+        r
+        for r in registries
+        if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
+    ]
+    if invalid:
+        errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
+    if any(r.est_time > 60 for r in registries):
+        errors.append(f"{path}: unit test est_time must be <= 60 seconds")
+    if _contains_call(tree, "popen_launch_server"):
+        errors.append(f"{path}: unit tests may not launch a server")
     return errors
 
 
