@@ -198,17 +198,26 @@ class Qwen3_5ForCausalLM(nn.Module):
             for name, loaded_weight in weights:
                 if name.startswith(_MODEL_PREFIX):
                     yield name[len(_MODEL_PREFIX) :], loaded_weight
-                elif name == "lm_head.weight":
+                elif name.startswith("lm_head."):
                     if self.config.tie_word_embeddings:
                         continue
-                    if "lm_head.weight" not in params_dict:
+                    param_name = name
+                    if (
+                        param_name.endswith(".weight")
+                        and param_name not in params_dict
+                        and (param_name[: -len(".weight")] + ".qweight") in params_dict
+                    ):
+                        # Unquantized GGUF tensors retain the `.weight` suffix,
+                        # while GGUF modules expose the payload as `.qweight`.
+                        param_name = param_name[: -len(".weight")] + ".qweight"
+                    if param_name not in params_dict:
                         continue
-                    param = params_dict["lm_head.weight"]
+                    param = params_dict[param_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add("lm_head.weight")
+                    loaded_params.add(param_name)
 
         body_loaded = self.model.load_weights(body_weights())
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)

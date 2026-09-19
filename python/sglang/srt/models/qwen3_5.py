@@ -1626,12 +1626,16 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        # The text-only wrapper delegates GGUF tensors directly to this body,
+        # so keep the quantization config here for load-time layout fixups.
+        self.quant_config = quant_config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
+        self._embedding_prefix = add_prefix("embed_tokens", prefix)
         self.embed_tokens = self._build_embed_tokens(config)
 
         # Decoder layers
@@ -1717,6 +1721,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            quant_config=self.quant_config,
+            prefix=self._embedding_prefix,
             enable_tp=not is_dp_attention_enabled(),
         )
 
@@ -1878,6 +1884,34 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    # Text-only GGUF checkpoints enter this loader directly. The conditional
+    # wrapper owns the shared implementation below; these adapters retain the
+    # text model's ``layers.*`` module-path convention for the TP metadata.
+    @staticmethod
+    def _perm_value_rows(t: torch.Tensor, ratio: int, nk: int) -> torch.Tensor:
+        return Qwen3_5ForConditionalGeneration._perm_value_rows(t, ratio, nk)
+
+    @staticmethod
+    def _gguf_block_elems(nbytes_last: int, n_elems: int) -> int:
+        return Qwen3_5ForConditionalGeneration._gguf_block_elems(nbytes_last, n_elems)
+
+    def _resolve_gdn_out_proj(self, name: str) -> nn.Module:
+        marker = ".linear_attn.out_proj."
+        path = name.replace("model.language_model.", "model.")
+        path = path[: path.index(marker)] + ".linear_attn.out_proj"
+        for candidate in (path, path.removeprefix("model.")):
+            try:
+                return self.get_submodule(candidate)
+            except AttributeError:
+                pass
+        raise AttributeError(
+            "GGUF GDN out_proj column permutation could not resolve "
+            f"'{path}' for '{name}'"
+        )
+
+    def _gguf_gdn_transform(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        return Qwen3_5ForConditionalGeneration._gguf_gdn_transform(self, name, weight)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
@@ -1896,6 +1930,16 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1903,6 +1947,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
             if "visual" in name:
                 continue
+            if is_gguf and (
+                name.endswith(gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+                or name == "norm.weight"
+            ):
+                # GemmaRMSNorm stores its runtime scale as (GGUF scale - 1).
+                loaded_weight = loaded_weight - 1.0
+            if is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1923,6 +1977,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                # F32 GGUF tensors retain their `.weight` suffix, but a GGUF
+                # linear module exposes `.qweight`. Redirect within this
+                # stacked branch to retain the b/a fused shard ID.
+                if (
+                    is_gguf
+                    and name.endswith(".weight")
+                    and name not in params_dict
+                    and (name[: -len(".weight")] + ".qweight") in params_dict
+                ):
+                    name = name[: -len(".weight")] + ".qweight"
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1943,6 +2007,17 @@ class Qwen3_5ForCausalLM(nn.Module):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
+
+                # GGUF stores depthwise conv1d weights as [channels, kernel],
+                # while the runtime parameter follows torch Conv1d's
+                # [channels, 1, kernel] layout.
+                if (
+                    is_gguf
+                    and name.endswith("conv1d.weight")
+                    and loaded_weight.dim() == 2
+                    and param.dim() == 3
+                ):
+                    loaded_weight = loaded_weight.unsqueeze(1)
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2039,6 +2114,16 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2047,6 +2132,15 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 continue
             if "visual" in name:
                 continue
+            if is_gguf and (
+                name.endswith(gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+                or name == "norm.weight"
+            ):
+                loaded_weight = loaded_weight - 1.0
+            if is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -2078,6 +2172,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                if (
+                    is_gguf
+                    and name.endswith(".weight")
+                    and name not in params_dict
+                    and (name[: -len(".weight")] + ".qweight") in params_dict
+                ):
+                    name = name[: -len(".weight")] + ".qweight"
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2158,9 +2259,35 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
+                        if (
+                            is_gguf
+                            and name.endswith("conv1d.weight")
+                            and loaded_weight.dim() == 2
+                            and param.dim() == 3
+                        ):
+                            loaded_weight = loaded_weight.unsqueeze(1)
+                        # GGUF drops the singleton output dimension of the
+                        # shared-expert router: [H] instead of Linear's [1,H].
+                        if (
+                            is_gguf
+                            and name.endswith("shared_expert_gate.weight")
+                            and loaded_weight.dim() == 1
+                            and param.dim() == 2
+                            and param.shape[0] == 1
+                        ):
+                            loaded_weight = loaded_weight.unsqueeze(0)
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if (
+                            weight_loader is default_weight_loader
+                            and param.size() != loaded_weight.size()
+                        ):
+                            raise ValueError(
+                                "Qwen3.5 MoE weight shape mismatch for "
+                                f"{name}: checkpoint={tuple(loaded_weight.shape)}, "
+                                f"parameter={tuple(param.shape)}"
+                            )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
@@ -2233,6 +2360,148 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+    @staticmethod
+    def _perm_value_rows(t: torch.Tensor, ratio: int, nk: int) -> torch.Tensor:
+        """Change GGUF value-head rows from ``[ratio, nk]`` to ``[nk, ratio]``.
+
+        GGUF quantized tensors are stored as independently packed output rows,
+        so this is equally valid for raw quantization bytes and F32 tensors.
+        """
+        nv = ratio * nk
+        per_head = t.shape[0] // nv
+        return (
+            t.reshape(ratio, nk, per_head, *t.shape[1:])
+            .transpose(0, 1)
+            .reshape(t.shape)
+            .contiguous()
+        )
+
+    @staticmethod
+    def _gguf_block_elems(nbytes_last: int, n_elems: int) -> int:
+        """Return the number of logical elements in one GGUF packed block."""
+        if nbytes_last == n_elems:
+            return 1
+        import gguf
+
+        candidates = [
+            block_elems
+            for block_elems, type_size in gguf.GGML_QUANT_SIZES.values()
+            if block_elems
+            and n_elems % block_elems == 0
+            and (n_elems // block_elems) * type_size == nbytes_last
+        ]
+        if not candidates:
+            raise ValueError(
+                f"cannot infer GGUF block size: {nbytes_last} bytes encode "
+                f"{n_elems} elements"
+            )
+        # In the unlikely case of an ambiguity, the largest block is the safe
+        # choice: it can choose the two-stage path unnecessarily, never an
+        # unsafe byte-level permutation.
+        return max(candidates)
+
+    def _resolve_gdn_out_proj(self, name: str) -> nn.Module:
+        """Find the out projection to annotate with its local column layout."""
+        marker = ".linear_attn.out_proj."
+        path = name.replace("model.language_model.", "model.")
+        path = path[: path.index(marker)] + ".linear_attn.out_proj"
+        try:
+            return self.get_submodule(path)
+        except AttributeError as exc:
+            raise AttributeError(
+                "GGUF GDN out_proj column permutation could not resolve "
+                f"'{path}' for '{name}'"
+            ) from exc
+
+    def _gguf_gdn_transform(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """Convert GGUF GDN tensor layouts to the runtime's Qwen3.5 layout.
+
+        The value-head axis is stored by GGUF as ``[ratio, num_key_heads]``;
+        Qwen3.5 expects ``[num_key_heads, ratio]``.  All output-row changes
+        can operate directly on raw GGUF bytes.  ``out_proj`` is different: it
+        permutes input columns, so only whole packed blocks may move here.
+        K-quant tensors whose value heads are smaller than a packed block use
+        a coarse global permutation and leave the local element permutation as
+        metadata for the quantization method after TP sharding.
+        """
+        if weight.dim() == 0:
+            return weight
+
+        config = getattr(self.config, "text_config", self.config)
+        nk = config.linear_num_key_heads
+        nv = config.linear_num_value_heads
+        if nv % nk:
+            return weight
+        ratio = nv // nk
+
+        if name.endswith("linear_attn.A_log"):
+            weight = torch.log(-weight)
+            return self._perm_value_rows(weight, ratio, nk) if ratio > 1 else weight
+        if ratio == 1:
+            return weight
+
+        if name.endswith("linear_attn.dt_bias"):
+            return self._perm_value_rows(weight, ratio, nk)
+
+        if ".linear_attn.out_proj." in name:
+            if weight.shape[1] % nv:
+                raise ValueError(
+                    f"GGUF GDN out_proj last dimension {weight.shape[1]} is "
+                    f"not divisible by {nv} value heads"
+                )
+            span = weight.shape[1] // nv
+            value_head_dim = config.linear_value_head_dim
+            block_elems = self._gguf_block_elems(weight.shape[1], nv * value_head_dim)
+            if value_head_dim % block_elems == 0:
+                return (
+                    weight.reshape(weight.shape[0], ratio, nk, span)
+                    .transpose(1, 2)
+                    .reshape(weight.shape)
+                    .contiguous()
+                )
+
+            out_proj = self._resolve_gdn_out_proj(name)
+            tp_size = int(getattr(out_proj, "tp_size", 1) or 1)
+            if nk % tp_size:
+                raise ValueError(
+                    f"GGUF GDN out_proj needs {nk} key heads divisible by "
+                    f"tp_size={tp_size}"
+                )
+            nk_local = nk // tp_size
+            if (nk_local * value_head_dim) % block_elems:
+                raise ValueError(
+                    "GGUF GDN out_proj local TP slice would split a packed "
+                    f"block: {nk_local} * {value_head_dim} is not divisible "
+                    f"by {block_elems}"
+                )
+            # The XPU GGUF quantization method applies this permutation to the
+            # dequantized local TP slice before packing it for its GEMM path.
+            out_proj._gguf_gdn_col_perm = (ratio, nk_local, value_head_dim)
+            return (
+                weight.reshape(weight.shape[0], ratio, tp_size, nk_local * span)
+                .transpose(1, 2)
+                .reshape(weight.shape)
+                .contiguous()
+            )
+
+        if (
+            ".linear_attn.in_proj_a." in name
+            or ".linear_attn.in_proj_b." in name
+            or ".linear_attn.in_proj_z." in name
+        ):
+            return self._perm_value_rows(weight, ratio, nk)
+
+        if ".linear_attn.in_proj_qkv." in name or name.endswith(
+            "linear_attn.conv1d.weight"
+        ):
+            key_dim = nk * config.linear_key_head_dim
+            value_dim = nv * config.linear_value_head_dim
+            q, k, v = torch.split(weight, [key_dim, key_dim, value_dim], dim=0)
+            return torch.cat(
+                [q, k, self._perm_value_rows(v, ratio, nk)], dim=0
+            ).contiguous()
+        return weight
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
@@ -2251,11 +2520,34 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        # linear_attn.norm is RMSNormGated rather than GemmaRMSNorm, so it
+        # deliberately does not appear here.
+        gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
                 continue
+            if is_gguf and (
+                name.endswith(gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+                or name == "norm.weight"
+            ):
+                # GemmaRMSNorm computes x * (1 + weight), while GGUF stores
+                # the standard RMSNorm scale.
+                loaded_weight = loaded_weight - 1.0
+            if is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -2287,6 +2579,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                # The GGUF iterator exposes F32 tensors as `.weight`, whereas
+                # a GGUF linear module owns only `.qweight`.  Keep this inside
+                # the fused-shard branch so in_proj_b/a retain their shard IDs.
+                if (
+                    is_gguf
+                    and name.endswith(".weight")
+                    and name not in params_dict
+                    and (name[: -len(".weight")] + ".qweight") in params_dict
+                ):
+                    name = name[: -len(".weight")] + ".qweight"
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2313,6 +2615,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
+
+                # GGUF depthwise convolution is [channels, kernel], while the
+                # runtime's Conv1d-compatible parameter is [channels, 1, kernel].
+                if (
+                    is_gguf
+                    and name.endswith("conv1d.weight")
+                    and loaded_weight.dim() == 2
+                    and param.dim() == 3
+                ):
+                    loaded_weight = loaded_weight.unsqueeze(1)
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

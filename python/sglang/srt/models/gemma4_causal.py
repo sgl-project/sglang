@@ -45,13 +45,16 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
+from sglang.srt.models.gemma3_causal import Gemma3MLP
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
@@ -68,7 +71,36 @@ def get_attention_sliding_window_size(config):
 
 
 Gemma4MLP = Gemma3MLP
-Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+class Gemma4TextScaledWordEmbedding(VocabParallelEmbedding):
+    """Gemma embedding with TP/quantization support and Gemma's scale."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: Optional[float] = 1.0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        enable_tp: bool = True,
+    ):
+        # VocabParallelEmbedding does not special-case padding_idx at runtime;
+        # retain the attribute for compatibility with nn.Embedding callers.
+        self.padding_idx = padding_idx
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            org_num_embeddings=num_embeddings,
+            quant_config=quant_config,
+            prefix=prefix,
+            enable_tp=enable_tp,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, input_ids: torch.Tensor):
+        return super().forward(input_ids) * self.embed_scale
 
 
 def load_tied_lm_head(
@@ -821,6 +853,8 @@ class Gemma4TextModel(PreTrainedModel):
                 config.hidden_size,
                 self.padding_idx,
                 embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -835,6 +869,8 @@ class Gemma4TextModel(PreTrainedModel):
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
                 self.padding_idx,
                 embed_scale=self.hidden_size_per_layer_input**0.5,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens_per_layer", prefix),
             )
 
             self.per_layer_model_projection = ReplicatedLinear(
@@ -1123,7 +1159,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # which makes the default tie_weights crash.  load_weights routes the
         # checkpoint embedding into lm_head explicitly, so the tie is a no-op
         # here when PP is active.
-        if self.pp_group.world_size > 1:
+        if self.pp_group.world_size > 1 or self.config.tie_word_embeddings:
             return
         super().tie_weights(*args, **kwargs)
 
@@ -1131,7 +1167,15 @@ class Gemma4ForCausalLM(PreTrainedModel):
         return self.model.embed_tokens
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed_weight = getattr(
+            self.model.embed_tokens,
+            "weight",
+            getattr(self.model.embed_tokens, "qweight", None),
+        )
+        head_weight = getattr(
+            self.lm_head, "weight", getattr(self.lm_head, "qweight", None)
+        )
+        return embed_weight, head_weight
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

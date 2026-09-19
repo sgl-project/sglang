@@ -3194,19 +3194,27 @@ class GGUFModelLoader(BaseModelLoader):
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
             ) from err
 
-        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
-
         config = model_config.hf_config
         model_type = config.model_type
-        name_map_builder = GGUF_HF_NAME_MAP_BUILDERS.get(model_type)
-        if name_map_builder is not None:
-            return name_map_builder(config)
+
+        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
+
+        # Muse Glimmer supplies its complete map independently of gguf-py's
+        # architecture enum (older gguf releases do not know this arch).
+        if model_type == "muse_glimmer":
+            return GGUF_HF_NAME_MAP_BUILDERS[model_type](config)
 
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
         elif model_type == "qwen3_moe":
             model_type = "qwen3moe"
+        elif model_type in ("qwen3_5", "qwen3_5_text"):
+            model_type = "qwen35"
+        elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_type = "qwen35moe"
+        elif model_type in ("gemma4", "gemma4_text"):
+            model_type = "gemma4"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -3214,6 +3222,11 @@ class GGUFModelLoader(BaseModelLoader):
                 break
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
+
+        name_map_builder = GGUF_HF_NAME_MAP_BUILDERS.get(config.model_type)
+        if name_map_builder is not None:
+            return name_map_builder(config, gguf, arch, model_config.model_path)
+
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
         with torch.device("meta"):
@@ -3259,11 +3272,17 @@ class GGUFModelLoader(BaseModelLoader):
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
 
-            for _, module in model.named_modules():
+            for module_name, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+                    try:
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Failed to post-process GGUF weights for module "
+                            f"{module_name} ({type(module).__name__})"
+                        ) from exc
         return model
 
 

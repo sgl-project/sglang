@@ -1144,13 +1144,24 @@ class FusedMoE(torch.nn.Module):
             return True
 
         if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
             if self.moe_tp_size > 1:
-                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
-                    shard_size = loaded_weight.size(0) // self.moe_tp_size
+                # GGUF expert matrices are row-major after decoding. Gate/up
+                # is column-parallel and shards output rows; down is
+                # row-parallel and shards its (still byte-packed) input axis.
+                # The old output_dim==0 branch incorrectly sliced w2's hidden
+                # output rows, producing the wrong TP-local down projection.
+                if shard_id in ("w1", "w3", "w2"):
+                    shard_dim = 1 if shard_id == "w2" else 0
+                    if loaded_weight.size(shard_dim) % self.moe_tp_size:
+                        raise ValueError(
+                            "GGUF MoE tensor cannot be evenly sharded for TP: "
+                            f"shard={shard_id}, packed shape={tuple(loaded_weight.shape)}, "
+                            f"tp_size={self.moe_tp_size}"
+                        )
+                    shard_size = loaded_weight.size(shard_dim) // self.moe_tp_size
                     start_idx = tp_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
-                        0, start_idx, shard_size
+                        shard_dim, start_idx, shard_size
                     ).clone()
 
             # Store in data_container with expert/shard info

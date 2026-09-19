@@ -342,4 +342,36 @@ def get_config(
             )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
+    if is_gguf and gguf_has_sidecar_config:
+        config = _maybe_gguf_text_only(config)
+
     return config
+
+
+def _maybe_gguf_text_only(config):
+    """Use the text tower when a GGUF omits multimodal tower tensors."""
+    model_type = getattr(config, "model_type", None)
+    if model_type not in ("gemma4", "qwen3_5", "qwen3_5_moe"):
+        return config
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return config
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            setattr(text_config, attr, value)
+    if model_type == "gemma4":
+        architecture = "Gemma4ForCausalLM"
+    else:
+        source_architectures = getattr(config, "architectures", None) or []
+        is_moe = model_type == "qwen3_5_moe" or any(
+            "Moe" in name for name in source_architectures
+        )
+        architecture = "Qwen3_5MoeForCausalLM" if is_moe else "Qwen3_5ForCausalLM"
+    _set_architectures(text_config, architecture)
+    return text_config
+
+
+def _maybe_gguf_gemma4_text_only(config):
+    """Backward-compatible alias for existing focused tests."""
+    return _maybe_gguf_text_only(config)

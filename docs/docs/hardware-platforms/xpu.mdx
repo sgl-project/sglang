@@ -129,6 +129,65 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
+## GGUF Q4_K Inference
+
+Intel XPU supports text-generation checkpoints in the GGUF Q4_K family through
+the W4A16 kernels provided by `sgl-kernel-xpu`. GGUF Q4_K weights are repacked
+once while the model is loaded; the serving path does not depend on the
+llm-scaler ESIMD extension.
+
+Place the Hugging Face sidecar files next to the GGUF file. At minimum this
+includes `config.json`, the tokenizer files, and
+`model.safetensors.index.json` (or the corresponding safetensors shards). This
+uses the same sidecar discovery as the existing SGLang GGUF loader; no
+XPU-specific environment variable is required.
+
+```text
+/models/qwen-gguf/
+├── config.json
+├── model.safetensors.index.json
+├── tokenizer.json
+├── tokenizer_config.json
+└── model-Q4_K_M.gguf
+```
+
+Launch the server by passing the GGUF file directly:
+
+```bash
+sglang serve \
+    --model-path /models/qwen-gguf/model-Q4_K_M.gguf \
+    --device xpu \
+    --tp 2 \
+    --attention-backend intel_xpu \
+    --disable-custom-all-reduce \
+    --disable-overlap-schedule \
+    --disable-radix-cache
+```
+
+`--disable-radix-cache` is currently required for the hybrid GDN Qwen models:
+the Intel XPU attention backend uses a paged KV cache, while the upstream
+no-buffer Mamba radix-cache strategy requires page size 1. It can be omitted
+for the Gemma4 checkpoints. The custom all-reduce and overlap-schedule flags
+match the current recommended XPU serving configuration.
+
+Validated checkpoints:
+
+| Model | GGUF variant |
+|:---|:---|
+| Qwen3.6-27B | Q4_K_M |
+| Qwen3.8-27B | UD-Q4_K_M |
+| Qwen3.6-35B-A3B | UD-Q4_K_M |
+| Gemma4-31B-it | Q4_K_M |
+| Gemma4-26B-A4B-it | UD-Q4_K_M |
+
+Current limitations:
+
+- The optimized packed path targets Xe2/BMG Intel GPUs.
+- Q4_K linear and MoE gate/up weights use W4A16. Other K-quant MoE down
+  projections are dequantized once to BF16 during loading.
+- CUDA, ROCm, and other accelerator backends are outside this XPU validation
+  scope.
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus

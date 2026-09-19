@@ -586,7 +586,34 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if isinstance(loaded_shard_id, tuple):
+            # Some hybrid models store several logical projections in one GGUF
+            # tensor (for example Qwen3.5 GDN's fused Q/K/V projection). GGUF
+            # parameters predate BasevLLMParameter's v2 loader, so split the
+            # fused rows here and feed each logical shard through the existing
+            # GGUF TP loader.
+            if is_gguf_weight_type:
+                for shard_id in loaded_shard_id:
+                    param.data[shard_id].copy_(loaded_weight)
+                    param.shard_weight_type[shard_id] = loaded_weight.item()
+                return
+            if is_gguf_weight:
+                output_dim = getattr(param, "output_dim", 0)
+                selected_sizes = [self.output_sizes[i] for i in loaded_shard_id]
+                if loaded_weight.shape[output_dim] != sum(selected_sizes):
+                    raise ValueError(
+                        "Fused GGUF shard has incompatible output size: "
+                        f"got {loaded_weight.shape[output_dim]}, expected "
+                        f"{sum(selected_sizes)} for shards {loaded_shard_id}"
+                    )
+                offset = 0
+                for shard_id, shard_size in zip(loaded_shard_id, selected_sizes):
+                    shard = loaded_weight.narrow(output_dim, offset, shard_size)
+                    self.weight_loader(param, shard, shard_id)
+                    offset += shard_size
+                return
             if hasattr(param, "load_merged_column_weight"):
                 return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
             raise NotImplementedError(
@@ -596,8 +623,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
             param.data[loaded_shard_id].copy_(loaded_weight)
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
