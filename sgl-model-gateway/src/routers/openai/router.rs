@@ -486,6 +486,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             model,
             metrics_labels::ENDPOINT_CHAT,
             bool_to_static_str(streaming),
+            headers,
         );
 
         let auth_header = extract_auth_header(headers, &None);
@@ -710,6 +711,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             model,
             metrics_labels::ENDPOINT_RESPONSES,
             bool_to_static_str(streaming),
+            headers,
         );
 
         let auth_header = extract_auth_header(headers, &None);

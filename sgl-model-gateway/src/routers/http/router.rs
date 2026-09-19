@@ -212,6 +212,7 @@ impl Router {
             model,
             endpoint,
             bool_to_static_str(is_stream),
+            headers,
         );
 
         let response = RetryExecutor::execute_response_with_retry(
