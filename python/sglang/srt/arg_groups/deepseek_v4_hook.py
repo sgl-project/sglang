@@ -108,6 +108,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
+    from sglang.srt.utils import is_ppu
+
     cfg = resolving_view(server_args)
     if not cfg.enable_prefill_cp:
         return
@@ -142,9 +144,16 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.tp_size <= 8, (
-            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-        )
+        if is_ppu():
+            if cfg.tp_size > 8:
+                logger.warning(
+                    f"Context parallel with tp_size={cfg.tp_size} (> 8) spans multiple machines. "
+                    f"Cross-machine CP may have precision issues. Proceed with caution."
+                )
+        else:
+            assert cfg.tp_size <= 8, (
+                "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+            )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
