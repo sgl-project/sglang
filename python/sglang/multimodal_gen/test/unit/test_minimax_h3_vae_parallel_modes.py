@@ -64,21 +64,63 @@ def test_unvalidated_decode_modes_are_rejected(mode):
         config.resolved_parallel_decode_mode()
 
 
+_VIDEO_VAE_ATTN = (
+    "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+)
+_VAE_USP_BACKENDS = {
+    AttentionBackendEnum.FA,
+    AttentionBackendEnum.AITER,
+    AttentionBackendEnum.TORCH_SDPA,
+}
+
+
 def test_vit_attention_uses_local_usp_backend_dispatch():
-    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
     with (
-        mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
-        mock.patch(f"{module}.USPAttention", autospec=True) as usp_attention,
+        mock.patch(f"{_VIDEO_VAE_ATTN}.current_platform.is_cuda", return_value=True),
+        mock.patch(f"{_VIDEO_VAE_ATTN}._ROCM_AITER_AVAILABLE", False),
+        mock.patch(
+            f"{_VIDEO_VAE_ATTN}._DEFAULT_ATTENTION_BACKEND",
+            AttentionBackendEnum.TORCH_SDPA,
+        ),
+        mock.patch(f"{_VIDEO_VAE_ATTN}.USPAttention", autospec=True) as usp_attention,
     ):
         Attention(heads=2, dim_head=64)
 
     kwargs = usp_attention.call_args.kwargs
     assert kwargs["skip_sequence_parallel"] is True
     assert kwargs["default_attention_backend"] == AttentionBackendEnum.TORCH_SDPA
-    assert kwargs["supported_attention_backends"] == {
-        AttentionBackendEnum.FA,
-        AttentionBackendEnum.TORCH_SDPA,
-    }
+    assert kwargs["supported_attention_backends"] == _VAE_USP_BACKENDS
+
+
+def test_vit_attention_uses_aiter_on_rocm_when_aiter_is_available():
+    with (
+        mock.patch(f"{_VIDEO_VAE_ATTN}.current_platform.is_cuda", return_value=False),
+        mock.patch(f"{_VIDEO_VAE_ATTN}._ROCM_AITER_AVAILABLE", True),
+        mock.patch(
+            f"{_VIDEO_VAE_ATTN}._DEFAULT_ATTENTION_BACKEND",
+            AttentionBackendEnum.AITER,
+        ),
+        mock.patch(f"{_VIDEO_VAE_ATTN}.USPAttention", autospec=True) as usp_attention,
+    ):
+        Attention(heads=2, dim_head=64)
+
+    usp_attention.assert_called_once()
+    kwargs = usp_attention.call_args.kwargs
+    assert kwargs["skip_sequence_parallel"] is True
+    assert kwargs["default_attention_backend"] == AttentionBackendEnum.AITER
+    assert kwargs["supported_attention_backends"] == _VAE_USP_BACKENDS
+
+
+def test_vit_attention_skips_usp_on_rocm_without_aiter():
+    with (
+        mock.patch(f"{_VIDEO_VAE_ATTN}.current_platform.is_cuda", return_value=False),
+        mock.patch(f"{_VIDEO_VAE_ATTN}._ROCM_AITER_AVAILABLE", False),
+        mock.patch(f"{_VIDEO_VAE_ATTN}.USPAttention", autospec=True) as usp_attention,
+    ):
+        attention = Attention(heads=2, dim_head=64)
+
+    usp_attention.assert_not_called()
+    assert attention.attn is None
 
 
 def test_vit_qk_norm_supports_affine_free_rmsnorm():
