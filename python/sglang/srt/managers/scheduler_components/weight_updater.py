@@ -102,7 +102,9 @@ class SchedulerWeightUpdaterManager:
                 )
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
-        if recv_req.flush_cache:
+        # A rebuild replaces the model object, so every cached token maps to
+        # weights that no longer exist; flush unconditionally in that case.
+        if recv_req.flush_cache or recv_req.rebuild_model:
             flush_cache_success = self.flush_cache(
                 empty_cache=recv_req.torch_empty_cache
             )
@@ -113,6 +115,17 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if recv_req.rebuild_model and self.offload_tags:
+            return UpdateWeightFromDiskReqOutput(
+                success=False,
+                message=(
+                    "rebuild_model is not supported while memory regions are "
+                    f"released (paused tags={sorted(self.offload_tags)}): the "
+                    "weights and KV regions the rebuild reads are not resident. "
+                    "Resume memory occupation first."
+                ),
+                num_paused_requests=0,
+            )
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
