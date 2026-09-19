@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.clear()
 
     def clear(self):
@@ -71,8 +73,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
+
+    def _debug_check_no_duplicate_pages(self):
+        pages = self.get_all_free_pages()
+        assert len(torch.unique(pages)) == len(pages)
 
     def free_page_ids(self, page_ids: torch.Tensor):
         # page_size == 1: page ids are token ids.
