@@ -2375,8 +2375,11 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_dp_rank, 0)
                 self.assertEqual(parallel.attn_cp_size, 1)
                 self.assertEqual(parallel.attn_cp_rank, 0)
-                self.assertEqual(parallel.dp_size, 1)
-                # The whole point of stating all of them: the identity the
+                # `dp_size` is the deployment's replica count, not a property
+                # of the group being installed, so the scope leaves it alone --
+                # `require_mlp_tp_gather` asserts on it under dp attention.
+                self.assertEqual(parallel.dp_size, 2)
+                # The whole point of stating the rest: the identity the
                 # override path and the group build both check holds in here.
                 self.assertEqual(
                     parallel.tp_size,
