@@ -50,6 +50,8 @@ def _gemma_fused_add_rmsnorm_kernel(
     w_ptr,
     out_ptr,
     res_out_ptr,
+    q8_ptr,
+    scale_ptr,
     n_cols,
     stride_xrow,
     stride_xcol,
@@ -57,6 +59,7 @@ def _gemma_fused_add_rmsnorm_kernel(
     stride_rcol,
     eps,
     BLOCK_N: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
@@ -78,11 +81,22 @@ def _gemma_fused_add_rmsnorm_kernel(
     rstd = 1.0 / tl.sqrt(var + eps)
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     out = s * rstd * (1.0 + w)
-    tl.store(
-        out_ptr + row * n_cols + cols,
-        out.to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    # TODO: can we avoid the fp32->bf16->fp32 round trip? The round trip is to
+    # maintain the parity with the unfused path
+    out_cast = out.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * n_cols + cols, out_cast, mask=mask)
+    if EMIT_FP8:
+        q_src = out_cast.to(tl.float32)
+        amax = tl.max(tl.abs(q_src), axis=0)
+        amax = tl.maximum(amax, 1e-12)
+        scale = amax * tl.full((), 1.0 / 448.0, tl.float32)
+        q = tl.clamp(q_src * (1.0 / scale), -448.0, 448.0)
+        tl.store(
+            q8_ptr + row * n_cols + cols,
+            q.to(q8_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        tl.store(scale_ptr + row, scale)
 
 
 def _num_warps(block_n: int) -> int:
@@ -120,8 +134,13 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    emit_fp8: bool = False,
 ):
-    """Fused (x + residual) then Gemma RMSNorm; returns (normed, pre-norm sum)."""
+    """Fused (x + residual) then Gemma RMSNorm; returns (normed, pre-norm sum).
+
+    With ``emit_fp8``, also computes the per-token fp8 quant of the normed
+    output.
+    """
     orig_shape = x.shape
     n = orig_shape[-1]
     x2 = x.reshape(-1, n)
@@ -129,6 +148,11 @@ def gemma_fused_add_rmsnorm(
     m = x2.shape[0]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     res_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    if emit_fp8:
+        q8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+        scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    else:
+        q8 = scale = None
     block_n = triton.next_power_of_2(n)
     _gemma_fused_add_rmsnorm_kernel[(m,)](
         x2,
@@ -136,6 +160,8 @@ def gemma_fused_add_rmsnorm(
         weight,
         out,
         res_out,
+        q8,
+        scale,
         n,
         x2.stride(0),
         x2.stride(1),
@@ -143,6 +169,10 @@ def gemma_fused_add_rmsnorm(
         r2.stride(1),
         eps,
         BLOCK_N=block_n,
+        EMIT_FP8=emit_fp8,
         num_warps=_num_warps(block_n),
     )
-    return out.reshape(orig_shape), res_out.reshape(orig_shape)
+    out = out.reshape(orig_shape)
+    if emit_fp8:
+        out._fp8_qinput = (q8, scale)
+    return out, res_out.reshape(orig_shape)
