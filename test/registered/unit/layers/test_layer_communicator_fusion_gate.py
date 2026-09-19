@@ -178,18 +178,9 @@ class TestResolveFusionGroup(CustomTestCase):
                 tp_rank=tp_rank,
                 moe_ep_rank=tp_rank % moe_ep_size,
                 moe_tp_rank=tp_rank % moe_tp_size,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_tp_group",
-                return_value=fake_tp_group,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_ep_group",
-                return_value=fake_ep_group,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_tp_group",
-                return_value=fake_moe_tp_group,
+                tp_group=fake_tp_group,
+                moe_ep_group=fake_ep_group,
+                moe_tp_group=fake_moe_tp_group,
             ),
         ):
             ws = resolve_fusion_world_size(use_attn_tp_group=False)

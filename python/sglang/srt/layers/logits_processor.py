@@ -464,9 +464,7 @@ class LogitsProcessor(nn.Module):
         ):
             parallel = get_parallel()
             group = (
-                parallel.attn_tp_group
-                if self.use_attn_tp_group
-                else parallel.tp_group
+                parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
             )
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(

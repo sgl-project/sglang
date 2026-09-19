@@ -205,16 +205,14 @@ class TestSpecOvershootCacheLen(CustomTestCase):
         req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
         req.update_finish_state(new_accepted_len=5)
         with get_context().override_server_args(strip_thinking_cache=False):
-            self.assertEqual(req.effective_kv_committed_len(), 5)
+            self.assertEqual(req.owned_kv_len(), 5)
 
     def test_strip_thinking_still_caps_at_prompt(self):
         req = _make_req([10, 11, EOS_ID], max_new_tokens=100)
         req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
         req.reasoning_tokens = 1
         with get_context().override_server_args(strip_thinking_cache=True):
-            self.assertEqual(
-                req.effective_kv_committed_len(), len(req.origin_input_ids)
-            )
+            self.assertEqual(req.owned_kv_len(), len(req.origin_input_ids))
 
     def test_abort_stopless_keeps_committed_len(self):
         # A running request aborted via set_finish_with_abort has no
@@ -234,7 +232,7 @@ class TestSpecOvershootCacheLen(CustomTestCase):
             req.set_finish_with_abort("boom")
         self.assertIsNone(req.finished_len)
         with get_context().override_server_args(strip_thinking_cache=False):
-            self.assertEqual(req.effective_kv_committed_len(), req.kv.kv_committed_len)
+            self.assertEqual(req.owned_kv_len(), req.kv.kv_committed_len)
 
 
 if __name__ == "__main__":
