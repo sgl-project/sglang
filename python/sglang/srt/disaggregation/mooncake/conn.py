@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
+    _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
@@ -218,6 +219,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        enable_custom_mem_pool, custom_mem_pool_type = (
+            check_mooncake_custom_mem_pool_enabled()
+        )
+        _validate_efa_allocator_compatibility(
+            enable_custom_mem_pool, custom_mem_pool_type
+        )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
