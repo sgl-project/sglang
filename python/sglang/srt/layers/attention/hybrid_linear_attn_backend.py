@@ -1346,20 +1346,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
-        """Update mamba states after MTP verify via a fused gather-scatter kernel.
-
-        Under PP-spec, ``req_pool_indices`` identifies the delayed micro-batch's
-        stable scratch rows and lets the commit re-derive its destination slots
-        after the original forward context has exited. Non-PP commits keep the
-        historical hot path: they read the active ``forward_metadata`` directly
-        and launch no request-to-mamba lookup or virtual-to-physical translation.
-        """
+        """Commit accepted Mamba states; PP rows identify the delayed batch."""
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
-            # PP target-verify writes scratch by stable request-pool row so it
-            # survives other in-flight micro-batches until acceptance relays
-            # back.  Commit must read those same rows, not positional 0..bs-1.
+            # Match delayed PP acceptance to its request-row scratch.
             src_indices_raw = req_pool_indices[:request_number]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1369,19 +1360,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
         if src_indices_raw is not None:
-            # A relayed PP accept result is committed after its verify forward
-            # context has exited.  At that point forward_metadata belongs to the
-            # most recently launched micro-batch, not necessarily the batch whose
-            # accept result just arrived.  Rebuild the destination slots from the
-            # matched forward snapshot supplied by the commit caller.
+            # Active metadata may belong to a later in-flight micro-batch.
             state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
                 self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
                     req_pool_indices[:request_number]
                 )
             )
         else:
-            # Direct worker commits happen in the active verify context and some
-            # legacy callers do not carry request-pool indices.
+            # Direct commits still own the active verify metadata.
             state_indices_tensor = (
                 self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                     :request_number
