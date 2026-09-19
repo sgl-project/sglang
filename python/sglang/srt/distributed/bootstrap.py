@@ -106,15 +106,6 @@ def init_torch_distributed(
             server_args=server_args,
             model_config=model_config,
             gpu_id=ps.gpu_id,
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
-            attn_dp_size=ps.attn_dp_size,
-            attn_cp_size=ps.attn_cp_size,
-            moe_ep_size=ps.moe_ep_size,
-            moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.attn_dcp_size,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
@@ -255,19 +246,13 @@ def _init_parallel_groups(
     server_args: ServerArgs,
     model_config: ModelConfig,
     gpu_id: int,
-    tp_rank: int,
-    tp_size: int,
-    pp_rank: int,
-    pp_size: int,
-    attn_dp_size: int,
-    attn_cp_size: int,
-    moe_ep_size: int,
-    moe_dp_size: int,
-    dcp_size: int,
 ) -> None:
+    parallel = get_parallel()
+    tp_size, pp_size = parallel.tp_size, parallel.pp_size
+    tp_rank, pp_rank = parallel.tp_rank, parallel.pp_rank
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
-    rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
+    rank_offset = parallel.ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
@@ -285,14 +270,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=attn_dp_size,
-        pipeline_model_parallel_size=pp_size,
-        expert_model_parallel_size=moe_ep_size,
-        attention_context_model_parallel_size=attn_cp_size,
-        moe_data_model_parallel_size=moe_dp_size,
-        decode_context_parallel_size=dcp_size,
-        shared_experts_tensor_parallel_size=get_parallel().shared_experts_tp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel

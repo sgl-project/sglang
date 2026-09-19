@@ -589,10 +589,32 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(
-            tensor_model_parallel_size=get_parallel().tp_size,
-            attention_context_model_parallel_size=get_parallel().attn_cp_size,
+        # The encoder serves the vision tower on a world of its own: `tp_size`
+        # ranks wide, with no pipeline, no expert or MoE-DP dimension and no
+        # decode context parallelism, whatever the generation side published.
+        # That has always been the layout it builds; stating it is what stops
+        # the context from answering with the other side's topology while these
+        # groups answer with this one.
+        parallel = get_parallel()
+        attn_cp_size = parallel.attn_cp_size
+        attn_tp_size = parallel.tp_size // attn_cp_size
+        attn_cp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+        parallel.override_permanently(
+            tp_rank=rank,
+            pp_size=1,
+            pp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=attn_tp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_dcp_size=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_dp_size=1,
+            moe_tp_size=parallel.tp_size,
         )
+        initialize_model_parallel()
         initialize_dp_attention(server_args, self.model_config)
 
         self.model = load_model(
