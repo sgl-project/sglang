@@ -258,6 +258,14 @@ class Schedule(msgspec.Struct):
             "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
         ),
     ] = None
+    enable_dp_phase_lockstep: A[
+        bool,
+        (
+            "Keep all DP-attention ranks in the same phase (extend or decode) "
+            "each pass so mixed passes stop vetoing cuda graphs. Requires the "
+            "prefill delayer."
+        ),
+    ] = False
     prefill_delayer_max_delay_ms: A[
         Optional[float],
         (
