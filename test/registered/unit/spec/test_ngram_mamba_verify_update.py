@@ -427,26 +427,21 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         torch.testing.assert_close(dst[0, 5], torch.tensor([3.0, 7.0]))
 
     def test_pp_verify_scratch_uses_stable_request_rows_for_all_backends(self):
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            MambaAttnBackendBase,
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
         )
 
-        backend = object.__new__(MambaAttnBackendBase)
-        backend.verify_intermediate_state_indices = torch.arange(8, dtype=torch.int32)
-        backend.req_to_token_pool = SimpleNamespace(size=64)
-        forward_batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([17, 23, 31], dtype=torch.int64)
-        )
+        default = torch.arange(8, dtype=torch.int32)
+        req_rows = torch.tensor([17, 23, 31], dtype=torch.int64)
         cache_indices = torch.tensor([4, -1, 9], dtype=torch.int32)
-        query_start_loc = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
 
         with patch(
-            "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-            "envs.SGLANG_ENABLE_PP_SPEC.get",
+            "sglang.srt.layers.attention.linear.utils."
+            "pp_spec_stable_rows_enabled",
             return_value=True,
         ):
-            result = backend._select_verify_intermediate_state_indices(
-                forward_batch, cache_indices, query_start_loc
+            result = select_verify_intermediate_state_indices(
+                default, req_rows, cache_indices >= 0, pool_size=64
             )
 
         torch.testing.assert_close(

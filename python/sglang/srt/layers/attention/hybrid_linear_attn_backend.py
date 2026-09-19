@@ -347,31 +347,6 @@ class MambaAttnBackendBase(AttentionBackend):
             spec_info.retrieve_next_sibling
         )
 
-    def _select_verify_intermediate_state_indices(
-        self,
-        forward_batch: ForwardBatch,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """Choose scratch rows that survive a delayed PP accept relay.
-
-        Outside PP speculative decoding the verify kernels may use compact
-        positional rows. Under PP, several micro-batches can run before the
-        matching accept result returns, so every recurrent backend must write
-        its snapshots to the stable request-pool rows that the delayed commit
-        reads. Padded rows share the scratch pool's dedicated discard row.
-        """
-        intermediate_state_indices = self.verify_intermediate_state_indices
-        if not pp_spec_stable_rows_enabled():
-            return intermediate_state_indices
-
-        req_rows = forward_batch.req_pool_indices[: query_start_loc.shape[0] - 1]
-        return torch.where(
-            cache_indices[: req_rows.shape[0]] >= 0,
-            req_rows.to(torch.int32),
-            torch.full_like(req_rows, self.req_to_token_pool.size).to(torch.int32),
-        )
-
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):

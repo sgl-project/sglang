@@ -108,6 +108,20 @@ def resolve_linear_attn_backends(
     return backends
 
 
+def select_verify_intermediate_state_indices(
+    default_indices, req_pool_indices, valid, pool_size: int
+):
+    if not pp_spec_stable_rows_enabled():
+        return default_indices
+
+    import torch
+
+    req_rows = req_pool_indices[: valid.shape[0]]
+    return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
+        torch.int32
+    )
+
+
 def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
