@@ -143,9 +143,12 @@ class PrefillCPBCGInput:
         required_local_tokens: int,
         capture_num_tokens: list[int],
         max_padding_factor: int,
+        min_replay_bucket: int = 0,
     ) -> Optional[int]:
         """Return the smallest global capture whose CP-local rows fit."""
-        max_num_tokens = num_tokens * max_padding_factor
+        # Buckets at or below min_replay_bucket replay regardless of the
+        # padding-factor limit (SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET).
+        max_num_tokens = max(num_tokens * max_padding_factor, min_replay_bucket)
         for bucket in capture_num_tokens:
             if bucket < num_tokens:
                 continue
@@ -166,6 +169,7 @@ class PrefillCPBCGInput:
         extend_seq_lens: Any,
         capture_num_tokens: list[int],
         max_padding_factor: int,
+        min_replay_bucket: int = 0,
     ) -> Optional[int]:
         required_local_tokens = self.required_local_tokens(extend_seq_lens)
         if required_local_tokens is None:
@@ -175,6 +179,7 @@ class PrefillCPBCGInput:
             required_local_tokens=required_local_tokens,
             capture_num_tokens=capture_num_tokens,
             max_padding_factor=max_padding_factor,
+            min_replay_bucket=min_replay_bucket,
         )
 
     def prepare(

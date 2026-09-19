@@ -1424,6 +1424,10 @@ class Envs:
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
+    # Prefill graph buckets at or below this token count replay regardless of
+    # the padding-factor limit (0 = disabled). Small buckets replay faster than
+    # an exact-shape eager forward even when mostly padding.
+    SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET = EnvInt(0)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
