@@ -1183,3 +1183,70 @@ class C4Indexer(nn.Module):
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
         )
+
+
+def select_candidate_block_indices(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return selected block indices and their reachability, including the newest block."""
+    if (
+        logits.is_cuda
+        and torch.version.cuda is not None
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and torch.is_tensor(compress_lens)
+        and compress_lens.device == logits.device
+        and compress_lens.dtype in (torch.int32, torch.int64)
+        and compress_lens.numel() == logits.shape[0]
+        and logits.numel() > 0
+        and 0 < block_size <= 1024
+    ):
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_indices,
+        )
+
+        return candidate_block_indices(
+            logits,
+            compress_lens.reshape(-1).contiguous(),
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+        )
+
+    width = logits.size(-1)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    return top.indices, top.values > -torch.inf
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Return a position mask covering selected reachable blocks and the newest block."""
+    indices, valid = select_candidate_block_indices(
+        logits, compress_lens, topk_blocks, block_size
+    )
+    width = logits.size(-1)
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(
+        -1,
+        indices,
+        valid,
+    )
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
