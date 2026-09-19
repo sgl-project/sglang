@@ -5,8 +5,11 @@ from unittest.mock import MagicMock
 
 from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
     validate_outlines_json_schema,
+    validate_schema_bounds,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
@@ -213,3 +216,143 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSchemaBoundsValidation(unittest.TestCase):
+    """Tests for schema depth and state explosion validation."""
+
+    def test_validate_schema_bounds_accepts_valid_schema(self):
+        """A normal schema should pass validation."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+        }
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_excessive_depth(self):
+        """Schema with nesting depth > 16 should be rejected."""
+        schema = {"type": "object"}
+        current = schema
+        for i in range(17):  # 17 levels = depth 17 > 16
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        with self.assertRaises(JSONSchemaDepthExceeded):
+            validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_accepts_boundary_depth(self):
+        """Schema at exactly depth 16 should pass."""
+        schema = {"type": "object"}
+        current = schema
+        for i in range(16):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_excessive_states(self):
+        """Schema with too many properties should be rejected."""
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {
+            "type": "object",
+            "properties": properties,
+        }
+
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_allof_explosion(self):
+        """Schema with many allOf clauses should be rejected."""
+        all_of = []
+        for i in range(3000):
+            all_of.append(
+                {"type": "object", "properties": {f"x{i}": {"type": "string"}}}
+            )
+        schema = {
+            "type": "object",
+            "allOf": all_of,
+        }
+
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
+    def test_xgrammar_rejects_deep_schema_before_compilation(self):
+        """XGrammar backend should reject deep schemas before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        # Create a deeply nested schema
+        schema = {"type": "object"}
+        current = schema
+        for i in range(17):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend.grammar_compiler.compile_json_schema.assert_not_called()
+
+    def test_xgrammar_rejects_state_explosion_before_compilation(self):
+        """XGrammar backend should reject state explosion before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend.grammar_compiler.compile_json_schema.assert_not_called()
+
+    def test_outlines_rejects_deep_schema_before_compilation(self):
+        """Outlines backend should reject deep schemas before regex compilation."""
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend._compile_regex = MagicMock()
+
+        schema = {"type": "object"}
+        current = schema
+        for i in range(17):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend._compile_regex.assert_not_called()
+
+    def test_outlines_rejects_state_explosion_before_compilation(self):
+        """Outlines backend should reject state explosion before regex compilation."""
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend._compile_regex = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend._compile_regex.assert_not_called()

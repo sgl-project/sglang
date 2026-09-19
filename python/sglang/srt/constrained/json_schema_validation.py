@@ -4,6 +4,166 @@ from collections.abc import Iterator
 from typing import Any
 
 
+class JSONSchemaDepthExceeded(ValueError):
+    """Raised when JSON schema nesting depth exceeds the maximum allowed limit."""
+
+    pass
+
+
+class JSONSchemaStateExplosion(ValueError):
+    """Raised when JSON schema would cause excessive DFA/NFA state explosion."""
+
+    pass
+
+
+# Maximum allowed nesting depth for JSON schema
+MAX_SCHEMA_DEPTH = 16
+# Maximum allowed estimated DFA states (to prevent state explosion)
+MAX_DFA_STATES = 10000
+
+
+def validate_schema_depth(
+    schema: Any,
+    current_depth: int = 0,
+    max_depth: int = MAX_SCHEMA_DEPTH,
+) -> None:
+    """
+    Validate that JSON schema nesting depth does not exceed the maximum allowed limit.
+
+    Only traverses schema-bearing keywords to avoid false positives from instance data.
+
+    Args:
+        schema: The JSON schema to validate
+        current_depth: Current nesting depth (used for recursion)
+        max_depth: Maximum allowed nesting depth
+
+    Raises:
+        JSONSchemaDepthExceeded: If nesting depth exceeds max_depth
+    """
+    if current_depth > max_depth:
+        raise JSONSchemaDepthExceeded(
+            f"JSON schema nesting depth exceeds allowable limit of {max_depth}"
+        )
+    if not isinstance(schema, dict):
+        return
+
+    # Single subschema keywords
+    for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
+        child = schema.get(keyword)
+        if isinstance(child, (bool, dict)):
+            validate_schema_depth(child, current_depth + 1, max_depth)
+        elif keyword == "items" and isinstance(child, list):
+            for item in child:
+                validate_schema_depth(item, current_depth + 1, max_depth)
+
+    # Array subschema keywords
+    for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
+        children = schema.get(keyword)
+        if isinstance(children, list):
+            for child in children:
+                validate_schema_depth(child, current_depth + 1, max_depth)
+
+    # Map subschema keywords
+    for keyword in _SUBSCHEMA_MAP_KEYWORDS:
+        children = schema.get(keyword)
+        if isinstance(children, dict):
+            for child in children.values():
+                validate_schema_depth(child, current_depth + 1, max_depth)
+
+    # Dependencies
+    dependencies = schema.get("dependencies")
+    if isinstance(dependencies, dict):
+        for child in dependencies.values():
+            if isinstance(child, (bool, dict)):
+                validate_schema_depth(child, current_depth + 1, max_depth)
+
+
+def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
+    """
+    Estimate the number of DFA states that would be generated from a JSON schema.
+    This is a heuristic to catch schemas that would cause state explosion.
+
+    Only traverses schema-bearing keywords to match validation behavior.
+
+    Args:
+        schema: The JSON schema to estimate
+        depth: Current nesting depth
+
+    Returns:
+        Estimated number of DFA states
+    """
+    if not isinstance(schema, dict):
+        return 1
+
+    state_count = 1  # Base state for this schema level
+
+    # Each property adds states
+    properties = schema.get("properties", {})
+    if isinstance(properties, dict):
+        state_count += len(properties) * 2  # Property name + value states
+
+    # Single subschema keywords
+    for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
+        child = schema.get(keyword)
+        if isinstance(child, (bool, dict)):
+            state_count += _estimate_dfa_states(child, depth + 1)
+        elif keyword == "items" and isinstance(child, list):
+            for item in child:
+                state_count += _estimate_dfa_states(item, depth + 1)
+
+    # Array subschema keywords
+    for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
+        children = schema.get(keyword)
+        if isinstance(children, list):
+            for child in children:
+                state_count += _estimate_dfa_states(child, depth + 1)
+
+    # Map subschema keywords
+    for keyword in _SUBSCHEMA_MAP_KEYWORDS:
+        children = schema.get(keyword)
+        if isinstance(children, dict):
+            for child in children.values():
+                state_count += _estimate_dfa_states(child, depth + 1)
+
+    # Dependencies
+    dependencies = schema.get("dependencies")
+    if isinstance(dependencies, dict):
+        for child in dependencies.values():
+            if isinstance(child, (bool, dict)):
+                state_count += _estimate_dfa_states(child, depth + 1)
+
+    return state_count
+
+
+def validate_schema_bounds(
+    schema: Any,
+    max_depth: int = MAX_SCHEMA_DEPTH,
+    max_states: int = MAX_DFA_STATES,
+) -> None:
+    """
+    Validate JSON schema bounds to prevent DFA state explosion and CPU thread hanging.
+
+    This should be called before compiling a JSON schema to a grammar automaton.
+
+    Args:
+        schema: The JSON schema to validate
+        max_depth: Maximum allowed nesting depth (default: 16)
+        max_states: Maximum allowed estimated DFA states (default: 10000)
+
+    Raises:
+        JSONSchemaDepthExceeded: If nesting depth exceeds max_depth
+        JSONSchemaStateExplosion: If estimated DFA states exceeds max_states
+    """
+    validate_schema_depth(schema, max_depth=max_depth)
+
+    estimated_states = _estimate_dfa_states(schema)
+    if estimated_states > max_states:
+        raise JSONSchemaStateExplosion(
+            f"JSON schema estimated DFA states ({estimated_states}) exceeds "
+            f"maximum allowed ({max_states}). Schema may cause DoS via state explosion."
+        )
+
+
 class UnsupportedJSONSchemaFeature(ValueError):
     """A schema uses constraints that the selected backend cannot preserve."""
 

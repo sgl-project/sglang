@@ -37,7 +37,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
+    validate_schema_bounds,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
@@ -347,6 +350,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # original string to XGrammar to preserve its parser behavior.
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
+                validate_schema_bounds(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
@@ -354,6 +358,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except (
             RuntimeError,
             UnsupportedJSONSchemaFeature,
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
             json.decoder.JSONDecodeError,
             UnicodeDecodeError,
         ) as e:
