@@ -59,6 +59,7 @@ class AscendLoRABackend(BaseLoRABackend):
         result = result * rank_mask.to(result.dtype)
 
         result = result * scaling_per_token.unsqueeze(1).to(result.dtype)
+        result = result.to(dtype=torch.float)
 
         return result
 
