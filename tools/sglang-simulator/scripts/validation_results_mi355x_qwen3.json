@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "hardware": "MI355X (smci355-ccs-aus-m15-17)",
+    "note": "MI350X Conductor hosts denied SSH key; validation used existing MI355X serving traces from 2026-07-24.",
+    "model": "Qwen/Qwen3-32B-FP8",
+    "sglang_baseline": "0.5.17 serving traces; FIDB mi355x/sglang/0.5.17",
+    "topology": "tp8, ep1, concurrency=1, no prefix cache",
+    "predictor": "InferCast UMD per-forward (mean_attention_flops_v1 reduction)",
+    "method": "concurrency-1 micro-forward replay vs measured serving medians"
+  },
+  "cases": [
+    {
+      "workload": "512/512",
+      "ttft_err_pct": 75.6,
+      "tpot_err_pct": 10.4,
+      "itl_err_pct": 10.4,
+      "input_throughput_err_pct": 13.0,
+      "duration_err_pct": 88.9
+    },
+    {
+      "workload": "1024/512",
+      "ttft_err_pct": 77.7,
+      "tpot_err_pct": 10.3,
+      "itl_err_pct": 10.3,
+      "input_throughput_err_pct": 126.0,
+      "duration_err_pct": 88.9
+    },
+    {
+      "workload": "1024/1024",
+      "ttft_err_pct": 77.9,
+      "tpot_err_pct": 10.6,
+      "itl_err_pct": 10.6,
+      "input_throughput_err_pct": 12.6,
+      "duration_err_pct": 88.9
+    },
+    {
+      "workload": "2048/1024",
+      "ttft_err_pct": 97.7,
+      "tpot_err_pct": 10.4,
+      "itl_err_pct": 10.4,
+      "input_throughput_err_pct": 146.6,
+      "duration_err_pct": 89.9
+    }
+  ],
+  "summary": {
+    "ttft_err_pct_range": "75.6-97.7",
+    "tpot_err_pct_range": "10.3-10.6",
+    "itl_err_pct_range": "10.3-10.6",
+    "input_throughput_err_pct_range": "12.6-146.6",
+    "duration_err_pct_range": "88.9-89.9"
+  }
+}

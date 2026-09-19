@@ -1,0 +1,32 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "mi350x",
+      "vendor": "AMD",
+      "hbm_capacity_gb": 288
+    },
+    "num_device_per_node": 8
+  },
+  "predictor": {
+    "name": "infercast",
+    "model_id": "Qwen/Qwen3-32B-FP8",
+    "systems_root": "/path/to/systems",
+    "database_mode": "SILICON",
+    "attn_kernel_impl": "cuda_graph",
+    "attn_dtype": "bfloat16",
+    "kv_cache_dtype": "fp8",
+    "provider_revision": "<full InferCast commit>"
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1,
+    "pp_size": 1,
+    "cp_size": 1,
+    "data_type": "FP8",
+    "kv_cache_data_type": "FP8",
+    "backend_name": "sglang",
+    "backend_version": "<sglang FIDB version>",
+    "max_total_tokens": 65536
+  }
+}
