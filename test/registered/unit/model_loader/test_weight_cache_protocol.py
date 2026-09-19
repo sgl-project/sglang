@@ -360,6 +360,17 @@ class TestIpcQuantAllowlist(CustomTestCase):
         self.assertFalse(is_ipc_quant_supported("fp8", {}))
         self.assertFalse(is_ipc_quant_supported("fp8", None))
 
+    def test_mxfp4_routed_experts_rejected_even_with_supported_base_quant(self):
+        # Mixed FP8/MXFP4 checkpoints report fp8 as their base method, but the
+        # routed experts use a post-load layout that IPC cannot rehydrate.
+        self.assertFalse(
+            is_ipc_quant_supported(
+                "fp8",
+                {"weight_block_size": [128, 128]},
+                is_fp4_experts=True,
+            )
+        )
+
     def test_unknown_method_rejected(self):
         self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
         self.assertFalse(is_ipc_quant_supported("awq", None))
@@ -370,6 +381,14 @@ class TestIpcQuantAllowlist(CustomTestCase):
         # Per-tensor FP8 must also raise even though "fp8" is a known key.
         with self.assertRaises(UnsupportedQuantForIPCError):
             check_ipc_quant_support("fp8", {}, where="daemon")
+        with self.assertRaises(UnsupportedQuantForIPCError) as ctx:
+            check_ipc_quant_support(
+                "fp8",
+                {"weight_block_size": [128, 128]},
+                where="client",
+                is_fp4_experts=True,
+            )
+        self.assertIn("MXFP4", str(ctx.exception))
 
     def test_check_passes_on_supported(self):
         # Should not raise.
