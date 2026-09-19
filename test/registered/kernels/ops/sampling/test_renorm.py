@@ -138,7 +138,7 @@ def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
     with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
         assert torch.equal(top_k_renorm_prob(probs, top_k), ref)
     # default path agrees with the deterministic one up to rounding
-    fast = top_k_renorm_prob(probs, top_k)
+    fast = top_k_renorm_prob(probs, top_k, deterministic=False)
     torch.testing.assert_close(fast, ref, rtol=1e-5, atol=1e-6)
 
 

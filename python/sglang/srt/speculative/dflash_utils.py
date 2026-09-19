@@ -46,8 +46,10 @@ if is_cuda():
         tree_speculative_sampling_target_only,
     )
     from sglang.srt.layers.sampling_renorm import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
+        spec_top_k_renorm_prob as top_k_renorm_prob,
+    )
+    from sglang.srt.layers.sampling_renorm import (
+        spec_top_p_renorm_prob as top_p_renorm_prob,
     )
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
@@ -56,8 +58,10 @@ elif is_musa():
         from sgl_kernel import tree_speculative_sampling_target_only
 
         from sglang.srt.layers.sampling_renorm import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
+            spec_top_k_renorm_prob as top_k_renorm_prob,
+        )
+        from sglang.srt.layers.sampling_renorm import (
+            spec_top_p_renorm_prob as top_p_renorm_prob,
         )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
