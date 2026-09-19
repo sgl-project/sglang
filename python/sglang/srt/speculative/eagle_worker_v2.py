@@ -1873,7 +1873,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.ps.tp_rank]
+            recv_req.serialized_named_tensors[self.model_runner.tp_rank]
         )
         success, message = (
             self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(

@@ -99,7 +99,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = ps.tp_rank
+        self.tp_rank = self.model_runner.tp_rank
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
