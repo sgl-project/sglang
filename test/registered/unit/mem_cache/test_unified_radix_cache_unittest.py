@@ -8511,6 +8511,122 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
 
+class TestHiCacheChunkBoundaryBackup(CustomTestCase):
+    """A FULL+MAMBA prefix committed at a chunk boundary must still reach host
+    backup when the final extend is shorter than mamba_cache_chunk_size, and a
+    request served entirely from the tree must not insert an untracked state."""
+
+    _rid = 0
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        mamba_cache_size=60,
+        kv_size=2048,
+        max_context_len=2048,
+    )
+    _init_hicache = TestUnifiedRadixCacheKVEvents._init_hicache
+    _make_req = UnifiedRadixCacheSuite._make_req
+
+    def _new_req(self, req_to_token_pool, tokens):
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.swa_evicted_seqlen = 0
+        req.swa_uuid_for_lock = None
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        return req
+
+    def _finish_with_one_token(self, cache, allocator, req_to_token_pool, req, tokens):
+        kv_len = len(tokens)
+        req.output_ids = array("q", [2000])
+        req.full_untruncated_fill_ids = array("q", tokens + [2000])
+        req.set_extend_range(kv_len, kv_len + 1)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(kv_len, kv_len + 1)), allocator.alloc(1)
+        )
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = kv_len + 1
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+
+    def _seed_chunk_boundary_prefix(self, cache, allocator, req_to_token_pool, tokens):
+        """First chunk commits the whole prefix via the chunked insert; the
+        one-token final extend is too short to track a new Mamba state."""
+        req = self._new_req(req_to_token_pool, tokens)
+        req.set_extend_range(0, len(tokens))
+        kv_len = len(tokens)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, kv_len)), allocator.alloc(kv_len)
+        )
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = kv_len
+        req.kv.mamba_last_track_seqlen = kv_len
+        req.last_node = cache.root_node.id
+        cache.cache_unfinished_req(req, chunked=True)
+        boundary_node = cache.resolve_node_handle(req.last_node)
+        self.assertIsNot(boundary_node, cache.root_node)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        return req, boundary_node
+
+    def test_chunk_boundary_prefix_backed_up_after_finish(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.write_through_threshold = 1
+        tokens = list(range(1, 1 + 3 * self.cfg.page_size))
+
+        req, boundary_node = self._seed_chunk_boundary_prefix(
+            cache, allocator, req_to_token_pool, tokens
+        )
+        self.assertFalse(boundary_node.backuped)
+        self._finish_with_one_token(cache, allocator, req_to_token_pool, req, tokens)
+
+        self.assertTrue(boundary_node.backuped)
+        cache.writing_check()
+        cache.sanity_check()
+
+    def test_untracked_finish_over_matched_prefix_inserts_no_state(self):
+        """Prefix entirely from match_prefix, final extend below the chunk
+        grid: the committed node already holds the state, so the finish-time
+        insert must report mamba_exist and release the request's slot."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.write_through_threshold = 1
+        tokens = list(range(1, 1 + 3 * self.cfg.page_size))
+        req, boundary_node = self._seed_chunk_boundary_prefix(
+            cache, allocator, req_to_token_pool, tokens
+        )
+        self._finish_with_one_token(cache, allocator, req_to_token_pool, req, tokens)
+        state_before = boundary_node.component_data[ComponentType.MAMBA].value
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        req2 = self._new_req(req_to_token_pool, tokens)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        kv_len = len(tokens)
+        self.assertEqual(len(match.device_indices), kv_len)
+        req2.prefix_indices = match.device_indices
+        req2.last_node = match.last_device_node
+        req2.lock_receipt = cache.inc_lock_ref(match.last_device_node).to_dec_params()
+        req_to_token_pool.write(
+            (req2.kv.req_pool_idx, slice(0, kv_len)), match.device_indices
+        )
+        req2.kv.kv_committed_len = req2.kv.kv_allocated_len = kv_len
+        req2.kv.cache_protected_len = kv_len
+        req2.kv.mamba_last_track_seqlen = None
+        self._finish_with_one_token(cache, allocator, req_to_token_pool, req2, tokens)
+
+        self.assertIs(
+            boundary_node.component_data[ComponentType.MAMBA].value, state_before
+        )
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
+        cache.writing_check()
+        cache.sanity_check()
+
+
 _CONFIGS: list[CacheConfig] = [
     CacheConfig(page_size=1, components=(ComponentType.FULL,)),
     CacheConfig(page_size=4, components=(ComponentType.FULL,)),
