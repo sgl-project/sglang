@@ -19,10 +19,13 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <bit>
 #include <climits>
 #include <cstdint>
 #include <iterator>
+#include <mutex>
+#include <utility>
 
 namespace sglang {
 
@@ -506,6 +509,401 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
 
 #endif  // SUPPORT_CLUSTER
 
+#ifdef USE_ROCM
+// ---------------------------------------------------------------------------
+// Split path (ROCm): one row across several blocks, cooperating through global
+// memory instead of a cluster.
+//
+// This is the CDNA answer to TopKCluster, not a port of it. The cluster path
+// needs thread-block clusters and distributed shared memory -- one cluster owns
+// a row, the ranks all-reduce their histograms over DSMEM and synchronise with
+// cluster.sync() -- and CDNA has neither primitive. What it does have is the
+// pattern v1's topk.hip already uses on this hardware: put the shared state in
+// global memory and let a kernel boundary be the barrier.
+//
+// Two launches, which is the fewest this can be done in without assuming the
+// blocks of a row are co-resident:
+//
+//   1. topk_split_hist    each rank histograms its own chunk and folds it into
+//                         the row's shared histogram with global atomics.
+//   2. topk_split_select  each rank reads that histogram, finds the threshold,
+//                         scans its chunk again and appends its candidates.
+//                         The last rank to arrive resolves the tie tail and
+//                         applies the page-table transform.
+//
+// Nothing spins: the epilogue runs in whichever block arrives last, so the path
+// makes no forward-progress assumption that a plain launch does not already
+// guarantee.
+//
+// The shared histogram is accumulated rather than given one plane per rank and
+// summed by the reader. Per-rank planes need no zeroing, which is tidier, but
+// the reader then walks `split` planes in a loop the compiler cannot software
+// pipeline, so it pays the memory latency `split` times over -- 23 us of a
+// 26 us kernel, measured. Accumulating costs a zeroed buffer instead, and the
+// epilogue block clears the row on its way out so the next launch finds it
+// clean (the allocation is zeroed once, for the first call).
+//
+// That reset makes the workspace single-stream state: two streams running this
+// path on one device would interleave their histograms. Every consumer runs the
+// model on one stream, and the counters below have the same shape of problem,
+// but it is the reason this scratch cannot simply be shared more widely.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kSplitMax = 32;  ///< most blocks one row may take
+constexpr uint32_t kSplitMin = 4;   ///< fewest that pays for the second launch
+
+/// Blocks a launch may spread its rows over: the cross-block cost grows with
+/// rows * split, while the scan it buys back only shrinks as L / split.
+constexpr uint32_t kSplitBlocks = 64;
+
+/// Shortest row worth splitting: the second launch and the once-per-row
+/// epilogue have to be covered, and their cost tracks the batch, not the spread.
+inline constexpr uint32_t split_floor(uint32_t batch_size) {
+  return batch_size <= 8 ? 40960 : batch_size <= 16 ? 49152 : batch_size <= 32 ? 65536 : 114688;
+}
+
+/// A cache line each: rows reserve their output slots with atomics on these,
+/// and packing four rows into one line makes those atomics serialize across
+/// rows that have nothing to do with each other.
+struct alignas(128) SplitCounters {
+  uint32_t count_gt;
+  uint32_t count_eq;
+  uint32_t arrive;
+  uint32_t _pad;
+};
+
+struct SplitWorkspace {
+  uint32_t* __restrict__ hist;        ///< [rows][kHistSize], accumulated, left zeroed
+  SplitCounters* __restrict__ ctr;    ///< [rows]
+  impl::TieValue* __restrict__ ties;  ///< [rows][kMaxNumTie]
+  uint32_t split;
+  uint32_t floor;  ///< same value the host dispatched on
+};
+
+/// 12 histogram bits, the width TopKStreaming uses: a 10-bit threshold bin holds
+/// more unequal scores than kMaxNumTie can stage, and drops the rest in silence.
+struct TopKSplit : impl::TopKRadixBase<12> {
+  using Base = impl::TopKRadixBase<12>;
+  static_assert(kHistSize % kBlockSize == 0, "the histogram is transferred kHistItems bins per thread");
+  /// Bins per thread, in the contiguous tx * kHistItems layout the base uses.
+  static constexpr uint32_t kHistItems = kHistSize / kBlockSize;
+  static constexpr uint32_t kWarp = kBlockSize / impl::TopKConfig::kNumWarps;
+
+  struct Smem : Base::Smem {
+    uint32_t base_gt, base_eq, total_gt, total_eq, is_last;
+    int32_t staged[kMaxTopK];
+  };
+
+  struct Chunk {
+    uint32_t start, len;
+  };
+
+  /// This rank's slice. Chunk starts are rounded up to a whole wavefront of
+  /// vector loads so that for_each_input's 16-byte path stays aligned on every
+  /// rank, not just the first.
+  SGL_DEVICE static Chunk chunk_of(uint32_t seq_len, uint32_t rank, uint32_t split) {
+    constexpr uint32_t kAlign = kWarp * kVecSize;
+    const uint32_t per = (seq_len + split - 1) / split;
+    const uint32_t size = ((per + kAlign - 1) / kAlign) * kAlign;
+    const uint32_t start = min(rank * size, seq_len);
+    return {start, min(start + size, seq_len) - start};
+  }
+
+  SGL_DEVICE static void
+  histogram_chunk(const TopKProblem& problem, Chunk chunk, uint32_t* __restrict__ row_hist, Smem* smem) {
+    const auto tx = threadIdx.x;
+    init_histogram(smem->histogram, tx);
+    __syncthreads();
+    for_each_input(problem.in + chunk.start, chunk.len, [&](float val, uint32_t) {
+      atomicAdd(&smem->histogram[impl::extract_coarse_bin<kHistBits>(val)], 1);
+    });
+    __syncthreads();
+    // One atomic per bin per rank, so `split` of them per address at worst.
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      if (const auto n = smem->histogram[bin]; n != 0) atomicAdd(&row_hist[bin], n);
+    }
+  }
+
+  /// Hand a row's histogram back zeroed, so the next launch needs no reset.
+  SGL_DEVICE static void clear_row(uint32_t* __restrict__ row_hist) {
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i)
+      row_hist[threadIdx.x * kHistItems + i] = 0;
+  }
+
+  /// Scan this rank's chunk and append what clears the threshold.
+  ///
+  /// Counted in LDS first and committed with one global atomic per block per
+  /// class, the way the cluster path stages through `tmp_out`. Taking a slot
+  /// per candidate straight from the global counter looks tempting because the
+  /// above-threshold candidates are bounded by topk -- but the threshold bin
+  /// itself is not, and a bin holding a few thousand elements turns into a few
+  /// thousand serialized atomics on one address, which measured five times
+  /// slower than not splitting at all.
+  SGL_DEVICE static void select_chunk(
+      const TopKProblem& problem,
+      Chunk chunk,
+      const uint32_t* __restrict__ row_hist,
+      SplitCounters* __restrict__ ctr,
+      impl::TieValue* __restrict__ ties,
+      Smem* smem) {
+    const auto tx = threadIdx.x;
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      smem->histogram[bin] = row_hist[bin];
+    }
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+      smem->v_hi = impl::padding_value();
+      smem->v_lo = impl::padding_value();
+    }
+    __syncthreads();
+    // The full row's histogram and the full row's seq_len, so every rank picks
+    // the same bin and the appends below agree on what "above" means.
+    find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
+      smem->v_hi = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
+      smem->v_lo = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+    });
+
+    const auto topk = problem.topk;
+    const auto v_hi = smem->v_hi;
+    const auto v_lo = smem->v_lo;
+    __syncthreads();
+
+    for_each_input(problem.in + chunk.start, chunk.len, [&](float val, uint32_t local) {
+      const auto idx = chunk.start + local;
+      if (val >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1u);
+        // The whole row has fewer than topk of these, so this rank has too.
+        if (pos < topk) [[likely]]
+          smem->staged[pos] = static_cast<int32_t>(idx);
+      } else if (val >= v_lo) {
+        const auto slot = atomicAdd(&smem->count_eq, 1u);
+        if (slot < kMaxNumTie) [[likely]]
+          smem->tie_values[slot] = {val, idx};
+      }
+    });
+    __syncthreads();
+
+    const auto n_gt = min(smem->count_gt, topk);
+    const auto n_eq = min(smem->count_eq, kMaxNumTie);
+    if (tx == 0) {
+      smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
+      smem->base_eq = atomicAdd(&ctr->count_eq, n_eq);
+    }
+    __syncthreads();
+    const auto base_gt = smem->base_gt;
+    const auto base_eq = smem->base_eq;
+
+    for (uint32_t t = tx; t < n_gt; t += kBlockSize) {
+      if (base_gt + t < topk) problem.emit(base_gt + t, static_cast<uint32_t>(smem->staged[t]));
+    }
+    for (uint32_t t = tx; t < n_eq; t += kBlockSize) {
+      if (base_eq + t < kMaxNumTie) ties[base_eq + t] = smem->tie_values[t];
+    }
+  }
+
+  /// True in exactly one block per row, once every rank's appends are visible.
+  /// Nobody waits: the epilogue simply runs wherever the last arrival lands.
+  SGL_DEVICE static bool arrive_last(SplitCounters* __restrict__ ctr, uint32_t split, Smem* smem) {
+    __syncthreads();  // this block's appends are done and visible to thread 0
+    if (threadIdx.x == 0) {
+      // Both fences belong to this thread alone. A device-scope fence on a
+      // multi-die part is a cross-L2 operation, and letting all 1024 threads
+      // issue one costs 8 us of a 26 us kernel; the __syncthreads above
+      // already gave thread 0 the rest of the block's writes to push out.
+      __threadfence();  // release: the appends land before the arrival does
+      const bool last = atomicAdd(&ctr->arrive, 1u) == split - 1;
+      smem->is_last = last ? 1u : 0u;
+      if (last) {
+        __threadfence();  // acquire the other ranks' appends
+        // Through the atomic path that wrote them: a plain load could be
+        // served out of this CU's own stale cache.
+        smem->total_gt = atomicAdd(&ctr->count_gt, 0u);
+        smem->total_eq = atomicAdd(&ctr->count_eq, 0u);
+      }
+    }
+    __syncthreads();
+    return smem->is_last != 0;
+  }
+
+  /// Fill the slots the threshold bin has to break ties for. handle_tie takes a
+  /// plain pointer, so it could read the workspace directly, but its ranking
+  /// pass is all-to-all over the candidates; staging them into LDS first keeps
+  /// that out of global memory.
+  SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto above_count = smem->total_gt;
+    const auto tie_count = min(smem->total_eq, kMaxNumTie);
+    const auto remain_topk = above_count < problem.topk ? problem.topk - above_count : 0;
+    for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+      smem->tie_values[t] = ties[t];
+    __syncthreads();
+    handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle);
+  }
+};
+
+template <bool kPDL>
+TOPK_KERNEL void topk_split_hist(const __grid_constant__ TopKPagedParams params, const SplitWorkspace ws) {
+  device::enable_smem_spilling();
+  const auto row = blockIdx.x;
+  const auto rank = blockIdx.y;
+  const auto tx = threadIdx.x;
+  // One launch boundary ahead of the only reader, so no fence is needed.
+  if (rank == 0 && tx < sizeof(SplitCounters) / sizeof(uint32_t)) {
+    reinterpret_cast<uint32_t*>(&ws.ctr[row])[tx] = 0;
+  }
+
+  const auto problem = params.problem(row);
+  if (problem.seq_len <= ws.floor) return;  // the select pass takes it whole
+
+  __shared__ impl::MaxSmem<TopKSplit::Smem> smem;
+  const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, ws.split);
+  auto* row_hist = ws.hist + static_cast<size_t>(row) * TopKSplit::kHistSize;
+  device::PDLWaitPrimary<kPDL>();
+  TopKSplit::histogram_chunk(problem, chunk, row_hist, reinterpret_cast<TopKSplit::Smem*>(&smem));
+}
+
+template <bool kPDL, TopKMode kMode>
+TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams params, const SplitWorkspace ws) {
+  device::enable_smem_spilling();
+  const auto row = blockIdx.x;
+  const auto rank = blockIdx.y;
+  auto problem = params.problem(row);
+  constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
+  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, TopKSplit::Smem> smem;
+
+  // Rows too short to be worth splitting were skipped by the histogram pass;
+  // rank 0 runs them on the ordinary one-block paths and the rest retire, the
+  // same election the cluster kernel makes for its short items.
+  if (problem.seq_len <= ws.floor) {
+    if (rank != 0) return;
+    __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
+    if (problem.seq_len <= problem.topk) {
+      return trivial_transform<kPDL, kMode>(problem, params.get_transform(row));
+    }
+    if constexpr (kNeedStaging) problem.out = s_topk_indices;
+    if (problem.seq_len <= kReg4MaxSeqLen) {
+      Register4::forward<kPDL>(problem, &smem);
+    } else {
+      Streaming::forward<kPDL>(problem, &smem);
+    }
+    device::PDLTriggerSecondary<kPDL>();
+    if constexpr (kNeedStaging) {
+      __syncthreads();
+      paged_transform<kMode>(problem, params.get_output_ptr(row), params.get_transform(row));
+    }
+    return;
+  }
+
+  auto* const split_smem = reinterpret_cast<TopKSplit::Smem*>(&smem);
+  auto* const ctr = &ws.ctr[row];
+  auto* const ties = ws.ties + static_cast<size_t>(row) * TopKSplit::kMaxNumTie;
+  const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, ws.split);
+  auto* const row_hist = ws.hist + static_cast<size_t>(row) * TopKSplit::kHistSize;
+
+  TopKSplit::select_chunk(problem, chunk, row_hist, ctr, ties, split_smem);
+  if (!TopKSplit::arrive_last(ctr, ws.split, split_smem)) return;
+
+  TopKSplit::clear_row(row_hist);
+  TopKSplit::finish_ties(problem, ties, split_smem);
+  device::PDLTriggerSecondary<kPDL>();
+  if constexpr (kNeedStaging) {
+    // problem.out is already the destination, and paged_transform reads every
+    // slot into registers before writing any, so transforming in place is safe.
+    __syncthreads();
+    paged_transform<kMode>(problem, problem.out, params.get_transform(row));
+  }
+}
+
+/// Per-device scratch for the split path, allocated once and never freed.
+///
+/// Never freed on purpose. Growing the buffer would be worse than wasteful: a
+/// HIP graph captured while an earlier allocation was current bakes that
+/// address into its kernel arguments, so releasing it leaves those graphs
+/// writing into memory the allocator has since handed to someone else -- the
+/// same hazard v1's topk.hip avoids by taking its scratch from the caching
+/// allocator per call. Allocating the worst case up front sidesteps both. The
+/// worst case is small because the path is only taken when rows * split fits
+/// the machine, so the histograms are bounded by the CU count and not by the
+/// batch: about 2 MB on a 256-CU part.
+struct SplitResources {
+  int cu = 0;
+  uint32_t max_rows = 0;
+  SplitWorkspace ws{};
+
+  SplitResources() = default;  // the "no split path here" state
+
+  explicit SplitResources(int device_id) {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device_id) != hipSuccess) {
+      (void)hipGetLastError();  // do not leave it for the next launch to trip on
+      return;
+    }
+    cu = prop.multiProcessorCount;
+    max_rows = std::max<uint32_t>(cu / kSplitMin, 1);
+
+    const size_t hist_bytes = static_cast<size_t>(max_rows) * TopKSplit::kHistSize * sizeof(uint32_t);
+    const size_t ctr_bytes = static_cast<size_t>(max_rows) * sizeof(SplitCounters);
+    const size_t tie_bytes = static_cast<size_t>(max_rows) * TopKSplit::kMaxNumTie * sizeof(impl::TieValue);
+
+    int prev = 0;
+    (void)hipGetDevice(&prev);
+    (void)hipSetDevice(device_id);
+    void* base = nullptr;
+    const auto total = hist_bytes + ctr_bytes + tie_bytes;
+    // Zeroed once here; from then on each launch leaves the histogram clean.
+    const bool ok = hipMalloc(&base, total) == hipSuccess && hipMemset(base, 0, total) == hipSuccess;
+    (void)hipSetDevice(prev);
+    if (!ok) {
+      (void)hipGetLastError();
+      cu = 0;  // the caller falls back to one block per row
+      return;
+    }
+    auto* p = static_cast<char*>(base);
+    ws.hist = reinterpret_cast<uint32_t*>(p);
+    p += hist_bytes;
+    ws.ctr = reinterpret_cast<SplitCounters*>(p);
+    p += ctr_bytes;
+    ws.ties = reinterpret_cast<impl::TieValue*>(p);
+  }
+};
+
+inline const SplitResources& split_resources(int device_id) {
+  // One slot per device: the buffer is a raw device pointer, so a single shared
+  // one would be valid on exactly one of them.
+  constexpr int kMaxDevices = 16;
+  static std::once_flag once[kMaxDevices];
+  static const SplitResources* slots[kMaxDevices] = {};
+  static const SplitResources kNone{};
+  if (device_id < 0 || device_id >= kMaxDevices) return kNone;
+  std::call_once(once[device_id], [device_id] { slots[device_id] = new SplitResources(device_id); });
+  return *slots[device_id];
+}
+
+/// How many blocks to give each row, and the scratch they share. Zero means the
+/// ordinary one-block-per-row dispatch.
+///
+/// Both bounds are measured: split_floor for how long the row has to be,
+/// kSplitBlocks for how far it is worth spreading.
+inline auto split_plan(uint32_t batch_size, uint32_t max_seq_len, DLDevice device)
+    -> std::pair<uint32_t, SplitWorkspace> {
+  const auto& res = split_resources(device.device_id);
+  if (res.cu <= 0 || batch_size == 0 || batch_size > res.max_rows) return {0, {}};
+  const auto split = std::clamp<uint32_t>(kSplitBlocks / batch_size, kSplitMin, kSplitMax);
+  const auto floor = split_floor(batch_size);
+  if (split < kSplitMin || max_seq_len <= floor) return {0, {}};
+  auto ws = res.ws;
+  ws.split = split;
+  ws.floor = floor;
+  return {split, ws};
+}
+#endif  // USE_ROCM
+
 template <bool kUsePDL>
 struct TopKKernel {
   static void plan(  //
@@ -697,6 +1095,18 @@ struct TopKKernel {
             return void();
           }
         }
+      }
+#elif defined(USE_ROCM)
+      // Split dispatch. One block per row leaves a long row latency bound on one
+      // CU however idle the rest is; split_plan decides where a second launch pays.
+      if (const auto [split, split_ws] = split_plan(batch_size, max_seq_len, device); split >= kSplitMin) {
+        LaunchKernel({batch_size, split}, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_split_hist<kUsePDL>, params, split_ws);
+        LaunchKernel({batch_size, split}, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_split_select<kUsePDL, kMode>, params, split_ws);
+        return;
       }
 #endif
       if (max_seq_len <= kReg2MaxSeqLen) {
