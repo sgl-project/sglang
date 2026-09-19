@@ -4,18 +4,15 @@
 use super::forward::{forward_chat_request, SelectedWorkers};
 use super::nonempty_header;
 use super::preparation::{parse_routing_fields, PreparedChatRequest};
-use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
+use crate::buckets_reorg::{BucketRequest, BucketResolver};
 use crate::discovery::ModelId;
-use crate::policies_reorg::{PickError, PickRequest, Stage};
+use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::state::LoadView;
-use crate::workers::Worker;
 use axum::body::Body;
 use axum::http::{HeaderMap, Response};
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Bucket-first implementation selected by `AppContext::chat_routing`.
@@ -58,12 +55,38 @@ pub(super) async fn chat_completions(
             None,
         ));
     }
+    let bucket_request = BucketRequest {
+        model: &request.model,
+        input_tokens,
+        expected_peak_tokens,
+        token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        session_key: ctx
+            .config
+            .model
+            .affinity
+            .as_ref()
+            .and_then(|config| nonempty_header(&headers, &config.session_id_header)),
+        routing_key: ctx
+            .config
+            .model
+            .sticky
+            .as_ref()
+            .and_then(|config| nonempty_header(&headers, &config.header_name)),
+    };
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
     for bucket in buckets {
-        match pick_bucket(ctx, &request, &headers, bucket, expected_peak_tokens).await {
-            Ok(workers) => {
+        match bucket
+            .pick_engines(&ctx.registry, &bucket_request, &ctx.engine_load)
+            .await
+        {
+            Ok(picks) => {
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
+                let workers = SelectedWorkers {
+                    prefill: picks.prefill.engine,
+                    decode: picks.decode.map(|pick| pick.engine),
+                    track_dispatch_timestamps: false,
+                };
                 return forward_chat_request(ctx, request, workers, headers, start).await;
             }
             Err((stage, error)) => {
@@ -87,99 +110,6 @@ pub(super) async fn chat_completions(
         None => PickError::NoCandidates,
     };
     Err(selection_error(error, &request.model, missing_stage))
-}
-
-async fn pick_bucket(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    headers: &HeaderMap,
-    bucket: &Bucket,
-    expected_peak_tokens: Option<u64>,
-) -> Result<SelectedWorkers, (Stage, PickError)> {
-    let (prefill, decode) = match &bucket.groups {
-        BucketGroups::Plain(group) => (
-            pick_engine(
-                ctx,
-                request,
-                headers,
-                bucket,
-                group,
-                Stage::Plain,
-                expected_peak_tokens,
-            )
-            .await?,
-            None,
-        ),
-        BucketGroups::Pd { prefill, decode } => {
-            let prefill = pick_engine(
-                ctx,
-                request,
-                headers,
-                bucket,
-                prefill,
-                Stage::Prefill,
-                expected_peak_tokens,
-            )
-            .await?;
-            let decode = pick_engine(
-                ctx,
-                request,
-                headers,
-                bucket,
-                decode,
-                Stage::Decode,
-                expected_peak_tokens,
-            )
-            .await?;
-            (prefill, Some(decode))
-        }
-    };
-    Ok(SelectedWorkers {
-        prefill,
-        decode,
-        track_dispatch_timestamps: false,
-    })
-}
-
-async fn pick_engine(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    headers: &HeaderMap,
-    bucket: &Bucket,
-    group: &EngineGroup,
-    stage: Stage,
-    expected_peak_tokens: Option<u64>,
-) -> Result<Arc<Worker>, (Stage, PickError)> {
-    // One lazy report snapshot per stage, including its policy fallback/admission.
-    let load = LoadView::new(&ctx.engine_load);
-    let pick_request = PickRequest {
-        bucket: &bucket.id,
-        expected_peak_tokens,
-        token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-        session_key: ctx
-            .config
-            .model
-            .affinity
-            .as_ref()
-            .and_then(|config| nonempty_header(headers, &config.session_id_header)),
-        routing_key: ctx
-            .config
-            .model
-            .sticky
-            .as_ref()
-            .and_then(|config| nonempty_header(headers, &config.header_name)),
-        ..PickRequest::new(
-            &request.model,
-            stage,
-            request.input_token_count as u64,
-            &load,
-        )
-    };
-    group
-        .pick(&ctx.registry, &pick_request)
-        .await
-        .map(|pick| pick.engine)
-        .map_err(|error| (stage, error))
 }
 
 fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {

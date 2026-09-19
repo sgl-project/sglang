@@ -9,16 +9,16 @@ listed at the end.
 
 1. **Order compatible buckets by token length first.** `BucketResolver` returns
    all matching buckets, smallest capacity first, without inspecting workers or policies.
-2. **The selected bucket determines plain versus PD serving.** `BucketGroups`
-   contains either one plain `EngineGroup`, or both prefill and decode groups.
-   Both PD engines come from that same selected bucket.
+2. **The bucket owns plain versus PD engine selection.** `Bucket::pick_engines`
+   calls its one plain group or both prefill and decode groups, returning a
+   complete selection. Both PD engines come from that same bucket.
 3. **An engine group owns membership and its policy.** `EngineGroup::pick`
    filters live workers by model, health, stage, and membership, invokes the
    policy, and validates that its result belongs to the exact candidate set.
 4. **A policy owns selection, fallback, and admission within its candidates.**
    It cannot choose another bucket or cross a PD role boundary.
-5. **The handler coordinates stages and dispatch.** A plain request needs one
-   pick; a PD request needs both picks before either engine is dispatched.
+5. **The handler owns bucket fallback and dispatch.** It calls `pick_engines`
+   on each bucket and dispatches only after a complete selection succeeds.
    Missing candidates or admission rejection advance to the next bucket, where
    all required engines are selected again. Invalid signals or policy results stop routing.
 
@@ -31,10 +31,10 @@ workers. Group policy instances are reused across requests.
 | Type | Owns |
 | --- | --- |
 | `BucketResolver` | A model's bucket collection, length filtering, and ordering |
-| `Bucket` | ID, input-token limits, context capacity, tie-break rank, and plain or PD groups |
+| `Bucket` | ID, length constraints, rank, groups, and complete plain/PD engine selection |
 | `EngineGroup` | Engine membership, attached policy, and engine selection |
 | `WorkerRegistry` | Live workers, model membership, health, and role |
-| Request handler | Ordered bucket iteration, group calls for each mode, and dispatch |
+| Request handler | Request preparation, ordered bucket attempts, HTTP errors, and dispatch |
 
 `worker_ids: None` means every healthy engine serving the requested model and
 role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
@@ -83,6 +83,11 @@ list of compatible bucket references (possibly empty), or an invalid-signal erro
 It does not receive a stage or a load view, resolve live engines, or invoke policies.
 The handler iterates this list until a bucket supplies the complete engine selection.
 
+`Bucket::pick_engines(workers, request, engine_load)` accepts a `BucketRequest`
+of prepared routing facts, invokes the required groups, and returns `BucketPick`
+(one plain pick or a complete P/D pair). Failures retain their stage. This API
+has no HTTP headers, `AppContext`, or forwarding dependency.
+
 `EngineGroup::pick(workers, request)` resolves healthy workers for the request's
 model and stage, intersects them with its membership, sorts them by stable ID,
 and invokes its attached policy. It rejects foreign results, including a newly
@@ -95,7 +100,7 @@ chat_completions (reorg configured): prepare tokens and expected peak
 BucketResolver::resolve: ordered length-compatible buckets
   |
   v
-For each bucket:
+For each bucket: bucket.pick_engines(...)
   |
   +-- BucketGroups::Plain
   |     plain.pick() -> one plain engine
@@ -111,9 +116,10 @@ For each bucket:
 Complete selection -> forward_chat_request: acquire guards, attach PD bootstrap, forward response
 ```
 
-The handler creates a fresh `LoadView` and stage-specific `PickRequest` for each
-group call. Each request carries the selected bucket ID, input length, optional
-expected peak, token IDs, and session/routing keys. PD uses separate group
+The handler extracts token facts and header keys once into `BucketRequest`.
+The bucket creates a fresh `LoadView` and stage-specific `PickRequest` for each
+group call, supplying its own ID and the role associated with that group.
+The input length, expected peak, token IDs, and session/routing keys pass through. PD uses separate group
 policies, but never independently resolves a decode bucket. Decode selection
 failure discards that tentative prefill choice and advances to the next bucket
 on missing candidates or admission rejection. No forwarding guards are acquired
@@ -147,8 +153,8 @@ the existing body-size estimate when tokenization is unavailable.
 4. Sort by ascending input capacity (the lesser of the input upper bound and
    context capacity). Unbounded capacities sort last. Break ties by ascending
    bucket rank, then ID, and return the entire ordered list.
-5. The handler tries each bucket's `BucketGroups` until one supplies its required
-   engine(s). A failed PD attempt never contributes an engine to a later pair.
+5. The handler calls each bucket's `pick_engines` until one supplies its complete
+   selection. A failed PD attempt never contributes an engine to a later pair.
 
 The handler checks addition overflow when computing the expected peak.
 An empty bucket list becomes a 400 `NoMatchingBucket` response. After exhausting
@@ -327,7 +333,7 @@ or correction for dispatches since the report. Those follow-ups must preserve
 source, freshness, and available measurements without adding another independent
 in-flight counter.
 
-The request handler creates a fresh `LoadView` for each stage's selection pass
+The bucket creates a fresh `LoadView` for each group selection attempt
 and lends it through `PickRequest`. Reuse it across admission, selection, and
 fallback in that pass; never store it on a bucket, group, or long-lived policy.
 A retry needs a new view. The type itself does not enforce this lifecycle.
@@ -413,7 +419,7 @@ With a known peak of 8k or less, the same input selects both groups of the short
 
 The planned factory validates unique nonempty bucket IDs, token ranges, and
 role-compatible membership. Each bucket is either plain or PD. The selected
-bucket determines which groups the handler invokes. The existing worker registry
+bucket invokes its required groups through `pick_engines`. The existing worker registry
 still rejects mixed plain and PD engines within one model; this PR preserves
 that constraint. The engine group's model and stage filters apply on every pick.
 
@@ -501,13 +507,15 @@ This PR adds the side-by-side interfaces in `src/buckets_reorg.rs` and
 Implemented here:
 
 - `BucketResolver::resolve` returns all length-compatible buckets in capacity/rank/ID order.
+- `Bucket::pick_engines` owns plain/PD orchestration and stage-specific policy
+  requests; `BucketRequest` carries prepared facts and `BucketPick` retains picks.
 - `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, admission placement, and `AllowAll`.
 - Lazy report capture through one `LoadView` per group selection pass.
-- The reorg chat implementation iterates resolved buckets, calls one plain group
-  or both PD groups, advances on empty candidates/admission rejection, and
+- The reorg chat implementation iterates resolved buckets, calls `pick_engines`,
+  advances on empty candidates/admission rejection, and
   dispatches only after one complete selection. Exhaustion retains admission reasons.
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
