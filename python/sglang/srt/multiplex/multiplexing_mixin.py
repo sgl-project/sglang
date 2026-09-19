@@ -21,7 +21,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_device, get_disagg, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -37,7 +37,7 @@ class SchedulerMultiplexMixin:
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(get_disagg().pdmux_config_path)
-        initialize_stream_groups(self.gpu_id, self.pdmux_config)
+        initialize_stream_groups(get_device().gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
@@ -207,7 +207,7 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.tp_size:
+                    if flags.item() == get_parallel().tp_size:
                         self.process_batch_result(
                             self.split_prefill_batch, prefill_result
                         )
