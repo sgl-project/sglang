@@ -190,7 +190,7 @@ def _run_mega_routed(
 ) -> torch.Tensor:
     import deep_gemm
 
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+    from sglang.srt.runtime_context import get_parallel
 
     hidden_size = moe.config.hidden_size
 
@@ -216,7 +216,7 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
-    ep_group = get_moe_ep_group().device_group
+    ep_group = get_parallel().moe_ep_group.device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size

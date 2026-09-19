@@ -150,7 +150,7 @@ def _clear_srt_tp_group() -> None:
 
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
-        get_parallel().clear_derived_widths()
+        get_parallel().clear_stamp()
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 
