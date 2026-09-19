@@ -360,6 +360,10 @@ class ExecMamba(msgspec.Struct):
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
     )
+    enable_inkling_sconv_strip_layout: A[
+        bool,
+        "Store each Inkling speculative convolution input once; requires CUDA and a linear draft chain.",
+    ] = False
     mamba_backend: A[
         str,
         Arg(

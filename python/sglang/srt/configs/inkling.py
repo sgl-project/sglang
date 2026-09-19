@@ -213,7 +213,6 @@ class InklingModelConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Optional[InklingConvCacheParams]:
-
         try:
             tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
@@ -246,6 +245,7 @@ class InklingModelConfig(PretrainedConfig):
                 (conv_len, stream_dim),
             ],
             temporal=(0, 0, 0),
+            conv_intermediate_strip=get_exec().mamba.enable_inkling_sconv_strip_layout,
         )
         dtype = InklingStateDType(conv=torch.bfloat16, temporal=torch.bfloat16)
         return InklingConvCacheParams(
@@ -408,6 +408,9 @@ class InklingConvStateShape:
     # along the dim axis, so the dedup conv-intermediate layout must stay off.
     disable_conv_window_dedup: bool = True
 
+    conv_intermediate_strip: bool = False
+    conv_slice_axis: int = 1
+
 
 @dataclass(kw_only=True, frozen=True)
 class InklingStateDType:
@@ -419,6 +422,16 @@ class InklingStateDType:
 class InklingConvCacheParams(BaseLinearStateParams):
     dtype: InklingStateDType = field(default_factory=InklingStateDType)
     shape: InklingConvStateShape
+
+    def spec_intermediate_bytes_per_req(self, ndt: int) -> int:
+        if not self.shape.conv_intermediate_strip:
+            return super().spec_intermediate_bytes_per_req(ndt)
+        return (
+            sum(dim for _, dim in self.shape.conv)
+            * ndt
+            * self.dtype.conv.itemsize
+            * len(self.layers)
+        )
 
 
 for _model_type, _config_cls in {
