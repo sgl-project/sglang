@@ -121,6 +121,46 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
+def handle_shared_experts_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.shared_experts_tp_size
+    if size is None:
+        return
+
+    from sglang.srt.runtime_context import derive_attention_widths
+
+    view = resolved_view(server_args)
+    _, attn_tp_size = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    if size < 1 or attn_tp_size % size != 0:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) must be a positive divisor "
+            f"of attention TP size ({attn_tp_size})."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--shared-experts-tp-size requires a Kimi-K3 model configuration."
+        )
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch != "KimiK3ForConditionalGeneration":
+        raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if cfg.moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "mooncake",
+        "ascend_fuseep",
+        "mori",
+    ):
+        raise ValueError(
+            "--shared-experts-tp-size requires an expert-parallel all-to-all "
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+        )
+
+
 def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
@@ -621,9 +661,7 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    ):
+    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
         raise ValueError(
-            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
         )

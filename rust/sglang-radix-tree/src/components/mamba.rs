@@ -494,6 +494,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
+        staging_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         Ok(match phase {
@@ -560,11 +561,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 }])
             }
             CacheTransferPhase::Prefetch => {
-                let host_indices =
-                    host_indices.expect("Mamba PREFETCH build requires host indices");
+                if staging_tokens == 0 {
+                    return Ok(None);
+                }
+                // Staging is allocated once the hit is known; the placeholder
+                // key carries the single trailing page this pool loads.
                 Some(vec![PoolTransfer {
                     name: PoolName::Mamba,
-                    host_indices: Some(host_indices),
                     keys: Some(vec!["__placeholder__".to_string()]),
                     hit_policy: PoolHitPolicy::TrailingPages,
                     ..Default::default()

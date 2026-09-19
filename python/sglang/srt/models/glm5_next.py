@@ -16,7 +16,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -861,7 +860,7 @@ class Glm5NextModel(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -981,7 +980,8 @@ class Glm5NextModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # mHC carries its residual streams in hidden_states across PP stages.
+            residual = None if self.config.mhc else pp_proxy_tensors["residual"]
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1059,6 +1059,8 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            if self.config.mhc:
+                return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1120,7 +1122,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             and getattr(text_config, "q_lora_rank", None) is not None
         )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
