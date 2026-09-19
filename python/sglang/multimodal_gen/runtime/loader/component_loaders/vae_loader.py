@@ -140,6 +140,7 @@ def _should_use_channels_last_3d(
     ) or not (
         current_platform.is_cuda()
         or current_platform.is_rocm()
+        or current_platform.is_cpu()
         or current_platform.is_xpu()
     ):
         return False
