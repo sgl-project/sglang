@@ -1,4 +1,3 @@
-import re
 import logging
 from contextlib import nullcontext
 from functools import partial
@@ -1451,14 +1450,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "mlp.shared_experts",
                     f"mlp.experts.{self.config.n_routed_experts}",
                 )
-
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0:
-                        match = re.search(r"layers\.(\d+)", name)
-                        if match and int(match.group(1)) >= self.config.num_hidden_layers:
-                            continue
+            if not is_nextn and hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0:
+                    import re
+                    match = re.search(r"layers\.(\d+)", name)
+                    if match and int(match.group(1)) >= self.config.num_hidden_layers:
+                        continue
             else:
                 if not name.startswith(nextn_layer_prefix):
                     continue
