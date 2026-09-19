@@ -100,6 +100,16 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
 
+    enable_spec = (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_algorithm.upper() != "NONE"
+    )
+    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
+        raise ValueError(
+            "The minimal HiSparse spec integration supports linear speculation "
+            "only; use --speculative-eagle-topk 1."
+        )
+
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:

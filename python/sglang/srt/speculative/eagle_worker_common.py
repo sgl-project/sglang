@@ -600,6 +600,11 @@ def run_eagle_verify(
         uno_target_max_top_k=uno_target_max_top_k,
     )
     new_seq_lens = batch.seq_lens + accept_lens
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.commit_spec_accept_tokens(
+            batch=batch,
+            accept_indices=accept_index,
+        )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
