@@ -154,7 +154,10 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     with patch.object(
                         hybrid_pool_assembler,
                         builder_name,
-                        return_value=(MagicMock(), object()),
+                        return_value=(
+                            MagicMock(),
+                            SimpleNamespace(transfer_layer_id_max=4),
+                        ),
                     ) as build_stack:
                         result = strategy_cls().build(
                             cache=SimpleNamespace(page_size=1),
