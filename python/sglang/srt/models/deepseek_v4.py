@@ -2602,7 +2602,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3651,7 +3652,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         finally:
             forward_batch.num_token_non_padded = saved_num_token_non_padded
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if self.config.model_type == "deepseek_v41":
+                parallel = get_parallel()
+                hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                parallel = get_parallel()
+                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
+                    parallel.attn_cp_rank
+                ].contiguous()
+            else:
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -4610,14 +4619,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP or MoE A2A"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4824,16 +4836,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -4842,7 +4857,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -4852,6 +4867,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
