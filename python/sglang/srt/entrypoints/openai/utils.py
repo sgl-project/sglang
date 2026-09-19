@@ -15,6 +15,29 @@ from sglang.srt.entrypoints.openai.protocol import (
 logger = logging.getLogger(__name__)
 
 
+def iter_token_logprob_records(
+    output_token_logprobs=None,
+    output_top_logprobs=None,
+):
+    """Yield selected tokens and their candidates without collapsing by text.
+
+    Engine records are ``(logprob, token_id, token_text)``. Chat and Responses
+    keep ordered lists, so two token IDs that decode to the same string must
+    both survive. Completions still uses ``to_openai_style_logprobs``.
+    """
+    top_lists = output_top_logprobs or []
+    for index, (logprob, _, token) in enumerate(output_token_logprobs or []):
+        candidates = top_lists[index] if index < len(top_lists) else None
+        yield (
+            token or "",
+            logprob,
+            [
+                (top_token or "", top_logprob)
+                for top_logprob, _, top_token in candidates or []
+            ],
+        )
+
+
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,

@@ -1095,7 +1095,7 @@ class BuildOutputTextLogprobsTestCase(CustomTestCase):
         meta_info = {
             "output_token_logprobs": [(-0.1, 10, "Hello"), (-0.2, 11, " world")],
             "output_top_logprobs": [
-                [(-0.1, 10, "Hello"), (-2.0, 12, "Hi")],
+                [(-0.1, 10, "Hello"), (-2.0, 12, "Hello")],
                 [(-0.2, 11, " world"), (-3.0, 13, " earth")],
             ],
         }
@@ -1104,18 +1104,39 @@ class BuildOutputTextLogprobsTestCase(CustomTestCase):
         self.assertEqual(out[0].token, "Hello")
         self.assertEqual(out[0].logprob, -0.1)
         self.assertEqual(out[0].bytes, list("Hello".encode("utf-8")))
-        self.assertEqual(len(out[0].top_logprobs), 2)
-        self.assertEqual(out[0].top_logprobs[0].token, "Hello")
         self.assertEqual(out[1].token, " world")
+        self.assertEqual(
+            [
+                [(entry.token, entry.logprob) for entry in item.top_logprobs]
+                for item in out
+            ],
+            [[("Hello", -0.1), ("Hello", -2.0)], [(" world", -0.2), (" earth", -3.0)]],
+        )
 
     def test_no_top_logprobs_yields_empty_lists(self):
-        meta_info = {
-            "output_token_logprobs": [(-0.5, 7, "hi")],
-            "output_top_logprobs": None,
-        }
-        out = _build_output_text_logprobs(meta_info)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0].top_logprobs, [])
+        for fields in (
+            {},
+            {"output_top_logprobs": None},
+            {"output_top_logprobs": []},
+            {"output_top_logprobs": [None]},
+        ):
+            with self.subTest(fields=fields):
+                out = _build_output_text_logprobs(
+                    {
+                        "output_token_logprobs": [(-0.5, 7, "hi"), (-0.6, 8, "!")],
+                        **fields,
+                    }
+                )
+                self.assertEqual([item.top_logprobs for item in out], [[], []])
+
+    def test_no_tokens_yields_empty_list(self):
+        for fields in (
+            {},
+            {"output_token_logprobs": None},
+            {"output_token_logprobs": []},
+        ):
+            with self.subTest(fields=fields):
+                self.assertEqual(_build_output_text_logprobs(fields), [])
 
 
 class ChatToolChoiceConversionTestCase(CustomTestCase):
