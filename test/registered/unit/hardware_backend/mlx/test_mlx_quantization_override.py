@@ -1,7 +1,6 @@
 """Unit tests for ``MlxQuantizationConfig.override_quantization_method``.
 
 The override is a classmethod over a dict; no mlx / Apple Silicon dependency.
-Runs on every CI platform and guards #25119 from regression.
 """
 
 from __future__ import annotations
@@ -17,11 +16,7 @@ register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 
 class TestMlxQuantizationOverride(CustomTestCase):
-    """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``.
-
-    The override is a classmethod over a dict; no mlx / Apple Silicon
-    dependency. Runs on every CI platform and guards #25119 from regression.
-    """
+    """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``."""
 
     def test_mlx_q4_dict_config_autodetect(self):
         """Bare {group_size, bits=4} dict maps to mlx_q4."""
@@ -74,7 +69,13 @@ class TestMlxQuantizationOverride(CustomTestCase):
                 {"bits": "4", "group_size": 64}, None
             )
         )
-        # Non-positive values.
+        self.assertIsNone(
+            MlxQuantizationConfig.override_quantization_method(
+                hf_quant_cfg={"bits": True, "group_size": 64},
+                user_quant=None,
+            )
+        )
+        # Non-positive bits on the passthrough branch.
         self.assertIsNone(
             MlxQuantizationConfig.override_quantization_method(
                 hf_quant_cfg={"bits": 0, "group_size": 64},
@@ -83,13 +84,7 @@ class TestMlxQuantizationOverride(CustomTestCase):
         )
 
     def test_six_bit_affine_dict_passthrough(self):
-        """6-bit affine dumps used to raise Unknown quantization method.
-
-        #25119 only mapped bits=4/8. A Hub config with bits=6 and extra
-        keys such as mode=affine produced an empty method name. The
-        validator must accept that shape as the mlx passthrough marker
-        so mlx_lm.load can keep the checkpoint's own bit-width.
-        """
+        """A {group_size, bits=6} MLX dict maps to the mlx passthrough marker."""
         self.assertEqual(
             MlxQuantizationConfig.override_quantization_method(
                 hf_quant_cfg={"group_size": 64, "bits": 6, "mode": "affine"},
