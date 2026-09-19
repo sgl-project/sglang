@@ -8,7 +8,7 @@ use crate::discovery::WorkerId;
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use dashmap::DashMap;
 use rand::Rng;
@@ -139,7 +139,15 @@ impl SessionAwarePolicy {
             Some(backup) => SelectionProposal::with_backup(primary, backup),
             None => SelectionProposal::primary(primary),
         };
-        proposal.with_kind(ProposalKind::SessionAffinity)
+        proposal
+            .with_kind(ProposalKind::SessionAffinity)
+            .with_guard_hints(GuardHints {
+                enable_pressure_guard: self.config.pressure_guard
+                    && self.config.mode == crate::config::AffinityMode::Soft,
+                pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
+                pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
+                pressure_rel_threshold: self.config.pressure_rel_threshold,
+            })
     }
 }
 

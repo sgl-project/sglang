@@ -50,7 +50,13 @@ import torch.distributed as dist
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_exec,
+    get_parallel,
+    publish,
+    spawn_world_rank,
+)
 
 from .protocol import (
     CacheConfig,
@@ -277,7 +283,17 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        publish(server_args, role="weight_cache_daemon")
+        # The launcher told this daemon where it sits, and it builds the same
+        # groups a scheduler does, so the same one number places it.
+        publish(
+            server_args,
+            role="weight_cache_daemon",
+            ranks=SpawnRanks(
+                world_rank=spawn_world_rank(
+                    server_args, tp_rank=self.tp_rank, pp_rank=self.pp_rank
+                )
+            ),
+        )
 
         from sglang.srt.layers.moe import initialize_moe_config
 
@@ -465,7 +481,7 @@ class WeightCacheDaemon:
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
-        if not self.server_args.enable_eplb:
+        if not get_exec().moe.enable_eplb:
             return
 
         from sglang.srt.eplb.expert_location import (

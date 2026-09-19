@@ -11,7 +11,7 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import Mamba2AttnBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 CHUNK = 128
 
@@ -37,8 +37,10 @@ def _split(extend_lens, prefix_lens, track_seqlens, track_mask):
     backend = _backend()
     cache_indices = torch.arange(len(extend_lens))
     (
+        _track_chunk_idx,
         h_src,
         h_dst,
+        _h_batch_src,
         _final_src,
         _final_dst,
         seq_idx,

@@ -22,17 +22,35 @@ path = "src/main.rs"
 unused_qualifications = "warn"
 
 [dependencies]
-# Dynamo crates — pinned by SHA. Bumps are manual PRs.
-dynamo-protocols = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
-dynamo-tokenizers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
-dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+# Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
+dynamo-tokenizers = "=1.8.1"
+# Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
+# template-less models like DeepSeek-V4) so cache-aware routing hashes the same
+# tokens the engine caches.
+dynamo-renderer = "=5.1.2"
+# `OAIChatLikeRequest` speaks minijinja values.
+minijinja = "2.24"
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
-axum = { version = "0.8", features = ["macros", "tracing"] }
+# http2 on both sides: axum serves cleartext h2c on the inbound listener, reqwest
+# dials it outbound.
+#
+# axum's `http2` looks redundant and is not — please don't drop it. `axum::serve`
+# runs on hyper-util's auto Builder, whose HTTP/2 branch is compiled by
+# `hyper-util/http2`, and that arrives today only transitively, via
+# sgl-kv-indexer -> tonic "transport" -> tonic/server -> hyper-util/server-auto
+# (which is server + http1 + http2). So the listener speaks h2c whether or not
+# this line exists. Declaring it forwards `hyper-util/http2` from axum directly,
+# so inbound h2c no longer rides on a gRPC dependency it has nothing to do with,
+# and it enables HTTP/2 extended CONNECT for h2 websockets.
+axum = { version = "0.8", features = ["macros", "tracing", "http2"] }
+# Named directly (not just via axum) to implement a response-body wrapper:
+# `Frame`/`SizeHint` are not re-exported through `axum::body`.
+http-body = "1"
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
-reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "catch-panic"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
 # Serialization
@@ -43,16 +61,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
 # this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
-
-# Chat-template rendering for cache-aware routing: the engine caches tokens
-# AFTER applying the model's chat template, so the router renders the same
-# template (from tokenizer_config.json) before hashing — otherwise its query
-# token_ids diverge from the engine's stored blocks. `pycompat` supplies the
-# Python str/dict methods HF chat templates rely on (.startswith, .items, ...).
-minijinja = { version = "2", features = ["loop_controls", "json"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-# `strftime_now` chat-template helper (some templates inject the current date).
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Utilities
 anyhow = "1"
@@ -75,6 +83,12 @@ uuid = { version = "1", features = ["v4"] }
 # `python/sglang/srt/disaggregation/kv_events.py`.
 parking_lot = "0.12"
 rmp-serde = "1"
+# FxHash for the KV-event radix tree's integer-keyed maps (i64 block
+# hashes, u64 node ids), off the routing hot path's SipHash cost. The
+# keys are client-derivable, not trusted; what bounds a collision attack
+# is that planting a key costs a real request — see the DoS note in
+# src/policies/kv_events/tree.rs.
+rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
@@ -82,6 +96,17 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 [dev-dependencies]
 dirs = "5"
 http-body-util = "0.1"
+# HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
+# `http1` as well as `http2`: tests/proxy/pd_protocol_binding.rs drives both
+# `hyper::server::conn::http1` and `::http2` to build single-protocol mocks.
+# `http1` arrives transitively via axum's defaults today; declaring it here
+# means an axum `default-features = false` later fails at the dependency
+# rather than as an unresolved import in a test.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# Capture the router's `tracing` access log in tests. Also a runtime dep, but
+# integration tests are a separate crate and need it declared here too.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

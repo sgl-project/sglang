@@ -23,10 +23,49 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
+
+
+@pytest.mark.parametrize(
+    "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
+    [
+        (32, None, None, 32),
+        (32, 0, 16, 32),
+        (32, 4, 64, 256),
+        (7, 16, 4, 112),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_verify_width(
+    max_running_requests, max_draft_tokens, max_cuda_graph_bs, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_decode_output_capacity(
+            max_running_requests, max_draft_tokens, max_cuda_graph_bs
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_context_len,max_prefill_tokens,chunked_prefill_limit,expected",
+    [
+        (4096, 8192, 0, 8192),
+        (8192, 4096, 0, 8192),
+        (8192, 16384, 2048, 2048),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_unchunked_batch(
+    max_context_len, max_prefill_tokens, chunked_prefill_limit, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_prefill_output_capacity(
+            max_context_len, max_prefill_tokens, chunked_prefill_limit
+        )
+        == expected
+    )
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
@@ -58,6 +97,30 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     )
     backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
     return backend
+
+
+@pytest.mark.parametrize(
+    "uses_genmha,prefill_native,decode_native,forward_mode,expected",
+    [
+        (True, True, True, ForwardMode.EXTEND, True),
+        (True, True, True, ForwardMode.TARGET_VERIFY, True),
+        # Hybrid mode=decode routes target verification into the decode child.
+        (True, False, True, ForwardMode.TARGET_VERIFY, True),
+        (True, False, True, ForwardMode.EXTEND, False),
+        # SM120 XQA has native access metadata but not the physical GenMHA layout.
+        (False, False, True, ForwardMode.TARGET_VERIFY, False),
+    ],
+)
+def test_extend_selects_native_nvfp4_layout_per_call(
+    uses_genmha, prefill_native, decode_native, forward_mode, expected
+):
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.uses_trtllm_gen_native_fp4 = uses_genmha
+    backend.prefill_uses_native_fp4 = prefill_native
+    backend.decode_uses_native_fp4 = decode_native
+
+    forward_batch = SimpleNamespace(forward_mode=forward_mode)
+    assert backend._forward_extend_uses_native_fp4(forward_batch) is expected
 
 
 def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):

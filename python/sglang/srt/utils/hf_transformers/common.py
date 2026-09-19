@@ -24,6 +24,8 @@ from huggingface_hub import snapshot_download
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
+    BailingMM2Config,
+    BailingMoeV3VLConfig,
     ChatGLMConfig,
     Cosmos3Config,
     Cosmos3EdgeConfig,
@@ -37,6 +39,9 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    FalconMambaConfig,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     HYV4Config,
     InklingAudioConfig,
@@ -56,6 +61,8 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
@@ -63,8 +70,10 @@ from sglang.srt.configs import (
     MultiModalityConfig,
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
+    NanbeigeConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
+    NemotronH_Omni_Reasoning_V3_Config,
     NemotronHConfig,
     NemotronHPuzzleConfig,
     Olmo3Config,
@@ -73,6 +82,8 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
     Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
@@ -80,6 +91,7 @@ from sglang.srt.configs import (
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -102,6 +114,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     for cls in [
         AfmoeConfig,
         BailingHybridConfig,
+        BailingMM2Config,
+        BailingMoeV3VLConfig,
         ChatGLMConfig,
         DbrxConfig,
         ExaoneConfig,
@@ -119,9 +133,16 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MuseGlimmerConfig,
         MuseGlimmerAssistantConfig,
         KimiK3Config,
+        Glm5NextConfig,
+        Glm5NextTextConfig,
         KimiLinearConfig,
         Qwen3NextConfig,
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
         FalconH1Config,
+        FalconMambaConfig,
+        Mamba2Config,
+        MambaConfig,
         GraniteMoeHybridConfig,
         HYV4Config,
         DotsVLMConfig,
@@ -129,8 +150,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
+        NemotronH_Omni_Reasoning_V3_Config,
         NemotronHConfig,
         NemotronHPuzzleConfig,
+        NanbeigeConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
@@ -170,9 +193,28 @@ try:
 
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
+        hc_pre_from_prev_sublayer = False
+        # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
+        q_head_norm = True
+        kv_source_layer_ids = ()
+        index_source_layer_ids = ()
+        candidate_source_layer_id = -1
+        candidate_topk_blocks = 0
+        candidate_block_size = 0
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_token_id = 2
+        engram_compressed_vocab_size = 0
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+    _CONFIG_REGISTRY.update(
+        {cls.model_type: cls for cls in DEEPSEEK_V41_CONFIG_CLASSES}
+    )
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):

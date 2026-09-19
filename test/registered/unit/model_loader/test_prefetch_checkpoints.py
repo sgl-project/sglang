@@ -28,7 +28,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _InlineThread:
@@ -238,7 +238,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
             patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
+                "sglang.srt.distributed.parallel_state.get_world_group",
                 return_value=FakeWorldGroup(),
             ),
             patch(

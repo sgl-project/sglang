@@ -11,7 +11,7 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::LoadStat;
+use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
@@ -124,10 +124,12 @@ impl Policy for CacheCandidatesPolicy {
                 worker: Arc::clone(&self.worker),
                 matched_prefix_tokens: 1,
                 uncached_tokens: 1,
+                matched_prefix_blocks: 1,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 0,
+            ..Default::default()
         }))
     }
 
@@ -141,18 +143,23 @@ fn config(policy: PolicyKind) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -286,17 +293,30 @@ async fn chat_commits_the_admitted_prefill_backup() {
         })
     })
     .await;
+    let now = Instant::now();
+    let native_load = |total_prefill_uncached_tokens, total_prefill_busy_us| LoadStat {
+        num_running_reqs: 1,
+        num_waiting_reqs: 0,
+        num_tokens: 100,
+        max_total_num_tokens: 100,
+        native_cache: Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 100,
+            max_running_requests: 16,
+            total_prefill_uncached_tokens,
+            total_prefill_busy_us,
+        }),
+    };
     fixture.ctx.engine_load.set(
         &fixture.workers[0].url,
         0,
-        LoadStat {
-            num_running_reqs: 1,
-            num_waiting_reqs: 0,
-            num_tokens: 100,
-            max_total_num_tokens: 100,
-        },
-        Instant::now(),
+        native_load(1, 1),
+        now - Duration::from_secs(1),
     );
+    fixture
+        .ctx
+        .engine_load
+        .set(&fixture.workers[0].url, 0, native_load(2, 2), now);
 
     assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
     assert!(fixture.backends[0]
@@ -339,6 +359,13 @@ async fn capacity_exhaustion_does_not_return_503() {
                 num_waiting_reqs: 0,
                 num_tokens: 100,
                 max_total_num_tokens: 100,
+                native_cache: Some(NativeCacheRankLoad {
+                    num_waiting_uncached_tokens: 0,
+                    num_total_tokens: 100,
+                    max_running_requests: 16,
+                    total_prefill_uncached_tokens: 1,
+                    total_prefill_busy_us: 1,
+                }),
             },
             Instant::now(),
         );
@@ -415,6 +442,13 @@ async fn chat_records_cache_candidates_exhausted() {
             num_waiting_reqs: 0,
             num_tokens: 100,
             max_total_num_tokens: 100,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: 0,
+                num_total_tokens: 100,
+                max_running_requests: 16,
+                total_prefill_uncached_tokens: 1,
+                total_prefill_busy_us: 1,
+            }),
         },
         Instant::now(),
     );

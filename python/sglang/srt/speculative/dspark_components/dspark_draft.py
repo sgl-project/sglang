@@ -225,6 +225,11 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        self._num_token_non_padded = (
+            torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
+            if enable_num_token_non_padded()
+            else None
+        )
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -473,6 +478,12 @@ class DraftBlockProposer:
         # The dense DSpark draft still reuses the target batch's graph tier.
         # Set graph eligibility before the DP-MoE-only metadata early return.
         forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+        device = self.draft_model_runner.device
+        num_tokens = forward_batch.input_ids.numel()
+        if self._num_token_non_padded is not None:
+            self._num_token_non_padded.fill_(num_tokens)
+            forward_batch.num_token_non_padded = self._num_token_non_padded
+        forward_batch.num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         # Graph bucket selection uses the raw per-rank request counts.  Keep
@@ -484,7 +495,6 @@ class DraftBlockProposer:
             batch.global_num_tokens,
             batch.global_num_tokens_for_logprob,
         )
-        device = self.draft_model_runner.device
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
         num_token_non_padded = _make_num_token_non_padded(num_tokens, device)

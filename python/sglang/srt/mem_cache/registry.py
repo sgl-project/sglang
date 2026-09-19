@@ -108,7 +108,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if server_args.enable_unified_cache_external_linker:
+    if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
@@ -196,8 +196,8 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
-    elif server_args.enable_unified_cache_external_linker:
-        backend = server_args.unified_cache_external_linker_backend
+    elif get_memory().enable_unified_cache_external_linker:
+        backend = get_memory().unified_cache_external_linker_backend
         if backend == "mooncake":
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
                 MooncakeDirectLinker,
@@ -262,6 +262,18 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             f"tree_cache is {type(cache).__name__}. Drop the flag or the "
             "option that selected another tree cache for this model."
         )
+
+    if get_memory().radix_eviction_policy == "tlru":
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # T-LRU's per-node tail bookkeeping only exists on the unified tree;
+        # any other cache would silently fall back to LRU ordering.
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "--radix-eviction-policy tlru requires UnifiedRadixCache, but "
+                f"tree_cache is {type(cache).__name__}. Drop the flag or the "
+                "option that selected another tree cache for this model."
+            )
 
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
