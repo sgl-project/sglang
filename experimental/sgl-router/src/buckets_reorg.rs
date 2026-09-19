@@ -131,16 +131,16 @@ impl Bucket {
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => (
-                self.pick_group(group, Stage::Plain, workers, request)
+                self.pick_engine(group, Stage::Plain, workers, request)
                     .await?,
                 None,
             ),
             BucketGroups::Pd { prefill, decode } => {
                 let prefill = self
-                    .pick_group(prefill, Stage::Prefill, workers, request)
+                    .pick_engine(prefill, Stage::Prefill, workers, request)
                     .await?;
                 let decode = self
-                    .pick_group(decode, Stage::Decode, workers, request)
+                    .pick_engine(decode, Stage::Decode, workers, request)
                     .await?;
                 (prefill, Some(decode))
             }
@@ -148,7 +148,7 @@ impl Bucket {
         Ok(BucketPick { prefill, decode })
     }
 
-    async fn pick_group(
+    async fn pick_engine(
         &self,
         group: &EngineGroup,
         stage: Stage,
