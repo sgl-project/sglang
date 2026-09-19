@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 try:
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
         fused_recurrent_gated_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -133,6 +134,69 @@ def run_fused_mtp(
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=cache_steps,
         retrieve_parent_token=retrieve_parent_token,
+    )
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+def test_target_verify_matches_packed_decode_beta_semantics():
+    """Target verify must preserve the existing packed-decode transition."""
+    H = HV = 1
+    K = V = 128
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q = torch.ones(1, 1, H, K, dtype=dtype, device=device)
+    k = torch.ones_like(q)
+    v = torch.ones(1, 1, HV, V, dtype=dtype, device=device)
+    mixed_qkv = torch.cat(
+        (q.reshape(1, -1), k.reshape(1, -1), v.reshape(1, -1)), dim=-1
+    ).contiguous()
+    a = torch.zeros(1, HV, dtype=dtype, device=device)
+    # sigmoid(-0.5) is not exactly representable in BF16, exposing whether the
+    # target path preserves packed decode's activation-dtype rounding.
+    b = torch.full((1, HV), -0.5, dtype=dtype, device=device)
+    A_log = torch.zeros(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros(HV, dtype=dtype, device=device)
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+    packed_state = torch.zeros(1, HV, V, K, dtype=torch.float32, device=device)
+    packed_out = torch.empty(1, 1, HV, V, dtype=dtype, device=device)
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=K**-0.5,
+        initial_state=packed_state,
+        out=packed_out,
+        ssm_state_indices=indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    verify_state = torch.zeros_like(packed_state)
+    intermediate_state = torch.empty(1, 1, HV, V, K, dtype=torch.float32, device=device)
+    verify_out = run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        verify_state,
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+        intermediate_states_buffer=intermediate_state,
+        intermediate_state_indices=indices,
+        cache_steps=1,
+    )
+
+    torch.testing.assert_close(verify_out, packed_out, rtol=0, atol=0)
+    torch.testing.assert_close(
+        intermediate_state[0, 0], packed_state[0], rtol=0, atol=0
     )
 
 
