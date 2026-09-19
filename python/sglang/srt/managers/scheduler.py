@@ -1127,6 +1127,15 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            kv_cache_builder.prepare_hicache_staging(
+                tp_worker=self.tp_worker,
+                draft_plan=(
+                    self.draft_worker.hicache_draft_plan
+                    if self.draft_worker is not None
+                    else None
+                ),
+            )
         device_module = torch.get_device_module(model_runner.device)
         self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.

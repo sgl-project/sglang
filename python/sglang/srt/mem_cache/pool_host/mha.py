@@ -71,6 +71,51 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def prepare_mha_write_back_staging(
+    device_pool: MHATokenToKVPool,
+    *,
+    layer_num: int,
+    page_size: int,
+    page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
+    retain: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not (_is_cuda or _is_hip) or layer_num == 0:
+        return None
+    if not all(
+        can_use_write_back_jit_kernel(
+            element_size=device_pool.head_num * dim * device_pool.store_dtype.itemsize
+        )
+        for dim in (device_pool.head_dim, device_pool.v_head_dim)
+    ):
+        return None
+    token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
+    shapes = tuple(
+        (token_capacity, layer_num, device_pool.head_num, dim)
+        for dim in (device_pool.head_dim, device_pool.v_head_dim)
+    )
+    staging = device_pool.hicache_write_back_staging
+    if staging is None:
+        staging = (
+            torch.empty(
+                shapes[0], dtype=device_pool.store_dtype, device=device_pool.device
+            ),
+            torch.empty(
+                shapes[1], dtype=device_pool.store_dtype, device=device_pool.device
+            ),
+        )
+        if retain:
+            device_pool.hicache_write_back_staging = staging
+    else:
+        for buffer, shape in zip(staging, shapes):
+            if (
+                buffer.dtype != device_pool.store_dtype
+                or tuple(buffer.shape[1:]) != shape[1:]
+                or buffer.shape[0] < shape[0]
+            ):
+                raise ValueError("HiCache staging geometry changed after preparation")
+    return staging
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
@@ -218,32 +263,24 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if self.layout != "page_first":
             return
-
-        # The staged write-back JIT kernel builds with hipcc and has a ROCm
-        # path, so enable it on HIP too (consistent with the CUDA path).
-        self.can_use_write_back_jit = (
-            _is_cuda or _is_hip
-        ) and can_use_write_back_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize,
+        page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging = prepare_mha_write_back_staging(
+            self.device_pool,
+            layer_num=self.layer_num,
+            page_size=self.page_size,
+            page_capacity=page_capacity,
+            retain=False,
         )
-        if not self.can_use_write_back_jit:
+        if staging is None:
             return
-
-        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
-        self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.staging_k_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.layer_num,
-                self.head_num,
-                self.head_dim,
-            ),
-            dtype=self.dtype,
-            device=self.device_pool.device,
+        self.can_use_write_back_jit = True
+        self.staging_page_capacity = page_capacity
+        self.staging_token_capacity = page_capacity * self.page_size
+        self.staging_k_buffer, self.staging_v_buffer = (
+            buffer[: self.staging_token_capacity] for buffer in staging
         )
-        self.staging_v_buffer = torch.empty_like(self.staging_k_buffer)
 
     @property
     def k_buffer(self):
@@ -1061,51 +1098,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     K/V direct transfers must be dispatched separately because the direct
     kernels derive copy sizes from each call's first tensor.
     """
-
-    def _init_write_back_staging_buffers(self):
-        self.staging_page_capacity = 0
-        self.staging_token_capacity = 0
-        self.staging_k_buffer = None
-        self.staging_v_buffer = None
-        self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
-            return
-
-        # K and V have different element sizes. Use the single-buffer staged
-        # kernel for each side, which specializes to its native stride.
-        can_use_staged_jit = (_is_cuda or _is_hip) and all(
-            can_use_write_back_jit_kernel(element_size=element_size)
-            for element_size in (
-                self._k_token_stride_size(),
-                self._v_token_stride_size(),
-            )
-        )
-        if not can_use_staged_jit:
-            return
-
-        self.can_use_write_back_jit = True
-        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
-        self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.staging_k_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.layer_num,
-                self.head_num,
-                self.head_dim,
-            ),
-            dtype=self.dtype,
-            device=self.device_pool.device,
-        )
-        self.staging_v_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.layer_num,
-                self.head_num,
-                self.v_head_dim,
-            ),
-            dtype=self.dtype,
-            device=self.device_pool.device,
-        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
