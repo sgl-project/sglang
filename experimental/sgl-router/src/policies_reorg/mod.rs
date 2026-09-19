@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Side-by-side implementation of POLICY_DESIGN.md. Not wired into serving;
-//! `policies` stays live until the switch PR replaces it.
+//! Side-by-side implementation of POLICY_DESIGN.md. Chat routing can opt into
+//! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
 pub mod power_of_two;
@@ -13,12 +13,11 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::discovery::{ModelId, WorkerId};
-use crate::state::LoadView;
 use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
 
-/// Request facts used for bucket matching and engine selection.
+/// Request facts for engine selection. Policies own their shared-state handles.
 #[derive(Debug, Clone, Copy)]
 pub struct PickRequest<'a> {
     pub model: &'a ModelId,
@@ -26,40 +25,28 @@ pub struct PickRequest<'a> {
     pub bucket: &'a str,
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
-    /// Optional bucket ordering targets; they do not relax length or admission limits.
-    pub ttft_ms: Option<u64>,
-    pub tokens_per_second: Option<f64>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
-    pub load: &'a LoadView<'a>,
 }
 
 impl<'a> PickRequest<'a> {
-    pub fn new(
-        model: &'a ModelId,
-        stage: Stage,
-        input_tokens: u64,
-        load: &'a LoadView<'a>,
-    ) -> Self {
+    /// Projected peak KV footprint when known, otherwise input tokens.
+    pub fn kv_tokens(&self) -> u64 {
+        self.expected_peak_tokens.unwrap_or(self.input_tokens)
+    }
+
+    pub fn new(model: &'a ModelId, stage: Stage, input_tokens: u64) -> Self {
         Self {
             model,
             stage,
             bucket: "",
             input_tokens,
             expected_peak_tokens: None,
-            ttft_ms: None,
-            tokens_per_second: None,
             token_ids: None,
             session_key: None,
             routing_key: None,
-            load,
         }
-    }
-
-    /// KV the request will hold: the input, or the projected peak when known.
-    pub fn kv_tokens(&self) -> u64 {
-        self.expected_peak_tokens.unwrap_or(self.input_tokens)
     }
 }
 
@@ -77,6 +64,8 @@ pub struct Rejection {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PickError {
+    #[error("no bucket matches the request length")]
+    NoMatchingBucket,
     #[error("no candidates")]
     NoCandidates,
     #[error("no admissible engine: {0:?}")]
@@ -92,7 +81,10 @@ pub enum PickError {
 }
 
 /// Returns one admitted engine from exactly the supplied candidates.
+/// Implementations receive shared load, KV, and affinity handles at construction;
+/// they obtain their own observations rather than asking callers to supply them.
 pub trait Policy: Send + Sync + Debug {
+    /// Read required state locally and pass the selected engine's observations to admission.
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
@@ -104,6 +96,7 @@ pub trait Policy: Send + Sync + Debug {
         None
     }
 
+    /// Delegate within the same candidates; the fallback reads its own state.
     fn pick_fallback<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
@@ -111,58 +104,7 @@ pub trait Policy: Send + Sync + Debug {
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         match self.fallback() {
             Some(fallback) => fallback.pick(engines, request),
-            None => ready(Err(PickError::NoCandidates)),
+            None => Box::pin(async { Err(PickError::NoCandidates) }),
         }
-    }
-}
-
-/// Lifts a synchronous result into the trait's future.
-pub(crate) fn ready(
-    result: Result<Pick, PickError>,
-) -> BoxFuture<'static, Result<Pick, PickError>> {
-    Box::pin(std::future::ready(result))
-}
-
-#[cfg(test)]
-pub(crate) mod testing {
-    use super::admission::Admission;
-    use super::*;
-    use crate::discovery::WorkerSpec;
-    use crate::state::load_monitor::engine_load::EngineLoadTable;
-
-    pub(crate) fn worker(id: &str) -> Arc<Worker> {
-        Arc::new(Worker::new(WorkerSpec {
-            id: WorkerId(id.into()),
-            url: format!("http://{id}"),
-            mode: Stage::Plain,
-            model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
-        }))
-    }
-
-    pub(crate) async fn pick(
-        policy: &dyn Policy,
-        engines: &[Arc<Worker>],
-    ) -> Result<Pick, PickError> {
-        let table = EngineLoadTable::new();
-        let load = LoadView::new(&table);
-        let model = ModelId("m".into());
-        policy
-            .pick(engines, &PickRequest::new(&model, Stage::Plain, 10, &load))
-            .await
-    }
-
-    /// First admitted engine under `admission`.
-    pub(crate) async fn pick_with(
-        admission: &Admission,
-        engines: &[Arc<Worker>],
-    ) -> Result<Pick, PickError> {
-        let table = EngineLoadTable::new();
-        let load = LoadView::new(&table);
-        let model = ModelId("m".into());
-        let request = PickRequest::new(&model, Stage::Plain, 10, &load);
-        admission.select(engines, &request, "test", |admitted| {
-            admitted.first().cloned()
-        })
     }
 }

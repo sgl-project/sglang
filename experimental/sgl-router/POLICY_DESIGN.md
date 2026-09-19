@@ -7,76 +7,51 @@ listed at the end.
 
 ## Principles
 
-1. **Resolve model, PD role, and buckets first.** Resolution produces ordered
-   candidate groups of eligible engines.
-2. **Each bucket contains role groups, each with its own policy.** The bucket
-   defines shared service constraints. Its plain, prefill, and decode groups
-   define engine membership, role-specific limits, rank, and selection policy.
-3. **A policy owns its selection logic.** It reads the signals it needs—cache,
-   load, or affinity—and implements `pick()`, including its within-bucket fallback.
-4. **A policy can only return an engine from its supplied candidates.** It cannot
-   select another bucket, cross a PD role boundary, or add candidates.
-5. **Each policy has attached admission checks.** Inside `pick()`, admission
-   either filters candidates before selection or checks the chosen engine after
-   selection. A successful pick always returns an admitted engine. New explicit
-   attachments default to `AllowAll`; migrated configurations retain their
-   existing acceptance checks.
-6. **The selection loop owns fallback between groups.** It tries their policies
-   in order and returns one engine for the stage. It never relaxes admission or
-   substitutes another engine after a successful pick.
+1. **Filter buckets by token length, then order preferences.** `BucketResolver`
+   returns all compatible buckets, applying optional SLO preferences before
+   capacity/rank/ID ordering, without inspecting workers or policies.
+2. **The bucket owns plain versus PD engine selection.** `Bucket::pick_engines`
+   calls its one plain group or both prefill and decode groups, returning a
+   complete selection. Both PD engines come from that same bucket.
+3. **An engine group owns membership and its policy.** `EngineGroup::pick`
+   filters live workers by model, health, stage, and membership, invokes the
+   policy, and validates that its result belongs to the exact candidate set.
+4. **A policy owns selection, fallback, admission, and its state dependencies.**
+   Construction injects the load, KV, or affinity handles it needs. Request-time
+   arguments contain facts and candidates. A policy cannot choose another bucket
+   or cross a PD role boundary.
+5. **The handler owns bucket fallback and dispatch.** It calls `pick_engines`
+   on each bucket and dispatches only after a complete selection succeeds.
+   Missing candidates or admission rejection advance to the next bucket, where
+   all required engines are selected again. Invalid signals or policy results stop routing.
 
-An engine is represented by `Worker`. A bucket describes a service class, such
-as a context capacity and SLO profile. It contains optional plain, prefill, and
-decode groups. All three use the same `EngineGroup` type; the containing field
-identifies the role. Each group has its own policy instance and engine IDs.
-
-```text
-Model's bucket configuration
-  Bucket: short-context
-    shared context limit, TTFT estimate, throughput estimate
-    prefill: EngineGroup { engine IDs, token range, rank, policy }
-    decode:  EngineGroup { engine IDs, token range, rank, policy }
-  Bucket: long-context
-    shared context limit, TTFT estimate, throughput estimate
-    prefill: EngineGroup { engine IDs, token range, rank, policy }
-    decode:  EngineGroup { engine IDs, token range, rank, policy }
-```
-
-A plain deployment uses `plain` groups. A PD deployment uses `prefill` and
-`decode` groups. A bucket may provide just one role. There is no persistent
-`Pool` or `Pools` container: a stage's eligible engines are a filtered view of
-`WorkerRegistry`. The registry owns live workers; groups reference their IDs.
-Engine role labels remain authoritative when filtering candidates.
-
-PD runs selection separately for each stage. Prefill and decode may select
-different buckets. Nesting both groups under a bucket does not require them to
-be selected together, paired engine by engine, or retried together.
+An engine is represented by `Worker`. Registry role labels remain authoritative
+when filtering candidates. Groups reference worker IDs rather than owning live
+workers. Group policy instances are reused across requests.
 
 ### Data ownership
 
 | Type | Owns |
 | --- | --- |
-| `Bucket` | ID, shared context limit and SLO estimates, optional plain/prefill/decode groups |
-| `EngineGroup` | Engine membership, token range, rank, and attached policy |
-| `WorkerRegistry` | Live `Worker` objects, model membership, and access to engine health and role |
-| `BucketResolver` | Bucket collection, per-stage SLO preferences, and rejection fallback setting |
+| `BucketResolver` | A model's bucket collection, length filtering, and ordering |
+| `Bucket` | ID, length constraints, rank, groups, and complete plain/PD engine selection |
+| `EngineGroup` | Engine membership, attached policy, and engine selection |
+| `WorkerRegistry` | Live workers, model membership, health, and role |
+| Request handler | Request preparation, ordered bucket attempts, HTTP errors, and dispatch |
 
 `worker_ids: None` means every healthy engine serving the requested model and
 role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
-an unbounded catch-all group. Without explicit bucket configuration, construction
-creates a `default` bucket containing catch-all groups for the deployment's roles.
-Missing role groups are skipped; the resolver does not synthesize a replacement.
-Model-specific construction supplies the appropriate bucket collection; the
-request's model still filters live workers on every selection.
+a catch-all membership group. `BucketGroups::Pd` requires both groups, making
+partial or mixed plain/PD bucket configurations unrepresentable.
 
 ## 1. Code organization
 
 ```text
 src/
-  buckets.rs                    Group resolution, ordering, and selection loop
+  buckets.rs                    Bucket resolution and engine-group selection
   policies/
     mod.rs                      Policy contract and construction
-    admission.rs                Acceptance checks and placement
+    admission.rs                Per-engine acceptance checks
     cache_aware.rs               Cache selection and local/remote adapter
     session_aware.rs             Session selection and fallback
     sticky.rs                   Routing-key selection and fallback
@@ -88,7 +63,6 @@ src/
     mod.rs                      Shared exports
     kv_events/                  Local index, subscriptions, hashing, wire format
     load_monitor/               Engine reports and router-local request accounting
-    load_view.rs                Lazy load snapshot for a selection pass
     affinity_store.rs           Assignments, expiry, and atomic updates
   server/
     app_context.rs              Shared service lifecycle and policy wiring
@@ -99,229 +73,143 @@ During migration, `buckets_reorg.rs` and `policies_reorg/` implement this design
 beside the live `policies/` path. The layout above is the target after switchover.
 Shared state already lives directly under `src/state/`.
 
-Dependencies flow from the resolver to policies, and from policies and admission
+Dependencies flow from engine groups to policies, and from policies and admission
 to shared state. State does not depend on bucket ordering or concrete policy
 strategies. Small shared helpers are sufficient; no generic score-composition,
 tier executor, or separate selection framework is required.
 
 ## 2. Responsibilities and request flow
 
-| Component | Owns | Returns |
-| --- | --- | --- |
-| Bucket matching | Requested role, context/token limits, and rank/ID ordering | Matching bucket references |
-| Selection loop | Filtering live engines by model, health, role, and membership; invoking policies and applying fallback | One selected engine for a stage, or an error |
-| Policy | Selection and fallback within its supplied candidates; application of its attached admission | One admitted engine, or a selection error |
-| Admission | Acceptance checks, such as capacity or in-flight limits | Allow or reject, with a reason |
-| Shared state | Load reports, local request accounting, cache ownership, and affinity assignments | Observations and atomic assignment updates |
-| Request handler | Request preparation, coordination of PD stages, dispatch, and request cleanup | The HTTP response |
+`BucketResolver::resolve(input_tokens, expected_peak_tokens, ttft_ms, tokens_per_second)` returns an ordered
+list of compatible bucket references (possibly empty), or an invalid-signal error.
+It does not receive a stage or a load view, resolve live engines, or invoke policies.
+The handler iterates this list until a bucket supplies the complete engine selection.
 
-`BucketResolver::matching_buckets(request)` returns bucket references whose
-role and length limits fit, ordered by SLO preference, rank, and ID. It does not resolve live
-engines or invoke policies. A matching bucket can have no available engines.
+`Bucket::pick_engines(workers, request)` accepts a `BucketRequest`
+of prepared routing facts, invokes the required groups, and returns `BucketPick`
+(one plain pick or a complete P/D pair). Failures retain their stage. This API
+has no HTTP headers, `AppContext`, or forwarding dependency.
 
-`BucketResolver::pick(request)` resolves healthy engines for the requested model
-and role, intersects them with each matching bucket's group membership, skips
-empty groups, and invokes the attached policy. Both methods use `PickRequest`;
-there is no additional request wrapper or resolved-group data structure.
+`EngineGroup::pick(workers, request)` resolves healthy workers for the request's
+model and stage, intersects them with its membership, sorts them by stable ID,
+and invokes its attached policy. It rejects foreign results, including a newly
+allocated worker with the same ID as a candidate.
 
 ```text
-Prepare request: model, tokens, output budget, affinity keys
+chat_completions (reorg configured): prepare tokens and expected peak
   |
   v
-Match buckets by role and length, then order by SLO preference, rank, and ID
+BucketResolver::resolve: ordered length-compatible buckets
   |
   v
-Resolve healthy engines for this model and stage
+For each bucket: bucket.pick_engines(...)
+  |
+  +-- BucketGroups::Plain
+  |     plain.pick() -> one plain engine
+  |
+  +-- BucketGroups::Pd
+        prefill.pick() -> P engine
+        decode.pick()  -> D engine from the same bucket
+  |
+  +-- empty group / admission rejection -> try next bucket (repeat all picks)
+  +-- invalid signal / configuration / foreign pick -> return error
   |
   v
-For each bucket, resolve its role group's engines and call its policy
-  |
-  +-- policy.pick() ----------------------------------> admitted engine
-  |     BeforeSelection: filter by admission, then choose
-  |     AfterSelection:  choose, then check admission
-  |
-  +-- empty group or admission rejection -------------> next permitted group
-  |
-  +-- invalid signal or configuration ----------------> error
-  |
-  v
-For PD, repeat for decode; then dispatch and track the actual requests
+Complete selection -> forward_chat_request: acquire guards, attach PD bootstrap, forward response
 ```
 
-A plain request selects one engine. A PD request selects a prefill engine and a
-decode engine. If decode compatibility depends on the prefill choice, the handler
-resolves that compatibility before selecting decode.
+The handler extracts token facts and header keys once into `BucketRequest`.
+The bucket creates a stage-specific `PickRequest` for each group call, supplying
+its own ID and the role associated with that group. Input length, expected peak,
+token IDs, and session/routing keys pass through. Policies obtain observations
+from their own shared-state handles; buckets and handlers do not provide load,
+KV, or affinity services on each call. PD uses separate group policies, but never
+independently resolves a decode bucket. Decode selection
+failure discards that tentative prefill choice and advances to the next bucket
+on missing candidates or admission rejection. No forwarding guards are acquired
+and no prefill request is sent until both picks in one bucket succeed.
+PD compatibility constraints beyond model and role remain follow-up work.
 
-Each role group's policy is constructed once and reused across requests.
-Prefill and decode groups in the same bucket may use different policies, such
-as cache-aware for prefill and power-of-two for decode. Model/stage settings
-supply defaults; each group can override its policy. Decode keeps its own
-default, power-of-two. Policy state, such as a round-robin cursor, belongs to
-that group policy instance.
+There is one endpoint: `POST /v1/chat/completions`. `AppContext::chat_routing`
+chooses its implementation:
 
-The policy must return an engine from the exact candidate set it received. It
-cannot add an engine, change buckets, or cross a PD role boundary. The caller
-validates this contract before dispatch. There is no later substitution of a
-policy's chosen engine.
+- `ChatRouting::Legacy` (default) uses the existing policies and bucket selector.
+- `ChatRouting::Reorg(HashMap<ModelId, BucketResolver>)` uses the new bucket and
+  policy interfaces, with explicit model-specific resolvers.
+
+Callers set this field before building the router. A missing model in the reorg
+map returns 404, without falling back to legacy routing. This PR adds the
+programmatic configuration switch; CLI/configuration factory construction and
+the remaining production policies remain follow-ups. Power-of-two is implemented
+for explicit attachments; the default serving path remains legacy.
+
+Both implementations reuse request preparation (including sampling validation
+and tokenization), forwarding, streaming, middleware, and the 32 MiB body limit.
+The reorg implementation requests tokenization for length matching, retaining
+the existing body-size estimate when tokenization is unavailable.
 
 ## 3. Bucket resolution
 
-### Length matching
+1. Validate that a known expected peak is at least the input length.
+2. Keep buckets whose inclusive input-token range contains the input length.
+3. Check the bucket context capacity against input plus requested output when
+   known, or against input length when the output budget is unknown.
+4. Apply enabled SLO preferences to complete buckets. Count unmet preferences
+   equally, then sort by ascending input capacity (the lesser of the input upper
+   bound and context capacity), rank, and ID. Unbounded capacities sort last.
+   Return the entire ordered list, retaining nonpreferred buckets for fallback.
+5. The handler calls each bucket's `pick_engines` until one supplies its complete
+   selection. A failed PD attempt never contributes an engine to a later pair.
 
-For one model and stage, routing proceeds as follows:
+The handler checks addition overflow when computing the expected peak.
+An empty bucket list becomes a 400 `NoMatchingBucket` response. After exhausting
+the list, accumulated admission rejection details produce a selection failure
+(503); if there were no admission rejections, the last unavailable stage produces
+a stage-specific 503. Invalid policy signals/configuration or out-of-candidate
+picks stop the pass immediately with an internal error. Successful engine
+selection ends the pass; forwarding errors do not restart bucket iteration.
 
-1. Keep buckets with a group for the requested role.
-2. Check the group's token range and the parent bucket's context limit.
-3. Apply the stage's SLO preference, then the group's ascending rank and bucket ID.
-4. In `pick`, obtain healthy engines serving the model and matching the role.
-5. Intersect each group's membership with those engines; skip empty groups.
-6. Invoke that group's attached policy, returning the first admitted engine.
+Token ranges and rank belong to the bucket, not its engine groups. For a PD
+bucket, both groups share this one request-length decision. Policy fallback on
+a cache/affinity miss stays within that group's candidates. There is no second
+pass with relaxed admission and no post-policy substitution.
 
-| Stage | Size compatibility |
-| --- | --- |
-| Plain / prefill | Input length fits the group's token range and bucket context limit |
-| Decode | Input plus requested output fits the group's token range and bucket context limit |
+### Optional SLO ordering
 
-When output length is unknown, decode can use only a group without sequence
-bounds; its parent bucket's context limit is checked against input length.
-Plain/prefill context checks use input length; decode uses expected peak length
-when known. Token ranges are group-specific, so P and D can have different
-ranges and ranks even under the same bucket.
+`Bucket` has optional `ttft_ms` and `tokens_per_second` estimates. The resolver
+has independent `ttft_slo` and `tps_slo` preferences: `Disabled` (default),
+`SloFirst` (matching first), and `BestEffort` (nonmatching first). The handler
+parses `x-sgl-ttft-slo-ms` and `x-sgl-tps-slo` only when their preference is enabled;
+invalid enabled headers return 400 before dispatch. Disabled headers are ignored.
+SLO targets belong to bucket resolution, not the engine policy's `PickRequest`.
 
-The skeleton preserves the existing input-length check for plain/prefill. The
-roadmap's `uncached_prefill_tokens` signal is not implemented by this range
-check; cache-informed routing remains separate work. Changing that signal must
-retain full-context checks and establish how per-engine cache observations
-produce a group decision.
+Absent targets are neutral. A bucket matches TTFT when its positive estimate is
+at most the target, and throughput when its finite positive estimate is at least
+the target. Missing or invalid estimates do not match a supplied target. Enabled
+TTFT targets must be positive; throughput targets must be finite and positive.
 
-Legacy configuration with no decode buckets is translated to a catch-all
-decode group. Existing prefill bucket configuration maps to plain groups for a
-plain deployment. Explicitly absent groups in the new model remain absent.
+Each unmet preference adds one ordering penalty. With both preferences set to
+`SloFirst`, a bucket matching both comes before one matching either, followed by
+buckets matching neither. Capacity/rank/ID breaks ties within these tiers. The
+same logic applies to plain and PD buckets, and a PD bucket always supplies both
+engines. TTFT and throughput preferences never independently resolve P/D groups.
+Length constraints are applied first and admission rejection still advances to
+the next complete bucket, including a bucket outside the preferred SLO tier.
 
-### SLO ordering
-
-SLO ordering is added in a separate PR after the power-of-two PR (#40271).
-`Bucket.ttft_ms` and `Bucket.tokens_per_second` are optional performance
-estimates; `PickRequest` carries optional targets using the same field names.
-They extend the existing matching method without another request wrapper or
-resolved-group type.
-
-| Stage | Match | Resolver preference |
-| --- | --- | --- |
-| Plain / prefill | Estimated TTFT is at most the requested TTFT | `prefill_slo` |
-| Decode | Estimated tokens/second is at least the requested rate | `decode_slo` |
-
-| Preference | Order |
-| --- | --- |
-| `Disabled` (default) | Rank, then bucket ID |
-| `SloFirst` | Matching buckets, then nonmatching buckets |
-| `BestEffort` | Nonmatching buckets, then matching buckets |
-
-Within each preference tier, rank/ID ordering is unchanged. Missing request
-targets treat all buckets equally. A supplied target with no bucket estimate
-is a nonmatch. Token-throughput targets must be finite and positive.
-
-SLO preference orders length-compatible buckets; it never relaxes context,
-token limits, engine membership, or admission. Nonmatching buckets remain
-fallback candidates. Estimates establish preference, not a runtime performance
-guarantee. The length-only skeleton (#40241) remains free of SLO support.
-
-### Affinity before size buckets (follow-up)
-
-A useful cache prefix or an existing session binding may live outside the
-request's size bucket. For example, a 6k-token request may share a 5k-token prefix
-with an engine in a bucket whose extend-token limit is 4k.
-
-The resolver supports this with an optional **affinity group** before the size
-buckets. This gives a policy a broader candidate set explicitly, while preserving
-the rule that it can only choose from the candidates it receives.
-
-| Property | Affinity group behavior |
-| --- | --- |
-| Candidates | Healthy engines serving this model and stage, filtered by each engine's own bucket context limit and the applicable SLO rule |
-| Size ranges | Extend-token ranges do not exclude an existing affinity holder |
-| SLO filtering | Under prefill `slo_first`, the engine's own bucket must meet the TTFT target |
-| Unbucketed engines | Remain eligible among healthy engines of the model and stage |
-| Policy | The stage's default affinity-capable policy |
-| Pick mode | `HitRequired`: return an admitted affinity hit; never run a fallback or create a binding |
-
-A miss advances to size buckets. A hit rejected by admission follows the
-resolver's admission-rejection setting, which allows advancing by default.
-
-The default is to enable affinity-first for `cache_aware`, `sticky`, and
-`session_aware` in a global session mode. Other policies do not use this group.
-Affinity-first is a per-stage resolver setting, not a group policy's permission
-to look outside its candidates. This probe is not implemented by the skeleton.
-
-For the 6k-token example:
-
-| Situation | Result |
-| --- | --- |
-| The short-bucket engine has the prefix and passes context, admission, and any enabled SLO checks | Select it from the affinity group |
-| No engine has a usable prefix | Try the compatible size buckets and their policy fallbacks |
-| The prefix holder fails admission | Try the compatible size buckets if rejection fallback is enabled |
-| The holder fails its own context limit or an enabled SLO rule | Exclude it from the affinity group |
-
-### Session scope
-
-Affinity keys distinguish model, stage, affinity kind, scope, and key value.
-Session and routing-key assignments cannot collide with each other.
-
-| Session mode | Lookup and binding behavior |
-| --- | --- |
-| `bucket` (default) | No session affinity group; bindings belong to the selected bucket |
-| `global-rebind` | Probe the global binding first; a size bucket may create or replace it when the probe cannot be used |
-| `global-preserve` | Probe the global binding first; if a binding exists but cannot be used, disable lookup and binding in later groups for this request |
-
-A new session can establish a binding in either global mode. Global keys remain
-global when selection reaches a size bucket. Sticky routing uses global pins so
-an existing routing key can be reused across request sizes.
-
-### The selection loop
-
-The resolver makes one ordered pass:
-
-```text
-for bucket in matching_buckets(request):
-    group = bucket.group(request.stage)
-    engines = healthy_members(group, request.model, request.stage)
-    if engines is empty:
-        continue
-    result = await group.policy.pick(engines, request_for(bucket))
-
-    match result:
-        selected engine:
-            validate membership and return it
-        NoCandidates:
-            continue
-        NoAdmissibleEngine or AdmissionRejected:
-            retain rejection details
-            advance if configured; otherwise return the error
-        other error:
-            return the error
-
-return exhaustion with the retained failure details
-```
-
-The resolver preserves enough information to distinguish missing candidates from
-admission exhaustion. Admission rejection advances by default; an explicit
-resolver option can disable that behavior.
-
-Inside an ordinary bucket, a cache miss or missing affinity binding is handled
-by the policy's fallback. It does not by itself move the request to another
-bucket. The affinity group's `HitRequired` mode is the exception: a miss there
-means the resolver should continue.
-
-There is no second pass with relaxed capacity, and no automatic backup selection
-after a policy returns a rejection.
+Cache lookup and session/sticky policies are follow-ups. Their
+integration must preserve bucket-first selection and the same-bucket PD rule.
+Cross-bucket affinity probing is not part of this interface. Session/routing
+keys still pass through `PickRequest` for policies operating inside the selected
+group; unsupported legacy modes need explicit migration decisions before the
+standard serving path switches.
 
 ## 4. Policy and admission contracts
 
 ### Policy
 
-All policies implement one asynchronous, object-safe interface. A boxed future
-supports the remote prefix indexer; local policies can return an immediately
-ready result.
+All policies implement one asynchronous, object-safe `Policy::pick` interface.
+A boxed future supports the remote prefix indexer; local policies can return an
+immediately ready result.
 
 ```rust
 pub trait Policy: Send + Sync + std::fmt::Debug {
@@ -333,25 +221,25 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 }
 ```
 
+Policies own their required state handles and read observations locally. Nested
+fallback uses `pick_fallback(engines, request)`, which calls the fallback's `pick`;
+the fallback reads its own state. There is no shared observation context or cache.
+Buckets and HTTP handlers supply only candidates and request facts.
+
 `Pick` identifies one engine and a selection reason for metrics and tracing.
-`PickRequest` carries request facts: model and stage, bucket and affinity scope,
-pick mode, input and expected peak token counts, optional token IDs and affinity
-keys, a shared load view, and a per-request prefix memo. It also allows the
-resolver to disable affinity lookup and binding for global-preserve fallback.
-It does not contain an HTTP body, a bucket resolver, or backend configuration.
+`PickRequest` carries model, stage, selected bucket ID, input and optional
+expected peak counts, optional token IDs, and session/routing keys. It contains
+no HTTP body, bucket resolver, state handles, snapshots, or backend configuration.
 
 | Outcome | Meaning |
 | --- | --- |
 | `Pick` | The chosen engine belongs to the supplied set and passed admission |
-| `NoCandidates` | The set is empty, or a `HitRequired` probe has no usable affinity hit |
-| `NoAdmissibleEngine` | Before-selection checks rejected all available candidates; includes reasons |
-| `AdmissionRejected` | The chosen engine failed after-selection admission; includes its reason |
-| `InvalidSignal` | A required input or signal is invalid; propagate the error |
-
-An affinity probe must distinguish a missing binding from an existing binding
-that was excluded or rejected. Global-preserve needs that distinction to decide
-whether later groups may bind. Soft cache gates can report a miss; hard admission
-rejection remains a rejection.
+| `NoMatchingBucket` | No bucket supports the requested length |
+| `NoCandidates` | No eligible member or policy selection miss |
+| `NoAdmissibleEngine` | A policy exhausted its candidates; includes rejection reasons |
+| `AdmissionRejected` | The chosen engine failed after-selection admission |
+| `InvalidSignal` / `InvalidConfiguration` | Invalid policy input or configuration |
+| `OutsideCandidates` | Policy returned an engine outside its exact candidate set |
 
 ### Admission
 
@@ -367,27 +255,44 @@ change buckets, or mutate affinity.
 | `QueueLimitAdmission` | Engine-reported waiting requests are below the limit |
 | `AllOfAdmission` | Every attached check allows the request |
 
-One `EngineAdmission` interface supports checking an engine or a list of engines
-against the same prepared context. Batch results preserve input order and carry
-one decision per engine. Filtering cannot add candidates. Invalid inputs are
-errors, distinct from an explicit acceptance rejection.
+`EngineAdmission::check(engine, request, load)` checks one engine and returns
+`Allow`, `Reject(reason)`, or an error for invalid inputs. Policies attach the
+checker directly as `Arc<dyn EngineAdmission>`. There is no placement setting,
+filtering wrapper, or before/after API; each policy decides where checking
+belongs in its selection algorithm. The `load` argument is an
+`AdmissionLoad` retained by the policy for this engine. It borrows the basic
+`EngineWorkerLoad` and optional `NativeCacheWorkerLoad` from the same snapshot.
+Capacity admission needs the native running limit and total KV footprint; queue
+admission uses the basic waiting count. Missing reports remain `None`, never zero
+load. Other required state handles belong to the checker.
 
-Each policy has an admission attachment and a placement:
+Power-of-two first selects an engine, then calls admission exactly once on that
+engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
+resample, choose the other sampled engine, or run a policy fallback. No candidates
+returns `NoCandidates` without invoking admission. A single candidate is selected
+directly; otherwise two distinct candidates are sampled uniformly, and the one
+with lower stage pressure wins. A complete tie keeps the first sampled engine.
 
-| Placement | Execution | On rejection |
-| --- | --- | --- |
-| `BeforeSelection` | Prepare signals, filter candidates through admission, then select | Return `NoAdmissibleEngine` if none survive |
-| `AfterSelection` | Prepare signals, select an engine, then check it | Return `AdmissionRejected`; do not silently try another engine |
-
-Both placements return `NoCandidates` for an empty original set. If a cache
-policy prefers A but only B passes admission, before-selection can choose B;
-after-selection rejects A and lets the resolver apply its fallback rule.
+Power-of-two reuses the existing pure pressure-comparison functions. Plain and
+prefill stages compare estimated prefill queue time when both reports provide it,
+then waiting uncached tokens, waiting requests, and running requests. Decode
+compares waiting requests, running requests, KV usage fraction, then used KV tokens.
+Reported-pressure ties use router-local active requests. If either sampled engine
+lacks a fresh, complete native report with valid capacity, both are compared by
+router-local active requests instead. Basic reports from older publishers are
+still passed to admission when fresh, but do not supply native pressure metrics.
 
 Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
 Decode capacity uses the expected peak sequence length when available, including
-on a cache hit. Admission and ranking share one load view for the selection pass.
-Synchronous checks do not fetch telemetry themselves.
+on a cache hit. Power-of-two retains the selected engine's load record from
+selection and passes it to admission without another snapshot. A single candidate
+still has its load read for admission, even though selection needs no comparison.
+Neither the bucket nor HTTP handler supplies observations. `Capacity` checks reported running and projected total KV usage (overflow rejects).
+`QueueLimit` checks reported waiting requests; both allow missing usable reports.
+`InFlightLimit` checks the existing router-local active count. `AllOf` stops at
+its first rejection or error. Additional cache-specific admission signals remain
+follow-up work. Synchronous checks do not fetch telemetry over the network themselves.
 
 `AllowAll` is the default for new explicit policy attachments. It leaves health,
 role, membership, and policy preferences in force. Migrated configurations must
@@ -417,13 +322,12 @@ separate mechanism.
 | `CacheAwarePolicy` | Prefer a usable prefix under cache and pressure rules; use a load-based fallback on a miss |
 
 Session and sticky policies do not create assignments for missing keys. A
-binding outside the candidates cannot win. A rejected binding may be preserved
-while normal-mode selection falls back within the bucket. `HitRequired` never
-runs those fallbacks or creates a binding.
+binding outside the candidates cannot win. A missing binding may invoke policy
+fallback within the group; hard admission rejection remains an error.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
 with round-robin as the default. Nested fallbacks use `AllowAll`; the owning
-policy applies hard admission once at its configured placement.
+policy explicitly checks the engine returned by its fallback.
 
 ### Cache-aware behavior
 
@@ -434,15 +338,15 @@ set. Its responsibilities are:
 2. Apply minimum matched-token and optional ratio thresholds.
 3. Bound candidates using prefix/pressure ordering and the configured minimum,
    ratio, and maximum worker counts.
-4. Apply the soft queue gate and saturation rules, together with hard admission
-   at its configured placement.
+4. Apply the soft queue gate and saturation rules, and call admission explicitly
+   as required by the cache policy's candidate-selection algorithm.
 5. Choose among usable prefix holders using uncached work, the switch margin,
    and the pressure guard.
 6. On a miss, run the load fallback, preferring engines admitted by the soft
    queue gate when available.
 
-Candidate limits and saturation observations use the current group's domain:
-all eligible stage engines for the affinity probe, and the role group otherwise.
+Candidate limits and saturation observations use only the selected bucket's
+role-group candidates.
 Saturation pinning must still pass hard admission.
 
 The target load fallback supports power-of-k sampling through
@@ -459,9 +363,12 @@ applies to the current group.
 ## 6. Shared state and construction
 
 Application wiring starts shared services once. Policy construction validates
-configuration and passes the required handles to each policy. Policy instances
-do not create duplicate subscriptions, polling loops, indexes, or remote-client
-concurrency limits.
+configuration and passes the required handles to each policy and admission
+implementation. For example, `PowerOfTwoPolicy::new(Arc<EngineLoadTable>)`
+retains the application's shared load table. KV-aware and affinity-aware policies
+receive their corresponding shared handles when implemented. Policies with no
+state dependency require none. Policy instances do not create duplicate
+subscriptions, polling loops, indexes, or remote-client concurrency limits.
 
 Requirements come from all configured policies, their admission checks, and
 nested fallbacks. This includes tokenization, affinity-header extraction, load
@@ -471,20 +378,27 @@ required settings even when the model's default uses a different policy.
 ### Load state
 
 `state/load_monitor/` owns engine reports and existing router-local request
-accounting. `state/load_view.rs` provides a lazy wrapper over `EngineLoadTable`:
-the first `snapshot()` call captures reports, and subsequent calls reuse them.
-Power-of-two uses `LoadView::lower_pressure` to call the existing stage-specific
-comparisons, including their local fallback and dispatch correction. A future
-shared interpretation layer must preserve source, freshness, and available
-measurements without adding another independent in-flight counter.
+accounting. Power-of-two owns an `Arc<EngineLoadTable>` and captures a snapshot
+locally for each nonempty selection attempt. Its `pick` method selects the engine,
+then passes that engine's borrowed load record directly to admission.
+No snapshot or observation is added to `Pick`, `PickRequest`,
+or the bucket interface, and no shared observation context is threaded through
+policies or fallbacks.
 
-The request handler creates a fresh `LoadView` for each stage's selection pass
-and lends it through `PickRequest`. Reuse it across admission, selection, and
-fallback in that pass; never store it on a bucket, group, or long-lived policy.
-A retry needs a new view. The type itself does not enforce this lifecycle.
-No snapshot is collected if no consumer reads it. Load and cache observations
-are not an atomic global snapshot. Preserve report freshness, rank aggregation,
-and request-guard cleanup.
+The existing snapshot reader preserves rank aggregation, freshness, and capacity
+fields. Missing, stale, or rank-incomplete reports yield `None`, not zero load.
+A new pick reads current state. Admission reuses the selected observation even if
+reports change after selection; it neither recaptures nor reserves capacity.
+Fallback policies read their own state and do not share snapshots with callers.
+
+Snapshot capture still scans the full table; an engine-scoped reader can be added
+if profiling justifies it. Power-of-two reuses the legacy prefill/decode pressure
+comparisons, including router-local fallback. Capacity, queue, in-flight, and
+composed admission are implemented here. Further shared load interpretation and correction for dispatches since
+the report remain follow-ups; these must preserve source, freshness, and available
+measurements without adding another
+independent in-flight counter. Load and cache observations are not an atomic global
+snapshot. Preserve request-guard cleanup.
 
 ### Cache state
 
@@ -508,9 +422,9 @@ a duplicate local cache tree.
 atomic updates. Policies decide when to reuse or replace an assignment.
 
 Concurrent first assignments must converge on an effective binding that is
-still a candidate and passes admission. Before-selection requires membership in
-the admitted subset; after-selection must check a different engine returned by
-a concurrent binding. Reconcile conflicts with bounded retry.
+still a candidate and passes admission. If a concurrent binding returns a
+different engine, the policy must check that engine before returning it.
+Reconcile conflicts with bounded retry.
 
 Create or replace a binding only after admission succeeds. A binding records
 preferred placement, not successful execution, so it may remain if later PD
@@ -524,57 +438,55 @@ current CLI/JSON syntax; existing bucket field names need not change.
 ```yaml
 buckets:
   - id: short-context
+    rank: 10
+    limits: {min: 0, max: 4096}
     max_context_tokens: 8192
-    ttft_ms: 100
-    tokens_per_second: 50
-    prefill:
-      rank: 10
-      worker_ids: [P1, P2]
-      limits: {min: 0, max: 4096}
-      policy:
-        type: cache_aware
-        admission: {type: capacity, placement: before_selection}
-    decode:
-      rank: 20
-      worker_ids: [D1, D2]
-      limits: {max: 8192}
-      policy:
-        type: power_of_two
-        admission: {type: capacity, placement: after_selection}
+    groups:
+      pd:
+        prefill:
+          worker_ids: [P1, P2]
+          policy:
+            type: cache_aware
+            admission: {type: capacity}
+        decode:
+          worker_ids: [D1, D2]
+          policy:
+            type: power_of_two
+            admission: {type: capacity}
 
   - id: long-context
+    rank: 20
+    limits: {min: 0, max: 131072}
     max_context_tokens: 131072
-    prefill:
-      rank: 20
-      worker_ids: [P3, P4]
-      limits: {min: 4097}
-      policy:
-        type: session_aware
-        admission: {type: capacity, placement: before_selection}
-    decode:
-      rank: 10
-      worker_ids: [D3, D4]
-      limits: {min: 8193}
-      policy:
-        type: power_of_two
-        admission: {type: capacity, placement: after_selection}
+    groups:
+      pd:
+        prefill:
+          worker_ids: [P3, P4]
+          policy:
+            type: cache_aware
+            admission: {type: capacity}
+        decode:
+          worker_ids: [D3, D4]
+          policy:
+            type: power_of_two
+            admission: {type: capacity}
 ```
 
-A request with 4k input tokens and a 16k expected peak can select the first
-bucket's prefill group and the second bucket's decode group. A bucket containing
-only one role simply omits the other group fields.
+A request with 4k input tokens and a 16k expected peak cannot fit the short
+bucket's context capacity. It selects the long bucket and both of its P/D groups.
+With a known peak of 8k or less, the same input selects both groups of the short bucket.
 
-Construction validates unique nonempty bucket IDs, token ranges, role-compatible
-membership, and deployment mode per model. A plain model must not mix with PD
-engines. Missing roles produce no candidates at runtime; they do not fall back
-to a different role. These configuration checks belong in the planned factory,
-not in another persistent container hierarchy.
+The planned factory validates unique nonempty bucket IDs, token ranges, and
+role-compatible membership. Each bucket is either plain or PD. The selected
+bucket invokes its required groups through `pick_engines`. The existing worker registry
+still rejects mixed plain and PD engines within one model; this PR preserves
+that constraint. The engine group's model and stage filters apply on every pick.
 
-Legacy `BucketSpec` represents a single role-specific membership set. Preserve
-each legacy spec as a bucket with one populated role group, retaining its ID,
-limits, rank, estimates, and applicable policy defaults. There is no existing
-parent-bucket association: combining old P and D specs into one shared bucket
-requires explicit configuration, never inference from rank or similar names.
+Legacy `BucketSpec` represents a single role-specific membership set. Migration
+must explicitly associate prefill and decode specs into complete PD buckets;
+never infer those associations from matching rank or similar names. Translation
+of role-specific ranges/ranks into bucket-level constraints needs explicit
+validation and is deferred with the configuration factory.
 
 Retained settings keep their meanings, defaults, units, and validation unless a
 change is listed below. Policy-specific tuning applies to role groups using that
@@ -584,23 +496,24 @@ do not accept and ignore them.
 ### Retained behavior
 
 - Keep `load_based` as the CLI name for `LeastLoadPolicy`.
-- Preserve bucket membership, ranges, context limits, rank/ID ordering, and
-  SLO preference semantics. Serving still uses the legacy path; configuration
-  wiring for the new bucket fields follows separately.
+- Preserve explicit engine membership and context constraints. Bucket-level
+  ranges and ordering replace independent per-stage selection.
+  SLO preferences order whole buckets; deployment configuration remains explicit
+  until the production configuration factory and serving switchover are ready.
 - Preserve cache-provider selection, endpoint validation, query timeout and
   concurrency limits, and unavailable-backend fallback.
 - Preserve cache thresholds and tuning: the 1,024-token default minimum hit,
   optional ratio gate, candidate bounds, switch margin, pressure guard, soft
   queue limit, and saturation floor.
-- Preserve session and sticky headers, idle timeouts, eviction cadence, global
-  session modes, and the four sticky fallback choices.
+- Preserve session and sticky headers, idle timeouts, eviction cadence, and the
+  four sticky fallback choices. Global modes need a bucket-first migration design.
 - Translate `--filter overloaded` and `--max-in-flight` into
   `InFlightLimitAdmission`, composed with other checks through `AllOfAdmission`.
-- When migrating existing configuration, attach before-selection capacity
-  checks to plain/prefill power-of-two, session-aware, cache-aware, and decode
-  power-of-two. Retain applicable pending-prefill and in-flight checks, including
-  their missing-report behavior. Other paths use `AllowAll` unless a check is
-  configured. Never silently discard a configured budget.
+- Preserve configured capacity, pending-prefill, and in-flight checks, including
+  their missing-report behavior. Power-of-two applies admission to its selected
+  engine; other policies explicitly place checks in their selection logic.
+  Other paths use `AllowAll` unless a check is configured. Never silently discard
+  a configured budget.
 
 Listener and shutdown configuration, discovery, worker health and circuit
 breakers, tokenizer loading, request timeouts, sampling overrides, and logging
@@ -611,8 +524,9 @@ validation, including dispatch-time breaker probes and request cancellation.
 
 | Behavior | Target |
 | --- | --- |
+| Power-of-two admission | Check only the chosen engine; rejection advances to the next bucket |
 | Round-robin cursor | One cursor per role-group policy instance |
-| Capacity exhaustion | One ordered pass; return exhaustion when no permitted group admits the request |
+| Capacity exhaustion | Try the next compatible bucket; return accumulated rejection details if all fail |
 | Primary/backup proposals and post-policy substitution | Removed; each policy returns one engine |
 | Session affinity | Reuse admitted bindings; remove primary/backup pressure escape |
 | Omitted `--affinity-mode` | Admitted-binding reuse replaces the former soft-mode default |
@@ -635,9 +549,10 @@ A successful pick means admission passed against the observed state. Health and
 capacity can change before dispatch. The handler owns network operations, retry
 rules, and accounting for the engines actually dispatched to.
 
-A retry rebuilds the permitted candidates, excludes failed engines as required,
-and invokes the attached policy. It does not silently replace a cache winner
-with a different engine after selection.
+Selection fallback advances through the ordered compatible buckets before any
+network dispatch. Every PD attempt picks both engines from that bucket. Transport
+retry integration remains separate work; a forwarding failure does not resume
+the bucket loop or silently replace a successful policy pick.
 
 For PD, acquire and release accounting for the actual stages and clean up
 partial setup on failure. Policy selection does not own the PD request lifetime.
@@ -645,60 +560,44 @@ Selection metrics must not imply that dispatch or execution succeeded.
 
 ## Implementation status
 
-The series adds the side-by-side selection implementation in
-`src/buckets_reorg.rs` and `src/policies_reorg/`. The default router still serves
-traffic through the legacy policies.
-
-### HTTP integration testing
-
-`build_router_with_new_policy(ctx, resolver)` mounts
-`chat_completions_with_new_policy` at `/v1/chat/completions` with an explicitly
-constructed `BucketResolver`. Integration tests inject groups and real policy
-instances here. There is no runtime configuration switch yet.
-
-The alternate builder shares the normal routes, body limit, metrics, and HTTP
-lifetime middleware. The handler reuses `PreparedChatRequest` and
-`forward_chat_request`, including tokenization, sampling rules, P/D bootstrap
-injection, JSON/SSE forwarding, and request accounting. It builds one load view
-per stage and completes both PD selections before dispatch. It does not consult
-the legacy policy registry or fall back to a legacy selection on failure.
-
-`tests/proxy/new_policy_routing.rs` exercises power-of-two against live HTTP mock
-workers, including length matching, role separation, admission rejection,
-streaming cleanup, and invalid requests. With SLO preference enabled, the new
-handler parses the existing `x-sgl-ttft-slo-ms` and `x-sgl-tps-slo` headers for
-the applicable stage. An HTTP test verifies independent P/D choices and invalid
-header rejection before dispatch. New policies can use the same builder as
-they are implemented.
-
-### Selection implementation
+This PR adds the side-by-side interfaces in `src/buckets_reorg.rs` and
+`src/policies_reorg/`, plus a configurable bucket-first implementation behind
+`chat_completions`. The live `src/policies/` path remains the default.
 
 Implemented here:
 
-- `Bucket` with a shared context limit, optional SLO estimates, and role groups.
-- Optional request SLO targets and independent prefill/decode preferences.
-- `EngineGroup` with membership, token range, rank, and attached policy.
-- `matching_buckets` for role/length matching and SLO/rank/ID ordering.
-- `pick` for model/health/role/membership filtering and one-pass selection with
-  exact candidate validation.
-- `Policy::pick`, fallback interface, admission placement, and `AllowAll`.
-- Lazy report capture through `LoadView`.
-- Power-of-two selection, stage-aware load comparison, and capacity, in-flight,
-  queue, and combined admission checks (#40271).
+- `BucketResolver::resolve` returns all length-compatible buckets in optional
+  SLO-preference tiers, with capacity/rank/ID order within each tier.
+- `Bucket::pick_engines` owns plain/PD orchestration and stage-specific policy
+  requests; `BucketRequest` carries prepared facts and `BucketPick` retains picks.
+- `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
+- `EngineGroup::pick` owns live candidate filtering, policy invocation, and
+  exact candidate validation, without cross-bucket fallback.
+- `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
+  `AllowAll`, `Capacity`, `InFlightLimit`, `QueueLimit`, and `AllOf`. Power-of-two samples two distinct engines, compares stage pressure,
+  and checks its selected engine with no replacement on rejection.
+- Policy-owned load dependency and local observations. Power-of-two passes the
+  selected engine's load record directly to admission, without another snapshot.
+  `PickRequest`, `Pick`, and bucket APIs carry no load observations.
+- The reorg chat implementation iterates resolved buckets, calls `pick_engines`,
+  advances on empty candidates/admission rejection, and
+  dispatches only after one complete selection. Exhaustion retains admission reasons.
+- `AppContext::chat_routing` configures legacy versus reorg routing on the same
+  endpoint and carries the reorg model-resolver map.
+- Optional bucket TTFT/throughput estimates and preferences, with enabled-header
+  parsing and whole-bucket fallback in the shared chat route.
 
-This PR adds bucket SLO ordering after power-of-two (#40271). The remaining
-policy and wiring work follows separately.
+Follow-up work: remaining policies and production configuration.
 
-Not yet implemented or wired in this path:
+Not yet implemented in the reorg path:
 
-- Other concrete policies and pending-prefill admission.
-- Configuration parsing, validation, model-specific construction, and default
-  group synthesis for the new bucket format. The YAML above is illustrative.
-- Affinity probes, session modes, prefix memoization, and cache-aware selection.
-- A unified load interpretation layer; power-of-two currently reuses the
-  existing stage-specific load comparisons.
-- Production configuration/handler wiring, PD compatibility filtering, retry
-  integration, and removal of the legacy path.
+- Other concrete policies and pending-prefill admission checks.
+- CLI/configuration parsing, validation, and model-specific construction.
+  The YAML above is illustrative; reorg resolvers are installed in code.
+- Session modes, prefix memoization, and cache-aware selection.
+- Shared load interpretation, dispatch correction, and policy-specific
+  dispatch-timestamp requirements.
+- PD compatibility filtering, retry integration, and legacy-route switchover.
 
-The preceding sections describe the target behavior for those follow-ups; they
-do not claim those capabilities are present in this PR.
+The preceding policy sections describe target behavior for those follow-ups;
+they do not claim those capabilities are present in this PR.

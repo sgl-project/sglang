@@ -1,15 +1,31 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Buckets define service constraints; their role groups own membership and policy.
-//! Each stage selects independently and may choose a different bucket.
+//! Order length-compatible buckets by optional SLO preferences, then capacity and rank.
+//!
+//! ```text
+//! BucketResolver (one model's buckets)
+//!   -> Bucket (token limits, context capacity, rank, SLO estimates)
+//!        -> Plain: one EngineGroup
+//!        -> PD: prefill + decode EngineGroups
+//!             -> each EngineGroup: worker membership + its own Policy
+//! ```
+//!
+//! - [`BucketResolver::resolve`] returns length-compatible buckets in preference order.
+//! - [`EngineGroup::pick`] filters live workers by model, health, stage, and membership,
+//!   then calls [`Policy::pick`] and validates the returned engine.
+//!
+//! The handler tries buckets in order, advancing on missing candidates or admission
+//! rejection. Both P/D picks must succeed in the same bucket before dispatch.
+//! [`WorkerRegistry`] owns live workers; groups reference their IDs. Policies own
+//! their load/KV/affinity dependencies and pass selected observations to admission.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::discovery::WorkerId;
+use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use crate::workers::{Worker, WorkerRegistry};
+use crate::workers::WorkerRegistry;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenLimits {
@@ -18,88 +34,183 @@ pub struct TokenLimits {
 }
 
 impl TokenLimits {
-    fn fits(&self, request: &PickRequest<'_>) -> bool {
-        let tokens = match request.stage {
-            Stage::Plain | Stage::Prefill => Some(request.input_tokens),
-            Stage::Decode => request.expected_peak_tokens,
-        };
-        match tokens {
-            Some(tokens) => {
-                self.min.is_none_or(|min| tokens >= min) && self.max.is_none_or(|max| tokens <= max)
-            }
-            None => self.min.is_none() && self.max.is_none(),
-        }
+    fn fits(&self, tokens: u64) -> bool {
+        self.min.is_none_or(|min| tokens >= min) && self.max.is_none_or(|max| tokens <= max)
     }
 }
 
 #[derive(Debug)]
 pub struct EngineGroup {
-    /// Lower ranks are tried first for this role.
-    pub rank: u32,
     /// `None` includes all registered engines matching the request's model and role.
     pub worker_ids: Option<HashSet<WorkerId>>,
-    /// Input range for plain/prefill; peak sequence range for decode.
-    pub limits: TokenLimits,
     pub policy: Arc<dyn Policy>,
 }
 
 impl EngineGroup {
-    /// A catch-all group with the supplied policy.
     pub fn new(policy: Arc<dyn Policy>) -> Self {
         Self {
-            rank: 0,
             worker_ids: None,
-            limits: TokenLimits::default(),
             policy,
         }
     }
 
-    fn contains(&self, engine: &Worker) -> bool {
-        self.worker_ids
-            .as_ref()
-            .is_none_or(|ids| ids.contains(&engine.id))
+    /// Resolve live members and invoke this group's policy. Never changes buckets.
+    pub async fn pick(
+        &self,
+        workers: &WorkerRegistry,
+        request: &PickRequest<'_>,
+    ) -> Result<Pick, PickError> {
+        let mut engines: Vec<_> = workers
+            .healthy_workers_for(request.model)
+            .into_iter()
+            .filter(|engine| engine.mode() == request.stage)
+            .filter(|engine| {
+                self.worker_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&engine.id))
+            })
+            .collect();
+        // Stable order so cursor-based policies see a consistent candidate list.
+        engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        if engines.is_empty() {
+            return Err(PickError::NoCandidates);
+        }
+        let pick = self.policy.pick(&engines, request).await?;
+        if !engines
+            .iter()
+            .any(|engine| Arc::ptr_eq(engine, &pick.engine))
+        {
+            return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
+        }
+        Ok(pick)
     }
 }
 
-#[derive(Debug, Default)]
+/// A bucket serves a request on one plain engine or on its own P/D groups.
+#[derive(Debug)]
+pub enum BucketGroups {
+    Plain(EngineGroup),
+    Pd {
+        prefill: EngineGroup,
+        decode: EngineGroup,
+    },
+}
+
+/// Prepared request facts shared by all bucket attempts. The bucket supplies
+/// its ID and each group's stage when calling policies.
+#[derive(Debug)]
+pub struct BucketRequest<'a> {
+    pub model: &'a ModelId,
+    pub input_tokens: u64,
+    pub expected_peak_tokens: Option<u64>,
+    pub token_ids: Option<&'a [u32]>,
+    pub session_key: Option<&'a str>,
+    pub routing_key: Option<&'a str>,
+}
+
+/// A complete selection from one bucket. For plain serving, `prefill` is the
+/// plain engine and `decode` is absent; PD supplies both picks.
+#[derive(Debug)]
+pub struct BucketPick {
+    pub prefill: Pick,
+    pub decode: Option<Pick>,
+}
+
+#[derive(Debug)]
 pub struct Bucket {
     pub id: String,
-    // Context length and SLO metadata.
-    /// Shared capacity: input length for plain/prefill, peak sequence for decode
-    /// (or input length when the output budget is unknown).
+    /// Break ties within an SLO tier between equally sized buckets; lower ranks win.
+    pub rank: u32,
+    /// Inclusive input-token range used to choose the bucket.
+    pub limits: TokenLimits,
+    /// Full sequence capacity, checked against the expected peak when known.
     pub max_context_tokens: Option<u64>,
+    /// Optional service estimates used only for bucket ordering.
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
-
-    // Engine groups: plain or PD.
-    pub plain: Option<EngineGroup>,
-    pub prefill: Option<EngineGroup>,
-    pub decode: Option<EngineGroup>,
+    pub groups: BucketGroups,
 }
 
 impl Bucket {
-    fn group(&self, stage: Stage) -> Option<&EngineGroup> {
-        match stage {
-            Stage::Plain => self.plain.as_ref(),
-            Stage::Prefill => self.prefill.as_ref(),
-            Stage::Decode => self.decode.as_ref(),
+    pub fn new(id: impl Into<String>, groups: BucketGroups) -> Self {
+        Self {
+            id: id.into(),
+            rank: 0,
+            limits: TokenLimits::default(),
+            max_context_tokens: None,
+            ttft_ms: None,
+            tokens_per_second: None,
+            groups,
         }
     }
 
-    fn matches_slo(&self, request: &PickRequest<'_>) -> bool {
-        match request.stage {
-            Stage::Plain | Stage::Prefill => request
-                .ttft_ms
-                .is_none_or(|target| self.ttft_ms.is_some_and(|estimate| estimate <= target)),
-            Stage::Decode => request.tokens_per_second.is_none_or(|target| {
-                self.tokens_per_second
-                    .is_some_and(|estimate| estimate >= target)
-            }),
-        }
+    /// Select this bucket's plain engine or complete P/D pair, without dispatching.
+    /// A failed group reports its stage; the caller may then try another bucket.
+    pub async fn pick_engines(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+    ) -> Result<BucketPick, (Stage, PickError)> {
+        let (prefill, decode) = match &self.groups {
+            BucketGroups::Plain(group) => (
+                self.pick_from_group(group, Stage::Plain, workers, request)
+                    .await?,
+                None,
+            ),
+            BucketGroups::Pd { prefill, decode } => {
+                let prefill = self
+                    .pick_from_group(prefill, Stage::Prefill, workers, request)
+                    .await?;
+                let decode = self
+                    .pick_from_group(decode, Stage::Decode, workers, request)
+                    .await?;
+                (prefill, Some(decode))
+            }
+        };
+        Ok(BucketPick { prefill, decode })
+    }
+
+    /// Scope the request to this bucket and role, then ask the group for one engine.
+    async fn pick_from_group(
+        &self,
+        group: &EngineGroup,
+        stage: Stage,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+    ) -> Result<Pick, (Stage, PickError)> {
+        let request = PickRequest {
+            model: request.model,
+            stage,
+            bucket: &self.id,
+            input_tokens: request.input_tokens,
+            expected_peak_tokens: request.expected_peak_tokens,
+            token_ids: request.token_ids,
+            session_key: request.session_key,
+            routing_key: request.routing_key,
+        };
+        group
+            .pick(workers, &request)
+            .await
+            .map_err(|error| (stage, error))
+    }
+
+    fn fits(&self, input_tokens: u64, expected_peak_tokens: Option<u64>) -> bool {
+        self.limits.fits(input_tokens)
+            && self
+                .max_context_tokens
+                .is_none_or(|max| expected_peak_tokens.unwrap_or(input_tokens) <= max)
+    }
+
+    fn input_capacity(&self) -> u64 {
+        self.limits
+            .max
+            .unwrap_or(u64::MAX)
+            .min(self.max_context_tokens.unwrap_or(u64::MAX))
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Soft preference; nonpreferred buckets remain available for fallback.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SloPreference {
     #[default]
     Disabled,
@@ -107,123 +218,77 @@ pub enum SloPreference {
     BestEffort,
 }
 
+impl SloPreference {
+    fn penalty(self, matches: Option<bool>) -> u8 {
+        match (self, matches) {
+            (Self::SloFirst, Some(false)) | (Self::BestEffort, Some(true)) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Model-specific bucket configuration. Selection does not inspect engine state.
+#[derive(Debug, Default)]
 pub struct BucketResolver {
-    pub workers: Arc<WorkerRegistry>,
     pub buckets: Vec<Bucket>,
-    /// TTFT preference for plain and prefill; throughput preference for decode.
-    pub prefill_slo: SloPreference,
-    pub decode_slo: SloPreference,
-    pub fallback_on_rejection: bool,
+    pub ttft_slo: SloPreference,
+    pub tps_slo: SloPreference,
 }
 
 impl BucketResolver {
-    pub fn new(workers: Arc<WorkerRegistry>, buckets: Vec<Bucket>) -> Self {
+    pub fn new(buckets: Vec<Bucket>) -> Self {
         Self {
-            workers,
             buckets,
-            prefill_slo: SloPreference::Disabled,
-            decode_slo: SloPreference::Disabled,
-            fallback_on_rejection: true,
+            ..Self::default()
         }
     }
 
-    /// Buckets whose requested role and context/token limits fit, ordered by SLO
-    /// preference, rank, then ID. Engine availability is handled by `pick`.
-    pub fn matching_buckets(&self, request: &PickRequest<'_>) -> Result<Vec<&Bucket>, PickError> {
-        if request
-            .expected_peak_tokens
-            .is_some_and(|tokens| tokens < request.input_tokens)
-        {
+    /// Return all length-compatible buckets, ordered by unmet SLO preferences,
+    /// then input capacity, rank, and ID. Both preferences have equal weight.
+    /// The caller tries their groups in order until a complete engine selection succeeds.
+    pub fn resolve(
+        &self,
+        input_tokens: u64,
+        expected_peak_tokens: Option<u64>,
+        ttft_ms: Option<u64>,
+        tokens_per_second: Option<f64>,
+    ) -> Result<Vec<&Bucket>, PickError> {
+        if expected_peak_tokens.is_some_and(|tokens| tokens < input_tokens) {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
             ));
         }
-        if request
-            .tokens_per_second
-            .is_some_and(|tps| !tps.is_finite() || tps <= 0.0)
+        if self.ttft_slo != SloPreference::Disabled && ttft_ms == Some(0) {
+            return Err(PickError::InvalidSignal(
+                "requested TTFT must be positive".into(),
+            ));
+        }
+        if self.tps_slo != SloPreference::Disabled
+            && tokens_per_second.is_some_and(|tps| !tps.is_finite() || tps <= 0.0)
         {
             return Err(PickError::InvalidSignal(
                 "requested tokens per second must be finite and positive".into(),
             ));
         }
-        let context_tokens = match request.stage {
-            Stage::Plain | Stage::Prefill => request.input_tokens,
-            Stage::Decode => request.expected_peak_tokens.unwrap_or(request.input_tokens),
-        };
         let mut buckets: Vec<_> = self
             .buckets
             .iter()
-            .filter(|bucket| {
+            .filter(|bucket| bucket.fits(input_tokens, expected_peak_tokens))
+            .collect();
+        buckets.sort_by_key(|bucket| {
+            let ttft_matches = ttft_ms.map(|target| {
                 bucket
-                    .max_context_tokens
-                    .is_none_or(|max| context_tokens <= max)
-            })
-            .filter_map(|bucket| bucket.group(request.stage).map(|group| (bucket, group)))
-            .filter(|(_, group)| group.limits.fits(request))
-            .collect();
-        let slo = match request.stage {
-            Stage::Plain | Stage::Prefill => self.prefill_slo,
-            Stage::Decode => self.decode_slo,
-        };
-        buckets.sort_by_key(|(bucket, group)| {
-            let demoted = match slo {
-                SloPreference::Disabled => false,
-                SloPreference::SloFirst => !bucket.matches_slo(request),
-                SloPreference::BestEffort => bucket.matches_slo(request),
-            };
-            (demoted, group.rank, &bucket.id)
+                    .ttft_ms
+                    .is_some_and(|estimate| estimate > 0 && estimate <= target)
+            });
+            let tps_matches = tokens_per_second.map(|target| {
+                bucket.tokens_per_second.is_some_and(|estimate| {
+                    estimate.is_finite() && estimate > 0.0 && estimate >= target
+                })
+            });
+            let penalty = self.ttft_slo.penalty(ttft_matches) + self.tps_slo.penalty(tps_matches);
+            (penalty, bucket.input_capacity(), bucket.rank, &bucket.id)
         });
-        Ok(buckets.into_iter().map(|(bucket, _)| bucket).collect())
-    }
-
-    pub async fn pick(&self, request: &PickRequest<'_>) -> Result<Pick, PickError> {
-        let buckets = self.matching_buckets(request)?;
-        let mut engines: Vec<_> = self
-            .workers
-            .healthy_workers_for(request.model)
-            .into_iter()
-            .filter(|engine| engine.mode() == request.stage)
-            .collect();
-        // Stable order so cursor-based policies see a consistent candidate list.
-        engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        let mut rejections = Vec::new();
-        for bucket in buckets {
-            let group = bucket
-                .group(request.stage)
-                .expect("matching bucket has this role");
-            let members: Vec<_> = engines
-                .iter()
-                .filter(|engine| group.contains(engine))
-                .cloned()
-                .collect();
-            if members.is_empty() {
-                continue;
-            }
-            let scoped = PickRequest {
-                bucket: &bucket.id,
-                ..*request
-            };
-            match group.policy.pick(&members, &scoped).await {
-                Ok(pick) => {
-                    if !members
-                        .iter()
-                        .any(|engine| Arc::ptr_eq(engine, &pick.engine))
-                    {
-                        return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
-                    }
-                    return Ok(pick);
-                }
-                Err(PickError::NoCandidates) => continue,
-                Err(error) if !self.fallback_on_rejection => return Err(error),
-                Err(PickError::NoAdmissibleEngine(reasons)) => rejections.extend(reasons),
-                Err(PickError::AdmissionRejected(reason)) => rejections.push(reason),
-                Err(error) => return Err(error),
-            }
-        }
-        if rejections.is_empty() {
-            Err(PickError::NoCandidates)
-        } else {
-            Err(PickError::NoAdmissibleEngine(rejections))
-        }
+        Ok(buckets)
     }
 }

@@ -3,25 +3,23 @@
 
 mod forward;
 mod preparation;
+mod reorg;
 
-use crate::buckets_reorg::{BucketResolver, SloPreference};
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdPools, PdResolveError};
+use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
-use crate::policies_reorg::{PickError, PickRequest, Stage};
-use crate::server::app_context::AppContext;
+use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::state::load_monitor::engine_load::EngineLoadSnapshot;
-use crate::state::LoadView;
 use crate::workers::Worker;
 use axum::body::Body;
-use axum::extract::{Extension, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_chat_request, SelectedWorkers};
@@ -39,6 +37,19 @@ pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 /// Validate, select workers, and forward a chat-completions request.
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    match &ctx.chat_routing {
+        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
+        ChatRouting::Reorg(resolvers) => {
+            reorg::chat_completions(&ctx, resolvers, headers, body).await
+        }
+    }
+}
+
+async fn chat_completions_legacy(
+    ctx: &AppContext,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
@@ -62,11 +73,11 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     let request =
-        PreparedChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
+        PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(
-        &ctx,
+        ctx,
         &request,
         &headers,
         policy.as_ref(),
@@ -76,117 +87,7 @@ pub async fn chat_completions(
     .await?;
 
     // PD sends to both workers and returns the decode response.
-    forward_chat_request(&ctx, request, workers, headers, start).await
-}
-
-/// Experimental selection with the same preparation, HTTP middleware, and
-/// forwarding as `chat_completions`. The default router does not mount this.
-pub async fn chat_completions_with_new_policy(
-    State(ctx): State<Arc<AppContext>>,
-    Extension(resolver): Extension<Arc<BucketResolver>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>, ApiError> {
-    let start = Instant::now();
-    let mut fields = parse_routing_fields(&body)?;
-    let model = ModelId(
-        fields
-            .model
-            .take()
-            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
-    );
-    if model.0 != ctx.config.model.id {
-        return Err(ApiError::ModelNotFound(model.0));
-    }
-    let stage = match PdPoolResolver::new(resolver.workers.clone())
-        .resolve(&model)
-        .map_err(|error| pool_error(error, &model))?
-    {
-        PdPools::Plain { .. } => Stage::Plain,
-        PdPools::Pd { .. } => Stage::Prefill,
-    };
-    // Length-based buckets need token counts even without an affinity policy.
-    let request = PreparedChatRequest::prepare(&ctx, model, fields, body, true)?;
-    let prefill = pick_with_new_policy(&ctx, &resolver, &request, &headers, stage).await?;
-    let decode = if stage == Stage::Prefill {
-        Some(pick_with_new_policy(&ctx, &resolver, &request, &headers, Stage::Decode).await?)
-    } else {
-        None
-    };
-    forward_chat_request(
-        &ctx,
-        request,
-        SelectedWorkers {
-            prefill,
-            decode,
-            track_dispatch_timestamps: true,
-        },
-        headers,
-        start,
-    )
-    .await
-}
-
-async fn pick_with_new_policy(
-    ctx: &AppContext,
-    resolver: &BucketResolver,
-    request: &PreparedChatRequest,
-    headers: &HeaderMap,
-    stage: Stage,
-) -> Result<Arc<Worker>, ApiError> {
-    let load = LoadView::new(&ctx.engine_load);
-    let mut pick = PickRequest::new(
-        &request.model,
-        stage,
-        request.input_token_count as u64,
-        &load,
-    );
-    match stage {
-        Stage::Plain | Stage::Prefill if resolver.prefill_slo != SloPreference::Disabled => {
-            pick.ttft_ms =
-                parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?;
-        }
-        Stage::Decode if resolver.decode_slo != SloPreference::Disabled => {
-            pick.tokens_per_second =
-                parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?;
-        }
-        _ => {}
-    }
-    pick.expected_peak_tokens = request
-        .max_output_tokens
-        .map(|output| {
-            pick.input_tokens.checked_add(output).ok_or_else(|| {
-                ApiError::BadRequest("input plus output token budget overflows".into())
-            })
-        })
-        .transpose()?;
-    pick.token_ids = request.tokens.as_ref().map(|tokens| tokens.ids.as_slice());
-    pick.routing_key = ctx
-        .config
-        .model
-        .sticky
-        .as_ref()
-        .and_then(|config| nonempty_header(headers, &config.header_name));
-    pick.session_key = ctx
-        .config
-        .model
-        .affinity
-        .as_ref()
-        .and_then(|config| nonempty_header(headers, &config.session_id_header));
-    resolver.pick(&pick).await.map(|pick| pick.engine).map_err(|error| {
-        tracing::warn!(model = %request.model.0, ?stage, %error, "experimental policy selection failed");
-        match error {
-            PickError::NoCandidates => match stage {
-                Stage::Plain => ApiError::NoHealthyWorkers { model: request.model.0.clone() },
-                Stage::Prefill => ApiError::NoPrefillWorkersAvailable { model: request.model.0.clone() },
-                Stage::Decode => ApiError::NoDecodeWorkersAvailable { model: request.model.0.clone() },
-            },
-            PickError::NoAdmissibleEngine(_) | PickError::AdmissionRejected(_) =>
-                ApiError::PolicySelectionFailed { model: request.model.0.clone() },
-            PickError::InvalidSignal(reason) => ApiError::BadRequest(reason),
-            error => ApiError::Internal(error.into()),
-        }
-    })
+    forward_chat_request(ctx, request, workers, headers, start).await
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {

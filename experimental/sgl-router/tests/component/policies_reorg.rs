@@ -4,21 +4,33 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use sgl_router::buckets_reorg::{Bucket, BucketResolver, EngineGroup, SloPreference, TokenLimits};
+use sgl_router::buckets_reorg::{
+    Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits,
+};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
-use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
-use sgl_router::state::LoadView;
+use sgl_router::policies_reorg::admission::{AdmissionLoad, AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 use sgl_router::workers::{Worker, WorkerRegistry};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TestPolicy {
-    admission: Admission,
+    admission: Arc<dyn EngineAdmission>,
     result: Option<Arc<Worker>>,
     miss: bool,
     invalid: bool,
     calls: Mutex<Vec<String>>,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            admission: Arc::new(AllowAll),
+            result: None,
+            miss: false,
+            invalid: false,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Policy for TestPolicy {
@@ -35,15 +47,23 @@ impl Policy for TestPolicy {
             if self.miss {
                 return Err(PickError::NoCandidates);
             }
-            let admitted = self.admission.admit(engines, request)?;
-            let engine = self.result.clone().unwrap_or_else(|| admitted[0].clone());
-            self.admission.verify(
-                Pick {
-                    engine,
-                    reason: "test",
-                },
-                request,
-            )
+            if engines.is_empty() {
+                return Err(PickError::NoCandidates);
+            }
+            let engine = self.result.clone().unwrap_or_else(|| engines[0].clone());
+            if let Decision::Reject(reason) =
+                self.admission
+                    .check(&engine, request, AdmissionLoad::default())?
+            {
+                return Err(PickError::AdmissionRejected(Rejection {
+                    engine: engine.id.clone(),
+                    reason,
+                }));
+            }
+            Ok(Pick {
+                engine,
+                reason: "test",
+            })
         })
     }
 }
@@ -52,7 +72,12 @@ impl Policy for TestPolicy {
 struct Reject(&'static str);
 
 impl EngineAdmission for Reject {
-    fn check(&self, engine: &Worker, _: &PickRequest<'_>) -> Result<Decision, PickError> {
+    fn check(
+        &self,
+        engine: &Worker,
+        _: &PickRequest<'_>,
+        _: AdmissionLoad<'_>,
+    ) -> Result<Decision, PickError> {
         Ok(if engine.id.0 == self.0 {
             Decision::Reject("full".into())
         } else {
@@ -90,325 +115,269 @@ fn registry() -> Arc<WorkerRegistry> {
     workers
 }
 
-fn group(rank: u32, members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
+fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
     EngineGroup {
-        rank,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
-        ..EngineGroup::new(policy)
+        policy,
     }
 }
 
-fn bucket(id: &str, rank: u32, members: &[&str], policy: Arc<dyn Policy>) -> Bucket {
-    Bucket {
-        id: id.into(),
-        plain: Some(group(rank, members, policy)),
-        ..Default::default()
-    }
-}
-
-fn request<'a>(model: &'a ModelId, stage: Stage, load: &'a LoadView<'a>) -> PickRequest<'a> {
-    PickRequest::new(model, stage, 10, load)
+fn bucket(id: &str, max: Option<u64>, policy: Arc<dyn Policy>) -> Bucket {
+    let mut bucket = Bucket::new(id, BucketGroups::Plain(EngineGroup::new(policy)));
+    bucket.limits.max = max;
+    bucket
 }
 
 #[tokio::test]
-async fn groups_isolate_model_health_and_stage() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
+async fn groups_isolate_model_health_stage_and_membership() {
+    let workers = registry();
     let model = ModelId("m".into());
-    let request = request(&model, Stage::Plain, &load);
-    let plain = BucketResolver::new(
-        registry(),
-        vec![Bucket {
-            id: "default".into(),
-            plain: Some(EngineGroup::new(Arc::new(TestPolicy::default()))),
-            ..Default::default()
-        }],
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    let group = EngineGroup::new(Arc::new(TestPolicy::default()));
+    assert_eq!(
+        group.pick(&workers, &request).await.unwrap().engine.id.0,
+        "a"
     );
-    assert_eq!(plain.pick(&request).await.unwrap().engine.id.0, "a");
-    plain.workers.remove(&WorkerId("a".into()));
-    assert_eq!(plain.pick(&request).await.unwrap().engine.id.0, "b");
-    plain.workers.remove(&WorkerId("b".into()));
+    workers.remove(&WorkerId("a".into()));
+    assert_eq!(
+        group.pick(&workers, &request).await.unwrap().engine.id.0,
+        "b"
+    );
+    workers.remove(&WorkerId("b".into()));
     assert!(matches!(
-        plain.pick(&request).await,
+        group.pick(&workers, &request).await,
         Err(PickError::NoCandidates)
     ));
 
-    let pd_model = ModelId("pd".into());
-    let pd = BucketResolver::new(
-        registry(),
-        vec![Bucket {
-            id: "default".into(),
-            prefill: Some(EngineGroup::new(Arc::new(TestPolicy::default()))),
-            decode: Some(EngineGroup::new(Arc::new(TestPolicy::default()))),
-            ..Default::default()
-        }],
-    );
-    for (stage, id) in [(Stage::Prefill, "p"), (Stage::Decode, "d")] {
-        let request = self::request(&pd_model, stage, &load);
-        assert_eq!(pd.pick(&request).await.unwrap().engine.id.0, id);
-        assert!(matches!(
-            plain.pick(&request).await,
-            Err(PickError::NoCandidates)
-        ));
+    let pd = ModelId("pd".into());
+    for (stage, expected) in [(Stage::Prefill, "p"), (Stage::Decode, "d")] {
+        let request = PickRequest::new(&pd, stage, 10);
+        let group = self::group(
+            &["p", "d", "other", "unhealthy"],
+            Arc::new(TestPolicy::default()),
+        );
+        assert_eq!(
+            group.pick(&workers, &request).await.unwrap().engine.id.0,
+            expected
+        );
     }
+    let empty = self::group(&[], Arc::new(TestPolicy::default()));
+    assert!(matches!(
+        empty.pick(&workers, &request).await,
+        Err(PickError::NoCandidates)
+    ));
 }
 
-#[tokio::test]
-async fn buckets_match_length_then_order_by_rank_and_id() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("m".into());
-    let request = request(&model, Stage::Plain, &load);
+#[test]
+fn resolve_orders_all_length_fits_by_capacity_rank_and_id() {
     let policy = Arc::new(TestPolicy::default());
-    let mut small = bucket("small", 0, &["a"], policy.clone());
-    small.plain.as_mut().unwrap().limits.max = Some(9);
-    let mut context = bucket("context", 0, &["a"], policy.clone());
-    context.max_context_tokens = Some(9);
-    let resolver = BucketResolver::new(
-        registry(),
-        vec![
-            bucket("last", 10, &["b"], policy.clone()),
-            small,
-            context,
-            bucket("z", 1, &["b"], policy.clone()),
-            bucket("a", 1, &["a", "other", "unhealthy"], policy.clone()),
-            bucket("empty", 0, &["missing"], policy),
-        ],
-    );
+    let mut z = bucket("z", Some(20), policy.clone());
+    z.rank = 1;
+    let mut a = bucket("a", Some(20), policy.clone());
+    a.rank = 1;
+    let mut later = bucket("later", Some(20), policy.clone());
+    later.rank = 2;
+    let mut min = bucket("min", Some(15), policy.clone());
+    min.limits.min = Some(11);
+    let resolver = BucketResolver::new(vec![
+        bucket("catch-all", None, policy.clone()),
+        bucket("too-small", Some(9), policy),
+        z,
+        later,
+        a,
+        min,
+    ]);
     assert_eq!(
         resolver
-            .matching_buckets(&request)
+            .resolve(10, None, None, None)
             .unwrap()
             .iter()
-            .map(|b| b.id.as_str())
+            .map(|bucket| bucket.id.as_str())
             .collect::<Vec<_>>(),
-        ["empty", "a", "z", "last"]
+        ["a", "z", "later", "catch-all"]
     );
-    // Matching buckets can be empty; selection skips them before invoking policies.
-    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "a");
+    assert_eq!(resolver.resolve(11, None, None, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(15, None, None, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(20, None, None, None).unwrap()[0].id, "a");
+    assert_eq!(
+        resolver.resolve(21, None, None, None).unwrap()[0].id,
+        "catch-all"
+    );
+}
+
+#[test]
+fn context_capacity_checks_peak_when_known_and_input_otherwise() {
+    let policy = Arc::new(TestPolicy::default());
+    let mut short = bucket("short", None, policy.clone());
+    short.max_context_tokens = Some(20);
+    let mut long = bucket("long", None, policy);
+    long.max_context_tokens = Some(30);
+    let resolver = BucketResolver::new(vec![long, short]);
+    assert_eq!(
+        resolver.resolve(10, None, None, None).unwrap()[0].id,
+        "short"
+    );
+    assert_eq!(
+        resolver.resolve(10, Some(20), None, None).unwrap()[0].id,
+        "short"
+    );
+    assert_eq!(
+        resolver.resolve(10, Some(21), None, None).unwrap()[0].id,
+        "long"
+    );
+    assert!(resolver
+        .resolve(10, Some(31), None, None)
+        .unwrap()
+        .is_empty());
+    assert!(resolver.resolve(31, None, None, None).unwrap().is_empty());
+    assert!(matches!(
+        resolver.resolve(10, Some(9), None, None),
+        Err(PickError::InvalidSignal(_))
+    ));
+    assert!(BucketResolver::default()
+        .resolve(1, None, None, None)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
-async fn one_bucket_uses_separate_role_memberships_and_policies() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("pd".into());
+async fn selected_pd_bucket_owns_both_memberships_and_policies() {
     let workers = registry();
     workers.add(spec("p2", Stage::Prefill, "pd")).unwrap();
     workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
-    let prefill = Arc::new(TestPolicy::default());
-    let decode = Arc::new(TestPolicy::default());
-    let resolver = BucketResolver::new(
-        workers,
-        vec![Bucket {
-            id: "shared".into(),
-            // Even explicitly listed members must match the request's model and role.
-            prefill: Some(group(0, &["p2", "d", "a"], prefill.clone())),
-            decode: Some(group(0, &["d2", "p", "other"], decode.clone())),
-            ..Default::default()
-        }],
+    let model = ModelId("pd".into());
+    let prefill_policy = Arc::new(TestPolicy::default());
+    let decode_policy = Arc::new(TestPolicy::default());
+    let resolver = BucketResolver::new(vec![Bucket::new(
+        "shared",
+        BucketGroups::Pd {
+            prefill: group(&["p2", "d", "a"], prefill_policy.clone()),
+            decode: group(&["d2", "p", "other"], decode_policy.clone()),
+        },
+    )]);
+    let bucket = resolver.resolve(10, Some(20), None, None).unwrap()[0];
+    let request = BucketRequest {
+        model: &model,
+        input_tokens: 10,
+        expected_peak_tokens: Some(20),
+        token_ids: None,
+        session_key: None,
+        routing_key: None,
+    };
+    let picks = bucket.pick_engines(&workers, &request).await.unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "p2");
+    assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
+    assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
+    assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
+}
+
+#[tokio::test]
+async fn resolver_includes_empty_groups_without_invoking_policies() {
+    let workers = registry();
+    let model = ModelId("m".into());
+    let policy = Arc::new(TestPolicy::default());
+    let mut empty = Bucket::new(
+        "empty",
+        BucketGroups::Plain(group(&["missing"], policy.clone())),
     );
-    for (stage, expected) in [(Stage::Prefill, "p2"), (Stage::Decode, "d2")] {
-        let request = request(&model, stage, &load);
-        assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, expected);
-    }
-    assert_eq!(*prefill.calls.lock().unwrap(), ["shared"]);
-    assert_eq!(*decode.calls.lock().unwrap(), ["shared"]);
+    empty.limits = TokenLimits {
+        min: None,
+        max: Some(10),
+    };
+    let resolver = BucketResolver::new(vec![empty, bucket("available", Some(20), policy.clone())]);
+    let buckets = resolver.resolve(10, None, None, None).unwrap();
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|bucket| bucket.id.as_str())
+            .collect::<Vec<_>>(),
+        ["empty", "available"]
+    );
+    let bucket = buckets[0];
+    let BucketGroups::Plain(group) = &bucket.groups else {
+        panic!("expected plain")
+    };
+    let request = PickRequest {
+        bucket: &bucket.id,
+        ..PickRequest::new(&model, Stage::Plain, 10)
+    };
     assert!(matches!(
-        resolver.pick(&request(&model, Stage::Plain, &load)).await,
+        group.pick(&workers, &request).await,
         Err(PickError::NoCandidates)
     ));
+    assert!(policy.calls.lock().unwrap().is_empty());
 }
 
-#[test]
-fn stages_have_independent_ranges_and_ranks() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("pd".into());
-    let policy = Arc::new(TestPolicy::default());
-    let mut resolver = BucketResolver::new(
-        registry(),
-        vec![
-            Bucket {
-                id: "short".into(),
-                prefill: Some(group(0, &["p"], policy.clone())),
-                decode: Some(group(1, &["d"], policy.clone())),
-                ..Default::default()
-            },
-            Bucket {
-                id: "long".into(),
-                prefill: Some(group(1, &["p"], policy.clone())),
-                decode: Some(group(0, &["d"], policy)),
-                ..Default::default()
-            },
-        ],
-    );
-    let prefill = request(&model, Stage::Prefill, &load);
-    let mut decode = request(&model, Stage::Decode, &load);
-    decode.expected_peak_tokens = Some(20);
-    assert_eq!(resolver.matching_buckets(&prefill).unwrap()[0].id, "short");
-    assert_eq!(resolver.matching_buckets(&decode).unwrap()[0].id, "long");
-
-    resolver.buckets[0].prefill.as_mut().unwrap().limits.max = Some(10);
-    resolver.buckets[0].decode.as_mut().unwrap().limits.max = Some(15);
-    resolver.buckets[1].prefill.as_mut().unwrap().limits.min = Some(11);
-    resolver.buckets[1].decode.as_mut().unwrap().limits.min = Some(16);
-    for (request, expected) in [(&prefill, "short"), (&decode, "long")] {
-        let groups = resolver.matching_buckets(request).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].id, expected);
-    }
-
-    // The same bucket context limit applies to both of its role groups.
-    resolver.buckets[0].max_context_tokens = Some(9);
-    resolver.buckets[1].max_context_tokens = Some(19);
-    assert!(resolver.matching_buckets(&prefill).unwrap().is_empty());
-    assert!(resolver.matching_buckets(&decode).unwrap().is_empty());
-}
-
-#[test]
-fn decode_unknown_output_uses_only_unbounded_sequence_ranges() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("pd".into());
-    let mut request = request(&model, Stage::Decode, &load);
-    let policy = Arc::new(TestPolicy::default());
-    let bounded = Bucket {
-        id: "bounded".into(),
-        max_context_tokens: Some(20),
-        decode: Some(EngineGroup {
-            limits: TokenLimits {
-                min: Some(10),
-                max: Some(20),
-            },
-            ..group(0, &["d"], policy.clone())
+#[tokio::test]
+async fn group_propagates_rejections_misses_and_invalid_signals() {
+    let workers = registry();
+    let model = ModelId("m".into());
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    let rejected = group(
+        &["a"],
+        Arc::new(TestPolicy {
+            admission: Arc::new(Reject("a")),
+            ..Default::default()
         }),
-        ..Default::default()
-    };
-    let catch_all = Bucket {
-        id: "catch-all".into(),
-        max_context_tokens: Some(30),
-        decode: Some(group(1, &["d"], policy)),
-        ..Default::default()
-    };
-    let resolver = BucketResolver::new(registry(), vec![bounded, catch_all]);
-    assert_eq!(
-        resolver.matching_buckets(&request).unwrap()[0].id,
-        "catch-all"
     );
-    request.expected_peak_tokens = Some(20);
-    assert_eq!(resolver.matching_buckets(&request).unwrap().len(), 2);
-    request.expected_peak_tokens = Some(31);
-    assert!(resolver.matching_buckets(&request).unwrap().is_empty());
-    request.expected_peak_tokens = Some(9);
     assert!(matches!(
-        resolver.matching_buckets(&request),
+        rejected.pick(&workers, &request).await,
+        Err(PickError::AdmissionRejected(_))
+    ));
+    let miss = group(
+        &["a"],
+        Arc::new(TestPolicy {
+            miss: true,
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(
+        miss.pick(&workers, &request).await,
+        Err(PickError::NoCandidates)
+    ));
+    let invalid = group(
+        &["a"],
+        Arc::new(TestPolicy {
+            invalid: true,
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(
+        invalid.pick(&workers, &request).await,
         Err(PickError::InvalidSignal(_))
     ));
 }
 
 #[tokio::test]
-async fn rejection_advances_once_or_stops_without_relaxing_admission() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
+async fn group_rejects_foreign_pick_even_with_same_worker_id() {
+    let workers = registry();
     let model = ModelId("m".into());
-    let request = request(&model, Stage::Plain, &load);
-    for placement in [Placement::BeforeSelection, Placement::AfterSelection] {
-        let first = Arc::new(TestPolicy {
-            admission: Admission {
-                check: Arc::new(Reject("a")),
-                placement,
-            },
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    let group = group(
+        &["a"],
+        Arc::new(TestPolicy {
+            result: Some(Arc::new(Worker::new(spec("a", Stage::Plain, "m")))),
             ..Default::default()
-        });
-        let second = Arc::new(TestPolicy::default());
-        let mut resolver = BucketResolver::new(
-            registry(),
-            vec![
-                bucket("first", 0, &["a"], first.clone()),
-                bucket("second", 1, &["b"], second.clone()),
-            ],
-        );
-        assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "b");
-        assert_eq!(*first.calls.lock().unwrap(), ["first"]);
-        resolver.fallback_on_rejection = false;
-        assert!(resolver.pick(&request).await.is_err());
-        assert_eq!(second.calls.lock().unwrap().len(), 1);
-        resolver.fallback_on_rejection = true;
-        resolver.workers.remove(&WorkerId("b".into()));
-        let Err(PickError::NoAdmissibleEngine(reasons)) = resolver.pick(&request).await else {
-            panic!("expected admission exhaustion")
-        };
-        assert_eq!(reasons.len(), 1);
-        assert_eq!(reasons[0].reason, "full");
-    }
+        }),
+    );
+    assert!(matches!(
+        group.pick(&workers, &request).await,
+        Err(PickError::OutsideCandidates(_))
+    ));
 }
 
 #[tokio::test]
-async fn misses_advance_but_invalid_signals_and_foreign_picks_stop() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
+async fn selected_engine_rejection_does_not_try_an_alternative() {
     let model = ModelId("m".into());
-    let request = request(&model, Stage::Plain, &load);
-    for (first, advances) in [
-        (
-            TestPolicy {
-                miss: true,
-                ..Default::default()
-            },
-            true,
-        ),
-        (
-            TestPolicy {
-                invalid: true,
-                ..Default::default()
-            },
-            false,
-        ),
-        // Even a recreated worker with the same ID is outside the supplied set.
-        (
-            TestPolicy {
-                result: Some(Arc::new(Worker::new(spec("a", Stage::Plain, "m")))),
-                ..Default::default()
-            },
-            false,
-        ),
-    ] {
-        let second = Arc::new(TestPolicy::default());
-        let resolver = BucketResolver::new(
-            registry(),
-            vec![
-                bucket("first", 0, &["a"], Arc::new(first)),
-                bucket("second", 1, &["b"], second.clone()),
-            ],
-        );
-        assert_eq!(resolver.pick(&request).await.is_ok(), advances);
-        assert_eq!(second.calls.lock().unwrap().len(), usize::from(advances));
-    }
-}
-
-#[tokio::test]
-async fn admission_placement_changes_whether_an_alternative_can_win() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("m".into());
-    let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+    let request = PickRequest::new(&model, Stage::Plain, 10);
     let engines = [
         Arc::new(Worker::new(spec("a", Stage::Plain, "m"))),
         Arc::new(Worker::new(spec("b", Stage::Plain, "m"))),
     ];
-    let mut policy = TestPolicy {
-        admission: Admission {
-            check: Arc::new(Reject("a")),
-            placement: Placement::BeforeSelection,
-        },
+    let policy = TestPolicy {
+        admission: Arc::new(Reject("a")),
         ..Default::default()
     };
-    assert_eq!(
-        policy.pick(&engines, &request).await.unwrap().engine.id.0,
-        "b"
-    );
-    policy.admission.placement = Placement::AfterSelection;
     assert!(matches!(
         policy.pick(&engines, &request).await,
         Err(PickError::AdmissionRejected(_))
@@ -419,118 +388,119 @@ async fn admission_placement_changes_whether_an_alternative_can_win() {
     ));
 }
 
-#[test]
-fn slo_preferences_order_each_stage_without_relaxing_length_limits() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
-    let model = ModelId("pd".into());
-    let policy = Arc::new(TestPolicy::default());
-    let mut resolver = BucketResolver::new(
-        registry(),
-        vec![
-            Bucket {
-                id: "fast-prefill".into(),
-                ttft_ms: Some(50),
-                tokens_per_second: Some(10.0),
-                prefill: Some(group(10, &["p"], policy.clone())),
-                decode: Some(group(10, &["d"], policy.clone())),
-                ..Default::default()
-            },
-            Bucket {
-                id: "fast-decode".into(),
-                ttft_ms: Some(100),
-                tokens_per_second: Some(100.0),
-                prefill: Some(group(0, &["p"], policy.clone())),
-                decode: Some(group(0, &["d"], policy.clone())),
-                ..Default::default()
-            },
-            Bucket {
-                id: "unknown".into(),
-                prefill: Some(group(5, &["p"], policy.clone())),
-                decode: Some(group(5, &["d"], policy)),
-                ..Default::default()
-            },
-        ],
-    );
-    let mut prefill = request(&model, Stage::Prefill, &load);
-    prefill.ttft_ms = Some(50);
-    let mut decode = request(&model, Stage::Decode, &load);
-    decode.tokens_per_second = Some(100.0);
-    decode.expected_peak_tokens = Some(20);
-    let rank_order = ["fast-decode", "unknown", "fast-prefill"];
-    for (slo, expected_prefill, expected_decode) in [
-        (SloPreference::Disabled, rank_order, rank_order),
-        (
-            SloPreference::SloFirst,
-            ["fast-prefill", "fast-decode", "unknown"],
-            rank_order,
-        ),
-        (
-            SloPreference::BestEffort,
-            rank_order,
-            ["unknown", "fast-prefill", "fast-decode"],
-        ),
-    ] {
-        resolver.prefill_slo = slo;
-        resolver.decode_slo = slo;
-        for (request, expected) in [(&prefill, expected_prefill), (&decode, expected_decode)] {
-            let buckets = resolver.matching_buckets(request).unwrap();
-            assert_eq!(
-                buckets.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-                expected
-            );
-        }
-        // A missing target treats every bucket alike, including unknown estimates.
-        let buckets = resolver
-            .matching_buckets(&request(&model, Stage::Prefill, &load))
-            .unwrap();
-        assert_eq!(
-            buckets.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-            rank_order
-        );
-    }
-    resolver.prefill_slo = SloPreference::SloFirst;
-    resolver.decode_slo = SloPreference::BestEffort;
-    assert_eq!(
-        resolver.matching_buckets(&prefill).unwrap()[0].id,
-        "fast-prefill"
-    );
-    assert_eq!(resolver.matching_buckets(&decode).unwrap()[0].id, "unknown");
+#[tokio::test]
+async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
+    #[derive(Debug)]
+    struct InspectRequest;
 
-    // SLO matches cannot override context or role-specific token limits.
-    resolver.buckets[0].max_context_tokens = Some(9);
-    resolver.buckets[1].decode.as_mut().unwrap().limits.max = Some(19);
-    assert_eq!(
-        resolver.matching_buckets(&prefill).unwrap()[0].id,
-        "fast-decode"
+    impl Policy for InspectRequest {
+        fn pick<'a>(
+            &'a self,
+            engines: &'a [Arc<Worker>],
+            request: &'a PickRequest<'a>,
+        ) -> BoxFuture<'a, Result<Pick, PickError>> {
+            Box::pin(async move {
+                assert_eq!(request.model.0, "m");
+                assert_eq!(request.bucket, "plain-bucket");
+                assert_eq!(request.stage, Stage::Plain);
+                assert_eq!(request.input_tokens, 2);
+                assert_eq!(request.expected_peak_tokens, Some(12));
+                assert_eq!(request.token_ids, Some([7, 9].as_slice()));
+                assert_eq!(request.session_key, Some("session"));
+                assert_eq!(request.routing_key, Some("routing"));
+                Ok(Pick {
+                    engine: engines[0].clone(),
+                    reason: "inspected",
+                })
+            })
+        }
+    }
+
+    let workers = registry();
+    let model = ModelId("m".into());
+    let bucket = Bucket::new(
+        "plain-bucket",
+        BucketGroups::Plain(group(&["b"], Arc::new(InspectRequest))),
     );
-    let buckets = resolver.matching_buckets(&decode).unwrap();
-    assert_eq!(buckets.len(), 1);
-    assert_eq!(buckets[0].id, "unknown");
+    let request = BucketRequest {
+        model: &model,
+        input_tokens: 2,
+        expected_peak_tokens: Some(12),
+        token_ids: Some(&[7, 9]),
+        session_key: Some("session"),
+        routing_key: Some("routing"),
+    };
+    let picks = bucket.pick_engines(&workers, &request).await.unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "b");
+    assert_eq!(picks.prefill.reason, "inspected");
+    assert!(picks.decode.is_none());
 }
 
 #[tokio::test]
-async fn slo_ordering_applies_to_plain_selection_and_rejects_invalid_targets() {
-    let table = EngineLoadTable::new();
-    let load = LoadView::new(&table);
+async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
+
+    #[derive(Debug)]
+    struct Check {
+        calls: Mutex<Vec<WorkerId>>,
+        reject: bool,
+        invalid: bool,
+    }
+
+    impl EngineAdmission for Check {
+        fn check(
+            &self,
+            engine: &Worker,
+            _: &PickRequest<'_>,
+            _: AdmissionLoad<'_>,
+        ) -> Result<Decision, PickError> {
+            self.calls.lock().unwrap().push(engine.id.clone());
+            if self.invalid {
+                Err(PickError::InvalidSignal("admission input".into()))
+            } else if self.reject {
+                Ok(Decision::Reject("full".into()))
+            } else {
+                Ok(Decision::Allow)
+            }
+        }
+    }
+
     let model = ModelId("m".into());
-    let policy = Arc::new(TestPolicy::default());
-    let mut fast = bucket("fast", 10, &["b"], policy.clone());
-    fast.ttft_ms = Some(50);
-    let mut resolver =
-        BucketResolver::new(registry(), vec![bucket("unknown", 0, &["a"], policy), fast]);
-    resolver.prefill_slo = SloPreference::SloFirst;
-    let mut request = request(&model, Stage::Plain, &load);
-    request.ttft_ms = Some(50);
-    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "b");
-    // A nonmatching group remains a fallback when the preferred group is empty.
-    resolver.workers.remove(&WorkerId("b".into()));
-    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "a");
-    for target in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        request.tokens_per_second = Some(target);
-        assert!(matches!(
-            resolver.pick(&request).await,
-            Err(PickError::InvalidSignal(_))
-        ));
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    let engine = Arc::new(Worker::new(spec("a", Stage::Plain, "m")));
+    let other = Arc::new(Worker::new(spec("b", Stage::Plain, "m")));
+    let _busy = other.load_guard();
+    for engines in [vec![engine.clone()], vec![other.clone(), engine.clone()]] {
+        for (reject, invalid) in [(false, false), (true, false), (false, true)] {
+            let check = Arc::new(Check {
+                calls: Mutex::new(Vec::new()),
+                reject,
+                invalid,
+            });
+            let fallback = Arc::new(TestPolicy::default());
+            let mut policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
+            policy.admission = check.clone();
+            policy.fallback = Some(fallback.clone());
+            assert!(matches!(
+                policy.pick(&[], &request).await,
+                Err(PickError::NoCandidates)
+            ));
+            assert!(check.calls.lock().unwrap().is_empty());
+            let result = policy.pick(&engines, &request).await;
+            if invalid {
+                assert!(matches!(result, Err(PickError::InvalidSignal(_))));
+            } else if reject {
+                assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
+                if reason.engine == engine.id && reason.reason == "full"));
+            } else {
+                assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
+            }
+            assert_eq!(
+                check.calls.lock().unwrap().as_slice(),
+                std::slice::from_ref(&engine.id)
+            );
+            assert!(fallback.calls.lock().unwrap().is_empty());
+        }
     }
 }
