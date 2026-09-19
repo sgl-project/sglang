@@ -238,6 +238,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
+    # Cosmos3 Multiview-AV sparse attention kernel: "triton" or "fa4". Wins over
+    # the checkpoint's multiview.backend; an explicit pipeline-config
+    # multiview_attention_backend wins over both.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
