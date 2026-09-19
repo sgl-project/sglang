@@ -41,12 +41,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashInfer sparse-MLA DSA {phase} "
             "backend."
         )
 
