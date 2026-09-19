@@ -8,7 +8,6 @@ are declared beside them but are not collected into the record.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any, Dict, List, Tuple, get_type_hints
 
 import msgspec

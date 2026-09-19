@@ -150,6 +150,28 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
 
 
+def test_watermark_host_enablement_tracks_filter_and_merge():
+    info = _make_info(
+        batch_size=2,
+        watermark_enabled=torch.tensor([False, True]),
+        watermark_candidates_host=[False, True],
+        has_watermark_candidates=True,
+    )
+    info.filter_batch([0], torch.tensor([0]))
+    assert info.watermark_candidates_host == [False]
+    assert not info.has_watermark_candidates
+
+    other = _make_info(
+        batch_size=1,
+        watermark_enabled=torch.tensor([True]),
+        watermark_candidates_host=[True],
+        has_watermark_candidates=True,
+    )
+    info.merge_batch(other)
+    assert info.watermark_candidates_host == [False, True]
+    assert info.has_watermark_candidates
+
+
 class TestMergeCustomLogitProcessor(CustomTestCase):
     def test_merge_preserves_processors_and_offsets_rows(self):
         proc_a, proc_b = MagicMock(), MagicMock()
@@ -708,6 +730,16 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+
+    def test_empty_batch_uses_max_top_k_merge_identity(self):
+        batch = MagicMock()
+        batch.reqs = []
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertEqual(len(info), 0)
+        self.assertEqual(info.max_top_k, 1)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
