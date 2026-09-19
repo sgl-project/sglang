@@ -108,3 +108,25 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
                 dtype=self.store_dtype,
             ),
         )
+
+
+class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
+    """Where every draft runner's layers live inside the "full" sub-pool: the
+    region, and each runner's lane count in runner order. Built once on the
+    target, stored on the `UnifiedKVPool`, and read back by each draft
+    runner, so the two sides cannot disagree on a lane.
+    """
+
+    region: DenseDraftRegion
+    runner_lane_counts: Tuple[int, ...]
+
+    def __post_init__(self):
+        assert self.runner_lane_counts, "a placement needs at least one draft runner"
+        assert sum(self.runner_lane_counts) == self.region.lane_num, (
+            f"runner lane counts {self.runner_lane_counts} must tile "
+            f"range({self.region.lane_num})"
+        )
+
+    def lanes_for(self, runner: int) -> range:
+        start = sum(self.runner_lane_counts[:runner])
+        return range(start, start + self.runner_lane_counts[runner])

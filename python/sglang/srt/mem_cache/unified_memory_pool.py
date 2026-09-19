@@ -36,7 +36,10 @@ from torch.profiler import record_function
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.page_major import (
     DenseEntryLayout,
     DensePart,
@@ -94,6 +97,8 @@ class SubPoolSpec(ABC):
     name: str
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
+    # Fused draft region riding in this sub-pool's entries; None = unfused.
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -131,7 +136,6 @@ class MHASubPoolSpec(SubPoolSpec):
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
-    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -223,6 +227,9 @@ class MLASubPoolSpec(SubPoolSpec):
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
+        assert self.draft_region is None, (
+            "MLA sub-pools do not carry a fused draft region yet"
+        )
 
     @property
     def kv_cache_dim(self) -> int:
@@ -266,6 +273,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
+        assert self.draft_region is None, (
+            "mamba state pages carry no fused draft region yet"
+        )
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -343,6 +353,7 @@ class UnifiedKVPool:
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
+        fused_draft: Optional[FusedDraftPlacement] = None,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) >= 2, (
@@ -376,6 +387,17 @@ class UnifiedKVPool:
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
+        self.fused_draft = fused_draft
+        for spec in sub_pool_specs:
+            expected = (
+                fused_draft.region
+                if fused_draft is not None and spec.name == "full"
+                else None
+            )
+            assert spec.draft_region is expected, (
+                f"sub-pool {spec.name!r}: draft_region {spec.draft_region} does "
+                f"not match the fused draft placement's {expected}"
+            )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -491,6 +513,17 @@ class UnifiedKVPool:
         )
         return s
 
+    def require_draft_host_spec(self, name: str) -> SubPoolSpec:
+        """The sub-pool spec whose entries carry a fused draft region.
+
+        Kind-agnostic: any spec that resolves a `draft_region` also lays the
+        draft parts out in its `layout()`."""
+        s = self._specs_by_name[name]
+        assert s.draft_region is not None, (
+            f"sub-pool {name!r} carries no fused draft region"
+        )
+        return s
+
     def max_slots(self, name: str) -> int:
         return self._max_slots[name]
 
@@ -539,10 +572,7 @@ class UnifiedKVPool:
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Per-layer K/V views of the DRAFT parts fused into ``sub_pool_name``'s
         entries: same pages, same slot ids, same v2p table as the host."""
-        spec = self._specs_by_name[sub_pool_name]
-        assert isinstance(spec, MHASubPoolSpec) and spec.draft_region is not None, (
-            f"sub-pool {sub_pool_name!r} carries no fused draft region"
-        )
+        spec = self.require_draft_host_spec(sub_pool_name)
         layout = spec.layout()
         page_size = self._page_size
         num_pages = self.max_slots(sub_pool_name) // page_size
@@ -1820,8 +1850,15 @@ def init_unified_swa_pools(
     lazy_compaction: bool = False,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    With ``fused_draft``, every entry of the "full" sub-pool carries the
+    draft model's K/V parts after the host parts, and each draft runner
+    binds a `UnifiedDraftKVPool` over its own lanes instead of allocating a
+    pool of its own.
+    """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1846,6 +1883,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -1896,6 +1934,7 @@ def init_unified_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
