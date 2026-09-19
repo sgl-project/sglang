@@ -976,85 +976,27 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
-    # TODO(unified-memory): fold this onto the fused path. Under the token-major
-    # views `translate_kv_loc`, `translate_kv_loc_for_kernel` and
-    # `_translate_loc_fused(dcp_size=1)` all compute the same id; only the
-    # implementation differs (one Triton launch vs several torch ops). Two things
-    # stop it being a rename: `write_loc_to_kernel_ids` flat-addresses and asserts
-    # contiguity, while callers pass strided slices (flashattention_backend hands
-    # `page_table[:bs, :max_seq_len]`); and the fused path sends a negative loc to
-    # the page-0 sink where this one lets the v2p index wrap, so the swap is a fix
-    # and needs a red-first test. Retarget `translate_kv_loc_for_kernel`'s caller
-    # only AFTER that -- first would strip the -1 handling the SWA path relies on.
     def translate_kv_loc(
         self,
         virt_tokens: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Translate token-granular virtual ids to physical ids.
-
-        Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
-        `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
-        `pool_page_size`. ``out=`` writes in-place into a caller-owned buffer,
-        required under cuda-graph capture: the captured graph records the gather
-        against a fixed ``data_ptr``.
-        """
-        if out is not None:
-            assert out.dtype == torch.int64, (
-                f"translate_kv_loc: out= dtype must be int64 (matches v2p), "
-                f"got {out.dtype}"
-            )
-            assert out.shape == virt_tokens.shape, (
-                f"translate_kv_loc: out= shape {tuple(out.shape)} must match "
-                f"virt_tokens shape {tuple(virt_tokens.shape)}"
-            )
-        with record_function("MultiEndedAlloc.translate_kv_loc"):
-            return self._translate_kv_loc_impl(virt_tokens, out)
-
-    def _translate_kv_loc_impl(
-        self,
-        virt_tokens: torch.Tensor,
-        out: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        # Tombstoned v2p entries (-1) clamp to physical slot 0.
-        ps = self.pool_page_size
-        pages = virt_tokens if ps == 1 else virt_tokens // ps
-        offsets = None if ps == 1 else virt_tokens % ps
-        if out is None:
-            phys = self.virtual_to_physical[pages]
-            ids = phys if offsets is None else phys * ps + offsets
-            return ids.clamp_(min=0)
-        if pages.dtype != torch.int64:
-            pages = pages.to(torch.int64)
-        if pages is virt_tokens:
-            # `take(out=out)` forbids index/out aliasing, but the canonical
-            # caller translates in place: translate(loc, out=loc).
-            out.copy_(torch.take(self.virtual_to_physical, pages))
-        else:
-            torch.take(self.virtual_to_physical, pages, out=out)
-        if offsets is not None:
-            out.mul_(ps)
-            out.add_(offsets)
-        return out.clamp_(min=0)
-
-    def translate_kv_loc_for_kernel(
-        self,
-        virt_tokens: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Virtual token ids -> kernel-facing ids, which under the token-major
-        views are the physical token ids:
+        """Virtual token ids -> physical token ids, which under the token-major
+        views ARE the kernel-facing ids:
 
             kernel_id(t) = v2p[t // ps] * ps + t % ps
 
-        Same id as `translate_kv_loc` for any mapped virtual token; this one
-        is one Triton launch, and it is the path that sends an unmapped or
-        negative loc to id 0, the page-0 sink. int64 out; a consumer whose
-        kernel ABI wants int32 narrows where it fills that buffer.
+        Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
+        `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
+        `pool_page_size`. An unmapped, out-of-range or negative id resolves to
+        0, the page-0 sink every kernel skips. ``out=`` writes in-place into a
+        caller-owned buffer, required under cuda-graph capture: the captured
+        graph records the gather against a fixed ``data_ptr``. int64 out; a
+        consumer whose kernel ABI wants int32 narrows where it fills that
+        buffer.
         """
-        with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
+        with record_function("MultiEndedAlloc.translate_kv_loc"):
             return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
 
     def _translate_loc_fused(
@@ -1067,17 +1009,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """One launch for the read and write conversions alike; see
-        `write_loc_to_kernel_ids`."""
-        if out is not None:
-            assert out.dtype == torch.int64, (
-                f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
-                f"got {out.dtype}"
-            )
-            if out_width is None:
-                assert out.shape == loc.shape, (
-                    f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
-                    f"match virt_tokens shape {tuple(loc.shape)}"
-                )
+        `write_loc_to_kernel_ids`, which owns the `out=` dtype and shape
+        contract for both."""
         return write_loc_to_kernel_ids(
             loc=loc,
             v2p=self.virtual_to_physical,

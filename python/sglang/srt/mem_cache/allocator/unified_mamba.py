@@ -250,8 +250,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> physical TOKEN ids; `-1` passes through as
-        `-1` (padding downstream). ``out=`` supports cuda-graph buffer stability."""
+        """Full-pool virtual TOKEN ids -> physical TOKEN ids; an unmapped or
+        negative id lands on 0, the sink. ``out=`` supports cuda-graph buffer
+        stability."""
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 

@@ -272,8 +272,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
-        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
+        """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices, out=out)
 
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
