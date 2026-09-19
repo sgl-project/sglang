@@ -788,6 +788,12 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         return out.view(*index_shape, hidden).to(self.params_dtype)
 
 
+# ``FP8_PB_WO`` is ModelOpt's canonical 2D block-FP8 name. Early composed
+# Qwen3.8-Flash-Next checkpoints label the same tensor layout (fp8 weight +
+# per-block ``weight_scale_inv``) ``FP8_BLOCK_SCALES``; keep it as an alias.
+_BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -798,7 +804,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
-        fp8_pb_wo_config: Fp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
@@ -807,7 +812,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
-        self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
@@ -889,17 +893,26 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
+        # Block-FP8 layers carry their block size as ``group_size``
+        # (default 128). One Fp8Config serves every such layer, so they must
+        # all agree.
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 layers to "
+                f"use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+
         packed_modules_mapping = config.get("packed_modules_mapping")
         fp8_config = ModelOptFp8Config(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_algo,
             exclude_modules=[],
-            packed_modules_mapping=packed_modules_mapping,
-        )
-        fp8_pb_wo_config = Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            activation_scheme="dynamic",
-            weight_block_size=[128, 128],
             packed_modules_mapping=packed_modules_mapping,
         )
         mxfp8_config = Fp8Config(
@@ -909,11 +922,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
-        # ModelOpt FP8_BLOCK_SCALES: 128x128 block fp8 with weight_scale_inv.
+        # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
+        # weight_scale_inv; the block size comes from the checkpoint's
+        # group_size (128 by default). One config serves Linear and FusedMoE.
         fp8_block_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
-            weight_block_size=[128, 128],
+            weight_block_size=[block_size, block_size],
             packed_modules_mapping=packed_modules_mapping,
         )
         nvfp4_config = ModelOptFp4Config(
@@ -938,7 +953,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
-            fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
             fp8_block_config=fp8_block_config,
             nvfp4_config=nvfp4_config,
@@ -1029,9 +1043,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "FP8_PB_WO":
-                return Fp8LinearMethod(self.fp8_pb_wo_config)
-            if quant_algo == "FP8_BLOCK_SCALES":
+            if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1062,7 +1074,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
-            if quant_algo == "FP8_BLOCK_SCALES":
+            if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
