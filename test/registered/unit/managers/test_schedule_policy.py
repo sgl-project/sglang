@@ -302,7 +302,11 @@ class TestShortestPrefillFirst(CustomTestCase):
                 self.assertEqual(limit, 1024 if name == "hrrn" else None)
 
     def test_hrrn_aging_orders_fitting_requests_before_reservation(self):
-        policy = self.make_policy("hrrn", enable_prefill_interleaving=True)
+        policy = self.make_policy(
+            "hrrn",
+            enable_prefill_interleaving=True,
+            prefill_interleaving_min_continuation_tokens=1024,
+        )
         old = self.make_req("old", 3072)
         old.arrival_processed_tokens = 0
         new = self.make_req("new", 1024)
@@ -319,6 +323,32 @@ class TestShortestPrefillFirst(CustomTestCase):
             1024,
         )
         self.assertEqual(waiting, [old, new])
+
+    def test_policy_default_minimum_and_explicit_override(self):
+        for name, minimum, budget, waiter, expected in (
+            ("hrrn", None, 16384, 8192, 8192),
+            ("hrrn", None, 4096, 3072, None),
+            ("hrrn", None, 1280, 512, 768),
+            ("hrrn", None, 256, 1, None),
+            ("hrrn", 256, 4096, 3840, 256),
+            ("shortest-prefill-first", None, 4096, 3840, 256),
+            ("shortest-prefill-first", 2048, 4096, 3072, None),
+        ):
+            with self.subTest(policy=name, minimum=minimum, budget=budget):
+                policy = self.make_policy(
+                    name,
+                    enable_prefill_interleaving=True,
+                    prefill_interleaving_min_continuation_tokens=minimum,
+                )
+                self.assertEqual(
+                    policy.prefill_interleaving_chunk_limit(
+                        self.make_req("continuation", 32768),
+                        [self.make_req("waiter", waiter)],
+                        budget,
+                        256,
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

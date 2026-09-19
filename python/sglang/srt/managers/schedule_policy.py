@@ -463,10 +463,16 @@ class SchedulePolicy:
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
         """Reserve whole waiting prefills and put selected HRRN requests first."""
-        minimum = self.prefill_interleaving_min_continuation_tokens or page_size
+        shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        minimum = self.prefill_interleaving_min_continuation_tokens
+        if minimum is None:
+            minimum = (
+                page_size
+                if shortest_first
+                else max(page_size, _ceil_div(budget, 2 * page_size) * page_size)
+            )
         if not self.prefill_interleaving or budget < minimum + page_size:
             return None
-        shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
         )

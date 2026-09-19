@@ -79,10 +79,11 @@ python -m sglang.launch_server --model-path MODEL_PATH \
   --prefill-interleaving-min-continuation-tokens 4096
 ```
 
-The continuation minimum defaults to one KV page. Set a positive multiple of
-`--page-size`, smaller than the chunk size, to reserve more progress for the active
-request. If no waiting request fits, the continuation uses the normal chunk
-budget. Memory admission can still limit either allocation. Use
+The continuation minimum defaults to one KV page for `shortest-prefill-first`.
+For `hrrn`, it defaults to half the current chunk budget, rounded up to a KV page
+(8K for a 16K budget). You can override either default with a positive multiple
+of `--page-size`, smaller than the chunk size. If no waiting request fits, the
+continuation uses the normal chunk budget. Memory admission can still limit either allocation. Use
 `--disable-prefill-interleaving` to disable the shortest-prefill-first default.
 
 | Policy | Waiting-request selection |

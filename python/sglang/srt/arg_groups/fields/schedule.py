@@ -70,7 +70,7 @@ class Schedule(msgspec.Struct):
     ] = False
     prefill_interleaving_min_continuation_tokens: A[
         Optional[int],
-        "Minimum tokens reserved for the continuing request when interleaving prefills. Defaults to one KV page. Must be a positive multiple of page_size. Without fitting waiters, the continuation uses the normal chunk budget.",
+        "Minimum tokens reserved for the continuing request when interleaving prefills. Defaults to one KV page for shortest-prefill-first, or half the current chunk budget rounded up to a KV page for hrrn. Explicit values must be positive multiples of page_size. Without fitting waiters, the continuation uses the normal chunk budget.",
     ] = None
     prefill_decode_interval: A[
         Optional[int],
