@@ -77,7 +77,12 @@ class ChunkCache(BasePrefixCache):
         return InsertResult(prefix_len=0)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
@@ -151,7 +156,12 @@ class PureSWAChunkCache(SWAChunkCache):
     """
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
     ):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :owned_kv_len

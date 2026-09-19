@@ -1,10 +1,19 @@
+import time
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
+import zmq
 
+from sglang.srt.managers.io_struct import AbortReq, SessionReapPlan
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, MatchResult
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -76,17 +85,43 @@ class _FakeInnerCache:
         return None
 
 
+class _FakeSessionTreeCache:
+    def __init__(self):
+        self.released = []
+
+    def release_session(self, session_id):
+        self.released.append(session_id)
+
+    def release_radix_session(self, session_id):
+        pass
+
+
+class _FinishedReq:
+    multimodal_inputs = None
+
+    def finished(self):
+        return True
+
+
 class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
+        self.rid = session_id
         self.session = SimpleNamespace(
             session_id=session_id,
             streaming=True,
             finish_req=lambda req: None,
-            abort_req=lambda: None,
             _inflight=False,
+            _inflight_rid=None,
         )
+
+        def abort_req(rid):
+            if self.session._inflight_rid == rid:
+                self.session._inflight = False
+                self.session._inflight_rid = None
+
+        self.session.abort_req = abort_req
         self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
@@ -132,7 +167,7 @@ def test_session_slot_round_trip_preserves_mamba_state():
 
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
-    the session: session=None, abort_req() called. Slot stays intact."""
+    the session: session=None, abort_req(rid) called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator(page_size=16)
@@ -178,6 +213,101 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
+
+
+def test_preabort_detaches_without_slot():
+    """Pre-aborted req detaches even when its session has no active slot."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    raw_result = MatchResult(
+        device_indices=torch.tensor([], dtype=torch.int64),
+        last_device_node=None,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=16,
+        match_results=[raw_result],
+    )
+    tree_cache = StreamingSession(inner)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1, allocated=1)
+    req.session._inflight_rid = req.rid
+    aborted = []
+    original_abort_req = req.session.abort_req
+
+    def record_abort_req(rid):
+        aborted.append(rid)
+        original_abort_req(rid)
+
+    req.session.abort_req = record_abort_req
+    req.to_finish = FINISH_ABORT("too long")
+
+    result = tree_cache.match_prefix(
+        SimpleNamespace(
+            req=req,
+            key=SimpleNamespace(token_ids=list(range(64))),
+        )
+    )
+
+    assert req.session is None
+    assert aborted == ["session-a"]
+    assert result is raw_result
+    assert len(result.device_indices) == 0
+    assert tree_cache.slots == {}
+
+
+def test_preabort_of_non_inflight_req_keeps_inflight():
+    """Only the matching in-flight request may clear session state."""
+
+    def match_preaborted_req(rid):
+        req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+        raw_result = MatchResult(
+            device_indices=torch.tensor([], dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+            best_match_node=None,
+        )
+        inner = _FakeInnerCache(
+            req_to_token_pool,
+            _FakeAllocator(),
+            page_size=16,
+            match_results=[raw_result],
+        )
+        tree_cache = StreamingSession(inner)
+        req = _FakeReq("session-a", req_pool_idx=0, committed=1, allocated=1)
+        req.rid = rid
+        req.session._inflight = True
+        req.session._inflight_rid = "turn-1"
+        abort_req = Mock()
+        real_abort_req = req.session.abort_req
+
+        def record_abort_req(request_rid):
+            if req.session._inflight_rid == request_rid:
+                abort_req(request_rid)
+            real_abort_req(request_rid)
+
+        req.session.abort_req = record_abort_req
+        req.to_finish = FINISH_ABORT("too long")
+
+        tree_cache.match_prefix(
+            SimpleNamespace(
+                req=req,
+                key=SimpleNamespace(token_ids=list(range(64))),
+            )
+        )
+        return req, abort_req
+
+    non_inflight_req, abort_req = match_preaborted_req("stub")
+    assert non_inflight_req.session is None
+    abort_req.assert_not_called()
+
+    inflight_req, abort_req = match_preaborted_req("turn-1")
+    assert inflight_req.session is None
+    abort_req.assert_called_once_with("turn-1")
 
 
 def test_first_mid_abort_nukes_ephemeral_slot():
@@ -382,6 +512,296 @@ def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
         list(range(32, 48)),
         list(range(48, 64)),
     ]
+
+
+def test_release_session_skips_lazy_ping_pong_sentinels():
+    allocator = MambaSlotAllocator(size=8, device="cpu")
+    allocator.alloc(8)
+    req_to_token_pool = SimpleNamespace(mamba_allocator=allocator)
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        page_size=1,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        kv=ReqKvInfo(
+            mamba_pool_idx=torch.tensor(3),
+            mamba_ping_pong_track_buffer=torch.tensor([5, -1]),
+        ),
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert set(allocator.free_slots.tolist()) == {3, 5}
+    assert -1 not in allocator.free_slots.tolist()
+    assert allocator.available_size() == 2
+
+
+def test_session_held_mamba_slots_ignores_sentinels():
+    req_to_token_pool = SimpleNamespace(mamba_allocator=_FakeAllocator())
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        page_size=1,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        kv=ReqKvInfo(
+            mamba_pool_idx=torch.tensor(3),
+            mamba_ping_pong_track_buffer=torch.tensor([5, -1]),
+        ),
+    )
+    assert tree_cache.session_held_mamba_slots() == 2
+
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-b"] = SessionSlot(
+        kv=ReqKvInfo(
+            mamba_pool_idx=torch.tensor(4),
+            mamba_ping_pong_track_buffer=torch.tensor([-1, -1]),
+        ),
+    )
+    assert tree_cache.session_held_mamba_slots() == 1
+
+
+def test_session_controller_plan_reap_defers_application():
+    tree_cache = _FakeSessionTreeCache()
+    controller = SessionController(tree_cache)
+    ready = Session(16, "ready")
+    ready.close_on_finish = True
+    ready.req_nodes["req"] = SimpleNamespace(req=_FinishedReq())
+    timed_out = Session(16, "timed-out", timeout=1)
+    timed_out.last_active_time = time.monotonic() - 2
+    controller.sessions.update({"ready": ready, "timed-out": timed_out})
+
+    controller._last_reap_time = 10
+    assert controller.plan_reap(10.5) is None
+    plan = controller.plan_reap(12)
+
+    assert plan == SessionReapPlan(
+        deferred=["ready"],
+        timed_out=["timed-out"],
+    )
+    assert set(controller.sessions) == {"ready", "timed-out"}
+    assert tree_cache.released == []
+
+
+def test_session_controller_apply_reap_filters_stale_sessions():
+    tree_cache = _FakeSessionTreeCache()
+    controller = SessionController(tree_cache)
+    deferred = Session(16, "deferred")
+    deferred.close_on_finish = True
+    not_deferred = Session(16, "not-deferred")
+    timed_out = Session(16, "timed-out")
+    controller.sessions.update(
+        {
+            "deferred": deferred,
+            "not-deferred": not_deferred,
+            "timed-out": timed_out,
+        }
+    )
+
+    controller.apply_reap(
+        SessionReapPlan(
+            deferred=["deferred", "missing", "not-deferred"],
+            timed_out=["timed-out", "missing"],
+        )
+    )
+
+    assert tree_cache.released == ["deferred", "timed-out"]
+    assert set(controller.sessions) == {"not-deferred"}
+
+
+def test_session_controller_apply_reap_is_rank_symmetric():
+    controllers = []
+    for _ in range(2):
+        tree_cache = _FakeSessionTreeCache()
+        controller = SessionController(tree_cache)
+        deferred = Session(16, "deferred")
+        deferred.close_on_finish = True
+        controller.sessions.update(
+            {"deferred": deferred, "untouched": Session(16, "untouched")}
+        )
+        controllers.append(controller)
+
+    plan = SessionReapPlan(deferred=["deferred"], timed_out=[])
+    for controller in controllers:
+        controller.apply_reap(plan)
+
+    assert set(controllers[0].sessions) == set(controllers[1].sessions) == {"untouched"}
+
+
+def test_request_receiver_classifies_session_reap_plan_as_work():
+    receiver = object.__new__(SchedulerRequestReceiver)
+    plan = SessionReapPlan(deferred=[], timed_out=[])
+
+    work, control = receiver._split_work_and_control_reqs([plan])
+
+    assert work == [plan]
+    assert control == []
+
+
+def _controller_with_deferred_session():
+    tree_cache = _FakeSessionTreeCache()
+    controller = SessionController(tree_cache)
+    deferred = Session(16, "deferred", streaming=True)
+    deferred.close_on_finish = True
+    deferred.req_nodes["req"] = SimpleNamespace(req=_FinishedReq())
+    controller.sessions["deferred"] = deferred
+    controller._last_reap_time = -1.0  # the first plan_reap call plans
+    return controller, tree_cache
+
+
+def _make_single_rank_receiver(
+    controller, skipper, pp_rank=0, pp_size=1, plan_session_reap=None
+):
+    """Receiver wired as the scheduler wires it, with the collective plumbing
+    faked for one non-dp rank (broadcast is the identity at tp_size=1)."""
+    return SchedulerRequestReceiver(
+        recv_from_tokenizer=None,
+        recv_from_rpc=None,
+        recv_skipper=skipper,
+        input_blocker=None,
+        mm_receiver=None,
+        ps=SimpleNamespace(
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+        ),
+        tp_group=None,
+        tp_cpu_group=None,
+        attn_tp_group=None,
+        attn_tp_cpu_group=None,
+        attn_cp_group=None,
+        attn_cp_cpu_group=None,
+        world_group=SimpleNamespace(cpu_group=None),
+        server_args=None,
+        model_config=SimpleNamespace(is_multimodal=False),
+        max_recv_per_poll=-1,
+        stream_output=lambda *args, **kwargs: None,
+        get_last_batch=lambda: None,
+        plan_session_reap=(
+            plan_session_reap if plan_session_reap is not None else controller.plan_reap
+        ),
+    )
+
+
+def test_skipped_receive_cycle_still_reaps_deferred_close():
+    """recv_skipper declining the poll must not strand deferred closes: the
+    leader still plans the reap and the plan still rides the per-step
+    broadcast, so every rank applies it at the same loop position."""
+    controller, tree_cache = _controller_with_deferred_session()
+    receiver = _make_single_rank_receiver(
+        controller, SimpleNamespace(handle=lambda _last_batch: False)
+    )
+
+    with patch(
+        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+        return_value=SimpleNamespace(enable_dp_attention=False),
+    ):
+        recv_reqs = receiver.recv_requests()
+
+    # Planning ran despite the skipped receive, and nothing else rode along.
+    assert recv_reqs == [SessionReapPlan(deferred=["deferred"], timed_out=[])]
+
+    # Applied at process_input_requests' head, the deferred close completes.
+    controller.apply_reap(recv_reqs[0])
+    assert tree_cache.released == ["deferred"]
+    assert controller.sessions == {}
+
+
+def test_skipped_receive_cycle_broadcasts_local_aborts():
+    """Timeout aborts the caller already polled still ride the per-step
+    broadcast on a receive-skipped cycle instead of being dropped."""
+    controller, _ = _controller_with_deferred_session()
+    receiver = _make_single_rank_receiver(
+        controller, SimpleNamespace(handle=lambda _last_batch: False)
+    )
+    abort = AbortReq(rid="stuck")
+
+    with patch(
+        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+        return_value=SimpleNamespace(enable_dp_attention=False),
+    ):
+        recv_reqs = receiver.recv_requests(local_reqs=[abort])
+
+    assert recv_reqs == [
+        SessionReapPlan(deferred=["deferred"], timed_out=[]),
+        abort,
+    ]
+
+
+def test_receive_cycle_appends_reap_plan_to_pulled_reqs():
+    """On a receive cycle the leader's plan is appended to the pulled reqs and
+    rides the same broadcast (the pre-fix behavior, preserved)."""
+    controller, _ = _controller_with_deferred_session()
+    receiver = _make_single_rank_receiver(
+        controller, SimpleNamespace(handle=lambda _last_batch: True)
+    )
+
+    with (
+        patch(
+            "sglang.srt.managers.scheduler_components.request_receiver.sock_recv",
+            side_effect=zmq.ZMQError(),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=False),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler_components.request_receiver.get_disagg",
+            return_value=SimpleNamespace(
+                language_only=False, encoder_transfer_backend=None
+            ),
+        ),
+    ):
+        recv_reqs = receiver.recv_requests()
+
+    assert recv_reqs == [SessionReapPlan(deferred=["deferred"], timed_out=[])]
+
+
+def test_skipped_receive_cycle_relays_reap_plan_across_pp_stages():
+    """PP>1: a skipped cycle must keep the point-to-point relay so the
+    leader's plan reaches every stage at the same iteration; later stages
+    must not plan locally (single-planner invariant)."""
+    controller0, tree_cache0 = _controller_with_deferred_session()
+    controller1, tree_cache1 = _controller_with_deferred_session()
+    skipper = SimpleNamespace(handle=lambda _last_batch: False)
+    stage0 = _make_single_rank_receiver(controller0, skipper)
+    stage1_plan = Mock(side_effect=controller1.plan_reap)
+    stage1 = _make_single_rank_receiver(
+        controller1, skipper, pp_rank=1, pp_size=2, plan_session_reap=stage1_plan
+    )
+
+    with patch(
+        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+        return_value=SimpleNamespace(enable_dp_attention=False),
+    ):
+        recv0 = stage0.recv_requests()
+        # The event loop forwards stage 0's list; stage 1's pull receives it.
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_receiver."
+            "point_to_point_pyobj",
+            side_effect=lambda *args, **kwargs: recv0,
+        ) as relay:
+            recv1 = stage1.recv_requests()
+
+    plan = SessionReapPlan(deferred=["deferred"], timed_out=[])
+    assert recv0 == [plan]
+    assert recv1 == [plan]
+    relay.assert_called_once()
+    stage1_plan.assert_not_called()
+
+    # Every stage applies the same plan.
+    controller0.apply_reap(recv0[0])
+    controller1.apply_reap(recv1[0])
+    assert tree_cache0.released == tree_cache1.released == ["deferred"]
+    assert controller0.sessions == controller1.sessions == {}
 
 
 if __name__ == "__main__":

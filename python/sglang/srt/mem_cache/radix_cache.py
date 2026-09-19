@@ -476,7 +476,12 @@ class RadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        owned_kv_len: int,
+        is_retract: bool = False,
     ):
         """Cache request when it finishes."""
         if self.disable:
