@@ -314,7 +314,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
-        scratch_indices = select_verify_intermediate_state_indices(
+        dst_indices_raw = select_verify_intermediate_state_indices(
             None,
             forward_batch.req_pool_indices,
             batch.lengths.ne(0),
@@ -326,7 +326,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
             ),
-            scratch_indices,
+            dst_indices_raw,
         )
         return
 
@@ -1098,19 +1098,19 @@ class Qwen4ExpPLELayer(nn.Module):
                 intermediate_state = intermediate_state.to(
                     dtype=intermediate_cache.dtype
                 )
-                scratch_indices = select_verify_intermediate_state_indices(
+                dst_indices_raw = select_verify_intermediate_state_indices(
                     None,
                     forward_batch.req_pool_indices,
                     batch.lengths.ne(0),
                     get_req_to_token_pool().size,
                 )
-                if scratch_indices is None:
+                if dst_indices_raw is None:
                     intermediate_cache[
                         : batch.lengths.shape[0], : batch.row_width
                     ].copy_(intermediate_state)
                 else:
                     intermediate_cache[
-                        scratch_indices.to(dtype=torch.long), : batch.row_width
+                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
                     ] = intermediate_state
         else:
             state_cols = torch.arange(

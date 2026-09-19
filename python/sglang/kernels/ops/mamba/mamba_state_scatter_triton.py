@@ -708,7 +708,7 @@ def scatter_mamba_states_after_mtp_verify(
     last_correct_step_indices: torch.Tensor,
     mamba_track_indices: torch.Tensor | None,
     mamba_steps_to_track: torch.Tensor | None,
-    source_indices_tensor: torch.Tensor | None = None,
+    src_indices_raw: torch.Tensor | None = None,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
     persistent caches, plus the interval-crossing track slots."""
@@ -721,7 +721,7 @@ def scatter_mamba_states_after_mtp_verify(
             intermediate_state_cache,
             state_indices_tensor,
             last_correct_step_indices,
-            source_indices_tensor,
+            src_indices_raw,
         )
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
@@ -730,7 +730,7 @@ def scatter_mamba_states_after_mtp_verify(
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
-                source_indices_tensor,
+                src_indices_raw,
             )
 
     pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
@@ -738,7 +738,7 @@ def scatter_mamba_states_after_mtp_verify(
         return
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
-    if source_indices_tensor is None and _conv_multi_eligible(pairs):
+    if src_indices_raw is None and _conv_multi_eligible(pairs):
         fused_conv_window_scatter_multi(
             pairs,
             state_indices_tensor,
@@ -753,7 +753,7 @@ def scatter_mamba_states_after_mtp_verify(
             intermediate_conv_window_cache,
             state_indices_tensor,
             last_correct_step_indices,
-            source_indices_tensor,
+            src_indices_raw,
         )
     if mamba_track_indices is not None:
         for conv_states, intermediate_conv_window_cache in pairs:
@@ -762,7 +762,7 @@ def scatter_mamba_states_after_mtp_verify(
                 intermediate_conv_window_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
-                source_indices_tensor,
+                src_indices_raw,
             )
 
 

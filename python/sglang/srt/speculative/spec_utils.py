@@ -920,7 +920,7 @@ def commit_mamba_states_after_verify(
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
     bs = accept_lens.shape[0]
-    source_indices_raw = (
+    src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
@@ -953,7 +953,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            source_indices_raw=source_indices_raw,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
         return
@@ -1020,7 +1020,7 @@ def commit_mamba_states_after_verify(
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
-            source_indices_raw,
+            src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
@@ -1028,7 +1028,7 @@ def commit_mamba_states_after_verify(
                 spec_state.intermediate_conv_window[0],
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
-                source_indices_raw,
+                src_indices_raw,
             )
         return
 
@@ -1089,7 +1089,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            source_indices_raw=source_indices_raw,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return

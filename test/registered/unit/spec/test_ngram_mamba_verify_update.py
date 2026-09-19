@@ -288,7 +288,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                     state_batch_indices=destinations,
                     accept_lens=accept_lens,
                     last_correct_step_indices=steps,
-                    source_indices_raw=source_rows,
+                    src_indices_raw=source_rows,
                 )
 
                 scatter.assert_called_once()
@@ -570,7 +570,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         )
         torch.testing.assert_close(scatter.call_args.args[2], last_steps)
         torch.testing.assert_close(
-            scatter.call_args.kwargs["source_indices_tensor"], req_pool_indices
+            scatter.call_args.kwargs["src_indices_raw"], req_pool_indices
         )
 
     def test_non_pp_commit_keeps_forward_metadata_fast_path(self):
@@ -619,7 +619,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         torch.testing.assert_close(
             scatter.call_args.args[1], torch.tensor([9, 10, 11], dtype=torch.int32)
         )
-        self.assertIsNone(scatter.call_args.kwargs["source_indices_tensor"])
+        self.assertIsNone(scatter.call_args.kwargs["src_indices_raw"])
 
 
 class TestConvWindowDedupLayout(CustomTestCase):

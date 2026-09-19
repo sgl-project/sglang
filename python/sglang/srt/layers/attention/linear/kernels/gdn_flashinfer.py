@@ -36,13 +36,13 @@ _FLASHINFER_GDN_ALIGNMENT = 32
 def copy_verify_intermediate_rows(
     destination: torch.Tensor,
     positional_source: torch.Tensor,
-    destination_rows: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
 ) -> None:
     """Move FlashInfer's positional verify snapshots to their owned rows."""
-    count = destination_rows.shape[0]
+    count = dst_indices_raw.shape[0]
     destination.index_copy_(
         0,
-        destination_rows.to(device=destination.device, dtype=torch.long),
+        dst_indices_raw.to(device=destination.device, dtype=torch.long),
         positional_source[:count],
     )
 
