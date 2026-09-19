@@ -37,9 +37,9 @@ impl Policy for TestPolicy {
             if self.miss {
                 return Err(PickError::NoCandidates);
             }
-            let admitted = self.admission.before(engines, request)?;
+            let admitted = self.admission.admit(engines, request)?;
             let engine = self.result.clone().unwrap_or_else(|| admitted[0].clone());
-            self.admission.after(
+            self.admission.verify(
                 Pick {
                     engine,
                     reason: "test",

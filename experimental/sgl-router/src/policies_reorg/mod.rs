@@ -5,7 +5,10 @@
 //! `policies` stays live until the switch PR replaces it.
 
 pub mod admission;
+pub mod least_load;
 pub mod power_of_two;
+pub mod random;
+pub mod round_robin;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -50,6 +53,11 @@ impl<'a> PickRequest<'a> {
             routing_key: None,
             load,
         }
+    }
+
+    /// KV the request will hold: the input, or the projected peak when known.
+    pub fn kv_tokens(&self) -> u64 {
+        self.expected_peak_tokens.unwrap_or(self.input_tokens)
     }
 }
 
@@ -101,7 +109,58 @@ pub trait Policy: Send + Sync + Debug {
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         match self.fallback() {
             Some(fallback) => fallback.pick(engines, request),
-            None => Box::pin(async { Err(PickError::NoCandidates) }),
+            None => ready(Err(PickError::NoCandidates)),
         }
+    }
+}
+
+/// Lifts a synchronous result into the trait's future.
+pub(crate) fn ready(
+    result: Result<Pick, PickError>,
+) -> BoxFuture<'static, Result<Pick, PickError>> {
+    Box::pin(std::future::ready(result))
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::admission::Admission;
+    use super::*;
+    use crate::discovery::WorkerSpec;
+    use crate::state::engine_load::EngineLoadTable;
+
+    pub(crate) fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}"),
+            mode: Stage::Plain,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    pub(crate) async fn pick(
+        policy: &dyn Policy,
+        engines: &[Arc<Worker>],
+    ) -> Result<Pick, PickError> {
+        let table = EngineLoadTable::new();
+        let load = LoadView::new(&table);
+        let model = ModelId("m".into());
+        policy
+            .pick(engines, &PickRequest::new(&model, Stage::Plain, 10, &load))
+            .await
+    }
+
+    /// First admitted engine under `admission`.
+    pub(crate) async fn pick_with(
+        admission: &Admission,
+        engines: &[Arc<Worker>],
+    ) -> Result<Pick, PickError> {
+        let table = EngineLoadTable::new();
+        let load = LoadView::new(&table);
+        let model = ModelId("m".into());
+        let request = PickRequest::new(&model, Stage::Plain, 10, &load);
+        admission.select(engines, &request, "test", |admitted| {
+            admitted.first().cloned()
+        })
     }
 }
