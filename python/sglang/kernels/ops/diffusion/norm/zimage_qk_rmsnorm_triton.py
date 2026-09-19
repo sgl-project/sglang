@@ -132,6 +132,23 @@ def can_use_qk_rmsnorm_native(
     )
 
 
+import struct
+
+from sglang.kernels.ops.diffusion.norm import fast_launch as _fast_launch
+
+_QK_RMSNORM_LAUNCH = _fast_launch.CachedLaunch()
+
+
+def _f32_bits(value: float) -> int:
+    """An fp32 kernel argument as the 4 bytes the driver will read."""
+    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+
+def _qk_signature(x, weight, eps):
+    """What a recorded q/k norm launch stays valid for."""
+    return (x.shape, x.stride(), x.dtype, weight.shape, eps)
+
+
 def zimage_qk_rmsnorm_native(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -144,6 +161,18 @@ def zimage_qk_rmsnorm_native(
     Returns None when the input is not supported (caller falls back).
     """
     head_dim = x.shape[-1]
+    # The comment on rows_per_prog below already says this shape is
+    # launch-bound, so the support checks and stride derivation cost more than
+    # the kernel. Replay a recorded launch once the signature is known.
+    if _fast_launch.available():
+        cached = _QK_RMSNORM_LAUNCH.lookup(_qk_signature(x, weight, eps))
+        if cached is not None:
+            y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            _QK_RMSNORM_LAUNCH.replay(
+                cached, [y.data_ptr(), x.data_ptr(), weight.data_ptr()]
+            )
+            return y
+
     if not can_use_qk_rmsnorm_native(x, weight, head_dim):
         return None
     token_stride = _qk_head_token_stride(x, head_dim)
@@ -161,7 +190,7 @@ def zimage_qk_rmsnorm_native(
     y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     grid = (triton.cdiv(n_rows, rows_per_prog),)
     with torch.get_device_module().device(x.device):
-        _qk_rmsnorm_native_kernel[grid](
+        compiled = _qk_rmsnorm_native_kernel[grid](
             y,
             x,
             weight,
@@ -172,6 +201,14 @@ def zimage_qk_rmsnorm_native(
             eps,
             rows_per_prog=rows_per_prog,
             num_warps=num_warps,
+        )
+    if _fast_launch.available() and compiled is not None:
+        _QK_RMSNORM_LAUNCH.record(
+            _qk_signature(x, weight, eps),
+            compiled,
+            (grid[0], 1, 1),
+            [y.data_ptr(), x.data_ptr(), weight.data_ptr()],
+            [token_stride, nheads, n_rows, head_dim, _f32_bits(eps)],
         )
     return y
 
