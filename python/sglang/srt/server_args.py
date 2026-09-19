@@ -3383,6 +3383,11 @@ class ServerArgs:
         "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
         NS("model"),
     ] = False
+    remote_instance_weight_loader_start_seed_via_nixl: A[
+        bool,
+        "Start seed server via NIXL backend for remote instance weight loader.",
+        NS("model"),
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -4190,6 +4195,7 @@ class ServerArgs:
             resolving_view(
                 self
             ).remote_instance_weight_loader_start_seed_via_transfer_engine
+            or resolving_view(self).remote_instance_weight_loader_start_seed_via_nixl
             or self.enable_engine_info_bootstrap
         )
 
