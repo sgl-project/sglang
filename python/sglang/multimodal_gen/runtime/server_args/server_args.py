@@ -1897,6 +1897,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
 

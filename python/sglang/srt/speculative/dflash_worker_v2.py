@@ -19,7 +19,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
@@ -391,7 +390,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._tp_sync = SpecTpSync(
             get_parallel().attn_tp_group
             if get_parallel().enable_dp_attention
-            else get_tp_group()
+            else get_parallel().tp_group
         )
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
@@ -443,7 +442,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             validate_domino_runtime(
                 device=torch.device(self.device),
-                tp_size=int(get_tp_group().world_size),
+                tp_size=int(get_parallel().tp_group.world_size),
                 tp_rank=int(self.ps.tp_rank),
                 target_vocab_size=int(self.model_runner.model_config.vocab_size),
                 draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
@@ -503,7 +502,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._is_domino:
                 logger.info(
                     "DFLASH Domino rollout enabled (BF16, TP=%s, block-shared candidate pool size=%s).",
-                    int(get_tp_group().world_size),
+                    int(get_parallel().tp_group.world_size),
                     self.domino_candidate_pool_size,
                 )
             logger.info(
@@ -628,7 +627,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,
                     self.gpu_id,
-                    group=get_tp_group(),
+                    group=get_parallel().tp_group,
                 )
                 if available_mem < 1.0:
                     capture_decode_cuda_graph = False
@@ -805,7 +804,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if self._is_domino:
             prefix_gru = self.draft_model.prefix_gru
             embed_proj = self.draft_model.embed_proj
@@ -1253,7 +1252,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().enable_dp_attention:
             return
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         tp_size = int(tp_group.world_size)
         if tp_size <= 1:
             return
@@ -1461,7 +1460,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         makes for GGUF models. Padding rows are excluded so argmax cannot return
         an id outside the real vocabulary.
         """
-        tp_size = int(get_tp_group().world_size)
+        tp_size = int(get_parallel().tp_group.world_size)
         if tp_size != 1:
             raise RuntimeError(
                 "DFLASH with a quantized target lm_head is only supported at "
@@ -1523,7 +1522,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
@@ -2517,7 +2516,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
                 raise RuntimeError("DFLASH Domino projector modules are unavailable.")
-            tp_group = get_tp_group()
+            tp_group = get_parallel().tp_group
             shard = getattr(lm_head, "shard_indices", None)
             draft_next = domino_greedy_rollout(
                 draft_hidden=draft_hidden,
