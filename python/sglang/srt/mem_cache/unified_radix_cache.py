@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -257,6 +258,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self.enable_cache_mode_storage_hit_pending = self.pp_size == 1 and not any(
+            group is not None and torch.distributed.get_world_size(group=group) > 1
+            for group in (
+                self.tp_group,
+                self.attn_cp_group,
+                self.attn_tp_group,
+                self.pp_group,
+            )
+        )
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -268,6 +278,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
+        self.storage_prefetch_retry_max_attempts = 8
         self.hicache_storage_pass_prefix_keys = False
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
@@ -388,6 +399,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
+        self.pending_storage_hits: deque[PrefetchOperation] = deque()
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -519,6 +531,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self.storage_prefetch_retry_max_attempts = (
+            get_memory().hicache_storage_prefetch_retry_max_attempts
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -2629,6 +2644,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
     def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
+        self._remove_pending_storage_hit(request)
         info = self.ongoing_prefetch.pop(request, None)
         self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
         if info is None:
@@ -2659,6 +2675,14 @@ class UnifiedRadixCache(BasePrefixCache):
             0,
             cc.prefetch_tokens_occupied
             - self._prefetch_occupied_span(prefetch_key, _host_indices),
+        )
+
+    def _remove_pending_storage_hit(self, request: CacheRequestHandle) -> None:
+        pending = getattr(self, "pending_storage_hits", None)
+        if not pending:
+            return
+        self.pending_storage_hits = deque(
+            operation for operation in pending if operation.handle != request
         )
 
     def _drain_storage_control_queues_impl(
@@ -2747,21 +2771,21 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None:
                 self.evict_host(alloc_len)
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
-                # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    hit_tokens,
-                    available_size - (available_size % self.page_size),
-                )
-                if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     # Parked ops hold no pin: release and re-take at the next
                     # attempt, which is also how a moved anchor gets noticed.
                     self.buffer_pipeline.release_anchor_lock(request)
+                    self._log_storage_prefetch_deferred(
+                        max(alloc_len, aux_hit_tokens), "host_capacity"
+                    )
+                    return False
+                retries = getattr(operation, "host_capacity_retries", 0)
+                if (
+                    self.enable_cache_mode_storage_hit_pending
+                    and retries < self.storage_prefetch_retry_max_attempts
+                ):
+                    operation.host_capacity_retries = retries + 1
                     self._log_storage_prefetch_deferred(
                         max(alloc_len, aux_hit_tokens), "host_capacity"
                     )
@@ -2811,13 +2835,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
+            # Parked hits first (FIFO fairness with retries).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
-                while parked:
-                    if not _try_alloc_storage_hit(parked[0]):
-                        break
-                    parked.popleft()
+            else:
+                parked = self.pending_storage_hits
+            while parked:
+                if not _try_alloc_storage_hit(parked[0]):
+                    break
+                parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
@@ -2866,10 +2892,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 parked_ahead = buffer_mode and bool(
                     self.buffer_pipeline.pending_hit_allocs
                 )
+                if not buffer_mode:
+                    parked_ahead = bool(self.pending_storage_hits)
                 if parked_ahead or not _try_alloc_storage_hit(operation):
                     # Counted once at first parking, not per retry tick.
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    if buffer_mode:
+                        self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    else:
+                        self.pending_storage_hits.append(operation)
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
