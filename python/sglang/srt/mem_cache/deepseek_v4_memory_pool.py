@@ -87,6 +87,7 @@ def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_fp8,
     )
+
     return is_unified_kv_fp8() if unified_fp8 is None else bool(unified_fp8)
 
 
