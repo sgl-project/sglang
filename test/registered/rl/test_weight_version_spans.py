@@ -212,8 +212,8 @@ class TestWeightVersionSpans(CustomTestCase):
             "No request spanned the weight update -- no boundary was recorded.",
         )
 
-    def test_04_openai_metadata_contains_weight_versions(self):
-        """OpenAI-compatible responses surface the spans under response metadata."""
+    def test_04_openai_sglext_contains_weight_versions(self):
+        """OpenAI-compatible responses surface the spans under response sglext."""
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             json={
@@ -227,19 +227,19 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(response.status_code, 200)
 
         data = response.json()
-        metadata = data["metadata"]
-        self.assertIn("weight_versions", metadata)
-        spans = metadata["weight_versions"]
+        sglext = data["sglext"]
+        self.assertIn("weight_versions", sglext)
+        spans = sglext["weight_versions"]
         self.assertEqual(len(spans), 1)
-        self.assertEqual(spans[0]["version"], metadata["weight_version"])
-        self.assertEqual(metadata["weight_version"], self._current_version())
+        self.assertEqual(spans[0]["version"], sglext["weight_version"])
+        self.assertEqual(sglext["weight_version"], self._current_version())
         self.assertEqual(spans[0]["start"], 0)
         self.assertEqual(spans[0]["end"], data["usage"]["completion_tokens"])
 
-    def test_04b_openai_metadata_reports_the_first_choice_when_n_is_greater_than_one(
+    def test_04b_openai_sglext_reports_the_first_choice_when_n_is_greater_than_one(
         self,
     ):
-        """With n > 1 the single metadata block describes the first choice instead of going missing."""
+        """With n > 1 the single sglext block describes the first choice instead of going missing."""
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             json={
@@ -255,11 +255,11 @@ class TestWeightVersionSpans(CustomTestCase):
 
         data = response.json()
         self.assertEqual(len(data["choices"]), 2)
-        metadata = data["metadata"]
-        spans = metadata["weight_versions"]
+        sglext = data["sglext"]
+        spans = sglext["weight_versions"]
         self.assertEqual(len(spans), 1)
-        self.assertEqual(spans[0]["version"], metadata["weight_version"])
-        self.assertEqual(metadata["weight_version"], self._current_version())
+        self.assertEqual(spans[0]["version"], sglext["weight_version"])
+        self.assertEqual(sglext["weight_version"], self._current_version())
         self.assertEqual(spans[0]["start"], 0)
 
     def test_05_aborted_retracted_requests_report_spans(self):
@@ -469,7 +469,7 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
         self.assertEqual(spans[-1]["end"], max_new_tokens)
 
-    def test_12_completions_endpoint_reports_metadata(self):
+    def test_12_completions_endpoint_reports_sglext(self):
         """/v1/completions surfaces the spans the same way /v1/chat/completions does."""
         response = requests.post(
             f"{self.base_url}/v1/completions",
@@ -484,11 +484,11 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(response.status_code, 200)
 
         data = response.json()
-        metadata = data["metadata"]
-        self.assertEqual(metadata["weight_version"], self._current_version())
-        spans = metadata["weight_versions"]
+        sglext = data["sglext"]
+        self.assertEqual(sglext["weight_version"], self._current_version())
+        spans = sglext["weight_versions"]
         self.assertEqual(len(spans), 1)
-        self.assertEqual(spans[0]["version"], metadata["weight_version"])
+        self.assertEqual(spans[0]["version"], sglext["weight_version"])
         self.assertEqual(spans[0]["start"], 0)
         self.assertEqual(spans[0]["end"], data["usage"]["completion_tokens"])
 

@@ -36,7 +36,9 @@ from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.srt.runtime_context import get_serving
-from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
+from sglang.srt.utils.weight_versions import (
+    build_endpoint_weight_version_sglext_fields,
+)
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -561,12 +563,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.n > 1
             else (spec_details[0] if spec_details else None)
         )
+        weight_version_fields = build_endpoint_weight_version_sglext_fields(
+            ret[0]["meta_info"]
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details or spec_tokens_details:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or spec_tokens_details
+            or weight_version_fields
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
+                **weight_version_fields,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -640,7 +651,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
-            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 
