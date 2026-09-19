@@ -830,6 +830,12 @@ async def server_info():
     after publication -- the model a weight update swapped in, its load format,
     an operator-set weight version -- are reported by `/model_info`, and the
     HiCache mirror by `GET /hicache/storage-backend`.
+
+    `effective_max_running_requests` is the minimum available per-DP
+    scheduler limit after memory-pool sizing. It describes per-worker
+    capacity; individual rank limits remain in `internal_states`.
+    The field is omitted when no rank reports an effective limit, and
+    `max_running_requests` retains its startup configuration value.
     """
     # Returns internal states per DP.
     internal_states: List[
@@ -838,20 +844,28 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    return msgspec_to_builtins(
-        {
-            **server_args.resolved_dict(),
-            "launch_command": server_args.launch_command,
-            **_global_state.scheduler_info,
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
-        }
-    )
+    result = {
+        **server_args.resolved_dict(),
+        "launch_command": server_args.launch_command,
+        **_global_state.scheduler_info,
+        "startup_time": _global_state.tokenizer_manager.startup_time,
+        "internal_states": internal_states,
+        "version": __version__,
+        # Structured KV-event publisher descriptor for KV-aware routers.
+        # `None` when publishing is disabled or misconfigured; see
+        # `runtime_context.describe_kv_events_publisher` for the contract.
+        "kv_events": describe_kv_events_publisher(server_args),
+    }
+
+    effective_values = [
+        state["effective_max_running_requests_per_dp"]
+        for state in internal_states
+        if state.get("effective_max_running_requests_per_dp") is not None
+    ]
+    if effective_values:
+        result["effective_max_running_requests"] = min(effective_values)
+
+    return msgspec_to_builtins(result)
 
 
 @app.get("/get_load")
