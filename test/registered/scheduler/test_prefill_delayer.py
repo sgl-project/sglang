@@ -31,7 +31,6 @@ register_cuda_ci(
     est_time=300,
     stage="base-c",
     runner_config="8-gpu-h200",
-    disabled="Temporarily disabled",
 )
 
 WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")

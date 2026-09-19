@@ -21,7 +21,6 @@ register_cuda_ci(
     est_time=60,
     stage="base-b",
     runner_config="2-gpu-large",
-    disabled="Temporarily disabled",
 )
 
 # Optional dependency in sglang repo; skip collection cleanly if absent.
