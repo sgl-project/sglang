@@ -57,3 +57,4 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    mtp_draft_mamba_pools: tuple[object, ...] = ()
