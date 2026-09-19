@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -18,7 +19,10 @@ if TYPE_CHECKING:
         UpdateWeightFromDiskReqInput,
         UpdateWeightsFromIPCReqInput,
     )
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -157,6 +161,33 @@ class BaseSpecWorker(ABC):
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
         self._additional_graph_time_usage: dict[str, float] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        method = cls.__dict__.get("forward_batch_generation")
+        if method is None or getattr(method, "__isabstractmethod__", False):
+            return
+        if "pp_proxy_tensors" not in inspect.signature(method).parameters:
+            raise TypeError(
+                f"{cls.__qualname__}.forward_batch_generation must accept "
+                "pp_proxy_tensors (the non-overlap scheduler always passes it)"
+            )
+
+    @abstractmethod
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
+        """Run one speculative generation step.
+
+        The non-overlap scheduler always passes ``pp_proxy_tensors`` (None
+        when pipeline parallelism is disabled). Subclasses must accept the
+        keyword and forward it to the target worker.
+        """
+        ...
 
     @property
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
