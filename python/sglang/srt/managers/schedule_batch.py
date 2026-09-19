@@ -863,7 +863,8 @@ class MultimodalInputs:
             if self.token_modalities is None:
                 self.token_modalities = list(other.token_modalities)
             else:
-                self.token_modalities += other.token_modalities
+                # Session appends shallow-copy their parent's metadata.
+                self.token_modalities = self.token_modalities + other.token_modalities
 
         mrope_positions = self.mrope_positions
         if mrope_positions is not None:
