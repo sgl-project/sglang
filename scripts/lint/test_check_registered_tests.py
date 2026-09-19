@@ -1,4 +1,3 @@
-import ast
 import unittest
 from types import SimpleNamespace
 
@@ -11,14 +10,12 @@ def _registry(suite: str):
 
 class TestRegisteredTestTaxonomy(unittest.TestCase):
     def setUp(self):
-        self.tree = ast.parse("")
         self.kernel_registry = [_registry("base-b-kernel-unit-test-1-gpu-large")]
 
     def test_plural_kernel_ops_layout_is_accepted(self):
         errors = taxonomy_errors(
             "test/registered/kernels/ops/attention/test_example.py",
             self.kernel_registry,
-            self.tree,
         )
         self.assertEqual(errors, [])
 
@@ -26,7 +23,6 @@ class TestRegisteredTestTaxonomy(unittest.TestCase):
         errors = taxonomy_errors(
             "test/registered/kernels/benchmark/attention/bench_example.py",
             [_registry("base-b-kernel-benchmark-test-1-gpu-large")],
-            self.tree,
         )
         self.assertEqual(errors, [])
 
@@ -34,7 +30,6 @@ class TestRegisteredTestTaxonomy(unittest.TestCase):
         errors = taxonomy_errors(
             "test/registered/kernel/attention/test_example.py",
             self.kernel_registry,
-            self.tree,
         )
         self.assertTrue(errors)
 
@@ -42,7 +37,6 @@ class TestRegisteredTestTaxonomy(unittest.TestCase):
         errors = taxonomy_errors(
             "test/registered/kernels/ops/test_example.py",
             self.kernel_registry,
-            self.tree,
         )
         self.assertTrue(errors)
 

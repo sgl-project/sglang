@@ -72,17 +72,12 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-Unit tests cover one srt module, so they mirror the source tree:
-
-```text
-test/registered/unit/<srt_module>/test_*.py
-```
-
-Every other directory under `test/registered/` groups tests by topic and is
-free-form (`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...). What a test
-costs, which stage gates it and which runner it needs are declared by its
-`register_*_ci` call -- including hardware, which is expressed by one or more
-`register_*_ci` calls and never by a new top-level directory. Kernel tests use
+Directories under `test/registered/` group tests by topic and are free-form
+(`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...); unit tests cover one srt
+module, so they mirror the source tree under `unit/`. What a test costs, which
+stage gates it and which runner it needs are declared by its `register_*_ci`
+call -- including hardware, which is expressed by one or more `register_*_ci`
+calls and never by a new top-level directory. Kernel tests use
 `test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
 plural `kernels` root.
 

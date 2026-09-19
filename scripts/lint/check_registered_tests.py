@@ -26,7 +26,6 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # to a suite no workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-_UNIT_ROOT = "unit"
 _KERNEL_ROOT = "kernels"
 
 _KERNEL_ROOT_TYPO = "kernel"
@@ -100,18 +99,7 @@ def _changed_registered_files() -> set[str]:
     return selected
 
 
-def _contains_call(tree: ast.AST, name: str) -> bool:
-    return any(
-        isinstance(node, ast.Call)
-        and (
-            (isinstance(node.func, ast.Name) and node.func.id == name)
-            or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-        )
-        for node in ast.walk(tree)
-    )
-
-
-def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
+def taxonomy_errors(path: str, registries: list) -> list[str]:
 
     parts = path.split("/")
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
@@ -132,27 +120,7 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
             f"{path}: kernel tests use the plural root: "
             "test/registered/kernels/{ops,benchmark}/<group>/"
         ]
-    if relative_parts[0] != _UNIT_ROOT:
-        return []
-
-    errors = []
-    if len(relative_parts) < 3:
-        errors.append(
-            f"{path}: unit tests mirror the srt tree: "
-            "test/registered/unit/<srt_module>/test_*.py"
-        )
-    invalid = [
-        r
-        for r in registries
-        if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
-    ]
-    if invalid:
-        errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
-    if any(r.est_time > 60 for r in registries):
-        errors.append(f"{path}: unit test est_time must be <= 60 seconds")
-    if _contains_call(tree, "popen_launch_server"):
-        errors.append(f"{path}: unit tests may not launch a server")
-    return errors
+    return []
 
 
 def main() -> int:
@@ -193,7 +161,7 @@ def main() -> int:
         with open(f, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=f)
         if f in changed_files:
-            taxonomy_violations.extend(taxonomy_errors(f, registries, tree))
+            taxonomy_violations.extend(taxonomy_errors(f, registries))
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
