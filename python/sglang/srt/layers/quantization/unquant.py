@@ -72,6 +72,21 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
 
+# The decode-shape skinny GEMM is gfx950-only and opt-in; resolving the arch
+# once here keeps the per-forward check to two attribute reads.
+_use_skinny_gemm = _is_hip and envs.SGLANG_USE_SKINNY_GEMM.get()
+if _use_skinny_gemm:
+    import torch as _torch
+
+    _use_skinny_gemm = (
+        _torch.cuda.is_available()
+        and str(_torch.cuda.get_device_properties(0).gcnArchName).split(":")[0]
+        == "gfx950"
+    )
+if _use_skinny_gemm:
+    from sglang.kernels.ops.gemm import skinny_gemm_bf16
+    from sglang.kernels.ops.gemm.skinny_gemm_gluon import is_tuned_shape
+
 
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
@@ -476,6 +491,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif (
+            _use_skinny_gemm
+            and x.dim() == 2
+            and x.dtype is torch.bfloat16
+            and layer.weight.dtype is torch.bfloat16
+            and type(layer.weight.data) is torch.Tensor
+            and is_tuned_shape(x.shape[0], layer.weight.shape[0], x.shape[1])
+        ):
+            # Only shapes the kernel was tuned on: everything else stays on the
+            # incumbent, which is what it was measured against.
+            return skinny_gemm_bf16(x, layer.weight, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
