@@ -81,12 +81,18 @@ def _can_enable_t1_fused_qk_norm_rope(
     tp_size: int,
     sp_size: int,
     is_compiled: bool,
+    hidden_size: int = 0,
 ) -> bool:
     if is_compiled:
         return False
     if is_blackwell:
         return True
-    return is_hopper and hidden_act != "relu2" and tp_size == 1 and sp_size == 1
+    return (
+        is_hopper
+        and (hidden_act != "relu2" or hidden_size == 2048)
+        and tp_size == 1
+        and sp_size == 1
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1710,13 +1716,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._ensure_cache_dicts()
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
-        # single-GPU Hopper Nano (SwiGLU) workload, while the Hopper
-        # Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
+        # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
+        # while the Hopper Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
         # path because that shape regresses with the fusion.
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
             hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),
             sp_size=get_sp_world_size(),
             is_compiled=self._gen_layers_torch_compiled,
