@@ -164,7 +164,12 @@ def run_with_timeout(
     def _target_func():
         ret_value.append(func(*args, **(kwargs or {})))
 
-    t = threading.Thread(target=_target_func)
+    # daemon=True: on timeout the worker is abandoned while still blocked on
+    # its child. A non-daemon worker would keep the interpreter alive at
+    # shutdown, so a child that survives kill_process_tree (e.g. stuck in
+    # D-state on a wedged GPU) would stall the runner indefinitely after every
+    # result had already been reported.
+    t = threading.Thread(target=_target_func, daemon=True, name="ci-file-runner")
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
