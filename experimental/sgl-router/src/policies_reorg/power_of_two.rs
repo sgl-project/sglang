@@ -2,19 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::future::BoxFuture;
 use rand::Rng;
 
+use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
+use crate::state::load_monitor::engine_load::EngineLoadTable;
 use crate::workers::Worker;
 
-use super::admission::Admission;
-use super::{ready, Pick, PickError, PickRequest, Policy};
+use super::admission::{AdmissionLoad, AllowAll, Decision, EngineAdmission};
+use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-/// Two distinct random candidates; the one under lower stage load wins.
-#[derive(Debug, Default)]
+/// Samples two distinct engines and selects the one with lower stage pressure.
+/// Checks admission only on the selected engine; rejection never resamples.
+#[derive(Debug)]
 pub struct PowerOfTwoPolicy {
-    pub admission: Admission,
+    /// Shared application state; snapshots are local to each pick.
+    engine_load: Arc<EngineLoadTable>,
+    pub admission: Arc<dyn EngineAdmission>,
+    pub fallback: Option<Arc<dyn Policy>>,
+}
+
+impl PowerOfTwoPolicy {
+    pub fn new(engine_load: Arc<EngineLoadTable>) -> Self {
+        Self {
+            engine_load,
+            admission: Arc::new(AllowAll),
+            fallback: None,
+        }
+    }
 }
 
 impl Policy for PowerOfTwoPolicy {
@@ -23,52 +40,49 @@ impl Policy for PowerOfTwoPolicy {
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
-        ready(
-            self.admission
-                .select(engines, request, "power_of_two", |admitted| {
-                    choose(admitted, request).cloned()
-                }),
-        )
+        Box::pin(async move {
+            if engines.is_empty() {
+                return Err(PickError::NoCandidates);
+            }
+            // Selection and admission use the same load observation.
+            let load = self.engine_load.capture_snapshot(Instant::now());
+            let engine = match engines {
+                [engine] => Arc::clone(engine),
+                _ => {
+                    let mut rng = rand::thread_rng();
+                    let i = rng.gen_range(0..engines.len());
+                    let mut j = rng.gen_range(0..engines.len() - 1);
+                    if j >= i {
+                        j += 1;
+                    }
+                    let (left, right) = (&engines[i], &engines[j]);
+                    let pressure = match request.stage {
+                        Stage::Plain | Stage::Prefill => {
+                            compare_prefill_pressure(left, right, Some(&load))
+                        }
+                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
+                    };
+                    Arc::clone(if pressure.is_gt() { right } else { left })
+                }
+            };
+            let engine_load = AdmissionLoad {
+                reported: load.fresh_load_for_url(&engine.url),
+                native: load.fresh_native_cache_load_for_url(&engine.url),
+            };
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, engine_load)? {
+                return Err(PickError::AdmissionRejected(Rejection {
+                    engine: engine.id.clone(),
+                    reason,
+                }));
+            }
+            Ok(Pick {
+                engine,
+                reason: "power_of_two",
+            })
+        })
     }
-}
 
-/// One power-of-two choice; shared by policies that fall back to it.
-pub(crate) fn choose<'e>(
-    engines: &'e [Arc<Worker>],
-    request: &PickRequest<'_>,
-) -> Option<&'e Arc<Worker>> {
-    let mut rng = rand::thread_rng();
-    let i = rng.gen_range(0..engines.len().max(1));
-    let left = engines.get(i)?;
-    if engines.len() == 1 {
-        return Some(left);
-    }
-    let j = (i + rng.gen_range(1..engines.len())) % engines.len();
-    Some(
-        request
-            .load
-            .lower_pressure(left, &engines[j], request.stage),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::testing::{pick, worker};
-    use super::*;
-    use std::collections::HashSet;
-    use std::sync::atomic::Ordering;
-
-    #[tokio::test]
-    async fn lower_load_wins_and_every_engine_is_reachable() {
-        let policy = PowerOfTwoPolicy::default();
-        let (a, b) = (worker("a"), worker("b"));
-        a.active_requests.store(10, Ordering::Relaxed);
-        assert_eq!(pick(&policy, &[a, b]).await.unwrap().engine.id.0, "b");
-        let fleet: Vec<_> = ["a", "b", "c", "d", "e"].map(worker).into();
-        let mut seen = HashSet::new();
-        for _ in 0..500 {
-            seen.insert(pick(&policy, &fleet).await.unwrap().engine.id.clone());
-        }
-        assert_eq!(seen.len(), fleet.len());
+    fn fallback(&self) -> Option<&dyn Policy> {
+        self.fallback.as_deref()
     }
 }

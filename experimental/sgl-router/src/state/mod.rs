@@ -8,7 +8,5 @@
 pub mod affinity_store;
 pub mod kv_events;
 pub mod load_monitor;
-pub mod load_view;
 
 pub use affinity_store::AffinityStore;
-pub use load_view::LoadView;
