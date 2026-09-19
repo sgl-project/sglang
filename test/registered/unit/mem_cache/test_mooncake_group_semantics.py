@@ -79,6 +79,7 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -100,6 +101,7 @@ def _fake_store_class():
             return self.objects.get(key)
 
         def batch_is_exist(self, keys):
+            self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
@@ -450,6 +452,43 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+        )
+
+    def test_v2_batches_scalar_and_multi_buffer_pools_in_one_rpc(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        results = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+            ]
+        )
+
+        self.assertEqual(results[PoolName.INDEXER], [True])
+        self.assertEqual(results[PoolName.DEEPSEEK_V4_C4], [True])
+        self.assertEqual(len(fake_store.batch_exist_calls), 1)
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(
+            call["keys"],
+            ["tag_page0__indexer", "tag_page0__deepseek_v4_c4"],
+        )
+        self.assertEqual(call["ptrs"], [[3000], [4000, 4001]])
+        self.assertEqual(call["sizes"], [[8], [8, 16]])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page0"],
         )
 
     def test_model_names_isolate_the_same_logical_key(self):
