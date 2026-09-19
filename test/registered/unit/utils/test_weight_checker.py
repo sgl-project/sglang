@@ -44,7 +44,7 @@ from sglang.srt.utils.weight_checker_comparator import (
     RawComparable,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -551,7 +551,8 @@ class _WeightCheckerTestBase(CustomTestCase):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
         runner = _FakeModelRunner(self.model)
-        self.checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
+        enter_scope(self, published_topology())
+        self.checker = WeightChecker(get_model=lambda: runner.model)
 
 
 class TestSnapshot(_WeightCheckerTestBase):
@@ -760,9 +761,16 @@ class _ChecksumTestBase(CustomTestCase):
             pp_rank=0,
             pp_size=1,
         )
-        self.checker = WeightChecker(
-            get_model=lambda: self.runner.model, ps=self.runner.ps
+        enter_scope(
+            self,
+            published_topology(
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                ranks={"world_rank": 2, "dp_rank": 1},
+            ),
         )
+        self.checker = WeightChecker(get_model=lambda: self.runner.model)
 
 
 class TestComputeChecksum(_ChecksumTestBase):
