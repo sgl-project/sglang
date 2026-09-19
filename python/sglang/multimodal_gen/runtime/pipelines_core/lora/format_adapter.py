@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -23,6 +24,7 @@ class LoRAFormat(str, Enum):
     QWEN_IMAGE_STANDARD = "qwen-image-standard"
     XLABS_FLUX = "xlabs-ai"
     KOHYA_FLUX = "kohya-flux"
+    KOHYA_MINIMAX_H3 = "kohya-minimax-h3"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
@@ -60,6 +62,68 @@ def _looks_like_xlabs_flux_key(k: str) -> bool:
         return False
 
     return ".processor." in k or ".proj_lora" in k or ".qkv_lora" in k
+
+
+_KOHYA_H3_KEY = re.compile(
+    r"^lora_unet_blocks_(\d+)_(attn_qkv_proj|attn_out_proj|mlp_fc1|mlp_fc2)"
+    r"\.(lora_down|lora_up|alpha)(?:\.weight)?$"
+)
+_KOHYA_H3_MODULES = {
+    "attn_qkv_proj": "attn.qkv_proj",
+    "attn_out_proj": "attn.out_proj",
+    "mlp_fc1": "mlp.fc1",
+    "mlp_fc2": "mlp.fc2",
+}
+_KOHYA_H3_SUFFIXES = {
+    "lora_down": "lora_A",
+    "lora_up": "lora_B",
+    "alpha": "alpha",
+}
+
+
+def _looks_like_kohya_minimax_h3(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Kohya `networks.lora_minimax_h3` export: lora_unet_blocks_* fused names."""
+    if not state_dict:
+        return False
+    return any(
+        k.startswith("lora_unet_blocks_") and "_attn_qkv_proj." in k for k in state_dict
+    )
+
+
+def _convert_kohya_minimax_h3(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """lora_unet_blocks_N_* + lora_down/up -> native H3 blocks.N.*.lora_A/B."""
+    out: Dict[str, torch.Tensor] = {}
+    unmatched: list[str] = []
+
+    for name, tensor in state_dict.items():
+        match = _KOHYA_H3_KEY.match(name)
+        if match is None:
+            unmatched.append(name)
+            out[name] = tensor
+            continue
+        layer, module, suffix = match.group(1), match.group(2), match.group(3)
+        target = (
+            f"blocks.{layer}.{_KOHYA_H3_MODULES[module]}.{_KOHYA_H3_SUFFIXES[suffix]}"
+        )
+        out[target] = tensor
+
+    sample = _sample_keys(out.keys(), 20)
+    log.info(
+        "[LoRAFormatAdapter] after KOHYA_MINIMAX_H3 conversion, "
+        "unmatched=%d sample keys (<=20): %s",
+        len(unmatched),
+        ", ".join(sample),
+    )
+    if unmatched:
+        log.warning(
+            "[LoRAFormatAdapter] KOHYA_MINIMAX_H3 left %d unmatched keys: %s",
+            len(unmatched),
+            ", ".join(_sample_keys(unmatched, 8)),
+        )
+    return out
 
 
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
@@ -152,6 +216,8 @@ def detect_lora_format_from_state_dict(
 
     if any(_looks_like_xlabs_flux_key(k) for k in keys):
         return LoRAFormat.XLABS_FLUX
+    if _looks_like_kohya_minimax_h3(state_dict):
+        return LoRAFormat.KOHYA_MINIMAX_H3
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
 
@@ -505,6 +571,9 @@ def convert_lora_state_dict_by_format(
     if fmt == LoRAFormat.XLABS_FLUX:
         converted = _convert_xlabs_ai_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
+
+    if fmt == LoRAFormat.KOHYA_MINIMAX_H3:
+        return _convert_kohya_minimax_h3(state_dict, log)
 
     if fmt == LoRAFormat.KOHYA_FLUX:
         converted = _convert_kohya_flux_via_diffusers(state_dict, log)
