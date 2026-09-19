@@ -871,9 +871,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert per_channel_quant, (
-                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
-            )
+            assert (
+                per_channel_quant
+            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -907,23 +907,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert not fuse_sum_all_reduce, (
-            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when fuse_add_to_output=True"
-        )
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when fuse_add_to_output=True"
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert not fuse_add_to_output, (
-            "mask_output and fuse_add_to_output are mutually exclusive"
-        )
-        assert not fuse_sum_all_reduce, (
-            "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when mask_output=True"
-        )
+        assert (
+            not fuse_add_to_output
+        ), "mask_output and fuse_add_to_output are mutually exclusive"
+        assert (
+            not fuse_sum_all_reduce
+        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when mask_output=True"
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -931,9 +931,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert not fuse_sum_all_reduce, (
-            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
-        )
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -1293,6 +1293,7 @@ def _fused_append_shared_experts_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    ZERO_PAD_WEIGHTS: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1327,11 +1328,13 @@ def _fused_append_shared_experts_kernel(
     if HAS_PADDING:
         # Fold the _fill_padded_rows pair that used to run before and after this
         # kernel: rows >= num_token_non_padded get pad_fill_id in every routed
-        # slot and a zero weight in every slot, shared slots included.
+        # slot, and -- unless SGLANG_MORI_NO_PAD_MASK suppressed that pass -- a
+        # zero weight in every slot, shared slots included.
         if pid >= tl.load(num_token_non_padded_ptr):
             ids = tl.full([BLOCK_K], pad_fill_id, dtype=ids.dtype)
-            ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
-            shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+            if ZERO_PAD_WEIGHTS:
+                ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
+                shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
 
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
@@ -1348,13 +1351,14 @@ def fused_append_shared_experts(
     N=None,
     num_token_non_padded=None,
     pad_fill_id=0,
+    zero_pad_weights=True,
 ):
     """Append shared-expert ids/weights to a routed top-k output.
 
-    When ``num_token_non_padded`` is given the kernel also materializes the
-    padded region (routed ids <- ``pad_fill_id``, all weights <- 0), which is
-    exactly what the ``_fill_padded_rows`` launches around this call did, so
-    the caller can drop both of them.
+    With ``num_token_non_padded`` the kernel also materializes the padded region
+    (routed ids <- ``pad_fill_id``, and all weights <- 0 unless
+    ``zero_pad_weights`` is off), which is what the ``_fill_padded_rows``
+    launches around this call did, so the caller can drop both of them.
     """
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
@@ -1384,6 +1388,7 @@ def fused_append_shared_experts(
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
         HAS_PADDING=has_padding,
+        ZERO_PAD_WEIGHTS=zero_pad_weights,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1405,6 +1410,7 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    ZERO_PAD_WEIGHTS: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1440,23 +1446,25 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     # routed ids collide with an earlier rank's shared slots.
     ids = ids + (ids // num_local_routed) * S
 
-    if HAS_PADDING:
-        # Fold the padded-topk_ids fill (previously a separate _fill_padded_rows
-        # launch): rows >= num_token_non_padded get pad_fill_id in every routed
-        # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
-        # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
-        # whole tile and let the masked store below drop the tail.
-        n_valid = tl.load(num_token_non_padded_ptr)
-        if pid >= n_valid:
-            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
-
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
-
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
+
+    if HAS_PADDING:
+        # Fold the padded-row fills that used to run around this kernel: rows
+        # >= num_token_non_padded get pad_fill_id in every routed slot, and a
+        # zero weight in every slot unless SGLANG_MORI_NO_PAD_MASK suppressed
+        # that pass. ids is a BLOCK_K-wide register tile (K need not be pow2),
+        # so fill the whole tile and let the masked store drop the tail.
+        if pid >= tl.load(num_token_non_padded_ptr):
+            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
+            if ZERO_PAD_WEIGHTS:
+                ws = tl.zeros((BLOCK_K,), dtype=ws.dtype)
+                shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
 
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws, mask=mask_s)
@@ -1471,6 +1479,7 @@ def fused_append_remap_shared_experts_deepep(
     num_local_routed,
     num_token_non_padded=None,
     pad_fill_id=0,
+    zero_pad_weights=True,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
@@ -1506,6 +1515,7 @@ def fused_append_remap_shared_experts_deepep(
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
         HAS_PADDING=has_padding,
+        ZERO_PAD_WEIGHTS=zero_pad_weights,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1595,9 +1605,9 @@ def fused_append_shared_experts_with_weights(
       ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
       exclusive.
     """
-    assert not (fuse_gate and apply_sigmoid), (
-        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
-    )
+    assert not (
+        fuse_gate and apply_sigmoid
+    ), "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1605,9 +1615,9 @@ def fused_append_shared_experts_with_weights(
         return topk_ids, topk_weights
 
     if fuse_gate:
-        assert hidden_states is not None and gate_weight is not None, (
-            "fuse_gate=True requires hidden_states and gate_weight"
-        )
+        assert (
+            hidden_states is not None and gate_weight is not None
+        ), "fuse_gate=True requires hidden_states and gate_weight"
         hidden_arg = hidden_states.contiguous()
         wgate_arg = gate_weight.reshape(-1).contiguous()
         hidden_dim = hidden_arg.shape[1]

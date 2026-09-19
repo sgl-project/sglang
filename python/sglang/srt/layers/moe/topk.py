@@ -861,9 +861,9 @@ def fused_topk_torch_native(
         topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
-        assert hidden_states.shape[0] == gating_output.shape[0], (
-            f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        )
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
         M, _ = hidden_states.shape
         topk_weights = torch.empty(
             M, topk, dtype=torch.float32, device=hidden_states.device
@@ -889,9 +889,9 @@ def fused_topk_softmax_torch_raw_logits(
     topk: int,
     renormalize: bool,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], (
-        f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-    )
+    assert (
+        hidden_states.shape[0] == gating_output.shape[0]
+    ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
 
     _, topk_ids = torch.topk(gating_output, k=topk, dim=-1, sorted=False)
     logits = gating_output.float()
@@ -1773,9 +1773,9 @@ def biased_grouped_topk_gpu(
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
-        assert hidden_states.shape[0] == gating_output.shape[0], (
-            f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
-        )
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
 
@@ -2230,13 +2230,13 @@ def _post_process_topk_ids(
         # Fold: when an aiter append kernel runs below (EPLB off, so the id fill
         # commutes with the identity remap) it fills the padded routed ids
         # itself with pad_fill_id=0, bit-identically, so skip the separate
-        # _fill_padded_rows launch here. The plain append kernel additionally
-        # zeroes the padded weights, which retires the trailing zeroing pass at
-        # the end of this function; its per-rank sibling folds the ids only.
+        # _fill_padded_rows launch here. Both append kernels -- the plain one
+        # and its per-rank sibling -- also zero the padded weights, which
+        # retires the trailing zeroing pass at the end of this function. That
+        # pass is itself suppressed by SGLANG_MORI_NO_PAD_MASK, so the fold has
+        # to stay off under the same flag or it would reintroduce the zeroing.
         _fold_pad_into_append = _aiter_append and not _eplb_remap_enabled()
-        _fold_pad_weights_into_append = (
-            _fold_pad_into_append and not use_per_rank_shared_slots
-        )
+        _fold_pad_weights_into_append = _fold_pad_into_append and not _skip_hip_pad_mask
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
@@ -2294,6 +2294,7 @@ def _post_process_topk_ids(
             num_token_non_padded=(
                 num_token_non_padded if _fold_pad_into_append else None
             ),
+            zero_pad_weights=_fold_pad_weights_into_append,
         )
     elif _aiter_append:
         M, N = router_logits.shape
@@ -2315,8 +2316,9 @@ def _post_process_topk_ids(
             scale_factor,
             N,  # base id for shared experts
             num_token_non_padded=(
-                num_token_non_padded if _fold_pad_weights_into_append else None
+                num_token_non_padded if _fold_pad_into_append else None
             ),
+            zero_pad_weights=_fold_pad_weights_into_append,
         )
 
     elif use_per_rank_shared_slots:
@@ -2339,9 +2341,9 @@ def _post_process_topk_ids(
     ):
         # Standard EP all-reduces the per-rank shared-expert outputs; without the
         # supplied 1/ep_size factor the shared contribution is summed ep_size times.
-        topk_weights[:, -num_fused_shared_experts:] *= (
-            fused_shared_experts_scaling_factor
-        )
+        topk_weights[
+            :, -num_fused_shared_experts:
+        ] *= fused_shared_experts_scaling_factor
 
     if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
@@ -2465,9 +2467,9 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert num_token_non_padded is None, (
-            "num_token_non_padded is not yet supported in fused_topk_native"
-        )
+        assert (
+            num_token_non_padded is None
+        ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = fused_topk_native(

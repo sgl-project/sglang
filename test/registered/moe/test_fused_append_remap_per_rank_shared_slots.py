@@ -239,14 +239,14 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         )
         self.assertTrue(torch.all(got_w[:, -s:] == 1.0))
 
-    def test_pad_fold_matches_separate_fill(self):
-        """HAS_PADDING fold == separate padded-fill(0) then append+remap.
+    def test_pad_fold_matches_separate_fill_and_zero(self):
+        """HAS_PADDING fold == separate padded-fill(0), append+remap, then zero.
 
-        The fusion folds the padded-topk_ids fill into this kernel: rows
-        >= num_token_non_padded get pad_fill_id in every routed slot. With
-        pad_fill_id=0 this is bit-identical to the previous path that filled the
-        padded region with 0 (topk_ids=0 -> remap 0 + 0//nlr = 0) via a separate
-        _fill_padded_rows launch before append+remap ran.
+        The fusion folds both padded-row passes into this kernel: rows >=
+        num_token_non_padded get pad_fill_id in every routed slot and a zero
+        weight in every slot. With pad_fill_id=0 that is bit-identical to the
+        previous path, which filled the padded ids with 0 (topk_ids=0 -> remap
+        0 + 0//nlr = 0) before append+remap and zeroed the padded weights after.
         """
         for m, k, npr, ep_size, ep_rank, s in self.CASES:
             for n_valid in (0, max(m // 2, 1), m):
@@ -256,7 +256,7 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                     )
                     topk_ids, topk_weights = self._make_inputs(m, k, npr)
 
-                    # Baseline: pre-fill padded rows to 0, no fold.
+                    # Baseline: pre-fill padded ids, append+remap, post-zero.
                     base_ids = topk_ids.clone()
                     base_ids[n_valid:] = 0
                     exp_ids, exp_w = fused_append_remap_shared_experts_deepep(
@@ -267,8 +267,8 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                         shared_id_base,
                         num_local_routed,
                     )
+                    exp_w[n_valid:] = 0
 
-                    # Fused: fold the fill (no pre-fill), pad_fill_id=0.
                     ntnp = torch.tensor(
                         [n_valid], dtype=torch.int32, device=topk_ids.device
                     )
@@ -285,6 +285,44 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
 
                     self.assertTrue(torch.equal(got_ids, exp_ids))
                     self.assertTrue(torch.allclose(got_w, exp_w))
+
+    def test_ids_fold_without_weight_zeroing(self):
+        """zero_pad_weights=False folds the ids only.
+
+        SGLANG_MORI_NO_PAD_MASK suppresses the padded-weight zeroing pass, so
+        the fold has to be able to leave the weights alone -- otherwise turning
+        that flag on would silently reintroduce the zeroing it disables.
+        """
+        # A case with m > 1, so there is a padded region to inspect at all.
+        m, k, npr, ep_size, ep_rank, s = 128, 16, 128, 4, 2, 2
+        n_valid = m // 2
+        shared_id_base, num_local_routed = self._shared_id_base(
+            npr, ep_size, ep_rank, s
+        )
+        topk_ids, topk_weights = self._make_inputs(m, k, npr)
+
+        base_ids = topk_ids.clone()
+        base_ids[n_valid:] = 0
+        exp_ids, exp_w = fused_append_remap_shared_experts_deepep(
+            base_ids, topk_weights.clone(), s, 1.0, shared_id_base, num_local_routed
+        )
+
+        ntnp = torch.tensor([n_valid], dtype=torch.int32, device=topk_ids.device)
+        got_ids, got_w = fused_append_remap_shared_experts_deepep(
+            topk_ids.clone(),
+            topk_weights.clone(),
+            s,
+            1.0,
+            shared_id_base,
+            num_local_routed,
+            num_token_non_padded=ntnp,
+            pad_fill_id=0,
+            zero_pad_weights=False,
+        )
+
+        self.assertTrue(torch.equal(got_ids, exp_ids))
+        self.assertTrue(torch.allclose(got_w, exp_w))
+        self.assertTrue((got_w[n_valid:] != 0).any(), "padded weights were zeroed")
 
     def test_no_shared_experts_is_noop(self):
         """s == 0 returns the inputs untouched (no kernel launch)."""
