@@ -1587,6 +1587,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Glm4MoeForCausalLM",
+            "GlmMoeDsaForCausalLM",
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
             "Qwen2MoeForCausalLM",
@@ -1595,6 +1596,26 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         for architecture in supported:
             with self.subTest(architecture=architecture):
                 handle_a2a_moe(self._make_args(architecture))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_w4a16_fc2_reduction_modes(self, _):
+        import torch
+
+        for quantization in ("modelopt_fp4", "nvfp4_online"):
+            for in_kernel_reduce in (False, True):
+                with (
+                    self.subTest(quantization=quantization, ikr=in_kernel_reduce),
+                    envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+                    envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("bf16"),
+                    envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override(
+                        in_kernel_reduce
+                    ),
+                ):
+                    args = self._make_args(
+                        "GlmMoeDsaForCausalLM", quantization=quantization
+                    )
+                    args._model_config.dtype = torch.bfloat16
+                    handle_a2a_moe(args)
 
     def test_megamoe_rejects_unaudited_model_architecture(self):
         with self.assertRaisesRegex(
@@ -1646,6 +1667,37 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
                 with self.assertRaisesRegex(ValueError, "incompatible"):
                     handle_a2a_moe(self._make_args())
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_nvfp4_online_requires_w4a16(self, _):
+        import torch
+
+        args = self._make_args("Qwen3MoeForCausalLM", quantization="nvfp4_online")
+        args._model_config.dtype = torch.bfloat16
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(False):
+            with self.assertRaisesRegex(ValueError, "W4A16=1"):
+                handle_a2a_moe(args)
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+            handle_a2a_moe(args)
+            args._model_config.dtype = torch.float16
+            with self.assertRaisesRegex(ValueError, "requires --dtype bfloat16"):
+                handle_a2a_moe(args)
+
+    def test_megamoe_w4a16_requires_bf16_combine(self):
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+            for combine_dtype in ("nvfp4", "mxfp8"):
+                for in_kernel_reduce in (False, True):
+                    with (
+                        self.subTest(combine_dtype=combine_dtype, ikr=in_kernel_reduce),
+                        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override(
+                            combine_dtype
+                        ),
+                        envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override(
+                            in_kernel_reduce
+                        ),
+                        self.assertRaisesRegex(ValueError, "W4A16 requires"),
+                    ):
+                        handle_a2a_moe(self._make_args())
 
 
 class TestPortArgs(unittest.TestCase):
