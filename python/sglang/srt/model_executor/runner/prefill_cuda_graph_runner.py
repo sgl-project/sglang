@@ -546,6 +546,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            logger.info(
+                "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
+                get_parallel().cp_strategy,
+                get_parallel().attn_cp_size,
+            )
+
         if self.max_context_size is not None and not (
             model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
         ):
@@ -1289,6 +1295,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        # A batch can be too small to activate CP. Its unsharded inputs must
+        # not replay a model body captured with CP-local rows.
+        if getattr(self, "enable_cp_bcg_capture", False) and not is_cp_active(
+            forward_batch
+        ):
             return False
 
         # Non-DP local check (sole decision for tp-only).
