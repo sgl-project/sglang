@@ -14,8 +14,8 @@ use crate::message::request::SchedulerRequest;
 
 /// ToSchedulerTx: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.
-/// Carries [`SchedulerRequest`] (columnar: scalar header + raw int64 ids cell), not a
-/// single msgpack blob, so the large `input_ids` tensor bypasses msgpack.
+/// Carries [`SchedulerRequest`] (scalar msgpack header + named buffers), not a
+/// single msgpack blob, so no tensor ever goes through msgpack or gets copied.
 #[derive(Clone)]
 pub struct ToSchedulerTx {
     tx: flume::Sender<SchedulerRequest>,
@@ -34,36 +34,6 @@ pub struct ToSchedulerRx {
     stash: Mutex<Option<SchedulerRequest>>,
 }
 
-/// A drained request batch in **columnar** (struct-of-arrays) form. The `ids`
-/// cells are kept *un-concatenated* so the pyo3 boundary can copy them straight
-/// into one `PyBytes` (no intermediate buffer); `ids_total` is their summed
-/// length, precomputed for that single allocation.
-#[derive(Default)]
-pub struct RequestColumns {
-    /// Per-request scalar msgpack header (`input_ids` omitted).
-    pub headers: Vec<Bytes>,
-    /// Per-request raw little-endian int64 ids cell (empty for control reqs).
-    pub ids: Vec<Bytes>,
-    /// Per-request token count (`ids` cell length / 8).
-    pub lengths: Vec<u32>,
-    /// Sum of all `ids` cell byte lengths.
-    pub ids_total: usize,
-}
-
-impl RequestColumns {
-    /// Concatenate the `ids` cells into `buf`, which must be exactly
-    /// `ids_total` bytes — the pyo3 boundary hands in the freshly allocated
-    /// `PyBytes` so the ids are copied once, straight to their destination.
-    pub fn copy_ids_into(&self, mut buf: &mut [u8]) {
-        debug_assert_eq!(buf.len(), self.ids_total);
-        for cell in &self.ids {
-            let (dst, rest) = buf.split_at_mut(cell.len());
-            dst.copy_from_slice(cell);
-            buf = rest;
-        }
-    }
-}
-
 impl ToSchedulerTx {
     /// Non-blocking push. Returns `false` on a full ring (backpressure) so the
     /// caller can fail the request rather than block a worker thread.
@@ -74,22 +44,23 @@ impl ToSchedulerTx {
 }
 
 impl ToSchedulerRx {
-    /// Drain up to `max` messages into a columnar [`RequestColumns`], returning
-    /// immediately when the ring runs dry — mirrors the scheduler's existing
-    /// `zmq.NOBLOCK` loop in `request_receiver._pull_raw_reqs`.
+    /// Drain up to `max` messages, returning immediately when the ring runs
+    /// dry — mirrors the scheduler's existing `zmq.NOBLOCK` loop in
+    /// `request_receiver._pull_raw_reqs`. The requests move out whole: their
+    /// buffers are handed to numpy by the pyo3 boundary, never copied here.
     ///
     /// Non-blocking by construction: `try_recv` returns `Err(TryRecvError::Empty)`
     /// instantly when the ring is empty, and `Err(_) => break` exits the loop
     /// right away.
-    pub fn drain(&self, max: usize) -> RequestColumns {
-        let mut batch = RequestColumns::default();
+    pub fn drain(&self, max: usize) -> Vec<SchedulerRequest> {
+        let mut batch = Vec::new();
         // A message parked by a prior blocking `wait` is delivered first.
         if let Some(m) = self.stash.lock().unwrap().take() {
-            push_msg(&mut batch, m);
+            batch.push(m);
         }
-        while batch.headers.len() < max {
+        while batch.len() < max {
             match self.rx.try_recv() {
-                Ok(m) => push_msg(&mut batch, m),
+                Ok(m) => batch.push(m),
                 Err(_) => break, // Empty or Disconnected -> stop now
             }
         }
@@ -114,15 +85,6 @@ impl ToSchedulerRx {
             Err(_) => false, // Timeout or Disconnected
         }
     }
-}
-
-/// Append one drained message's columnar cells to the batch.
-#[inline]
-fn push_msg(batch: &mut RequestColumns, m: SchedulerRequest) {
-    batch.ids_total += m.ids.len();
-    batch.lengths.push((m.ids.len() / 8) as u32); // int64 cell → tokens
-    batch.headers.push(m.header);
-    batch.ids.push(m.ids);
 }
 
 /// Scheduler output (`Server.push_decode_result_batch` / `push_control_result`
@@ -186,7 +148,7 @@ mod tests {
     fn msg(h: &'static [u8]) -> SchedulerRequest {
         SchedulerRequest {
             header: Bytes::from_static(h),
-            ids: Bytes::new(),
+            buffers: Vec::new(),
         }
     }
 
@@ -203,8 +165,8 @@ mod tests {
         // Idempotent: already stashed, returns true without touching the ring.
         assert!(rx.wait(Duration::from_millis(1)));
         // Drain yields the stashed message, then the ring is empty.
-        assert_eq!(rx.drain(16).headers.len(), 1);
-        assert!(rx.drain(16).headers.is_empty());
+        assert_eq!(rx.drain(16).len(), 1);
+        assert!(rx.drain(16).is_empty());
     }
 
     /// A blocked `wait` is woken the instant a producer pushes (no polling).
@@ -218,7 +180,7 @@ mod tests {
         // Generous timeout, but it should return well before it as soon as the
         // push lands.
         assert!(rx.wait(Duration::from_secs(5)));
-        assert_eq!(rx.drain(16).headers.len(), 1);
+        assert_eq!(rx.drain(16).len(), 1);
     }
 
     /// A full from_scheduler channel parks the producer until the consumer drains — the

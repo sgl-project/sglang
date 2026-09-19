@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -48,22 +49,44 @@ class TestWrapEncoded(CustomTestCase):
     OFFSETS = [(2, 5), (8, 8)]
 
     def transport(self, features):
-        """Inline: the features ride the numpy array itself."""
-        return dict(features=features, shm_names=None)
+        """Inline: each item's features ride their own shaped numpy array
+        (views of one backing array here, so a write shows through both)."""
+        return {
+            "mm.feature.0": features[:24].reshape(4, 6),
+            "mm.feature.1": features[24:].reshape(1, 6),
+        }
+
+    def meta(self):
+        """The `mm.meta` sidecar as the Rust worker encodes it."""
+        return np.frombuffer(
+            msgspec.msgpack.encode(
+                {
+                    "items": [
+                        {
+                            "modality": "image",
+                            "hash": item_hash,
+                            "offsets": [list(offset)],
+                            "model_specific_data": {"image_grid_thw": list(grid)},
+                        }
+                        for grid, item_hash, offset in zip(
+                            self.GRIDS, self.HASHES, self.OFFSETS
+                        )
+                    ],
+                    "token_ids": None,
+                    "mrope_delta": -3,
+                }
+            ),
+            dtype=np.uint8,
+        )
 
     def build(self):
         features = np.arange(30, dtype=np.float32)
-        output = RustMmProcessor.wrap_encoded(
-            self.spec,
-            SimpleNamespace(  # the shape of Rust's MmEncodedResult
-                grids=self.GRIDS,
-                hashes=self.HASHES,
-                offsets=self.OFFSETS,
-                mrope=np.arange(30, dtype=np.int64),
-                mrope_delta=-3,
-                **self.transport(features),
-            ),
-        )
+        buffers = {  # the `mm.*` buffers of one `IngressRequest`
+            "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
+            "mm.meta": self.meta(),
+            **self.transport(features),
+        }
+        output = RustMmProcessor.wrap_encoded(self.spec, buffers)
         return output, features
 
     def test_wraps_and_slices_native_buffers(self):
@@ -135,8 +158,14 @@ class TestWrapEncodedShm(TestWrapEncoded):
         return names
 
     def transport(self, features):
-        """Shm: the worker parked each item's slice in its own segment."""
-        return dict(features=None, shm_names=self._park(features))
+        """Shm: the worker placed each item's slice in its own segment; the
+        buffer is the `ShmBuffer` stub naming it."""
+        return {
+            f"mm.feature.{i}": SimpleNamespace(name=name, dtype="float32", shape=(n, 6))
+            for i, (name, n) in enumerate(
+                zip(self._park(features), [t * h * w for t, h, w in self.GRIDS])
+            )
+        }
 
     def test_wraps_and_slices_native_buffers(self):
         import torch

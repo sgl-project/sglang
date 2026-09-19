@@ -11,6 +11,16 @@
 //! Queued, Streaming { chunks_sent }, Finalizing, Completed, Failed(Error),
 //! Aborted
 //! ```
+//!
+//! The to-scheduler stages run in one fixed order, each skipped when a request
+//! has nothing for it: `Tokenizing` (text → ids) then `Encoding` (ids + media →
+//! placeholder-expanded ids + features), converging on `PreSendValidating`.
+//! `Tokenizing` carries what follows it ([`AfterTokenize`]) so the tokenizer
+//! pool, which applies `TokenizeDone` itself, needs no routing knowledge: the
+//! next state is a pure function of (state, event), decided by intake once at
+//! `Normalizing`. A request that already has ids still passes through
+//! `Tokenizing` — intake applies `TokenizeDone` inline instead of visiting the
+//! pool — so "skip" means no pool hop, never a different route.
 
 use super::error::Error;
 
@@ -21,7 +31,11 @@ pub enum RequestState {
     /// Generate-only: sampling params normalized + verified before routing.
     Normalizing,
     Encoding,
-    Tokenizing,
+    Tokenizing {
+        /// Where `TokenizeDone` leads. Set by intake at routing time; the pool
+        /// never reads it.
+        then: AfterTokenize,
+    },
     /// Every branch converges here with its final `input_ids`, for the checks
     /// that need the tokenized length (the input + `max_new_tokens` ceiling).
     /// The last state before the request leaves Rust.
@@ -36,11 +50,19 @@ pub enum RequestState {
     Aborted,
 }
 
+/// The stage after `Tokenizing`: the pre-send checks, or — for a multimodal
+/// prompt, whose placeholders the MM worker expands in ids — `Encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterTokenize {
+    PreSend,
+    Encode,
+}
+
 /// Outcome of validation.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding, where an MM worker runs the multimodal
-    /// pipeline and returns the final expanded `input_ids`.
+    /// Has multimodal inputs → Tokenizing, then Encoding, where an MM worker
+    /// runs the multimodal pipeline and returns the final expanded `input_ids`.
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,
@@ -119,17 +141,34 @@ impl RequestState {
             // normalize/verify); control requests skip it, having none.
             (Validating, NeedsNormalize) => Normalizing,
             (Validating, Validated(AlreadyTokenized)) => PreSendValidating,
-            (Normalizing, Validated(HasMultimodal)) => Encoding,
-            (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
+            (Normalizing, Validated(HasMultimodal)) => Tokenizing {
+                then: AfterTokenize::Encode,
+            },
+            (Normalizing, Validated(NeedsTokenize)) => Tokenizing {
+                then: AfterTokenize::PreSend,
+            },
             (Normalizing, Validated(AlreadyTokenized)) => PreSendValidating,
+            // A multimodal prompt has its ids (the client's, or the pool's);
+            // now the MM worker expands its placeholders.
+            (
+                Tokenizing {
+                    then: AfterTokenize::Encode,
+                },
+                TokenizeDone,
+            ) => Encoding,
             // The MM worker returns the *final* placeholder-expanded input_ids,
-            // so an encoded request skips the tokenizer pool — but not the
-            // pre-send checks: expanded image tokens count against the same
+            // so an encoded request never revisits the tokenizer pool — but not
+            // the pre-send checks: expanded image tokens count against the same
             // input + max_new_tokens ceiling as tokenized text.
             (Encoding, EncodeDone) => PreSendValidating,
             // Every to-scheduler branch funnels through the pre-send checks, so they
             // run exactly once per request no matter how it got its ids.
-            (Tokenizing, TokenizeDone) => PreSendValidating,
+            (
+                Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
+                TokenizeDone,
+            ) => PreSendValidating,
             (PreSendValidating, PreSendValidated) => Queued,
             (Queued, SchedulerPicked) => Streaming { chunks_sent: 0 },
             // response
@@ -154,10 +193,11 @@ mod tests {
         state
     }
 
-    /// Every to-scheduler branch — control, client-supplied ids, and text through the
-    /// tokenizer pool — must land in `PreSendValidating`, because that is where
-    /// the checks needing the final `input_ids` run. A branch that reached
-    /// `Queued` directly would skip them silently.
+    /// Every to-scheduler branch — control, client-supplied ids, text through the
+    /// tokenizer pool, and media through the MM pool — must land in
+    /// `PreSendValidating`, because that is where the checks needing the final
+    /// `input_ids` run. A branch that reached `Queued` directly would skip them
+    /// silently.
     #[test]
     fn every_branch_reaches_the_ring_through_pre_send_validating() {
         for from in [
@@ -169,7 +209,13 @@ mod tests {
                 RequestState::Normalizing,
                 Event::Validated(ValidationOutcome::AlreadyTokenized),
             ),
-            after(RequestState::Tokenizing, Event::TokenizeDone),
+            after(
+                RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
+                Event::TokenizeDone,
+            ),
+            after(RequestState::Encoding, Event::EncodeDone),
         ] {
             assert!(
                 matches!(from, RequestState::PreSendValidating),
@@ -182,6 +228,36 @@ mod tests {
         }
     }
 
+    /// The stages run in one fixed order: a multimodal prompt tokenizes, then
+    /// encodes — the single MM route, whether the pool or intake (ids already
+    /// present) applies `TokenizeDone`. It cannot reach the ring without
+    /// `Encoding`, and `Encoding` never loops back to the pool.
+    #[test]
+    fn multimodal_prompts_tokenize_before_encoding() {
+        let mm = after(
+            RequestState::Normalizing,
+            Event::Validated(ValidationOutcome::HasMultimodal),
+        );
+        assert!(matches!(
+            mm,
+            RequestState::Tokenizing {
+                then: AfterTokenize::Encode
+            }
+        ));
+        assert!(matches!(
+            after(mm, Event::TokenizeDone),
+            RequestState::Encoding
+        ));
+
+        let mut encoded = after(RequestState::Encoding, Event::EncodeDone);
+        assert!(matches!(encoded, RequestState::PreSendValidating));
+        assert_eq!(
+            encoded.apply(Event::TokenizeDone),
+            Err(TransitionError::Illegal),
+            "an encoded request never revisits the tokenizer pool"
+        );
+    }
+
     /// The converse: `Queued` has no other in-edge, so the checks can't be skipped
     /// by emitting the wrong event, and can't run twice.
     #[test]
@@ -189,7 +265,13 @@ mod tests {
         for mut state in [
             RequestState::Validating,
             RequestState::Normalizing,
-            RequestState::Tokenizing,
+            RequestState::Tokenizing {
+                then: AfterTokenize::PreSend,
+            },
+            RequestState::Tokenizing {
+                then: AfterTokenize::Encode,
+            },
+            RequestState::Encoding,
             RequestState::Queued,
         ] {
             assert_eq!(

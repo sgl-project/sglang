@@ -27,7 +27,6 @@ use crate::message::detok::DetokMsg;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
-use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::AbortSource;
 use crate::utils::runtime::Runnable;
 use crate::utils::{
@@ -412,7 +411,7 @@ fn handle_chunk(
 
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
+fn trim_stop_token(token_ids: &mut Vec<i32>, matched: &Option<Matched>, no_stop_trim: bool) {
     // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
     // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
     // for any model whose stop id happens to be 0.

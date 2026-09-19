@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::finish_reason::FinishReason;
-use super::types::TokenIds;
 use crate::message::ids::Rid;
 use crate::utils::error::Error;
 
@@ -545,8 +544,9 @@ pub struct ChunkEvent {
     /// is still chosen by `Rid::shard`, but a hash collision there now only
     /// co-locates two requests instead of merging them.
     pub rid: Rid,
-    /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
-    pub token_ids: TokenIds,
+    /// New token ids for this step, in the scheduler's int32 wire width. Empty
+    /// allowed (e.g. metadata-only frames).
+    pub token_ids: Vec<i32>,
     /// `None` while streaming, the [`FinishReason`] on the final chunk.
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
