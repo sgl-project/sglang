@@ -297,6 +297,9 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
+        if "explicitly_destroy" in inspect.signature(Buffer.__init__).parameters:
+            buffer_kwargs["explicitly_destroy"] = True
+
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
 
