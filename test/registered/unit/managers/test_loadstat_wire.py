@@ -23,13 +23,13 @@ from unittest.mock import MagicMock, patch
 
 import msgspec.msgpack
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.load_publisher import (
     LoadStat,
     SchedulerLoadPublisher,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -97,19 +97,21 @@ class TestLoadPublisherGating(CustomTestCase):
     connect-style one.
     """
 
-    def _build(
-        self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit="auto", **ps_overrides
-    ):
+    def _build(self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit="auto", **topology):
         """Construct a publisher with the socket bind stubbed out, returning
         (publisher, captured _open_pub_socket mock). Opts in via explicit="auto"
-        by default (the feature is off without it). dp_size lives on the ps,
-        which the publisher reads (no separate param to disagree with it)."""
-        with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
-        ) as open_sock:
+        by default (the feature is off without it). The topology is stated on
+        the context the publisher reads, so there is no second copy to disagree
+        with it; every read happens in the constructor."""
+        with (
+            published_topology(),
+            get_parallel().override(dp_size=dp_size, **topology),
+            patch(
+                "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
+            ) as open_sock,
+        ):
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
-                ps=ParallelState.trivial(dp_size=dp_size, **ps_overrides),
                 load_publish_endpoint=explicit,
             )
         return pub, open_sock
@@ -289,11 +291,11 @@ class TestLoadPublisherGating(CustomTestCase):
             "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket",
             side_effect=zmq.ZMQError,
         ) as open_sock:
-            pub = SchedulerLoadPublisher(
-                kv_events_config=ZMQ_ENDPOINT,
-                ps=ParallelState.trivial(),
-                load_publish_endpoint="auto",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config=ZMQ_ENDPOINT,
+                    load_publish_endpoint="auto",
+                )
         open_sock.assert_called_once()  # the bind was attempted and failed
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
@@ -468,11 +470,11 @@ class TestLoadStatIntegration(CustomTestCase):
             with _socket.socket() as probe:
                 probe.bind(("", 0))
                 port = probe.getsockname()[1]
-            pub = SchedulerLoadPublisher(
-                kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
-                ps=ParallelState.trivial(),
-                load_publish_endpoint=f"tcp://*:{port}",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+                    load_publish_endpoint=f"tcp://*:{port}",
+                )
             if pub.enable:
                 break
         self.assertTrue(pub.enable, "load socket never bound a free port")
