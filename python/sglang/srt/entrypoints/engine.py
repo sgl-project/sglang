@@ -369,11 +369,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
 
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        self.loop = self._ensure_event_loop()
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
@@ -1304,6 +1300,9 @@ class Engine(EngineScoreMixin, EngineBase):
     def _init_tokenizer_worker(
         server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict[str, Any]
     ) -> Tuple[TokenizerManager, TemplateManager]:
+        # TokenizerWorker.__init__ registers with the router over a zmq.asyncio
+        # socket, which needs the loop the Engine will later run to be current.
+        Engine._ensure_event_loop()
         port_args = copy.copy(port_args)
         port_args.tokenizer_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1316,6 +1315,19 @@ class Engine(EngineScoreMixin, EngineBase):
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
+
+    @staticmethod
+    def _ensure_event_loop() -> asyncio.AbstractEventLoop:
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        try:
+            return asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
 
     @classmethod
     def attach_tokenizer_worker(cls, parent_pid: Optional[int] = None) -> Engine:
@@ -1348,10 +1360,7 @@ class Engine(EngineScoreMixin, EngineBase):
         self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
             server_args, port_args, scheduler_info
         )
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
+        self.loop = self._ensure_event_loop()
         return self
 
     def shutdown(self):
