@@ -915,8 +915,10 @@ def eagle_sample(
             )
         elif not _is_npu:
             from sglang.srt.layers.sampling_renorm import (
-                top_k_renorm_prob,
-                top_p_renorm_prob,
+                spec_top_k_renorm_prob as top_k_renorm_prob,
+            )
+            from sglang.srt.layers.sampling_renorm import (
+                spec_top_p_renorm_prob as top_p_renorm_prob,
             )
 
         expanded_temperature = torch.repeat_interleave(
