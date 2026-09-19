@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -388,8 +387,8 @@ class TpModelWorker(BaseTpWorker):
         self.device = self.model_runner.device
 
         # Init nccl groups
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        self.pp_group = get_parallel().pp_group
+        self.world_group = get_parallel().world_group
 
         # Sync random seed across TP workers.
         # Elastic joiners and last-stage-only draft workers cannot enter the WORLD

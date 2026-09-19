@@ -28,7 +28,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -2196,8 +2195,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_parallel().world_group.world_size > 1,
+            cpu_group=get_parallel().world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2292,7 +2291,7 @@ class KVCacheConfigurator:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_parallel().world_group.cpu_group,
             )
             token_capacity = tensor.item()
 

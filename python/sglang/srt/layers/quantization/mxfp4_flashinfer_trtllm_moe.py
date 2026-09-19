@@ -7,7 +7,6 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -15,6 +14,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -418,7 +418,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         symm_output = None
         if not defer_finalize:
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 out_hidden_size = (
                     x_quant.shape[-1] * 2
@@ -530,7 +530,7 @@ def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
             CustomAllReduceV2,
         )
 
-        ca_comm = get_tp_group().ca_comm
+        ca_comm = get_parallel().tp_group.ca_comm
         if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
             all_reduce_fusion.register_comm(ca_comm.obj)
             _fused_finalize_all_reduce_world_size = ca_comm.world_size
@@ -560,7 +560,7 @@ def should_use_fuse_finalize_all_reduce(
 
     if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
         return False
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
         return False
     # one push phase counter per row (the plane has num_sm of them)

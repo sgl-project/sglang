@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -29,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -100,7 +100,7 @@ def _deepep_precompile_tp_barrier() -> None:
     # To avoid this, we use torch.distributed's barrier during the compile stage.
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
-        get_tp_group().barrier()
+        get_parallel().tp_group.barrier()
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
