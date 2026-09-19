@@ -24,9 +24,11 @@ from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.kvcache.hicache import (
+    DEFAULT_BLOCK_QUOTA,
+    TMA_BLOCK_QUOTA,
+    _default_unroll,
+    _jit_hicache_module,
     _jit_hicache_tma_module,
-    transfer_hicache_all_layer,
-    transfer_hicache_one_layer,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -109,15 +111,19 @@ def sglang_jit_transfer_one(
     indices_src: torch.Tensor,
     element_dim: int,
 ) -> None:
-    """SGL JIT Kernel for single layer transfer."""
-    transfer_hicache_one_layer(
-        k_cache_dst,
-        v_cache_dst,
+    """SGL JIT register kernel for single layer transfer (bypasses TMA routing)."""
+    element_size = element_dim * k_cache_dst.element_size()
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_one(
+        k_cache_dst.view(-1, element_dim),
+        v_cache_dst.view(-1, element_dim),
         indices_dst,
-        k_cache_src,
-        v_cache_src,
+        k_cache_src.view(-1, element_dim),
+        v_cache_src.view(-1, element_dim),
         indices_src,
-        element_dim=element_dim,
     )
 
 
@@ -154,17 +160,20 @@ def sglang_jit_transfer_all(
     stride_bytes: int,
     element_size: int,
 ) -> None:
-    """SGL JIT Kernel for all layer transfer."""
-    transfer_hicache_all_layer(
+    """SGL JIT register kernel for all layer transfer (bypasses TMA routing)."""
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_all(
         k_ptrs_dst,
         v_ptrs_dst,
         indices_dst,
         k_ptrs_src,
         v_ptrs_src,
         indices_src,
-        kv_cache_src_stride_bytes=stride_bytes,
-        kv_cache_dst_stride_bytes=stride_bytes,
-        element_size=element_size,
+        stride_bytes,
+        stride_bytes,
     )
 
 
@@ -177,7 +186,7 @@ def sglang_tma_transfer_one(
     indices_src: torch.Tensor,
 ) -> None:
     """SGL TMA staging kernel for single layer transfer."""
-    _jit_hicache_tma_module(block_quota=2).launch_one(
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_one(
         k_cache_dst, v_cache_dst, indices_dst, k_cache_src, v_cache_src, indices_src
     )
 
@@ -193,7 +202,7 @@ def sglang_tma_transfer_all(
     element_size: int,
 ) -> None:
     """SGL TMA staging kernel for all layer transfer."""
-    _jit_hicache_tma_module(block_quota=2).launch_all(
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_all(
         k_ptrs_dst,
         v_ptrs_dst,
         indices_dst,
