@@ -576,6 +576,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
+    # CUDA-graph runners may capture only the transformer body and execute the
+    # logits processor eagerly after replay.
+    defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
