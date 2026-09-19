@@ -4294,7 +4294,7 @@ class DeepseekV4AttnBackend(
         small_metadata = (
             not is_prefill
             and seq_lens_casual.is_cuda
-            and 0 < seq_lens_casual.numel() <= 8
+            and 0 < seq_lens_casual.numel() <= 384
             and out_loc.numel() == seq_lens_casual.numel()
             and self.low_ratios == (1, 2)
             and set(self.present_ratios) == {1, 2}
