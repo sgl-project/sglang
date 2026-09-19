@@ -9,9 +9,10 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -232,6 +233,29 @@ class TransportProxyTensor(torch.Tensor):
         return self._metadata.get("transport_mode", "default")
 
 
+def _validate_mm_token_array(input_ids: array, name: str) -> None:
+    if not (
+        isinstance(input_ids, array)
+        and input_ids.typecode == "q"
+        and input_ids.itemsize == 8
+    ):
+        raise TypeError(f"{name} must be array('q') with 8-byte items")
+
+
+def pad_mm_input_ids(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    pad_input_ids_func: Callable[[array, MultimodalInputs], array],
+) -> array:
+    """Enforce the model padding contract without per-token conversions."""
+    _validate_mm_token_array(input_ids, "input_ids")
+    padded_ids = pad_input_ids_func(input_ids, mm_inputs)
+    _validate_mm_token_array(padded_ids, "pad_input_ids result")
+    # Preserve scheduler ownership: no-op models return the unpadded input,
+    # and other models can retain the result in multimodal metadata.
+    return padded_ids[:]
+
+
 class MultiModalityDataPaddingPattern:
     """
     Data tokens (like image tokens) often need special handling during padding
@@ -240,11 +264,10 @@ class MultiModalityDataPaddingPattern:
     """
 
     @abstractmethod
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
-        Pad the input ids sequence containing data tokens, and replace them with pad_values
+        Replace data tokens with pad_values using native int64 arrays.
+        Implementations must not mutate the original input.
         """
         pass
 
@@ -273,12 +296,11 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             s for s, _e in data_token_pairs
         ]
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
+        _validate_mm_token_array(input_ids, "input_ids")
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
@@ -292,7 +314,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         start_token_ids = {s for s, _e in data_token_pairs}
         end_tokens_ids = {e for _s, e in data_token_pairs}
 
-        padded_ids = []
+        padded_ids = array("q")
         last_idx = 0
         data_idx = -1
 
@@ -314,7 +336,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
 
             num_tokens = end_idx - start_idx - 1
             pad_value = pad_values[data_idx]
-            padded_ids.extend([pad_value] * num_tokens)
+            if num_tokens > 0:
+                padded_ids.extend(array("q", [pad_value]) * num_tokens)
 
             last_idx = end_idx
 
@@ -329,17 +352,19 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
+        _validate_mm_token_array(input_ids, "input_ids")
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        # as_tensor(array) walks and boxes every token. View a bulk copy instead,
+        # keeping the original request's unpadded token buffer unchanged.
+        padded_input_ids = input_ids[:]
+        input_ids_tensor = torch.frombuffer(padded_input_ids, dtype=torch.int64)
 
         # Replace multimodal tokens using per-item offsets
         items_by_modality = defaultdict(list)
@@ -362,8 +387,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                 for offset in items[i].offsets:
                     input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
 
-        ret_input_ids = input_ids_tensor.tolist()
-        return ret_input_ids
+        return padded_input_ids
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus

@@ -15,6 +15,7 @@
 import logging
 import math
 import re
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1266,7 +1267,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
