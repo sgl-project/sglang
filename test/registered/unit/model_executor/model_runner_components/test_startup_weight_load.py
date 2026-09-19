@@ -758,6 +758,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
             SimpleNamespace(
+                hicache_draft_plan=None,
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
                 _draft_model_runners=lambda: (worker.model_runner,),
             )
