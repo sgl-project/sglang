@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 TOPK = 2048
 
@@ -33,9 +33,11 @@ class TestDSATransformIndex(CustomTestCase):
         )
         return columns.unsqueeze(0) + row_bias
 
-    def _make_topk(self, rows: int, context_length: int) -> torch.Tensor:
+    def _make_topk(
+        self, rows: int, context_length: int, width: int = TOPK
+    ) -> torch.Tensor:
         topk = (
-            torch.arange(TOPK, dtype=torch.int64, device=self.device)
+            torch.arange(width, dtype=torch.int64, device=self.device)
             .remainder(context_length)
             .repeat(rows, 1)
         )
@@ -55,7 +57,7 @@ class TestDSATransformIndex(CustomTestCase):
     ) -> torch.Tensor:
         real_num_tokens = sum(extend_lens_cpu)
         expected = torch.full(
-            (output_num_tokens, TOPK),
+            (output_num_tokens, topk_indices.shape[1]),
             -1,
             dtype=torch.int32,
             device=self.device,
@@ -91,14 +93,15 @@ class TestDSATransformIndex(CustomTestCase):
         *,
         zero_row_stride: bool = False,
         provide_result: bool = False,
+        topk_width: int = TOPK,
     ) -> None:
         if zero_row_stride:
             page_table = self._make_page_table(1, context_length).expand(batch_size, -1)
         else:
             page_table = self._make_page_table(batch_size, context_length)
-        topk_indices = self._make_topk(batch_size, context_length)
+        topk_indices = self._make_topk(batch_size, context_length, topk_width)
         expected = torch.empty(
-            (batch_size, TOPK), dtype=torch.int32, device=self.device
+            (batch_size, topk_width), dtype=torch.int32, device=self.device
         )
         torch.gather(
             page_table,
@@ -127,6 +130,7 @@ class TestDSATransformIndex(CustomTestCase):
         page_table_is_expanded: bool,
         topk_padding: int = 0,
         output_padding: int = 0,
+        topk_width: int = TOPK,
     ) -> None:
         real_num_tokens = sum(extend_lens_cpu)
         page_table_rows = (
@@ -135,7 +139,7 @@ class TestDSATransformIndex(CustomTestCase):
         topk_num_tokens = real_num_tokens + topk_padding
         output_num_tokens = topk_num_tokens + output_padding
         page_table = self._make_page_table(page_table_rows, context_length)
-        topk_indices = self._make_topk(topk_num_tokens, context_length)
+        topk_indices = self._make_topk(topk_num_tokens, context_length, topk_width)
         expected = self._expected(
             page_table,
             topk_indices,
@@ -264,6 +268,64 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
+
+    def test_nonstandard_topk_width(self):
+        # GLM-5.3-Flash MTP index-share rows carry topk + kpool - 1 = 2051
+        # columns instead of the usual 2048; narrower widths appear in other
+        # sparse-attention variants. Both kernels must follow topk_indices.
+        for width in (2051, 64):
+            with self.subTest(topk_width=width):
+                self._check_case(
+                    [2, 1],
+                    4096,
+                    page_table_is_expanded=False,
+                    topk_width=width,
+                )
+                self._check_case(
+                    [0, 3, 1, 0, 4],
+                    8192,
+                    page_table_is_expanded=True,
+                    topk_padding=5,
+                    topk_width=width,
+                )
+                self._check_decode_case(17, 8192, topk_width=width)
+
+    def test_prefill_topk_indices_out_of_page_table_range(self):
+        # GLM-5.3-Flash MTP index-share rows carry kpool slot positions whose
+        # value can exceed max_seqlen_k (the page-table width). The kernel
+        # must map them to -1 instead of reading out of bounds.
+        context_length = 64
+        extend_lens_cpu = [2, 1]
+        real_num_tokens = sum(extend_lens_cpu)
+        page_table = self._make_page_table(len(extend_lens_cpu), context_length)
+        topk_indices = self._make_topk(real_num_tokens, context_length)
+        topk_indices[0, :3] = torch.tensor(
+            [context_length, context_length + 31, 1 << 20],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        actual = transform_index_page_table_prefill_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            extend_lens_cpu=extend_lens_cpu,
+            page_table_is_expanded=False,
+        )
+        torch.cuda.synchronize()
+
+        request_ids = torch.repeat_interleave(
+            torch.arange(len(extend_lens_cpu), dtype=torch.int64, device=self.device),
+            torch.tensor(extend_lens_cpu, dtype=torch.int64, device=self.device),
+        )
+        source_rows = page_table[request_ids]
+        valid = (topk_indices >= 0) & (topk_indices < context_length)
+        gathered = torch.gather(
+            source_rows.to(torch.int32),
+            1,
+            topk_indices.clamp(0, context_length - 1),
+        )
+        expected = torch.where(valid, gathered, torch.full_like(gathered, -1))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
