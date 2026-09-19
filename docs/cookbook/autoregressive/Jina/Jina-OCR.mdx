@@ -17,39 +17,18 @@ This recipe uses autoregressive decoding. FastMTP draft heads are not used. You 
 
 The public checkpoint does not require a Hugging Face token. See the [model card](https://huggingface.co/jinaai/jina-ocr-v1) for model licensing and usage terms.
 
-## Prepare the chat template
+## Start the server
 
-Run the following in your SGLang environment. Set `MODEL_PATH` to the Hugging Face model ID or an existing local checkpoint directory. Keep the generated template available when starting the server.
+Set `MODEL_PATH` to the Hugging Face model ID or a local checkpoint directory, then run:
 
 ```bash
 export MODEL_PATH=jinaai/jina-ocr-v1
 # For an existing download instead:
 # export MODEL_PATH=/path/to/jina-ocr-v1
 
-python - <<'PYTHON'
-import os
-from pathlib import Path
-from transformers.utils import cached_file
-
-template = Path(cached_file(os.environ["MODEL_PATH"], "chat_template.jinja")).read_text()
-template = template.replace("\\\\n", "\n").replace("\\n", "\n")
-Path("jina-ocr.jinja").write_text(template)
-PYTHON
-```
-
-<Note>
-Always pass the generated file through `--chat-template`. Local checkpoints can otherwise select the legacy DeepSeek-VL2 conversation template. Jina's serialized template also contains escaped newlines that need normalization to match its reference processor. The preparation step leaves the original checkpoint unchanged.
-</Note>
-
-## Start the server
-
-In the same directory and shell, run:
-
-```bash
 sglang serve \
   --model-path "$MODEL_PATH" \
   --served-model-name jina-ocr \
-  --chat-template ./jina-ocr.jinja \
   --dtype bfloat16 \
   --context-length 4096 \
   --mem-fraction-static 0.7 \
@@ -58,7 +37,7 @@ sglang serve \
   --port 30000
 ```
 
-This uses one GPU with the default tensor and data parallel sizes of one. You can also replace `sglang serve` with `python -m sglang.launch_server` using the same arguments. `--served-model-name` keeps the client model name stable when you switch between a Hugging Face ID and a local directory.
+This uses one GPU with the default tensor and data parallel sizes of one. You can also replace `sglang serve` with `python -m sglang.launch_server` using the same arguments. `--served-model-name` keeps the client model name stable when you switch between a Hugging Face ID and a local directory. SGLang selects the built-in `jina-ocr` chat template automatically (`<|User|>:\n<image>\n{text}\n<|Assistant|>:\n`, matching the checkpoint's reference processor), so no `--chat-template` is needed.
 
 Wait for the server to become ready, then check it from another terminal:
 

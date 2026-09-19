@@ -295,22 +295,19 @@ class DeepseekOCRProcessor(ProcessorMixin):
     attributes = ["tokenizer"]
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        config, _ = PretrainedConfig.get_config_dict(
-            pretrained_model_name_or_path, **kwargs
-        )
-        if config.get("mtp_num_heads", 0):
-            # Jina OCR uses the same encoder, but ships a different processor
-            # schema: its reference processor omits BOS and uses up to 9 tiles.
-            for key, value in dict(
-                candidate_resolutions=config["candidate_resolutions"],
-                patch_size=16,
-                downsample_ratio=4,
-                max_crops=9,
-                add_bos_token=False,
-            ).items():
-                kwargs.setdefault(key, value)
-        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+    def from_args_and_dict(cls, args, processor_dict: Dict[str, Any], **kwargs):
+        # Jina OCR reuses the DeepSeek-OCR encoder but ships the
+        # `processing_deepseek_ocr.py` processor schema: its processor_config.json
+        # carries none of the DeepSeek-VL2 keys and its reference tiles up to 9 crops.
+        if "candidate_resolutions" not in processor_dict:
+            processor_dict = {
+                "candidate_resolutions": ((BASE_SIZE, BASE_SIZE),),
+                "patch_size": 16,
+                "downsample_ratio": 4,
+                "max_crops": 9,
+                **processor_dict,
+            }
+        return super().from_args_and_dict(args, processor_dict, **kwargs)
 
     def __init__(
         self,
@@ -329,7 +326,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ignore_id: int = -100,
         ocr2_mode: bool = False,
         max_crops: int = MAX_CROPS,
-        add_bos_token: bool = True,
+        add_bos_token: Optional[bool] = None,
         **kwargs,
     ):
 
@@ -381,7 +378,12 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self.ignore_id = ignore_id
         self.ocr2_mode = ocr2_mode
         self.max_crops = max_crops
-        self.add_bos_token = add_bos_token
+        # Follow the checkpoint's tokenizer (Jina OCR sets add_bos_token=false).
+        self.add_bos_token = (
+            getattr(tokenizer, "add_bos_token", True)
+            if add_bos_token is None
+            else add_bos_token
+        )
 
         super().__init__(
             tokenizer,

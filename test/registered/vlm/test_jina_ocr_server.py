@@ -7,12 +7,9 @@ The target uses the existing DeepSeek-OCR engine; FastMTP is not enabled.
 import base64
 import io
 import unittest
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import openai
 from PIL import Image, ImageDraw, ImageFont
-from transformers.utils import cached_file
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import TestOpenAIMLLMServerBase
@@ -28,24 +25,6 @@ class TestJinaOCRServer(TestOpenAIMLLMServerBase):
         "--mem-fraction-static=0.7",
         "--cuda-graph-max-bs-decode=4",
     ]
-
-    @classmethod
-    def setUpClass(cls):
-        # Local snapshots share deepseek_vl_v2's model_type, which otherwise
-        # selects the legacy VL2 conversation template instead of Jina's.
-        # The serialized template double-escapes some newlines; normalize to
-        # the reference processor's actual newlines before the Jinja loader.
-        template = Path(cached_file(cls.model, "chat_template.jinja")).read_text()
-        template_dir = TemporaryDirectory()
-        cls.addClassCleanup(template_dir.cleanup)
-        template_path = Path(template_dir.name) / "jina-ocr.jinja"
-        template_path.write_text(template.replace("\\\\n", "\n").replace("\\n", "\n"))
-        cls.extra_args = [
-            *cls.extra_args,
-            "--chat-template",
-            str(template_path),
-        ]
-        super().setUpClass()
 
     def test_ocr(self):
         image = Image.new("RGB", (1920, 1920), "white")

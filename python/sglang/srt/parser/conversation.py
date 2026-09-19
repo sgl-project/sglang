@@ -898,6 +898,22 @@ register_conv_template(
     )
 )
 
+# Mirrors jinaai/jina-ocr-v1's chat_template.jinja:
+# "<|User|>:\n<image>\n{text}\n<|Assistant|>:\n"
+register_conv_template(
+    Conversation(
+        name="jina-ocr",
+        system_message="",
+        system_template="{system_message}",
+        roles=("<|User|>:", "<|Assistant|>:"),
+        sep="\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<｜end▁of▁sentence｜>"],
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
 register_conv_template(
     Conversation(
         name="deepseek-ocr",
@@ -1124,6 +1140,24 @@ MODEL_TYPE_TO_TEMPLATE = {
 
 
 @register_conv_template_matching_function
+def match_jina_ocr(model_path: str):
+    # Registered ahead of the model_type-based matchers: Jina OCR reports
+    # model_type "deepseek_vl_v2", which would otherwise pick "deepseek-vl2".
+    if "jina-ocr" in model_path.lower():
+        return "jina-ocr"
+    config = _read_model_config(model_path)
+    if config is None:
+        return None
+    auto_map = config.get("auto_map") or {}
+    is_deepseek_ocr = (
+        auto_map.get("AutoModel") == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+    )
+    if is_deepseek_ocr and config.get("mtp_num_heads"):
+        return "jina-ocr"
+    return None
+
+
+@register_conv_template_matching_function
 def match_points_v15_chat(model_path: str):
     # reference: https://github.com/sgl-project/sglang/issues/12791
     if re.search(r"\bpoints\b", model_path, re.IGNORECASE):
@@ -1136,6 +1170,31 @@ def match_moss_vl(model_path: str):
         return "moss-vl"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+def _read_model_config(model_path: str) -> Optional[dict]:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        # Hub IDs: the server has already downloaded config.json by the time
+        # templates are resolved, so a cache-only lookup is enough.
+        try:
+            from transformers.utils import cached_file
+
+            config_path = cached_file(
+                model_path,
+                "config.json",
+                local_files_only=True,
+                _raise_exceptions_for_missing_entries=False,
+            )
+        except Exception:
+            config_path = None
+        if not config_path:
+            return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (IOError, json.JSONDecodeError):
+        return None
 
 
 def get_model_type(model_path: str) -> Optional[str]:
