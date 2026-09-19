@@ -1,4 +1,4 @@
-from sglang.srt.runtime_context import get_context, get_observability
+from sglang.srt.runtime_context import get_context, get_observability, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -15,7 +15,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -292,6 +292,8 @@ class TestForwardPassMetrics(unittest.TestCase):
             kv_events_config=None,
         )
         scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=2, pp_rank=0, pp_size=1)
+        # The reporter asks the context whether this is the last stage.
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1))
         scheduler.enable_kv_cache_events = False
 
         with patch(
@@ -329,6 +331,8 @@ class TestForwardPassMetrics(unittest.TestCase):
             kv_events_config=None,
         )
         scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=0, pp_rank=0, pp_size=2)
+        # The reporter asks the context whether this is the last stage.
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=2))
         scheduler.enable_kv_cache_events = False
 
         with patch(
