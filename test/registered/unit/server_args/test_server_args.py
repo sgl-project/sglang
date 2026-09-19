@@ -3664,6 +3664,27 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestDwdpPlatformGate(CustomTestCase):
+    """--dwdp-size on a non-NVIDIA platform must be rejected at arg resolution,
+    not crash later inside model-runner init on the missing cuda bindings."""
+
+    def _args(self, **fields):
+        return ServerArgs(model_path="dummy", tp_size=2, dwdp_size=2, **fields)
+
+    def test_rejects_non_cuda_device(self):
+        with self.assertRaisesRegex(ValueError, "requires an NVIDIA CUDA device"):
+            parallel_hook.handle_dwdp(self._args(device="xpu"))
+
+    @override_platform(is_hip=True)
+    def test_rejects_rocm(self):
+        with self.assertRaisesRegex(ValueError, "requires an NVIDIA CUDA device"):
+            parallel_hook.handle_dwdp(self._args(device="cuda"))
+
+    @override_platform(is_hip=False)
+    def test_allows_cuda(self):
+        parallel_hook.handle_dwdp(self._args(device="cuda"))
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """The graph-captured TP LM-head all-to-all must not run with NCCL's
     graph buffer registration: registered graph-pool temporaries deadlock the

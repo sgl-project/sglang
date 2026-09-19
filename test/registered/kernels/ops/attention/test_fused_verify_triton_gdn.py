@@ -11,7 +11,12 @@ import sys
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 try:
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -28,9 +33,12 @@ except ImportError:
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_xpu_ci(est_time=40, suite="nightly-xpu-1-gpu", nightly=True)
+
+DEVICE = get_device()
 
 
-def _make_tensors(N, T, H, HV, K, V, device="cuda", seed=2025):
+def _make_tensors(N, T, H, HV, K, V, device=DEVICE, seed=2025):
     """Create input tensors for GDN target_verify."""
     torch.manual_seed(seed)
     A_log = torch.randn(HV, dtype=torch.float32, device=device)
@@ -244,7 +252,7 @@ def test_verify_scratch_pitch_uses_allocated_steps():
         N, T, H, HV, K, V
     )
     buffer = torch.full(
-        (N + 1, ALLOCATED, HV, V, K), float("nan"), dtype=torch.float32, device="cuda"
+        (N + 1, ALLOCATED, HV, V, K), float("nan"), dtype=torch.float32, device=DEVICE
     )
 
     run_fused_mtp(

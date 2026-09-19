@@ -99,6 +99,38 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
                             except (AttributeError, TypeError):
                                 continue
 
+        # No TimestepPreparationStage here, and DenoisingStage requires a scheduler.
+        if batch.scheduler is None:
+            batch.scheduler = self.scheduler
+
+        # No TextEncodingStage here, so back-fill require_text_seq_lens' input.
+        # A 2-D entry is [seq, dim] text unless the batch has pooled embeds, where
+        # it is the pooled projection instead and its leading dim is the batch.
+        pipeline_config = server_args.pipeline_config
+        if batch.prompt_embeds is not None and batch.prompt_seq_lens is None:
+            has_pooled = bool(batch.pooled_embeds)
+            batch.prompt_seq_lens = [
+                (
+                    None
+                    if has_pooled and e.ndim == 2
+                    else pipeline_config.seq_lens_from_prompt_embeds(e)
+                )
+                for e in batch.prompt_embeds
+            ]
+        if (
+            batch.negative_prompt_embeds is not None
+            and batch.negative_prompt_seq_lens is None
+        ):
+            has_neg_pooled = bool(batch.neg_pooled_embeds)
+            batch.negative_prompt_seq_lens = [
+                (
+                    None
+                    if has_neg_pooled and e.ndim == 2
+                    else pipeline_config.seq_lens_from_prompt_embeds(e)
+                )
+                for e in batch.negative_prompt_embeds
+            ]
+
         original_latents_shape = None
         if batch.latents is not None:
             original_latents_shape = batch.latents.shape

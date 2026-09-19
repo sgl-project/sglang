@@ -419,6 +419,25 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+def device_timing_event(device_module: Optional[Any] = None) -> Optional[Any]:
+    """An elapsed-time event for the device, or None where unsupported.
+
+    Probes by constructing: torch.cpu has Event but rejects enable_timing.
+    """
+
+    if device_module is None:
+        device_module = torch.get_device_module()
+
+    event_cls = getattr(device_module, "Event", None)
+    if event_cls is None:
+        return None
+
+    try:
+        return event_cls(enable_timing=True)
+    except TypeError:
+        return None
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):

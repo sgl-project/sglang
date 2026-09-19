@@ -668,6 +668,16 @@ class PipelineConfig:
             raise ValueError("text conditioning mask must have shape [batch, seq]")
         return torch.count_nonzero(mask, dim=1).tolist()
 
+    @staticmethod
+    def seq_lens_from_prompt_embeds(prompt_embeds: "torch.Tensor") -> list[int]:
+        """Text lengths for a maskless text-encoder output; 2-D (seq x dim) is batch=1.
+
+        Not valid for a pooled embedding, whose 2-D leading dim is the batch.
+        """
+        if prompt_embeds.ndim == 2:
+            return [int(prompt_embeds.shape[0])]
+        return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+
     def require_text_seq_lens(
         self,
         batch,
@@ -689,6 +699,13 @@ class PipelineConfig:
             raise ValueError(
                 f"Missing {kind} prompt_seq_lens for text encoder {encoder_index}; "
                 "dynamic text conditioning requires explicit sequence lengths."
+            )
+
+        # None means the entry is not a text-encoder output, not that it is absent.
+        if seq_lens_by_encoder[encoder_index] is None:
+            raise ValueError(
+                f"{kind} prompt_seq_lens entry {encoder_index} is not a text "
+                "encoder output, so it carries no sequence lengths."
             )
 
         seq_lens = [int(x) for x in seq_lens_by_encoder[encoder_index]]

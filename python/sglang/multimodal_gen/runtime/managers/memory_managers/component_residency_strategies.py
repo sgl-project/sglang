@@ -198,9 +198,14 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # of the weights next to the device copy still being read from
             # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
             # and exhausted a GB10. Take the synchronous, pageable path there.
+            # XPU takes the sync path too: this strategy only builds a prefetch
+            # stream under is_cuda, so nothing overlaps an async copy here.
             module.to(
                 "cpu",
-                non_blocking=not current_platform.device_shares_host_memory(),
+                non_blocking=not (
+                    current_platform.device_shares_host_memory()
+                    or current_platform.is_xpu()
+                ),
             )
         self._ready_events.pop(use.component_name, None)
 

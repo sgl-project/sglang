@@ -12,11 +12,13 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8,
     CustomTestCase,
     intel_amx_benchmark,
+    requires_intel_amx,
 )
 
 register_cpu_ci(est_time=47, suite="stage-a-test-cpu-intel")
 
 
+@requires_intel_amx()
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
