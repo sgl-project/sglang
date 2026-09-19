@@ -58,9 +58,8 @@ def _resolve_elastic_world_dp_size(
         return dp_size
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-    from sglang.srt.layers.dp_attention import get_attention_dp_size
 
-    live_dp_size = get_attention_dp_size()
+    live_dp_size = get_parallel().attn_dp_size
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     world_size = torch.distributed.get_world_size(group)
 
