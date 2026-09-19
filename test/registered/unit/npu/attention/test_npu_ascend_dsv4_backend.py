@@ -669,16 +669,16 @@ class TestCompressorStateTableABI(unittest.TestCase):
             patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
             patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
         ):
-            custom_ops.compressor.return_value = torch.empty((0, 1))
+            npu_ops.compressor.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
 
-        self.assertEqual(npu_ops.compressor.call_count, 0)
+        self.assertEqual(custom_ops.compressor.call_count, 0)
         self.assertIs(
-            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+            npu_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
         )
         self.assertIs(
-            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+            npu_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
         )
 
 
