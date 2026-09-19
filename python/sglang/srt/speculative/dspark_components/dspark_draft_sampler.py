@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -53,6 +54,27 @@ class DsparkDraftSampler:
     ):
         self.model = model
         self.markov_head = model.markov_head
+        candidate_k = envs.SGLANG_DSPARK_MARKOV_CANDIDATE_K.get()
+        if candidate_k:
+            if (
+                folded_sampling
+                or not envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
+                or get_tensor_model_parallel_world_size() != 1
+                or type(self.markov_head) is not VanillaMarkov
+            ):
+                raise ValueError(
+                    "DSpark candidates require TP=1, a vanilla head, "
+                    "SGLANG_DSPARK_FOLDED_SAMPLING=0 and "
+                    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV=true"
+                )
+            self.markov_head.prepare_candidates(
+                candidate_k, envs.SGLANG_DSPARK_MARKOV_CANDIDATE_M.get()
+            )
+            logger.info(
+                "DSpark candidate proposals enabled: K=%s, M=%s",
+                candidate_k,
+                self.markov_head.bias_top_ids.shape[1],
+            )
         self.gamma = int(gamma)
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
@@ -233,6 +255,8 @@ def maybe_build_draft_sampler(
     proposal must stay eager."""
 
     def _eager(reason):
+        if envs.SGLANG_DSPARK_MARKOV_CANDIDATE_K.get():
+            raise ValueError(f"DSpark candidates require folded proposals: {reason}")
         if tp_rank == 0:
             logger.info("DSpark draft proposal kept eager (reason=%s).", reason)
         return None
