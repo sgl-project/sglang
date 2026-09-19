@@ -1,8 +1,9 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -122,6 +123,108 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
+
+
+class TestShortestPrefillFirst(CustomTestCase):
+    def setUp(self):
+        self.policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def make_req(self, rid, uncached, *, cached=0, arrived=0):
+        req = _make_req(rid, "", list(range(uncached + cached)))
+        req.full_untruncated_fill_ids = req.origin_input_ids[:]
+        req.num_matched_prefix_tokens = cached
+        req.prefix_indices = list(range(cached))
+        req.time_stats.wait_queue_entry_time = arrived
+        return req
+
+    def test_calc_priority_uses_uncached_work(self):
+        cached = self.make_req("cached", 16, cached=4096)
+        short = self.make_req("short", 32)
+        long = self.make_req("long", 1024)
+        queue = [long, short, cached]
+        with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
+            self.policy.calc_priority(queue)
+        self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
+
+    def test_equal_work_uses_arrival_time(self):
+        older = self.make_req("z", 32, arrived=1)
+        newer = self.make_req("a", 32, arrived=2)
+        queue = [newer, older]
+        self.policy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(queue, [older, newer])
+
+    def test_duplicate_prefix_is_deprioritized(self):
+        duplicate = self.make_req("duplicate", 1)
+        other = self.make_req("other", 1024)
+        queue = [duplicate, other]
+        with patch.object(
+            self.policy, "_compute_prefix_matches", return_value={duplicate.rid}
+        ):
+            self.policy.calc_priority(queue)
+        self.assertEqual(queue, [other, duplicate])
+
+    def test_retracted_output_is_part_of_uncached_work(self):
+        replay = self.make_req("replay", 16, cached=1024)
+        replay.output_ids.extend([0] * 64)
+        short = self.make_req("short", 32)
+        queue = [replay, short]
+        self.policy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(queue, [short, replay])
+
+    def test_chunk_limit_reserves_complete_short_prefills(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            2560,
+        )
+
+    def test_reservation_rounds_to_pages_and_keeps_continuation_progress(self):
+        continuation = self.make_req("continuation", 16384)
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, [self.make_req("short", 257)], 4096, 256
+            ),
+            3584,
+        )
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, [self.make_req("short", 3840)], 4096, 256
+            ),
+            256,
+        )
+
+    def test_no_reservation_when_request_cannot_fit_or_is_not_shorter(self):
+        continuation = self.make_req("continuation", 8192)
+        for waiting, budget in [
+            ([], 4096),
+            ([self.make_req("same", 8192)], 4096),
+            ([self.make_req("too-large", 4096)], 4096),
+            ([self.make_req("short", 1)], 256),
+        ]:
+            with self.subTest(budget=budget, waiting=[req.rid for req in waiting]):
+                self.assertIsNone(
+                    self.policy.shortest_prefill_chunk_limit(
+                        continuation, waiting, budget, 256
+                    )
+                )
+
+    def test_other_policy_keeps_normal_chunk_limit(self):
+        self.policy.policy = CacheAwarePolicy.HRRN
+        self.assertIsNone(
+            self.policy.shortest_prefill_chunk_limit(
+                self.make_req("continuation", 8192),
+                [self.make_req("short", 512)],
+                4096,
+                256,
+            )
+        )
 
 
 if __name__ == "__main__":

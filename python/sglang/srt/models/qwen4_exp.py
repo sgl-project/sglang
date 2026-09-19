@@ -14,7 +14,7 @@ from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -27,7 +27,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -69,7 +68,9 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.utils import get_bool_env_var, is_hip, logger
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -503,7 +504,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.use_attn_tp_ngram = _use_attn_tp_ngram()
         self.gather_dp_tokens = (
             is_dp_attention_enabled()
-            and get_attention_dp_size() > 1
+            and get_parallel().attn_dp_size > 1
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
@@ -852,7 +853,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         allocation_context = nullcontext()
         if self.tp_size > 1:
             allocation_context = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with allocation_context, torch.inference_mode(False):
             # The gather kernel emits bf16 rows regardless of the table dtype.
@@ -1358,7 +1359,7 @@ class Qwen4ExpLayerExtensionMixin:
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
-        return get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
+        return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
 
     def _qwen4_exp_use_attn_tp_a2a_scatter(self) -> bool:
         return get_parallel().attn_tp_size > 1 and not get_moe_a2a_backend().is_none()
@@ -1376,7 +1377,7 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -1395,11 +1396,11 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if should_use_dp_reduce_scatterv():
-                get_tp_group().reduce_scatterv(
+                get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
@@ -1548,10 +1549,6 @@ class Qwen4ExpAttentionDecoderLayer(
             # and writes QSA-private pool buffers.
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.alt_stream):
-                topk_indices = self._compute_qsa_topk_indices(
-                    hidden_states, positions, forward_batch
-                )
 
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
@@ -1560,6 +1557,10 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         if overlap_indexer:
+            with torch.cuda.stream(self.alt_stream):
+                topk_indices = self._compute_qsa_topk_indices(
+                    hidden_states, positions, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
             # stream; tell the caching allocator before alt_stream is reused.
@@ -1836,12 +1837,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         ]
 
         num_experts = getattr(self.config, "num_experts", None)
+        # A fused shared expert lives in routed slot `num_experts`, so the
+        # mapping has to cover one more expert than the config declares.
+        num_fused_shared_experts = 0
+        if _use_aiter:
+            for module in self.modules():
+                fused = getattr(module, "num_fused_shared_experts", 0)
+                if fused:
+                    num_fused_shared_experts = fused
+                    break
         expert_params_mapping = (
             FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=num_experts,
+                num_experts=num_experts + num_fused_shared_experts,
             )
             if num_experts is not None
             else []
@@ -2036,6 +2046,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 layer_id < self.start_layer or layer_id >= self.end_layer
             ):
                 continue
+
+            if (
+                _use_aiter
+                and num_fused_shared_experts > 0
+                and "mlp.shared_expert." in name
+            ):
+                # Map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
 
             is_fused_expert = (
                 "experts.gate_up_proj" in name or "experts.down_proj" in name

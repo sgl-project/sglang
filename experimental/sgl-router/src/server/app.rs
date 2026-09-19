@@ -73,6 +73,11 @@ fn pod_id() -> &'static str {
 /// `route` is the matched template (not the raw URI) and `method` a known-verb
 /// allow-list, so neither label's cardinality is caller-controlled.
 ///
+///
+/// Also the only place that sees every HTTP exchange on every route, so it is
+/// where `inflight_http` is taken — the count the termination drain reports on.
+/// The guard rides the response body rather than being dropped here: a
+/// streaming completion has barely started when this function returns.
 /// The access log runs at the same site, which is what lets it cover responses
 /// produced before any handler runs (a 413 from the body-limit layer, a 400 from
 /// the body extractor when a client drops the connection mid-upload, a
@@ -112,6 +117,7 @@ async fn access_log_and_record(
     let start = std::time::Instant::now();
 
     ctx.metrics.record_ingress(&route, method_label);
+    let inflight = ctx.inflight_http.enter();
     let resp = next.run(req).await;
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -127,30 +133,30 @@ async fn access_log_and_record(
             latency_ms,
             "http_request",
         );
-        return resp;
+    } else {
+        // Per-worker fields are present only when a handler dispatched the
+        // request and attached them; anything rejected before dispatch logs
+        // them empty and falls back to the status for its outcome, which is all
+        // the status can say.
+        let log_ctx = resp.extensions().get::<RequestLogContext>();
+        tracing::info!(
+            pod_id = %pod_id(),
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            outcome = log_ctx
+                .map(|c| c.outcome)
+                .unwrap_or_else(|| outcome_from_status(status.as_u16()))
+                .as_str(),
+            worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
+            model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
+            stream = log_ctx.is_some_and(|c| c.streaming),
+            latency_ms,
+            "http_request",
+        );
     }
-
-    // Per-worker fields are present only when a handler dispatched the request
-    // and attached them; anything rejected before dispatch logs them empty and
-    // falls back to the status for its outcome, which is all the status can say.
-    let log_ctx = resp.extensions().get::<RequestLogContext>();
-    tracing::info!(
-        pod_id = %pod_id(),
-        request_id = %request_id,
-        method = %method,
-        path = %path,
-        status = status.as_u16(),
-        outcome = log_ctx
-            .map(|c| c.outcome)
-            .unwrap_or_else(|| outcome_from_status(status.as_u16()))
-            .as_str(),
-        worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
-        model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
-        stream = log_ctx.is_some_and(|c| c.streaming),
-        latency_ms,
-        "http_request",
-    );
-    resp
+    resp.map(|body| crate::server::inflight::track_body(body, inflight))
 }
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method and

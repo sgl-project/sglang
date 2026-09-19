@@ -73,6 +73,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
@@ -590,6 +591,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
+
+    def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "needs mamba state"):
+            self._construct(
+                "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
+            )
+
+    def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_radix_cache=True,
+        )
+        self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -1703,6 +1719,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # V4.1 leaves the ratio unset (cap-mode SWA sizing).
+        hf41 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
+        )
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
+        )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(
             "moe_runner_backend",
@@ -1776,6 +1800,74 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
+
+    def test_bailing_v3_mixed_mxfp4_selects_native_runner(self):
+        """Packed MXFP4 experts must not reach the FP8 Triton runner."""
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(quantization="fp8", is_fp4_experts=True),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with override_platform(
+            is_sm90=False, is_sm100=True, is_sm120=False, is_hip=False
+        ):
+            for architecture in (
+                "BailingMoeV3ForCausalLM",
+                "BailingMoeV3VLForConditionalGeneration",
+            ):
+                with self.subTest(architecture=architecture):
+                    declarations = collect_model_override_declarations(
+                        architecture,
+                        _args(),
+                        SimpleNamespace(architectures=[architecture]),
+                    )
+                    self.assertEqual(
+                        declarations,
+                        [
+                            (
+                                "_bailing_moe_v3_overrides",
+                                {"moe_runner_backend": "flashinfer_mxfp4"},
+                            )
+                        ],
+                    )
+
+            from sglang.srt.arg_groups.model_overrides.bailing_moe_v3 import (
+                _bailing_moe_v3_overrides,
+            )
+
+            hf = SimpleNamespace(
+                architectures=["BailingMoeV3VLForConditionalGeneration"]
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_runner_backend="triton"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_a2a_backend="deepep"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=False
+                        )
+                    ),
+                    hf,
+                ),
+                {},
+            )
+
+        with override_platform(
+            is_sm90=False, is_sm100=False, is_sm120=False, is_hip=False
+        ):
+            self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (

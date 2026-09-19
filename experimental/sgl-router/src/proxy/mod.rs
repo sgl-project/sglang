@@ -8,6 +8,7 @@ pub mod sse;
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
+use crate::workers::WireProtocol;
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -233,26 +234,66 @@ impl Drop for AbortOnDrop {
 
 #[derive(Debug)]
 pub struct Proxy {
-    pub client: Client,
+    /// The negotiating client: HTTP/1.1 in cleartext, and ALPN `h2, http/1.1`
+    /// over TLS. Safe against any engine, which is why it is also the client
+    /// for side-channel admin traffic (`/flush_cache`).
+    default_client: Client,
+    /// Cleartext h2c (HTTP/2 prior knowledge). No negotiation happens, so this
+    /// is used only for workers whose `/server_info` reported `--enable-http2`
+    /// on a cleartext URL.
+    h2c_client: Client,
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+}
+
+/// Build a forwarding client for `protocol`, sharing pool/connect tuning
+/// across protocols. The h2c variant pins HTTP/2 prior knowledge, which is
+/// what Granian's `HTTPModes.auto` serves on a plaintext port; plaintext has
+/// no ALPN, so prior knowledge is the only way to reach it.
+fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
+    let builder = Client::builder()
+        .pool_max_idle_per_host(64)
+        .connect_timeout(Duration::from_secs(5));
+    match protocol {
+        WireProtocol::Http1 => builder,
+        WireProtocol::H2c => builder.http2_prior_knowledge(),
+    }
+    .build()
+    .context("build reqwest client")
 }
 
 impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
+    ///
+    /// WHY both clients up front: protocol is a per-worker property resolved
+    /// from each engine's `/server_info`, so the request path must be able to
+    /// pick either one per request. Building them here reduces that to a
+    /// selection — no per-request client construction, and no single shared
+    /// client whose first writer decides the protocol for the whole fleet.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
-        let client = Client::builder()
-            .pool_max_idle_per_host(64)
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .context("build reqwest client")?;
         Ok(Self {
-            client,
+            default_client: build_client(WireProtocol::Http1)?,
+            h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
         })
+    }
+
+    /// The forwarding client for `protocol`, taken from the selected worker's
+    /// [`crate::workers::Worker::protocol`].
+    fn client_for(&self, protocol: WireProtocol) -> &Client {
+        match protocol {
+            WireProtocol::Http1 => &self.default_client,
+            WireProtocol::H2c => &self.h2c_client,
+        }
+    }
+
+    /// The client for side-channel admin traffic (e.g. `/flush_cache`), which
+    /// fans out across workers and so cannot use any one worker's protocol.
+    pub fn admin_client(&self) -> &Client {
+        &self.default_client
     }
 
     /// Build an [`AbortOnDrop`] guard for a **non-streaming** forward to
@@ -261,6 +302,12 @@ impl Proxy {
     /// future was cancelled by a client disconnect, or the stale-request
     /// janitor fired — it `POST`s `/abort_request` so the engine stops
     /// generating a reply no one will read.
+    ///
+    /// `protocol` is the selected worker's wire protocol, so the abort rides
+    /// the same client as the forward it covers. An h2c-only worker cannot be
+    /// reached by the negotiating client on a cleartext port, so using
+    /// [`admin_client`](Self::admin_client) here would silently fail the abort
+    /// on exactly the fleets that enable `--enable-http2`.
     ///
     /// `rid` must be the request id the router injected into the forwarded body
     /// (so the engine's request carries it). `headers` are the client's, so the
@@ -272,12 +319,13 @@ impl Proxy {
     pub(crate) fn abort_guard_for(
         &self,
         worker_url: &str,
+        protocol: WireProtocol,
         rid: &str,
         headers: &HeaderMap,
     ) -> Option<AbortOnDrop> {
         let abort_url = Url::parse(worker_url).ok()?.join("/abort_request").ok()?;
         Some(AbortOnDrop::new(
-            self.client.clone(),
+            self.client_for(protocol).clone(),
             abort_url.to_string(),
             rid.to_string(),
             abort_auth(headers),
@@ -322,6 +370,7 @@ impl Proxy {
     pub async fn forward_json_to(
         &self,
         worker_url: &str,
+        protocol: WireProtocol,
         breaker: &CircuitBreaker,
         path: &str,
         headers: &HeaderMap,
@@ -336,7 +385,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -411,7 +460,7 @@ impl Proxy {
     /// own clean end, the engine is told to stop generating this rid. `None`
     /// disables it (callers that don't track a rid).
     // Each parameter is a distinct, required input to a single upstream
-    // forward (target, breaker, path, headers, body, plus the
+    // forward (target, protocol, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks and the abort rid). Bundling them into a
     // struct purely to satisfy the arg-count heuristic would add indirection
     // without clarity.
@@ -419,6 +468,7 @@ impl Proxy {
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
+        protocol: WireProtocol,
         breaker: &Arc<CircuitBreaker>,
         path: &str,
         headers: &HeaderMap,
@@ -437,7 +487,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -483,7 +533,7 @@ impl Proxy {
         let abort_on_end = match abort_rid {
             Some(rid) if status.is_success() => worker_url.join("/abort_request").ok().map(|url| {
                 (
-                    self.client.clone(),
+                    self.client_for(protocol).clone(),
                     url.to_string(),
                     rid.to_string(),
                     abort_auth(headers),
@@ -572,6 +622,26 @@ mod tests {
         assert_eq!(p.request_timeout, Duration::from_secs(5));
     }
 
+    /// `client_for` routes each protocol to its own field, and admin traffic
+    /// shares the default client. Asserting the two clients differ by address
+    /// would be vacuous — they are distinct struct fields, so that holds even
+    /// if `build_client` ignored its argument. What the selector must get right
+    /// is the mapping, so pin that instead; the on-the-wire difference between
+    /// the two clients is covered by tests/proxy/h2c_forward.rs.
+    #[tokio::test]
+    async fn client_for_maps_each_protocol_to_its_own_client() {
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        assert!(std::ptr::eq(
+            p.client_for(WireProtocol::Http1),
+            &p.default_client
+        ));
+        assert!(std::ptr::eq(p.client_for(WireProtocol::H2c), &p.h2c_client));
+        assert!(std::ptr::eq(
+            p.client_for(WireProtocol::Http1),
+            p.admin_client()
+        ));
+    }
+
     #[test]
     fn breaker_outcome_treats_backpressure_as_neutral() {
         // Backpressure: healthy but busy — must not touch the breaker.
@@ -653,6 +723,7 @@ mod tests {
             let resp = proxy
                 .forward_json_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
@@ -695,6 +766,7 @@ mod tests {
             let _ = proxy
                 .forward_json_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
@@ -737,6 +809,7 @@ mod tests {
         let resp = proxy
             .forward_json_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -771,6 +844,7 @@ mod tests {
             let resp = proxy
                 .forward_streaming_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
@@ -940,7 +1014,12 @@ mod tests {
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
         {
             let _guard = proxy
-                .abort_guard_for(&url, "rid-authed", &bearer("Bearer sk-test"))
+                .abort_guard_for(
+                    &url,
+                    WireProtocol::Http1,
+                    "rid-authed",
+                    &bearer("Bearer sk-test"),
+                )
                 .expect("a well-formed worker URL must yield a guard");
         }
         wait_for_auth(&seen, Duration::from_secs(2)).await;
@@ -963,6 +1042,7 @@ mod tests {
         let resp = proxy
             .forward_streaming_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &bearer("Bearer sk-stream"),
@@ -1118,7 +1198,12 @@ mod tests {
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
         assert!(
             proxy
-                .abort_guard_for("not a valid url", "rid", &HeaderMap::new())
+                .abort_guard_for(
+                    "not a valid url",
+                    WireProtocol::Http1,
+                    "rid",
+                    &HeaderMap::new()
+                )
                 .is_none(),
             "an unparsable worker URL must yield no guard"
         );
@@ -1133,7 +1218,12 @@ mod tests {
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
         {
             let _guard = proxy
-                .abort_guard_for(&url, "rid-via-proxy", &HeaderMap::new())
+                .abort_guard_for(
+                    &url,
+                    WireProtocol::Http1,
+                    "rid-via-proxy",
+                    &HeaderMap::new(),
+                )
                 .expect("a well-formed worker URL must yield a guard");
         }
         wait_for_aborts(&abort_log, 1, Duration::from_secs(2)).await;
@@ -1160,6 +1250,7 @@ mod tests {
         let resp = proxy
             .forward_streaming_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &HeaderMap::new(),
@@ -1210,6 +1301,7 @@ mod tests {
         let resp = proxy
             .forward_streaming_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &HeaderMap::new(),
@@ -1242,6 +1334,7 @@ mod tests {
         let resp = proxy
             .forward_streaming_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &HeaderMap::new(),
@@ -1303,6 +1396,7 @@ mod tests {
             let resp = proxy
                 .forward_streaming_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &HeaderMap::new(),

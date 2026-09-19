@@ -17,6 +17,8 @@ sub-pools of one `UnifiedKVPool`, and the tri-pool variant that adds mamba state
 from __future__ import annotations
 
 import logging
+import math
+from abc import abstractmethod
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
@@ -42,11 +44,10 @@ from sglang.srt.utils.common import get_num_new_pages
 logger = logging.getLogger(__name__)
 
 
-class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
-    """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools).
+class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
+    """Shared FULL/SWA virtual IDs, allocation lifecycle, and index translation.
 
-    One alloc(N) binds N pages on BOTH sides under the same virtual id, so
-    `available_size()` (joint bytes, in TOKENS) is the only safe alloc pre-check.
+    Concrete allocators define the two-ended or Mamba/SWA/FULL capacity policy.
     """
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
@@ -65,26 +66,36 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         unified_buffer: UnifiedKVPool,
         kvcache,  # UnifiedSWAKVPool
         device: str,
-        full_max_total_num_tokens: int,
-        swa_max_total_num_tokens: int,
+        full_max_total_num_tokens: Optional[int] = None,
+        swa_max_total_num_tokens: Optional[int] = None,
         page_size: int = 1,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
-        # Set _size_full / _size_swa BEFORE base init (read during it). STATIC
-        # partition caps -- the slot-conservation value the leak invariant expects.
-        self._size_full = full_max_total_num_tokens
-        self._size_swa = swa_max_total_num_tokens
-        self._full_max_total_num_tokens = full_max_total_num_tokens
-        self._swa_max_total_num_tokens = swa_max_total_num_tokens
+        if (full_max_total_num_tokens is None) != (swa_max_total_num_tokens is None):
+            raise ValueError(
+                "full_max_total_num_tokens and swa_max_total_num_tokens must "
+                "either both be set or both be omitted"
+            )
+        legacy_capacities = full_max_total_num_tokens is not None
+        self._size_full = (
+            int(full_max_total_num_tokens)
+            if legacy_capacities
+            else unified_buffer.max_slots("full") - 1
+        )
+        self._size_swa = (
+            int(swa_max_total_num_tokens)
+            if legacy_capacities
+            else unified_buffer.max_slots("swa") - 1
+        )
         self.page_size = page_size
 
         # The parent is inherited only for the isinstance contract: skip its
         # static-partition sub-pool allocation, which the unified pool replaces.
         BaseTokenToKVPoolAllocator.__init__(
             self,
-            size=full_max_total_num_tokens,
+            size=self._size_full,
             page_size=page_size,
             dtype=unified_buffer.mha_spec("full").store_dtype,
             device=device,
@@ -120,6 +131,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         self._wire_peers()
 
+        self._empty_shared_gap_bytes = self.full_attn_allocator._current_gap_bytes()
+        if not legacy_capacities:
+            self._size_full = self.full_attn_allocator.available_size()
+            self._size_swa = min(
+                self.swa_attn_allocator.available_size(),
+                len(self.full_attn_allocator.free_virtual_ids) * page_size,
+            )
+        self._full_max_total_num_tokens = self._size_full
+        self._swa_max_total_num_tokens = self._size_swa
+
         # Epoch-keyed memo for the joint capacity view (any chain member's
         # mutation invalidates -- see `MultiEndedAllocator._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
@@ -143,7 +164,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "[unified-memory-pool] UnifiedSWATokenToKVPoolAllocator ready: "
             "full max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
             "swa max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
-            "static caps full=%d swa=%d, joint available=%d",
+            "max capacity full=%d swa=%d, joint available=%d",
             self.full_attn_allocator.max_slots,
             self.full_attn_allocator.min_slot_index,
             self.full_attn_allocator.entry_bytes,
@@ -157,18 +178,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- construction hooks (the tri-pool subclass overrides both) --
 
-    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
-        """The swa sub-allocator: an END pool in the 2-pool pair."""
-        return MultiEndedAllocator(
-            sub_pool_name="swa",
-            is_id_owner=False,  # non-owner; consumes virtuals minted by full
-            **kwargs,
-        )
-
-    def _wire_peers(self) -> None:
-        self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
-        self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
-
     # -- capacity reporting (three-way split) --
 
     def available_size(self) -> int:
@@ -178,46 +187,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self._joint_avail_memo_tokens = self._compute_available_size()
             self._joint_avail_memo_epoch = epoch
         return self._joint_avail_memo_tokens
-
-    def _compute_available_size(self) -> int:
-        """Joint byte budget in TOKENS: each composite alloc(1) consumes one
-        full-side AND one swa-side page under the same virtual id."""
-        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
-        e_f = fa.entry_bytes_per_page
-        e_s = sa.entry_bytes_per_page
-        # Direction-agnostic shared gap: the free byte band between the two pools.
-        if fa.grow_direction == "up":
-            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
-        else:
-            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
-        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        if not self.lazy_compaction:
-            pages_by_bytes = gap_bytes // (e_f + e_s)
-            return min(pages_by_bytes, R_f, R_s) * self.page_size
-
-        H_f = len(fa._free_phys_pages)
-        H_s = len(sa._free_phys_pages)
-
-        K1 = min(H_f, H_s)  # Phase 1: both drain
-
-        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
-        if H_f <= H_s:
-            e_phase2 = e_f
-            K_phase2_max = H_s
-        else:
-            e_phase2 = e_s
-            K_phase2_max = H_f
-        K2_room = K_phase2_max - K1
-        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
-        gap_bytes -= K2 * e_phase2
-
-        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
-
-        K_total = K1 + K2 + K3
-        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
-        return K_total * self.page_size
 
     # Slot-conservation views for the leak invariant only; the byte-coordinated
     # value would flag spurious leaks. `allocated_count()` is in TOKENS.
@@ -261,17 +230,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def schedulable_swa_available_size(self) -> int:
         return self.swa_attn_allocator.schedulable_available_size()
 
-    def _flush_targets(self):
-        """Flush ALL members, including ones that are not short themselves: a
-        one-sided hole is unusable, and compacting it yields SHARED gap."""
-        return (self.full_attn_allocator, self.swa_attn_allocator)
+    # `size_full` / `size_swa` bound each side independently; current capacities
+    # also account for the peer's live byte usage.
 
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """No float in a two-END chain -- nothing can slide."""
-        return None
+    @property
+    def current_full_capacity(self) -> int:
+        return self.full_available_size() + self.full_attn_allocator.allocated_count()
 
-    # `size_full` / `size_swa` are inherited and read the static caps; reporting
-    # `max_slots - 1` here would be ~= full_max + swa_max and over-promise.
+    @property
+    def current_swa_capacity(self) -> int:
+        return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
 
     @property
     def draft_virtual_id_space(self) -> int:
@@ -396,11 +364,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedSWAAlloc.alloc"):
-            # Joint pre-check. Both sides are mutual peers (each side's compaction
-            # opens gap for the other), so flush BOTH on shortfall.
-            if need_size > self.available_size():
-                if not _relieve_for_alloc(self, need_size):
-                    return None
+            if not self.ensure_capacity(need_size, need_size):
+                return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
             num_pages = need_size // self.page_size
             fa = self.full_attn_allocator
@@ -423,6 +388,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        *,
+        num_swa_pages: Optional[int] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the full side's paged extend and report which virtual PAGES it
         newly took. Returns (virtual TOKEN ids, new virtual PAGE ids), or None
@@ -437,9 +404,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             prefix_lens=prefix_lens_cpu,
         )
         need_tokens = num_new_pages * self.page_size
-        if need_tokens > self.available_size():
-            if not _relieve_for_alloc(self, need_tokens):
-                return None
+        swa_tokens = (
+            need_tokens if num_swa_pages is None else num_swa_pages * self.page_size
+        )
+        if not self.ensure_capacity(need_tokens, swa_tokens):
+            return None
 
         # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
         # its view after the slice is consumed.
@@ -514,14 +483,22 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         sink and is skipped by `free`'s `swa_v2p_page > 0` mask -- exactly the
         out-of-window state the ratchet produces via `free_swa`.
 
-        Admission is priced at the FULL side's page count, as plain
-        `alloc_extend` is: pessimistic when the tail is short, but it reuses
-        the composite's audited joint capacity path, and the bytes actually
-        held still follow the tail.
+        Admission prices FULL's new pages and only the new pages in the SWA
+        tail. A partial prefix page is already bound and costs no new SWA page.
         """
         assert len(prefix_lens_cpu) == 1
         assert 0 <= swa_tail_len <= extend_num_tokens
         with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            prefix_len = int(prefix_lens_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            first_new_page = (prefix_len + self.page_size - 1) // self.page_size
+            first_tail_page = (seq_len - swa_tail_len) // self.page_size
+            num_swa_pages = (
+                (seq_len + self.page_size - 1) // self.page_size
+                - max(first_new_page, first_tail_page)
+                if swa_tail_len
+                else 0
+            )
             extended = self._extend_in_virtual_space(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -529,6 +506,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 seq_lens_cpu,
                 last_loc,
                 extend_num_tokens,
+                num_swa_pages=num_swa_pages,
             )
             if extended is None:
                 return None
@@ -555,9 +533,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
             need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
+            if not self.ensure_capacity(need_tokens, need_tokens):
+                return None
 
             fa = self.full_attn_allocator
             new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
@@ -727,14 +704,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.clear_inverse_history()
         self.swa_attn_allocator.clear_inverse_history()
 
-    def verify_byte_accounting(self) -> List[str]:
-        return (
-            _chain_byte_accounting_violations(
-                _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
-            )
-            + self._joint_capacity_memo_violations()
-        )
-
     def _joint_capacity_memo_violations(self) -> List[str]:
         """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
         for the composite joint view. Empty == healthy."""
@@ -781,6 +750,445 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 forward_done, out_cache_loc_virtual
             )
 
+    @abstractmethod
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator: ...
+
+    @abstractmethod
+    def _wire_peers(self) -> None: ...
+
+    @abstractmethod
+    def _compute_available_size(self) -> int: ...
+
+    @abstractmethod
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool: ...
+
+    @abstractmethod
+    def _flush_targets(self): ...
+
+    @abstractmethod
+    def _ask_float_for_room(self, need_tokens: int) -> None: ...
+
+
+class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
+    """Two-ended FULL/SWA allocator with asymmetric shared-byte reservations."""
+
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
+        """The swa sub-allocator: an END pool in the 2-pool pair."""
+        return MultiEndedAllocator(
+            sub_pool_name="swa",
+            is_id_owner=False,  # non-owner; consumes virtuals minted by full
+            **kwargs,
+        )
+
+    def _wire_peers(self) -> None:
+        self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
+        self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
+
+    def _compute_available_size(self) -> int:
+        """Joint byte budget in TOKENS: each composite alloc(1) consumes one
+        full-side AND one swa-side page under the same virtual id."""
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        e_f = fa.entry_bytes_per_page
+        e_s = sa.entry_bytes_per_page
+        # Direction-agnostic shared gap: the free byte band between the two pools.
+        if fa.grow_direction == "up":
+            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
+        else:
+            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
+        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
+
+        if not self.lazy_compaction:
+            pages_by_bytes = gap_bytes // (e_f + e_s)
+            return min(pages_by_bytes, R_f, R_s) * self.page_size
+
+        H_f = len(fa._free_phys_pages)
+        H_s = len(sa._free_phys_pages)
+
+        K1 = min(H_f, H_s)  # Phase 1: both drain
+
+        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
+        if H_f <= H_s:
+            e_phase2 = e_f
+            K_phase2_max = H_s
+        else:
+            e_phase2 = e_s
+            K_phase2_max = H_f
+        K2_room = K_phase2_max - K1
+        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
+        gap_bytes -= K2 * e_phase2
+
+        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
+
+        K_total = K1 + K2 + K3
+        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
+        return K_total * self.page_size
+
+    def _flush_targets(self):
+        """Flush ALL members, including ones that are not short themselves: a
+        one-sided hole is unusable, and compacting it yields SHARED gap."""
+        return (self.full_attn_allocator, self.swa_attn_allocator)
+
+    def _ask_float_for_room(self, need_tokens: int) -> None:
+        """No float in a two-END chain -- nothing can slide."""
+        return None
+
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        return True
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        return self.can_reserve(full_tokens, swa_tokens, empty_pool=True)
+
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        """Reclaim both sides together: freeing FULL pages can open SWA room
+        and the reverse, so the shared envelope is the only gate worth
+        re-checking."""
+        ready = self.evict_to_free_tokens(
+            tree_cache, full_tokens, swa_num_tokens=swa_tokens
+        )
+        if ready is None:
+            ready = self.ensure_capacity(full_tokens, swa_tokens)
+        if ready:
+            return None
+        return (
+            "Unified FULL/SWA byte reclamation insufficient: "
+            f"needed=({full_tokens}, {swa_tokens})"
+        )
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Price both sides against the shared byte envelope.
+
+        There is no per-side capacity for the scheduler's budget to be
+        compared against, so the gap between that budget and what this side
+        can currently hand out is folded back into the demand; `can_reserve`
+        then prices the whole ask in bytes. Reachable only for hybrid-SWA
+        models, so the tree's `full_*` accounting is the full-attention one.
+        """
+        full_evictable_tokens = tree_cache.full_evictable_size()
+        swa_evictable_tokens = tree_cache.swa_evictable_size()
+        full_tokens += (
+            self.full_available_size() + full_evictable_tokens - full_budget_tokens
+        )
+        if swa_budget_tokens is not None:
+            swa_tokens += (
+                self.swa_available_size() + swa_evictable_tokens - swa_budget_tokens
+            )
+        return self.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+        )
+
+    def reclaim_plan(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+    ) -> Optional[Tuple[int, int]]:
+        """Return cumulative FULL/SWA eviction targets, or None if impossible.
+
+        The tree evicts FULL before SWA. Minimize required SWA reclaim with all
+        evictable FULL available, then trim excess FULL reclaim. FULL eviction's
+        actual SWA cascade is counted by the tree's shared eviction tracker.
+        """
+        if full_tokens < 0 or swa_tokens < 0:
+            return None
+
+        page_size = self.page_size
+        full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
+        swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
+        # Restoring host SWA for device-resident FULL can require more new
+        # SWA pages than new FULL pages; only the shared budget constrains it.
+
+        compacted = empty_pool or not self.lazy_compaction or self._compaction_allowed()
+
+        def fits(full_reclaim_pages: int, swa_reclaim_pages: int) -> bool:
+            return self._fits_page_demand(
+                full_pages,
+                swa_pages,
+                full_reclaim_pages=full_reclaim_pages,
+                swa_reclaim_pages=swa_reclaim_pages,
+                compacted=compacted,
+                empty_pool=empty_pool,
+            )
+
+        if empty_pool:
+            return (0, 0) if fits(0, 0) else None
+        if fits(0, 0):
+            return (0, 0)
+
+        max_full_pages = min(
+            self.full_attn_allocator.allocated_count() // page_size,
+            max(0, int(full_evictable_tokens)) // page_size,
+        )
+        max_swa_pages = min(
+            self.swa_attn_allocator.allocated_count() // page_size,
+            max(0, int(swa_evictable_tokens)) // page_size,
+        )
+        if not fits(max_full_pages, max_swa_pages):
+            return None
+
+        def first_fit(high: int, predicate: Callable[[int], bool]) -> int:
+            low = 0
+            while low < high:
+                mid = (low + high) // 2
+                if predicate(mid):
+                    high = mid
+                else:
+                    low = mid + 1
+            return low
+
+        swa_reclaim_pages = first_fit(
+            max_swa_pages, lambda value: fits(max_full_pages, value)
+        )
+        full_reclaim_pages = first_fit(
+            max_full_pages, lambda value: fits(value, swa_reclaim_pages)
+        )
+        return (
+            full_reclaim_pages * page_size,
+            swa_reclaim_pages * page_size,
+        )
+
+    def can_reserve(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+        require_token_slack: bool = False,
+    ) -> bool:
+        """Check pending FULL/SWA demand against the shared byte envelope.
+
+        Scheduler admission keeps the historical one-token strict slack at an
+        empty-pool boundary. Live admission checks the state reachable after
+        reclaiming the currently evictable pages from both sides.
+        """
+        if full_tokens < 0 or swa_tokens < 0:
+            return False
+        if require_token_slack and (
+            full_tokens >= self.size_full or swa_tokens >= self.size_swa
+        ):
+            return False
+
+        return (
+            self.reclaim_plan(
+                full_tokens,
+                swa_tokens,
+                full_evictable_tokens=full_evictable_tokens,
+                swa_evictable_tokens=swa_evictable_tokens,
+                empty_pool=empty_pool,
+            )
+            is not None
+        )
+
+    def _compaction_allowed(self) -> bool:
+        return all(
+            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
+        )
+
+    def _fits_page_demand(
+        self,
+        num_full_pages: int,
+        num_swa_pages: int,
+        *,
+        full_reclaim_pages: int = 0,
+        swa_reclaim_pages: int = 0,
+        compacted: bool,
+        empty_pool: bool = False,
+    ) -> bool:
+        """Check one FULL/SWA page demand against a single allocator snapshot."""
+        if min(num_full_pages, num_swa_pages) < 0:
+            return False
+
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        if empty_pool:
+            full_live_pages = swa_live_pages = 0
+            full_reclaim_pages = swa_reclaim_pages = 0
+        else:
+            full_live_pages = fa.allocated_count() // self.page_size
+            swa_live_pages = sa.allocated_count() // self.page_size
+            full_reclaim_pages = min(full_live_pages, max(0, int(full_reclaim_pages)))
+            swa_reclaim_pages = min(swa_live_pages, max(0, int(swa_reclaim_pages)))
+
+        full_live_pages -= full_reclaim_pages
+        swa_live_pages -= swa_reclaim_pages
+        full_total_pages = full_live_pages + num_full_pages
+        swa_total_pages = swa_live_pages + num_swa_pages
+        virtual_page_capacity = fa.num_virtual_ids - fa.min_page_index
+        full_page_capacity = min(
+            virtual_page_capacity,
+            fa.num_pages - fa.min_page_index,
+        )
+        swa_page_capacity = min(
+            virtual_page_capacity,
+            sa.num_pages - sa.min_page_index,
+        )
+        if full_total_pages > full_page_capacity or swa_total_pages > swa_page_capacity:
+            return False
+
+        if compacted:
+            full_virtual_room = virtual_page_capacity - full_live_pages
+            full_holes = swa_holes = 0
+            full_index_room = full_page_capacity - full_live_pages
+            swa_index_room = swa_page_capacity - swa_live_pages
+            gap_bytes = (
+                self._empty_shared_gap_bytes
+                - full_live_pages * fa.entry_bytes_per_page
+                - swa_live_pages * sa.entry_bytes_per_page
+            )
+        else:
+            full_virtual_room = len(fa.free_virtual_ids) + full_reclaim_pages
+            full_holes = len(fa._free_phys_pages) + full_reclaim_pages
+            swa_holes = len(sa._free_phys_pages) + swa_reclaim_pages
+            full_index_room = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+            swa_index_room = sa.num_pages - sa.min_page_index - sa._allocated_pages()
+            gap_bytes = fa._current_gap_bytes()
+
+        if num_full_pages > full_virtual_room:
+            return False
+        if num_full_pages > full_holes + full_index_room:
+            return False
+        if num_swa_pages > swa_holes + swa_index_room:
+            return False
+        full_extensions = max(0, num_full_pages - full_holes)
+        swa_extensions = max(0, num_swa_pages - swa_holes)
+        return (
+            full_extensions * fa.entry_bytes_per_page
+            + swa_extensions * sa.entry_bytes_per_page
+            <= max(0, gap_bytes)
+        )
+
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        """Gate one allocation and compact both sides on shortfall."""
+        if full_tokens < 0 or swa_tokens < 0:
+            return False
+        if full_tokens == 0 and swa_tokens == 0:
+            return True
+        page_size = self.page_size
+        num_full_pages = (int(full_tokens) + page_size - 1) // page_size
+        num_swa_pages = (int(swa_tokens) + page_size - 1) // page_size
+        if self._fits_page_demand(
+            num_full_pages,
+            num_swa_pages,
+            compacted=False,
+        ):
+            return True
+        if not self.lazy_compaction or not self._compaction_allowed():
+            return False
+        if not self._fits_page_demand(
+            num_full_pages,
+            num_swa_pages,
+            compacted=True,
+        ):
+            return False
+        self.full_attn_allocator.flush_for_allocation()
+        self.swa_attn_allocator.flush_for_allocation()
+        return self._fits_page_demand(
+            num_full_pages,
+            num_swa_pages,
+            compacted=False,
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
+
+        return SharedSWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (self.current_full_capacity, self.full_available_size()),
+            (self.current_swa_capacity, self.swa_available_size()),
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+
+        def fits(candidate):
+            return self.can_reserve(
+                input_tokens + candidate + self.page_size,
+                estimate_swa_kv_tokens(
+                    input_tokens,
+                    candidate,
+                    sliding_window_size=sliding_window_size,
+                    page_size=self.page_size,
+                    allocation_limit=chunk_size,
+                ),
+                empty_pool=True,
+                require_token_slack=True,
+            )
+
+        if not fits(0):
+            return None
+        if fits(max_new_tokens):
+            return max_new_tokens
+        lo, hi = 0, max_new_tokens
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def evict_to_free_tokens(
+        self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
+    ) -> bool | None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        reclaim_plan = self.reclaim_plan(
+            num_tokens,
+            required_swa,
+            full_evictable_tokens=tree_cache.full_evictable_size(),
+            swa_evictable_tokens=tree_cache.swa_evictable_size(),
+        )
+        if reclaim_plan is None:
+            return
+        full_reclaim, swa_reclaim = reclaim_plan
+        if full_reclaim or swa_reclaim:
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
+            )
+        # A zero-reclaim plan can still depend on compaction before allocation.
+        return self.ensure_capacity(num_tokens, required_swa)
+
+    def verify_byte_accounting(self) -> List[str]:
+        return (
+            _chain_byte_accounting_violations(
+                _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
+            )
+            + self._joint_capacity_memo_violations()
+        )
+
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free."""
         with record_function("UnifiedSWAAlloc.flush_opportunistic"):
@@ -796,7 +1204,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return fa.flush_opportunistic() + sa.flush_opportunistic()
 
 
-class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
+class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     """Tri-pool composite for models with full KV + SWA KV + mamba/conv state
     (both `mambaish_config` and `is_hybrid_swa`).
 
@@ -887,51 +1295,117 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
 
     # -- capacity --
 
-    def _compute_available_size(self) -> int:
-        """Joint TOKENS for `alloc(N)`: N costs N full pages AND N swa pages, drawn
-        from DIFFERENT bands -- full extends only into the high band, the float into
-        either side but only ONE per batch alloc. Feasibility is monotone in N, so
-        binary search; the order matches the alloc path (full takes the high band).
+    def can_reserve(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+        require_token_slack: bool = False,
+    ) -> bool:
+        if (
+            full_tokens < 0
+            or swa_tokens < 0
+            or full_evictable_tokens
+            or swa_evictable_tokens
+            or empty_pool
+        ):
+            return False
+        return self._fits_page_demand(
+            math.ceil(full_tokens / self.page_size),
+            math.ceil(swa_tokens / self.page_size),
+        )
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Price the pair on the float chain's grid, then against the budgets.
+
+        Each side's `available_size` takes `schedulable_available_size()`,
+        which credits the peer's drainable holes, so the two are backed by the
+        same bytes and a pair that fits each side alone can fail together. The
+        budgets still apply on top: they carry decode headroom this allocator
+        cannot see.
         """
+        page_size = self.page_size
+        if not self._fits_page_demand(
+            -(-full_tokens // page_size), -(-swa_tokens // page_size)
+        ):
+            return False
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        )
+
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        if full_tokens < 0 or swa_tokens < 0:
+            return False
+        if self.can_reserve(full_tokens, swa_tokens):
+            return True
+        for allocator in self._flush_targets():
+            allocator.flush_for_allocation()
+        if self.can_reserve(full_tokens, swa_tokens):
+            return True
+        _float_open_short_side(
+            self.swa_attn_allocator,
+            {
+                self.full_attn_allocator: -(-full_tokens // self.page_size),
+                self.swa_attn_allocator: -(-swa_tokens // self.page_size),
+                self.mamba_allocator: 0,
+            },
+        )
+        return self.can_reserve(full_tokens, swa_tokens)
+
+    def _fits_page_demand(self, full_pages: int, swa_pages: int) -> bool:
+        """Price FULL first, then SWA in one contiguous band on the float grid."""
         fa, sa = self.full_attn_allocator, self.swa_attn_allocator
-        e_f = fa.entry_bytes_per_page
-        # full is grow-down: its chain gap IS the high band.
-        b_high = fa._current_gap_bytes()
         h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
         h_s = sa._hole_pages()
         r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
         r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        def feasible(n: int) -> bool:
-            if n > h_f + r_f or n > h_s + r_s:
-                return False
-            ext_f = max(0, n - h_f)
-            if ext_f * e_f > b_high:
-                return False
-            ext_s = max(0, n - h_s)
-            # On the float's page grid, never in raw bytes: a byte budget
-            # credits a page `take_physical_pages` cannot yield.
-            full_low_after = fa._byte_low_frontier() - ext_f * e_f
-            if sa._is_frontier_transparent():
-                room = sa.pages_in_band(
-                    low_byte=sa._chain_high_frontier_below_bytes(),
-                    high_byte=full_low_after,
-                )
-                return ext_s <= room
-            p_low = sa.pages_in_band(
+        if full_pages > h_f + r_f or swa_pages > h_s + r_s:
+            return False
+        full_bytes = max(0, full_pages - h_f) * fa.entry_bytes_per_page
+        if full_bytes > fa._current_gap_bytes():
+            return False
+        ext_s = max(0, swa_pages - h_s)
+        full_low_after = fa._byte_low_frontier() - full_bytes
+        if sa._is_frontier_transparent():
+            room = sa.pages_in_band(
                 low_byte=sa._chain_high_frontier_below_bytes(),
-                high_byte=sa._byte_low_frontier(),
-            )
-            p_high = sa.pages_in_band(
-                low_byte=sa._byte_high_frontier(),
                 high_byte=full_low_after,
             )
-            return ext_s <= max(p_low, p_high)
+            return ext_s <= room
+        p_low = sa.pages_in_band(
+            low_byte=sa._chain_high_frontier_below_bytes(),
+            high_byte=sa._byte_low_frontier(),
+        )
+        p_high = sa.pages_in_band(
+            low_byte=sa._byte_high_frontier(),
+            high_byte=full_low_after,
+        )
+        return ext_s <= max(p_low, p_high)
 
+    def _compute_available_size(self) -> int:
+        """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
+        as tail allocation. FULL takes the high band before SWA binds its pages.
+        """
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
+        h_s = sa._hole_pages()
+        r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
         lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
         while lo_n < hi_n:
             mid = (lo_n + hi_n + 1) // 2
-            if feasible(mid):
+            if self._fits_page_demand(mid, mid):
                 lo_n = mid
             else:
                 hi_n = mid - 1
@@ -1036,17 +1510,33 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Mamba competes for the shared gap too; retain the tri-pool's existing
+        # token and state-slot admission until it has a three-way reservation.
+        return SWATokenToKVPoolAllocator.create_prefill_budget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(self, *args, **kwargs):
+        return BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(
+            self, *args, **kwargs
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.conserve_full_available_size()),
+            (swa_capacity, self.conserve_swa_available_size()),
+        )
+
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         """Joint-aware eviction: one tri-lifetime node frees bytes on several sides
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
         # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
         for _ in range(4):
             before = self.available_size()
             if before >= num_tokens:
                 return
-            evict_from_tree_cache(tree_cache, num_tokens)
+            SWATokenToKVPoolAllocator.evict_to_free_tokens(self, tree_cache, num_tokens)
             if self.available_size() <= before:
                 return  # no progress
 

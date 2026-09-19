@@ -105,6 +105,33 @@ impl EngineLoadSnapshot {
         self.workers.get(worker_url)
     }
 
+    /// True when some worker in `fleet_urls` has a fresh queue reading
+    /// strictly below `floor` — a destination where a diverted request would
+    /// provably wait behind fewer than `floor` others. Workers with no fresh
+    /// sample do not count: the saturation pin asks whether a provably better
+    /// destination exists, and an unknown queue is not proof. This is the
+    /// opposite polarity from the queue gate's fail-open, and the two
+    /// compose: both leave the request with its prefix owner when the signal
+    /// is missing.
+    ///
+    /// The caller passes the routable fleet rather than letting this scan the
+    /// whole table: the table is router-wide, so it also holds decode peers,
+    /// other models' workers, and workers no longer healthy enough to receive
+    /// this request. None of those is a destination a diversion could reach,
+    /// and a decode peer idling at zero waiting would otherwise veto the pin
+    /// on every PD deployment.
+    pub fn any_fresh_queue_below<'u>(
+        &self,
+        fleet_urls: impl IntoIterator<Item = &'u str>,
+        floor: u64,
+    ) -> bool {
+        fleet_urls.into_iter().any(|url| {
+            self.workers
+                .get(url)
+                .is_some_and(|load| load.num_waiting_reqs < floor)
+        })
+    }
+
     /// Returns only complete, fresh native Cache-Aware monitor data.
     pub fn fresh_native_cache_load_for_url(
         &self,
