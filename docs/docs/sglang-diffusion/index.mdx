@@ -47,6 +47,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Deployment and Performance Modes](/docs/sglang-diffusion/deployment_cookbook): choose `--performance-mode`, offload, FSDP, CFG parallelism, SP, and TP
 - [Attention Backends](/docs/sglang-diffusion/attention_backends): choose the best backend for your model and hardware
 - [Sequence Parallelism](/docs/sglang-diffusion/ring_sp_performance): configure SP, Ulysses, and ring-based splitting for long sequences
+- [Expert Parallelism](/docs/sglang-diffusion/expert_parallelism): shard routed MoE experts across an SP-aligned GPU group
 - [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel): fold, data-parallel, or replicate the text/image encoders across idle GPUs
 - [Inference Batching](/docs/sglang-diffusion/dynamic_batching): batch compatible native diffusion requests during serving
 - [Progressive Resolution Generation](/docs/sglang-diffusion/progressive_resolution): run early denoising steps at lower latent resolution for selected pipelines

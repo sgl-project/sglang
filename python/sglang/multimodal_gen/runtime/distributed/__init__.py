@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     initialize_model_parallel,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+    sequence_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import *
 
@@ -54,6 +55,7 @@ __all__ = [
     "get_sp_group",
     "get_sp_parallel_rank",
     "get_sp_world_size",
+    "sequence_parallel_is_initialized",
     # Tensor parallel group
     "get_tp_group",
     "get_tp_rank",
