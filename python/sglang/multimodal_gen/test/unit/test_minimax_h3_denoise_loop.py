@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _build_cube_attn_metadata,
     _precompute_refined_prompt_embeds,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
 
 
 def _branch(
@@ -62,6 +65,22 @@ def _branch(
         token_tags=packed["token_tags"] if token_tags is None else token_tags,
         device=torch.device("cpu"),
     )
+
+
+def test_time_shift_sigmas_build_exact_denoise_step_count():
+    for num_steps in (1, 2, 10, 50):
+        for shift_scale in (3.0, 12.0):
+            sigmas = minimax_h3_time_shift_sigmas(
+                num_steps=num_steps,
+                shift_scale=shift_scale,
+            )
+
+            assert len(sigmas) == num_steps + 1
+            assert sigmas[0] == 1.0
+            assert sigmas[-1] == 0.0
+            assert all(
+                current > following for current, following in zip(sigmas, sigmas[1:])
+            )
 
 
 def test_precomputed_timestep_plan_matches_full_unique_reference():
