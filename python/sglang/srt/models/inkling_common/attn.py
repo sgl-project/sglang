@@ -6,9 +6,6 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
-    is_batch_invariant,
-)
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
@@ -40,6 +37,19 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast, is_xpu
+
+try:
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant,
+    )
+except ImportError:
+    # cute/__init__ eagerly imports .interface -> `import cutlass`, and
+    # nvidia-cutlass-dsl is CUDA-only (absent from pyproject_xpu.toml). The flag is
+    # only ever set True by the fa4 backend, which needs cutlass itself, so False is
+    # what the real module would return wherever this fallback can be reached.
+    def is_batch_invariant() -> bool:
+        return False
+
 
 try:
     import cutlass.cute as cute
