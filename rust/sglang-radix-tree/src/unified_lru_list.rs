@@ -484,7 +484,10 @@ impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
 }
 
 /// The strategy for an eviction-policy name.
-pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionStrategy<K> + Send> {
+pub fn get_eviction_strategy<K: ChildKeyType>(
+    policy: &str,
+    slru_protected_threshold: i64,
+) -> Box<dyn EvictionStrategy<K> + Send> {
     match policy.to_lowercase().as_str() {
         "lru" => Box::new(LruStrategy),
         "lfu" => Box::new(LfuStrategy),
@@ -493,7 +496,7 @@ pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionS
         "filo" => Box::new(FiloStrategy),
         "priority" => Box::new(PriorityStrategy),
         "slru" => Box::new(SlruStrategy {
-            protected_threshold: 2,
+            protected_threshold: slru_protected_threshold,
         }),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \

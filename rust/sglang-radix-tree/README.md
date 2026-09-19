@@ -4,13 +4,31 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 
 ## Usage
 
-Select the backend with:
+Rust is the default tree core. The centralized tree-core registry falls back to
+Python in these cases:
+
+- Session-aware caching.
+- T-LRU eviction.
+- C128 or other unsupported components.
+- Custom component overrides.
+- Non-Linux platforms.
+- PyTorch versions outside 2.11 through 2.13.
+- Devices other than CPU or CUDA.
+- Installations containing neither the Rust extension nor its sources.
+
+This policy also applies when Rust is explicitly selected.
+Build, import, and runtime failures in supported configurations remain errors.
+
+Select a backend explicitly with:
 
 ```bash
 SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust
+# Use the Python implementation instead:
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 ```
 
-SGLang wheels bundle the production extension. A source checkout falls back to
+Standard SGLang wheels bundle the production extension; some platform
+distributions omit it. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
@@ -40,3 +58,8 @@ cache suite. Production wheels do not enable it.
 Unit tests live in `src/tests/`, mirroring the source layout one file per module (wired via `#[cfg(test)] #[path = ...]`), so implementation files stay free of inline test blocks.
 
 Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Full, SWA, Mamba]`.
+
+SWA buffer-mode load-back can repair tombstoned windows in Rust. The core finds
+missing SWA spans and attaches loaded slots across node boundaries, preserving
+Full-KV ownership, lock accounting, and pending write-through split actions.
+The shared Python pipeline handles transfers and redundant-slot cleanup.

@@ -59,6 +59,7 @@ fn insert_params_mamba<'k>(
     mamba_slot: Option<i64>,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),

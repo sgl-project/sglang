@@ -1,23 +1,26 @@
 """Unit tests for the tree-core backend registry."""
 
+import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    EvictLayer,
-    TreeComponent,
-)
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
     create_tree_core,
     register_tree_core_backend,
     registered_tree_core_backends,
+    resolve_tree_core_backend,
+    select_tree_core_backend,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -177,11 +180,17 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         cache = UnifiedRadixCache(params)
         self.assertTrue(cache.tree_core.is_eagle)
 
-    def test_default_backend_builds_the_python_tree_core(self):
+    def test_custom_components_default_to_the_python_tree_core(self):
         cache = UnifiedRadixCache(params=self._cache_params())
         self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
         component = cache.components[ComponentType.FULL]
         self.assertIs(component.tree_core, cache.tree_core)
+
+    def test_explicit_rust_cache_records_the_python_fallback(self):
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            cache = UnifiedRadixCache(params=self._cache_params())
+        self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
+        self.assertEqual(cache._tree_core_backend, "python")
 
     def test_env_var_routes_construction_to_the_selected_backend(self):
         """SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND selects the registered factory
@@ -195,6 +204,169 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self.assertIs(cache.tree_core, core)
         component = cache.components[ComponentType.FULL]
         self.assertIs(component.tree_core, core)
+
+    def test_supported_default_routes_to_rust(self):
+        core = mock.MagicMock()
+        factory = mock.MagicMock(return_value=core)
+        params = self._cache_params(component_registry_override=None)
+        with (
+            mock.patch.dict(os.environ),
+            mock.patch.object(
+                tree_core_registry,
+                "_rust_fallback_reason",
+                return_value=None,
+            ),
+            mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}),
+        ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            cache = UnifiedRadixCache(params)
+        factory.assert_called_once_with(params, cache.components)
+        self.assertIs(cache.tree_core, core)
+
+    def test_default_rust_construction_errors_propagate(self):
+        factory = mock.MagicMock(side_effect=RuntimeError("extension build failed"))
+        with (
+            mock.patch.dict(os.environ),
+            mock.patch.object(
+                tree_core_registry,
+                "_rust_fallback_reason",
+                return_value=None,
+            ),
+            mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}),
+        ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            with self.assertRaisesRegex(RuntimeError, "extension build failed"):
+                UnifiedRadixCache(self._cache_params(component_registry_override=None))
+
+
+class TreeCoreDefaultCompatibilityTest(CustomTestCase):
+    def setUp(self):
+        patchers = (
+            mock.patch.dict(os.environ),
+            mock.patch.object(tree_core_registry.sys, "platform", "linux"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.13.0"),
+            mock.patch.object(
+                tree_core_registry.importlib.util, "find_spec", return_value=None
+            ),
+            mock.patch.object(tree_core_registry, "_RUST_TREE_CORE_MANIFEST"),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+        tree_core_registry._RUST_TREE_CORE_MANIFEST.is_file.return_value = True
+
+    def test_source_install_defaults_to_rust_on_cpu_and_cuda(self):
+        for device in ("cpu", "cuda:1"):
+            with self.subTest(device=device):
+                params = _cache_init_params()
+                params.token_to_kv_pool_allocator = SimpleNamespace(device=device)
+                self.assertEqual(select_tree_core_backend(params), "rust")
+
+    def test_bundled_extension_needs_neither_sources_nor_toolchain(self):
+        tree_core_registry._RUST_TREE_CORE_MANIFEST.is_file.return_value = False
+        tree_core_registry.importlib.util.find_spec.return_value = object()
+        self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
+
+    def test_platform_distribution_without_tree_core_uses_python(self):
+        tree_core_registry._RUST_TREE_CORE_MANIFEST.is_file.return_value = False
+        self.assertEqual(select_tree_core_backend(_cache_init_params()), "python")
+
+    def test_session_and_custom_components_use_python(self):
+        for overrides in (
+            {"enable_session_radix_cache": True},
+            {"component_registry_override": {ComponentType.FULL: _StubFullComponent}},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(
+                    select_tree_core_backend(_cache_init_params(**overrides)), "python"
+                )
+        params = _cache_init_params()
+        params.tree_components = (ComponentType.FULL, ComponentType.C128)
+        self.assertEqual(select_tree_core_backend(params), "python")
+
+    def test_unsupported_platform_and_torch_use_python(self):
+        for platform in ("darwin", "win32"):
+            with (
+                self.subTest(platform=platform),
+                mock.patch.object(tree_core_registry.sys, "platform", platform),
+            ):
+                self.assertEqual(
+                    select_tree_core_backend(_cache_init_params()), "python"
+                )
+        for version in ("2.10.0", "2.14.0", "unknown"):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(tree_core_registry.torch, "__version__", version),
+            ):
+                self.assertEqual(
+                    select_tree_core_backend(_cache_init_params()), "python"
+                )
+
+    def test_unsupported_device_uses_python(self):
+        params = _cache_init_params()
+        params.token_to_kv_pool_allocator = SimpleNamespace(device="xpu:0")
+        self.assertEqual(select_tree_core_backend(params), "python")
+
+    def test_explicit_rust_uses_the_same_compatibility_fallback(self):
+        params = _cache_init_params(enable_session_radix_cache=True)
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            self.assertEqual(select_tree_core_backend(params), "python")
+        self.assertEqual(resolve_tree_core_backend("rust", params), "python")
+
+    def test_tlru_uses_python_and_preserves_policy_configuration(self):
+        params = _cache_init_params(
+            eviction_policy="tlru",
+            eviction_policy_config={"threshold": 4096, "next_prompt_estimate": 1024},
+        )
+        self.assertEqual(select_tree_core_backend(params), "python")
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            self.assertEqual(select_tree_core_backend(params), "python")
+
+        rust_factory = mock.MagicMock(side_effect=AssertionError("Rust was loaded"))
+        component = mock.MagicMock()
+        with mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": rust_factory}):
+            core = create_tree_core("rust", params, {ComponentType.FULL: component})
+
+        rust_factory.assert_not_called()
+        self.assertIsInstance(core, UnifiedTreeCore)
+        self.assertIs(component.tree_core, core)
+        self.assertIsInstance(core.eviction_strategy, TLRUStrategy)
+        self.assertEqual(core.eviction_strategy.threshold, 4096)
+        self.assertEqual(core.eviction_strategy.next_prompt_estimate, 1024)
+        self.assertTrue(core.tlru_bookkeeping)
+
+    def test_python_and_custom_backend_selections_are_unchanged(self):
+        params = _cache_init_params(enable_session_radix_cache=True)
+        for backend in ("python", "custom_backend"):
+            with (
+                self.subTest(backend=backend),
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+            ):
+                self.assertEqual(select_tree_core_backend(params), backend)
+
+    def test_factory_resolves_rust_fallback_before_loading_the_extension(self):
+        params = _cache_init_params(enable_session_radix_cache=True)
+        components = {ComponentType.FULL: mock.MagicMock()}
+        python_factory = mock.MagicMock()
+        rust_factory = mock.MagicMock(side_effect=AssertionError("Rust was loaded"))
+        with mock.patch.dict(
+            _TREE_CORE_REGISTRY, {"python": python_factory, "rust": rust_factory}
+        ):
+            result = create_tree_core("rust", params, components)
+        python_factory.assert_called_once_with(params, components)
+        rust_factory.assert_not_called()
+        self.assertIs(result, python_factory.return_value)
+
+    def test_supported_explicit_rust_factory_errors_propagate(self):
+        rust_factory = mock.MagicMock(side_effect=RuntimeError("extension load failed"))
+        python_factory = mock.MagicMock()
+        with mock.patch.dict(
+            _TREE_CORE_REGISTRY, {"python": python_factory, "rust": rust_factory}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "extension load failed"):
+                create_tree_core("rust", _cache_init_params(), {})
+        python_factory.assert_not_called()
 
 
 if __name__ == "__main__":
