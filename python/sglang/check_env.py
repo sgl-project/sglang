@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import os
+import platform
 import resource
 import subprocess
 import sys
@@ -10,11 +11,17 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_cpu, is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
     return torch.version.cuda is not None
+
+
+# Detects the torch build, unlike is_xpu(), which also needs a visible device:
+# a present-but-unusable XPU must still be reported, not fall through to unknown.
+def is_xpu_v2():
+    return torch.version.xpu is not None
 
 
 # List of packages to check versions
@@ -27,6 +34,7 @@ PACKAGE_LIST = [
     "triton",
     "transformers",
     "torchao",
+    "torch_memory_saver",
     "numpy",
     "aiohttp",
     "fastapi",
@@ -56,7 +64,8 @@ class BaseEnv:
     """Base class for environment check"""
 
     def __init__(self):
-        self.package_list = PACKAGE_LIST
+        # Copy: subclasses append their extras, and PACKAGE_LIST is module-global.
+        self.package_list = list(PACKAGE_LIST)
 
     @abstractmethod
     def get_info(self) -> dict:
@@ -514,8 +523,6 @@ class MPSEnv(BaseEnv):
         self.package_list.extend(MPSEnv.EXTRA_PACKAGE_LIST)
 
     def get_info(self):
-        import platform
-
         info = {"MPS available": torch.backends.mps.is_available()}
         if not info["MPS available"]:
             return info
@@ -580,15 +587,126 @@ class MPSEnv(BaseEnv):
         return {}
 
 
-if __name__ == "__main__":
+class XPUEnv(BaseEnv):
+    """Environment checker for Intel XPU"""
+
+    EXTRA_PACKAGE_LIST = [
+        "sglang-kernel-xpu",
+        "triton-xpu",
+        "intel-sycl-rt",
+        "oneccl",
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.package_list.extend(XPUEnv.EXTRA_PACKAGE_LIST)
+
+    def get_info(self):
+        info = {"XPU available": torch.xpu.is_available()}
+        if not info["XPU available"]:
+            return info
+
+        info.update(self.get_device_info())
+        # torch.version.xpu is the oneAPI/SYCL release torch was compiled against.
+        info["XPU SYCL Build"] = torch.version.xpu
+        return info
+
+    def get_device_info(self):
+        devices = defaultdict(list)
+        drivers = defaultdict(list)
+        for k in range(torch.xpu.device_count()):
+            props = torch.xpu.get_device_properties(k)
+            memory_gib = props.total_memory / 1024**3
+            devices[f"{props.name} ({memory_gib:.1f} GiB)"].append(str(k))
+            drivers[props.driver_version].append(str(k))
+
+        info = {}
+        for name, device_ids in devices.items():
+            info[f"XPU {','.join(device_ids)}"] = name
+        for driver_version, device_ids in drivers.items():
+            info[f"XPU {','.join(device_ids)} Driver Version"] = driver_version
+        return info
+
+    def get_topology(self):
+        try:
+            result = subprocess.run(
+                ["xpu-smi", "topology", "-m"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                # A wedged Level-Zero driver hangs xpu-smi, and check_env prints
+                # nothing until every probe returns.
+                timeout=15,
+            )
+            return {"XPU Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return {}
+
+
+class CPUEnv(BaseEnv):
+    """Environment checker for the CPU engine"""
+
+    ISA_FLAGS = ["avx512f", "avx512_bf16", "amx_bf16", "amx_int8"]
+
+    def get_info(self):
+        info = {
+            "SGLANG_USE_CPU_ENGINE": os.environ.get("SGLANG_USE_CPU_ENGINE", "unset"),
+            "Machine": platform.machine(),
+        }
+        info.update(self._get_cpu_info())
+        return info
+
+    def _get_cpu_info(self):
+        try:
+            output = subprocess.check_output(["lscpu"], text=True, timeout=15)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return {}
+
+        info = {}
+        for line in output.splitlines():
+            # lscpu indents nested fields, so match on the stripped label.
+            label, _, value = line.partition(":")
+            label = label.strip()
+            if label == "Model name":
+                info["CPU Model"] = value.strip()
+            elif label == "Flags":
+                flags = set(value.split())
+                isa = [flag for flag in CPUEnv.ISA_FLAGS if flag in flags]
+                info["CPU ISA"] = ",".join(isa) if isa else "no avx512/amx"
+        return info
+
+    def get_topology(self):
+        return {}
+
+
+class UnknownEnv(BaseEnv):
+    """Environment checker for a host with no accelerator sglang recognizes"""
+
+    def get_info(self):
+        return {"Accelerator": "none detected"}
+
+    def get_topology(self):
+        return {}
+
+
+def select_env() -> BaseEnv:
     if is_cuda_v2():
-        env = GPUEnv()
-    elif is_hip():
-        env = HIPEnv()
-    elif is_npu():
-        env = NPUEnv()
-    elif is_musa():
-        env = MUSAEnv()
-    elif is_mps():
-        env = MPSEnv()
-    env.check_env()
+        return GPUEnv()
+    if is_hip():
+        return HIPEnv()
+    if is_npu():
+        return NPUEnv()
+    if is_musa():
+        return MUSAEnv()
+    if is_mps():
+        return MPSEnv()
+    if is_xpu_v2():
+        return XPUEnv()
+    if is_cpu():
+        return CPUEnv()
+    return UnknownEnv()
+
+
+if __name__ == "__main__":
+    select_env().check_env()
