@@ -1,8 +1,9 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-import sglang.srt
 import torch
+
+import sglang.srt
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
