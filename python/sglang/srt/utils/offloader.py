@@ -134,6 +134,24 @@ class OffloaderV1(BaseOffloader):
             self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
 
+        for _, submodule in module.named_modules():
+            if hasattr(submodule, "gemma_weight"):
+                weight = getattr(submodule, "weight", None)
+
+                if weight is not None and weight.device.type == "cpu":
+                    gemma_weight = submodule.gemma_weight
+
+                    cpu_buffer = torch.empty_strided(
+                        size=gemma_weight.size(),
+                        stride=gemma_weight.stride(),
+                        dtype=gemma_weight.dtype,
+                        layout=gemma_weight.layout,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    )
+                    cpu_buffer.copy_(gemma_weight)
+                    submodule.gemma_weight = cpu_buffer
+
         if offloaded_parameters:
             original_forward = module.forward
 
@@ -145,6 +163,9 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
+                for name, buffer in module.named_buffers(remove_duplicate=False):
+                    if name.endswith("gemma_weight"):
+                        device_state[name] = buffer.to(device, non_blocking=True)
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
                 return output
