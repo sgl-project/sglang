@@ -990,6 +990,11 @@ class AiterAttnBackend(AttentionBackend):
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
         )
+        q_descale = None
+        if self.kv_cache_dtype == fp8_dtype:
+            q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            q_u_2d, _ = scaled_fp8_quant(q_u.reshape(q_u.shape[0], -1), q_descale)
+            q_u = q_u_2d.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         unified_attention(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
@@ -1004,7 +1009,7 @@ class AiterAttnBackend(AttentionBackend):
             window_size=uni_window,
             block_table=pt,
             softcap=layer.logit_cap,
-            q_descale=None,
+            q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
