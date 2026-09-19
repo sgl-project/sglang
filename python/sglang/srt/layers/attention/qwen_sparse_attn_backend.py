@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -30,6 +31,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qsa_sparse_decode_triton,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -42,6 +44,37 @@ logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_QSA_DECODE_BACKENDS = {"auto", "flash_attn", "triton", "trtllm"}
+
+
+@lru_cache(maxsize=1)
+def _qsa_decode_backend() -> str:
+    """Resolve the package-independent sparse decode override.
+
+    SM120 defaults to Triton. SM100 defaults to trtllm-gen when it is
+    available, and other architectures retain the existing flash-attn
+    fallback. An explicit backend always takes precedence over these defaults.
+    """
+    backend = envs.SGLANG_QSA_DECODE_BACKEND.get().lower()
+    if backend not in _QSA_DECODE_BACKENDS:
+        choices = ", ".join(sorted(_QSA_DECODE_BACKENDS))
+        raise ValueError(
+            f"Invalid SGLANG_QSA_DECODE_BACKEND={backend!r}; choose {choices}"
+        )
+    if backend == "auto":
+        from sglang.srt.utils import is_sm120_supported, is_sm121
+
+        # GB10 (sm_121) shares the capability major but is unvalidated for the
+        # new Triton default; it keeps the fallback unless explicitly opted in.
+        if is_sm120_supported() and not is_sm121():
+            return "triton"
+        return "trtllm" if _resolve_trtllm_sparse_decode() is not None else "flash_attn"
+    if backend == "trtllm" and _resolve_trtllm_sparse_decode() is None:
+        raise RuntimeError(
+            "SGLANG_QSA_DECODE_BACKEND=trtllm was requested, but the "
+            "trtllm-gen sparse decode backend is unavailable"
+        )
+    return backend
 
 
 @lru_cache(maxsize=1)
@@ -168,7 +201,13 @@ class QSAMTPSharedSparseIndices:
 
 
 class QwenSparseAttnBackend(AttentionBackend):
-    """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
+    """QSA backend using trtllm-gen, direct Triton, or packed FA2/FA4 decode.
+
+    ``SGLANG_QSA_DECODE_BACKEND=auto`` (the default) selects direct Triton on
+    SM120, trtllm-gen on SM100 when available, and packed flash-attn elsewhere.
+    Explicit ``triton``, ``trtllm``, and ``flash_attn`` requests are honored or
+    rejected when unavailable.
+    """
 
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
@@ -1534,8 +1573,11 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        trtllm_decode = _resolve_trtllm_sparse_decode()
-        if trtllm_decode is not None:
+        decode_backend = _qsa_decode_backend()
+        if decode_backend == "trtllm":
+            trtllm_decode = _resolve_trtllm_sparse_decode()
+            if trtllm_decode is None:
+                raise RuntimeError("trtllm-gen sparse decode became unavailable")
             return self._forward_trtllm_sparse(
                 q,
                 k_buffer,
@@ -1546,6 +1588,26 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 trtllm_decode,
             )
+
+        if decode_backend == "triton":
+            output = qsa_sparse_decode_triton(
+                q,
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                metadata.sequence_lengths,
+                layer.scaling,
+            )
+            return output.reshape(q.shape[0], -1)
+
+        if decode_backend != "flash_attn":
+            raise RuntimeError(f"unsupported QSA decode backend {decode_backend!r}")
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         batch, topk = topk_indices.shape
