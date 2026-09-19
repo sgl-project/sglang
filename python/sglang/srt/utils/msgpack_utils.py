@@ -169,7 +169,7 @@ def enc_hook(obj: object) -> object:
         raw_data = arr.reshape(-1).view(np.uint8).data
         return _pack_buffer_ext(
             _MSGPACK_EXT_NP_ARRAY,
-            (arr.shape, arr.dtype.str),
+            (obj.shape, arr.dtype.str),
             raw_data,
         )
     if isinstance(obj, np.floating):
