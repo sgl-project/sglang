@@ -39,6 +39,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+_ULYSSES_GATHER_QKV_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -92,6 +93,92 @@ def _a2a_staging_buffer(
         buffer = torch.empty(required_numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
     return buffer[:required_numel].view(shape)
+
+
+def _usp_minimax_h3_gather_project_qkv(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Exchange U2 hidden rows and project only this rank's QKV heads.
+
+    The result is in global row order, with rank-local [Q, K, V] columns.
+    Local projection overlaps the hidden exchange. The dedicated stream is
+    joined before returning, including NCCL's own asynchronous stream work,
+    so neither input nor scratch can be reused while communication reads it.
+    """
+    if get_ulysses_parallel_world_size() != 2:
+        raise ValueError("MiniMax-H3 gather-project QKV requires Ulysses size 2")
+    if (
+        not x.is_cuda
+        or weight.device != x.device
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or x.ndim != 2
+        or weight.ndim != 2
+        or x.shape[0] == 0
+        or x.shape[1] != weight.shape[1]
+        or weight.shape[0] % 3
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("invalid MiniMax-H3 gather-project QKV tensors")
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("MiniMax-H3 gather-project QKV requires eager execution")
+
+    group = get_sp_group().ulysses_group
+    assert group is not None, "Ulysses process group is not initialized"
+    rank = get_ulysses_parallel_rank()
+    peer_rank = 1 - rank
+    peer_global_rank = dist.get_global_rank(group, peer_rank)
+    rows = x.shape[0]
+    peer_x = _a2a_staging_buffer(
+        "h3_gather_qkv_peer_x", tuple(x.shape), x.dtype, x.device
+    )
+    projected = _a2a_staging_buffer(
+        "h3_gather_qkv_projected", (2 * rows, weight.shape[0]), x.dtype, x.device
+    )
+    device_index = x.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    comm_stream = _ULYSSES_GATHER_QKV_STREAMS.get(device_index)
+    if comm_stream is None:
+        comm_stream = torch.cuda.Stream(device=device_index)
+        _ULYSSES_GATHER_QKV_STREAMS[device_index] = comm_stream
+    compute_stream = torch.cuda.current_stream(x.device)
+    comm_stream.wait_stream(compute_stream)
+    with torch.cuda.stream(comm_stream):
+        requests = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, x, peer_global_rank, group),
+                dist.P2POp(dist.irecv, peer_x, peer_global_rank, group),
+            ]
+        )
+        for request in requests:
+            request.wait()
+
+    torch.mm(x, weight.t(), out=projected.narrow(0, rank * rows, rows))
+    compute_stream.wait_stream(comm_stream)
+    torch.mm(peer_x, weight.t(), out=projected.narrow(0, peer_rank * rows, rows))
+    return projected
+
+
+def _release_minimax_h3_gather_qkv_staging() -> int:
+    """Release this device's gather-project scratch before H3 VAE decode."""
+    roles = ("h3_gather_qkv_peer_x", "h3_gather_qkv_projected")
+    keys = [key for key in _A2A_STAGING_BUFFERS if key[0] in roles]
+    if not keys:
+        return 0
+    device_index = torch.cuda.current_device()
+    keys = [key for key in keys if key[2] == device_index]
+    if not keys:
+        return 0
+    torch.cuda.current_stream().synchronize()
+    released_bytes = sum(
+        _A2A_STAGING_BUFFERS[key].numel() * _A2A_STAGING_BUFFERS[key].element_size()
+        for key in keys
+    )
+    for key in keys:
+        del _A2A_STAGING_BUFFERS[key]
+    return released_bytes
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
