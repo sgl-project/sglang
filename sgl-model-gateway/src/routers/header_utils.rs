@@ -79,10 +79,7 @@ pub fn apply_request_headers(
     skip_content_headers: bool,
 ) -> reqwest::RequestBuilder {
     // Always forward Authorization header first if present
-    if let Some(auth) = headers
-        .get("authorization")
-        .or_else(|| headers.get("Authorization"))
-    {
+    if let Some(auth) = headers.get("authorization") {
         request_builder = request_builder.header("Authorization", auth.clone());
     }
 
@@ -176,31 +173,23 @@ pub fn apply_provider_headers(
     req
 }
 
-/// Extract auth header with passthrough semantics.
+/// Extract auth header for upstream worker requests.
 ///
-/// Passthrough mode: User's Authorization header takes priority.
-/// Fallback: Worker's API key is used only if user didn't provide auth.
-///
-/// This enables use cases where:
-/// 1. Users send their own API keys (multi-tenant, BYOK)
-/// 2. Router has a default key for users who don't provide one
+/// Worker-key-first: If the worker has its own API key, always use it.
+/// The user's Authorization header authenticates to the gateway, not to
+/// the upstream backend. Only forward user auth when no worker key is
+/// configured (passthrough / BYOK mode).
 pub fn extract_auth_header(
     headers: Option<&HeaderMap>,
     worker_api_key: &Option<String>,
 ) -> Option<HeaderValue> {
-    // Passthrough: Try user's auth header first
-    let user_auth = headers.and_then(|h| {
-        h.get("authorization")
-            .or_else(|| h.get("Authorization"))
-            .cloned()
-    });
+    // Worker has its own credential for the upstream service — use it.
+    if let Some(key) = worker_api_key.as_ref() {
+        return HeaderValue::from_str(&format!("Bearer {}", key)).ok();
+    }
 
-    // Return user's auth if provided, otherwise use worker's API key
-    user_auth.or_else(|| {
-        worker_api_key
-            .as_ref()
-            .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
-    })
+    // No worker key: passthrough user's auth header (BYOK / multi-tenant)
+    headers.and_then(|h| h.get("authorization").cloned())
 }
 
 #[inline]
