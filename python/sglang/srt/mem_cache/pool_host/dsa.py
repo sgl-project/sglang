@@ -48,7 +48,21 @@ logger = logging.getLogger(__name__)
 
 
 class DSAIndexerPoolHost(HostKVCache):
-    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
+    """Host-side DSA index buffers only.
+
+    Slot geometry follows the anchor MLA host pool's LOGICAL view: the
+    controller hands this pool the anchor's untranslated host/device slots
+    (``PoolTransfer.indices_from_pool == KV``). Under WQ Hopper DCP the anchor
+    stripes its MLA rows per rank (physical size = logical / dcp, page =
+    widened / dcp) while the device index-K stays REPLICATED over the virtual
+    loc space, so this pool keeps one page per ``page_size`` logical slots and
+    never applies the DCP translation. Without DCP logical == physical and the
+    layout is upstream's.
+
+    Layers that reuse the previous layer's top-k own a 0-row placeholder on the
+    device (``IndexKeyCache``) and never hold index-K; they are skipped here
+    too, so the host pool only pays for layers that can be loaded back.
+    """
 
     device_pool: DSATokenToKVPool
 
@@ -65,6 +79,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
+        assert self.page_size == device_pool.page_size, (
+            f"DSA indexer host page ({self.page_size}) must equal the device "
+            f"index-K page ({device_pool.page_size})."
+        )
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -72,9 +90,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
-        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+        self._init_packed_layers()
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -83,17 +100,15 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
+        self.size = anchor_host.logical_size
 
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
-        )
+        self.page_num = self.indexer_page_num
+        self.size_per_token = self.get_size_per_token()
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
@@ -118,28 +133,62 @@ class DSAIndexerPoolHost(HostKVCache):
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
-        draft_layer_num = self.layer_num - self.target_layer_num
-        if draft_layer_num > 0:
-            logger.info(
-                "Allocating %.2f GB host memory for DSA indexer (layout=%s), "
-                "packed MTP layers: "
-                "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                requested_bytes / 1e9,
-                layout,
-                self.target_layer_num,
-                draft_layer_num,
-                self.layer_num,
-            )
-        else:
-            logger.info(
-                "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-                requested_bytes / 1e9,
-                layout,
-            )
+        draft_layer_num = len(self.mtp_draft_device_pools)
+        logger.info(
+            "Allocating %.2f GB host memory for DSA indexer (layout=%s): "
+            "%d logical slots, page=%d, packed layers=%d "
+            "(target=%d, mtp_draft=%d, top-k reuse layers skipped=%d).",
+            requested_bytes / 1e9,
+            layout,
+            self.size,
+            self.page_size,
+            self.layer_num,
+            self.layer_num - (draft_layer_num - self._elided_draft_layer_num),
+            draft_layer_num - self._elided_draft_layer_num,
+            self.elided_layer_num,
+        )
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _init_packed_layers(self) -> None:
+        """Pack the target's owned index-K layers, then one layer per MTP draft pool.
+
+        ``_compact_layer`` maps the packed layer id the controller uses (the
+        device layer for the target, ``target_layer_num + depth`` for drafts)
+        to the host buffer layer; layers without a device index-K buffer are
+        absent from the map and are no-ops for load and backup.
+        """
+        self.target_layer_num = self._effective_host_layer_num()
+        self._compact_layer: dict[int, int] = {}
+        self.packed_device_index_buffers: list[torch.Tensor] = []
+        self.elided_layer_num = 0
+        self._elided_draft_layer_num = 0
+        pairs = [
+            (
+                self._host_layer_index(layer_id),
+                self.device_pool.index_k_with_scale_buffer[layer_id],
+            )
+            for layer_id in self._owned_device_layer_ids(self.device_pool)
+        ]
+        for depth, draft_pool in enumerate(self.mtp_draft_device_pools):
+            pairs.append(
+                (self.target_layer_num + depth, draft_pool.index_k_with_scale_buffer[0])
+            )
+        for packed_layer, buffer in pairs:
+            if buffer.shape[0] == 0:
+                self.elided_layer_num += 1
+                if packed_layer >= self.target_layer_num:
+                    self._elided_draft_layer_num += 1
+                continue
+            self._compact_layer[packed_layer] = len(self.packed_device_index_buffers)
+            self.packed_device_index_buffers.append(buffer)
+        self.layer_num = len(self.packed_device_index_buffers)
+
+    def _compact_host_layer(self, layer_id: int, is_draft: bool):
+        packed_layer = layer_id if is_draft else self._host_layer_index(layer_id)
+        return self._compact_layer.get(packed_layer)
 
     def get_size_per_token(self):
         return (
@@ -151,10 +200,6 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-        self.packed_device_index_buffers = [
-            buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
-        ]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
             dtype=torch.uint64,
@@ -249,7 +294,9 @@ class DSAIndexerPoolHost(HostKVCache):
             "load on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = self._compact_host_layer(layer_id, is_draft)
+        if host_layer_id is None:
+            return  # top-k reuse layer: no index-K on either side
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -314,7 +361,9 @@ class DSAIndexerPoolHost(HostKVCache):
             "backup on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = self._compact_host_layer(layer_id, is_draft)
+        if host_layer_id is None:
+            return  # top-k reuse layer: no index-K on either side
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
