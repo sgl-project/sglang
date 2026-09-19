@@ -1,8 +1,8 @@
 """
 AMD GSM8K Evaluation Test (Migrated from test/srt/nightly/)
 
-This test evaluates instruction-tuned models on the gsm8k benchmark using chat completions.
-Models are tested with various TP configurations on AMD GPUs.
+This test evaluates instruction-tuned models on the sgl-eval gsm8k benchmark using
+chat completions. Models are tested with various TP configurations on AMD GPUs.
 
 Registry: nightly-amd suite (2-GPU tests)
 """
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
@@ -34,7 +34,9 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
-    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
+    # Thresholds set at 5% below each model's published GSM8K (5-shot/CoT) score.
+    # sgl-eval grades zero-shot chat answers instead, so these gates are carried
+    # over unchanged and still need a nightly run to recalibrate against.
     # Llama 3.1 series
     "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
     "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
@@ -269,7 +271,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     metrics = None
                     for attempt in range(3):
                         try:
-                            metrics = run_eval(args)
+                            metrics = run_sgl_eval(args)
                             score = metrics["score"]
                             if threshold and score >= threshold:
                                 break

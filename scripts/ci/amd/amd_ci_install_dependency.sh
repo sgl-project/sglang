@@ -157,6 +157,11 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# Every accuracy gate grades through sgl-eval now, including the GSM8K-only jobs
+# that pass --skip-test-time-deps and the --skip-sglang-build jobs that never run
+# the `python[...]` install above. The `sglang[test]` extra pins the same version.
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "sgl-eval==0.1.0"
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
@@ -171,8 +176,8 @@ else
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
-  # every `sgl-eval run mmlu` dies with "Unsupported ANTLR version 4.7.2". Pin it
-  # back, the same way the CUDA installer does after its own lmms-eval install.
+  # every sgl-eval run dies with "Unsupported ANTLR version 4.7.2". Pin it back,
+  # the same way the CUDA installer does after its own lmms-eval install.
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
