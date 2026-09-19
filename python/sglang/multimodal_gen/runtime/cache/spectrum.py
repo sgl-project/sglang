@@ -370,17 +370,11 @@ class SpectrumMixin:
             self.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
         )
 
-    def reset_spectrum_state(self, spectrum_params: SpectrumParams) -> None:
-        self.spectrum_cnt = 0
-        self.spectrum_num_consecutive_cached_steps = 0
-        self.spectrum_curr_ws = spectrum_params.window_size
-        self.spectrum_forecaster = None
-        self.spectrum_is_cfg_negative = False
-        self.spectrum_real_steps = 0
-        self.spectrum_skipped_steps = 0
-        self.spectrum_shadow_rel_l2_sum = 0.0
-        self.spectrum_shadow_rel_l2_count = 0
-        if self._spectrum_supports_cfg_cache:
+    def _reset_spectrum_branch_state(
+        self, spectrum_params: SpectrumParams, *, is_cfg_negative: bool
+    ) -> None:
+        """Reset the schedule, forecaster, and stats owned by one CFG branch."""
+        if is_cfg_negative and self._spectrum_supports_cfg_cache:
             self.spectrum_cnt_negative = 0
             self.spectrum_num_consecutive_cached_steps_negative = 0
             self.spectrum_curr_ws_negative = spectrum_params.window_size
@@ -389,6 +383,23 @@ class SpectrumMixin:
             self.spectrum_skipped_steps_negative = 0
             self.spectrum_shadow_rel_l2_sum_negative = 0.0
             self.spectrum_shadow_rel_l2_count_negative = 0
+            return
+
+        self.spectrum_cnt = 0
+        self.spectrum_num_consecutive_cached_steps = 0
+        self.spectrum_curr_ws = spectrum_params.window_size
+        self.spectrum_forecaster = None
+        self.spectrum_real_steps = 0
+        self.spectrum_skipped_steps = 0
+        self.spectrum_shadow_rel_l2_sum = 0.0
+        self.spectrum_shadow_rel_l2_count = 0
+
+    def reset_spectrum_state(self, spectrum_params: SpectrumParams) -> None:
+        """Reset all Spectrum state for callers that need a full reset."""
+        self._reset_spectrum_branch_state(spectrum_params, is_cfg_negative=False)
+        if self._spectrum_supports_cfg_cache:
+            self._reset_spectrum_branch_state(spectrum_params, is_cfg_negative=True)
+        self.spectrum_is_cfg_negative = False
 
     def _get_spectrum_branch_state(self) -> tuple[int, int, float]:
         """Get schedule state for current branch (cond or uncond)."""
@@ -538,21 +549,21 @@ class SpectrumMixin:
             # Spectrum disabled — always run blocks (normal DiT path).
             return True
 
-        # Reset at the very first denoising step of each generation.
-        # Only the positive (or sole) branch triggers the reset so that:
-        # - single-branch models (FLUX, Hunyuan embedded guidance) reset once.
-        # - dual-branch models (Wan with true CFG) reset both counters from the
-        #   positive-branch call and leave the negative-branch call unaffected,
-        #   keeping both branches synchronised (both start at cnt=0 → cnt=1).
-        # Doing the reset here (not inside _get_spectrum_context) guarantees it
-        # fires exactly once per step, preventing the double-reset that would
-        # desync the two branches.
-        if ctx.current_step == 0 and not ctx.is_cfg_negative:
-            if ctx.debug:
+        # Reset the branch owned by this call at the first denoising step of each
+        # generation. This works both when dual CFG branches run serially on one
+        # model and when CFG parallel assigns one branch to each model instance.
+        # Models without separate CFG state keep the existing positive/sole-branch
+        # ownership so a shared counter cannot be reset twice.
+        if ctx.current_step == 0 and (
+            not ctx.is_cfg_negative or self._spectrum_supports_cfg_cache
+        ):
+            if ctx.debug and not ctx.is_cfg_negative:
                 logger.info(
                     "[Spectrum] Debug mode enables shadow-error validation; runtime perf is not representative of non-debug runs."
                 )
-            self.reset_spectrum_state(ctx.spectrum_params)
+            self._reset_spectrum_branch_state(
+                ctx.spectrum_params, is_cfg_negative=ctx.is_cfg_negative
+            )
 
         self.spectrum_is_cfg_negative = ctx.is_cfg_negative
         params = ctx.spectrum_params
