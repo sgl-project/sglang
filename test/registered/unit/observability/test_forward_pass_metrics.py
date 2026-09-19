@@ -345,6 +345,7 @@ class TestIdleMetrics(unittest.TestCase):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
             waiting_queue=[],
+            chunked_req=None,
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,

@@ -57,18 +57,35 @@ class QueueCount:
 
     total: int = 0
     by_priority: Optional[Dict[int, int]] = None
+    # Requests retracted from decode (KV pressure) waiting to resume.
+    num_retracted: int = 0
 
     @classmethod
-    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+    def from_reqs(
+        cls,
+        reqs: List[Req],
+        enable_priority_scheduling: bool = False,
+        count_retracted: bool = False,
+    ):
         # NOTE: If requests have priority=None (no --default-priority-value set),
         # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
         # Set --default-priority-value when enabling priority scheduling to avoid this.
-        by_priority = (
-            dict(Counter(req.priority for req in reqs))
-            if enable_priority_scheduling
-            else None
+        if not enable_priority_scheduling and not count_retracted:
+            return cls(total=len(reqs))
+        by_priority: Optional[Counter] = (
+            Counter() if enable_priority_scheduling else None
         )
-        return cls(total=len(reqs), by_priority=by_priority)
+        num_retracted = 0
+        for req in reqs:
+            if by_priority is not None:
+                by_priority[req.priority] += 1
+            if count_retracted and req.is_retracted:
+                num_retracted += 1
+        return cls(
+            total=len(reqs),
+            by_priority=dict(by_priority) if by_priority is not None else None,
+            num_retracted=num_retracted,
+        )
 
 
 @dataclass
@@ -77,6 +94,20 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
+    # Split of the waiting queue by what a request is waiting for.
+    # prefill_queue_depth: never-prefilled requests waiting for their first prefill.
+    # decode_queue_depth:  retracted requests (evicted mid-decode under KV pressure)
+    #                      waiting to be re-prefilled and resume decoding.
+    # Invariant (non-PD): prefill_queue_depth + decode_queue_depth == num_queue_reqs.total
+    # PD mode keeps the same contract: prefill counts bootstrap + waiting (the
+    # inflight queue is post-prefill KV transfer and is excluded); decode
+    # counts retracted_queue + held_rebootstrap_reqs + in-flight rebootstraps
+    # (DecodeRequest.is_rebootstrap) in the prealloc/transfer queues + restored
+    # retractions still queued (retracted_stain / pd_rebootstrap_in_progress).
+    prefill_queue_depth: int = 0
+    decode_queue_depth: int = 0
+    # 1 while a chunked prefill is in progress (scheduler.chunked_req is set), else 0.
+    num_prefill_inflight_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
@@ -291,6 +322,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prefill_queue_depth = Gauge(
+            name="sglang:prefill_queue_depth",
+            documentation="The number of waiting requests that have not been prefilled yet (waiting for a prefill slot).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_queue_depth = Gauge(
+            name="sglang:decode_queue_depth",
+            documentation="The number of waiting requests that were retracted from decode (KV pressure) and are waiting to resume.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_prefill_inflight_reqs = Gauge(
+            name="sglang:num_prefill_inflight_reqs",
+            documentation="The number of requests with a chunked prefill in progress (0 or 1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1368,6 +1417,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
+        self._log_gauge(self.prefill_queue_depth, stats.prefill_queue_depth)
+        self._log_gauge(self.decode_queue_depth, stats.decode_queue_depth)
+        self._log_gauge(self.num_prefill_inflight_reqs, stats.num_prefill_inflight_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
