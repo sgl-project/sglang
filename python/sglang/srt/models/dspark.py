@@ -25,6 +25,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -501,6 +502,45 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        self._glm_dspark_quarot_config = None
+        if (
+            is_npu()
+            and not self.is_nemotron_35_draft
+            and envs.SGLANG_NPU_GLM_DSPARK_QUAROT.get()
+        ):
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                get_glm_dspark_quarot_config,
+            )
+
+            self._glm_dspark_quarot_config = get_glm_dspark_quarot_config()
+        if self._glm_dspark_quarot_config is not None:
+            if quant_config is not None:
+                raise ValueError(
+                    "GLM DSpark QuaRot original mode requires an unquantized draft."
+                )
+            if int(config.hidden_size) != self._glm_dspark_quarot_config.hidden_size:
+                raise ValueError("GLM DSpark QuaRot target/draft hidden sizes differ.")
+            from sglang.srt.layers.vocab_parallel_embedding import (
+                ParallelLMHead,
+                VocabParallelEmbedding,
+                get_embedding_tp_kwargs,
+            )
+
+            # Construct inside the draft's existing dtype/device/TP scope so
+            # normal loading, postprocessing and KV budgeting see both tables.
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=f"{prefix}.embed_tokens" if prefix else "embed_tokens",
+                **get_embedding_tp_kwargs(),
+            )
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+            )
+            self.uses_own_vocab_modules = True
+            self._glm_dspark_quarot_weights_loaded = False
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
         # target's ``num_nextn_predict_layers`` (>0) on the config; without this
@@ -552,8 +592,29 @@ class DSparkDraftMixin:
         confidence_weights = []
         backbone_weights = []
         params_dict = dict(self.named_parameters())
+        quarot_config = self._glm_dspark_quarot_config
+        quarot_loaded = set()
         for name, loaded_weight in weights:
             normalized_name = name.removeprefix("model.")
+            if quarot_config is not None:
+                if normalized_name in ("embed_tokens.weight", "lm_head.weight"):
+                    param = params_dict[normalized_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    quarot_loaded.add(normalized_name)
+                    continue
+                if normalized_name in ("fc.weight", "encoder.fc.weight"):
+                    from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                        fold_glm_dspark_fc,
+                    )
+
+                    # Always convert the newly received original weight, never
+                    # the already converted Parameter (including on reload).
+                    loaded_weight = fold_glm_dspark_fc(loaded_weight, quarot_config)
+                    name = "fc.weight"
+                    quarot_loaded.add(name)
             if any(
                 normalized_name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES
             ):
@@ -571,6 +632,18 @@ class DSparkDraftMixin:
             else:
                 backbone_weights.append((name, loaded_weight))
 
+        if quarot_config is not None and not self._glm_dspark_quarot_weights_loaded:
+            missing = {
+                "embed_tokens.weight",
+                "lm_head.weight",
+                "fc.weight",
+            } - quarot_loaded
+            if missing:
+                raise ValueError(
+                    "GLM DSpark QuaRot original mode is missing checkpoint weights: "
+                    + ", ".join(sorted(missing))
+                )
+
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:
@@ -586,6 +659,8 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if quarot_config is not None:
+            self._glm_dspark_quarot_weights_loaded = True
 
     def _load_confidence_weights(
         self,
