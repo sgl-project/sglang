@@ -161,6 +161,21 @@ def validate_gdn_mis_backend(prefill_backend: LinearAttnKernelBackend) -> None:
         raise ValueError("GDN multi-item scoring does not support page-major layout")
 
 
+
+def _store_tracked_conv_states(
+    conv_states: torch.Tensor,
+    state_indices: torch.Tensor,
+    tracked_mixed_qkv: torch.Tensor,
+) -> None:
+    """Store a GDN conv snapshot in the cache's configured dtype.
+
+    The conv cache may intentionally use a dtype different from the runtime
+    activation dtype (for example, through SGLANG_MAMBA_CONV_DTYPE). Indexed
+    assignment does not perform this conversion, so normalize at this boundary.
+    """
+    conv_states[state_indices] = tracked_mixed_qkv.to(dtype=conv_states.dtype)
+
+
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -908,8 +923,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                _store_tracked_conv_states(
+                    conv_states,
+                    forward_metadata.conv_states_mask_indices,
+                    mixed_qkv_to_track,
                 )
 
             mixed_qkv = causal_conv1d_fn(
