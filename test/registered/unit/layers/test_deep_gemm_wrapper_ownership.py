@@ -29,7 +29,9 @@ except Exception:
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 @unittest.skipUnless(_HAS_WRAPPER, "sgl-deep-gemm wrapper unavailable")
 class TestDeepGemmWrapperOwnership(CustomTestCase):
-    def _assert_output_survives_input_free(self, input_factory, make_out, expected_value):
+    def _assert_output_survives_input_free(
+        self, input_factory, make_out, expected_value
+    ):
         # input_factory keeps exactly one reference alive inside this frame,
         # mirroring callers that rebind the result over their only reference.
         sf = input_factory()
@@ -59,10 +61,17 @@ class TestDeepGemmWrapperOwnership(CustomTestCase):
         # path, which returns the input itself (an alias). The wrapper must
         # return the input object rather than the alias.
         self._assert_output_survives_input_free(
-            lambda: torch.full((1, 128, 40), 0.0005, device="cuda", dtype=torch.float32),
+            lambda: torch.full(
+                (1, 128, 40), 0.0005, device="cuda", dtype=torch.float32
+            ),
             lambda sf: deep_gemm_wrapper.transform_sf_into_required_layout(
-                sf, 16384, 5120, (1, 128, 128),
-                num_groups=1, is_sfa=False, disable_ue8m0_cast=True,
+                sf,
+                16384,
+                5120,
+                (1, 128, 128),
+                num_groups=1,
+                is_sfa=False,
+                disable_ue8m0_cast=True,
             ),
             0.0005,
         )

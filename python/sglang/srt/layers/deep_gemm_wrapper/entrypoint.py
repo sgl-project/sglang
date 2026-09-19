@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
     from deep_gemm import (
         transform_sf_into_required_layout as _transform_sf_into_required_layout,
+    )
+    from deep_gemm.utils.layout import (
+        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
     )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
