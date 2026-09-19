@@ -227,28 +227,7 @@ class DSANPUIndexerMixin:
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                get_attn_backend().forward_metadata.actual_seq_lengths_q = (
-                    forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
-                    forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
-                )
-                if sum(forward_batch.extend_prefix_lens_cpu) > 0:
-                    total_kv_len_prev_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_prev_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
-                    )
-                    total_kv_len_next_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_next_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
-                    )
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
-                        total_kv_len_prev_tensor,
-                        total_kv_len_next_tensor,
-                    )
-                else:
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
-                        forward_batch.attn_cp_metadata.kv_len_prev_tensor,
-                        forward_batch.attn_cp_metadata.kv_len_next_tensor,
-                    )
+                # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
@@ -301,7 +280,7 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            block_table = block_table[: actual_seq_lengths_q[0].numel()]
+            block_table = block_table[: actual_seq_lengths_q.numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -370,26 +349,19 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_kv,
         block_table,
     ):
-        q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
-        weights_prev, weights_next = None, None
+        # V2: Q is local (sharded); single indexer call against full KV.
         if indexer_weights is not None:
-            weights_prev, weights_next = torch.split(
-                indexer_weights, (indexer_weights.size(0) + 1) // 2, dim=0
+            indexer_weights = indexer_weights.contiguous().view(
+                -1, indexer_weights.shape[-1]
             )
-            weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
-            weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
-
-        actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-
-        topk_indices_prev = torch_npu.npu_lightning_indexer(
-            query=q_prev,
+        topk_indices = torch_npu.npu_lightning_indexer(
+            query=q,
             key=past_key_states,
-            weights=weights_prev,
-            actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+            weights=indexer_weights,
+            actual_seq_lengths_query=actual_seq_lengths_q.to(
                 device=q.device, dtype=torch.int32
             ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+            actual_seq_lengths_key=actual_seq_lengths_kv.to(
                 device=q.device, dtype=torch.int32
             ),
             block_table=block_table,
@@ -398,23 +370,7 @@ class DSANPUIndexerMixin:
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        topk_indices_next = torch_npu.npu_lightning_indexer(
-            query=q_next,
-            key=past_key_states,
-            weights=weights_next,
-            actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
-        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+        return topk_indices[0].squeeze(1)
 
 
 def scattered_to_tp_attn_full(
