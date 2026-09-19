@@ -489,6 +489,10 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Log one metadata-only line per host-pool KV transfer (device <-> host).
+    # Attributing an asynchronous CUDA fault to the transfer that caused it is
+    # otherwise guesswork: the failing copy returns before the error surfaces.
+    SGLANG_DEBUG_HOST_POOL_IO = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
