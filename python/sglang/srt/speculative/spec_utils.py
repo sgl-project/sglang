@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -920,7 +921,7 @@ def commit_mamba_states_after_verify(
     mamba_pool = getattr(req_pool, "mamba_pool", None)
     bs = accept_lens.shape[0]
     source_indices_raw = (
-        batch.req_pool_indices[:bs] if envs.SGLANG_ENABLE_PP_SPEC.get() else None
+        batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
     # Fold-every-commit: replay the accepted prefix from the ring into

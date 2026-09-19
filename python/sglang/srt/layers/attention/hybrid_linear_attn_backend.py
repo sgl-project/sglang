@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
 from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -361,7 +362,7 @@ class MambaAttnBackendBase(AttentionBackend):
         reads. Padded rows share the scratch pool's dedicated discard row.
         """
         intermediate_state_indices = self.verify_intermediate_state_indices
-        if not envs.SGLANG_ENABLE_PP_SPEC.get():
+        if not pp_spec_stable_rows_enabled():
             return intermediate_state_indices
 
         req_rows = forward_batch.req_pool_indices[: query_start_loc.shape[0] - 1]
@@ -1380,7 +1381,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         """
         request_number = last_correct_step_indices.shape[0]
         source_indices_tensor = None
-        if envs.SGLANG_ENABLE_PP_SPEC.get() and req_pool_indices is not None:
+        if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
             # PP target-verify writes scratch by stable request-pool row so it
             # survives other in-flight micro-batches until acceptance relays
             # back.  Commit must read those same rows, not positional 0..bs-1.

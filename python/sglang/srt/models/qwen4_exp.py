@@ -39,6 +39,7 @@ from sglang.srt.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -352,7 +353,7 @@ def _ple_verify_scratch_indices(
     batch: _PLEBatch, forward_batch: ForwardBatch
 ) -> Optional[torch.Tensor]:
     """Stable PP rows for PLE snapshots consumed after a delayed accept relay."""
-    if not envs.SGLANG_ENABLE_PP_SPEC.get():
+    if not pp_spec_stable_rows_enabled():
         return None
     pool = get_req_to_token_pool()
     req_rows = forward_batch.req_pool_indices[: batch.lengths.shape[0]]

@@ -15,6 +15,7 @@ from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -605,7 +606,7 @@ class SchedulerPPMixin:
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
+            pp_spec_stable_rows_enabled()
             and self.ps.pp_size > 1
             and not self.spec_algorithm.is_none()
         )

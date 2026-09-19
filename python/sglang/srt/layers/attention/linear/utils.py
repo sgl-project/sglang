@@ -5,11 +5,16 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
     pass
+
+
+def pp_spec_stable_rows_enabled() -> bool:
+    return envs.SGLANG_ENABLE_PP_SPEC.get()
 
 
 class LinearAttnKernelBackend(Enum):

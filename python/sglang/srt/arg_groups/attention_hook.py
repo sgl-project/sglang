@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -277,7 +278,7 @@ def handle_linear_attn_backend(server_args: Any):
     if verify is None and decode == "flashinfer":
         verify = "flashinfer"
     if (
-        envs.SGLANG_ENABLE_PP_SPEC.get()
+        pp_spec_stable_rows_enabled()
         and verify == "flashinfer"
         and uses_kda_attention(model_config_of(server_args).hf_config)
     ):

@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -1017,7 +1018,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     intermediate_state_indices=intermediate_state_indices,
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
-                    stable_rows=envs.SGLANG_ENABLE_PP_SPEC.get(),
+                    stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
