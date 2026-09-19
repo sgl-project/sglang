@@ -84,6 +84,28 @@ python -m sglang.launch_server \
   --hicache-storage-backend-extra-config '{"meta_service_url":"tcp://127.0.0.1:5000", "config_store_url":"tcp://127.0.0.1:6000", "log_level":"info", "world_size":256, "protocol": "device_sdma", "dram_size": "1GB"}'
 ```
 
+DeepSeek-V4 must use `page_first_direct`: its logical FULL anchor and independently
+paged C4/C128 host pools do not implement the generic MLA
+`page_first_kv_split` layout. Set `--hicache-mem-layout page_first_direct`
+explicitly for DeepSeek-V4.
+
+For DeepSeek-V4 L1/L2/L3 caching, use `--hicache-host-memory-mode cache`
+(the default), `--hicache-mem-layout page_first_direct`, and
+`--hicache-storage-backend npu_memcache`. `buffer_only` mode does not support
+the C128 component. For an L3 replay check, use `write_through` with
+`--hicache-storage-prefetch-policy wait_complete`, wait for outstanding backups,
+then flush L1/L2 without clearing the storage backend. Compare against a repeated
+resident-cache run at the same cached-prefix boundary, not against cold prefill.
+
+DSV4 keeps the default NPU-pinned Host pools and passes their buffers directly
+to MemCache without CPU staging. On A3, `device_rdma` requires the MemFabric
+Host/HBM classification fix: unpatched 1.1.4 and 1.2.0 misclassify pinned Host
+addresses and fail RDMA registration. Testing currently uses a locally patched
+1.1.4 build; pinned RDMA model end-to-end validation is still pending. Both device
+transports defer initialization until the first backup; metadata-only clear remains available
+before that point. The external MemCache services must have usable Holder
+capacity before starting the test; a healthy Meta endpoint alone is insufficient.
+
 Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
 
 | Key | Type | Required | Default | Valid range | Description |
