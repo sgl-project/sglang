@@ -28,7 +28,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -320,7 +319,9 @@ class KVCacheConfigurator:
             quant_name,
             num_layers=num_layers,
             device=self.device,
+            page_size=self.page_size,
         )
+        quant_method.configure_attention_backends_from_server_args(self.server_args)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
@@ -866,32 +867,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        if get_disagg().disaggregation_mode == "decode":
-            # A decode node hands out request rows to PREALLOCATED transfers on
-            # top of its running set, so it needs the extra-slot pool (and the
-            # `pre_alloc_size` the scheduler's invariant checker reads). Mirrors
-            # `_build_req_to_token_pool`'s decode branch; the mamba composite
-            # already takes `decode_pre_alloc_size` the same way.
-            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
-
-            req_to_token_pool = DecodeReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-                pre_alloc_size=get_disagg().disaggregation_decode_extra_slots,
-            )
-        else:
-            req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-            )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -2219,8 +2195,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_parallel().launch_world_size > 1,
+            cpu_group=get_parallel().world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2315,7 +2291,7 @@ class KVCacheConfigurator:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_parallel().world_group.cpu_group,
             )
             token_capacity = tensor.item()
 
@@ -2444,7 +2420,9 @@ class KVCacheConfigurator:
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
-                        self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                        self.model_config.num_hidden_layers,
+                        rank,
+                        self.ps.pp_size,
                     )
                     for rank in range(self.ps.pp_size)
                 )

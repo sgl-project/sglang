@@ -272,8 +272,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 return_value=object(),
             ),
             patch(
-                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
-                return_value=SimpleNamespace(device_group=object()),
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
             ),
         ):
             mega_moe._run_mega_routed(
@@ -325,8 +327,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),
             patch(
-                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
-                return_value=SimpleNamespace(device_group=object()),
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
             ),
         ):
             out = mega_moe.run_mega_routed_experts(

@@ -227,10 +227,10 @@ class TestChatTemplateCache(CustomTestCase):
 
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
         first = self._render()
-        first[1].append(99)
+        first[0].append(99)
         second = self._render()
 
-        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.assertEqual(second, ([11, 12], "decoded"))
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
@@ -292,6 +292,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.tokenizer.reset_mock()
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(

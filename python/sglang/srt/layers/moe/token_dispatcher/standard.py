@@ -4,9 +4,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import (
-    get_tp_group,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -153,7 +150,7 @@ class StandardDispatcher(BaseDispatcher):
 
             # Quantize before comm, swizzle after.
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 if hidden_states.shape[0] > 0:
                     x, x_sf = fp4_quantize_flashinfer(
@@ -167,7 +164,7 @@ class StandardDispatcher(BaseDispatcher):
                     x_sf = torch.zeros(
                         0, x_col // 16, dtype=torch.uint8, device=hidden_states.device
                     )
-            topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
+            topk_weights, topk_ids, x, x_sf = get_parallel().tp_group.all_gatherv(
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
             # TODO: fuse into cutlass moe
@@ -251,10 +248,10 @@ class StandardDispatcher(BaseDispatcher):
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),

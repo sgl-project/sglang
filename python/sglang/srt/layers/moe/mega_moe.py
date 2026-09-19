@@ -270,9 +270,9 @@ def run_mega_routed_experts(
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
 
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+    from sglang.srt.runtime_context import get_parallel
 
-    ep_group = get_moe_ep_group().device_group
+    ep_group = get_parallel().moe_ep_group.device_group
     num_experts = experts.num_experts
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()

@@ -483,6 +483,19 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _require_single_row_dsv4_swa_pages(
+    *, logical_page_size: int, physical_page_size: int, consumer: str
+) -> None:
+    """Reject consumers that cannot map one logical SWA page to many rows."""
+    if logical_page_size != physical_page_size:
+        raise ValueError(
+            f"{consumer} does not support the DeepSeek-V4 direct SWA KV layout "
+            f"({logical_page_size}-token logical pages stored as "
+            f"{physical_page_size}-token physical rows). Disable "
+            "SGLANG_OPT_SM120_DIRECT_SWA_KV for this configuration."
+        )
+
+
 def _dsv4_page_aligned_only(pool: Any) -> bool:
     """Whether a pool may only move whole pages: the token-granular copy
     (``transfer_cache_dsv4_mla``) hardcodes the V4 data/scale row split."""
@@ -743,6 +756,11 @@ def build_deepseek_v4_hicache_stack(
         # Unified KV and encoder replay rebuild SWA state; keep it out of host cache.
         swa_layer_mapping = {}
     else:
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=kvcache.swa_page_size,
+            physical_page_size=kvcache.swa_kv_pool.page_size,
+            consumer="DeepSeek-V4 HiCache",
+        )
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
@@ -1431,6 +1449,11 @@ def build_swa_draft_pools(
     target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=target_swa_host_pool.slot_page_size,
+            physical_page_size=draft_swa_pool.page_size,
+            consumer="DeepSeek-V4 MTP SWA HiCache sidecar",
+        )
         host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DRAFT_SWA),
             device_buffers=draft_swa_pool.kv_buffer,

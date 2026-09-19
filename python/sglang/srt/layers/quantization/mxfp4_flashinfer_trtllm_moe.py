@@ -7,7 +7,6 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -15,6 +14,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -416,9 +416,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
         symm_output = None
-        if not defer_finalize:
+        # Preserve the ordinary output shape in the medium-batch autotuner
+        # cache key. The deferred ABI ignores this allocation and returns the
+        # expanded GEMM output for the separate fused finalize epilogue.
+        if not defer_finalize or 96 < num_tokens <= 384:
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 out_hidden_size = (
                     x_quant.shape[-1] * 2
@@ -519,21 +522,43 @@ def maybe_fuse_routed_scale_and_shared_add(
 # Fused finalize + shared add + TP all-reduce
 _fused_finalize_all_reduce_world_size: Optional[int] = None
 _fused_finalize_all_reduce_probed = False
+_fused_finalize_all_reduce_comm = None
 
 
 def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
+    """Reserve a separate push plane for up to 384 rows of fused MoE output."""
     global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
+    global _fused_finalize_all_reduce_comm
     if not _fused_finalize_all_reduce_probed:
+        # The eager warmup must initialize peer workspaces before capture.
+        if torch.cuda.is_current_stream_capturing():
+            return None
         _fused_finalize_all_reduce_probed = True
         from sglang.kernels.ops.communication import all_reduce_fusion
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
             CustomAllReduceV2,
         )
 
-        ca_comm = get_tp_group().ca_comm
+        ca_comm = get_parallel().tp_group.ca_comm
         if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-            all_reduce_fusion.register_comm(ca_comm.obj)
-            _fused_finalize_all_reduce_world_size = ca_comm.world_size
+            fused_comm = ca_comm
+            if ca_comm.world_size == 4:
+                from sglang.kernels.ops.communication.mp import register_comm_cleanup
+
+                fused_comm = CustomAllReduceV2(
+                    ca_comm.group,
+                    ca_comm.device,
+                    max_pull_size=0,
+                    max_pull_blocks=0,
+                    max_push_size=4 * 1024 * 1024,
+                    max_push_blocks=512,
+                )
+                register_comm_cleanup(fused_comm)
+            if fused_comm.disabled:
+                return None
+            _fused_finalize_all_reduce_comm = fused_comm
+            all_reduce_fusion.register_comm(fused_comm.obj)
+            _fused_finalize_all_reduce_world_size = fused_comm.world_size
         else:
             log_info_on_rank0(
                 logger,
@@ -556,16 +581,20 @@ def should_use_fuse_finalize_all_reduce(
         return False
     if num_tokens <= 0:
         return False
+    if num_tokens > 96:
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if is_batch_invariant_mode_enabled():
+            return False
     from sglang.kernels.ops.communication import all_reduce_fusion
 
     if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
         return False
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
         return False
-    # one push phase counter per row (the plane has num_sm of them)
-    if num_tokens > tp_group.ca_comm.config.num_push_blocks:
+    comm = _fused_finalize_all_reduce_comm
+    # Each token row owns a push phase counter on the epilogue's plane.
+    if num_tokens > comm.config.num_push_blocks:
         return False
-    return all_reduce_fusion.fits_push_slot(
-        tp_group.ca_comm.max_push_size, num_tokens, hidden_dim
-    )
+    return all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
