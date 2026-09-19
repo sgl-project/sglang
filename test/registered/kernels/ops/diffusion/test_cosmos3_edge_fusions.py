@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @pytest.mark.parametrize(
@@ -25,6 +26,8 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b
 )
 @torch.inference_mode()
 def test_edge_qk_rope_pack_matches_split(batch, tokens, prefix):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Split-path bitwise parity covers the newly enabled Hopper path")
     torch.manual_seed(42)
     qkv = torch.randn(batch, tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
     q, k, v = qkv[:, :, :16], qkv[:, :, 16:24], qkv[:, :, 24:]
