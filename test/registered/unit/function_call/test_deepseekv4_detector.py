@@ -309,32 +309,54 @@ class TestDeepSeekV4NonStreamingLeak(CustomTestCase):
         self.assertNotIn(DSML, result.normal_text)
         self.assertIn("marker.", result.normal_text)
 
-    def test_streaming_still_emits_a_malformed_opener_as_content(self):
-        """Known limitation: the streaming path is not covered by this fix.
+    def test_streaming_strips_a_malformed_opener(self):
+        """Streaming must not emit a mangled opener as content either.
 
-        Observed against a live server. The model emitted
+        Observed against a live server: the model emitted
         `<｜DSML｜tool_calls|` (ASCII pipe, no closing `>`) before a valid
-        invoke. Non-streaming strips it; the streaming path has no
-        equivalent strip, so it still reaches `delta.content`. Recorded
-        here so the asymmetry is visible rather than surprising, and so
-        the test starts failing if the streaming path is ever fixed.
+        invoke. `preamble` is built by backing up over a well-formed
+        `bot_token`, which does not match the mangled form, so it used to
+        reach `delta.content`.
         """
-        detector = DeepSeekV4Detector()
         text = (
             f"<{DSML}tool_calls|\n"
             + _invoke("get_weather", _param("city", "true", "SF"))
             + f"\n</{DSML}tool_calls>"
         )
+        for size in (1, 8, len(text)):
+            with self.subTest(chunk=size):
+                detector = DeepSeekV4Detector()
+                normal, names = "", []
+                for start in range(0, len(text), size):
+                    result = detector.parse_streaming_increment(
+                        text[start : start + size], self.tools
+                    )
+                    normal += result.normal_text
+                    names += [c.name for c in result.calls if c.name]
+
+                self.assertNotIn(DSML, normal)
+                self.assertEqual(names, ["get_weather"])
+
+        # The non-streaming path agrees.
+        self.assertNotIn(DSML, self._parse(text).normal_text)
+
+    def test_streaming_strip_keeps_prose_containing_angle_brackets(self):
+        """A mangled marker must consume the tag only, never the sentence."""
+        text = (
+            f"Before. <{DSML}tool_calls| 5 > 3 After.\n"
+            + _invoke("get_weather", _param("city", "true", "SF"))
+            + f"\n</{DSML}tool_calls>"
+        )
+        detector = DeepSeekV4Detector()
         normal = ""
         for start in range(0, len(text), 8):
             normal += detector.parse_streaming_increment(
                 text[start : start + 8], self.tools
             ).normal_text
 
-        # Non-streaming removes it.
-        self.assertNotIn(DSML, self._parse(text).normal_text)
-        # Streaming does not, yet.
-        self.assertIn(DSML, normal)
+        self.assertNotIn(DSML, normal)
+        self.assertIn("Before.", normal)
+        self.assertIn("5 > 3 After.", normal)
 
 
 class TestDeepSeekV32SharesTheFix(CustomTestCase):

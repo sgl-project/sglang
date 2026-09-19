@@ -115,15 +115,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
         ]
         self.current_tool_id = -1
         # Any DSML tag, so leftovers never reach user-visible content.
-        # Escaped because subclasses may override the marker. The closing
-        # `>` is optional: a model can emit a truncated or malformed tag
-        # (e.g. `<｜DSML｜tool_calls|`), and that must be stripped too.
-        # The leading `<` and trailing `>` are both optional: the marker is
-        # a single special token, so a model can emit it truncated or
-        # mangled (e.g. `<｜DSML｜tool_calls|`, seen from a live server).
-        # Any occurrence is model markup rather than prose, so remove it.
+        # Escaped because subclasses may override the marker. The marker is a
+        # single special token, so any occurrence is model markup rather than
+        # prose: the leading `<` and the trailing `>` are both optional, since
+        # a model can emit a truncated or mangled tag such as
+        # `<｜DSML｜tool_calls|` (seen from a live server).
+        #
+        # The tag body is matched tag-shaped (a name plus optional
+        # `attr="value"` pairs) rather than "anything up to the next `>`", so a
+        # mangled marker mid-sentence can only ever consume the tag itself and
+        # never the surrounding prose (e.g. `5 > 3` after it must survive).
         self.residual_markup_regex = (
-            rf"<?/?{re.escape(self.dsml_token)}(?:[^>\n]*>|\w*\|?)?"
+            rf"<?/?{re.escape(self.dsml_token)}"
+            rf'(?:\w*(?:\s+\w+="[^"\n]*")*\s*/?>|\w*\|?)?'
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -434,7 +438,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text=preamble, calls=all_calls)
+            return StreamingParseResult(
+                normal_text=self._strip_residual_markup(preamble), calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")

@@ -4625,9 +4625,9 @@ class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
     def test_streaming_sse_body_is_clean(self):
         """The SSE stream must not carry DSML either.
 
-        The streaming path is not modified by this change; this pins the
-        behaviour so a future change to the shared detector cannot start
-        leaking markup into `delta.content`.
+        Covers the mangled-opener shape seen from a live server
+        (`<｜DSML｜tool_calls|`), which the streaming preamble used to emit
+        as content, alongside the well-formed shapes.
         """
         from fastapi import FastAPI
         from starlette.testclient import TestClient
@@ -4699,6 +4699,9 @@ class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
             "bare invoke": f"Let me check.\n\n{invoke}",
             "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
             "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+            "mangled opener": (
+                f"<{self.DSML}tool_calls|\n{invoke}\n</{self.DSML}tool_calls>"
+            ),
         }
         for label, text in cases.items():
             with self.subTest(payload=label):
