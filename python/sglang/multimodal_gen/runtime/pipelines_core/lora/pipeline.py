@@ -459,6 +459,15 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count_critic,
             )
 
+        # The wrappers replaced quantized linears; FP8 fused fast paths decided
+        # against the raw modules are stale and would read quant attributes
+        # (input_scale/quant_method) off the wrappers. Let each DiT recheck.
+        for module_name in ("transformer", "transformer_2"):
+            module = self.modules.get(module_name)
+            revalidate = getattr(module, "revalidate_fp8_fast_paths", None)
+            if callable(revalidate):
+                revalidate()
+
     def _normalize_lora_params(
         self,
         lora_nickname: str | list[str],
