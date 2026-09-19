@@ -102,6 +102,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return False
 
+    def reclaims_full_for_prealloc(self) -> bool:
+        """Whether reclaim_for_prealloc also reclaims FULL capacity.
+
+        False means the caller still owns full-page eviction. This does not
+        imply that the allocator implements reclaim_for_prealloc.
+        """
+        return False
+
     def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
         """Whether a demand this size could EVER be preallocated, or None when
         this pool has no ceiling of its own and the caller's token capacity is
