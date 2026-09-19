@@ -801,7 +801,6 @@ class Scheduler(
     ) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
             server_args=self.server_args,
-            ps=self.ps,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
@@ -2331,7 +2330,6 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
-            ps=self.ps,
             tp_group=self.tp_group,
             tp_cpu_group=self.tp_cpu_group,
             attn_tp_group=self.attn_tp_group,
@@ -2420,10 +2418,9 @@ class Scheduler(
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
             kv_events_config=get_observability().kv_events_config,
-            ps=self.ps,
             attn_tp_rank=get_parallel().attn_tp_rank,
             attn_cp_rank=get_parallel().attn_cp_rank,
-            attn_dp_rank=self.ps.attn_dp_rank,
+            attn_dp_rank=get_parallel().attn_dp_rank,
             dp_rank=get_parallel().dp_rank,
             tree_cache=self.tree_cache,
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
@@ -2439,7 +2436,6 @@ class Scheduler(
         # instead of walking the queues itself.
         self.load_publisher = SchedulerLoadPublisher(
             kv_events_config=get_observability().kv_events_config,
-            ps=self.ps,
             load_publish_endpoint=get_observability().load_publish_endpoint,
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
