@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 mp.set_start_method("spawn", force=True)
 
+from sglang.benchmark.deepseek_utils import get_weight_shapes
 from sglang.kernels.ops.quantization.fp8_kernel import (
     _w8a8_block_fp8_matmul,
     _w8a8_block_fp8_matmul_unrolledx4,
@@ -190,39 +191,6 @@ def get_configs_compute_bound():
                                     }
                                 )
     return configs
-
-
-def get_weight_shapes(tp_size):
-    # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.
-    # cannot TP
-    total = [
-        (512 + 64, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (7168, 16384),
-        (7168, 18432),
-    ]
-    # N can TP
-    n_tp = [
-        (18432 * 2, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (24576, 1536),
-        (4096, 7168),
-    ]
-    # K can TP
-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
-
-    weight_shapes = []
-    for t in total:
-        weight_shapes.append(t)
-    for n_t in n_tp:
-        new_t = (n_t[0] // tp_size, n_t[1])
-        weight_shapes.append(new_t)
-    for k_t in k_tp:
-        new_t = (k_t[0], k_t[1] // tp_size)
-        weight_shapes.append(new_t)
-    return weight_shapes
 
 
 def benchmark_config(
