@@ -7,6 +7,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -142,6 +143,82 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(match_len(self.cache, [7, 8, 9]), 0)
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)
+
+
+class TestSessionTerminalLeaf(CustomTestCase):
+    def test_empty_terminal_insert_preserves_prior_hybrid_session_leaf(self):
+        import test_unified_radix_cache_unittest as native
+
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
+
+        cases = (
+            ("missing_checkpoint", True, None, True, False, False),
+            ("zero_checkpoint", True, 0, True, False, False),
+            ("new_checkpoint", True, 256, True, False, False),
+            ("no_prefix", False, None, True, False, False),
+            ("aborted", True, None, True, True, False),
+            ("no_insert", True, None, False, False, False),
+            ("stale_generation", True, None, True, False, True),
+        )
+        for name, prior, checkpoint, insert_tail, aborted, stale in cases:
+            with (
+                self.subTest(case=name),
+                patch.object(native, "_TREE_CORE_TEST_BACKEND", "python"),
+            ):
+                cfg = native.CacheConfig(
+                    components=(ComponentType.FULL, ComponentType.MAMBA),
+                    page_size=64,
+                    kv_size=2048,
+                    max_context_len=1024,
+                    enable_mamba_extra_buffer=True,
+                    mamba_cache_size=60,
+                )
+                cache, allocator, pool = native.build_fixture(
+                    cfg, enable_session_radix_cache=True
+                )
+                helper = native.UnifiedRadixCacheSuite()
+                helper.cfg = cfg
+                tokens = array("q", range(256))
+                if prior:
+                    helper._insert(cache, allocator, pool, tokens)
+                req = helper._make_req(pool)
+                match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+                helper._apply_match_to_req(req, match)
+                cache.inc_lock_ref(req.last_node)
+                req.kv.cache_protected_len = len(match.device_indices)
+                req.origin_input_ids = tokens
+                req.output_ids = array("q", range(2000, 2008))
+                length = len(tokens) + len(req.output_ids)
+                suffix = helper._alloc(allocator, length - len(match.device_indices))
+                indices = torch.cat([match.device_indices, suffix])
+                pool.write((req.kv.req_pool_idx, slice(0, length)), indices)
+                req.kv.kv_committed_len = req.kv.kv_allocated_len = length
+                req.full_untruncated_fill_ids = tokens + req.output_ids
+                req.set_extend_range(len(match.device_indices), length)
+                req.kv.mamba_last_track_seqlen = checkpoint
+                req.session_id = "terminal-leaf"
+                req.session_generation = cache.open_radix_session(req.session_id)
+                if stale:
+                    cache.release_radix_session(req.session_id)
+                    cache.open_radix_session(req.session_id)
+                req.finished_reason = (
+                    FINISH_ABORT() if aborted else FINISH_LENGTH(length=8)
+                )
+                cache.cache_finished_req(
+                    req, is_insert=insert_tail, kv_len_to_handle=length
+                )
+                expected = int(prior and insert_tail and not aborted and not stale)
+                for component in cache.components.values():
+                    refs = component._session_leaves.get(req.session_id, ())
+                    self.assertEqual(
+                        sum(component.session_ref(node) > 0 for node in refs), expected
+                    )
+                self.assertEqual(match_len(cache, tokens), 256 if prior else 0)
+                cache.sanity_check()
+                cache.release_radix_session(req.session_id)
+                cache.evict(EvictParams(num_tokens=2048, mamba_num=60))
+                self.assertEqual(match_len(cache, tokens), 0)
+                self.assertEqual(allocator.available_size(), 2048)
 
 
 if __name__ == "__main__":
