@@ -166,7 +166,8 @@ def pcg_dsa_indexer_prefill_split(
         forward_batch=forward_batch,
     )
     q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-    # Reuse the compiled head-gate util shared with the eager path.
+    # Reuse the compiled head-gate util shared with the eager path. Fusion
+    # returned above, so weights_proj is a separate module here.
     weights = indexer._get_logits_head_gate(x, q_scale)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
