@@ -18,7 +18,7 @@ use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
 
-/// Request facts a policy may read. Resolver-only facts live in `SelectionRequest`.
+/// Request facts used for bucket matching and engine selection.
 #[derive(Debug, Clone, Copy)]
 pub struct PickRequest<'a> {
     pub model: &'a ModelId,

@@ -4,9 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use sgl_router::buckets_reorg::{
-    Bucket, BucketResolver, EngineGroup, SelectionRequest, SloPreference, TokenLimits,
-};
+use sgl_router::buckets_reorg::{Bucket, BucketResolver, EngineGroup, TokenLimits};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
@@ -108,8 +106,8 @@ fn bucket(id: &str, rank: u32, members: &[&str], policy: Arc<dyn Policy>) -> Buc
     }
 }
 
-fn request<'a>(model: &'a ModelId, stage: Stage, load: &'a LoadView<'a>) -> SelectionRequest<'a> {
-    SelectionRequest::new(PickRequest::new(model, stage, 10, load))
+fn request<'a>(model: &'a ModelId, stage: Stage, load: &'a LoadView<'a>) -> PickRequest<'a> {
+    PickRequest::new(model, stage, 10, load)
 }
 
 #[tokio::test]
@@ -126,16 +124,14 @@ async fn groups_isolate_model_health_and_stage() {
             ..Default::default()
         }],
     );
-    let groups = plain.ordered_groups(&request).unwrap();
-    assert_eq!(
-        groups[0]
-            .engines
-            .iter()
-            .map(|w| w.id.0.as_str())
-            .collect::<Vec<_>>(),
-        ["a", "b"]
-    );
     assert_eq!(plain.pick(&request).await.unwrap().engine.id.0, "a");
+    plain.workers.remove(&WorkerId("a".into()));
+    assert_eq!(plain.pick(&request).await.unwrap().engine.id.0, "b");
+    plain.workers.remove(&WorkerId("b".into()));
+    assert!(matches!(
+        plain.pick(&request).await,
+        Err(PickError::NoCandidates)
+    ));
 
     let pd_model = ModelId("pd".into());
     let pd = BucketResolver::new(
@@ -157,42 +153,39 @@ async fn groups_isolate_model_health_and_stage() {
     }
 }
 
-#[test]
-fn groups_order_by_slo_then_rank_and_id_and_filter_limits() {
+#[tokio::test]
+async fn buckets_match_length_then_order_by_rank_and_id() {
     let table = EngineLoadTable::new();
     let load = LoadView::new(&table);
     let model = ModelId("m".into());
-    let mut request = request(&model, Stage::Plain, &load);
-    request.ttft_ms = Some(100);
+    let request = request(&model, Stage::Plain, &load);
     let policy = Arc::new(TestPolicy::default());
-    let mut fast = bucket("fast", 10, &["a", "other", "unhealthy"], policy.clone());
-    fast.ttft_ms = Some(50);
     let mut small = bucket("small", 0, &["a"], policy.clone());
     small.plain.as_mut().unwrap().limits.max = Some(9);
     let mut context = bucket("context", 0, &["a"], policy.clone());
     context.max_context_tokens = Some(9);
-    let buckets = vec![
-        fast,
-        small,
-        context,
-        bucket("z", 1, &["b"], policy.clone()),
-        bucket("a", 1, &["a"], policy.clone()),
-        bucket("empty", 0, &["missing"], policy),
-    ];
-    let mut resolver = BucketResolver::new(registry(), buckets);
-    for (slo, expected) in [
-        (SloPreference::Disabled, vec!["a", "z", "fast"]),
-        (SloPreference::SloFirst, vec!["fast", "a", "z"]),
-        (SloPreference::BestEffort, vec!["a", "z", "fast"]),
-    ] {
-        resolver.prefill_slo = slo;
-        let groups = resolver.ordered_groups(&request).unwrap();
-        assert_eq!(
-            groups.iter().map(|g| g.bucket).collect::<Vec<_>>(),
-            expected
-        );
-        assert!(groups.iter().all(|g| g.engines.len() == 1));
-    }
+    let resolver = BucketResolver::new(
+        registry(),
+        vec![
+            bucket("last", 10, &["b"], policy.clone()),
+            small,
+            context,
+            bucket("z", 1, &["b"], policy.clone()),
+            bucket("a", 1, &["a", "other", "unhealthy"], policy.clone()),
+            bucket("empty", 0, &["missing"], policy),
+        ],
+    );
+    assert_eq!(
+        resolver
+            .matching_buckets(&request)
+            .unwrap()
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>(),
+        ["empty", "a", "z", "last"]
+    );
+    // Matching buckets can be empty; selection skips them before invoking policies.
+    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "a");
 }
 
 #[tokio::test]
@@ -217,8 +210,6 @@ async fn one_bucket_uses_separate_role_memberships_and_policies() {
     );
     for (stage, expected) in [(Stage::Prefill, "p2"), (Stage::Decode, "d2")] {
         let request = request(&model, stage, &load);
-        let groups = resolver.ordered_groups(&request).unwrap();
-        assert_eq!(groups[0].engines.len(), 1);
         assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, expected);
     }
     assert_eq!(*prefill.calls.lock().unwrap(), ["shared"]);
@@ -230,7 +221,7 @@ async fn one_bucket_uses_separate_role_memberships_and_policies() {
 }
 
 #[test]
-fn stages_have_independent_ranges_ranks_and_slo_ordering() {
+fn stages_have_independent_ranges_and_ranks() {
     let table = EngineLoadTable::new();
     let load = LoadView::new(&table);
     let model = ModelId("pd".into());
@@ -240,56 +231,39 @@ fn stages_have_independent_ranges_ranks_and_slo_ordering() {
         vec![
             Bucket {
                 id: "short".into(),
-                ttft_ms: Some(50),
-                tokens_per_second: Some(10.0),
                 prefill: Some(group(0, &["p"], policy.clone())),
                 decode: Some(group(1, &["d"], policy.clone())),
                 ..Default::default()
             },
             Bucket {
                 id: "long".into(),
-                ttft_ms: Some(100),
-                tokens_per_second: Some(100.0),
                 prefill: Some(group(1, &["p"], policy.clone())),
                 decode: Some(group(0, &["d"], policy)),
                 ..Default::default()
             },
         ],
     );
-    let mut prefill = request(&model, Stage::Prefill, &load);
-    prefill.ttft_ms = Some(75);
+    let prefill = request(&model, Stage::Prefill, &load);
     let mut decode = request(&model, Stage::Decode, &load);
-    decode.tokens_per_second = Some(50.0);
-    decode.pick.expected_peak_tokens = Some(20);
-    assert_eq!(
-        resolver.ordered_groups(&prefill).unwrap()[0].bucket,
-        "short"
-    );
-    assert_eq!(resolver.ordered_groups(&decode).unwrap()[0].bucket, "long");
-
-    resolver.prefill_slo = SloPreference::SloFirst;
-    resolver.decode_slo = SloPreference::BestEffort;
-    assert_eq!(
-        resolver.ordered_groups(&prefill).unwrap()[0].bucket,
-        "short"
-    );
-    assert_eq!(resolver.ordered_groups(&decode).unwrap()[0].bucket, "short");
+    decode.expected_peak_tokens = Some(20);
+    assert_eq!(resolver.matching_buckets(&prefill).unwrap()[0].id, "short");
+    assert_eq!(resolver.matching_buckets(&decode).unwrap()[0].id, "long");
 
     resolver.buckets[0].prefill.as_mut().unwrap().limits.max = Some(10);
     resolver.buckets[0].decode.as_mut().unwrap().limits.max = Some(15);
     resolver.buckets[1].prefill.as_mut().unwrap().limits.min = Some(11);
     resolver.buckets[1].decode.as_mut().unwrap().limits.min = Some(16);
     for (request, expected) in [(&prefill, "short"), (&decode, "long")] {
-        let groups = resolver.ordered_groups(request).unwrap();
+        let groups = resolver.matching_buckets(request).unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].bucket, expected);
+        assert_eq!(groups[0].id, expected);
     }
 
     // The same bucket context limit applies to both of its role groups.
     resolver.buckets[0].max_context_tokens = Some(9);
     resolver.buckets[1].max_context_tokens = Some(19);
-    assert!(resolver.ordered_groups(&prefill).unwrap().is_empty());
-    assert!(resolver.ordered_groups(&decode).unwrap().is_empty());
+    assert!(resolver.matching_buckets(&prefill).unwrap().is_empty());
+    assert!(resolver.matching_buckets(&decode).unwrap().is_empty());
 }
 
 #[test]
@@ -319,16 +293,16 @@ fn decode_unknown_output_uses_only_unbounded_sequence_ranges() {
     };
     let resolver = BucketResolver::new(registry(), vec![bounded, catch_all]);
     assert_eq!(
-        resolver.ordered_groups(&request).unwrap()[0].bucket,
+        resolver.matching_buckets(&request).unwrap()[0].id,
         "catch-all"
     );
-    request.pick.expected_peak_tokens = Some(20);
-    assert_eq!(resolver.ordered_groups(&request).unwrap().len(), 2);
-    request.pick.expected_peak_tokens = Some(31);
-    assert!(resolver.ordered_groups(&request).unwrap().is_empty());
-    request.pick.expected_peak_tokens = Some(9);
+    request.expected_peak_tokens = Some(20);
+    assert_eq!(resolver.matching_buckets(&request).unwrap().len(), 2);
+    request.expected_peak_tokens = Some(31);
+    assert!(resolver.matching_buckets(&request).unwrap().is_empty());
+    request.expected_peak_tokens = Some(9);
     assert!(matches!(
-        resolver.ordered_groups(&request),
+        resolver.matching_buckets(&request),
         Err(PickError::InvalidSignal(_))
     ));
 }
