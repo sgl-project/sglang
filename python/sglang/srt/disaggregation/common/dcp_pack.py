@@ -103,9 +103,17 @@ def init_dcp_pack_buffers(
     kv_item_lens = kv_args.kv_item_lens
     if kv_args.num_draft_entries > 0:
         kv_item_lens = kv_item_lens[: len(kv_item_lens) - kv_args.num_draft_entries]
-    # Note(kpham-sgl): size = dcp_size x ceil(max_tokens / dcp_size)
-    # x sum(per-layer token bytes). At 32,768 tokens and 61 MLA layers
-    # x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
+    # size = dcp_size x max_tokens x sum(per-layer token bytes). Every rank
+    # gets a full max_tokens region because how a chunk's tokens map onto DCP
+    # ranks depends on their positions -- in the worst case a whole chunk lands
+    # on one rank, and try_pack_dcp_src's fits() check is written against that
+    # worst-case offset. Sizing a rank at max_tokens / dcp_size instead assumes
+    # a uniform split that fits() never assumes, so any pack larger than that
+    # share fails and silently falls back to per-token RDMA.
+    #
+    # This costs dcp_size x the old footprint. Measured on Kimi-K3 (61 MLA
+    # layers, max_tokens=16,384, dcp_size=8): 1,728 MiB/buffer, 6.75 GiB for 4
+    # queues, of which a typical long-context pack uses ~31%.
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
