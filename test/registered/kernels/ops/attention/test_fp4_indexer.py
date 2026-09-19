@@ -326,7 +326,18 @@ def test_candidate_fp4_indexer(width, rows):
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize(
     "case",
-    ["dense", "compact", "mixed", "below", "at", "zero_compressed", "empty_query"],
+    [
+        "dense",
+        "compact",
+        "mixed",
+        "below",
+        "at",
+        "zero_compressed",
+        "empty_query",
+        "multi_long",
+        "multi_long_empty_query",
+        "single_query",
+    ],
 )
 def test_candidate_prefill_mapping(ratio, case):
     from types import SimpleNamespace as NS
@@ -343,12 +354,20 @@ def test_candidate_prefill_mapping(ratio, case):
     if case in ("below", "at"):
         context = other = 262144 - (case == "below")
     lengths, q_lengths = [context * ratio, 0, 0, other * ratio], [33, 0, 0, 17]
+    if case == "multi_long_empty_query":
+        q_lengths[3] = 0
+    if case not in ("dense", "mixed", "multi_long", "multi_long_empty_query"):
+        lengths[3], q_lengths[3] = 0, 0
+    if case == "single_query":
+        q_lengths[0] = 1
     if case == "zero_compressed":
         lengths[2], q_lengths[2] = 1, 1
     if case == "empty_query":
         # Even a small context without query rows keeps the batch dense.
         lengths[2] = 1
-    compact = all(lc == 0 or lc >= 262144 for lc in (s // ratio for s in lengths))
+    compact = case in ("compact", "at", "single_query") or (
+        ratio == 2 and case in ("zero_compressed", "empty_query")
+    )
     tokens, topk = sum(q_lengths), 512
     compressed = [length // ratio for length in lengths]
     positions = torch.cat(

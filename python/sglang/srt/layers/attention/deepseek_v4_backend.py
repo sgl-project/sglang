@@ -3352,9 +3352,10 @@ class DeepseekV4AttnBackend(
                 lc_per_req,
                 q_lens_cpu,
                 empty_mask,
-                # All nonzero contexts must qualify, including requests with no
-                # query rows. Otherwise preserve batched dense consumers.
+                # Per-request compact launches regress multi-request batches.
+                # Keep those batched dense, including contexts with no query rows.
                 return_indices=indexer.is_candidate_source
+                and sum(lc > 0 for lc in lc_per_req) == 1
                 and all(
                     lc == 0
                     or lc
