@@ -11,6 +11,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    resolve_pp_proxy_dspark_hidden_size,
+)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
@@ -52,6 +55,25 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
+        class Model:
+            def get_pp_proxy_dspark_hidden_size(self):
+                return 16
+
+        for model, pp_size, pp_rank, expected in (
+            (Model(), 1, 0, 0),
+            (Model(), 2, 0, 0),
+            (Model(), 2, 1, 16),
+            (object(), 2, 1, 0),
+        ):
+            with self.subTest(pp_size=pp_size, pp_rank=pp_rank, expected=expected):
+                self.assertEqual(
+                    resolve_pp_proxy_dspark_hidden_size(
+                        model=model, pp_size=pp_size, pp_rank=pp_rank
+                    ),
+                    expected,
+                )
+
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
         full_proxy = PPProxyTensors(

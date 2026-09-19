@@ -128,6 +128,8 @@ def _configure_target_hidden_projection(
 
 
 class DSparkWorkerV2(BaseSpecWorker):
+    """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1048,4 +1050,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
+        if not self._hosts_draft:
+            return None
         return self._verify_planner.confidence_budget_prepare()

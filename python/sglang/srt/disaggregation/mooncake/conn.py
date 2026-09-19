@@ -1204,6 +1204,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     )
                     continue
+                if self.is_mla_backend:
+                    raise ValueError(
+                        "PD DCP draft head slicing is unsupported for pure MLA: "
+                        "dummy prefill senders may omit draft head shards"
+                    )
                 copy_width = min(src_width, dst_width)
                 if max(src_width, dst_width) % copy_width:
                     raise ValueError("PD DCP draft KV head shards must divide evenly")

@@ -65,6 +65,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         result = worker.forward_batch_generation(batch, pp_proxy_tensors=proxy)
         self.assertIs(result.pp_hidden_states_proxy_tensors, proxy)
         self.assertIs(result.new_seq_lens, batch.seq_lens)
+        self.assertIsNone(worker.get_confidence_budget_prepare())
         self.assertIsNone(worker.primary_draft_kv_pool)
         self.assertEqual(worker.preloaded_weights_bytes, 0)
         self.assertEqual(

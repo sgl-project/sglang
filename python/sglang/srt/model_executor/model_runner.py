@@ -683,7 +683,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
@@ -801,10 +800,11 @@ class ModelRunner:
             enable_batch_invariant_mode()
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
-        if self.ps.pp_size == 1 or self.ps.pp_rank == 0:
-            return 0
-        getter = getattr(self.model, "get_pp_proxy_dspark_hidden_size", None)
-        return getter() if getter is not None else 0
+        return misc_utils.resolve_pp_proxy_dspark_hidden_size(
+            model=self.model,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+        )
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
